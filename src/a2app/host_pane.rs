@@ -6,6 +6,7 @@ use makepad_widgets::*;
 
 use a2app_core::manifest::{MiniAppId, MiniAppManifest};
 use crate::a2app::host_set::{MiniAppHostAreaWidgetExt, SplashHostSet};
+use matrix_sdk::ruma::OwnedRoomId;
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -51,6 +52,13 @@ script_mod! {
                 }
             }
 
+            return_button := RobrixNeutralIconButton {
+                visible: false
+                padding: Inset{top: 5, bottom: 5, left: 10, right: 10},
+                icon_walk: Walk{width: 0, height: 0, margin: 0}
+                text: "Return to room"
+            }
+
             close_button := RobrixIconButton {
                 width: Fit, height: Fit,
                 padding: 12,
@@ -82,6 +90,8 @@ script_mod! {
 pub enum MiniAppHostPaneAction {
     /// The user closed the pane; the app keeps running in the background.
     CloseClicked,
+    /// A room-bound app wants to go back into that room's dock.
+    ReturnToRoom { app_id: MiniAppId, room_id: OwnedRoomId },
     #[default]
     None,
 }
@@ -92,6 +102,8 @@ pub struct MiniAppHostPane {
     #[rust] host_set: SplashHostSet,
     /// The app currently shown in the pane.
     #[rust] active: Option<MiniAppId>,
+    /// The room the shown app is bound to, if it was popped out of one.
+    #[rust] active_room: Option<OwnedRoomId>,
 }
 
 impl ScriptHook for MiniAppHostPane {
@@ -132,6 +144,11 @@ impl Widget for MiniAppHostPane {
             if self.view.button(cx, ids!(close_button)).clicked(actions) {
                 cx.action(MiniAppHostPaneAction::CloseClicked);
             }
+            if self.view.button(cx, ids!(return_button)).pressed(actions)
+                && let (Some(app_id), Some(room_id)) = (self.active.clone(), self.active_room.clone())
+            {
+                cx.action(MiniAppHostPaneAction::ReturnToRoom { app_id, room_id });
+            }
         }
 
         // Backgrounded apps still receive network responses so in-flight
@@ -153,15 +170,21 @@ impl Widget for MiniAppHostPane {
 }
 
 impl MiniAppHostPaneRef {
-    /// Opens (or brings back) the given app, creating its isolate on first open.
-    pub fn open_app(&self, cx: &mut Cx, manifest: &MiniAppManifest, grants: Vec<String>) {
+    /// Opens (or brings back) the given app, creating its isolate on first
+    /// open. `room` binds it like a docked instance and offers a way back.
+    pub fn open_app(&self, cx: &mut Cx, manifest: &MiniAppManifest, grants: Vec<String>, room: Option<OwnedRoomId>) {
         let Some(mut inner) = self.borrow_mut() else { return };
         let uid = inner.widget_uid();
-        let tag = instance_tag_for(manifest);
+        let tag = match &room {
+            Some(room_id) => a2app_core::manifest::instance_tag(&manifest.id, Some(room_id.as_str())),
+            None => instance_tag_for(manifest),
+        };
         if inner.host_set.ensure_host(cx, uid, manifest, &grants, &tag).is_none() {
             return;
         }
         inner.active = Some(manifest.id.clone());
+        inner.view.button(cx, ids!(return_button)).set_visible(cx, room.is_some());
+        inner.active_room = room;
         let host = inner.host_set.host_of(&manifest.id);
         inner.view.mini_app_host_area(cx, ids!(host_area)).set_host(host);
         inner.view.label(cx, ids!(app_glyph)).set_text(cx, &manifest.icon);
@@ -176,6 +199,7 @@ impl MiniAppHostPaneRef {
         inner.host_set.teardown(cx, uid, app_id);
         if inner.active.as_deref() == Some(app_id) {
             inner.active = None;
+            inner.active_room = None;
             inner.view.mini_app_host_area(cx, ids!(host_area)).set_host(None);
         }
         inner.view.redraw(cx);
@@ -184,11 +208,12 @@ impl MiniAppHostPaneRef {
     /// Restarts a RUNNING app with fresh grants (needed for `network`
     /// changes, whose runtime is baked in at VM alloc). No-op if not running.
     pub fn restart_if_running(&self, cx: &mut Cx, manifest: &MiniAppManifest, grants: Vec<String>) {
-        let (was_running, was_active) = {
+        let (was_running, was_active, room) = {
             let Some(inner) = self.borrow() else { return };
             (
                 inner.host_set.is_running(&manifest.id),
                 inner.active.as_deref() == Some(manifest.id.as_str()),
+                inner.active_room.clone(),
             )
         };
         if !was_running {
@@ -197,7 +222,7 @@ impl MiniAppHostPaneRef {
         self.force_stop(cx, &manifest.id);
         if was_active {
             // open_app re-points the host area at the fresh host.
-            self.open_app(cx, manifest, grants);
+            self.open_app(cx, manifest, grants, room);
         } else {
             let Some(mut inner) = self.borrow_mut() else { return };
             let uid = inner.widget_uid();

@@ -315,6 +315,11 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     for pane_action in pane_actions {
         match pane_action {
             MiniAppHostPaneAction::CloseClicked => ops.push(A2AppOp::CloseHostPane),
+            // Closing quits the popped-out instance; the room's dock starts its own.
+            MiniAppHostPaneAction::ReturnToRoom { app_id, room_id } => {
+                ops.push(A2AppOp::CloseHostPane);
+                cx.action(DockCmd::Open { app_id, room_id });
+            }
             MiniAppHostPaneAction::None => {}
         }
     }
@@ -393,9 +398,9 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 (true, Some(pane_room)) => {
                     cx.action(DockCmd::Open { app_id, room_id: pane_room });
                 }
-                _ => {
+                (_, room) => {
                     with_a2app(|state| state.foreground_app = Some(app_id.clone()));
-                    host_pane(cx, ui).open_app(cx, &manifest, grants);
+                    host_pane(cx, ui).open_app(cx, &manifest, grants, room);
                     ui.modal(cx, ids!(mini_app_host_modal)).open(cx);
                 }
             }

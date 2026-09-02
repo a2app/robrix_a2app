@@ -12,7 +12,7 @@ use matrix_sdk::ruma::OwnedRoomId;
 
 use a2app_core::manifest::{instance_tag, MiniAppId};
 use crate::a2app::host_set::{MiniAppHostAreaWidgetRefExt, SplashHostSet};
-use crate::a2app::runtime::with_a2app;
+use crate::a2app::runtime::{with_a2app, A2AppOp};
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -426,15 +426,20 @@ impl Widget for MiniAppDock {
                     PaneButton::Chip => self.set_minimized(cx, &app_id, false),
                     PaneButton::CycleEdge => self.cycle_edge(cx, &app_id),
                     PaneButton::BreakOutTab => {
-                        // Quit the docked instance; the tab starts its own.
+                        // Quit the docked instance; the new home starts its own:
+                        // a dock tab on desktop, the full-screen host otherwise.
                         let Some(room_id) = self.room_id.clone() else { continue };
                         let room_name = self.room_name.clone();
                         self.quit_app(cx, app_id.clone(), false);
-                        cx.action(crate::a2app::tab_screen::A2AppTabRequest::Open {
-                            app_id,
-                            room_id,
-                            room_name,
-                        });
+                        if crate::home::home_screen::effective_is_desktop(cx) {
+                            cx.action(crate::a2app::tab_screen::A2AppTabRequest::Open {
+                                app_id,
+                                room_id,
+                                room_name,
+                            });
+                        } else {
+                            cx.action(A2AppOp::OpenApp { app_id, room_id: Some(room_id), in_room_pane: false });
+                        }
                     }
                 }
             }
@@ -527,9 +532,6 @@ impl MiniAppDock {
                 })
             })
             .fold(0.0, f64::max);
-        // Breaking out into a dock tab only exists in the desktop layout.
-        let is_desktop = crate::home::home_screen::effective_is_desktop(cx);
-        pane.button(cx, ids!(pane_tab_button)).set_visible(cx, is_desktop);
         pane.mini_app_host_area(cx, ids!(host_area)).set_host(Some(host));
 
         let Some(chip) = self.instantiate(cx, live_id!(Chip)) else { return };
