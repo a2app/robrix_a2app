@@ -107,7 +107,10 @@ fn on_surface_changed(json){
     read_pane()
 }
 
-fn on_app_resize(w, h){ read_pane() }
+fn on_app_resize(w, h){
+    read_env()
+    read_pane()
+}
 
 fn on_prefs_changed(json){
     log("settings changed")
@@ -197,7 +200,7 @@ View{
             device_line := Label{ text: "…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
         }
         Label{
-            text: "What Robrix told this app, newest last" padding: 0 margin: 0
+            text: "What Robrix told this app, newest first" padding: 0 margin: 0
             draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
         }
         event_list := ScrollYView{
@@ -209,9 +212,11 @@ View{
                         draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
                     }
                 } else {
-                    for line in events {
+                    let i = events.len()
+                    while i > 0 {
+                        i -= 1
                         Label{
-                            text: line width: Fill padding: 0 margin: 0
+                            text: events[i] width: Fill padding: 0 margin: 0
                             draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
                         }
                     }
