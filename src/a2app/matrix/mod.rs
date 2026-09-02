@@ -11,7 +11,7 @@ use std::collections::HashSet;
 
 use makepad_widgets::*;
 use matrix_sdk::RoomState;
-use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
+use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
 
 use a2app_core::services::{MatrixServiceCall, Reply, SearchScope};
 
@@ -43,6 +43,14 @@ pub enum A2AppMatrixRequest {
     ShareApp { room_id: OwnedRoomId, bundle_json: String, app_name: String },
 
     // --- room ---
+    ThreadReplies { room_id: OwnedRoomId, event_id: OwnedEventId, limit: u32, reply: Reply },
+    OlderMessages { room_id: OwnedRoomId, before: Option<OwnedEventId>, limit: u32, reply: Reply },
+    Event { room_id: OwnedRoomId, event_id: OwnedEventId, reply: Reply },
+    ReadReceipts { room_id: OwnedRoomId, user_id: Option<OwnedUserId>, reply: Reply },
+    Unread { room_id: OwnedRoomId, reply: Reply },
+    PowerLevels { room_id: OwnedRoomId, reply: Reply },
+    Permalink { room_id: OwnedRoomId, event_id: Option<OwnedEventId>, use_matrix_scheme: bool, reply: Reply },
+    Successor { room_id: OwnedRoomId, reply: Reply },
 
     // --- rooms ---
 
@@ -111,6 +119,42 @@ pub fn request_for(
             A2AppMatrixRequest::Threads { room_id, limit, reply },
 
         // --- room ---
+        (MatrixServiceCall::ThreadReplies { event_id, limit }, Some(room_id)) => {
+            let Ok(event_id) = OwnedEventId::try_from(event_id.as_str()) else {
+                return Err("not a valid event id");
+            };
+            A2AppMatrixRequest::ThreadReplies { room_id, event_id, limit, reply }
+        }
+        (MatrixServiceCall::OlderMessages { before, limit }, Some(room_id)) => {
+            let Ok(before) = before.map(|id| OwnedEventId::try_from(id.as_str())).transpose() else {
+                return Err("not a valid event id");
+            };
+            A2AppMatrixRequest::OlderMessages { room_id, before, limit, reply }
+        }
+        (MatrixServiceCall::Event { event_id }, Some(room_id)) => {
+            let Ok(event_id) = OwnedEventId::try_from(event_id.as_str()) else {
+                return Err("not a valid event id");
+            };
+            A2AppMatrixRequest::Event { room_id, event_id, reply }
+        }
+        (MatrixServiceCall::ReadReceipts { user_id }, Some(room_id)) => {
+            let Ok(user_id) = user_id.map(|id| OwnedUserId::try_from(id.as_str())).transpose() else {
+                return Err("not a valid user id");
+            };
+            A2AppMatrixRequest::ReadReceipts { room_id, user_id, reply }
+        }
+        (MatrixServiceCall::Unread, Some(room_id)) =>
+            A2AppMatrixRequest::Unread { room_id, reply },
+        (MatrixServiceCall::PowerLevels, Some(room_id)) =>
+            A2AppMatrixRequest::PowerLevels { room_id, reply },
+        (MatrixServiceCall::Permalink { event_id, use_matrix_scheme }, Some(room_id)) => {
+            let Ok(event_id) = event_id.map(|id| OwnedEventId::try_from(id.as_str())).transpose() else {
+                return Err("not a valid event id");
+            };
+            A2AppMatrixRequest::Permalink { room_id, event_id, use_matrix_scheme, reply }
+        }
+        (MatrixServiceCall::Successor, Some(room_id)) =>
+            A2AppMatrixRequest::Successor { room_id, reply },
 
         // --- rooms ---
 
@@ -531,6 +575,22 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
         }
 
         // --- room ---
+        A2AppMatrixRequest::ThreadReplies { room_id, event_id, limit, reply } =>
+            (reply, room::thread_replies(room_id, event_id, limit).await),
+        A2AppMatrixRequest::OlderMessages { room_id, before, limit, reply } =>
+            (reply, room::older_messages(room_id, before, limit).await),
+        A2AppMatrixRequest::Event { room_id, event_id, reply } =>
+            (reply, room::event(room_id, event_id).await),
+        A2AppMatrixRequest::ReadReceipts { room_id, user_id, reply } =>
+            (reply, room::read_receipts(room_id, user_id).await),
+        A2AppMatrixRequest::Unread { room_id, reply } =>
+            (reply, room::unread(room_id).await),
+        A2AppMatrixRequest::PowerLevels { room_id, reply } =>
+            (reply, room::power_levels(room_id).await),
+        A2AppMatrixRequest::Permalink { room_id, event_id, use_matrix_scheme, reply } =>
+            (reply, room::permalink(room_id, event_id, use_matrix_scheme).await),
+        A2AppMatrixRequest::Successor { room_id, reply } =>
+            (reply, room::successor(room_id).await),
 
         // --- rooms ---
 

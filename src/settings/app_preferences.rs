@@ -160,6 +160,7 @@ impl AppPreferences {
     /// Applies the current `show_read_receipts` value.
     pub fn on_show_read_receipts_changed(&self, cx: &mut Cx) {
         cx.global::<AppPreferencesGlobal>().0.show_read_receipts = self.show_read_receipts;
+        SHOW_READ_RECEIPTS.store(self.show_read_receipts, Ordering::Relaxed);
         // Read receipt avatar rows check this pref at draw time, so redraw everything.
         cx.redraw_all();
     }
@@ -325,6 +326,14 @@ pub fn preferred_receipt_type() -> ReceiptType {
     } else {
         ReceiptType::ReadPrivate
     }
+}
+
+/// A way to allow `show_read_receipts` to be accessed by all threads.
+static SHOW_READ_RECEIPTS: AtomicBool = AtomicBool::new(true);
+
+/// Whether other users' read receipts may be shown at all.
+pub fn show_read_receipts() -> bool {
+    SHOW_READ_RECEIPTS.load(Ordering::Relaxed)
 }
 
 fn default_true() -> bool {

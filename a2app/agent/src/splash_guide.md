@@ -490,6 +490,38 @@ burning a permission.
   messages, newest first; `event_id` is the thread root.
 
 <!-- room -->
+- `"matrix.thread_replies"` (needs `matrix-room-read`): `{event_id, limit: N}`
+  (max 100) -> `{root, replies: [message]}`, the latest replies in that thread,
+  oldest first; `root` is the thread's first message (null if it isn't one). A
+  message is `{sender, sender_id, event_id, body, ts, msgtype}`, `ts` in unix
+  millis. Served from what Robrix has cached; a thread it hasn't seen is
+  fetched from the homeserver.
+- `"matrix.older_messages"` (needs `matrix-room-read`): `{before: event_id?,
+  limit: N}` (max 50) -> `{messages: [message], has_more}`, one page of text
+  messages older than `before` (or older than what `matrix.read_messages`
+  returns), oldest first. Always hits the homeserver; pass the first message's
+  `event_id` back as `before` to keep paging while `has_more` is true.
+- `"matrix.event"` (needs `matrix-room-read`): `{event_id}` -> a message plus
+  `{edited, reactions: [{key, count, mine}], thread_root}`; `body` is the
+  latest edit and `thread_root` is null outside threads. A cached event is
+  free; anything else is fetched from the homeserver.
+- `"matrix.read_receipts"` (needs `matrix-room-read`): `{user_id?}` ->
+  `{receipts: [{user_id, name, event_id, ts}]}`, the latest read position of
+  that member, or of every joined member (first 200), newest first. Empty
+  while the user has "show read receipts" turned off, so never read an empty
+  list as "nobody has read this".
+- `"matrix.unread"` (needs `matrix-room-info`): `{}` ->
+  `{unread, mentions, marked_unread}`, Robrix's own counts for the room.
+- `"matrix.power_levels"` (needs `matrix-room-info`): `{}` ->
+  `{mine, can: {invite, kick, ban, redact_others, pin, send_message,
+  notify_room, change_settings}}`, the user's power level and what it permits
+  here. Check `can.*` before offering a write; the server refuses the rest anyway.
+- `"matrix.permalink"` (needs `matrix-room-info`): `{event_id?, scheme?}` ->
+  `{url}`, a `matrix.to` link (default) or a `matrix:` URI (`scheme:
+  "matrix"`) to the room, or to one of its events when `event_id` is given.
+- `"matrix.successor"` (needs `matrix-room-info`): `{}` ->
+  `{upgraded, room_id, name, reason}`; where an upgraded room continued
+  (fields null when it wasn't upgraded). Pass `room_id` to `nav.room` to go there.
 
 <!-- rooms -->
 
