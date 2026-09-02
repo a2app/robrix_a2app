@@ -496,7 +496,7 @@ impl Generation {
                     // lists every one of them.
                     permissions: header.permissions.clone(),
                     permission_reasons: header.permission_reasons.clone(),
-                    capabilities: Vec::new(),
+                    capabilities: header.capabilities.clone(),
                     builtin: false,
                     widget: None,
                     shortcuts: Vec::new(),
@@ -523,7 +523,22 @@ impl Generation {
                     r.extend(header.permission_reasons.clone());
                     r
                 },
-                capabilities: Vec::new(),
+                // A narrowed id lands only for a group new to the app or one
+                // already narrowed; narrowing a whole granted group would drop abilities.
+                capabilities: {
+                    let mut caps = base.capabilities.clone();
+                    for id in &header.capabilities {
+                        let Some(group) = a2app_core::capabilities::by_id(id).and_then(|c| c.group) else { continue };
+                        let new_group = !base.permissions.iter().any(|p| p == group.as_str());
+                        let narrowed = caps.iter().any(|c| {
+                            a2app_core::capabilities::by_id(c).is_some_and(|c| c.group == Some(group))
+                        });
+                        if (new_group || narrowed) && !caps.contains(id) {
+                            caps.push(id.clone());
+                        }
+                    }
+                    caps
+                },
                 // Keep the flag: a modified BUILT-IN stays built-in (its
                 // override just shadows the stock app). Dropping it here would
                 // make it uninstallable-then-resurrectable — and would strip
@@ -616,7 +631,8 @@ const RESPONSIVE_POLICY: &str = "The app MUST lay out well and stay fully usable
 const PERMISSION_POLICY: &str = "The app is SANDBOXED. Anything beyond its own UI and \
      its private `fs` jail (network, location, clipboard, notifications, links, files, \
      share, auth, messaging other apps, Matrix room data and messages, the user's \
-     Matrix identity) needs a capability DECLARED in the header \
+     Matrix identity, steering Robrix to a room/thread/message/profile, drafting into \
+     its composer) needs a capability DECLARED in the header \
      (`// permissions: network, location`) with a reason per capability \
      (`// why-network: ...`). Declaring is not granting: the user is asked, and can \
      refuse or revoke at any time. So the app MUST be fully usable with everything \
@@ -640,7 +656,10 @@ const PERMISSION_POLICY: &str = "The app is SANDBOXED. Anything beyond its own U
      The `matrix.*` services (see the guide's Matrix services section) work only \
      when the app is attached to a room, and fail like a denial without one. Send \
      ONLY what the user explicitly asked to send, one message per user action, \
-     never on a timer.";
+     never on a timer. Anything the app lists that maps onto Robrix (a member, a \
+     thread, a message, a room) should be tappable via `on_item_tap` on the list and \
+     the `nav.*` services (see the guide's Acting inside Robrix section), only ever \
+     in response to a tap.";
 
 fn build_initial_prompt(request: &str, slim: bool) -> String {
     format!(

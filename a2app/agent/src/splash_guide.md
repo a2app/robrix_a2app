@@ -199,9 +199,25 @@ lap_list := ScrollYView{
 ```
 
 After changing the array call `ui.lap_list.render()`. Rows built inside
-`on_render` must NOT carry `on_click` handlers — if rows must be tappable,
-pre-declare a fixed set of row widgets (e.g. `row_0`..`row_7`, hidden via
-`set_visible(false)`) and fill them from a `refresh()` function instead.
+`on_render` must NOT carry `on_click` handlers (the list stops re-rendering).
+To make rows tappable put ONE handler on the list itself:
+
+```splash
+lap_list := ScrollYView{
+    width: Fill height: 220 flow: Down spacing: 6
+    on_item_tap: |i| open_lap(i)
+    on_render: || { for lap in laps { glass.ListRow{ ... } } }
+}
+fn open_lap(i){
+    if i >= laps.len() { return nil }
+    let lap = laps[i]
+    ...
+}
+```
+
+`i` is the index of the direct child that was tapped, so emit exactly one
+row per array item (an empty-state label is fine: guard `i >= arr.len()`).
+Buttons inside a row keep their own `on_click` and don't trigger the tap.
 
 ## Saving data (persistence)
 
@@ -292,6 +308,8 @@ and scope (this room, account, device, app-local). Available today:
 | matrix-room-read | `matrix.room.messages.read`, `matrix.room.members.read`, `matrix.room.pins.read`, `matrix.room.threads.read` | read · this room |
 | matrix-room-send | `matrix.room.message.send` | write · this room |
 | matrix-profile | `matrix.profile.read` | read · account |
+| robrix-navigation | `host.nav.user`, `host.nav.thread`, `host.nav.event`, `host.nav.room`, `host.nav.space`, `host.nav.screen`, `host.nav.link`, `host.nav.app` | act · app→Robrix · this room / account |
+| robrix-composer | `host.composer.insert`, `host.composer.reply_to` | act · app→Robrix · this room |
 
 Ungated plumbing every app has: `host.env.read` (`"env"`),
 `permissions.query`, `permissions.request`, and the hooks
@@ -303,12 +321,13 @@ capability id (`host.has("matrix.room.members.read")`), and
 the group may be allowed while that one ability is blocked.
 
 Only the ids in the table above exist in this Robrix. Anything else (other
-Matrix reads or writes, navigation, live event hooks) is refused with
-`not available in this Robrix` — do not invent service names; fall back.
+Matrix reads or writes, live event hooks) is refused with `unknown service`.
+Do not invent service names; fall back.
 
 **Declaring is not granting.** Sensitive capabilities (`network`,
-`location`, `notifications`, `clipboard-read`, `ipc`) prompt the user the
-first time you use them, and the answer can be "no". The rest
+`location`, `notifications`, `clipboard-read`, `ipc`, `robrix-navigation`,
+`robrix-composer`) prompt the user the first time you use them, and the
+answer can be "no". The rest
 (`clipboard-write`, `open-url`, `files`, `share`, `auth`) start allowed but
 the user can turn them off at any moment.
 
@@ -329,7 +348,8 @@ Two doorways:
   `"share"`, `"files.pick"`/`"files.save"`, `"auth.check"`,
   `"ipc.send"` (`{to: "self"}` is free of any permission; receivers define
   top-level `fn on_ipc_message(from, data)`, data is a JSON string),
-  `"permissions.query"`, `"permissions.request"`.
+  `"permissions.query"`, `"permissions.request"`, the `"nav.*"` and
+  `"composer.*"` services (see Acting inside Robrix below).
   `host.capabilities()` / `host.has("network")` report current grants.
 - `mod.net.http_request(mod.net.HttpRequest{url: u}, mod.net.HttpEvents{
   on_response: fn(res){ ... res.body.parse_json() ... }, on_error: fn(e){}})`
@@ -409,7 +429,9 @@ burning a permission.
   `{room_id, room_name, topic, member_count, encrypted, join_rule,
   history_visibility}` for the attached room.
 - `"matrix.read_messages"` (needs `matrix-room-read`): `{limit: N}` (max 30)
-  -> `{messages: [{sender, body}]}` — the latest text messages, oldest first.
+  -> `{messages: [{sender, sender_id, event_id, body}]}`, the latest text
+  messages, oldest first. `sender` is the short name, `sender_id` the full
+  `@user:server`, `event_id` what the `nav.*` / `composer.*` services take.
 - `"matrix.send_message"` (needs `matrix-room-send`): `{body: "text"}` -> `{}`
   — sends a plain text message to the attached room as the user.
 - `"matrix.profile"` (needs `matrix-profile`): `{}` ->
@@ -417,15 +439,59 @@ burning a permission.
 - `"matrix.room_members"` (needs `matrix-room-read`): `{limit: N}` (max 200)
   -> `{count, members: [{name, user_id, power}]}` — who is in the room.
 - `"matrix.pinned_events"` (needs `matrix-room-read`): `{}` ->
-  `{pinned: [{sender, body}]}` — the room's pinned messages.
+  `{pinned: [{sender, sender_id, event_id, body}]}`, the room's pinned messages.
 - `"matrix.room_threads"` (needs `matrix-room-read`): `{limit: N}` (max 50)
-  -> `{threads: [{sender, body}]}` — thread root messages, newest first.
+  -> `{threads: [{sender, sender_id, event_id, body}]}`, thread root
+  messages, newest first; `event_id` is the thread root.
 
 `matrix-room-info` and `matrix-profile` start allowed but revocable;
 `matrix-room-read` and `matrix-room-send` prompt the user on first use.
 Sending messages as the user is a serious capability: send ONLY what the
 user explicitly asked to send, one message per user action, never on a
 timer, and show what was sent.
+
+## Acting inside Robrix (navigation and composer)
+
+Whatever you list that exists in Robrix (a member, a thread, a message, a
+room, a space) should be tappable, and the tap should take the user THERE
+in Robrix. Put `on_item_tap: |i| ...` on the list and call one of these
+from it. All of them answer `{}` on success and fail like a denial
+(`r.is_ok == false`, `r.error` says why) when refused, not attached to a
+room, or given a bad id. They only work while your app is on screen, and
+must only ever run in response to a tap or click, never on load or a timer.
+
+Needs `robrix-navigation` (prompts on first use):
+
+- `"nav.user"` `{user_id}`: opens the profile pane for `@user:server` in
+  the attached room (pass `room_id` to use another room).
+- `"nav.thread"` `{event_id}`: opens the thread whose root is `event_id`.
+- `"nav.event"` `{event_id}`: scrolls the room to that message and
+  highlights it.
+- `"nav.room"` `{room_id}`: switches Robrix to that room (`!id:server`).
+- `"nav.space"` `{space_id}`: opens that space's lobby.
+- `"nav.screen"` `{screen}`: `"home"`, `"add_room"`, `"mini_apps"` or
+  `"settings"`.
+- `"nav.link"` `{url}`: a `matrix.to` / `matrix:` link, opened in-app
+  (user, room or event; aliases are refused).
+- `"nav.app"` `{app_id}`: opens another installed mini-app, in this
+  room's dock when attached.
+
+Needs `robrix-composer` (prompts on first use); nothing is ever sent, the
+user still presses Send:
+
+- `"composer.insert"` `{text}`: appends text to the room's draft and
+  focuses the message box.
+- `"composer.reply_to"` `{event_id}`: puts the message box into reply
+  mode for that message.
+
+```splash
+fn open_member(i){
+    if i >= items.len() { return nil }
+    host.request("nav.user", {user_id: items[i].user_id}, fn(r){
+        if !r.is_ok { ui.header.set_text(r.error) }
+    })
+}
+```
 
 ## Hard rules
 
