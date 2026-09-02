@@ -153,14 +153,6 @@ impl Widget for MiniAppTabScreen {
                             self.vacate(cx, false);
                         }
                     }
-                    Some(DockCmd::Restart(app_id)) => {
-                        if let Some(key) = self.key.clone()
-                            && key.0 == *app_id
-                        {
-                            self.view.mini_app_host_area(cx, ids!(host_area)).set_host(instances::host_of(&key));
-                            self.view.redraw(cx);
-                        }
-                    }
                     _ => {}
                 }
             }

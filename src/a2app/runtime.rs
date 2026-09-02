@@ -30,7 +30,7 @@ use crate::a2app::permission_prompt::{
     MiniAppPermissionPromptWidgetRefExt, PermissionPromptAction, PromptInfo,
 };
 use crate::a2app::dock::DockCmd;
-use crate::a2app::instances::{self, InstanceKey, MiniAppInstanceAction};
+use crate::a2app::instances::{self, MiniAppInstanceAction};
 use crate::a2app::room_watch::{self, A2AppRoomWatchEvent, RoomWatchKind};
 use a2app_core::layout::PaneLayout;
 use crate::app::{AppStateAction, SelectedRoom};
@@ -988,11 +988,10 @@ fn advance_generation(cx: &mut Cx, ui: &WidgetRef) {
                 state.registry_dirty = true;
             });
             publish_grants(cx);
-            // A rewritten app that's running restarts so the new source boots.
-            restart_running_app(cx, ui, &manifest);
+            let was_running = stop_for_restart(cx, ui, &manifest);
             enqueue_popup_notification(
-                format!("Mini-app \"{}\" is ready.", manifest.name),
-                PopupKind::Success, Some(4.0),
+                reopen_hint(format!("Mini-app \"{}\" is ready.", manifest.name), was_running),
+                PopupKind::Success, Some(5.0),
             );
             ui.redraw(cx);
         }
@@ -1244,9 +1243,9 @@ fn install_version(cx: &mut Cx, ui: &WidgetRef, updated: MiniAppManifest, done: 
     }
     with_a2app(|state| state.registry.insert(updated.clone()));
     publish_grants(cx);
-    restart_running_app(cx, ui, &updated);
+    let was_running = stop_for_restart(cx, ui, &updated);
     cx.action(A2AppRuntimeAction::VersionsChanged(updated.id.clone()));
-    enqueue_popup_notification(done, PopupKind::Success, Some(4.0));
+    enqueue_popup_notification(reopen_hint(done, was_running), PopupKind::Success, Some(5.0));
     ui.redraw(cx);
 }
 
@@ -1477,7 +1476,7 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
 }
 
 /// Pushes a changed grant into the app's live isolate: network changes
-/// restart the app (the net runtime is baked in at VM alloc); anything else
+/// stop the app (the net runtime is baked in at VM alloc); anything else
 /// just gets the new caps list plus an `on_permissions_changed` call.
 fn apply_permission_to_running(cx: &mut Cx, ui: &WidgetRef, app_id: &str, perm: Permission) {
     prune_hook_subs();
@@ -1487,7 +1486,12 @@ fn apply_permission_to_running(cx: &mut Cx, ui: &WidgetRef, app_id: &str, perm: 
     let grants = a2app_core::permissions::snapshot_grants_for(app_id);
     if perm == Permission::Network {
         let Some(Some(manifest)) = with_a2app(|state| state.registry.get(app_id).cloned()) else { return };
-        restart_running_app(cx, ui, &manifest);
+        if stop_for_restart(cx, ui, &manifest) {
+            enqueue_popup_notification(
+                format!("\"{}\" was stopped; open it again with its new network access.", manifest.name),
+                PopupKind::Info, Some(5.0),
+            );
+        }
     } else {
         instances::update_app_caps(cx, app_id, grants);
     }
@@ -1496,18 +1500,22 @@ fn apply_permission_to_running(cx: &mut Cx, ui: &WidgetRef, app_id: &str, perm: 
 /// Restarts a running app's isolate on whichever surface hosts it, so the
 /// current source and grants take effect (the net runtime especially, which
 /// is baked in at VM alloc).
-fn restart_running_app(cx: &mut Cx, ui: &WidgetRef, manifest: &MiniAppManifest) {
-    let grants = a2app_core::permissions::snapshot_grants_for(&manifest.id);
-    let keys: Vec<InstanceKey> = instances::keys_of_app(&manifest.id);
-    for key in &keys {
-        instances::restart(cx, key, manifest, &grants);
+/// Quits the app wherever it runs so its next open boots the new source or
+/// grants. Returns whether anything was running. Swapping the isolate under
+/// a live pane leaves the old frame on screen and a pane rebuilt straight
+/// after its teardown takes no input, so the user reopens it instead.
+fn stop_for_restart(cx: &mut Cx, ui: &WidgetRef, manifest: &MiniAppManifest) -> bool {
+    let was_running = instances::is_running(&manifest.id);
+    if was_running {
+        stop_app_everywhere(cx, ui, &manifest.id);
     }
     prune_hook_subs();
-    if keys.is_empty() {
-        return;
-    }
-    host_pane(cx, ui).refresh_host(cx);
-    cx.action(DockCmd::Restart(manifest.id.clone()));
+    was_running
+}
+
+/// Tacks the reopen hint onto a popup when the app had to be stopped.
+fn reopen_hint(done: String, was_running: bool) -> String {
+    if was_running { format!("{done} It was stopped; open it again to run this version.") } else { done }
 }
 
 fn expire_timed_grants(cx: &mut Cx, ui: &WidgetRef) {

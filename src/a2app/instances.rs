@@ -275,32 +275,6 @@ pub fn gc(cx: &mut Cx) {
     gc_dead_splash_isolates(cx);
 }
 
-/// Replaces the isolate with a fresh eval of `manifest` (new source or
-/// grants), keeping the layout and whoever is showing it.
-pub fn restart(cx: &mut Cx, key: &InstanceKey, manifest: &MiniAppManifest, grants: &[String]) -> Option<WidgetRef> {
-    let (layout, shown_by) = with_registry(|r| {
-        let inst = r.instances.remove(key)?;
-        Some((inst.layout, inst.shown_by))
-    })?;
-    gc(cx);
-    let (host, heap_key) = spawn(cx, manifest, grants, key)?;
-    if let Some(surface_uid) = shown_by {
-        cx.widget_tree_insert_child_deep(surface_uid, tree_name(key), host.clone());
-    }
-    with_registry(|r| {
-        r.instances.insert(key.clone(), MiniAppInstance {
-            host: host.clone(),
-            heap_key,
-            last_size: Vec2d::default(),
-            pending_resize: None,
-            layout,
-            shown_by,
-            anchored: true,
-        });
-    });
-    Some(host)
-}
-
 /// Queues an `on_app_resize` if the instance's content box changed.
 pub fn note_size(key: &InstanceKey, size: Vec2d) {
     if size.x < 1.0 || size.y < 1.0 {

@@ -248,8 +248,6 @@ pub enum DockCmd {
     Open { app_id: MiniAppId, room_id: OwnedRoomId },
     /// The registry dropped every instance of this app: let go of its chrome.
     QuitEverywhere(MiniAppId),
-    /// The registry restarted this app's isolates: re-fetch the hosts.
-    Restart(MiniAppId),
     #[default]
     None,
 }
@@ -345,14 +343,6 @@ impl Widget for MiniAppDock {
                     Some(DockCmd::QuitEverywhere(app_id)) => {
                         self.drop_chrome(cx, app_id);
                         instances::gc(cx);
-                        continue;
-                    }
-                    Some(DockCmd::Restart(app_id)) => {
-                        if let Some(key) = self.key_for(app_id) {
-                            self.pane_host_area(cx, app_id)
-                                .map(|area| area.set_host(instances::host_of(&key)));
-                            self.view.redraw(cx);
-                        }
                         continue;
                     }
                     Some(DockCmd::None) | None => {}

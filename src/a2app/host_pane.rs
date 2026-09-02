@@ -220,15 +220,6 @@ impl MiniAppHostPaneRef {
         }
     }
 
-    /// Re-points the area at the (possibly restarted) active host.
-    pub fn refresh_host(&self, cx: &mut Cx) {
-        let Some(mut inner) = self.borrow_mut() else { return };
-        if let Some(key) = &inner.active {
-            inner.view.mini_app_host_area(cx, ids!(host_area)).set_host(instances::host_of(key));
-            inner.view.redraw(cx);
-        }
-    }
-
     pub fn active(&self) -> Option<InstanceKey> {
         self.borrow().and_then(|inner| inner.active.clone())
     }

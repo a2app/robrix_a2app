@@ -636,7 +636,7 @@ script_mod! {
                     text_style: REGULAR_TEXT {font_size: 9.5},
                     color: (MESSAGE_TEXT_COLOR)
                 }
-                text: "This app is running: permission changes apply immediately, and changing network access restarts it."
+                text: "This app is running: permission changes apply immediately; changing network access stops it, so open it again afterwards."
             }
             no_perms_label := Label {
                 visible: false,
@@ -902,7 +902,7 @@ script_mod! {
                     text_style: REGULAR_TEXT {font_size: 10},
                     color: (MESSAGE_TEXT_COLOR)
                 }
-                text: "Saving keeps the previous version and restarts the app wherever it is running."
+                text: "Saving keeps the previous version. A running copy stops; open it again to run the new one."
             }
             source_editor := mod.widgets.LightCodeEditor {
                 editor +: {
