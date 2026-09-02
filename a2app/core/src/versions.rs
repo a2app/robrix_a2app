@@ -1,45 +1,105 @@
-//! Version history for modified mini-apps.
+//! Version history for mini-apps.
 //!
-//! Every time an app's script is rewritten (an AI modification, or restoring
-//! an older version), the *previous* state is snapshotted first, so the user
-//! can always get back to what they had. Snapshots live beside the app's code
-//! in its own directory:
+//! Every state an app has been in is a version, appended and never pruned.
+//! The working copy points at the one it currently IS (`current_version`),
+//! and each version points at the one it was edited from. They live beside
+//! the app's code:
 //!
 //! ```text
 //! apps/<id>/versions/20260724-153204.splash   the source as it was
-//! apps/<id>/versions/20260724-153204.json     when, why, and its name/icon/tint
+//! apps/<id>/versions/20260724-153204.json     when, why, and the manifest fields
 //! ```
 //!
-//! The stamp is local wall-clock time, so a version is identifiable straight
-//! from the filename (the user asked for date/timestamped versions). The
-//! `.splash` is written first and the `.json` last — listing keys off the
-//! `.json`, so a crash mid-snapshot leaves an ignored orphan rather than a
-//! version that claims to exist but has no code (same ordering rule as
-//! `save_user_app`).
+//! The stamp is local wall-clock time. The `.splash` is written first and the
+//! `.json` (which listing keys off) last, so a crash mid-write leaves an
+//! ignored orphan rather than a version with no code.
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::manifest::MiniAppManifest;
+use crate::manifest::{A2AppScope, MiniAppManifest};
 
-/// How many snapshots to keep per app; older ones are pruned oldest-first so
-/// a heavily-iterated app can't grow without bound.
-pub const MAX_VERSIONS: usize = 20;
+/// Where a version came from. `Legacy` is a pre-origin snapshot that only
+/// archived source and identity, not declarations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum VersionOrigin {
+    Ai,
+    Manual,
+    Import,
+    Stock,
+    #[default]
+    Legacy,
+}
 
-/// One entry in an app's history, newest first when listed.
+impl VersionOrigin {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ai => "AI",
+            Self::Manual => "Edited by hand",
+            Self::Import => "Imported",
+            Self::Stock => "Stock",
+            Self::Legacy => "Earlier",
+        }
+    }
+}
+
+/// One entry in an app's history: the whole manifest minus its source,
+/// which sits in the sibling `.splash`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppVersion {
     /// Filename key, e.g. `20260724-153204` (local time, sortable).
     pub stamp: String,
     /// Seconds since the unix epoch, for stable ordering across DST/tz moves.
     pub at_unix: u64,
-    /// Why this version was superseded — the request that changed it, or a
-    /// marker like "Original" / "Before restore".
+    /// The request that produced this version, or a marker like "Original".
     pub note: String,
-    /// The manifest fields at that point, so restoring brings back the app's
-    /// identity (a modification may have renamed or restyled it), not just code.
     pub name: String,
     pub icon: String,
     pub tint: u32,
+    #[serde(default)]
+    pub origin: VersionOrigin,
+    /// The stamp this version was edited from.
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub allow_net: bool,
+    #[serde(default)]
+    pub permissions: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub permission_reasons: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub shortcuts: Vec<String>,
+    #[serde(default)]
+    pub scope: A2AppScope,
+}
+
+impl AppVersion {
+    /// The working copy this version describes: `base` with this version's
+    /// identity, declarations, and `source`. Id, builtin, and scope stay base's.
+    pub fn apply_to(&self, base: &MiniAppManifest, source: String) -> MiniAppManifest {
+        let mut manifest = MiniAppManifest {
+            source,
+            name: self.name.clone(),
+            icon: self.icon.clone(),
+            tint: self.tint,
+            current_version: Some(self.stamp.clone()),
+            ..base.clone()
+        };
+        // A Legacy version never recorded declarations, so base keeps its own.
+        if self.origin != VersionOrigin::Legacy {
+            manifest.allow_net = self.allow_net;
+            manifest.permissions = self.permissions.clone();
+            manifest.permission_reasons = self.permission_reasons.clone();
+            manifest.capabilities = self.capabilities.clone();
+            manifest.shortcuts = self.shortcuts.clone();
+        }
+        crate::builtin::union_stock_declarations(&mut manifest);
+        manifest.normalize_permissions();
+        manifest
+    }
 }
 
 /// Y-M-D H:M:S in the local zone, from a unix timestamp + the local offset.
@@ -96,8 +156,16 @@ pub fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Builds the version record for `manifest` as it stands right now.
-pub fn version_of(manifest: &MiniAppManifest, note: &str, at_unix: u64, offset_secs: i64) -> AppVersion {
+/// The version record for `manifest` as it stands right now. `parent` is the
+/// stamp it was edited from.
+pub fn new_version(
+    manifest: &MiniAppManifest,
+    origin: VersionOrigin,
+    note: &str,
+    parent: Option<&str>,
+    at_unix: u64,
+    offset_secs: i64,
+) -> AppVersion {
     AppVersion {
         stamp: stamp_for(at_unix, offset_secs),
         at_unix,
@@ -105,7 +173,20 @@ pub fn version_of(manifest: &MiniAppManifest, note: &str, at_unix: u64, offset_s
         name: manifest.name.clone(),
         icon: manifest.icon.clone(),
         tint: manifest.tint,
+        origin,
+        parent: parent.map(str::to_string),
+        allow_net: manifest.allow_net,
+        permissions: manifest.permissions.clone(),
+        permission_reasons: manifest.permission_reasons.clone(),
+        capabilities: manifest.capabilities.clone(),
+        shortcuts: manifest.shortcuts.clone(),
+        scope: manifest.scope.clone(),
     }
+}
+
+/// Compat shim for callers not yet passing an origin or parent.
+pub fn version_of(manifest: &MiniAppManifest, note: &str, at_unix: u64, offset_secs: i64) -> AppVersion {
+    new_version(manifest, VersionOrigin::Legacy, note, None, at_unix, offset_secs)
 }
 
 #[cfg(test)]
@@ -131,5 +212,18 @@ mod tests {
         assert_eq!(earlier, "20260724-153204");
         assert!(later > earlier, "stamps must sort chronologically as strings");
         assert_eq!(label_for(1_784_907_124, 0), "Jul 24, 15:32");
+    }
+
+    /// A pre-origin json file has none of the new fields and must still parse
+    /// as a Legacy version.
+    #[test]
+    fn old_version_files_parse_as_legacy() {
+        let v: AppVersion = serde_json::from_str(
+            r#"{"stamp":"20260724-153204","at_unix":1784907124,"note":"x","name":"N","icon":"i","tint":7}"#,
+        )
+        .unwrap();
+        assert_eq!(v.origin, VersionOrigin::Legacy);
+        assert!(v.parent.is_none());
+        assert!(v.permissions.is_empty());
     }
 }

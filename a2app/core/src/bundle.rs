@@ -146,6 +146,7 @@ fn parse_bundle(text: &str) -> Result<MiniAppManifest, String> {
         }),
         shortcuts: file.shortcuts,
         scope: Default::default(),
+        current_version: None,
     };
     manifest.normalize_permissions();
     Ok(manifest)
@@ -189,6 +190,7 @@ fn parse_bare_source(source: &str) -> Result<MiniAppManifest, String> {
         widget: None,
         shortcuts: Vec::new(),
         scope: Default::default(),
+        current_version: None,
     };
     manifest.normalize_permissions();
     Ok(manifest)
@@ -340,12 +342,17 @@ mod tests {
             widget: None,
             shortcuts: vec!["Start".to_string()],
             scope: Default::default(),
+            current_version: Some("20260724-153204".to_string()),
         }
     }
 
     #[test]
     fn round_trips_a_bundle() {
-        let m = parse(&to_text(&sample())).unwrap();
+        let text = to_text(&sample());
+        // The version pointer is local history and never travels in a file.
+        assert!(!text.contains("current_version"));
+        let m = parse(&text).unwrap();
+        assert!(m.current_version.is_none());
         assert_eq!(m.id, "pomodoro");
         assert_eq!(m.name, "Pomodoro");
         assert_eq!(m.icon, "🍅");

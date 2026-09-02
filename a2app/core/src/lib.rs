@@ -20,6 +20,8 @@ pub mod layout;
 pub mod bundle;
 /// Version history snapshots for modified apps.
 pub mod versions;
+/// Line diffs between two versions of an app's source.
+pub mod diff;
 /// The permission model: declarations, grants, prompts, restrictions.
 pub mod permissions;
 /// The tagged catalog of every ability, layered over the permission groups.

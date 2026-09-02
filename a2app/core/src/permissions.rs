@@ -864,6 +864,7 @@ mod tests {
             widget: None,
             shortcuts: vec![],
             scope: Default::default(),
+            current_version: None,
         }
     }
 

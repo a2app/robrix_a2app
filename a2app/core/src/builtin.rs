@@ -34,24 +34,26 @@ fn app(id: &str, name: &str, icon: &str, tint: u32, source: String) -> MiniAppMa
         widget: None,
         shortcuts: Vec::new(),
         scope: Default::default(),
+        current_version: None,
     };
     manifest.normalize_permissions();
     manifest
 }
 
-/// What a built-in DECLARES, for anyone holding a saved copy of one.
-///
-/// A user-modified built-in is stored on disk and that copy shadows the code,
-/// so a copy saved before this build had a permission carries none — and a
-/// built-in's declarations cannot be edited, so there is no way back. The
-/// loader unions these in; see `load_user_app`.
-pub fn declared_permissions(id: &str) -> Vec<String> {
-    permissions_for(id)
-}
-
-/// The stock reasons for a built-in's declarations, same purpose.
-pub fn declared_reasons(id: &str) -> std::collections::BTreeMap<String, String> {
-    reasons_for(id)
+/// Unions a built-in's stock declarations back into a saved or restored copy,
+/// since a copy made before a declaration existed would otherwise lose it.
+pub fn union_stock_declarations(manifest: &mut MiniAppManifest) {
+    if !manifest.builtin {
+        return;
+    }
+    for p in permissions_for(&manifest.id) {
+        if !manifest.permissions.contains(&p) {
+            manifest.permissions.push(p);
+        }
+    }
+    for (perm, why) in reasons_for(&manifest.id) {
+        manifest.permission_reasons.entry(perm).or_insert(why);
+    }
 }
 
 /// What each stock app DECLARES. Declaring is not granting: runtime-tier

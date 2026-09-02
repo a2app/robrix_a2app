@@ -501,54 +501,10 @@ impl Generation {
                     widget: None,
                     shortcuts: Vec::new(),
                     scope: self.scope.clone(),
+                    current_version: None,
                 }
             }
-            GenMode::Refine { base } => MiniAppManifest {
-                id: base.id.clone(),
-                name: header.name.unwrap_or_else(|| base.name.clone()),
-                icon: header.icon.unwrap_or_else(|| base.icon.clone()),
-                tint: header.tint.unwrap_or(base.tint),
-                source,
-                allow_net: base.allow_net,
-                // Declarations survive a refine like the id does: the user
-                // granted against them, and a rewrite mustn't silently widen
-                // or narrow what the app may ask for.
-                // A refine may ADD a capability the rewrite needs (the user
-                // asked for the change, and it lands in App Info like any
-                // other); it never silently drops one they already granted
-                // against. Removing is App Info's "Remove capability".
-                permissions: union_permissions(&base.permissions, &header.permissions),
-                permission_reasons: {
-                    let mut r = base.permission_reasons.clone();
-                    r.extend(header.permission_reasons.clone());
-                    r
-                },
-                // A narrowed id lands only for a group new to the app or one
-                // already narrowed; narrowing a whole granted group would drop abilities.
-                capabilities: {
-                    let mut caps = base.capabilities.clone();
-                    for id in &header.capabilities {
-                        let Some(group) = a2app_core::capabilities::by_id(id).and_then(|c| c.group) else { continue };
-                        let new_group = !base.permissions.iter().any(|p| p == group.as_str());
-                        let narrowed = caps.iter().any(|c| {
-                            a2app_core::capabilities::by_id(c).is_some_and(|c| c.group == Some(group))
-                        });
-                        if (new_group || narrowed) && !caps.contains(id) {
-                            caps.push(id.clone());
-                        }
-                    }
-                    caps
-                },
-                // Keep the flag: a modified BUILT-IN stays built-in (its
-                // override just shadows the stock app). Dropping it here would
-                // make it uninstallable-then-resurrectable — and would strip
-                // the protection the menu relies on.
-                builtin: base.builtin,
-                // Robrix never runs widget scripts, so nothing to carry over.
-                widget: None,
-                shortcuts: Vec::new(),
-                scope: base.scope.clone(),
-            },
+            GenMode::Refine { base } => a2app_core::manifest::rewritten(base, source),
         };
         TurnVerdict::Installed(Box::new(manifest))
     }
@@ -765,17 +721,6 @@ fn extract_splash_block(reply: &str) -> Option<String> {
         return None;
     }
     Some(body.replace("\r\n", "\n"))
-}
-
-/// Base declarations plus anything the rewrite added, order preserved.
-fn union_permissions(base: &[String], added: &[String]) -> Vec<String> {
-    let mut out = base.to_vec();
-    for p in added {
-        if !out.contains(p) {
-            out.push(p.clone());
-        }
-    }
-    out
 }
 
 /// Cheap pre-parse ban list: constructs from OTHER dialects (octos-one's
@@ -1115,22 +1060,6 @@ mod tests {
         let h = parse_app_header("// name: Tip\nView{}");
         assert!(h.permissions.is_empty());
         assert!(h.permission_reasons.is_empty());
-    }
-
-    /// A refine may ADD what the rewrite needs but never drops a declaration
-    /// the user has already granted against.
-    #[test]
-    fn refine_unions_declarations() {
-        let base = vec!["network".to_string(), "location".to_string()];
-        let added = vec!["location".to_string(), "clipboard-write".to_string()];
-        assert_eq!(
-            union_permissions(&base, &added),
-            vec![
-                "network".to_string(),
-                "location".to_string(),
-                "clipboard-write".to_string()
-            ]
-        );
     }
 
     #[test]

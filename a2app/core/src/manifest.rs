@@ -49,6 +49,9 @@ pub struct MiniAppManifest {
     /// Where this app lives: the whole account, or attached to one room.
     #[serde(default)]
     pub scope: A2AppScope,
+    /// The stamp of the version in `versions/` this working copy currently IS.
+    #[serde(default)]
+    pub current_version: Option<String>,
 }
 
 impl MiniAppManifest {
@@ -134,6 +137,59 @@ impl MiniAppManifest {
         self.permission_reasons.remove(perm.as_str());
         self.normalize_permissions();
     }
+}
+
+/// `base` with a rewritten `source`: the header may restyle it, and declarations
+/// only ever grow, since the user granted against the existing ones.
+pub fn rewritten(base: &MiniAppManifest, source: String) -> MiniAppManifest {
+    let header = crate::header::parse_app_header(&source);
+    MiniAppManifest {
+        id: base.id.clone(),
+        name: header.name.unwrap_or_else(|| base.name.clone()),
+        icon: header.icon.unwrap_or_else(|| base.icon.clone()),
+        tint: header.tint.unwrap_or(base.tint),
+        source,
+        allow_net: base.allow_net,
+        permissions: union_permissions(&base.permissions, &header.permissions),
+        permission_reasons: {
+            let mut r = base.permission_reasons.clone();
+            r.extend(header.permission_reasons);
+            r
+        },
+        // A narrowed id lands only for a group new to the app or one already
+        // narrowed; narrowing a whole granted group would drop abilities.
+        capabilities: {
+            let mut caps = base.capabilities.clone();
+            for id in &header.capabilities {
+                let Some(group) = crate::capabilities::by_id(id).and_then(|c| c.group) else { continue };
+                let new_group = !base.permissions.iter().any(|p| p == group.as_str());
+                let narrowed = caps.iter().any(|c| {
+                    crate::capabilities::by_id(c).is_some_and(|c| c.group == Some(group))
+                });
+                if (new_group || narrowed) && !caps.contains(id) {
+                    caps.push(id.clone());
+                }
+            }
+            caps
+        },
+        builtin: base.builtin,
+        // Robrix never runs widget scripts, so nothing to carry over.
+        widget: None,
+        shortcuts: Vec::new(),
+        scope: base.scope.clone(),
+        current_version: base.current_version.clone(),
+    }
+}
+
+/// Base declarations plus anything the rewrite added, order preserved.
+pub fn union_permissions(base: &[String], added: &[String]) -> Vec<String> {
+    let mut out = base.to_vec();
+    for p in added {
+        if !out.contains(p) {
+            out.push(p.clone());
+        }
+    }
+    out
 }
 
 /// A widget provided by a mini-app: a separate, smaller Splash script.
@@ -234,5 +290,70 @@ pub fn split_instance_tag(tag: &str) -> (&str, Option<&str>) {
     match tag.split_once(INSTANCE_TAG_SEP) {
         Some((app, room)) => (app, Some(room)),
         None => (tag, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base() -> MiniAppManifest {
+        MiniAppManifest {
+            id: "sunrise".into(),
+            name: "Sunrise".into(),
+            icon: "🌅".into(),
+            tint: 0x112233,
+            source: "View{}".into(),
+            allow_net: true,
+            permissions: vec!["network".into(), "location".into()],
+            permission_reasons: [("location".to_string(), "Uses your city.".to_string())].into(),
+            capabilities: Vec::new(),
+            builtin: false,
+            widget: None,
+            shortcuts: vec!["Start".into()],
+            scope: A2AppScope::Room { room_id: "!r:example.org".into() },
+            current_version: Some("20260724-153204".into()),
+        }
+    }
+
+    /// A refine may ADD what the rewrite needs but never drops a declaration
+    /// the user has already granted against.
+    #[test]
+    fn refine_unions_declarations() {
+        let base = vec!["network".to_string(), "location".to_string()];
+        let added = vec!["location".to_string(), "clipboard-write".to_string()];
+        assert_eq!(
+            union_permissions(&base, &added),
+            vec![
+                "network".to_string(),
+                "location".to_string(),
+                "clipboard-write".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rewrite_keeps_identity_and_unions_the_headers_declarations() {
+        let source = "// name: Sunrise II\n\
+                      // permissions: clipboard-write\n\
+                      // why-clipboard-write: Copies the time.\n\
+                      View{}";
+        let m = rewritten(&base(), source.to_string());
+        assert_eq!(m.id, "sunrise");
+        assert_eq!(m.name, "Sunrise II");
+        // No icon/tint in the header, so base's stay.
+        assert_eq!(m.icon, "🌅");
+        assert_eq!(m.tint, 0x112233);
+        assert_eq!(m.source, source);
+        assert_eq!(
+            m.permissions,
+            vec!["network".to_string(), "location".to_string(), "clipboard-write".to_string()]
+        );
+        assert_eq!(m.permission_reasons.get("location").unwrap(), "Uses your city.");
+        assert_eq!(m.permission_reasons.get("clipboard-write").unwrap(), "Copies the time.");
+        assert_eq!(m.scope, A2AppScope::Room { room_id: "!r:example.org".into() });
+        assert_eq!(m.current_version.as_deref(), Some("20260724-153204"));
+        assert!(m.widget.is_none());
+        assert!(m.shortcuts.is_empty());
     }
 }
