@@ -7,6 +7,10 @@
 
 use makepad_widgets::*;
 
+/// AI agent sessions and the MCP tool bridge (per-AI-room sessions whose
+/// models call host tools like `launch_splash_app` / `send_message`).
+pub mod ai;
+
 /// The modal pane that hosts running mini-apps.
 pub mod host_pane;
 /// Shared host widgets used by every host surface.

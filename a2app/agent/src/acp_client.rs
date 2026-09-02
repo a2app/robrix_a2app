@@ -30,6 +30,8 @@ use std::sync::{Arc, Mutex};
 use makepad_widgets::SignalToUI;
 use serde_json::{json, Value};
 
+use crate::mcp::McpServerConfig;
+
 /// Cap on one incoming NDJSON line. A frame past this is not a protocol we
 /// can parse anyway (real replies are a few KB) — treat it as a dead agent
 /// rather than buffering without bound.
@@ -102,6 +104,11 @@ struct Shared {
     turn_text: Mutex<String>,
     /// Absolute workspace dir sent as the session's `cwd`.
     workspace: String,
+    /// The stdio MCP servers advertised in `session/new` (`mcpServers`), so
+    /// the agent's model can call Robrix's host tools. Usually empty — the
+    /// create-app pipeline needs no tools — and set only by a session host
+    /// that runs a tool server (see the app's `a2app::ai::session`).
+    mcp_servers: Vec<McpServerConfig>,
 }
 
 impl Shared {
@@ -142,6 +149,7 @@ impl AcpClient {
         workspace: &std::path::Path,
         env: &[(String, String)],
         extra_args: &[String],
+        mcp_servers: &[McpServerConfig],
     ) -> Result<Self, String> {
         let mut parts = cmd_line.split_whitespace();
         let bin = parts.next().ok_or("agent command is empty")?;
@@ -178,6 +186,7 @@ impl AcpClient {
             session_id: Mutex::new(None),
             turn_text: Mutex::new(String::new()),
             workspace: workspace.to_string_lossy().into_owned(),
+            mcp_servers: mcp_servers.to_vec(),
         });
 
         // Writer thread: sole owner of the child's stdin. Exits when every
@@ -345,6 +354,115 @@ impl Drop for AcpClient {
     }
 }
 
+/// The `session/new` params a session starts with: the workspace dir the
+/// agent works in, plus every stdio MCP server the agent may connect to.
+/// `mcpServers` is where a session's tool server reaches the model — Robrix
+/// registers itself (the `--mcp-bridge` relay child), so a model that decides
+/// to call a host tool spawns a relay whose stdio lands back in Robrix.
+fn session_new_params(workspace: &str, mcp_servers: &[McpServerConfig]) -> Value {
+    json!({
+        "cwd": workspace,
+        "mcpServers": mcp_servers.iter().map(|server| json!({
+            "name": server.name,
+            "command": server.command,
+            "args": server.args,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+#[cfg(test)]
+mod params_tests {
+    use super::*;
+
+    #[test]
+    fn session_new_advertises_no_servers_by_default() {
+        assert_eq!(
+            session_new_params("/tmp/work", &[]),
+            json!({"cwd": "/tmp/work", "mcpServers": []})
+        );
+    }
+
+    #[test]
+    fn session_new_carries_a_tool_servers_command_and_args() {
+        let servers = [McpServerConfig::new(
+            "robrix-tools",
+            "/usr/bin/robrix",
+            vec!["--mcp-bridge".to_string(), "--socket".to_string(), "/tmp/s/tools.sock".to_string()],
+        )];
+        let value = session_new_params("/tmp/work", &servers);
+        assert_eq!(value["cwd"], "/tmp/work");
+        let advertised = value["mcpServers"].as_array().unwrap();
+        assert_eq!(advertised.len(), 1);
+        assert_eq!(advertised[0]["name"], "robrix-tools");
+        assert_eq!(advertised[0]["command"], "/usr/bin/robrix");
+        assert_eq!(
+            advertised[0]["args"],
+            json!(["--mcp-bridge", "--socket", "/tmp/s/tools.sock"])
+        );
+    }
+
+    /// The whole point: the config a session host passes to `spawn` must
+    /// actually ride the wire to the agent in `session/new`. Here a canned
+    /// stdio agent records the request it receives; the app's own session
+    /// tests exercise a real agent shape end to end.
+    #[cfg(unix)]
+    #[test]
+    fn spawned_agent_sees_the_tool_servers_in_session_new() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join("acp_mcpservers_wire_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("record.sh");
+        let out = dir.join("session_new.json");
+        // Reads stdin; answers `initialize` (its id is always 1, the first
+        // request this client sends) so the reader thread proceeds to
+        // session/new, and copies that request to `$out` before replying.
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+out="{out}"
+while IFS= read -r line; do
+  case "$line" in
+    *initialize*) echo '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}' ;;
+    *session/new*) echo "$line" > "$out" ;;
+  esac
+done
+"#,
+                out = out.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let servers = [McpServerConfig::new(
+            "robrix-tools",
+            "/usr/bin/robrix",
+            vec!["--mcp-bridge".to_string(), "--socket".to_string(), "/tmp/s/tools.sock".to_string()],
+        )];
+        let mut client =
+            AcpClient::spawn(script.to_str().unwrap(), &dir, &[], &[], &servers).unwrap();
+        // Let the reader thread drive the handshake to session/new.
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if out.exists() {
+                break;
+            }
+            let _ = client.drain_events();
+        }
+        drop(client);
+
+        let line = std::fs::read_to_string(&out).expect("the agent recorded session/new");
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["params"]["cwd"], dir.to_string_lossy().into_owned());
+        let advertised = value["params"]["mcpServers"].as_array().unwrap();
+        assert_eq!(advertised.len(), 1);
+        assert_eq!(advertised[0]["name"], "robrix-tools");
+        assert_eq!(advertised[0]["command"], "/usr/bin/robrix");
+        assert_eq!(advertised[0]["args"][0], "--mcp-bridge");
+        assert_eq!(advertised[0]["args"][2], "/tmp/s/tools.sock");
+    }
+}
+
 /// Reads one `\n`-terminated line into `buf` (cleared first), lossily and
 /// capped at `MAX_LINE_BYTES`. Returns false on EOF/error with nothing read.
 /// A line hitting the cap is returned as-is (caller checks `buf.len()`).
@@ -392,7 +510,7 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let mut client = AcpClient::spawn(script.to_str().unwrap(), &dir, &[], &[]).unwrap();
+        let mut client = AcpClient::spawn(script.to_str().unwrap(), &dir, &[], &[], &[]).unwrap();
         // Let the flood arrive (the client refuses each request via the
         // writer channel; the child never drains stdin, so the pipe fills).
         std::thread::sleep(std::time::Duration::from_millis(600));
@@ -544,7 +662,7 @@ fn reduce_line(shared: &Shared, line: &str) -> Vec<AcpEvent> {
             shared.send_request(
                 Pending::NewSession,
                 "session/new",
-                json!({"cwd": shared.workspace, "mcpServers": []}),
+                session_new_params(&shared.workspace, &shared.mcp_servers),
             );
             vec![]
         }

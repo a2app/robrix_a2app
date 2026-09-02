@@ -46,6 +46,13 @@ use crate::shared::popup_list::{enqueue_popup_notification, PopupKind};
 use crate::sliding_sync::{submit_async_request, MatrixRequest};
 use crate::utils::RoomNameId;
 
+#[cfg(unix)]
+use crate::a2app::ai::session::{AiSession, PromptOutcome, SessionJob, SessionUpdate};
+#[cfg(unix)]
+use crate::sliding_sync::TimelineKind;
+#[cfg(unix)]
+use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+
 /// How long between saves of dirty permission/registry state.
 const PERSIST_THROTTLE: Duration = Duration::from_secs(2);
 /// How often expired timed grants are checked for.
@@ -111,6 +118,18 @@ pub struct A2AppState {
     watched_rooms: HashSet<OwnedRoomId>,
     /// Whether the worker runs the account watch for them too.
     account_watched: bool,
+    /// One long-lived AI agent session per room (the `/ai` chat). Sessions
+    /// bind their own tool server, spawn their agent, and answer tool calls
+    /// drained here each event pass.
+    #[cfg(unix)]
+    pub ai_sessions: HashMap<OwnedRoomId, AiSession>,
+    /// The room whose session launched the current generation, while one is
+    /// running for a `launch_splash_app` tool call. `None` when the current
+    /// (or last-finished) generation came from the Mini Apps screen instead —
+    /// that is what lets completion answer the waiting tool call and run the
+    /// finished app in the right room.
+    #[cfg(unix)]
+    pub ai_generation_room: Option<OwnedRoomId>,
     perms_dirty: bool,
     registry_dirty: bool,
     last_persist: Instant,
@@ -174,6 +193,10 @@ pub fn init() {
             hook_subs: HashMap::new(),
             watched_rooms: HashSet::new(),
             account_watched: false,
+            #[cfg(unix)]
+            ai_sessions: HashMap::new(),
+            #[cfg(unix)]
+            ai_generation_room: None,
             perms_dirty: false,
             registry_dirty: false,
             last_persist: Instant::now(),
@@ -226,6 +249,13 @@ pub enum A2AppOp {
     ShareToRoom { app_id: MiniAppId, room_id: OwnedRoomId },
     /// The user's "Mini-apps can write to rooms" switch.
     SetMatrixWrite(bool),
+    /// Talk to (creating it if needed) the room's AI agent session: the text
+    /// after `/ai` goes to the agent, and its replies land back in the room.
+    #[cfg(unix)]
+    AiCommand { request: String, room_id: OwnedRoomId },
+    /// Ends the room's AI agent session, killing its agent and socket.
+    #[cfg(unix)]
+    StopAiSession { room_id: OwnedRoomId },
 }
 
 
@@ -424,6 +454,11 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
         deliver_room_hooks(cx, ui, watch_events, account_events, host_events);
     }
 
+    // Sessions drain their tool calls and agent events every pass; a tool
+    // call may start a generation, which advance_generation below then
+    // drives to completion (and answers the waiting tool call).
+    #[cfg(unix)]
+    advance_ai_sessions(cx, ui);
     advance_generation(cx, ui);
     process_broker(cx, ui);
 
@@ -934,6 +969,11 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 state.generation = None;
                 state.console.status = String::from("Cancelled.");
             });
+            // A session's launch_splash_app tool call may be waiting on this
+            // generation; tell it the build was cancelled rather than leave
+            // its serve thread parked forever.
+            #[cfg(unix)]
+            resolve_session_generation(cx, ui, None, Err(String::from("The generation was cancelled.")));
             ui.redraw(cx);
         }
         A2AppOp::RetryGeneration => {
@@ -983,6 +1023,12 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 bundle_json: bundle::to_text(&manifest),
                 app_name: manifest.name.clone(),
             }));
+        }
+        #[cfg(unix)]
+        A2AppOp::AiCommand { request, room_id } => ai_command(cx, ui, request, room_id),
+        #[cfg(unix)]
+        A2AppOp::StopAiSession { room_id } => {
+            stop_ai_session(cx, ui, &room_id);
         }
     }
 }
@@ -1102,7 +1148,7 @@ fn start_generation(
 fn advance_generation(cx: &mut Cx, ui: &WidgetRef) {
     enum Done {
         Ready { manifest: Box<MiniAppManifest>, refine_of: Option<MiniAppId> },
-        Failed,
+        Failed(String),
     }
     let done = with_a2app(|state| {
         let generation = state.generation.as_mut()?;
@@ -1118,7 +1164,7 @@ fn advance_generation(cx: &mut Cx, ui: &WidgetRef) {
             GenOutcome::Failed(reason) => {
                 refresh_console(state, true);
                 state.console.status = format!("Failed: {reason}");
-                Some(Done::Failed)
+                Some(Done::Failed(reason))
             }
         }
     }).flatten();
@@ -1147,15 +1193,31 @@ fn advance_generation(cx: &mut Cx, ui: &WidgetRef) {
                 state.registry_dirty = true;
             });
             publish_grants(cx);
+            // If the old version was running, quit it so the next open boots
+            // the new source (the reopen_hint below says so); then, if a
+            // session's launch_splash_app tool call started this run, answer
+            // it with the installed summary and dock the app into the room it
+            // was asked for.
             let was_running = stop_for_restart(cx, ui, &manifest);
+            #[cfg(unix)]
+            {
+                let summary = serde_json::json!({
+                    "app_id": manifest.id,
+                    "name": manifest.name,
+                    "status": "installed_and_running",
+                });
+                resolve_session_generation(cx, ui, Some(&manifest), Ok(summary.to_string()));
+            }
             enqueue_popup_notification(
                 reopen_hint(format!("Mini-app \"{}\" is ready.", manifest.name), was_running),
                 PopupKind::Success, Some(5.0),
             );
             ui.redraw(cx);
         }
-        Some(Done::Failed) => {
+        Some(Done::Failed(reason)) => {
             with_a2app(|state| state.generation = None);
+            #[cfg(unix)]
+            resolve_session_generation(cx, ui, None, Err(format!("The build failed: {reason}")));
             ui.redraw(cx);
         }
         None => {}
@@ -1872,5 +1934,277 @@ pub fn run_miniapp_command(cx: &mut Cx, arg: &str, room_id: &OwnedRoomId) {
     cx.action(A2AppOp::StartGeneration {
         request: arg.to_string(),
         room_id: Some(room_id.clone()),
+    });
+}
+
+// -----------------------------------------------------------------------
+// AI agent sessions (/ai)
+// -----------------------------------------------------------------------
+
+/// The `/ai` slash command: sends everything after the command to the room's
+/// agent session, creating the session on first use. `/ai stop` (or `end`,
+/// `quit`) ends the room's session instead — the one way to reclaim the
+/// agent process without leaving the room forever.
+#[cfg(unix)]
+pub fn run_ai_command(cx: &mut Cx, arg: &str, room_id: &OwnedRoomId) {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        enqueue_popup_notification(
+            "/ai <request>: talk to this room's agent. It can also build Splash mini-apps \
+             (like /miniapp) while you chat. `/ai stop` ends the session.",
+            PopupKind::Info, Some(5.0),
+        );
+        return;
+    }
+    if matches!(arg.to_ascii_lowercase().as_str(), "stop" | "end" | "quit") {
+        cx.action(A2AppOp::StopAiSession {
+            room_id: room_id.clone(),
+        });
+        return;
+    }
+    cx.action(A2AppOp::AiCommand {
+        request: arg.to_string(),
+        room_id: room_id.clone(),
+    });
+}
+
+/// Handles `A2AppOp::AiCommand`: starts the room's agent session when it
+/// isn't running, then sends the request to it (queued while it's busy).
+#[cfg(unix)]
+fn ai_command(cx: &mut Cx, ui: &WidgetRef, request: String, room_id: OwnedRoomId) {
+    let prefs = with_a2app(|state| state.agent_prefs.clone())
+        .unwrap_or_else(a2app_agent::prefs::load_agent_prefs);
+    // A fresh session queues its first prompt until the handshake finishes,
+    // which is expected startup, not "you're behind" — only a prompt queued
+    // behind a pre-existing session's busy turn gets the popup below.
+    let mut fresh = false;
+    let outcome = with_a2app(|state| {
+        if !state.ai_sessions.contains_key(&room_id) {
+            match AiSession::start(room_id.clone(), prefs.clone()) {
+                Ok(session) => {
+                    fresh = true;
+                    state.ai_sessions.insert(room_id.clone(), session);
+                }
+                Err(e) => {
+                    enqueue_popup_notification(e, PopupKind::Error, Some(6.0));
+                    return None;
+                }
+            }
+        }
+        state
+            .ai_sessions
+            .get_mut(&room_id)
+            .map(|session| session.prompt(request))
+    }).flatten();
+    match outcome {
+        Some(PromptOutcome::Queued) if !fresh => {
+            enqueue_popup_notification(
+                "The agent in this room is still working; your request is queued.",
+                PopupKind::Info, Some(4.0),
+            );
+        }
+        Some(PromptOutcome::Dead) => {
+            enqueue_popup_notification(
+                "The agent in this room has stopped; try /ai stop, then /ai again.",
+                PopupKind::Warning, Some(6.0),
+            );
+        }
+        _ => {}
+    }
+    ui.redraw(cx);
+}
+
+/// Ends the room's agent session: the agent child is killed and its socket
+/// closed (both by [`AiSession`]'s drop). A generation the session started
+/// keeps running — the app it was building is still wanted — and its launch
+/// tool call is answered with an error by the drop.
+#[cfg(unix)]
+fn stop_ai_session(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
+    let removed = with_a2app(|state| state.ai_sessions.remove(room_id)).is_some();
+    if removed {
+        ui.redraw(cx);
+    }
+}
+
+/// Drives every room's AI session for one event pass. First the tool calls
+/// that arrived on the sessions' serve threads are executed (the real work:
+/// posting to the room, starting the generation pipeline); then each agent
+/// is advanced and its replies/errors/deaths are acted on.
+#[cfg(unix)]
+fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
+    // 1. Tool calls waiting on the UI thread. Executing one can touch
+    //    generation state (start_generation), so drain first, then act.
+    let jobs: Vec<(OwnedRoomId, Vec<SessionJob>)> = with_a2app(|state| {
+        state
+            .ai_sessions
+            .iter_mut()
+            .map(|(room_id, session)| (room_id.clone(), session.drain_jobs()))
+            .filter(|(_, jobs)| !jobs.is_empty())
+            .collect()
+    }).unwrap_or_default();
+    for (room_id, jobs) in jobs {
+        for job in jobs {
+            execute_session_job(cx, ui, &room_id, job);
+        }
+    }
+
+    // 2. Agent events since the last pass.
+    let mut to_post: Vec<(OwnedRoomId, String)> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    let mut deaths: Vec<(OwnedRoomId, String)> = Vec::new();
+    {
+        let updates: Vec<(OwnedRoomId, Vec<SessionUpdate>)> = with_a2app(|state| {
+            state
+                .ai_sessions
+                .iter_mut()
+                .map(|(room_id, session)| {
+                    let updates = session.advance();
+                    (room_id.clone(), updates)
+                })
+                .filter(|(_, updates)| !updates.is_empty())
+                .collect()
+        }).unwrap_or_default();
+        for (room_id, updates) in updates {
+            for update in updates {
+                match update {
+                    SessionUpdate::Ready => {}
+                    SessionUpdate::Reply { text } => to_post.push((room_id.clone(), text)),
+                    SessionUpdate::Error(msg) => errors.push(msg),
+                    SessionUpdate::Gone(msg) => deaths.push((room_id.clone(), msg)),
+                }
+            }
+        }
+    }
+    for (room_id, text) in to_post {
+        post_to_room(&room_id, text);
+    }
+    for msg in errors {
+        enqueue_popup_notification(format!("AI session error: {msg}"), PopupKind::Error, Some(6.0));
+    }
+    for (room_id, msg) in deaths {
+        enqueue_popup_notification(
+            format!("The AI agent in this room stopped: {msg}"),
+            PopupKind::Warning, Some(8.0),
+        );
+        with_a2app(|state| {
+            state.ai_sessions.remove(&room_id);
+        });
+        ui.redraw(cx);
+    }
+}
+
+/// Runs one tool call the room's agent made, on the UI thread, and sends the
+/// result back to the serve thread that called the tool.
+#[cfg(unix)]
+fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: SessionJob) {
+    match job {
+        SessionJob::SendRoomMessage { text, answer } => {
+            post_to_room(room_id, text);
+            let _ = answer.send(Ok(String::from("Posted to the room.")));
+        }
+        SessionJob::LaunchSplashApp { description, answer } => {
+            // Refuse up front when the pipeline cannot start, exactly as the
+            // Mini Apps screen would; a tool call must not hang on a build
+            // that can never begin.
+            let refused = a2app_agent::blocker()
+                .map(|b| b.headline())
+                .or_else(|| {
+                    with_a2app(|state| {
+                        state.generation.as_ref().map(|_| {
+                            "Another mini-app is already being built in Robrix; \
+                             try again in a moment."
+                                .to_string()
+                        })
+                    }).flatten()
+                });
+            if let Some(reason) = refused {
+                let _ = answer.send(Err(reason));
+                return;
+            }
+            // Record where completion must answer, then start the same
+            // generation machinery the Mini Apps screen uses. A tool call
+            // may not overlap an already-running build, so refuse early is
+            // the only concurrency policy (one global pipeline today).
+            let mut answer = Some(answer);
+            with_a2app(|state| {
+                state.ai_generation_room = Some(room_id.clone());
+                if let Some(session) = state.ai_sessions.get_mut(room_id) {
+                    if let Some(answer) = answer.take() {
+                        session.set_generation_answer(answer);
+                    }
+                }
+            });
+            start_generation(cx, ui, description, Some(room_id.clone()), None);
+            // Generation::start can still fail after the blockers passed (an
+            // agent that dies instantly); it reports that by leaving no
+            // generation running. Unblock the tool call rather than strand it.
+            if !with_a2app(|state| state.generation.is_some()).unwrap_or(false) {
+                let taken = with_a2app(|state| {
+                    state.ai_generation_room = None;
+                    state
+                        .ai_sessions
+                        .get_mut(room_id)
+                        .and_then(|session| session.take_generation_answer())
+                }).flatten();
+                if let Some(answer) = taken.or_else(|| answer.take()) {
+                    let _ = answer.send(Err(String::from(
+                        "The build could not start; check the Mini Apps screen for the reason.",
+                    )));
+                }
+            }
+        }
+    }
+}
+
+/// Resolves a finished (or cancelled) generation back to the session that
+/// launched it through `launch_splash_app`: answers the waiting tool call
+/// with the outcome, and when an app was actually built and the session is
+/// still alive, docks it into the room's own pane (the tool's "then runs
+/// it"). A generation the user started from the Mini Apps screen resolves to
+/// nothing here — `ai_generation_room` is unset for those.
+#[cfg(unix)]
+fn resolve_session_generation(
+    cx: &mut Cx,
+    ui: &WidgetRef,
+    manifest: Option<&MiniAppManifest>,
+    outcome: Result<String, String>,
+) {
+    let room_id = with_a2app(|state| state.ai_generation_room.take()).flatten();
+    let Some(room_id) = room_id else { return };
+    let answered = with_a2app(|state| {
+        state
+            .ai_sessions
+            .get_mut(&room_id)
+            .and_then(|session| session.take_generation_answer())
+            .map(|answer| {
+                let _ = answer.send(outcome.clone());
+            })
+            .is_some()
+    }).unwrap_or(false);
+    if answered {
+        if outcome.is_ok() {
+            if let Some(manifest) = manifest {
+                cx.action(A2AppOp::OpenApp {
+                    app_id: manifest.id.clone(),
+                    room_id: Some(room_id),
+                    in_room_pane: true,
+                });
+            }
+        }
+        ui.redraw(cx);
+    }
+}
+
+/// Posts `text` into a room's main timeline as the logged-in user — the same
+/// path the room's own input bar uses. This is how an agent's replies (and
+/// its `send_message` tool calls) reach the room.
+#[cfg(unix)]
+fn post_to_room(room_id: &OwnedRoomId, text: String) {
+    submit_async_request(MatrixRequest::SendMessage {
+        timeline_kind: TimelineKind::MainRoom { room_id: room_id.clone() },
+        message: RoomMessageEventContent::text_markdown(text),
+        replied_to: None,
+        #[cfg(feature = "tsp")]
+        sign_with_tsp: false,
     });
 }
