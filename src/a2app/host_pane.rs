@@ -135,11 +135,9 @@ impl Widget for MiniAppHostPane {
         }
 
         // Backgrounded apps still receive network responses so in-flight
-        // requests complete; everything else goes to the active host only.
+        // requests complete; input reaches the active host via its area.
         if let Event::NetworkResponses(_) = event {
             self.host_set.handle_network_responses(cx, event, scope);
-        } else if let Some(active) = self.active.clone() {
-            self.host_set.handle_event_for(cx, event, scope, &active);
         }
     }
 

@@ -62,6 +62,13 @@ pub struct MiniAppHostArea {
 impl Widget for MiniAppHostArea {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
+        // Input goes to the host drawn here; network responses reach every
+        // host through the set, so backgrounded requests still complete.
+        if let Some(host) = self.host.clone()
+            && !matches!(event, Event::NetworkResponses(_))
+        {
+            host.handle_event(cx, event, scope);
+        }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -239,13 +246,6 @@ impl SplashHostSet {
 
     pub fn has_pending_resize(&self) -> bool {
         !self.pending_resize_notify.is_empty()
-    }
-
-    /// Forwards an event to the given app's host only.
-    pub fn handle_event_for(&self, cx: &mut Cx, event: &Event, scope: &mut Scope, app_id: &str) {
-        if let Some(host) = self.hosts.get(app_id).cloned() {
-            host.handle_event(cx, event, scope);
-        }
     }
 
     /// Forwards network responses to ALL hosts, so backgrounded apps'
