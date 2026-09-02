@@ -168,7 +168,11 @@ impl Capability {
     /// The compact tag line shown under a capability row; risk is only
     /// called out when it is worth a second look.
     pub fn tags(&self) -> String {
-        let mut tags = format!("{} · {} · {}", self.access.as_str(), self.direction.as_str(), self.scope.as_str());
+        let mut tags = format!("{} · {}", self.access.as_str(), self.scope.as_str());
+        if self.direction == Direction::Incoming {
+            tags.push_str(" · ");
+            tags.push_str(self.direction.as_str());
+        }
         if self.risk >= Risk::High {
             tags.push_str(" · ");
             tags.push_str(self.risk.as_str());

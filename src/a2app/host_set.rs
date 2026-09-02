@@ -10,6 +10,22 @@ script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
 
+    // An icon-only button with no fill until hovered.
+    mod.widgets.MiniAppGhostButton = RobrixIconButton {
+        width: 32, height: 32
+        padding: 0, margin: 0, spacing: 0
+        align: Align{x: 0.5, y: 0.5}
+        icon_walk: Walk{width: 16, height: 16, margin: 0}
+        draw_icon.color: #666
+        draw_bg +: {
+            border_size: 0
+            border_radius: 6.0
+            color: #0000
+            color_hover: #00000012
+            color_down: #00000022
+        }
+    }
+
     // The slot a pane's ACTIVE host is drawn into. A custom widget so the
     // host is drawn inside this turtle's own coordinate space; abs-positioned
     // drawing from the pane level lands wrong inside a translated Modal.

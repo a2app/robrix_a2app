@@ -32,22 +32,34 @@ script_mod! {
 
         width: Fill, height: Fit
         flow: Right
-        spacing: 10
+        spacing: 12
         align: Align{y: 0.5}
-        padding: Inset{top: 8, bottom: 8, left: 10, right: 10}
+        padding: Inset{top: 8, bottom: 8, left: 10, right: 8}
 
         show_bg: true
         draw_bg +: {
             color: (COLOR_PRIMARY)
-            border_radius: 4.0
+            border_radius: 8.0
+            border_size: 1.0
+            border_color: (COLOR_DIVIDER)
         }
 
-        row_glyph := Label {
-            width: 32, height: Fit
-            padding: 0, margin: 0
-            draw_text +: {
-                text_style: TITLE_TEXT {font_size: 18},
-                color: #000
+        // The app's glyph on a tile in its own tint.
+        row_tile := RoundedView {
+            width: 44, height: 44
+            align: Align{x: 0.5, y: 0.5}
+            show_bg: true
+            draw_bg +: {
+                color: (COLOR_BG_PREVIEW)
+                border_radius: 10.0
+            }
+            row_glyph := Label {
+                width: Fit, height: Fit
+                padding: 0, margin: 0
+                draw_text +: {
+                    text_style: TITLE_TEXT {font_size: 20},
+                    color: #000
+                }
             }
         }
         View {
@@ -72,15 +84,12 @@ script_mod! {
             }
         }
         row_open_button := RobrixIconButton {
-            padding: 8,
+            padding: Inset{top: 7, bottom: 7, left: 14, right: 14},
             icon_walk: Walk{width: 0, height: 0, margin: 0}
             text: "Open"
         }
-        row_info_button := RobrixNeutralIconButton {
-            padding: 8,
+        row_info_button := mod.widgets.MiniAppGhostButton {
             draw_icon +: { svg: (ICON_INFO) }
-            icon_walk: Walk{width: 14, height: 14, margin: 0}
-            text: ""
         }
     }
 
@@ -124,7 +133,7 @@ script_mod! {
             }
         }
         perm_state := Label {
-            width: 90, height: Fit
+            width: Fit, height: Fit
             padding: 0, margin: 0
             align: Align{x: 1.0}
             draw_text +: {
@@ -172,7 +181,7 @@ script_mod! {
             }
         }
         cap_state := Label {
-            width: 110, height: Fit
+            width: Fit, height: Fit
             padding: 0, margin: 0
             align: Align{x: 1.0}
             draw_text +: {
@@ -192,13 +201,13 @@ script_mod! {
         ..mod.widgets.RoundedView
 
         width: Fill, height: Fit
-        flow: Right
+        flow: Flow.Right{wrap: true}
         spacing: 8
         align: Align{y: 0.5}
         padding: Inset{top: 4, bottom: 4, left: 10, right: 10}
 
         View {
-            width: Fill, height: Fit
+            width: Fill{min: 180}, height: Fit
             flow: Down
             spacing: 1
             version_label := Label {
@@ -243,6 +252,16 @@ script_mod! {
             padding: 6,
             icon_walk: Walk{width: 0, height: 0, margin: 0}
             text: "View"
+        }
+    }
+
+    // The word at the start of a manage-card row.
+    mod.widgets.MiniAppGroupLabel = Label {
+        width: 56, height: Fit
+        padding: 0, margin: 0
+        draw_text +: {
+            text_style: theme.font_bold {font_size: 10},
+            color: (MESSAGE_TEXT_COLOR)
         }
     }
 
@@ -304,55 +323,78 @@ script_mod! {
                     text_style: REGULAR_TEXT {font_size: 10.5},
                     color: (MESSAGE_TEXT_COLOR)
                 }
-                text: "Sandboxed Splash mini-apps that run inside Robrix. Each app runs in its own isolate with no access to anything you haven't granted it."
+                text: "Small sandboxed apps that run inside Robrix. Each one gets only what you grant it."
             }
-            matrix_write_toggle := ToggleFlat {
-                margin: Inset{left: 0.5, top: 4, bottom: 2}
-                padding: Inset{left: 15}
-                active: false
-                draw_bg +: { size: 21 }
-                text: "Mini-apps may write to rooms"
-                draw_text +: { text_style: theme.font_bold {font_size: 11} }
-            }
-            Label {
+            View {
                 width: Fill, height: Fit
-                flow: Flow.Right{wrap: true}
-                draw_text +: {
-                    text_style: REGULAR_TEXT {font_size: 10},
-                    color: (MESSAGE_TEXT_COLOR)
+                flow: Down
+                spacing: 2
+                matrix_write_toggle := ToggleFlat {
+                    margin: Inset{left: 0.5, top: 4}
+                    padding: Inset{left: 15}
+                    active: false
+                    draw_bg +: { size: 21 }
+                    text: "Mini-apps may write to rooms"
+                    draw_text +: { text_style: theme.font_bold {font_size: 11} }
                 }
-                text: "Off: no mini-app can send messages or events to your rooms, and /miniapp share is blocked. On: an app still has to ask you before it sends anything, and it sends as you."
+                Label {
+                    width: Fill, height: Fit
+                    flow: Flow.Right{wrap: true}
+                    margin: Inset{left: 42}
+                    draw_text +: {
+                        text_style: REGULAR_TEXT {font_size: 9.5},
+                        color: (MESSAGE_TEXT_COLOR)
+                    }
+                    text: "Off: nothing gets sent to your rooms. On: an app still asks you first, and sends as you."
+                }
             }
 
             create_section := RoundedView {
                 width: Fill, height: Fit
                 flow: Down
-                spacing: 8
-                padding: 12
+                spacing: 10
+                padding: 14
                 show_bg: true,
                 draw_bg +: {
-                    color: #F6F8F9
-                    border_radius: 4.0
-                }
-
-                SubsectionLabel { text: "Create or modify a mini-app with AI" }
-
-                prompt_input := RobrixTextInput {
-                    width: Fill, height: Fit
-                    empty_text: "Describe the app you want, or a change to one you have…"
+                    color: #F4F6F9
+                    border_radius: 8.0
                 }
 
                 View {
                     width: Fill, height: Fit
                     flow: Right
+                    spacing: 6
+                    align: Align{y: 0.5}
+                    Icon {
+                        icon_walk: Walk{width: 16, height: 16, margin: 0}
+                        draw_icon +: { svg: (ICON_SPARKLE), color: (COLOR_ROBRIX_PURPLE) }
+                    }
+                    SubsectionLabel { text: "Create with AI", margin: 0 }
+                }
+
+                prompt_input := RobrixTextInput {
+                    width: Fill, height: Fit
+                    padding: 12
+                    empty_text: "Describe an app, or a change to one you have"
+                    draw_text +: { text_style: REGULAR_TEXT {font_size: 11.5} }
+                }
+
+                View {
+                    width: Fill, height: Fit
+                    flow: Flow.Right{wrap: true}
                     spacing: 8
                     align: Align{y: 0.5}
 
                     generate_button := RobrixPositiveIconButton {
-                        padding: 10,
+                        padding: Inset{top: 9, bottom: 9, left: 14, right: 16},
                         draw_icon +: { svg: (ICON_SPARKLE) }
                         icon_walk: Walk{width: 16, height: 16, margin: Inset{right: 2}}
                         text: "Generate"
+                    }
+                    providers_button := RobrixNeutralIconButton {
+                        padding: Inset{top: 9, bottom: 9, left: 12, right: 12},
+                        icon_walk: Walk{width: 0, height: 0, margin: 0}
+                        text: "AI Providers…"
                     }
                     scope_label := Label {
                         width: Fit, height: Fit
@@ -363,11 +405,28 @@ script_mod! {
                         }
                         text: "New apps are available account-wide."
                     }
-                    Filler {}
-                    providers_button := RobrixNeutralIconButton {
-                        padding: 8,
+                }
+
+                // Says which installed app the text will rewrite, before
+                // Generate is pressed, with a way to force a new app.
+                intent_hint := View {
+                    visible: false,
+                    width: Fill, height: Fit
+                    flow: Flow.Right{wrap: true}
+                    spacing: 8
+                    align: Align{y: 0.5}
+                    intent_label := Label {
+                        width: Fit, height: Fit
+                        padding: 0, margin: 0
+                        draw_text +: {
+                            text_style: theme.font_bold {font_size: 10},
+                            color: (COLOR_ACTIVE_PRIMARY)
+                        }
+                    }
+                    intent_switch_button := RobrixNeutralIconButton {
+                        padding: 6,
                         icon_walk: Walk{width: 0, height: 0, margin: 0}
-                        text: "AI Providers…"
+                        text: "Create a new app instead"
                     }
                 }
 
@@ -539,82 +598,120 @@ script_mod! {
                 }
             }
 
+            // What you do with the app most: run it here or in a room.
             View {
                 width: Fill, height: Fit
                 flow: Flow.Right{wrap: true}
                 spacing: 8
+                align: Align{y: 0.5}
 
                 info_open_button := RobrixIconButton {
-                    padding: 10,
+                    padding: Inset{top: 9, bottom: 9, left: 16, right: 16},
                     icon_walk: Walk{width: 0, height: 0, margin: 0}
                     text: "Open"
                 }
-                info_source_button := RobrixNeutralIconButton {
-                    padding: 10,
-                    draw_icon +: { svg: (ICON_VIEW_SOURCE) }
-                    icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
-                    text: "View Source"
-                }
-                info_edit_button := RobrixNeutralIconButton {
-                    padding: 10,
-                    draw_icon +: { svg: (ICON_EDIT) }
-                    icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
-                    text: "Edit Source"
-                }
-                info_export_button := RobrixNeutralIconButton {
-                    padding: 10,
-                    draw_icon +: { svg: (ICON_COPY) }
-                    icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
-                    text: "Export"
-                }
-                info_share_button := RobrixNeutralIconButton {
-                    padding: 10,
-                    draw_icon +: { svg: (ICON_SHARE) }
-                    icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
-                    text: "Share…"
-                }
-                info_send_button := RobrixNeutralIconButton {
-                    padding: 10,
-                    draw_icon +: { svg: (ICON_SEND) }
-                    icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
-                    text: "Send to room…"
-                }
                 info_open_room_button := RobrixNeutralIconButton {
-                    padding: 10,
-                    draw_icon +: { svg: (ICON_JUMP) }
+                    padding: Inset{top: 9, bottom: 9, left: 12, right: 12},
+                    draw_icon +: { svg: (ICON_JOIN_ROOM) }
                     icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
                     text: "Open in room…"
                 }
-                info_modify_button := RobrixNeutralIconButton {
-                    padding: 10,
-                    draw_icon +: { svg: (ICON_EDIT) }
-                    icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
-                    text: "Modify with AI"
-                }
                 info_force_stop_button := RobrixNegativeIconButton {
                     visible: false,
-                    padding: 10,
+                    padding: Inset{top: 9, bottom: 9, left: 12, right: 12},
                     draw_icon +: { svg: (ICON_FORBIDDEN) }
                     icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
                     text: "Force Stop"
                 }
-                info_clear_data_button := RobrixNegativeIconButton {
-                    padding: 10,
-                    icon_walk: Walk{width: 0, height: 0, margin: 0}
-                    text: "Clear Data"
+            }
+
+            // Everything else, grouped so a narrow window wraps each group
+            // on its own line instead of scattering twelve buttons.
+            manage_card := RoundedView {
+                width: Fill, height: Fit
+                flow: Down
+                spacing: 8
+                padding: 12
+                show_bg: true,
+                draw_bg +: {
+                    color: #F4F6F9
+                    border_radius: 8.0
                 }
-                info_uninstall_button := RobrixNegativeIconButton {
-                    padding: 10,
-                    draw_icon +: { svg: (ICON_TRASH) }
-                    icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
-                    text: "Uninstall"
+
+                View {
+                    width: Fill, height: Fit
+                    flow: Flow.Right{wrap: true}
+                    spacing: 8
+                    align: Align{y: 0.5}
+                    mod.widgets.MiniAppGroupLabel { text: "Source" }
+                    info_source_button := RobrixNeutralIconButton {
+                        padding: 8,
+                        draw_icon +: { svg: (ICON_VIEW_SOURCE) }
+                        icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                        text: "View"
+                    }
+                    info_edit_button := RobrixNeutralIconButton {
+                        padding: 8,
+                        draw_icon +: { svg: (ICON_EDIT) }
+                        icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                        text: "Edit"
+                    }
+                    info_modify_button := RobrixNeutralIconButton {
+                        padding: 8,
+                        draw_icon +: { svg: (ICON_SPARKLE) }
+                        icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                        text: "Modify with AI"
+                    }
                 }
-                info_reset_button := RobrixNegativeIconButton {
-                    visible: false,
-                    padding: 10,
-                    draw_icon +: { svg: (ICON_ROTATE_CW) }
-                    icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
-                    text: "Reset to stock"
+                View {
+                    width: Fill, height: Fit
+                    flow: Flow.Right{wrap: true}
+                    spacing: 8
+                    align: Align{y: 0.5}
+                    mod.widgets.MiniAppGroupLabel { text: "Share" }
+                    info_export_button := RobrixNeutralIconButton {
+                        padding: 8,
+                        draw_icon +: { svg: (ICON_COPY) }
+                        icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                        text: "Export"
+                    }
+                    info_share_button := RobrixNeutralIconButton {
+                        padding: 8,
+                        draw_icon +: { svg: (ICON_SHARE) }
+                        icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                        text: "Share…"
+                    }
+                    info_send_button := RobrixNeutralIconButton {
+                        padding: 8,
+                        draw_icon +: { svg: (ICON_SEND) }
+                        icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                        text: "Send to room…"
+                    }
+                }
+                View {
+                    width: Fill, height: Fit
+                    flow: Flow.Right{wrap: true}
+                    spacing: 8
+                    align: Align{y: 0.5}
+                    mod.widgets.MiniAppGroupLabel { text: "Data" }
+                    info_clear_data_button := RobrixNegativeIconButton {
+                        padding: 8,
+                        icon_walk: Walk{width: 0, height: 0, margin: 0}
+                        text: "Clear Data"
+                    }
+                    info_reset_button := RobrixNegativeIconButton {
+                        visible: false,
+                        padding: 8,
+                        draw_icon +: { svg: (ICON_ROTATE_CW) }
+                        icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                        text: "Reset to stock"
+                    }
+                    info_uninstall_button := RobrixNegativeIconButton {
+                        padding: 8,
+                        draw_icon +: { svg: (ICON_TRASH) }
+                        icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                        text: "Uninstall"
+                    }
                 }
             }
 
@@ -956,11 +1053,16 @@ impl Widget for MiniAppRow {
 }
 
 impl MiniAppRow {
-    fn populate(&mut self, cx: &mut Cx, app_id: &str, icon: &str, name: &str, detail: &str) {
+    fn populate(&mut self, cx: &mut Cx, app_id: &str, icon: &str, name: &str, detail: &str, tint: u32) {
         self.app_id = app_id.to_string();
         self.view.label(cx, ids!(row_glyph)).set_text(cx, icon);
         self.view.label(cx, ids!(row_name)).set_text(cx, name);
         self.view.label(cx, ids!(row_detail)).set_text(cx, detail);
+        // The tile is the app's tint at a pastel strength.
+        let channel = |shift: u32| ((tint >> shift) & 0xff) as f32 / 255.0;
+        let tile = vec4(channel(16), channel(8), channel(0), 0.16);
+        let mut row_tile = self.view.view(cx, ids!(row_tile));
+        script_apply_eval!(cx, row_tile, { draw_bg +: { color: #(tile) } });
     }
 }
 
@@ -1677,7 +1779,7 @@ impl MiniAppsScreen {
             Pane::List => {
                 // (id, icon, name, detail) only; cloning whole manifests here
                 // would copy every app's source per draw.
-                let rows: Vec<(MiniAppId, String, String, String)> = with_a2app(|state| {
+                let rows: Vec<(MiniAppId, String, String, String, u32)> = with_a2app(|state| {
                     state.registry.iter().map(|m| {
                         let running = state.is_running(&m.id);
                         let mut detail = match (&m.scope, m.builtin) {
@@ -1690,14 +1792,14 @@ impl MiniAppsScreen {
                         } else if running {
                             detail.push_str(" · running");
                         }
-                        (m.id.clone(), m.icon.clone(), m.name.clone(), detail)
+                        (m.id.clone(), m.icon.clone(), m.name.clone(), detail, m.tint)
                     }).collect()
                 }).unwrap_or_default();
-                for (app_id, icon, name, detail) in &rows {
+                for (app_id, icon, name, detail, tint) in &rows {
                     let item_live_id = LiveId::from_str(app_id);
                     let Some(item) = list.item(cx, item_live_id, id!(mini_app_row)) else { continue };
                     if let Some(mut row) = item.borrow_mut::<MiniAppRow>() {
-                        row.populate(cx, app_id, icon, name, detail);
+                        row.populate(cx, app_id, icon, name, detail, *tint);
                     }
                     item.draw_all(cx, &mut Scope::empty());
                 }
