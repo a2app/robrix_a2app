@@ -305,9 +305,11 @@ and scope (this room, account, device, app-local). Available today:
 | files | `device.files.pick` (read), `device.files.save` (write) | device |
 | auth | `device.auth.check` | read · device |
 | matrix-room-info | `matrix.room.info.read` | read · this room |
-| matrix-room-read | `matrix.room.messages.read`, `matrix.room.members.read`, `matrix.room.pins.read`, `matrix.room.threads.read` | read · this room |
+| matrix-room-read | `matrix.room.messages.read`, `matrix.room.members.read`, `matrix.room.pins.read`, `matrix.room.threads.read`, `matrix.room.messages.search` | read · this room |
 | matrix-room-send | `matrix.room.message.send` | write · this room |
 | matrix-profile | `matrix.profile.read` | read · account |
+| matrix-rooms-list | `matrix.rooms.list` | read · many rooms |
+| matrix-rooms-read | `matrix.rooms.messages.search` | read · many rooms · critical |
 | robrix-navigation | `host.nav.user`, `host.nav.thread`, `host.nav.event`, `host.nav.room`, `host.nav.space`, `host.nav.screen`, `host.nav.link`, `host.nav.app` | act · app→Robrix · this room / account |
 | robrix-composer | `host.composer.insert`, `host.composer.reply_to` | act · app→Robrix · this room |
 | matrix-room-watch | `on_room_message`, `on_room_members_changed` (Robrix→app hooks) | read · this room |
@@ -471,12 +473,25 @@ burning a permission.
   -> `{count, members: [{name, user_id, power}]}` — who is in the room.
 - `"matrix.pinned_events"` (needs `matrix-room-read`): `{}` ->
   `{pinned: [{sender, sender_id, event_id, body}]}`, the room's pinned messages.
+- `"matrix.rooms_list"` (needs `matrix-rooms-list`, works without a room): `{}` ->
+  `{rooms: [{room_id, name, is_direct, is_space, member_count, is_encrypted}]}`.
+- `"matrix.search_room"` (needs `matrix-room-read`, attached room):
+  `{query, limit: N, server: bool}` ->
+  `{results: [{room_id, room_name, event_id, sender, sender_id, body, ts, source}],
+  searched_rooms, server_used}`, newest first. Matches the text case-insensitively
+  against what Robrix holds locally (encrypted rooms included); `server: true`
+  also asks the homeserver, which only sees unencrypted rooms and may be slow.
+  Search on Return or a tap, never per keystroke.
+- `"matrix.search_rooms"` (needs `matrix-rooms-read`, prompts, works without a
+  room): the same with `room_ids: [...]` to pick rooms, else every joined room.
+  Pass a result's `room_id` along with `event_id` to `nav.event` to jump there.
 - `"matrix.room_threads"` (needs `matrix-room-read`): `{limit: N}` (max 50)
   -> `{threads: [{sender, sender_id, event_id, body}]}`, thread root
   messages, newest first; `event_id` is the thread root.
 
 `matrix-room-info` and `matrix-profile` start allowed but revocable;
-`matrix-room-read` and `matrix-room-send` prompt the user on first use.
+`matrix-room-read`, `matrix-room-send`, `matrix-rooms-list` and
+`matrix-rooms-read` prompt the user on first use.
 Sending messages as the user is a serious capability: send ONLY what the
 user explicitly asked to send, one message per user action, never on a
 timer, and show what was sent. The user also has a global "Mini-apps may

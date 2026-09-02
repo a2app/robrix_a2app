@@ -248,6 +248,7 @@ pub const CATALOG: &[Capability] = &[
     cap!("matrix.room.members.read", "Member list", "Joined members with power level; store first, /members sync only when sparse.", Read, Outgoing, Room, Some(P::MatrixRoomRead), Available, Medium, ["matrix.room_members"]),
     cap!("matrix.room.pins.read", "Pinned messages", "The attached room's pinned messages.", Read, Outgoing, Room, Some(P::MatrixRoomRead), Available, Medium, ["matrix.pinned_events"]),
     cap!("matrix.room.threads.read", "Thread list", "Thread root messages, newest first.", Read, Outgoing, Room, Some(P::MatrixRoomRead), Available, High, ["matrix.room_threads"]),
+    cap!("matrix.room.messages.search", "Search this room", "Find messages in the attached room by text: what Robrix holds locally first (decrypted content included), plus the homeserver when asked and the room is unencrypted.", Read, Outgoing, Room, Some(P::MatrixRoomRead), Available, High, ["matrix.search_room"]),
     cap!("matrix.room.thread.read", "Thread replies", "Replies inside one thread, oldest first.", Read, Outgoing, Room, Some(P::MatrixRoomRead), PlannedMachinery, High, []),
     cap!("matrix.room.messages.paginate", "Older history", "One page further back than the recent window.", Read, Outgoing, Room, Some(P::MatrixRoomRead), PlannedMachinery, High, []),
     cap!("matrix.room.event.read", "One message", "A single event by id with sender, body, timestamp, reactions and edit state.", Read, Outgoing, Room, Some(P::MatrixRoomRead), PlannedMachinery, High, []),
@@ -350,7 +351,7 @@ pub const CATALOG: &[Capability] = &[
     cap!("matrix.media.upload", "Upload media", "Upload bytes to the media repo and get an mxc uri without sending an event.", Write, Outgoing, Account, Some(P::MatrixMedia), PlannedMachinery, Medium, []),
     cap!("on_upload_progress", "Upload progress hook", "Be told how an upload it started is progressing, and cancel it.", Read, Incoming, Room, Some(P::MatrixMedia), PlannedMachinery, Low, []),
     // ----- matrix-rooms-list -----
-    cap!("matrix.rooms.list", "Your rooms", "Joined rooms and DMs with name, unread, mentions, tags, is_direct, is_space; no message previews; optionally limited to a space.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsList), PlannedMachinery, High, []),
+    cap!("matrix.rooms.list", "Your rooms", "Joined rooms and DMs with name, unread, mentions, tags, is_direct, is_space; no message previews; optionally limited to a space.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsList), Available, High, ["matrix.rooms_list"]),
     cap!("matrix.rooms.search", "Find rooms", "Your rooms and spaces whose name or alias match a query.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsList), PlannedMachinery, Medium, []),
     cap!("matrix.rooms.invites.list", "Pending invites", "Rooms you are invited to, with inviter.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsList), PlannedMachinery, Medium, []),
     cap!("matrix.rooms.preview.read", "Preview a room", "Public details of any room by id or alias, joined or not.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsList), PlannedMachinery, Low, []),
@@ -360,6 +361,7 @@ pub const CATALOG: &[Capability] = &[
     // ----- matrix-rooms-read -----
     cap!("matrix.rooms.info.read", "Details of another room", "Room details for a room in this app's allowlist.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsRead), PlannedMachinery, Medium, []),
     cap!("matrix.rooms.messages.read", "Messages in another room", "Recent messages in a room in this app's allowlist.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsRead), PlannedMachinery, Critical, []),
+    cap!("matrix.rooms.messages.search", "Search across rooms", "Find messages by text in every joined room or a picked set; local content first, the homeserver for unencrypted rooms when asked. Reads far beyond the attached room.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsRead), Available, Critical, ["matrix.search_rooms"]),
     cap!("on_rooms_message", "New messages in picked rooms", "New messages in allowlisted rooms; only rooms whose timeline Robrix has built deliver, so a firehose over every room is not offered.", Read, Incoming, MultiRoom, Some(P::MatrixRoomsRead), PlannedNewPlumbing, Critical, []),
     // ----- matrix-rooms-send -----
     cap!("matrix.rooms.message.send", "Send to another room", "Post text to an allowlisted room as you; room name and text shown on every prompt.", Write, Outgoing, MultiRoom, Some(P::MatrixRoomsSend), PlannedMachinery, Critical, []),

@@ -1,0 +1,228 @@
+// name: Search
+// icon: 🔍
+// tint: #0F88FE
+// permissions: matrix-room-read, matrix-rooms-list, matrix-rooms-read, robrix-navigation
+// why-matrix-room-read: Searches the messages in this room.
+// why-matrix-rooms-list: Lists your rooms so you can pick which to search.
+// why-matrix-rooms-read: Searches messages across the rooms you pick.
+// why-robrix-navigation: Jumps to a result you tap.
+
+let mode = "room"
+let attached = false
+let server = false
+let rooms = []
+let picked = []
+let results = []
+
+fn mode_label(m, text){
+    if mode == m { return "● " + text }
+    return "○ " + text
+}
+
+fn sync_mode(){
+    ui.mode_room.set_text(mode_label("room", "This room"))
+    ui.mode_all.set_text(mode_label("all", "All rooms"))
+    ui.mode_pick.set_text(mode_label("pick", "Pick rooms"))
+    ui.mode_room.set_visible(attached)
+    ui.room_list_wrap.set_visible(mode == "pick")
+    if mode == "pick" && rooms.len() == 0 { load_rooms() }
+}
+
+fn set_mode(m){
+    mode = m
+    sync_mode()
+}
+
+fn load_rooms(){
+    host.request("matrix.rooms_list", nil, fn(r){
+        if r.is_ok {
+            rooms = []
+            for it in r.data.rooms {
+                if !it.is_space { rooms.push(it) }
+            }
+        } else {
+            rooms = []
+            ui.status.set_text(r.error)
+        }
+        ui.room_list.render()
+    })
+}
+
+fn is_picked(id){
+    for p in picked {
+        if p == id { return true }
+    }
+    return false
+}
+
+fn mode_label_room(it){
+    let mark = "○ "
+    if is_picked(it.room_id) { mark = "● " }
+    let lock = ""
+    if it.is_encrypted { lock = "  🔒" }
+    return mark + it.name + lock
+}
+
+fn toggle_pick(i){
+    if i >= rooms.len() { return nil }
+    let id = rooms[i].room_id
+    if is_picked(id) {
+        picked.retain(|p| p != id)
+    } else {
+        picked.push(id)
+    }
+    ui.room_list.render()
+}
+
+fn plural(n, word){
+    if "" + n == "1" { return word }
+    return word + "s"
+}
+
+fn on_results(r){
+    if r.is_ok {
+        results = r.data.results
+        let note = "" + results.len() + " " + plural(results.len(), "result") + " in " + r.data.searched_rooms + " " + plural(r.data.searched_rooms, "room")
+        if r.data.server_used { note = note + " · server included" }
+        ui.status.set_text(note)
+    } else {
+        results = []
+        ui.status.set_text(r.error)
+    }
+    ui.result_list.render()
+}
+
+fn run_search(t){
+    let query = ("" + t).trim()
+    if query == "" {
+        ui.status.set_text("Type something to search for.")
+        return nil
+    }
+    ui.status.set_text("Searching…")
+    if mode == "room" {
+        host.request("matrix.search_room", {query: query, limit: 40, server: server}, on_results)
+        return nil
+    }
+    if mode == "pick" {
+        if picked.len() == 0 {
+            ui.status.set_text("Pick at least one room first.")
+            return nil
+        }
+        host.request("matrix.search_rooms", {query: query, room_ids: picked, limit: 40, server: server}, on_results)
+        return nil
+    }
+    host.request("matrix.search_rooms", {query: query, limit: 40, server: server}, on_results)
+}
+
+fn open_result(i){
+    if i >= results.len() { return nil }
+    host.request("nav.event", {event_id: results[i].event_id, room_id: results[i].room_id}, fn(r){
+        if !r.is_ok { ui.status.set_text(r.error) }
+    })
+}
+
+fn on_permissions_changed(caps){
+    sync_mode()
+}
+
+let _boot = start_timeout(0.05, || {
+    host.request("env", nil, fn(r){
+        attached = r.is_ok && r.data.room_attached
+        if !attached { mode = "all" }
+        sync_mode()
+    })
+})
+
+View{
+    width: Fill height: Fit flow: Down align: Align{x: 0.5}
+    col := View{
+        width: Fill{max: 520.0} height: Fit flow: Down spacing: 10 padding: 14
+        Label{
+            text: "Search" padding: 0 margin: 0
+            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }
+        }
+        View{
+            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+            q := TextInput{
+                width: Fill height: Fit empty_text: "Search messages, then press Return"
+                on_return: |t| run_search(t)
+            }
+            Button{
+                text: "Search" on_click: || run_search(ui.q.text())
+                draw_text +: { color: #x1C274C }
+            }
+        }
+        View{
+            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 6
+            mode_room := Button{ text: "● This room" on_click: || set_mode("room") draw_text +: { color: #x1C274C } }
+            mode_all := Button{ text: "○ All rooms" on_click: || set_mode("all") draw_text +: { color: #x1C274C } }
+            mode_pick := Button{ text: "○ Pick rooms" on_click: || set_mode("pick") draw_text +: { color: #x1C274C } }
+        }
+        Toggle{
+            text: "Also ask the server (unencrypted rooms only)"
+            on_click: |on| { server = on }
+            draw_text +: { color: #x333333 }
+        }
+        room_list_wrap := View{
+            width: Fill height: Fit flow: Down spacing: 4 visible: false
+            Label{
+                text: "Tap rooms to include them" padding: 0 margin: 0
+                draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+            }
+            room_list := ScrollYView{
+                width: Fill height: 160 flow: Down spacing: 3
+                on_item_tap: |i| toggle_pick(i)
+                on_render: || {
+                    if rooms.len() == 0 {
+                        Label{ text: "Loading rooms…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 } }
+                    } else {
+                        for it in rooms {
+                            RoundedView{
+                                width: Fill height: Fit flow: Right spacing: 6 padding: 8
+                                show_bg: true
+                                draw_bg +: { color: #xF0F5FF border_radius: 6.0 }
+                                Label{
+                                    text: mode_label_room(it) width: Fill padding: 0 margin: 0
+                                    draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        status := Label{
+            text: "Search messages Robrix has, across one room or many." width: Fill padding: 0 margin: 0
+            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
+        }
+        result_list := ScrollYView{
+            width: Fill height: 300 flow: Down spacing: 5
+            on_item_tap: |i| open_result(i)
+            on_render: || {
+                if results.len() == 0 {
+                    Label{
+                        text: "No results yet. Tap a result to jump to that message."
+                        width: Fill padding: 0 margin: 0
+                        draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                    }
+                } else {
+                    for it in results {
+                        RoundedView{
+                            width: Fill height: Fit flow: Down spacing: 2 padding: 10
+                            show_bg: true
+                            draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                            Label{
+                                text: it.sender + " · " + it.room_name padding: 0 margin: 0 width: Fill
+                                draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+                            }
+                            Label{
+                                text: it.body width: Fill padding: 0 margin: 0
+                                draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -57,7 +57,10 @@ fn cost_of(service: &str) -> f64 {
         "location.get" | "clipboard.read" | "permissions.request" => 5.0,
         // Round-trip through the matrix worker, and sending speaks as the user.
         "matrix.read_messages" | "matrix.send_message" | "matrix.room_members"
-        | "matrix.pinned_events" | "matrix.room_threads" => 5.0,
+        | "matrix.pinned_events" | "matrix.room_threads" | "matrix.rooms_list"
+        | "matrix.search_room" => 5.0,
+        // Fans out over every room and may hit the network.
+        "matrix.search_rooms" => 8.0,
         // Put something on screen the user has to deal with.
         "files.pick" | "files.save" | "auth.check" | "share" | "url.open" => 8.0,
         // Steer Robrix itself: a pane, a room switch, the composer.

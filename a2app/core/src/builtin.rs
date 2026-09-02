@@ -65,6 +65,7 @@ fn permissions_for(id: &str) -> Vec<String> {
         "roll-call" => &["matrix-profile", "matrix-room-send"],
         "room-info" => &["matrix-room-info"],
         "room-members" | "room-threads" => &["matrix-room-read", "robrix-navigation", "matrix-room-watch"],
+        "search" => &["matrix-room-read", "matrix-rooms-list", "matrix-rooms-read", "robrix-navigation"],
         "room-pins" => &["matrix-room-read", "robrix-navigation", "matrix-room-info"],
         _ => &[],
     };
@@ -105,9 +106,20 @@ fn reasons_for(id: &str) -> std::collections::BTreeMap<String, String> {
             ("robrix-navigation", "Opens a thread you tap."),
             ("matrix-room-watch", "Refreshes as new messages arrive."),
         ],
+        "search" => &[
+            ("matrix-room-read", "Searches the messages in this room."),
+            ("matrix-rooms-list", "Lists your rooms so you can pick which to search."),
+            ("matrix-rooms-read", "Searches messages across the rooms you pick."),
+            ("robrix-navigation", "Jumps to a result you tap."),
+        ],
         _ => &[],
     };
     r.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+}
+
+/// The stock manifest of one built-in.
+pub fn stock(id: &str) -> Option<MiniAppManifest> {
+    builtin_apps().into_iter().find(|m| m.id == id)
 }
 
 /// The pre-installed apps: always present, can't be uninstalled.
@@ -119,6 +131,7 @@ pub fn builtin_apps() -> Vec<MiniAppManifest> {
         app("room-members", "Room Members", "👥", 0x6C8E3A, app_source!("room_members.splash")),
         app("room-pins", "Pinned Events", "📌", 0xC0533E, app_source!("room_pins.splash")),
         app("room-threads", "Room Threads", "🧵", 0x8A5CA8, app_source!("room_threads.splash")),
+        app("search", "Search", "🔍", 0x0F88FE, app_source!("search.splash")),
     ]
 }
 
@@ -131,7 +144,7 @@ mod tests {
     #[test]
     fn catalog_matches_the_splash_headers() {
         let apps = builtin_apps();
-        assert_eq!(apps.len(), 6);
+        assert_eq!(apps.len(), 7);
         for m in &apps {
             assert!(m.builtin);
             assert!(m.widget.is_none());
