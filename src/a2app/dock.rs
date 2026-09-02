@@ -295,6 +295,9 @@ struct Instance {
     /// Width last given to the header's button box, so a reflow only
     /// rewrites the walk (and redraws) when it actually changes.
     header_width: f64,
+    /// The widest title line laid out unwrapped: the room the buttons
+    /// must leave before they may take another column.
+    title_width: f64,
     side: PaneSide,
     minimized: bool,
     chip: WidgetRef,
@@ -514,6 +517,16 @@ impl MiniAppDock {
         pane.label(cx, ids!(pane_glyph)).set_text(cx, &manifest.icon);
         pane.label(cx, ids!(pane_title)).set_text(cx, &manifest.name);
         pane.label(cx, ids!(pane_room)).set_text(cx, &self.room_name);
+        let title_width = [ids!(pane_title), ids!(pane_room)].into_iter()
+            .map(|id| {
+                let label = pane.label(cx, id);
+                let text = label.text();
+                label.borrow().map_or(0.0, |label| {
+                    label.draw_text.layout(cx, 0.0, 0.0, None, false, Align::default(), &text)
+                        .size_in_lpxs.width as f64
+                })
+            })
+            .fold(0.0, f64::max);
         // Breaking out into a dock tab only exists in the desktop layout.
         let is_desktop = crate::home::home_screen::effective_is_desktop(cx);
         pane.button(cx, ids!(pane_tab_button)).set_visible(cx, is_desktop);
@@ -528,6 +541,7 @@ impl MiniAppDock {
         self.instances.insert(app_id.clone(), Instance {
             pane,
             header_width: 0.0,
+            title_width,
             side,
             minimized: false,
             chip,
@@ -577,8 +591,8 @@ impl MiniAppDock {
         self.view.redraw(cx);
     }
 
-    /// One row of buttons while the title has width, otherwise as many rows
-    /// as the pane's height allows so the title gets the width back.
+    /// The buttons stack in one column and take more columns, leftwards,
+    /// only while the title still fits unwrapped beside them.
     fn reflow_headers(&mut self, cx: &mut Cx) {
         const BUTTONS: &[&[LiveId]] = &[
             ids!(pane_edge_button),
@@ -599,7 +613,7 @@ impl MiniAppDock {
             if header_width <= 0.0 {
                 continue;
             }
-            let for_title_and_buttons = header_width - glyph_width - HEADER_SPACING * 2.0;
+            let for_buttons = header_width - glyph_width - HEADER_SPACING * 2.0 - inst.title_width;
             let widths: Vec<f64> = BUTTONS
                 .iter()
                 .map(|id| inst.pane.button(cx, id).area().rect(cx).size.x)
@@ -613,25 +627,10 @@ impl MiniAppDock {
             let box_width = |cols: usize| {
                 widest * cols as f64 + SPACING * (cols - 1) as f64
             };
-            // Widest arrangement the title can still afford, 4 down to 1.
-            let mut cols = (1..=count)
+            let cols = (1..=count)
                 .rev()
-                .find(|c| for_title_and_buttons - box_width(*c) >= HEADER_TITLE_MIN)
+                .find(|c| box_width(*c) <= for_buttons)
                 .unwrap_or(1);
-
-            // Off a single row, keep trading columns for rows until the
-            // stack would eat too much of a short pane.
-            let button_height = inst.pane.button(cx, ids!(pane_close_button)).area().rect(cx).size.y;
-            let pane_height = inst.pane.area().rect(cx).size.y;
-            if cols < count && button_height > 0.0 && pane_height > 0.0 {
-                let stack_height = |cols: usize| {
-                    let rows = count.div_ceil(cols) as f64;
-                    button_height * rows + SPACING * (rows - 1.0)
-                };
-                while cols > 1 && stack_height(cols - 1) <= pane_height * HEADER_STACK_SHARE {
-                    cols -= 1;
-                }
-            }
             let target = box_width(cols);
             if (target - inst.header_width).abs() > 0.5 {
                 updates.push((app_id.clone(), target));
@@ -759,12 +758,6 @@ const GRAB_IDLE: Vec4 = Vec4 { x: 0.62, y: 0.62, z: 0.62, w: 1.0 };
 const GRAB_HOVER: Vec4 = Vec4 { x: 0.42, y: 0.42, z: 0.42, w: 1.0 };
 const GRAB_DRAG: Vec4 = Vec4 { x: 0.30, y: 0.30, z: 0.30, w: 1.0 };
 
-/// What the title needs before the header stops giving room to the buttons
-/// and wraps them into a second line instead.
-const HEADER_TITLE_MIN: f64 = 104.0;
-/// How much of a pane's height the stacked header buttons may take before
-/// they stop growing; the rest belongs to the app.
-const HEADER_STACK_SHARE: f64 = 0.5;
 /// The header row's own spacing, between the glyph, the title and the buttons.
 const HEADER_SPACING: f64 = 4.0;
 /// `PaneFrame`'s border width; the grip centres on the middle of that line.
