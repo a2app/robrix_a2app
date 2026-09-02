@@ -5868,11 +5868,6 @@ impl SmallStateEventContent for RoomMembershipChange {
     }
 }
 
-/// Creates, populates, and adds a SmallStateEvent liveview widget to the given `PortalList`
-/// with the given `item_id`.
-///
-/// The content of the returned widget is populated with data from the
-/// given room membership change and its parent `EventTimelineItem`.
 /// Routes a custom message-like event: `rs.robius.a2app` mini-app shares get
 /// their own fixed-height card; everything else stays a small state event.
 fn populate_other_message_like(
@@ -5916,6 +5911,11 @@ fn populate_other_message_like(
     )
 }
 
+/// Creates, populates, and adds a SmallStateEvent liveview widget to the given `PortalList`
+/// with the given `item_id`.
+///
+/// The content of the returned widget is populated with data from the
+/// given room membership change and its parent `EventTimelineItem`.
 fn populate_small_state_event(
     cx: &mut Cx,
     list: &mut PortalList,

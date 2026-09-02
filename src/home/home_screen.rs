@@ -563,12 +563,7 @@ impl Widget for HomeScreen {
                         self.switch_to_tab(cx, app_state, SelectedTab::AddRoom);
                     }
                     Some(NavigationBarAction::GoToMiniApps) => {
-                        if !matches!(app_state.selected_tab, SelectedTab::MiniApps) {
-                            self.previous_selection = std::mem::replace(&mut app_state.selected_tab, SelectedTab::MiniApps);
-                            cx.action(NavigationBarAction::TabSelected(app_state.selected_tab.clone()));
-                            self.update_active_page_from_selection(cx, app_state);
-                            self.view.redraw(cx);
-                        }
+                        self.switch_to_tab(cx, app_state, SelectedTab::MiniApps);
                     }
                     Some(NavigationBarAction::GoToSpace { space_name_id }) => {
                         self.switch_to_tab(cx, app_state, SelectedTab::Space { space_name_id: space_name_id.clone() });

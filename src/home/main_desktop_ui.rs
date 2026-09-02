@@ -511,14 +511,6 @@ impl MainDesktopUI {
         }
     }
 
-    /// Lazily initializes a tab's widget if it hasn't been initialized yet.
-    ///
-    /// This is called when a tab becomes visible (e.g., via user click or sidebar selection)
-    /// that was restored from saved state but whose widget content was deferred
-    /// to avoid blocking the UI thread.
-    ///
-    /// It is safe to call this on an already-initialized tab, as the underlying
-    /// `set_displayed_*` methods short-circuit when the content is already set.
     #[cfg(feature = "a2app")]
     fn mini_app_tab_id(app_id: &str, room_id: &matrix_sdk::ruma::RoomId) -> LiveId {
         LiveId::from_str(&format!("miniapp:{app_id}:{room_id}"))
@@ -564,6 +556,14 @@ impl MainDesktopUI {
         }
     }
 
+    /// Lazily initializes a tab's widget if it hasn't been initialized yet.
+    ///
+    /// This is called when a tab becomes visible (e.g., via user click or sidebar selection)
+    /// that was restored from saved state but whose widget content was deferred
+    /// to avoid blocking the UI thread.
+    ///
+    /// It is safe to call this on an already-initialized tab, as the underlying
+    /// `set_displayed_*` methods short-circuit when the content is already set.
     fn init_tab_if_needed(&self, cx: &mut Cx, tab_id: LiveId) {
         if !self.open_rooms.contains_key(&tab_id) {
             return;
