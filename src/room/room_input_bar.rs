@@ -24,7 +24,7 @@ use matrix_sdk::room::reply::{EnforceThread, Reply};
 use ruma::events::room::message::AddMentions;
 use matrix_sdk_ui::timeline::{EmbeddedEvent, EventTimelineItem, TimelineEventItemId};
 use ruma::{events::room::message::{LocationMessageEventContent, MessageType, ReplyWithinThread, RoomMessageEventContent}, OwnedEventId, OwnedRoomId};
-use crate::{home::{editing_pane::{EditingPaneState, EditingPaneWidgetExt, EditingPaneWidgetRefExt}, location_preview::{LocationPreviewWidgetExt, LocationPreviewWidgetRefExt}, room_screen::{MessageAction, populate_preview_of_timeline_item}, rooms_list::RoomsListRef, tombstone_footer::{SuccessorRoomDetails, TombstoneFooterWidgetExt}, upload_progress::UploadProgressViewWidgetRefExt}, join_leave_room_modal::{JoinLeaveModalKind, JoinLeaveRoomModalAction}, location::init_location_subscriber, profile::user_profile::{ShowUserProfileAction, UserProfile, UserProfileAndRoomId}, room::BasicRoomDetails, settings::app_preferences::{AppPreferencesAction, AppPreferencesGlobal}, shared::{avatar::{AvatarState, AvatarWidgetRefExt}, file_upload_modal::{AttachmentUpload, FileUploadAttemptId, PendingUpload, handle_picked_file, handle_picker_launch_errors}, html_or_plaintext::HtmlOrPlaintextWidgetRefExt, mentionable_text_input::{MentionableTextInputWidgetExt, MentionableTextInputWidgetRefExt, MentionableTextInputState}, popup_list::{PopupKind, enqueue_popup_notification}, room_input_popup_menu::RoomInputPopupMenuAction, slash_commands::{SlashCommandAction, SlashCommandOutcome}, styles::*}, sliding_sync::{MatrixRequest, TimelineKind, UserPowerLevels, submit_async_request}, utils};
+use crate::{home::{editing_pane::{EditingPaneState, EditingPaneWidgetExt, EditingPaneWidgetRefExt}, location_preview::{LocationPreviewWidgetExt, LocationPreviewWidgetRefExt}, room_screen::{MessageAction, populate_preview_of_timeline_item}, rooms_list::RoomsListRef, tombstone_footer::{SuccessorRoomDetails, TombstoneFooterWidgetExt}, upload_progress::UploadProgressViewWidgetRefExt}, join_leave_room_modal::{JoinLeaveModalKind, JoinLeaveRoomModalAction}, location::init_location_subscriber, profile::user_profile::{ShowUserProfileAction, UserProfile, UserProfileAndRoomId}, room::BasicRoomDetails, settings::app_preferences::{AppPreferencesAction, AppPreferencesGlobal}, shared::{avatar::{AvatarState, AvatarWidgetRefExt}, file_upload_modal::{AttachmentUpload, FileUploadAttemptId, FileUploadMetadata, PendingUpload, handle_picked_file, handle_picker_launch_errors, stage_local_file}, html_or_plaintext::HtmlOrPlaintextWidgetRefExt, mentionable_text_input::{MentionableTextInputWidgetExt, MentionableTextInputWidgetRefExt, MentionableTextInputState}, popup_list::{PopupKind, enqueue_popup_notification}, room_input_popup_menu::RoomInputPopupMenuAction, slash_commands::{SlashCommandAction, SlashCommandOutcome}, styles::*}, sliding_sync::{MatrixRequest, TimelineKind, UserPowerLevels, submit_async_request}, utils};
 use crate::room::reply_preview::CollapsiblePreviewWidgetRefExt;
 
 script_mod! {
@@ -771,21 +771,28 @@ impl RoomInputBar {
         self.view.check_box(cx, ids!(tsp_sign_checkbox)).active(cx)
     }
 
+    /// True (with a warning shown) while an upload is still in flight.
+    fn upload_in_progress(&self, cx: &mut Cx) -> bool {
+        let busy = self.view.view(cx, ids!(upload_progress_view)).visible();
+        if busy {
+            enqueue_popup_notification(
+                "Finish or cancel the current upload before starting another one.",
+                PopupKind::Warning,
+                Some(7.0),
+            );
+        }
+        busy
+    }
+
     /// Shows the native file picker dialog to select a file to be uploaded.
     fn open_file_picker(
         &mut self,
         cx: &mut Cx,
         timeline_kind: TimelineKind,
     ) {
-        if self.view.view(cx, ids!(upload_progress_view)).visible() {
-            enqueue_popup_notification(
-                "Finish or cancel the current upload before starting another one.",
-                PopupKind::Warning,
-                Some(7.0),
-            );
+        if self.upload_in_progress(cx) {
             return;
         }
-
         let on_picked = self.upload_picker_callback(cx, timeline_kind);
         handle_picker_launch_errors(
             robius_file_picker::FileDialog::new().pick_file(on_picked)
@@ -798,15 +805,9 @@ impl RoomInputBar {
         cx: &mut Cx,
         timeline_kind: TimelineKind,
     ) {
-        if self.view.view(cx, ids!(upload_progress_view)).visible() {
-            enqueue_popup_notification(
-                "Finish or cancel the current upload before starting another one.",
-                PopupKind::Warning,
-                Some(7.0),
-            );
+        if self.upload_in_progress(cx) {
             return;
         }
-
         let on_picked = self.upload_picker_callback(cx, timeline_kind);
         handle_picker_launch_errors(
             robius_file_picker::FileDialog::new().pick_image_or_video(on_picked)
@@ -815,17 +816,28 @@ impl RoomInputBar {
 
     fn upload_picker_callback(
         &self,
-        _cx: &mut Cx,
+        cx: &mut Cx,
         timeline_kind: TimelineKind,
     ) -> impl FnOnce(robius_file_picker::Result<Option<robius_file_picker::PickedFile>>) + Send + 'static {
+        let into_upload = self.attachment_builder(cx, timeline_kind);
+        // `robius-file-picker` ensures that this `on_picked` callback runs on a bg thread.
+        move |result| handle_picked_file(result, into_upload)
+    }
+
+    /// Wraps a file as an attachment upload with the reply and signing state
+    /// current right now, since the file itself arrives later on a bg thread.
+    fn attachment_builder(
+        &self,
+        _cx: &mut Cx,
+        timeline_kind: TimelineKind,
+    ) -> impl FnOnce(FileUploadMetadata) -> Result<PendingUpload, String> + Send + 'static {
         let in_reply_to = self.replying_to
             .as_ref()
             .and_then(|(event_tl_item, _embedded_event)| event_tl_item.event_id().map(ToOwned::to_owned));
         #[cfg(feature = "tsp")]
         let sign_with_tsp = self.is_tsp_signing_enabled(_cx);
 
-        // `robius-file-picker` ensures that this `on_picked` callback runs on a bg thread.
-        move |result| handle_picked_file(result, move |file_data| {
+        move |file_data| {
             Ok(PendingUpload::Attachment(AttachmentUpload {
                 timeline_kind,
                 file_data,
@@ -833,7 +845,7 @@ impl RoomInputBar {
                 #[cfg(feature = "tsp")]
                 sign_with_tsp,
             }))
-        })
+        }
     }
 }
 
@@ -917,6 +929,22 @@ impl RoomInputBarRef {
     ) {
         let Some(mut inner) = self.borrow_mut() else { return };
         inner.open_file_picker(cx, timeline_kind);
+    }
+
+    /// Stages a file Robrix already has on disk as an attachment upload,
+    /// opening the usual preview modal with `caption` filled in.
+    pub fn stage_file(
+        &self,
+        cx: &mut Cx,
+        timeline_kind: TimelineKind,
+        path: std::path::PathBuf,
+        caption: Option<String>,
+    ) {
+        let Some(inner) = self.borrow() else { return };
+        if inner.upload_in_progress(cx) {
+            return;
+        }
+        stage_local_file(path, caption, inner.attachment_builder(cx, timeline_kind));
     }
 
     /// Shows the preview flow for sending the current location into this room.

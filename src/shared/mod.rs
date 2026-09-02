@@ -19,6 +19,7 @@ pub mod popup_list;
 pub mod progress_bar;
 pub mod room_filter_input_bar;
 pub mod room_input_popup_menu;
+pub mod room_picker_modal;
 pub mod slash_commands;
 pub mod styles;
 pub mod text_or_image;
@@ -57,4 +58,5 @@ pub fn script_mod(vm: &mut ScriptVm) {
     image_viewer::script_mod(vm);
     progress_bar::script_mod(vm);
     file_upload_modal::script_mod(vm);
+    room_picker_modal::script_mod(vm);
 }

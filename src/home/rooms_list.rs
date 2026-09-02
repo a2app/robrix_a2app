@@ -362,6 +362,14 @@ pub struct JoinedRoomInfo {
     //       they are children of. One room can be in multiple spaces.
 }
 
+/// The subset of a joined room's info shown by the room picker modal.
+#[derive(Clone, Debug)]
+pub struct RoomPickerEntry {
+    pub room_name_id: RoomNameId,
+    pub room_avatar: FetchedRoomAvatar,
+    pub is_direct: bool,
+}
+
 /// UI-related info about a room that the user has been invited to.
 ///
 /// This includes info needed display a preview of that room in the RoomsList
@@ -2036,6 +2044,26 @@ impl RoomsListRef {
                     .get(room_id)
                     .map(|ir| ir.room_name_id.clone())
             )
+    }
+
+    /// Returns the joined rooms matching `keywords`, in rooms-list order.
+    /// Hidden and tombstoned rooms are skipped.
+    pub fn joined_rooms_matching(&self, keywords: &str) -> Vec<RoomPickerEntry> {
+        let Some(inner) = self.borrow() else { return Vec::new() };
+        let (filter, _) = RoomDisplayFilterBuilder::new()
+            .set_keywords(keywords.into())
+            .set_filter_criteria(RoomFilterCriteria::All)
+            .build();
+        inner.all_known_rooms_order.iter()
+            .filter(|room_id| !inner.hidden_rooms.contains(*room_id))
+            .filter_map(|room_id| inner.all_joined_rooms.get(room_id))
+            .filter(|jr| !jr.is_tombstoned && filter(*jr))
+            .map(|jr| RoomPickerEntry {
+                room_name_id: jr.room_name_id.clone(),
+                room_avatar: jr.room_avatar.clone(),
+                is_direct: jr.is_direct,
+            })
+            .collect()
     }
 
     /// Returns the currently-selected space (the one selected in the SpacesBar).

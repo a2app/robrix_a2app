@@ -6,7 +6,7 @@ use makepad_code_editor::code_view::CodeViewWidgetExt;
 use makepad_widgets::*;
 use makepad_widgets::image_cache::{ImageBuffer, decode_image_from_data};
 use ruma::OwnedEventId;
-use std::{io::Read, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}};
+use std::{io::Read, path::{Path, PathBuf}, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}};
 use crate::{
     settings::account_settings::AccountSettingsAction,
     shared::popup_list::{PopupKind, enqueue_popup_notification},
@@ -318,12 +318,37 @@ script_mod! {
     }
 }
 
+/// Where an upload's bytes live.
+#[derive(Clone, Debug)]
+pub enum UploadSource {
+    /// A file the user picked. For Android content selections this is a temp
+    /// copy, auto-deleted once every clone drops.
+    Picked(robius_file_picker::LocalFile),
+    /// A file Robrix wrote itself, e.g. an exported mini-app bundle.
+    Path(PathBuf),
+}
+
+impl UploadSource {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Picked(file) => file.path(),
+            Self::Path(path) => path,
+        }
+    }
+
+    /// The platform-provided MIME type, if there is one.
+    fn mime_type(&self) -> Option<&str> {
+        match self {
+            Self::Picked(file) => file.mime_type(),
+            Self::Path(_) => None,
+        }
+    }
+}
+
 /// Metadata describing a file to be uploaded.
 #[derive(Clone, Debug)]
 pub struct FileUploadMetadata {
-    /// The local source file. For Android content selections this is a temp
-    /// copy, auto-deleted once this metadata and all its clones drop.
-    pub source: robius_file_picker::LocalFile,
+    pub source: UploadSource,
     /// The optional user-editable caption to send with the attachment.
     pub caption: Option<String>,
     /// The MIME type of the file.
@@ -371,7 +396,7 @@ pub struct TextPreview {
 
 impl FileUploadMetadata {
     /// The local filesystem path of the file to upload.
-    pub fn path(&self) -> &std::path::Path {
+    pub fn path(&self) -> &Path {
         self.source.path()
     }
 
@@ -709,23 +734,43 @@ pub fn handle_picked_file(
             return;
         }
     };
-    let upload_and_preview = picked
+    let staged = picked
         .into_local_file()
         .map_err(|e| format!("Failed to read selected file: {e}"))
-        .and_then(load_file_metadata)
+        .and_then(|file| load_file_metadata(UploadSource::Picked(file)))
         .and_then(|(file_data, preview_source)| {
             into_upload(file_data).map(|upload| (upload, preview_source))
         });
-    let (upload, preview_source) = match upload_and_preview {
+    show_upload_modal(staged);
+}
+
+/// Like [`handle_picked_file`], for a file Robrix wrote itself: no picker,
+/// and the caption comes pre-filled. Spawns its own thread for the file reads.
+pub fn stage_local_file(
+    path: PathBuf,
+    caption: Option<String>,
+    into_upload: impl FnOnce(FileUploadMetadata) -> Result<PendingUpload, String> + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        let staged = load_file_metadata(UploadSource::Path(path))
+            .and_then(|(mut file_data, preview_source)| {
+                file_data.caption = caption;
+                into_upload(file_data).map(|upload| (upload, preview_source))
+            });
+        show_upload_modal(staged);
+    });
+}
+
+/// Shows the preview modal instantly, then re-uses this bg thread to read
+/// the file and generate the preview.
+fn show_upload_modal(staged: Result<(PendingUpload, PreviewSource), String>) {
+    let (upload, preview_source) = match staged {
         Ok(pair) => pair,
         Err(e) => {
             enqueue_popup_notification(e, PopupKind::Error, None);
             return;
         }
     };
-
-    // Show the preview modal instantly, and then re-use this bg thread
-    // to read the file and generate the preview.
     let preview_id = next_file_preview_id();
     Cx::post_action(FileUploadModalAction::Show { upload, preview_id });
     let preview = preview_source.build();
@@ -756,9 +801,9 @@ pub fn handle_picker_launch_errors(result: robius_file_picker::Result<()>) {
     }
 }
 
-/// Inspects the given picked file and returns upload-related metadata for it.
+/// Inspects the given file and returns upload-related metadata for it.
 fn load_file_metadata(
-    source: robius_file_picker::LocalFile,
+    source: UploadSource,
 ) -> Result<(FileUploadMetadata, PreviewSource), String> {
     let path = source.path();
     let metadata = std::fs::metadata(path).map_err(
@@ -778,7 +823,7 @@ fn load_file_metadata(
     };
 
     let preview_source = PreviewSource {
-        // Keep the source `LocalFile` object alive throughout the preview creation.
+        // Keeps a picked temp file alive throughout the preview creation.
         source: source.clone(),
         mime_type: mime_type.clone(),
         file_size,
@@ -797,7 +842,7 @@ fn load_file_metadata(
 
 /// Info needed to create a preview of a file.
 pub struct PreviewSource {
-    source: robius_file_picker::LocalFile,
+    source: UploadSource,
     mime_type: String,
     file_size: u64,
     is_mime_guaranteed: bool,
