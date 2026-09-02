@@ -131,9 +131,22 @@ pub fn init() {
     a2app_core::set_data_root(crate::app_data_dir().join("a2app"));
 
     let mut registry = AppRegistry::new(builtin::builtin_apps());
-    // A user's saved copy of an app (including a modified builtin) shadows
-    // the stock one.
-    for app in persistence::load_user_apps() {
+    // A user's saved copy shadows the stock one; a built-in updated in this
+    // build only reaches copies still following stock.
+    for mut app in persistence::load_user_apps() {
+        let following_stock = match &app.current_version {
+            None => true,
+            Some(stamp) => persistence::load_version(&app.id, stamp)
+                .is_some_and(|(v, _)| v.origin == VersionOrigin::Stock),
+        };
+        if let Some(stock) = builtin::stock(&app.id)
+            && app.builtin && following_stock && stock.source != app.source
+        {
+            app = on_stock(app, stock);
+            if let Err(e) = persistence::save_user_app(&app) {
+                error!("Failed to save the updated stock copy of {}: {e}", app.id);
+            }
+        }
         registry.insert(app);
     }
     let permissions = persistence::load_permissions();
@@ -774,27 +787,12 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
         }
         A2AppOp::ResetToStock(app_id) => {
             let reset = with_a2app(|state| {
-                let mut current = state.registry.get(&app_id).cloned()?;
-                let mut stock = builtin::stock(&app_id)?;
+                let current = state.registry.get(&app_id).cloned()?;
+                let stock = builtin::stock(&app_id)?;
                 if current.source == stock.source {
                     return Some(None);
                 }
-                archive_current(&mut current);
-                // An archived stock version is reused rather than duplicated.
-                let archived = persistence::list_versions(&app_id).into_iter()
-                    .filter(|v| v.origin == VersionOrigin::Stock)
-                    .find_map(|v| persistence::load_version(&app_id, &v.stamp))
-                    .filter(|(_, source)| *source == stock.source);
-                let updated = match archived {
-                    Some((version, source)) => version.apply_to(&current, source),
-                    None => {
-                        stock.scope = current.scope;
-                        stock.current_version = current.current_version;
-                        commit_version(&mut stock, VersionOrigin::Stock, "Stock");
-                        stock
-                    }
-                };
-                Some(Some(updated))
+                Some(Some(on_stock(current, stock)))
             }).flatten();
             match reset {
                 Some(Some(updated)) => install_version(cx, ui, updated, String::from("Back on the stock version.")),
@@ -1292,6 +1290,25 @@ fn archive_current(manifest: &mut MiniAppManifest) {
         manifest, origin, note, versions::now_unix(), utc_offset_secs(),
     ) {
         error!("Failed to archive the current version of {}: {e}", manifest.id);
+    }
+}
+
+/// `current` put on this build's stock source. An archived stock version
+/// with that exact source is reused rather than duplicated.
+fn on_stock(mut current: MiniAppManifest, mut stock: MiniAppManifest) -> MiniAppManifest {
+    archive_current(&mut current);
+    let archived = persistence::list_versions(&current.id).into_iter()
+        .filter(|v| v.origin == VersionOrigin::Stock)
+        .filter_map(|v| persistence::load_version(&current.id, &v.stamp))
+        .find(|(_, source)| *source == stock.source);
+    match archived {
+        Some((version, source)) => version.apply_to(&current, source),
+        None => {
+            stock.scope = current.scope;
+            stock.current_version = current.current_version;
+            commit_version(&mut stock, VersionOrigin::Stock, "Stock");
+            stock
+        }
     }
 }
 
