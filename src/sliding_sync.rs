@@ -801,7 +801,7 @@ pub enum MatrixRequest {
     },
     /// A matrix operation requested by a Splash mini-app (or an app share).
     #[cfg(feature = "a2app")]
-    A2App(crate::a2app::runtime::A2AppMatrixRequest),
+    A2App(crate::a2app::matrix::A2AppMatrixRequest),
 }
 
 /// Submits a request to the worker thread to be executed asynchronously.
@@ -2498,7 +2498,7 @@ async fn matrix_worker_task(
             #[cfg(feature = "a2app")]
             MatrixRequest::A2App(request) => {
                 let _a2app_task = Handle::current().spawn(
-                    crate::a2app::runtime::handle_matrix_request(request)
+                    crate::a2app::matrix::handle_matrix_request(request)
                 );
             }
 

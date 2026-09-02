@@ -52,15 +52,10 @@ fn cost_of(service: &str) -> f64 {
         "env" | "permissions.query" | "events.subscribe" | "events.unsubscribe" => 1.0,
         // Touch host state or another isolate.
         "notify.post" | "notify.clear" | "clipboard.write" | "ipc.send" => 1.0,
-        "matrix.room_info" | "matrix.profile" => 1.0,
         // Leave the process: network, a child process, the OS.
         "location.get" | "clipboard.read" | "permissions.request" => 5.0,
-        // Round-trip through the matrix worker, and sending speaks as the user.
-        "matrix.read_messages" | "matrix.send_message" | "matrix.room_members"
-        | "matrix.pinned_events" | "matrix.room_threads" | "matrix.rooms_list"
-        | "matrix.search_room" => 5.0,
-        // Fans out over every room and may hit the network.
-        "matrix.search_rooms" => 8.0,
+        // Priced by domain where the services live.
+        s if super::matrix::is_service(s) => super::matrix::cost(s),
         // Put something on screen the user has to deal with.
         "files.pick" | "files.save" | "auth.check" | "share" | "url.open" => 8.0,
         // Steer Robrix itself: a pane, a room switch, the composer.

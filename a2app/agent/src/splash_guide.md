@@ -489,6 +489,18 @@ burning a permission.
   -> `{threads: [{sender, sender_id, event_id, body}]}`, thread root
   messages, newest first; `event_id` is the thread root.
 
+<!-- room -->
+
+<!-- rooms -->
+
+<!-- spaces -->
+
+<!-- account -->
+
+<!-- send -->
+
+<!-- membership -->
+
 `matrix-room-info` and `matrix-profile` start allowed but revocable;
 `matrix-room-read`, `matrix-room-send`, `matrix-rooms-list` and
 `matrix-rooms-read` prompt the user on first use.

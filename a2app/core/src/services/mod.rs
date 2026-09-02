@@ -12,6 +12,9 @@
 //! event pass (`SignalToUI` wakes one promptly).
 
 pub mod limits;
+pub mod matrix;
+
+pub use matrix::{MatrixServiceCall, SearchScope};
 
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -168,35 +171,7 @@ pub enum HostAction {
     ComposerReplyTo { room: Option<String>, event_id: String },
 }
 
-/// A matrix.* service call, parsed and validated by the broker.
-pub enum MatrixServiceCall {
-    /// `{room_id, room_name, topic, member_count}` for the attached room.
-    RoomInfo,
-    /// The latest `limit` text messages, oldest first (limit already 1..=30).
-    ReadMessages { limit: u32 },
-    /// Send a plain text message to the attached room as the user.
-    SendMessage { body: String },
-    /// `{user_id, display_name}` — the user's own identity.
-    Profile,
-    /// `{count, members: [{name, user_id, power}]}` for the attached room.
-    Members { limit: u32 },
-    /// `{pinned: [{sender, body}]}` — the room's pinned messages.
-    PinnedEvents,
-    /// `{threads: [{sender, body}]}` — thread roots, newest first.
-    Threads { limit: u32 },
-    /// Every joined room, with name, kind and encryption flag.
-    RoomsList,
-    /// Text search over messages; `scope` says which rooms.
-    Search { query: String, scope: SearchScope, limit: u32, server: bool },
-}
 
-/// Which rooms a `matrix.search_*` call covers.
-pub enum SearchScope {
-    Attached,
-    AllJoined,
-    /// Room ids as given; the host validates them.
-    Rooms(Vec<String>),
-}
 
 /// Async results coming home from robius callbacks on other threads.
 enum Completion {
@@ -676,76 +651,16 @@ impl Broker {
                     data_json,
                 });
             }
-            "matrix.room_info" | "matrix.read_messages" | "matrix.send_message"
-            | "matrix.profile" | "matrix.room_members" | "matrix.pinned_events"
-            | "matrix.room_threads" | "matrix.rooms_list" | "matrix.search_room"
-            | "matrix.search_rooms" => {
-                // Room-scoped calls need an attached room; checked AFTER the
-                // permission gate so a first-use prompt still reads sensibly.
-                let room_free = matches!(
-                    req.service.as_str(),
-                    "matrix.profile" | "matrix.rooms_list" | "matrix.search_rooms"
-                );
-                if !room_free && instance_room.is_none() {
-                    return respond(cx, reply, Err("this mini-app is not attached to a room"));
+            service if matrix::is_service(service) => {
+                match matrix::parse(service, &args, instance_room.is_some()) {
+                    Ok(call) => asks.push(BrokerAsk::Matrix {
+                        reply,
+                        app_id: manifest.id.clone(),
+                        room: instance_room.clone(),
+                        call,
+                    }),
+                    Err(e) => respond(cx, reply, Err(&e)),
                 }
-                let call = match req.service.as_str() {
-                    "matrix.room_info" => MatrixServiceCall::RoomInfo,
-                    "matrix.profile" => MatrixServiceCall::Profile,
-                    "matrix.rooms_list" => MatrixServiceCall::RoomsList,
-                    "matrix.search_room" | "matrix.search_rooms" => {
-                        let query = args["query"].as_str().map(str::trim).unwrap_or_default();
-                        if query.is_empty() {
-                            return respond(cx, reply, Err(&format!("{} needs {{query}}", req.service)));
-                        }
-                        let scope = if req.service == "matrix.search_room" {
-                            SearchScope::Attached
-                        } else {
-                            match args["room_ids"].as_array() {
-                                Some(ids) => SearchScope::Rooms(
-                                    ids.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
-                                ),
-                                None => SearchScope::AllJoined,
-                            }
-                        };
-                        MatrixServiceCall::Search {
-                            query: query.to_string(),
-                            scope,
-                            limit: args["limit"].as_u64().unwrap_or(25) as u32,
-                            server: args["server"].as_bool().unwrap_or(false),
-                        }
-                    }
-                    "matrix.read_messages" => MatrixServiceCall::ReadMessages {
-                        limit: args["limit"].as_u64().unwrap_or(10).clamp(1, 30) as u32,
-                    },
-                    "matrix.room_members" => MatrixServiceCall::Members {
-                        limit: args["limit"].as_u64().unwrap_or(50).clamp(1, 200) as u32,
-                    },
-                    "matrix.pinned_events" => MatrixServiceCall::PinnedEvents,
-                    "matrix.room_threads" => MatrixServiceCall::Threads {
-                        limit: args["limit"].as_u64().unwrap_or(20).clamp(1, 50) as u32,
-                    },
-                    _ => {
-                        let body = args["body"].as_str().map(str::trim).unwrap_or_default();
-                        if body.is_empty() {
-                            return respond(cx, reply, Err("matrix.send_message needs {body}"));
-                        }
-                        if body.chars().count() > 4096 {
-                            return respond(
-                                cx,
-                                reply,
-                                Err("message is too long (4096 characters max)"),
-                            );
-                        }
-                        MatrixServiceCall::SendMessage { body: body.to_string() }
-                    }
-                };
-                asks.push(BrokerAsk::Matrix {
-                    reply,
-                    app_id: manifest.id.clone(),
-                    room: instance_room.clone(),
-                    call,
-                });
             }
             "events.subscribe" => {
                 let Some(name) = args["event"].as_str() else {
