@@ -1185,10 +1185,14 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
                             let Ok(AnySyncTimelineEvent::MessageLike(
                                 AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(msg))
                             )) = event.raw().deserialize() else { continue };
-                            let sender = msg.sender.localpart().to_string();
                             let mut body = msg.content.body().to_string();
                             body.truncate(500);
-                            out.push(serde_json::json!({ "sender": sender, "body": body }));
+                            out.push(serde_json::json!({
+                                "sender": msg.sender.localpart(),
+                                "sender_id": msg.sender,
+                                "event_id": msg.event_id,
+                                "body": body,
+                            }));
                             if out.len() >= limit as usize {
                                 break;
                             }
@@ -1210,10 +1214,14 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
                             let Ok(AnySyncTimelineEvent::MessageLike(
                                 AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(msg))
                             )) = event.raw().deserialize() else { continue };
-                            let sender = msg.sender.localpart().to_string();
                             let mut body = msg.content.body().to_string();
                             body.truncate(500);
-                            out.push(serde_json::json!({ "sender": sender, "body": body }));
+                            out.push(serde_json::json!({
+                                "sender": msg.sender.localpart(),
+                                "sender_id": msg.sender,
+                                "event_id": msg.event_id,
+                                "body": body,
+                            }));
                             if out.len() >= limit as usize {
                                 break;
                             }
@@ -1306,7 +1314,9 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
                     let mut body = msg.content.body().to_string();
                     body.truncate(300);
                     out.push(serde_json::json!({
-                        "sender": msg.sender.localpart().to_string(),
+                        "sender": msg.sender.localpart(),
+                        "sender_id": msg.sender,
+                        "event_id": msg.event_id,
                         "body": body,
                     }));
                 }
@@ -1331,7 +1341,9 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
                     let mut body = msg.content.body().to_string();
                     body.truncate(300);
                     out.push(serde_json::json!({
-                        "sender": msg.sender.localpart().to_string(),
+                        "sender": msg.sender.localpart(),
+                        "sender_id": msg.sender,
+                        "event_id": msg.event_id,
                         "body": body,
                     }));
                 }
