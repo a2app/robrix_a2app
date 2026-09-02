@@ -18,7 +18,7 @@ use matrix_sdk::ruma::{matrix_uri::MatrixId, MatrixToUri, MatrixUri, OwnedEventI
 use a2app_core::builtin;
 use a2app_core::bundle;
 use a2app_core::manifest::{A2AppScope, AppRegistry, MiniAppId, MiniAppManifest};
-use a2app_core::permissions::{GrantState, Permission, PermissionStore};
+use a2app_core::permissions::{Effective, GrantState, Permission, PermissionStore};
 use a2app_core::persistence::{self, A2AppPersistedState};
 use a2app_core::services::{self, Broker, BrokerAsk, BrokerCtx, HostAction, MatrixServiceCall, Reply, MATRIX_WRITE_OFF_MSG};
 use a2app_agent::pipeline::{GenOutcome, Generation};
@@ -99,6 +99,10 @@ pub struct A2AppState {
     /// A mini-app's request of a room's RoomScreen, waiting to be taken by
     /// the screen showing that room (see [`take_room_action`]).
     room_action: Option<PendingRoomAction>,
+    /// Live incoming-hook subscriptions, by isolate heap key.
+    hook_subs: HashMap<usize, HookSubscription>,
+    /// Rooms the worker is watching for those subscriptions.
+    watched_rooms: HashSet<OwnedRoomId>,
     perms_dirty: bool,
     registry_dirty: bool,
     last_persist: Instant,
@@ -146,6 +150,8 @@ pub fn init() {
             create_room: None,
             foreground_app: None,
             room_action: None,
+            hook_subs: HashMap::new(),
+            watched_rooms: HashSet::new(),
             perms_dirty: false,
             registry_dirty: false,
             last_persist: Instant::now(),
@@ -182,23 +188,33 @@ pub enum A2AppOp {
     NewPrompt,
     /// Posts an app's bundle into a room as a custom event.
     ShareToRoom { app_id: MiniAppId, room_id: OwnedRoomId },
+    /// The user's "Mini-apps may write to rooms" switch.
+    SetMatrixWrite(bool),
 }
 
 /// Matrix work requested by a mini-app (or a share), run on the worker.
 #[derive(Debug)]
 pub enum A2AppMatrixRequest {
     RoomInfo { room_id: OwnedRoomId, reply: Reply },
-    /// The user's "Mini-apps may write to rooms" switch.
-    SetMatrixWrite(bool),
     ReadMessages { room_id: OwnedRoomId, limit: u32, reply: Reply },
     SendMessage { room_id: OwnedRoomId, body: String, reply: Reply },
     Profile { reply: Reply },
     Members { room_id: OwnedRoomId, limit: u32, reply: Reply },
     PinnedEvents { room_id: OwnedRoomId, reply: Reply },
     Threads { room_id: OwnedRoomId, limit: u32, reply: Reply },
+    /// Start or stop the worker's watch on a room for the incoming hooks.
+    WatchRoom { room_id: OwnedRoomId },
+    UnwatchRoom { room_id: OwnedRoomId },
     /// Sends an app bundle into a room as an `rs.robius.a2app` event.
     /// No reply: outcome is reported via a popup notification.
     ShareApp { room_id: OwnedRoomId, bundle_json: String, app_name: String },
+}
+
+/// One isolate's live room hooks.
+struct HookSubscription {
+    app_id: MiniAppId,
+    room_id: OwnedRoomId,
+    hooks: HashSet<&'static str>,
 }
 
 /// What a mini-app asked the RoomScreen of its room to do.
@@ -251,12 +267,14 @@ pub struct A2AppMatrixResult {
 pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     if let Event::NetworkResponses(e) = event {
         with_a2app(|state| state.broker.handle_network(cx, e));
+        instances::handle_network_responses(cx, event, &mut Scope::empty());
         return;
     }
     match event {
         Event::Signal | Event::Actions(_) | Event::Timer(_) => {}
         _ => return,
     }
+    instances::flush_pending(cx);
 
     let mut ops: Vec<A2AppOp> = Vec::new();
     let mut prompt_answers: Vec<PermissionPromptAction> = Vec::new();
@@ -265,14 +283,16 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     let mut stopped: Vec<MiniAppId> = Vec::new();
     let mut watch_events: Vec<A2AppRoomWatchEvent> = Vec::new();
     if let Event::Actions(actions) = event {
-        instances::handle_network_responses(cx, event, &mut Scope::empty());
         for action in actions {
+            if let Some(watch_event) = action.downcast_ref::<A2AppRoomWatchEvent>() {
+                watch_events.push(watch_event.clone());
+                continue;
+            }
             if let Some(op) = action.downcast_ref::<A2AppOp>() {
                 ops.push(op.clone());
                 continue;
             }
             if let Some(answer) = action.downcast_ref::<PermissionPromptAction>() {
-    instances::flush_pending(cx);
                 prompt_answers.push(*answer);
                 continue;
             }
@@ -314,7 +334,7 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     for pane_action in pane_actions {
         match pane_action {
             MiniAppHostPaneAction::CloseClicked => ops.push(A2AppOp::CloseHostPane),
-            // Closing quits the popped-out instance; the room's dock starts its own.
+            // The instance goes back to its room's dock, state intact.
             MiniAppHostPaneAction::ReturnToRoom { app_id, room_id } => {
                 host_pane(cx, ui).close_active(cx, true);
                 with_a2app(|state| state.foreground_app = None);
@@ -330,6 +350,9 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     for op in ops {
         apply_op(cx, ui, op);
     }
+    if !watch_events.is_empty() {
+        deliver_room_hooks(cx, ui, watch_events);
+    }
 
     advance_generation(cx, ui);
     process_broker(cx, ui);
@@ -341,26 +364,6 @@ fn host_pane(cx: &mut Cx, ui: &WidgetRef) -> crate::a2app::host_pane::MiniAppHos
     ui.mini_app_host_pane(cx, ids!(mini_app_host_modal.content))
 }
 
-fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
-    match op {
-        A2AppOp::OpenApp { app_id, room_id, in_room_pane } => {
-            let Some((manifest, grants, restricted, room)) = with_a2app(|state| {
-                let manifest = state.registry.get(&app_id).cloned();
-                let grants = a2app_core::permissions::snapshot_grants_for(&app_id);
-                let restricted = state.permissions.is_restricted(&app_id);
-                let room = room_id.or_else(|| match manifest.as_ref().map(|m| &m.scope) {
-                    Some(A2AppScope::Room { room_id }) => OwnedRoomId::try_from(room_id.as_str()).ok(),
-                    _ => None,
-                });
-                manifest.map(|m| (m, grants, restricted, room))
-            }).flatten() else {
-                enqueue_popup_notification("That mini-app no longer exists.", PopupKind::Error, Some(4.0));
-                return;
-            };
-            if restricted {
-                enqueue_popup_notification(
-                    format!("\"{}\" was stopped for hammering the host with requests. You can let it run again from its app info.", manifest.name),
-                    PopupKind::Warning, Some(6.0),
 /// One-time grants die with the app's last isolate.
 fn app_stopped(cx: &mut Cx, app_id: &str) {
     prune_hook_subs();
@@ -492,6 +495,26 @@ fn stop_app_everywhere(cx: &mut Cx, ui: &WidgetRef, app_id: &str) {
     instances::quit_app(cx, app_id);
 }
 
+fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
+    match op {
+        A2AppOp::OpenApp { app_id, room_id, in_room_pane } => {
+            let Some((manifest, grants, restricted, room)) = with_a2app(|state| {
+                let manifest = state.registry.get(&app_id).cloned();
+                let grants = a2app_core::permissions::snapshot_grants_for(&app_id);
+                let restricted = state.permissions.is_restricted(&app_id);
+                let room = room_id.or_else(|| match manifest.as_ref().map(|m| &m.scope) {
+                    Some(A2AppScope::Room { room_id }) => OwnedRoomId::try_from(room_id.as_str()).ok(),
+                    _ => None,
+                });
+                manifest.map(|m| (m, grants, restricted, room))
+            }).flatten() else {
+                enqueue_popup_notification("That mini-app no longer exists.", PopupKind::Error, Some(4.0));
+                return;
+            };
+            if restricted {
+                enqueue_popup_notification(
+                    format!("\"{}\" was stopped for hammering the host with requests. You can let it run again from its app info.", manifest.name),
+                    PopupKind::Warning, Some(6.0),
                 );
                 return;
             }
@@ -696,6 +719,26 @@ fn stop_app_everywhere(cx: &mut Cx, ui: &WidgetRef, app_id: &str) {
             );
             ui.redraw(cx);
         }
+        A2AppOp::ShareToRoom { app_id, room_id } => {
+            if !with_a2app(|state| state.permissions.matrix_write()).unwrap_or(false) {
+                enqueue_popup_notification(
+                    format!("{MATRIX_WRITE_OFF_MSG}, so sharing an app into a room is blocked too."),
+                    PopupKind::Warning, Some(5.0),
+                );
+                return;
+            }
+            let Some(Some(manifest)) = with_a2app(|state| state.registry.get(&app_id).cloned()) else { return };
+            submit_async_request(MatrixRequest::A2App(A2AppMatrixRequest::ShareApp {
+                room_id,
+                bundle_json: bundle::to_text(&manifest),
+                app_name: manifest.name.clone(),
+            }));
+        }
+    }
+}
+
+fn install_import(cx: &mut Cx, ui: &WidgetRef, parsed: Result<MiniAppManifest, String>) {
+    match parsed {
         Ok(mut manifest) => {
             with_a2app(|state| {
                 // An import can never overwrite an app you already have.
@@ -719,26 +762,6 @@ fn stop_app_everywhere(cx: &mut Cx, ui: &WidgetRef, app_id: &str) {
 
 fn manifest_name_for_popup(manifest: &MiniAppManifest) -> String {
     if manifest.name.is_empty() { manifest.id.clone() } else { manifest.name.clone() }
-        A2AppOp::ShareToRoom { app_id, room_id } => {
-            if !with_a2app(|state| state.permissions.matrix_write()).unwrap_or(false) {
-                enqueue_popup_notification(
-                    format!("{MATRIX_WRITE_OFF_MSG}, so sharing an app into a room is blocked too."),
-                    PopupKind::Warning, Some(5.0),
-                );
-                return;
-            }
-            let Some(Some(manifest)) = with_a2app(|state| state.registry.get(&app_id).cloned()) else { return };
-            submit_async_request(MatrixRequest::A2App(A2AppMatrixRequest::ShareApp {
-                room_id,
-                bundle_json: bundle::to_text(&manifest),
-                app_name: manifest.name.clone(),
-            }));
-        }
-    }
-}
-
-fn install_import(cx: &mut Cx, ui: &WidgetRef, parsed: Result<MiniAppManifest, String>) {
-    match parsed {
 }
 
 fn unique_import_id(base: &str, taken: &[MiniAppId]) -> MiniAppId {
@@ -996,6 +1019,35 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
             };
             submit_async_request(MatrixRequest::A2App(request));
         }
+        BrokerAsk::Subscribe { reply, app_id, heap_key, room, hook } => {
+            let Ok(room_id) = OwnedRoomId::try_from(room.as_str()) else {
+                return services::respond(cx, reply, Err("not a valid room id"));
+            };
+            with_a2app(|state| {
+                let sub = state.hook_subs.entry(heap_key).or_insert_with(|| HookSubscription {
+                    app_id,
+                    room_id: room_id.clone(),
+                    hooks: HashSet::new(),
+                });
+                sub.hooks.insert(hook);
+            });
+            prune_hook_subs();
+            services::respond(cx, reply, Ok("{\"subscribed\":true}"));
+        }
+        BrokerAsk::Unsubscribe { reply, heap_key, hook } => {
+            with_a2app(|state| {
+                match hook {
+                    Some(hook) => {
+                        if let Some(sub) = state.hook_subs.get_mut(&heap_key) {
+                            sub.hooks.remove(hook);
+                        }
+                    }
+                    None => { state.hook_subs.remove(&heap_key); }
+                }
+            });
+            prune_hook_subs();
+            services::respond(cx, reply, Ok("{}"));
+        }
         BrokerAsk::HostAction { reply, app_id, action } => {
             // Only the modal's own isolate has to get out of the way when it
             // sends the user elsewhere; closing quits it, like its Close button.
@@ -1174,10 +1226,18 @@ fn show_next_permission_prompt(cx: &mut Cx, ui: &WidgetRef) {
         let (app_name, app_icon, reason) = state.registry.get(&prompt.app_id)
             .map(|m| (m.name.clone(), m.icon.clone(), m.reason_for(prompt.perm).map(str::to_string)))
             .unwrap_or_else(|| (prompt.app_id.clone(), String::new(), None));
-        // Name the exact ability that asked, not just its group.
-        let capability = prompt.parked.first()
-            .and_then(|r| a2app_core::capabilities::for_service(&r.service))
-            .map(|c| c.title.to_string());
+        // Name the exact ability that asked, not just its group; a parked
+        // subscribe names the hook it is for.
+        let capability = prompt.parked.first().and_then(|r| {
+            let hook_name = (r.service == "events.subscribe")
+                .then(|| serde_json::from_str::<serde_json::Value>(&r.args_json).ok())
+                .flatten()
+                .and_then(|args| args["event"].as_str().map(str::to_string));
+            match hook_name {
+                Some(name) => a2app_core::capabilities::for_hook(&name),
+                None => a2app_core::capabilities::for_service(&r.service),
+            }
+        }).map(|c| c.title.to_string());
         let info = PromptInfo {
             app_name,
             app_icon,
@@ -1261,6 +1321,7 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
 /// restart the app (the net runtime is baked in at VM alloc); anything else
 /// just gets the new caps list plus an `on_permissions_changed` call.
 fn apply_permission_to_running(cx: &mut Cx, ui: &WidgetRef, app_id: &str, perm: Permission) {
+    prune_hook_subs();
     if !with_a2app(|state| state.is_running(app_id)).unwrap_or(false) {
         return;
     }
@@ -1317,6 +1378,14 @@ fn publish_grants(_cx: &mut Cx) {
     with_a2app(|state| {
         a2app_core::permissions::publish_snapshot(state.permissions.snapshot(&state.registry));
     });
+}
+
+/// Cuts a body to `max` chars on a char boundary; a byte truncate could
+/// split a multi-byte char and panic.
+fn clip_chars(s: &mut String, max: usize) {
+    if let Some((idx, _)) = s.char_indices().nth(max) {
+        s.truncate(idx);
+    }
 }
 
 /// The local UTC offset, for version-history timestamps in local time.
@@ -1456,7 +1525,7 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
                                 AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(msg))
                             )) = event.raw().deserialize() else { continue };
                             let mut body = msg.content.body().to_string();
-                            body.truncate(500);
+                            clip_chars(&mut body, 500);
                             out.push(serde_json::json!({
                                 "sender": msg.sender.localpart(),
                                 "sender_id": msg.sender,
@@ -1485,7 +1554,7 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
                                 AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(msg))
                             )) = event.raw().deserialize() else { continue };
                             let mut body = msg.content.body().to_string();
-                            body.truncate(500);
+                            clip_chars(&mut body, 500);
                             out.push(serde_json::json!({
                                 "sender": msg.sender.localpart(),
                                 "sender_id": msg.sender,
@@ -1582,7 +1651,7 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
                         AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(msg))
                     )) = event.raw().deserialize() else { continue };
                     let mut body = msg.content.body().to_string();
-                    body.truncate(300);
+                    clip_chars(&mut body, 300);
                     out.push(serde_json::json!({
                         "sender": msg.sender.localpart(),
                         "sender_id": msg.sender,
@@ -1609,7 +1678,7 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
                         AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(msg))
                     )) = event.raw().deserialize() else { continue };
                     let mut body = msg.content.body().to_string();
-                    body.truncate(300);
+                    clip_chars(&mut body, 300);
                     out.push(serde_json::json!({
                         "sender": msg.sender.localpart(),
                         "sender_id": msg.sender,
@@ -1620,6 +1689,14 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
                 Ok(serde_json::json!({ "threads": out }).to_string())
             }.await;
             (reply, result)
+        }
+        A2AppMatrixRequest::WatchRoom { room_id } => {
+            room_watch::start_watch(room_id);
+            return;
+        }
+        A2AppMatrixRequest::UnwatchRoom { room_id } => {
+            room_watch::stop_watch(&room_id);
+            return;
         }
         A2AppMatrixRequest::Profile { reply } => {
             let result: Result<String, String> = async {

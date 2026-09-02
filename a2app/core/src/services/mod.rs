@@ -135,6 +135,20 @@ pub enum BrokerAsk {
         app_id: MiniAppId,
         action: HostAction,
     },
+    /// This isolate wants `hook` for its room; already permission-checked.
+    Subscribe {
+        reply: Reply,
+        app_id: MiniAppId,
+        heap_key: usize,
+        room: String,
+        hook: &'static str,
+    },
+    /// Drop one hook (or all with `None`) for this isolate.
+    Unsubscribe {
+        reply: Reply,
+        heap_key: usize,
+        hook: Option<&'static str>,
+    },
 }
 
 /// A parsed nav.* / composer.* call. `room` is the explicit `room_id`
@@ -195,6 +209,10 @@ pub struct BrokerCtx<'a> {
     pub is_docked: &'a dyn Fn(&str) -> bool,
 }
 
+/// The refusal every switch-gated write gets while the user keeps writes off.
+pub const MATRIX_WRITE_OFF_MSG: &str =
+    "Mini-apps may not write to rooms: turn on \"Mini-apps may write to rooms\" in the Mini Apps screen";
+
 pub struct Broker {
     tx: Sender<Completion>,
     rx: Receiver<Completion>,
@@ -209,10 +227,6 @@ pub struct Broker {
     /// app from turning the bridge into a denial-of-service on the host.
     limits: limits::AbuseLimiter,
     /// Which app owns each on-screen OS dialog, so the one-at-a-time guard
-/// The refusal every switch-gated write gets while the user keeps writes off.
-pub const MATRIX_WRITE_OFF_MSG: &str =
-    "Mini-apps may not write to rooms: turn on \"Mini-apps may write to rooms\" in the Mini Apps screen";
-
     /// can be released when the completion comes home from another thread.
     dialog_owner: HashMap<(usize, u64), MiniAppId>,
 }
@@ -414,6 +428,12 @@ impl Broker {
         if !capability.is_available() {
             return respond(cx, reply, Err(&format!("'{}' is not available in this Robrix", req.service)));
         }
+        // A write behind the user's switch: refused without a prompt.
+        if capability.status == crate::capabilities::Status::RefusedBySwitch
+            && !ctx.permissions.matrix_write()
+        {
+            return respond(cx, reply, Err(MATRIX_WRITE_OFF_MSG));
+        }
         // Same-app IPC is inside one sandbox: no permission involved.
         let self_ipc = req.service == "ipc.send"
             && ipc_target.as_deref() == Some(manifest.id.as_str());
@@ -428,12 +448,6 @@ impl Broker {
                 Effective::Granted => {
                     asks.push(BrokerAsk::Used { app_id: manifest.id.clone(), perm });
                 }
-        // A write behind the user's switch: refused without a prompt.
-        if capability.status == crate::capabilities::Status::RefusedBySwitch
-            && !ctx.permissions.matrix_write()
-        {
-            return respond(cx, reply, Err(MATRIX_WRITE_OFF_MSG));
-        }
                 Effective::Denied => return Self::respond_denied(cx, &req),
                 Effective::Undeclared => {
                     return respond(
@@ -483,6 +497,14 @@ impl Broker {
                 let Some(perm) = args["perm"].as_str().and_then(Permission::from_str) else {
                     return respond(cx, reply, Err("unknown permission"));
                 };
+                // No point prompting for a group the write switch refuses anyway.
+                let switched_off = !ctx.permissions.matrix_write()
+                    && crate::capabilities::in_group(perm)
+                        .filter(|c| c.is_available())
+                        .all(|c| c.status == crate::capabilities::Status::RefusedBySwitch);
+                if switched_off {
+                    return respond(cx, reply, Ok("{\"granted\": false}"));
+                }
                 match ctx.permissions.effective(&manifest, perm) {
                     Effective::Granted => respond(cx, reply, Ok("{\"granted\": true}")),
                     Effective::Denied => respond(cx, reply, Ok("{\"granted\": false}")),
@@ -497,14 +519,6 @@ impl Broker {
                             app_id: manifest.id.clone(),
                             perm,
                             request: Some(req),
-                // No point prompting for a group the write switch refuses anyway.
-                let switched_off = !ctx.permissions.matrix_write()
-                    && crate::capabilities::in_group(perm)
-                        .filter(|c| c.is_available())
-                        .all(|c| c.status == crate::capabilities::Status::RefusedBySwitch);
-                if switched_off {
-                    return respond(cx, reply, Ok("{\"granted\": false}"));
-                }
                         });
                     }
                 }
@@ -692,6 +706,60 @@ impl Broker {
                     room: instance_room.clone(),
                     call,
                 });
+            }
+            "events.subscribe" => {
+                let Some(name) = args["event"].as_str() else {
+                    return respond(cx, reply, Err("events.subscribe needs {event}"));
+                };
+                let Some(hook) = crate::capabilities::for_hook(name).filter(|c| c.is_available()) else {
+                    return respond(cx, reply, Err(&format!("unknown event '{name}'")));
+                };
+                let Some(room) = instance_room.clone() else {
+                    return respond(cx, reply, Err("this mini-app is not attached to a room"));
+                };
+                // The hook's own group answers, exactly like an outgoing call.
+                match ctx.permissions.effective_capability(&manifest, hook) {
+                    Effective::Granted => {
+                        if let Some(perm) = hook.group {
+                            asks.push(BrokerAsk::Used { app_id: manifest.id.clone(), perm });
+                        }
+                        asks.push(BrokerAsk::Subscribe {
+                            reply,
+                            app_id: manifest.id.clone(),
+                            heap_key: req.heap_key,
+                            room,
+                            hook: hook.wire[0],
+                        });
+                    }
+                    Effective::Denied => respond(cx, reply, Err(&format!("permission denied: {}", hook.id))),
+                    Effective::Undeclared => {
+                        let group = hook.group.map_or("", |g| g.as_str());
+                        respond(cx, reply, Err(&format!("permission not declared: {group}")));
+                    }
+                    Effective::NeedsPrompt if !req.may_prompt => {
+                        respond(cx, reply, Err(&format!("permission denied: {}", hook.id)));
+                    }
+                    Effective::NeedsPrompt => {
+                        let Some(perm) = hook.group else { return };
+                        asks.push(BrokerAsk::Prompt {
+                            app_id: manifest.id.clone(),
+                            perm,
+                            request: Some(req),
+                        });
+                    }
+                }
+            }
+            "events.unsubscribe" => {
+                let name = args["event"].as_str().unwrap_or("*");
+                let hook = if name == "*" {
+                    None
+                } else {
+                    let Some(hook) = crate::capabilities::for_hook(name) else {
+                        return respond(cx, reply, Err(&format!("unknown event '{name}'")));
+                    };
+                    Some(hook.wire[0])
+                };
+                asks.push(BrokerAsk::Unsubscribe { reply, heap_key: req.heap_key, hook });
             }
             "nav.room" | "nav.event" | "nav.thread" | "nav.user" | "nav.space"
             | "nav.screen" | "nav.link" | "nav.app" | "composer.insert"

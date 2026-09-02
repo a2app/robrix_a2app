@@ -49,7 +49,7 @@ fn cost_of(service: &str) -> f64 {
         // each one still crosses the bridge, builds a JSON answer and re-enters
         // the isolate, so a script polling these in a loop is still a script
         // the host has to keep up with.
-        "env" | "permissions.query" => 1.0,
+        "env" | "permissions.query" | "events.subscribe" | "events.unsubscribe" => 1.0,
         // Touch host state or another isolate.
         "notify.post" | "notify.clear" | "clipboard.write" | "ipc.send" => 1.0,
         "matrix.room_info" | "matrix.profile" => 1.0,

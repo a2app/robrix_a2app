@@ -1,9 +1,10 @@
 // name: Room Threads
 // icon: 🧵
 // tint: #8A5CA8
-// permissions: matrix-room-read, robrix-navigation
+// permissions: matrix-room-read, robrix-navigation, matrix-room-watch
 // why-matrix-room-read: Lists the discussion threads in this room.
 // why-robrix-navigation: Opens a thread you tap.
+// why-matrix-room-watch: Refreshes as new messages arrive.
 
 let items = []
 
@@ -20,8 +21,17 @@ fn load(){
     })
 }
 
+fn on_room_message(json){
+    load()
+}
+
+fn watch(){
+    host.request("events.subscribe", {event: "on_room_message"}, nil)
+}
+
 fn on_permissions_changed(caps){
     load()
+    watch()
 }
 
 fn open_thread(i){
@@ -31,7 +41,10 @@ fn open_thread(i){
     })
 }
 
-let _boot = start_timeout(0.05, || load())
+let _boot = start_timeout(0.05, || {
+    load()
+    watch()
+})
 
 View{
     width: Fill height: Fit flow: Down align: Align{x: 0.5}

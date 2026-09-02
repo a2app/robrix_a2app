@@ -1,11 +1,12 @@
 // name: Room Peek
 // icon: 👀
 // tint: #4A90D9
-// permissions: matrix-room-info, matrix-room-read, matrix-room-send, robrix-navigation
+// permissions: matrix-room-info, matrix-room-read, matrix-room-send, robrix-navigation, matrix-room-watch
 // why-matrix-room-info: Shows this room's name and member count.
 // why-matrix-room-read: Lists the latest messages in this room.
 // why-matrix-room-send: Sends the message you type into this room.
 // why-robrix-navigation: Jumps to a message you tap.
+// why-matrix-room-watch: Shows new messages as they arrive.
 
 let room_name = "Room Peek"
 let room_line = "Open me from a room to see its info."
@@ -60,14 +61,36 @@ fn send_msg(){
     })
 }
 
+fn on_room_message(json){
+    let batch = json.parse_json()
+    for m in batch {
+        messages.push(m)
+    }
+    while messages.len() > 15 {
+        messages.remove(0)
+    }
+    ui.msg_list.render()
+}
+
+fn on_room_members_changed(json){
+    load_room()
+}
+
+fn watch(){
+    host.request("events.subscribe", {event: "on_room_message"}, nil)
+    host.request("events.subscribe", {event: "on_room_members_changed"}, nil)
+}
+
 fn on_permissions_changed(caps){
     load_room()
     load_messages()
+    watch()
 }
 
 let _boot = start_timeout(0.05, || {
     load_room()
     load_messages()
+    watch()
 })
 
 View{

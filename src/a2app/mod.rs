@@ -22,6 +22,8 @@ pub mod dock;
 pub mod tab_screen;
 /// State ownership and per-event-pass processing.
 pub mod runtime;
+/// Worker-side room watches that feed the mini-app hooks.
+pub mod room_watch;
 /// The timeline card for `rs.robius.a2app` events (apps shared into rooms).
 pub mod timeline_card;
 

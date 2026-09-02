@@ -310,10 +310,41 @@ and scope (this room, account, device, app-local). Available today:
 | matrix-profile | `matrix.profile.read` | read · account |
 | robrix-navigation | `host.nav.user`, `host.nav.thread`, `host.nav.event`, `host.nav.room`, `host.nav.space`, `host.nav.screen`, `host.nav.link`, `host.nav.app` | act · app→Robrix · this room / account |
 | robrix-composer | `host.composer.insert`, `host.composer.reply_to` | act · app→Robrix · this room |
+| matrix-room-watch | `on_room_message`, `on_room_members_changed` (Robrix→app hooks) | read · this room |
+| matrix-room-info | `on_room_pins_changed` (Robrix→app hook) | read · this room |
 
 Ungated plumbing every app has: `host.env.read` (`"env"`),
-`permissions.query`, `permissions.request`, and the hooks
-`on_permissions_changed(caps)` / `on_app_resize(w, h)`.
+`permissions.query`, `permissions.request`, `events.subscribe` /
+`events.unsubscribe`, and the hooks `on_permissions_changed(caps)` /
+`on_app_resize(w, h)`.
+
+## Live room updates (Robrix -> app hooks)
+
+Instead of a Refresh button, subscribe once after your first load and
+define the hook as a top-level `fn`. The hook's own group is what the
+user is asked for (`matrix-room-watch` prompts on first use,
+`matrix-room-info` starts allowed), and a subscription dies with the app
+instance, so subscribe again from `on_permissions_changed`.
+
+```splash
+fn on_room_message(json){
+    let batch = json.parse_json()      // [{room_id, event_id, sender, sender_id, sender_name, body, ts, msgtype, is_own}]
+    for m in batch { messages.push(m) }
+    ui.msg_list.render()
+}
+fn on_room_members_changed(json){ load() }   // {room_id, count}
+fn on_room_pins_changed(json){ load() }      // {room_id, pinned: [event_id, ...]}
+fn watch(){
+    host.request("events.subscribe", {event: "on_room_message"}, nil)
+}
+```
+
+`on_room_message` gets every new message since you subscribed, batched
+into one call per burst and never replayed from history; `sender` is the
+short name and `sender_id` the full id, like `matrix.read_messages`.
+`events.unsubscribe` `{event: "on_room_message"}` (or `"*"`) stops them.
+Hooks arrive only while the app is running (its pane, chip, tab or
+modal); nothing is queued for a closed app.
 
 `host.has()` accepts either a group id (`host.has("network")`) or a
 capability id (`host.has("matrix.room.members.read")`), and

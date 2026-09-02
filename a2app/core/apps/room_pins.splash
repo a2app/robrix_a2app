@@ -1,9 +1,10 @@
 // name: Pinned Events
 // icon: 📌
 // tint: #C0533E
-// permissions: matrix-room-read, robrix-navigation
+// permissions: matrix-room-read, robrix-navigation, matrix-room-info
 // why-matrix-room-read: Shows this room's pinned messages.
 // why-robrix-navigation: Jumps to a pinned message you tap.
+// why-matrix-room-info: Refreshes when the pins change.
 
 let items = []
 
@@ -20,8 +21,17 @@ fn load(){
     })
 }
 
+fn on_room_pins_changed(json){
+    load()
+}
+
+fn watch(){
+    host.request("events.subscribe", {event: "on_room_pins_changed"}, nil)
+}
+
 fn on_permissions_changed(caps){
     load()
+    watch()
 }
 
 fn jump_to_pin(i){
@@ -31,7 +41,10 @@ fn jump_to_pin(i){
     })
 }
 
-let _boot = start_timeout(0.05, || load())
+let _boot = start_timeout(0.05, || {
+    load()
+    watch()
+})
 
 View{
     width: Fill height: Fit flow: Down align: Align{x: 0.5}

@@ -59,10 +59,11 @@ pub fn declared_reasons(id: &str) -> std::collections::BTreeMap<String, String> 
 /// on purpose — don't add "just in case" entries.
 fn permissions_for(id: &str) -> Vec<String> {
     let p: &[&str] = match id {
-        "room-peek" => &["matrix-room-info", "matrix-room-read", "matrix-room-send", "robrix-navigation"],
+        "room-peek" => &["matrix-room-info", "matrix-room-read", "matrix-room-send", "robrix-navigation", "matrix-room-watch"],
         "roll-call" => &["matrix-profile", "matrix-room-send"],
         "room-info" => &["matrix-room-info"],
-        "room-members" | "room-pins" | "room-threads" => &["matrix-room-read", "robrix-navigation"],
+        "room-members" | "room-threads" => &["matrix-room-read", "robrix-navigation", "matrix-room-watch"],
+        "room-pins" => &["matrix-room-read", "robrix-navigation", "matrix-room-info"],
         _ => &[],
     };
     p.iter().map(|x| x.to_string()).collect()
@@ -78,6 +79,7 @@ fn reasons_for(id: &str) -> std::collections::BTreeMap<String, String> {
             ("matrix-room-read", "Lists the latest messages in this room."),
             ("matrix-room-send", "Sends the message you type into this room."),
             ("robrix-navigation", "Jumps to a message you tap."),
+            ("matrix-room-watch", "Shows new messages as they arrive."),
         ],
         "roll-call" => &[
             ("matrix-profile", "Shows who is rolling."),
@@ -89,14 +91,17 @@ fn reasons_for(id: &str) -> std::collections::BTreeMap<String, String> {
         "room-members" => &[
             ("matrix-room-read", "Lists who is in this room."),
             ("robrix-navigation", "Opens the profile of a member you tap."),
+            ("matrix-room-watch", "Refreshes the list as people join or leave."),
         ],
         "room-pins" => &[
             ("matrix-room-read", "Shows this room's pinned messages."),
             ("robrix-navigation", "Jumps to a pinned message you tap."),
+            ("matrix-room-info", "Refreshes when the pins change."),
         ],
         "room-threads" => &[
             ("matrix-room-read", "Lists the discussion threads in this room."),
             ("robrix-navigation", "Opens a thread you tap."),
+            ("matrix-room-watch", "Refreshes as new messages arrive."),
         ],
         _ => &[],
     };
