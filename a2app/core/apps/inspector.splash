@@ -158,9 +158,9 @@ let _boot = start_timeout(0.05, || {
 })
 
 View{
-    width: Fill height: Fit flow: Down align: Align{x: 0.5}
-    col := View{
-        width: Fill{max: 460.0} height: Fit flow: Down spacing: 10 padding: 14
+    width: Fill height: Fill flow: Down align: Align{x: 0.5}
+    col := ScrollYView{
+        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
         Label{
             text: "Inspector" padding: 0 margin: 0
             draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }

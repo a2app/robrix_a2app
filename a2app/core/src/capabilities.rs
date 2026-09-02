@@ -406,8 +406,8 @@ pub const CATALOG: &[Capability] = &[
     cap!("on_prefs_changed", "Display settings changed", "One of those settings changed.", Read, Incoming, Client, Some(P::RobrixPreferences), Available, Low, ["on_prefs_changed"]),
     cap!("on_theme_changed", "Theme changed", "Scheme or zoom changed (ScriptReapply).", Read, Incoming, Client, Some(P::RobrixPreferences), PlannedNewPlumbing, Low, []),
     // ----- robrix-observe -----
-    cap!("on_active_room_changed", "You switched rooms", "Which room, thread, or nothing Robrix now shows; latest-only per pass. Reveals browsing, so it prompts.", Read, Incoming, MultiRoom, Some(P::RobrixObserve), Available, High, ["on_active_room_changed"]),
-    cap!("on_navigation_changed", "You switched screens", "Home, a space, settings, mini apps; latest-only per pass.", Read, Incoming, Client, Some(P::RobrixObserve), Available, Medium, ["on_navigation_changed"]),
+    cap!("on_active_room_changed", "Know which room you switch to", "Which room, thread, or nothing Robrix now shows; latest-only per pass. Reveals browsing, so it prompts.", Read, Incoming, MultiRoom, Some(P::RobrixObserve), Available, High, ["on_active_room_changed"]),
+    cap!("on_navigation_changed", "Know which screen you switch to", "Home, a space, settings, mini apps; latest-only per pass.", Read, Incoming, Client, Some(P::RobrixObserve), Available, Medium, ["on_navigation_changed"]),
     cap!("on_launch", "Launch context hook", "Be told how the instance was opened: slash command, timeline card, list, or tab.", Read, Incoming, Instance, None, PlannedMachinery, Low, []),
     // ----- never -----
     cap!("apps.manage", "Manage installed apps", "Never: install, uninstall, archive, restore, export or import apps stays a user-only surface.", Write, Outgoing, Apps, None, Never, Critical, []),

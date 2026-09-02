@@ -53,7 +53,7 @@ script_mod! {
                 flow: Down
                 padding: Inset{left: 8, right: 8, top: 8, bottom: 8}
                 splash := Splash {
-                    width: Fill, height: Fit
+                    width: Fill, height: Fill
                 }
             }
         }
