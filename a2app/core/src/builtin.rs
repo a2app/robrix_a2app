@@ -66,6 +66,7 @@ fn permissions_for(id: &str) -> Vec<String> {
         "room-info" => &["matrix-room-info"],
         "room-members" | "room-threads" => &["matrix-room-read", "robrix-navigation", "matrix-room-watch"],
         "search" => &["matrix-room-read", "matrix-rooms-list", "matrix-rooms-read", "robrix-navigation"],
+        "watcher" => &["matrix-room-watch", "notifications", "matrix-room-send"],
         "room-pins" => &["matrix-room-read", "robrix-navigation", "matrix-room-info"],
         _ => &[],
     };
@@ -112,6 +113,11 @@ fn reasons_for(id: &str) -> std::collections::BTreeMap<String, String> {
             ("matrix-rooms-read", "Searches messages across the rooms you pick."),
             ("robrix-navigation", "Jumps to a result you tap."),
         ],
+        "watcher" => &[
+            ("matrix-room-watch", "Sees new messages so it can match your rules."),
+            ("notifications", "Tells you when a message matches a rule."),
+            ("matrix-room-send", "Posts your reply when a rule says to."),
+        ],
         _ => &[],
     };
     r.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
@@ -132,6 +138,7 @@ pub fn builtin_apps() -> Vec<MiniAppManifest> {
         app("room-pins", "Pinned Events", "📌", 0xC0533E, app_source!("room_pins.splash")),
         app("room-threads", "Room Threads", "🧵", 0x8A5CA8, app_source!("room_threads.splash")),
         app("search", "Search", "🔍", 0x0F88FE, app_source!("search.splash")),
+        app("watcher", "Watcher", "👁", 0xD9822B, app_source!("watcher.splash")),
     ]
 }
 
@@ -144,7 +151,7 @@ mod tests {
     #[test]
     fn catalog_matches_the_splash_headers() {
         let apps = builtin_apps();
-        assert_eq!(apps.len(), 7);
+        assert_eq!(apps.len(), 8);
         for m in &apps {
             assert!(m.builtin);
             assert!(m.widget.is_none());
@@ -154,5 +161,28 @@ mod tests {
             assert_eq!(h.permissions, m.permissions, "{}", m.id);
             assert_eq!(h.permission_reasons, m.permission_reasons, "{}", m.id);
         }
+    }
+
+    /// Every stock app must parse with the real Splash parser, or it would
+    /// launch to an empty pane.
+    #[test]
+    fn builtin_sources_parse() {
+        use makepad_widgets::makepad_script::{parser::ScriptParser, tokenizer::ScriptTokenizer, ScriptVmBase};
+
+        fn parse_errors(base: &mut ScriptVmBase, source: &str) -> Vec<String> {
+            let mut tokenizer = ScriptTokenizer::default();
+            tokenizer.tokenize(source, &mut base.heap);
+            let mut parser = ScriptParser::default();
+            parser.parse(&tokenizer, "builtin", (0, 0), &[]);
+            parser.parse_errors
+        }
+
+        let mut base = ScriptVmBase::new();
+        for m in builtin_apps() {
+            let errors = parse_errors(&mut base, &m.source);
+            assert!(errors.is_empty(), "{}: {errors:?}", m.id);
+        }
+        // A missing property value is a parse error, so the check has teeth.
+        assert!(!parse_errors(&mut base, "View{ width: }").is_empty());
     }
 }

@@ -1,0 +1,208 @@
+// name: Watcher
+// icon: 👁
+// tint: #D9822B
+// permissions: matrix-room-watch, notifications, matrix-room-send
+// why-matrix-room-watch: Sees new messages so it can match your rules.
+// why-notifications: Tells you when a message matches a rule.
+// why-matrix-room-send: Posts your reply when a rule says to.
+
+let rules = []
+let hits = []
+let last_reply = ""
+let watch_line = "Starting…"
+let metas = ["\\", ".", "*", "+", "?", "(", ")", "[", "]", "{", "}", "|", "^", "$"]
+
+fn save(){ fs.write("/rules.json", rules.to_json()) }
+
+fn load(){
+    if fs.exists("/rules.json") {
+        let parsed = fs.read("/rules.json").parse_json()
+        if parsed.is_array() { rules = parsed }
+    }
+}
+
+// Escapes regex metacharacters so a keyword always matches literally.
+fn keyword_pattern(keyword){
+    let out = keyword
+    for c in metas {
+        let parts = out.split(c)
+        let first = true
+        out = ""
+        for part in parts {
+            let sep = "\\" + c
+            if first { sep = "" }
+            let next = out + sep + part
+            out = next
+            first = false
+        }
+    }
+    return out
+}
+
+fn show_status(){
+    let line = watch_line
+    if !host.has("matrix.room.message.send") {
+        line = line + " Replies are off until this app may send to the room."
+    }
+    ui.status.set_text(line)
+}
+
+fn subscribe(){
+    host.request("events.subscribe", {event: "on_room_message"}, fn(r){
+        if r.is_ok {
+            watch_line = "Watching this room."
+        } else {
+            watch_line = "Not watching: " + r.error
+        }
+        show_status()
+    })
+}
+
+fn on_permissions_changed(caps){ subscribe() }
+
+fn add_rule(){
+    let keyword = ui.keyword_input.text().trim()
+    if keyword == "" { return nil }
+    rules.push({
+        keyword: keyword
+        pattern: keyword_pattern(keyword)
+        notify: !ui.silent_toggle.checked()
+        reply: ui.reply_input.text().trim()
+    })
+    save()
+    ui.keyword_input.set_text("")
+    ui.reply_input.set_text("")
+    ui.rule_list.render()
+}
+
+fn remove_rule(i){
+    if i >= rules.len() { return nil }
+    rules.remove(i)
+    save()
+    ui.rule_list.render()
+}
+
+fn rule_line(rule){
+    let line = "notify off"
+    if rule.notify { line = "notify on" }
+    if rule.reply.len() > 0 { line = line + "  ·  reply: " + rule.reply }
+    return line
+}
+
+// Own messages and our own replies never match, so a rule can't loop on itself.
+fn check(m){
+    if m.is_own { return nil }
+    if m.body == last_reply { return nil }
+    let line = m.sender_name + ": " + m.body
+    for rule in rules {
+        if regex(rule.pattern, "i").test(m.body) {
+            hits.push(line)
+            if rule.notify {
+                host.request("notify.post", {title: "Watcher: " + rule.keyword, body: line}, nil)
+            }
+            if rule.reply.len() > 0 {
+                if host.has("matrix.room.message.send") {
+                    last_reply = rule.reply
+                    host.request("matrix.send_message", {body: rule.reply}, fn(r){
+                        if !r.is_ok { ui.status.set_text("Reply failed: " + r.error) }
+                    })
+                }
+            }
+        }
+    }
+    while hits.len() > 20 { hits.remove(0) }
+}
+
+fn on_room_message(json){
+    let batch = json.parse_json()
+    for m in batch { check(m) }
+    ui.hit_list.render()
+}
+
+let _init = load()
+let _boot = start_timeout(0.05, || {
+    subscribe()
+    ui.rule_list.render()
+})
+
+View{
+    width: Fill height: Fit flow: Down align: Align{x: 0.5}
+    col := View{
+        width: Fill{max: 460.0} height: Fit flow: Down spacing: 10 padding: 14
+        Label{
+            text: "Watcher" padding: 0 margin: 0
+            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }
+        }
+        status := Label{
+            text: "Starting…" width: Fill padding: 0 margin: 0
+            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
+        }
+        RoundedView{
+            width: Fill height: Fit flow: Down spacing: 8 padding: 10
+            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
+            keyword_input := TextInput{ width: Fill empty_text: "Keyword to watch for" on_return: |t| add_rule() }
+            reply_input := TextInput{ width: Fill empty_text: "Auto-reply text (optional)" on_return: |t| add_rule() }
+            View{
+                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8 align: Align{y: 0.5}
+                silent_toggle := Toggle{
+                    text: "Silent (no notification)"
+                    draw_text +: { color: #x333333 }
+                }
+                Button{ text: "Add rule" on_click: || add_rule() draw_text +: { color: #x1C274C } }
+            }
+        }
+        Label{
+            text: "Rules  ·  tap one to remove it" padding: 0 margin: 0
+            draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+        }
+        rule_list := ScrollYView{
+            width: Fill height: 150 flow: Down spacing: 5
+            on_item_tap: |i| remove_rule(i)
+            on_render: || {
+                if rules.len() == 0 {
+                    Label{
+                        text: "No rules yet. Add a keyword above." width: Fill padding: 0 margin: 0
+                        draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                    }
+                } else {
+                    for rule in rules {
+                        RoundedView{
+                            width: Fill height: Fit flow: Down spacing: 2 padding: 8
+                            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                            Label{
+                                text: rule.keyword width: Fill padding: 0 margin: 0
+                                draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} }
+                            }
+                            Label{
+                                text: rule_line(rule) width: Fill padding: 0 margin: 0
+                                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 11} }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Label{
+            text: "Recent matches" padding: 0 margin: 0
+            draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+        }
+        hit_list := ScrollYView{
+            width: Fill height: 140 flow: Down spacing: 4
+            on_render: || {
+                if hits.len() == 0 {
+                    Label{
+                        text: "Nothing has matched yet." width: Fill padding: 0 margin: 0
+                        draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                    }
+                } else {
+                    for line in hits {
+                        Label{
+                            text: line width: Fill padding: 0 margin: 0
+                            draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -27,11 +27,23 @@ cargo run --features a2app
 - **Matrix services** for apps attached to a room: `matrix.room_info`,
   `matrix.read_messages`, `matrix.send_message`, and `matrix.profile`, each
   behind its own permission.
-- **Sharing**: export any app as a `.splashapp` bundle (file + clipboard), or
-  post it into a room with `/miniapp share <name>`, where it renders as a
-  card other Robrix users can install and run.
-- Two built-in demo apps: **Room Peek** (room info + recent messages + send)
-  and **Roll Call** (dice roller that can post its roll to the room).
+- **Live room updates**: an app can subscribe to its room (new messages,
+  membership, pins) and refresh itself instead of polling; the built-ins do.
+- **Writes are off by default**: the "Mini-apps may write to rooms" switch on
+  the Mini Apps screen gates every send, on top of per-app permissions.
+- **Version history**: every AI change, hand edit (there is a source editor),
+  and version switch is kept; switch back and forth freely, diff any version
+  against the current source, and reset a built-in to stock.
+- **Sharing**: export any app as a `.splashapp` bundle (file + clipboard),
+  hand it to another app through the system share sheet, send it into a room
+  as a file attachment with a pre-filled caption ("Send to room…"), or post
+  it with `/miniapp share <name>`, where it renders as a card other Robrix
+  users can install and run. "Open in room…" docks an app into any room you
+  pick, straight from the Mini Apps screen.
+- Built-in demo apps, including **Room Peek** (room info + recent messages + send),
+  **Roll Call** (dice roller that can post its roll to the room), **Search**
+  (messages across one room or many), and **Watcher** (keyword rules that
+  notify you when a message matches and can auto-reply).
 
 ## Crates
 
