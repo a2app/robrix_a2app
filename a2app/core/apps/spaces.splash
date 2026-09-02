@@ -66,6 +66,7 @@ fn load_spaces(){
     ui.status.set_text("Loading your spaces…")
     host.request("matrix.spaces", nil, fn(r){
         if r.is_ok {
+            items = []
             for s in r.data.spaces {
                 items.push({room_id: s.space_id name: s.name topic: s.topic member_count: s.member_count is_space: true joined: true})
             }
