@@ -1,0 +1,245 @@
+// name: Inbox
+// icon: 📥
+// tint: #E0862B
+// permissions: matrix-rooms-list, robrix-navigation, matrix-membership
+// why-matrix-rooms-list: Lists your invites and the rooms with unread messages.
+// why-robrix-navigation: Opens a room you tap.
+// why-matrix-membership: Accepts or declines an invite when you tap a button.
+
+let invites = []
+let unread = []
+let invite_note = "Loading…"
+let unread_note = "Loading…"
+let pick_id = ""
+let pick_name = ""
+let pick_verb = ""
+
+fn plural(n, word){
+    if "" + n == "1" { return word }
+    return word + "s"
+}
+
+fn totals_text(u, m){
+    return "" + u + " unread · " + m + " " + plural(m, "mention")
+}
+
+fn invite_line(it){
+    let who = "someone"
+    if !it.inviter_name.is_nil() { who = it.inviter_name }
+    let line = "invited by " + who
+    if it.is_space { line = "space · " + line }
+    if it.is_direct { line = "DM · " + line }
+    return line
+}
+
+fn badge(it){
+    let b = "" + it.unread
+    if it.mentions > 0 { b = b + " · " + it.mentions + " " + plural(it.mentions, "mention") }
+    return b
+}
+
+fn outranks(a, b){
+    if a.mentions > b.mentions { return true }
+    if a.mentions < b.mentions { return false }
+    return a.unread > b.unread
+}
+
+fn sync_pick(){
+    let found = false
+    for inv in invites {
+        if inv.room_id == pick_id { found = true }
+    }
+    if !found { pick_id = "" }
+    ui.pick_wrap.set_visible(found)
+}
+
+fn pick_invite(i){
+    if i >= invites.len() { return nil }
+    pick_id = invites[i].room_id
+    pick_name = invites[i].name
+    ui.pick_title.set_text(pick_name)
+    ui.pick_note.set_text("")
+    sync_pick()
+}
+
+fn answer_invite(accept){
+    if pick_id == "" { return nil }
+    pick_verb = "Declined"
+    if accept { pick_verb = "Accepted" }
+    ui.pick_note.set_text("One moment…")
+    host.request("matrix.invite_respond", {room_id: pick_id, accept: accept}, fn(r){
+        if !r.is_ok {
+            ui.pick_note.set_text(r.error)
+            return nil
+        }
+        ui.status.set_text(pick_verb + " the invite to " + pick_name)
+        load_invites()
+    })
+}
+
+fn load_invites(){
+    host.request("matrix.invites", nil, fn(r){
+        if r.is_ok {
+            invites = r.data.invites
+            invite_note = "No pending invites."
+            ui.invite_head.set_text("INVITES · " + invites.len())
+        } else {
+            invites = []
+            invite_note = r.error
+            ui.invite_head.set_text("INVITES")
+        }
+        sync_pick()
+        ui.invite_list.render()
+    })
+}
+
+fn load_unread(){
+    host.request("matrix.rooms_list", nil, fn(r){
+        if !r.is_ok {
+            unread = []
+            unread_note = r.error
+            ui.totals.set_text("Unread counts unavailable.")
+            ui.unread_head.set_text("UNREAD")
+            ui.unread_list.render()
+            return nil
+        }
+        let pending = []
+        let sum_u = 0
+        let sum_m = 0
+        for it in r.data.rooms {
+            if !it.is_space && it.unread + it.mentions > 0 {
+                pending.push(it)
+                sum_u += it.unread
+                sum_m += it.mentions
+            }
+        }
+        unread = []
+        while pending.len() > 0 {
+            let best = 0
+            let i = 0
+            for it in pending {
+                if outranks(it, pending[best]) { best = i }
+                i += 1
+            }
+            unread.push(pending[best])
+            pending.remove(best)
+        }
+        unread_note = "Nothing unread. You're all caught up."
+        ui.totals.set_text(totals_text(sum_u, sum_m))
+        ui.unread_head.set_text("UNREAD · " + unread.len() + " " + plural(unread.len(), "room"))
+        ui.unread_list.render()
+    })
+}
+
+fn load_all(){
+    load_invites()
+    load_unread()
+}
+
+fn open_room(i){
+    if i >= unread.len() { return nil }
+    host.request("nav.room", {room_id: unread[i].room_id}, fn(r){
+        if !r.is_ok { ui.status.set_text(r.error) }
+    })
+}
+
+fn on_invite_received(json){ load_invites() }
+fn on_rooms_changed(json){ load_unread() }
+fn on_unread_totals_changed(json){
+    let t = json.parse_json()
+    ui.totals.set_text(totals_text(t.unread, t.mentions))
+}
+
+fn watch(){
+    host.request("events.subscribe", {event: "on_invite_received"}, nil)
+    host.request("events.subscribe", {event: "on_rooms_changed"}, nil)
+    host.request("events.subscribe", {event: "on_unread_totals_changed"}, nil)
+}
+
+fn on_permissions_changed(caps){
+    load_all()
+    watch()
+}
+
+let _boot = start_timeout(0.05, || {
+    load_all()
+    watch()
+})
+
+View{
+    width: Fill height: Fit flow: Down align: Align{x: 0.5}
+    col := View{
+        width: Fill{max: 520.0} height: Fit flow: Down spacing: 10 padding: 14
+        View{
+            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+            Label{ text: "Inbox" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} } }
+            Button{ text: "Refresh" on_click: || load_all() draw_text +: { color: #x1C274C } }
+        }
+        totals := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_bold{font_size: 13} } }
+        status := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
+        invite_head := Label{ text: "INVITES" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
+        invite_list := ScrollYView{
+            width: Fill height: 140 flow: Down spacing: 5
+            on_item_tap: |i| pick_invite(i)
+            on_render: || {
+                if invites.len() == 0 {
+                    Label{ text: invite_note width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
+                } else {
+                    for it in invites {
+                        RoundedView{
+                            width: Fill height: Fit flow: Down spacing: 2 padding: 10
+                            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                            Label{
+                                text: it.name width: Fill padding: 0 margin: 0
+                                draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} }
+                            }
+                            Label{
+                                text: invite_line(it) width: Fill padding: 0 margin: 0
+                                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 11} }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        pick_wrap := View{
+            width: Fill height: Fit flow: Down visible: false
+            RoundedView{
+                width: Fill height: Fit flow: Down spacing: 6 padding: 12
+                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
+                pick_title := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 14} } }
+                View{
+                    width: Fill height: Fit flow: Right spacing: 8
+                    Button{ text: "Accept" on_click: || answer_invite(true) draw_text +: { color: #x138808 } }
+                    Button{ text: "Decline" on_click: || answer_invite(false) draw_text +: { color: #xB91C1C } }
+                }
+                pick_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 11} } }
+            }
+        }
+        unread_head := Label{ text: "UNREAD" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
+        unread_list := ScrollYView{
+            width: Fill height: 240 flow: Down spacing: 5
+            on_item_tap: |i| open_room(i)
+            on_render: || {
+                if unread.len() == 0 {
+                    Label{ text: unread_note width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
+                } else {
+                    for it in unread {
+                        RoundedView{
+                            width: Fill height: Fit flow: Right spacing: 8 padding: 10 align: Align{y: 0.5}
+                            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                            Label{
+                                text: it.name width: Fill padding: 0 margin: 0
+                                draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} }
+                            }
+                            Label{
+                                text: badge(it) padding: 0 margin: 0
+                                draw_text +: { color: #x0f88fe text_style: theme.font_bold{font_size: 11} }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

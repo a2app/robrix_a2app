@@ -1,0 +1,207 @@
+// name: Who's Here
+// icon: 👀
+// tint: #3A86FF
+// permissions: matrix-room-read, matrix-room-watch, robrix-navigation
+// why-matrix-room-read: Shows how far each person has read.
+// why-matrix-room-watch: Updates who is typing and reading as it happens.
+// why-robrix-navigation: Opens a person you tap, or jumps to the message they read.
+
+let rows = []
+let cells = []
+let bodies = []
+let pending = ""
+
+fn ago(ts){
+    if ts.is_nil() { return "" }
+    let s = time_now() - ts / 1000.0
+    if s < 60.0 { return "just now" }
+    if s < 3600.0 { return "" + floor(s / 60.0) + "m ago" }
+    if s < 86400.0 { return "" + floor(s / 3600.0) + "h ago" }
+    return "" + floor(s / 86400.0) + "d ago"
+}
+
+fn body_of(event_id){
+    for b in bodies {
+        if b.event_id == event_id { return b.body }
+    }
+    return nil
+}
+
+// Two list cells per person: their name, then the message they last read.
+fn refresh(){
+    cells = []
+    for row in rows {
+        let body = body_of(row.event_id)
+        if body.is_nil() { body = "…" }
+        cells.push({who: true, text: row.name + "  ·  " + ago(row.ts), user_id: row.user_id})
+        cells.push({who: false, text: body, event_id: row.event_id})
+    }
+    ui.receipt_list.render()
+}
+
+// One matrix.event lookup in flight at a time, for the top rows only.
+fn fetch_next(){
+    if pending != "" { return nil }
+    let n = min(rows.len(), 10)
+    let i = 0
+    while i < n {
+        let id = rows[i].event_id
+        i += 1
+        if body_of(id).is_nil() {
+            pending = id
+            host.request("matrix.event", {event_id: id}, fn(r){
+                let text = "(couldn't load this message)"
+                if r.is_ok { text = r.data.body }
+                bodies.push({event_id: id, body: text})
+                pending = ""
+                refresh()
+                if !r.is_ok { return nil }
+                fetch_next()
+            })
+            return nil
+        }
+    }
+}
+
+fn load(){
+    host.request("matrix.read_receipts", nil, fn(r){
+        if r.is_ok {
+            rows = r.data.receipts
+            if rows.len() == 0 {
+                ui.header.set_text("No read positions: read receipts are turned off in your settings.")
+            } else {
+                ui.header.set_text("" + rows.len() + " read positions · tap a person, or the message they read")
+            }
+        } else {
+            rows = []
+            ui.header.set_text(r.error)
+        }
+        fetch_next()
+        refresh()
+    })
+}
+
+fn on_room_typing(json){
+    let ev = json.parse_json()
+    let names = ""
+    for t in ev.typing {
+        let name = t.name
+        if name.is_nil() { name = t.user_id }
+        let sep = ", "
+        if names == "" { sep = "" }
+        let next = names + sep + name
+        names = next
+    }
+    let line = "Nobody is typing"
+    if ev.typing.len() > 0 { line = names + " is typing…" }
+    if ev.typing.len() > 1 { line = names + " are typing…" }
+    ui.typing.set_text(line)
+}
+
+fn on_room_receipt(json){
+    let ev = json.parse_json()
+    for rc in ev.receipts {
+        let known = false
+        let k = 0
+        while k < rows.len() {
+            if rows[k].user_id == rc.user_id {
+                known = true
+                rows[k] += {event_id: rc.event_id, ts: rc.ts}
+            }
+            let next = k + 1
+            k = next
+        }
+        if !known {
+            let parts = rc.user_id.split(":")
+            rows.push({user_id: rc.user_id, name: parts[0], event_id: rc.event_id, ts: rc.ts})
+        }
+    }
+    fetch_next()
+    refresh()
+}
+
+fn watch(){
+    host.request("events.subscribe", {event: "on_room_typing"}, nil)
+    host.request("events.subscribe", {event: "on_room_receipt"}, nil)
+}
+
+fn on_permissions_changed(caps){
+    load()
+    watch()
+}
+
+fn tap_cell(i){
+    if i >= cells.len() { return nil }
+    let c = cells[i]
+    if c.who {
+        host.request("nav.user", {user_id: c.user_id}, on_nav)
+        return nil
+    }
+    host.request("nav.event", {event_id: c.event_id}, on_nav)
+}
+
+fn on_nav(r){ if !r.is_ok { ui.header.set_text(r.error) } }
+
+let _boot = start_timeout(0.05, || {
+    load()
+    watch()
+})
+
+View{
+    width: Fill height: Fit flow: Down align: Align{x: 0.5}
+    col := View{
+        width: Fill{max: 460.0} height: Fit flow: Down spacing: 10 padding: 14
+        Label{
+            text: "Who's Here" padding: 0 margin: 0
+            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }
+        }
+        RoundedView{
+            width: Fill height: Fit padding: 10
+            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
+            typing := Label{
+                text: "Nobody is typing" width: Fill padding: 0 margin: 0
+                draw_text +: { color: #x0f88fe text_style: theme.font_bold{font_size: 13} }
+            }
+        }
+        header := Label{
+            text: "Loading…" width: Fill padding: 0 margin: 0
+            draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 12} }
+        }
+        receipt_list := ScrollYView{
+            width: Fill height: 330 flow: Down spacing: 0
+            on_item_tap: |i| tap_cell(i)
+            on_render: || {
+                if cells.len() == 0 {
+                    Label{
+                        text: "Nothing to show. This app needs to be opened from a room, and needs your permission to read it."
+                        width: Fill padding: 0 margin: 0
+                        draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                    }
+                } else {
+                    for c in cells {
+                        if c.who {
+                            RoundedView{
+                                width: Fill height: Fit padding: Inset{top: 8, bottom: 2, left: 10, right: 10}
+                                margin: Inset{top: 6}
+                                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                                Label{
+                                    text: c.text width: Fill padding: 0 margin: 0
+                                    draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} }
+                                }
+                            }
+                        } else {
+                            RoundedView{
+                                width: Fill height: Fit padding: Inset{top: 2, bottom: 8, left: 10, right: 10}
+                                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                                Label{
+                                    text: c.text width: Fill padding: 0 margin: 0
+                                    draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

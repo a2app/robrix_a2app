@@ -1,0 +1,228 @@
+// name: Room Tools
+// icon: 🧰
+// tint: #8D6E63
+// permissions: matrix-room-read, matrix-room-info, matrix-room-manage, clipboard-write, robrix-navigation
+// why-matrix-room-read: Lists recent messages and which of them are pinned.
+// why-matrix-room-info: Reads the unread flag, room links and where an upgraded room went.
+// why-matrix-room-manage: Changes favorite, low priority, unread and pins when you tap.
+// why-clipboard-write: Copies a room or message link when you tap.
+// why-robrix-navigation: Opens the upgraded room when you tap.
+
+// `on` stays nil until the first toggle succeeds (or matrix.unread answers).
+let flags = [
+    {service: "matrix.favorite", on: nil, on_text: "Unfavorite", off_text: "Favorite", done_on: "Added to favorites.", done_off: "Removed from favorites."},
+    {service: "matrix.low_priority", on: nil, on_text: "Normal priority", off_text: "Low priority", done_on: "Marked low priority.", done_off: "Back to normal priority."},
+    {service: "matrix.mark_unread", on: nil, on_text: "Clear unread", off_text: "Mark unread", done_on: "Marked unread.", done_off: "Unread flag cleared."}
+]
+let messages = []
+let pins = []
+let successor = ""
+
+fn flag_text(f){
+    if f.on.is_nil() { return f.off_text + "…" }
+    if f.on { return f.on_text }
+    return f.off_text
+}
+
+fn show_flags(){
+    ui.fav_btn.set_text(flag_text(flags[0]))
+    ui.low_btn.set_text(flag_text(flags[1]))
+    ui.unread_btn.set_text(flag_text(flags[2]))
+}
+
+fn toggle(i){
+    let want = true
+    if !flags[i].on.is_nil() { want = !flags[i].on }
+    host.request(flags[i].service, {on: want}, fn(r){
+        if !r.is_ok {
+            ui.status.set_text(r.error)
+            return nil
+        }
+        flags[i] += {on: want}
+        let note = flags[i].done_off
+        if want { note = flags[i].done_on }
+        ui.status.set_text(note)
+        show_flags()
+    })
+}
+
+fn load_unread(){
+    host.request("matrix.unread", nil, fn(r){
+        if r.is_ok { flags[2] += {on: r.data.marked_unread} }
+        show_flags()
+    })
+}
+
+fn is_pinned(event_id){
+    for p in pins {
+        if p == event_id { return true }
+    }
+    return false
+}
+
+fn pin_line(m){
+    if is_pinned(m.event_id) { return "📌 pinned  ·  " + m.sender }
+    return "○ " + m.sender
+}
+
+fn load_pins(){
+    host.request("matrix.pinned_events", nil, fn(r){
+        pins = []
+        if r.is_ok {
+            for p in r.data.pinned { pins.push(p.event_id) }
+        } else {
+            ui.status.set_text(r.error)
+        }
+        ui.msg_list.render()
+    })
+}
+
+fn load_messages(){
+    host.request("matrix.read_messages", {limit: 15}, fn(r){
+        if r.is_ok {
+            messages = r.data.messages
+        } else {
+            messages = []
+            ui.status.set_text(r.error)
+        }
+        ui.msg_list.render()
+    })
+}
+
+fn toggle_pin(i){
+    if i >= messages.len() { return nil }
+    let id = messages[i].event_id
+    let want = !is_pinned(id)
+    host.request("matrix.pin", {event_id: id, pinned: want}, fn(r){
+        if !r.is_ok {
+            ui.status.set_text(r.error)
+            return nil
+        }
+        if want {
+            pins.push(id)
+            ui.status.set_text("Pinned.")
+        } else {
+            pins.retain(|p| p != id)
+            ui.status.set_text("Unpinned.")
+        }
+        ui.msg_list.render()
+    })
+}
+
+fn copy_link(event_id){
+    let args = nil
+    if event_id != "" { args = {event_id: event_id} }
+    host.request("matrix.permalink", args, fn(r){
+        if !r.is_ok {
+            ui.status.set_text(r.error)
+            return nil
+        }
+        let url = r.data.url
+        host.request("clipboard.write", {text: url}, fn(c){
+            let note = "Copied " + url
+            if !c.is_ok { note = c.error }
+            ui.status.set_text(note)
+        })
+    })
+}
+
+fn copy_latest(){
+    if messages.len() == 0 {
+        ui.status.set_text("No messages to link to yet.")
+        return nil
+    }
+    copy_link(messages[messages.len() - 1].event_id)
+}
+
+fn load_successor(){
+    host.request("matrix.successor", nil, fn(r){
+        successor = ""
+        if r.is_ok && r.data.upgraded { successor = r.data.room_id }
+        if successor.is_nil() { successor = "" }
+        ui.upgraded_wrap.set_visible(successor != "")
+    })
+}
+
+fn open_successor(){
+    host.request("nav.room", {room_id: successor}, fn(r){
+        if !r.is_ok { ui.status.set_text(r.error) }
+    })
+}
+
+fn load_all(){
+    load_unread()
+    load_pins()
+    load_messages()
+    load_successor()
+}
+
+fn on_permissions_changed(caps){ load_all() }
+
+let _boot = start_timeout(0.05, || load_all())
+
+View{
+    width: Fill height: Fit flow: Down align: Align{x: 0.5}
+    col := View{
+        width: Fill{max: 460.0} height: Fit flow: Down spacing: 10 padding: 14
+        Label{
+            text: "Room Tools" padding: 0 margin: 0
+            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }
+        }
+        status := Label{
+            text: "Each button changes this room only when you tap it." width: Fill padding: 0 margin: 0
+            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
+        }
+        upgraded_wrap := View{
+            width: Fill height: Fit visible: false
+            Button{
+                text: "This room was upgraded. Tap to open the new one" width: Fill
+                on_click: || open_successor()
+                draw_text +: { color: #xB91C1C }
+            }
+        }
+        View{
+            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 6
+            fav_btn := Button{ text: "Favorite…" on_click: || toggle(0) draw_text +: { color: #x1C274C } }
+            low_btn := Button{ text: "Low priority…" on_click: || toggle(1) draw_text +: { color: #x1C274C } }
+            unread_btn := Button{ text: "Mark unread…" on_click: || toggle(2) draw_text +: { color: #x1C274C } }
+        }
+        View{
+            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 6
+            Button{ text: "Copy room link" on_click: || copy_link("") draw_text +: { color: #x1C274C } }
+            Button{ text: "Copy link to latest message" on_click: || copy_latest() draw_text +: { color: #x1C274C } }
+        }
+        Label{
+            text: "Recent messages  ·  tap one to pin or unpin it" padding: 0 margin: 0
+            draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+        }
+        msg_list := ScrollYView{
+            width: Fill height: 260 flow: Down spacing: 5
+            on_item_tap: |i| toggle_pin(i)
+            on_render: || {
+                if messages.len() == 0 {
+                    Label{
+                        text: "No messages to show. This app needs to be opened from a room, and needs your permission to read it."
+                        width: Fill padding: 0 margin: 0
+                        draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                    }
+                } else {
+                    for m in messages {
+                        RoundedView{
+                            width: Fill height: Fit flow: Down spacing: 2 padding: 10
+                            show_bg: true
+                            draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                            Label{
+                                text: pin_line(m) width: Fill padding: 0 margin: 0
+                                draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+                            }
+                            Label{
+                                text: m.body width: Fill padding: 0 margin: 0
+                                draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

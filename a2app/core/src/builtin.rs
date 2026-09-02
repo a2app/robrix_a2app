@@ -67,6 +67,13 @@ fn permissions_for(id: &str) -> Vec<String> {
         "room-members" | "room-threads" => &["matrix-room-read", "robrix-navigation", "matrix-room-watch"],
         "search" => &["matrix-room-read", "matrix-rooms-list", "matrix-rooms-read", "robrix-navigation"],
         "watcher" => &["matrix-room-watch", "notifications", "matrix-room-send"],
+        "presence" => &["matrix-room-read", "matrix-room-watch", "robrix-navigation"],
+        "room-tools" => &["matrix-room-read", "matrix-room-info", "matrix-room-manage", "clipboard-write", "robrix-navigation"],
+        "spaces" => &["matrix-spaces", "matrix-rooms-list", "robrix-navigation", "matrix-membership"],
+        "inbox" => &["matrix-rooms-list", "robrix-navigation", "matrix-membership"],
+        "room-stats" => &["matrix-room-read", "matrix-room-info", "robrix-navigation"],
+        "account" => &["matrix-profile", "matrix-account-read", "matrix-users", "open-url", "robrix-navigation"],
+        "inspector" => &["robrix-ui", "robrix-preferences", "robrix-observe", "device-info"],
         "room-pins" => &["matrix-room-read", "robrix-navigation", "matrix-room-info"],
         _ => &[],
     };
@@ -118,6 +125,47 @@ fn reasons_for(id: &str) -> std::collections::BTreeMap<String, String> {
             ("notifications", "Tells you when a message matches a rule."),
             ("matrix-room-send", "Posts your reply when a rule says to."),
         ],
+        "presence" => &[
+            ("matrix-room-read", "Shows how far each person has read."),
+            ("matrix-room-watch", "Updates who is typing and reading as it happens."),
+            ("robrix-navigation", "Opens a person you tap, or jumps to the message they read."),
+        ],
+        "room-tools" => &[
+            ("matrix-room-read", "Lists recent messages and which of them are pinned."),
+            ("matrix-room-info", "Reads the unread flag, room links and where an upgraded room went."),
+            ("matrix-room-manage", "Changes favorite, low priority, unread and pins when you tap."),
+            ("clipboard-write", "Copies a room or message link when you tap."),
+            ("robrix-navigation", "Opens the upgraded room when you tap."),
+        ],
+        "spaces" => &[
+            ("matrix-spaces", "Lists your spaces and the rooms inside them."),
+            ("matrix-rooms-list", "Previews a room you have not joined yet."),
+            ("robrix-navigation", "Opens a room you tap."),
+            ("matrix-membership", "Joins a room when you tap Join."),
+        ],
+        "inbox" => &[
+            ("matrix-rooms-list", "Lists your invites and the rooms with unread messages."),
+            ("robrix-navigation", "Opens a room you tap."),
+            ("matrix-membership", "Accepts or declines an invite when you tap a button."),
+        ],
+        "room-stats" => &[
+            ("matrix-room-read", "Reads this room's messages to count who posts and when."),
+            ("matrix-room-info", "Shows your power level and what it lets you do here."),
+            ("robrix-navigation", "Opens the profile of a sender you tap."),
+        ],
+        "account" => &[
+            ("matrix-profile", "Shows your display name and user id."),
+            ("matrix-account-read", "Shows this device, your homeserver, and who you ignore."),
+            ("matrix-users", "Looks up the profile and DM of a user id you enter."),
+            ("open-url", "Opens your homeserver's account management page."),
+            ("robrix-navigation", "Opens the DM you already have with a user you look up."),
+        ],
+        "inspector" => &[
+            ("robrix-ui", "Moves, minimizes, breaks out or closes its own pane when you tap."),
+            ("robrix-preferences", "Shows Robrix's display settings and follows changes to them."),
+            ("robrix-observe", "Logs which room and screen you switch to, so you can see what an app would see."),
+            ("device-info", "Shows what this device reports about itself."),
+        ],
         _ => &[],
     };
     r.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
@@ -139,6 +187,13 @@ pub fn builtin_apps() -> Vec<MiniAppManifest> {
         app("room-threads", "Room Threads", "🧵", 0x8A5CA8, app_source!("room_threads.splash")),
         app("search", "Search", "🔍", 0x0F88FE, app_source!("search.splash")),
         app("watcher", "Watcher", "👁", 0xD9822B, app_source!("watcher.splash")),
+        app("presence", "Who's Here", "👀", 0x3A86FF, app_source!("presence.splash")),
+        app("room-tools", "Room Tools", "🧰", 0x8D6E63, app_source!("room_tools.splash")),
+        app("spaces", "Spaces", "🪐", 0x5B3FD9, app_source!("spaces.splash")),
+        app("inbox", "Inbox", "📥", 0xE0862B, app_source!("inbox.splash")),
+        app("room-stats", "Room Stats", "📊", 0x2A9D8F, app_source!("room_stats.splash")),
+        app("account", "Account", "🪪", 0x386FA4, app_source!("account.splash")),
+        app("inspector", "Inspector", "🛠", 0x546E7A, app_source!("inspector.splash")),
     ]
 }
 
@@ -151,7 +206,7 @@ mod tests {
     #[test]
     fn catalog_matches_the_splash_headers() {
         let apps = builtin_apps();
-        assert_eq!(apps.len(), 8);
+        assert_eq!(apps.len(), 15);
         for m in &apps {
             assert!(m.builtin);
             assert!(m.widget.is_none());

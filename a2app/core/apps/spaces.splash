@@ -1,0 +1,244 @@
+// name: Spaces
+// icon: 🪐
+// tint: #5B3FD9
+// permissions: matrix-spaces, matrix-rooms-list, robrix-navigation, matrix-membership
+// why-matrix-spaces: Lists your spaces and the rooms inside them.
+// why-matrix-rooms-list: Previews a room you have not joined yet.
+// why-robrix-navigation: Opens a room you tap.
+// why-matrix-membership: Joins a room when you tap Join.
+
+let items = []
+let trail = []
+let empty_note = "Loading…"
+let preview_id = ""
+
+fn plural(n, word){
+    if "" + n == "1" { return word }
+    return word + "s"
+}
+
+fn shown_name(name, id){
+    if name.is_nil() || name == "" { return id }
+    return name
+}
+
+fn detail_line(it){
+    let line = "" + it.member_count + " " + plural(it.member_count, "member")
+    if it.topic != "" { line = line + " · " + it.topic }
+    return line
+}
+
+// The top level only lists joined spaces, so the joined mark is noise there.
+fn item_line(it){
+    if trail.len() == 0 { return detail_line(it) }
+    let mark = "○ not joined"
+    if it.joined { mark = "● joined" }
+    if it.is_space { mark = mark + " · subspace" }
+    return mark + " · " + detail_line(it)
+}
+
+fn crumb_text(){
+    let out = "Spaces"
+    for s in trail {
+        let next = out + " / " + s.name
+        out = next
+    }
+    return out
+}
+
+fn show_level(){
+    let inside = trail.len() > 0
+    ui.crumb.set_text(crumb_text())
+    ui.back_wrap.set_visible(inside)
+    ui.info_wrap.set_visible(inside)
+    ui.preview_wrap.set_visible(false)
+}
+
+fn clear_list(){
+    items = []
+    empty_note = "Loading…"
+    ui.item_list.render()
+}
+
+fn load_spaces(){
+    show_level()
+    clear_list()
+    ui.status.set_text("Loading your spaces…")
+    host.request("matrix.spaces", nil, fn(r){
+        if r.is_ok {
+            for s in r.data.spaces {
+                items.push({room_id: s.space_id name: s.name topic: s.topic member_count: s.member_count is_space: true joined: true})
+            }
+            empty_note = "You haven't joined any spaces yet."
+            ui.status.set_text("" + items.len() + " " + plural(items.len(), "space") + " · tap one to explore it")
+        } else {
+            empty_note = "Nothing to show."
+            ui.status.set_text(r.error)
+        }
+        ui.item_list.render()
+    })
+}
+
+fn load_rooms(){
+    let cur = trail[trail.len() - 1]
+    clear_list()
+    ui.status.set_text("Loading rooms…")
+    host.request("matrix.space_rooms", {space_id: cur.space_id}, fn(r){
+        if r.is_ok {
+            items = r.data.rooms
+            empty_note = "This space has no rooms yet."
+            ui.status.set_text("" + items.len() + " " + plural(items.len(), "room") + " · tap a room to open it, a subspace to enter it")
+        } else {
+            empty_note = "Nothing to show."
+            ui.status.set_text(r.error)
+        }
+        ui.item_list.render()
+    })
+}
+
+fn open_current(){
+    let cur = trail[trail.len() - 1]
+    show_level()
+    ui.space_title.set_text(cur.name)
+    ui.space_line.set_text("Loading…")
+    ui.space_topic.set_text("")
+    host.request("matrix.space_info", {space_id: cur.space_id}, fn(r){
+        if !r.is_ok {
+            ui.space_line.set_text(r.error)
+            return nil
+        }
+        let n = r.data.children_count
+        ui.space_line.set_text("" + r.data.member_count + " " + plural(r.data.member_count, "member") + " · " + n + " " + plural(n, "room") + " · " + r.data.join_rule)
+        ui.space_topic.set_text(r.data.topic)
+    })
+    load_rooms()
+}
+
+fn reload(){
+    if trail.len() > 0 {
+        open_current()
+        return nil
+    }
+    load_spaces()
+}
+
+fn go_back(){
+    trail.pop()
+    reload()
+}
+
+fn tap_item(i){
+    if i >= items.len() { return nil }
+    let it = items[i]
+    if it.is_space {
+        trail.push({space_id: it.room_id name: shown_name(it.name, it.room_id)})
+        open_current()
+        return nil
+    }
+    if it.joined {
+        host.request("nav.room", {room_id: it.room_id}, fn(r){
+            if !r.is_ok { ui.status.set_text(r.error) }
+        })
+        return nil
+    }
+    preview_id = it.room_id
+    ui.preview_title.set_text(shown_name(it.name, it.room_id))
+    ui.preview_line.set_text("Loading preview…")
+    ui.join_note.set_text("")
+    ui.preview_wrap.set_visible(true)
+    host.request("matrix.room_preview", {room: preview_id}, fn(r){
+        if !r.is_ok {
+            ui.preview_line.set_text(r.error)
+            return nil
+        }
+        ui.preview_line.set_text(detail_line(r.data) + " · " + r.data.join_rule)
+    })
+}
+
+fn join_room(){
+    if preview_id == "" { return nil }
+    ui.join_note.set_text("Joining…")
+    host.request("matrix.join", {room: preview_id}, fn(r){
+        if !r.is_ok {
+            ui.join_note.set_text(r.error)
+            return nil
+        }
+        if r.data.knocked {
+            ui.join_note.set_text("Knocked. You're in once someone lets you in.")
+            return nil
+        }
+        ui.join_note.set_text("Joined! Tap it in the list to open it.")
+        load_rooms()
+    })
+}
+
+fn on_permissions_changed(caps){ reload() }
+
+let _boot = start_timeout(0.05, || reload())
+
+View{
+    width: Fill height: Fit flow: Down align: Align{x: 0.5}
+    col := View{
+        width: Fill{max: 520.0} height: Fit flow: Down spacing: 10 padding: 14
+        View{
+            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+            Label{ text: "Spaces" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} } }
+            back_wrap := View{
+                width: Fit height: Fit visible: false
+                Button{ text: "Back" on_click: || go_back() draw_text +: { color: #x1C274C } }
+            }
+        }
+        crumb := Label{ text: "Spaces" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
+        status := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
+        info_wrap := View{
+            width: Fill height: Fit flow: Down visible: false
+            RoundedView{
+                width: Fill height: Fit flow: Down spacing: 4 padding: 12
+                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
+                space_title := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 16} } }
+                space_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
+                space_topic := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
+            }
+        }
+        item_list := ScrollYView{
+            width: Fill height: 300 flow: Down spacing: 5
+            on_item_tap: |i| tap_item(i)
+            on_render: || {
+                if items.len() == 0 {
+                    Label{ text: empty_note width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
+                } else {
+                    for it in items {
+                        RoundedView{
+                            width: Fill height: Fit flow: Down spacing: 2 padding: 10
+                            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                            Label{
+                                text: shown_name(it.name, it.room_id) width: Fill padding: 0 margin: 0
+                                draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} }
+                            }
+                            Label{
+                                text: item_line(it) width: Fill padding: 0 margin: 0
+                                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 11} }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        preview_wrap := View{
+            width: Fill height: Fit flow: Down visible: false
+            RoundedView{
+                width: Fill height: Fit flow: Down spacing: 6 padding: 12
+                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
+                Label{ text: "NOT JOINED" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
+                preview_title := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 14} } }
+                preview_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
+                View{
+                    width: Fill height: Fit flow: Right spacing: 8
+                    Button{ text: "Join" on_click: || join_room() draw_text +: { color: #x1C274C } }
+                    Button{ text: "Close" on_click: || ui.preview_wrap.set_visible(false) draw_text +: { color: #x1C274C } }
+                }
+                join_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 11} } }
+            }
+        }
+    }
+}

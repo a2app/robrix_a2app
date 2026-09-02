@@ -1,0 +1,236 @@
+// name: Account
+// icon: 🪪
+// tint: #386FA4
+// permissions: matrix-profile, matrix-account-read, matrix-users, open-url, robrix-navigation
+// why-matrix-profile: Shows your display name and user id.
+// why-matrix-account-read: Shows this device, your homeserver, and who you ignore.
+// why-matrix-users: Looks up the profile and DM of a user id you enter.
+// why-open-url: Opens your homeserver's account management page.
+// why-robrix-navigation: Opens the DM you already have with a user you look up.
+
+let ignored = []
+let manage_url = nil
+let dm_room = nil
+
+fn or_blank(name, fallback){
+    if name == nil || name == "" { return fallback }
+    return name
+}
+
+fn load(){
+    host.request("matrix.profile", nil, fn(r){
+        if !r.is_ok {
+            ui.me_name.set_text("Signed in")
+            ui.me_id.set_text(r.error)
+            return nil
+        }
+        ui.me_name.set_text(or_blank(r.data.display_name, "(no display name)"))
+        ui.me_id.set_text(r.data.user_id)
+    })
+    host.request("matrix.device", nil, fn(r){
+        if !r.is_ok {
+            ui.device_line.set_text(r.error)
+            return nil
+        }
+        let state = "not verified"
+        if r.data.verified { state = "verified" }
+        ui.device_line.set_text(or_blank(r.data.name, "(unnamed)") + " · " + r.data.device_id + " · " + state)
+    })
+    host.request("matrix.account_info", nil, fn(r){
+        if !r.is_ok {
+            ui.server_line.set_text(r.error)
+            ui.manage_wrap.set_visible(false)
+            return nil
+        }
+        ui.server_line.set_text(r.data.homeserver)
+        manage_url = r.data.account_management_url
+        ui.manage_wrap.set_visible(manage_url != nil)
+    })
+    host.request("matrix.ignored_users", nil, fn(r){
+        if r.is_ok {
+            ignored = r.data.users
+            ui.ignored_head.set_text("" + ignored.len() + " ignored · tap one to look them up")
+        } else {
+            ignored = []
+            ui.ignored_head.set_text(r.error)
+        }
+        ui.ignored_list.render()
+    })
+}
+
+fn open_manage(){
+    if manage_url == nil { return nil }
+    host.request("url.open", {url: manage_url}, fn(r){
+        if !r.is_ok { ui.server_line.set_text(r.error) }
+    })
+}
+
+fn lookup(t){
+    let id = ("" + t).trim()
+    if id == "" {
+        ui.lookup_line.set_text("Enter a user id like @alice:example.org")
+        return nil
+    }
+    ui.user_input.set_text(id)
+    ui.lookup_line.set_text("Looking up " + id + "…")
+    ui.dm_line.set_text("")
+    ui.dm_wrap.set_visible(false)
+    dm_room = nil
+    host.request("matrix.user_profile", {user_id: id}, fn(r){
+        if !r.is_ok {
+            ui.lookup_line.set_text(r.error)
+            return nil
+        }
+        let line = or_blank(r.data.display_name, "(no display name)") + " · " + r.data.user_id
+        if r.data.has_avatar { line = line + " · has an avatar" } else { line = line + " · no avatar" }
+        if r.data.ignored { line = line + " · ignored by you" }
+        ui.lookup_line.set_text(line)
+    })
+    host.request("matrix.dm_find", {user_id: id}, fn(r){
+        if !r.is_ok {
+            ui.dm_line.set_text(r.error)
+            return nil
+        }
+        if r.data.room_id == nil {
+            ui.dm_line.set_text("No DM yet")
+            return nil
+        }
+        ui.dm_line.set_text("DM: " + or_blank(r.data.name, id))
+        dm_room = r.data.room_id
+        ui.dm_wrap.set_visible(true)
+    })
+}
+
+fn open_dm(){
+    if dm_room == nil { return nil }
+    host.request("nav.room", {room_id: dm_room}, fn(r){
+        if !r.is_ok { ui.dm_line.set_text(r.error) }
+    })
+}
+
+fn lookup_ignored(i){
+    if i >= ignored.len() { return nil }
+    lookup(ignored[i])
+}
+
+fn on_permissions_changed(caps){ load() }
+
+let _boot = start_timeout(0.05, || load())
+
+View{
+    width: Fill height: Fit flow: Down align: Align{x: 0.5}
+    col := View{
+        width: Fill{max: 520.0} height: Fit flow: Down spacing: 10 padding: 14
+        Label{
+            text: "Account" padding: 0 margin: 0
+            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }
+        }
+        Label{
+            text: "YOU" padding: 0 margin: 0
+            draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+        }
+        RoundedView{
+            width: Fill height: Fit flow: Down spacing: 4 padding: 12
+            show_bg: true
+            draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
+            me_name := Label{
+                text: "Loading…" width: Fill padding: 0 margin: 0
+                draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 16} }
+            }
+            me_id := Label{
+                text: "" width: Fill padding: 0 margin: 0
+                draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
+            }
+        }
+        Label{
+            text: "THIS DEVICE" padding: 0 margin: 0
+            draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+        }
+        RoundedView{
+            width: Fill height: Fit padding: 12
+            show_bg: true
+            draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
+            device_line := Label{
+                text: "Loading…" width: Fill padding: 0 margin: 0
+                draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+            }
+        }
+        Label{
+            text: "HOMESERVER" padding: 0 margin: 0
+            draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+        }
+        RoundedView{
+            width: Fill height: Fit flow: Down spacing: 8 padding: 12
+            show_bg: true
+            draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
+            server_line := Label{
+                text: "Loading…" width: Fill padding: 0 margin: 0
+                draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+            }
+            manage_wrap := View{
+                width: Fill height: Fit visible: false
+                Button{ text: "Manage account" on_click: || open_manage() draw_text +: { color: #x1C274C } }
+            }
+        }
+        Label{
+            text: "LOOK UP A USER" padding: 0 margin: 0
+            draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+        }
+        View{
+            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+            user_input := TextInput{
+                width: Fill height: Fit empty_text: "@user:server, then press Return"
+                on_return: |t| lookup(t)
+            }
+            Button{ text: "Look up" on_click: || lookup(ui.user_input.text()) draw_text +: { color: #x1C274C } }
+        }
+        lookup_line := Label{
+            text: "Shows their name and whether you already have a DM with them." width: Fill padding: 0 margin: 0
+            draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+        }
+        View{
+            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+            dm_line := Label{
+                text: "" width: Fill padding: 0 margin: 0
+                draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
+            }
+            dm_wrap := View{
+                width: Fit height: Fit visible: false
+                Button{ text: "Open DM" on_click: || open_dm() draw_text +: { color: #x1C274C } }
+            }
+        }
+        ignored_head := Label{
+            text: "IGNORED USERS" padding: 0 margin: 0
+            draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+        }
+        ignored_list := ScrollYView{
+            width: Fill height: 140 flow: Down spacing: 4
+            on_item_tap: |i| lookup_ignored(i)
+            on_render: || {
+                if ignored.len() == 0 {
+                    Label{
+                        text: "Nobody is ignored, or this app may not read your account yet."
+                        width: Fill padding: 0 margin: 0
+                        draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                    }
+                } else {
+                    for id in ignored {
+                        RoundedView{
+                            width: Fill height: Fit padding: 8
+                            show_bg: true
+                            draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                            Label{
+                                text: id width: Fill padding: 0 margin: 0
+                                draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        View{
+            width: Fill height: Fit flow: Right align: Align{x: 0.5}
+            Button{ text: "Refresh" on_click: || load() draw_text +: { color: #x1C274C } }
+        }
+    }
+}

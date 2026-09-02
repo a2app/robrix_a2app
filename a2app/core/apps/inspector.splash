@@ -1,0 +1,222 @@
+// name: Inspector
+// icon: 🛠
+// tint: #546E7A
+// permissions: robrix-ui, robrix-preferences, robrix-observe, device-info
+// why-robrix-ui: Moves, minimizes, breaks out or closes its own pane when you tap.
+// why-robrix-preferences: Shows Robrix's display settings and follows changes to them.
+// why-robrix-observe: Logs which room and screen you switch to, so you can see what an app would see.
+// why-device-info: Shows what this device reports about itself.
+
+let events = []
+let pane = nil
+
+fn clock(){
+    let s = floor(time_now())
+    let h = floor(s / 3600.0) % 24
+    let m = floor(s / 60.0) % 60
+    let mm = "" + m
+    if m < 10 { mm = "0" + m }
+    return "" + h + ":" + mm
+}
+
+fn log(line){
+    events.push(clock() + "  " + line)
+    while events.len() > 20 { events.remove(0) }
+    ui.event_list.render()
+}
+
+fn yes_no(b){
+    if b { return "yes" }
+    return "no"
+}
+
+fn show_pane(){
+    if pane.is_nil() { return nil }
+    let side = pane.side
+    if side.is_nil() { side = "none" }
+    ui.pane_line.set_text(pane.surface + " · side " + side + " · " + floor(pane.width) + "×" + floor(pane.height))
+    ui.pane_state.set_text("foreground " + yes_no(pane.foreground) + " · minimized " + yes_no(pane.minimized))
+}
+
+fn read_pane(){
+    host.request("ui.pane.read", nil, fn(r){
+        if !r.is_ok {
+            ui.pane_line.set_text(r.error)
+            return nil
+        }
+        pane = r.data
+        show_pane()
+    })
+}
+
+fn read_env(){
+    host.request("env", nil, fn(r){
+        if !r.is_ok { return nil }
+        let room = "no room attached"
+        if r.data.room_attached { room = r.data.room_id }
+        ui.env_line.set_text(r.data.platform + " · " + r.data.view_mode + " layout · " + room)
+    })
+}
+
+fn read_prefs(){
+    host.request("host.prefs", nil, fn(r){
+        if !r.is_ok {
+            ui.prefs_line.set_text(r.error)
+            return nil
+        }
+        show_prefs(r.data)
+    })
+}
+
+fn show_prefs(p){
+    ui.prefs_line.set_text(p.view_mode + " (" + p.view_mode_override + ") · zoom " + p.ui_zoom + " · thumbnails " + p.thumbnail_max_height + "px")
+    ui.prefs_more.set_text("send on Enter " + yes_no(p.send_on_enter) + " · read receipts shown " + yes_no(p.show_read_receipts))
+}
+
+fn read_device(){
+    host.request("device.info", nil, fn(r){
+        if !r.is_ok {
+            ui.device_line.set_text(r.error)
+            return nil
+        }
+        let tz = r.data.time_zone
+        if tz.is_nil() { tz = "UTC" + r.data.utc_offset_minutes / 60 }
+        let locale = r.data.locale
+        if locale.is_nil() { locale = "unknown locale" }
+        ui.device_line.set_text(r.data.platform + " · " + tz + " · " + locale)
+    })
+}
+
+fn pane_call(service, args){
+    host.request(service, args, fn(r){
+        if !r.is_ok { log(service + ": " + r.error) }
+    })
+}
+
+fn on_focus_changed(json){
+    let ev = json.parse_json()
+    log("focus: foreground " + yes_no(ev.foreground))
+    read_pane()
+}
+
+fn on_surface_changed(json){
+    let ev = json.parse_json()
+    let side = ev.side
+    if side.is_nil() { side = "none" }
+    log("surface: " + ev.surface + ", side " + side)
+    read_pane()
+}
+
+fn on_app_resize(w, h){ read_pane() }
+
+fn on_prefs_changed(json){
+    log("settings changed")
+    show_prefs(json.parse_json())
+}
+
+fn on_active_room_changed(json){
+    let ev = json.parse_json()
+    if ev.kind == "space" {
+        log("looking at a space")
+        return nil
+    }
+    log("looking at " + ev.kind + " " + ev.name)
+}
+
+fn on_navigation_changed(json){
+    let ev = json.parse_json()
+    log("screen: " + ev.screen)
+}
+
+fn subscribe(name){
+    host.request("events.subscribe", {event: name}, fn(r){
+        if !r.is_ok { log(name + ": " + r.error) }
+    })
+}
+
+fn watch(){
+    subscribe("on_prefs_changed")
+    subscribe("on_active_room_changed")
+    subscribe("on_navigation_changed")
+}
+
+fn load(){
+    read_env()
+    read_pane()
+    read_prefs()
+    read_device()
+}
+
+fn on_permissions_changed(caps){
+    load()
+    watch()
+}
+
+let _boot = start_timeout(0.05, || {
+    load()
+    watch()
+})
+
+View{
+    width: Fill height: Fit flow: Down align: Align{x: 0.5}
+    col := View{
+        width: Fill{max: 460.0} height: Fit flow: Down spacing: 10 padding: 14
+        Label{
+            text: "Inspector" padding: 0 margin: 0
+            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }
+        }
+        RoundedView{
+            width: Fill height: Fit flow: Down spacing: 4 padding: 10
+            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
+            Label{ text: "THIS PANE" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
+            env_line := Label{ text: "…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
+            pane_line := Label{ text: "…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} } }
+            pane_state := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
+            View{
+                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 6 margin: Inset{top: 4}
+                Button{ text: "Top" on_click: || pane_call("ui.pane.set_side", {side: "top"}) draw_text +: { color: #x1C274C } }
+                Button{ text: "Bottom" on_click: || pane_call("ui.pane.set_side", {side: "bottom"}) draw_text +: { color: #x1C274C } }
+                Button{ text: "Left" on_click: || pane_call("ui.pane.set_side", {side: "left"}) draw_text +: { color: #x1C274C } }
+                Button{ text: "Right" on_click: || pane_call("ui.pane.set_side", {side: "right"}) draw_text +: { color: #x1C274C } }
+                Button{ text: "Minimize" on_click: || pane_call("ui.pane.minimize", nil) draw_text +: { color: #x1C274C } }
+                Button{ text: "Break out" on_click: || pane_call("ui.pane.break_out", nil) draw_text +: { color: #x1C274C } }
+                Button{ text: "Close app" on_click: || pane_call("ui.pane.close", nil) draw_text +: { color: #xB91C1C } }
+            }
+        }
+        RoundedView{
+            width: Fill height: Fit flow: Down spacing: 4 padding: 10
+            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
+            Label{ text: "ROBRIX SETTINGS" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
+            prefs_line := Label{ text: "…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
+            prefs_more := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
+        }
+        RoundedView{
+            width: Fill height: Fit flow: Down spacing: 4 padding: 10
+            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
+            Label{ text: "DEVICE" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
+            device_line := Label{ text: "…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
+        }
+        Label{
+            text: "What Robrix told this app, newest last" padding: 0 margin: 0
+            draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+        }
+        event_list := ScrollYView{
+            width: Fill height: 180 flow: Down spacing: 3
+            on_render: || {
+                if events.len() == 0 {
+                    Label{
+                        text: "Nothing yet. Switch rooms, resize the window, or move this pane." width: Fill padding: 0 margin: 0
+                        draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                    }
+                } else {
+                    for line in events {
+                        Label{
+                            text: line width: Fill padding: 0 margin: 0
+                            draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
