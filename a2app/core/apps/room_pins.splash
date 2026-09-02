@@ -1,8 +1,9 @@
 // name: Pinned Events
 // icon: 📌
 // tint: #C0533E
-// permissions: matrix-room-read
+// permissions: matrix-room-read, robrix-navigation
 // why-matrix-room-read: Shows this room's pinned messages.
+// why-robrix-navigation: Jumps to a pinned message you tap.
 
 let items = []
 
@@ -10,7 +11,7 @@ fn load(){
     host.request("matrix.pinned_events", nil, fn(r){
         if r.is_ok {
             items = r.data.pinned
-            ui.header.set_text("" + items.len() + " pinned")
+            ui.header.set_text("" + items.len() + " pinned · tap one to jump to it")
         } else {
             items = []
             ui.header.set_text(r.error)
@@ -21,6 +22,13 @@ fn load(){
 
 fn on_permissions_changed(caps){
     load()
+}
+
+fn jump_to_pin(i){
+    if i >= items.len() { return nil }
+    host.request("nav.event", {event_id: items[i].event_id}, fn(r){
+        if !r.is_ok { ui.header.set_text(r.error) }
+    })
 }
 
 let _boot = start_timeout(0.05, || load())
@@ -40,6 +48,7 @@ View{
         }
         item_list := ScrollYView{
             width: Fill height: 330 flow: Down spacing: 5
+            on_item_tap: |i| jump_to_pin(i)
             on_render: || {
                 if items.len() == 0 {
                     Label{

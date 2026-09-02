@@ -1,8 +1,9 @@
 // name: Room Threads
 // icon: 🧵
 // tint: #8A5CA8
-// permissions: matrix-room-read
+// permissions: matrix-room-read, robrix-navigation
 // why-matrix-room-read: Lists the discussion threads in this room.
+// why-robrix-navigation: Opens a thread you tap.
 
 let items = []
 
@@ -10,7 +11,7 @@ fn load(){
     host.request("matrix.room_threads", {limit: 20}, fn(r){
         if r.is_ok {
             items = r.data.threads
-            ui.header.set_text("" + items.len() + " threads")
+            ui.header.set_text("" + items.len() + " threads · tap one to open it")
         } else {
             items = []
             ui.header.set_text(r.error)
@@ -21,6 +22,13 @@ fn load(){
 
 fn on_permissions_changed(caps){
     load()
+}
+
+fn open_thread(i){
+    if i >= items.len() { return nil }
+    host.request("nav.thread", {event_id: items[i].event_id}, fn(r){
+        if !r.is_ok { ui.header.set_text(r.error) }
+    })
 }
 
 let _boot = start_timeout(0.05, || load())
@@ -40,6 +48,7 @@ View{
         }
         item_list := ScrollYView{
             width: Fill height: 330 flow: Down spacing: 5
+            on_item_tap: |i| open_thread(i)
             on_render: || {
                 if items.len() == 0 {
                     Label{

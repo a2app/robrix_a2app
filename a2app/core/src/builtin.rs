@@ -59,10 +59,10 @@ pub fn declared_reasons(id: &str) -> std::collections::BTreeMap<String, String> 
 /// on purpose — don't add "just in case" entries.
 fn permissions_for(id: &str) -> Vec<String> {
     let p: &[&str] = match id {
-        "room-peek" => &["matrix-room-info", "matrix-room-read", "matrix-room-send"],
+        "room-peek" => &["matrix-room-info", "matrix-room-read", "matrix-room-send", "robrix-navigation"],
         "roll-call" => &["matrix-profile", "matrix-room-send"],
         "room-info" => &["matrix-room-info"],
-        "room-members" | "room-pins" | "room-threads" => &["matrix-room-read"],
+        "room-members" | "room-pins" | "room-threads" => &["matrix-room-read", "robrix-navigation"],
         _ => &[],
     };
     p.iter().map(|x| x.to_string()).collect()
@@ -77,6 +77,7 @@ fn reasons_for(id: &str) -> std::collections::BTreeMap<String, String> {
             ("matrix-room-info", "Shows this room's name and member count."),
             ("matrix-room-read", "Lists the latest messages in this room."),
             ("matrix-room-send", "Sends the message you type into this room."),
+            ("robrix-navigation", "Jumps to a message you tap."),
         ],
         "roll-call" => &[
             ("matrix-profile", "Shows who is rolling."),
@@ -87,12 +88,15 @@ fn reasons_for(id: &str) -> std::collections::BTreeMap<String, String> {
         ],
         "room-members" => &[
             ("matrix-room-read", "Lists who is in this room."),
+            ("robrix-navigation", "Opens the profile of a member you tap."),
         ],
         "room-pins" => &[
             ("matrix-room-read", "Shows this room's pinned messages."),
+            ("robrix-navigation", "Jumps to a pinned message you tap."),
         ],
         "room-threads" => &[
             ("matrix-room-read", "Lists the discussion threads in this room."),
+            ("robrix-navigation", "Opens a thread you tap."),
         ],
         _ => &[],
     };

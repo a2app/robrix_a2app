@@ -1,10 +1,11 @@
 // name: Room Peek
 // icon: 👀
 // tint: #4A90D9
-// permissions: matrix-room-info, matrix-room-read, matrix-room-send
+// permissions: matrix-room-info, matrix-room-read, matrix-room-send, robrix-navigation
 // why-matrix-room-info: Shows this room's name and member count.
 // why-matrix-room-read: Lists the latest messages in this room.
 // why-matrix-room-send: Sends the message you type into this room.
+// why-robrix-navigation: Jumps to a message you tap.
 
 let room_name = "Room Peek"
 let room_line = "Open me from a room to see its info."
@@ -35,6 +36,13 @@ fn load_messages(){
             messages = []
         }
         ui.msg_list.render()
+    })
+}
+
+fn jump_to_message(i){
+    if i >= messages.len() { return nil }
+    host.request("nav.event", {event_id: messages[i].event_id}, fn(r){
+        if !r.is_ok { ui.send_note.set_text(r.error) }
     })
 }
 
@@ -76,6 +84,7 @@ View{
         }
         msg_list := ScrollYView{
             width: Fill height: 260 flow: Down spacing: 6
+            on_item_tap: |i| jump_to_message(i)
             on_render: || {
                 if messages.len() == 0 {
                     Label{

@@ -1,8 +1,9 @@
 // name: Room Members
 // icon: 👥
 // tint: #6C8E3A
-// permissions: matrix-room-read
+// permissions: matrix-room-read, robrix-navigation
 // why-matrix-room-read: Lists who is in this room.
+// why-robrix-navigation: Opens the profile of a member you tap.
 
 let items = []
 
@@ -10,7 +11,7 @@ fn load(){
     host.request("matrix.room_members", {limit: 60}, fn(r){
         if r.is_ok {
             items = r.data.members
-            ui.header.set_text("" + r.data.count + " members")
+            ui.header.set_text("" + r.data.count + " members · tap one for their profile")
         } else {
             items = []
             ui.header.set_text(r.error)
@@ -21,6 +22,13 @@ fn load(){
 
 fn on_permissions_changed(caps){
     load()
+}
+
+fn open_member(i){
+    if i >= items.len() { return nil }
+    host.request("nav.user", {user_id: items[i].user_id}, fn(r){
+        if !r.is_ok { ui.header.set_text(r.error) }
+    })
 }
 
 fn member_line(m){
@@ -46,6 +54,7 @@ View{
         }
         item_list := ScrollYView{
             width: Fill height: 330 flow: Down spacing: 5
+            on_item_tap: |i| open_member(i)
             on_render: || {
                 if items.len() == 0 {
                     Label{
