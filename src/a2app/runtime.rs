@@ -12,14 +12,15 @@ use std::time::{Duration, Instant};
 
 use makepad_widgets::*;
 use makepad_widgets::splash_host::SplashHostRequest;
-use matrix_sdk::ruma::OwnedRoomId;
+use matrix_sdk::RoomState;
+use matrix_sdk::ruma::{matrix_uri::MatrixId, MatrixToUri, MatrixUri, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId};
 
 use a2app_core::builtin;
 use a2app_core::bundle;
 use a2app_core::manifest::{A2AppScope, AppRegistry, MiniAppId, MiniAppManifest};
 use a2app_core::permissions::{GrantState, Permission, PermissionStore};
 use a2app_core::persistence::{self, A2AppPersistedState};
-use a2app_core::services::{self, Broker, BrokerAsk, BrokerCtx, MatrixServiceCall, Reply};
+use a2app_core::services::{self, Broker, BrokerAsk, BrokerCtx, HostAction, MatrixServiceCall, Reply};
 use a2app_agent::pipeline::{GenOutcome, Generation};
 use a2app_agent::prefs::AgentPrefs;
 
@@ -28,8 +29,13 @@ use crate::a2app::permission_prompt::{
     MiniAppPermissionPromptWidgetRefExt, PermissionPromptAction, PromptInfo,
 };
 use crate::a2app::dock::{DockCmd, MiniAppDockAction};
+use crate::app::{AppStateAction, SelectedRoom};
+use crate::home::navigation_tab_bar::NavigationBarAction;
+use crate::home::rooms_list::{RoomsListAction, RoomsListRef};
+use crate::room::BasicRoomDetails;
 use crate::shared::popup_list::{enqueue_popup_notification, PopupKind};
 use crate::sliding_sync::{submit_async_request, MatrixRequest};
+use crate::utils::RoomNameId;
 
 /// How long between saves of dirty permission/registry state.
 const PERSIST_THROTTLE: Duration = Duration::from_secs(2);
@@ -37,6 +43,8 @@ const PERSIST_THROTTLE: Duration = Duration::from_secs(2);
 const TIMED_GRANT_CHECK: Duration = Duration::from_secs(5);
 /// How often the generation console re-renders while output streams in.
 const CONSOLE_REPAINT: Duration = Duration::from_millis(120);
+/// How long a room-scoped host action waits for its RoomScreen to appear.
+const ROOM_ACTION_TTL: Duration = Duration::from_secs(10);
 
 thread_local! {
     static A2APP: RefCell<Option<A2AppState>> = const { RefCell::new(None) };
@@ -91,6 +99,9 @@ pub struct A2AppState {
     /// `matrix.send_message` is refused without prompting, and sharing an
     /// app into a room is blocked, since that posts an event.
     pub matrix_read_only: bool,
+    /// A mini-app's request of a room's RoomScreen, waiting to be taken by
+    /// the screen showing that room (see [`take_room_action`]).
+    room_action: Option<PendingRoomAction>,
     perms_dirty: bool,
     registry_dirty: bool,
     last_persist: Instant,
@@ -140,6 +151,7 @@ pub fn init() {
             room_instances: HashMap::new(),
             foreground_app: None,
             matrix_read_only: true,
+            room_action: None,
             perms_dirty: false,
             registry_dirty: false,
             last_persist: Instant::now(),
@@ -191,6 +203,42 @@ pub enum A2AppMatrixRequest {
     /// Sends an app bundle into a room as an `rs.robius.a2app` event.
     /// No reply: outcome is reported via a popup notification.
     ShareApp { room_id: OwnedRoomId, bundle_json: String, app_name: String },
+}
+
+/// What a mini-app asked the RoomScreen of its room to do.
+#[derive(Clone, Debug)]
+pub enum RoomAction {
+    ShowUserProfile(OwnedUserId),
+    JumpToEvent(OwnedEventId),
+    ReplyTo(OwnedEventId),
+    InsertDraft(String),
+}
+
+struct PendingRoomAction {
+    room_id: OwnedRoomId,
+    action: RoomAction,
+    since: Instant,
+}
+
+/// Pokes the RoomScreen showing `room_id` to take its pending [`RoomAction`].
+#[derive(Clone, Debug, Default)]
+pub enum A2AppRoomAction {
+    Pending { room_id: OwnedRoomId },
+    #[default]
+    None,
+}
+
+/// Hands the pending action for `room_id` to the one RoomScreen that asks
+/// first; a stale one (its room never opened) is dropped instead.
+pub fn take_room_action(room_id: &RoomId) -> Option<RoomAction> {
+    with_a2app(|state| {
+        let pending = state.room_action.as_ref()?;
+        if pending.room_id != room_id {
+            return None;
+        }
+        let fresh = pending.since.elapsed() <= ROOM_ACTION_TTL;
+        state.room_action.take().filter(|_| fresh).map(|p| p.action)
+    }).flatten()
 }
 
 /// A finished matrix service call, posted back to the UI thread so the
@@ -857,7 +905,136 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
             };
             submit_async_request(MatrixRequest::A2App(request));
         }
+        BrokerAsk::HostAction { reply, app_id, action } => {
+            // Only the modal's own isolate has to get out of the way when it
+            // sends the user elsewhere; closing quits it, like its Close button.
+            let leaves_modal = !matches!(action, HostAction::OpenApp { .. })
+                && host_pane(cx, ui).heap_of(&app_id) == Some(reply.heap_key);
+            match perform_host_action(cx, ui, action) {
+                Ok(()) => services::respond(cx, reply, Ok("{}")),
+                Err(e) => {
+                    services::respond(cx, reply, Err(&e));
+                    return;
+                }
+            }
+            if leaves_modal {
+                apply_op(cx, ui, A2AppOp::CloseHostPane);
+            }
+        }
     }
+}
+
+/// Applies one nav.* / composer.* call. Global moves happen right here;
+/// room-scoped ones open the room and park the action for its RoomScreen.
+fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, action: HostAction) -> Result<(), String> {
+    let room_of = |room: Option<String>| -> Result<OwnedRoomId, String> {
+        let room = room.ok_or("this mini-app is not attached to a room; pass {room_id}")?;
+        OwnedRoomId::try_from(room.as_str()).map_err(|_| String::from("not a valid room id"))
+    };
+    let event_of = |event_id: &str| {
+        OwnedEventId::try_from(event_id).map_err(|_| String::from("not a valid event id"))
+    };
+    // Only rooms (and spaces) the user is in: anything else would open a
+    // join dialog on the app's say-so.
+    let joined_name = |cx: &mut Cx, room_id: &OwnedRoomId| -> Result<RoomNameId, String> {
+        let rooms = cx.get_global::<RoomsListRef>();
+        if rooms.get_room_state(room_id) != Some(RoomState::Joined) {
+            return Err(String::from("not a room you're in"));
+        }
+        Ok(rooms.get_room_name(room_id).unwrap_or_else(|| RoomNameId::empty(room_id.clone())))
+    };
+    let queue_room_action = |cx: &mut Cx, room_id: OwnedRoomId, action: RoomAction| -> Result<(), String> {
+        let destination_room = BasicRoomDetails::Name(joined_name(cx, &room_id)?);
+        with_a2app(|state| {
+            state.room_action = Some(PendingRoomAction {
+                room_id: room_id.clone(),
+                action,
+                since: Instant::now(),
+            });
+        });
+        cx.action(AppStateAction::NavigateToRoom { room_to_close: None, destination_room });
+        cx.action(A2AppRoomAction::Pending { room_id });
+        Ok(())
+    };
+    match action {
+        HostAction::OpenRoom { room } => {
+            let room_id = room_of(Some(room))?;
+            let destination_room = BasicRoomDetails::Name(joined_name(cx, &room_id)?);
+            cx.action(AppStateAction::NavigateToRoom { room_to_close: None, destination_room });
+        }
+        HostAction::OpenThread { room, event_id } => {
+            let room_id = room_of(room)?;
+            let thread_root_event_id = event_of(&event_id)?;
+            let room_name_id = joined_name(cx, &room_id)?;
+            cx.widget_action(
+                ui.widget_uid(),
+                RoomsListAction::Selected(SelectedRoom::Thread { room_name_id, thread_root_event_id }),
+            );
+        }
+        HostAction::OpenSpace { space } => {
+            let space_id = room_of(Some(space))?;
+            let space_name_id = joined_name(cx, &space_id)?;
+            cx.action(NavigationBarAction::GoToSpace { space_name_id });
+        }
+        HostAction::OpenScreen { screen } => {
+            let action = match screen.as_str() {
+                "home" => NavigationBarAction::GoToHome,
+                "add_room" => NavigationBarAction::GoToAddRoom,
+                "mini_apps" => NavigationBarAction::GoToMiniApps,
+                "settings" => NavigationBarAction::OpenSettings,
+                _ => return Err(String::from("screen must be one of home, add_room, mini_apps, settings")),
+            };
+            cx.action(action);
+        }
+        HostAction::OpenLink { room, url } => {
+            let matrix_id = MatrixToUri::parse(&url).map(|u| u.id().clone())
+                .or_else(|_| MatrixUri::parse(&url).map(|u| u.id().clone()))
+                .map_err(|_| String::from("not a matrix.to or matrix: link"))?;
+            let action = match matrix_id {
+                MatrixId::User(user_id) => HostAction::ShowUser { room, user_id: user_id.to_string() },
+                MatrixId::Room(room_id) => HostAction::OpenRoom { room: room_id.to_string() },
+                MatrixId::Event(room_or_alias, event_id) => {
+                    let room_id = OwnedRoomId::try_from(room_or_alias)
+                        .map_err(|_| String::from("room aliases can't be resolved yet"))?;
+                    HostAction::JumpToEvent { room: Some(room_id.to_string()), event_id: event_id.to_string() }
+                }
+                _ => return Err(String::from("room aliases can't be resolved yet")),
+            };
+            return perform_host_action(cx, ui, action);
+        }
+        HostAction::OpenApp { room, app_id } => {
+            let installed = with_a2app(|state| {
+                state.registry.get(&app_id).map(|_| state.permissions.is_restricted(&app_id))
+            }).flatten();
+            match installed {
+                None => return Err(String::from("no such app")),
+                Some(true) => return Err(String::from("that app is stopped for hammering the host")),
+                Some(false) => {}
+            }
+            let room_id = room.and_then(|r| OwnedRoomId::try_from(r.as_str()).ok());
+            let in_room_pane = room_id.is_some();
+            apply_op(cx, ui, A2AppOp::OpenApp { app_id, room_id, in_room_pane });
+        }
+        HostAction::JumpToEvent { room, event_id } => {
+            let room_id = room_of(room)?;
+            queue_room_action(cx, room_id, RoomAction::JumpToEvent(event_of(&event_id)?))?;
+        }
+        HostAction::ShowUser { room, user_id } => {
+            let room_id = room_of(room)?;
+            let user_id = OwnedUserId::try_from(user_id.as_str())
+                .map_err(|_| String::from("not a valid user id"))?;
+            queue_room_action(cx, room_id, RoomAction::ShowUserProfile(user_id))?;
+        }
+        HostAction::ComposerInsert { room, text } => {
+            let room_id = room_of(room)?;
+            queue_room_action(cx, room_id, RoomAction::InsertDraft(text))?;
+        }
+        HostAction::ComposerReplyTo { room, event_id } => {
+            let room_id = room_of(room)?;
+            queue_room_action(cx, room_id, RoomAction::ReplyTo(event_of(&event_id)?))?;
+        }
+    }
+    Ok(())
 }
 
 fn queue_permission_prompt(

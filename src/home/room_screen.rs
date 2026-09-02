@@ -1150,6 +1150,33 @@ impl Widget for RoomScreen {
             self.handle_message_actions(cx, actions, &portal_list, &loading_pane);
 
             for action in actions {
+                // A mini-app asked the screen showing its room to do something.
+                // Only the focused screen takes it (hidden mobile history screens
+                // see actions too), so a screen also checks as focus lands on it.
+                #[cfg(feature = "a2app")]
+                {
+                    let poked_room = match action.downcast_ref() {
+                        Some(crate::a2app::runtime::A2AppRoomAction::Pending { room_id }) => {
+                            let is_focused = _scope.data.get::<crate::app::AppState>().is_none_or(|app_state| {
+                                matches!(&app_state.selected_room, Some(SelectedRoom::JoinedRoom { room_name_id }) if room_name_id.room_id() == room_id)
+                            });
+                            is_focused.then_some(room_id)
+                        }
+                        _ => match action.downcast_ref() {
+                            Some(AppStateAction::RoomFocused(SelectedRoom::JoinedRoom { room_name_id })) => Some(room_name_id.room_id()),
+                            _ => None,
+                        },
+                    };
+                    if let Some(room_id) = poked_room
+                        && self.tl_state.is_some()
+                        && self.timeline_kind.as_ref().is_some_and(|k| matches!(k, TimelineKind::MainRoom { room_id: r } if r == room_id))
+                        && let Some(room_action) = crate::a2app::runtime::take_room_action(room_id)
+                    {
+                        self.apply_mini_app_room_action(cx, room_action, &portal_list, &loading_pane, &user_profile_sliding_pane);
+                        continue;
+                    }
+                }
+
                 // If the backend sync task rebuilt this room's timeline, our timeline update receiver is dead,
                 // so we need to get a new one.
                 if let Some(TimelineEndpointsRecreated { room_id }) = action.downcast_ref()
@@ -2923,6 +2950,73 @@ impl RoomScreen {
         self.redraw(cx);
     }
 
+    #[cfg(feature = "a2app")]
+    fn apply_mini_app_room_action(
+        &mut self,
+        cx: &mut Cx,
+        action: crate::a2app::runtime::RoomAction,
+        portal_list: &PortalListRef,
+        loading_pane: &LoadingPaneRef,
+        user_profile_sliding_pane: &UserProfileSlidingPaneRef,
+    ) {
+        use crate::a2app::runtime::RoomAction;
+        match action {
+            RoomAction::ShowUserProfile(user_id) => {
+                let Some(room_id) = self.room_id().cloned() else { return };
+                self.show_user_profile(
+                    cx,
+                    user_profile_sliding_pane,
+                    UserProfilePaneInfo {
+                        profile_and_room_id: UserProfileAndRoomId {
+                            user_profile: UserProfile {
+                                user_id,
+                                username: None,
+                                avatar_state: AvatarState::Unknown,
+                            },
+                            room_id,
+                        },
+                        room_name: self.room_name_id.as_ref().map_or_else(
+                            || UNNAMED_ROOM.to_string(),
+                            |r| r.to_string(),
+                        ),
+                        room_member: None,
+                    },
+                );
+            }
+            RoomAction::JumpToEvent(event_id) => {
+                self.jump_to_event(
+                    cx,
+                    &event_id,
+                    None,
+                    String::from("the message a mini-app pointed at"),
+                    portal_list,
+                    loading_pane,
+                );
+            }
+            RoomAction::ReplyTo(event_id) => {
+                let Some(tl) = self.tl_state.as_ref() else { return };
+                let event_tl_item = index_of_event(&tl.items, &event_id, tl.items.len(), tl.items.len())
+                    .and_then(|index| tl.items.get(index))
+                    .and_then(|item| item.as_event())
+                    .cloned();
+                let Some(event_tl_item) = event_tl_item else {
+                    enqueue_popup_notification(
+                        "Could not find that message in the timeline to reply to.",
+                        PopupKind::Error,
+                        Some(5.0),
+                    );
+                    return;
+                };
+                let replied_to_info = EmbeddedEvent::from_timeline_item(&event_tl_item);
+                self.view.room_input_bar(cx, ids!(room_input_bar))
+                    .show_replying_to(cx, (event_tl_item, replied_to_info), &tl.kind);
+            }
+            RoomAction::InsertDraft(text) => {
+                self.view.room_input_bar(cx, ids!(room_input_bar)).append_draft(cx, &text);
+            }
+        }
+    }
+
     /// Invoke this when this timeline is being shown,
     /// e.g., when the user navigates to this timeline.
     fn show_timeline(&mut self, cx: &mut Cx) {
@@ -3344,6 +3438,18 @@ impl RoomScreen {
         }
 
         self.show_timeline(cx);
+
+        // A mini-app may have opened this room just to act in it. With no
+        // timeline yet, the RoomLoadedSuccessfully re-entry gets another go.
+        #[cfg(feature = "a2app")]
+        if self.tl_state.is_some()
+            && let TimelineKind::MainRoom { room_id } = &timeline_kind
+            && let Some(room_action) = crate::a2app::runtime::take_room_action(room_id)
+        {
+            let RoomScreenWidgetRefs { portal_list, user_profile_sliding_pane, loading_pane, .. } =
+                self.cached_widget_refs(cx);
+            self.apply_mini_app_room_action(cx, room_action, &portal_list, &loading_pane, &user_profile_sliding_pane);
+        }
     }
 
     pub fn hide_displayed_room(&mut self, cx: &mut Cx) {

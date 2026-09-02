@@ -286,6 +286,10 @@ impl SplashHostSet {
         self.hosts.contains_key(app_id)
     }
 
+    pub fn heap_of(&self, app_id: &str) -> Option<usize> {
+        self.heap_keys.get(app_id).copied()
+    }
+
     pub fn running_ids(&self) -> Vec<MiniAppId> {
         self.hosts.keys().cloned().collect()
     }

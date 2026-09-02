@@ -224,6 +224,10 @@ impl MiniAppHostPaneRef {
         self.borrow().is_some_and(|inner| inner.host_set.is_running(app_id))
     }
 
+    pub fn heap_of(&self, app_id: &str) -> Option<usize> {
+        self.borrow()?.host_set.heap_of(app_id)
+    }
+
     pub fn active_app(&self) -> Option<MiniAppId> {
         self.borrow().and_then(|inner| inner.active.clone())
     }

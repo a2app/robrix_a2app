@@ -850,6 +850,22 @@ impl RoomInputBarRef {
         inner.show_replying_to(cx, replying_to, timeline_kind, true);
     }
 
+    /// Appends `text` to the draft, cursor after it, and focuses the input
+    /// so the user reviews before sending.
+    pub fn append_draft(&self, cx: &mut Cx, text: &str) {
+        let Some(inner) = self.borrow() else { return };
+        let text_input = inner.text_input(cx, ids!(input_bar.mentionable_text_input.text_input));
+        let mut draft = text_input.text();
+        if !draft.is_empty() && !draft.ends_with(char::is_whitespace) {
+            draft.push(' ');
+        }
+        draft.push_str(text);
+        let end = makepad_widgets::text::selection::Cursor { index: draft.len(), prefer_next_row: false };
+        text_input.set_text(cx, &draft);
+        text_input.set_cursor(cx, end, false);
+        text_input.set_key_focus(cx);
+    }
+
     /// Shows the editing pane to allow the user to edit the given event.
     pub fn show_editing_pane(
         &self,
