@@ -46,10 +46,36 @@ pub enum MatrixServiceCall {
     Successor,
 
     // --- rooms ---
+    /// Joined and invited rooms whose name or alias contains `query`.
+    RoomsSearch { query: String, limit: u32 },
+    /// Pending invites, with who sent each.
+    Invites,
+    /// Public details of any room by id or alias; hits the homeserver.
+    RoomPreview { room: String, via: Vec<String> },
+    /// The `RoomInfo` shape for any joined room.
+    RoomsInfo { room_id: String },
+    /// The `ReadMessages` shape for any joined room (limit already 1..=30).
+    RoomsMessages { room_id: String, limit: u32 },
 
     // --- spaces ---
+    /// Every joined space.
+    Spaces,
+    /// One joined space's details.
+    SpaceInfo { space_id: String },
+    /// A space's direct child rooms and subspaces.
+    SpaceRooms { space_id: String },
 
     // --- account ---
+    /// Any user's public profile, plus whether the user ignores them.
+    UserProfile { user_id: String },
+    /// The existing DM room with a user, if any; never creates one.
+    DmFind { user_id: String },
+    /// This device's id, name and verification state.
+    Device,
+    /// User id, homeserver and account-management URL.
+    AccountInfo,
+    /// The account's ignore list.
+    IgnoredUsers,
 
     // --- send ---
 
@@ -71,7 +97,23 @@ pub fn is_service(service: &str) -> bool {
 
 /// Services that work without an attached room.
 fn room_free(service: &str) -> bool {
-    matches!(service, "matrix.profile" | "matrix.rooms_list" | "matrix.search_rooms")
+    matches!(service,
+        "matrix.profile" | "matrix.rooms_list" | "matrix.search_rooms"
+        | "matrix.rooms_search" | "matrix.invites" | "matrix.room_preview"
+        | "matrix.rooms_info" | "matrix.rooms_messages"
+        | "matrix.spaces" | "matrix.space_info" | "matrix.space_rooms"
+        | "matrix.user_profile" | "matrix.dm_find" | "matrix.device"
+        | "matrix.account_info" | "matrix.ignored_users"
+    )
+}
+
+/// A Matrix id argument, checked only for its sigil; the host parses it.
+fn id_arg(service: &str, args: &serde_json::Value, key: &str, sigil: char) -> Result<String, String> {
+    let id = args[key].as_str().map(str::trim).unwrap_or_default();
+    if !id.starts_with(sigil) {
+        return Err(format!("{service} needs {{{key}}}"));
+    }
+    Ok(id.to_string())
 }
 
 /// Validates and clamps a call's arguments. Runs AFTER the permission gate,
@@ -166,10 +208,54 @@ pub fn parse(service: &str, args: &serde_json::Value, has_room: bool) -> Result<
         "matrix.successor" => MatrixServiceCall::Successor,
 
         // --- rooms ---
+        "matrix.rooms_search" => {
+            let query = args["query"].as_str().map(str::trim).unwrap_or_default();
+            if query.is_empty() {
+                return Err("matrix.rooms_search needs {query}".into());
+            }
+            MatrixServiceCall::RoomsSearch {
+                query: query.to_string(),
+                limit: args["limit"].as_u64().unwrap_or(20).clamp(1, 50) as u32,
+            }
+        }
+        "matrix.invites" => MatrixServiceCall::Invites,
+        "matrix.room_preview" => {
+            let room = args["room"].as_str().map(str::trim).unwrap_or_default();
+            if !room.starts_with(['!', '#']) {
+                return Err("matrix.room_preview needs {room}, a room id or alias".into());
+            }
+            let via = args["via"].as_array()
+                .map(|v| v.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            MatrixServiceCall::RoomPreview { room: room.to_string(), via }
+        }
+        "matrix.rooms_info" => MatrixServiceCall::RoomsInfo {
+            room_id: id_arg(service, args, "room_id", '!')?,
+        },
+        "matrix.rooms_messages" => MatrixServiceCall::RoomsMessages {
+            room_id: id_arg(service, args, "room_id", '!')?,
+            limit: args["limit"].as_u64().unwrap_or(10).clamp(1, 30) as u32,
+        },
 
         // --- spaces ---
+        "matrix.spaces" => MatrixServiceCall::Spaces,
+        "matrix.space_info" => MatrixServiceCall::SpaceInfo {
+            space_id: id_arg(service, args, "space_id", '!')?,
+        },
+        "matrix.space_rooms" => MatrixServiceCall::SpaceRooms {
+            space_id: id_arg(service, args, "space_id", '!')?,
+        },
 
         // --- account ---
+        "matrix.user_profile" => MatrixServiceCall::UserProfile {
+            user_id: id_arg(service, args, "user_id", '@')?,
+        },
+        "matrix.dm_find" => MatrixServiceCall::DmFind {
+            user_id: id_arg(service, args, "user_id", '@')?,
+        },
+        "matrix.device" => MatrixServiceCall::Device,
+        "matrix.account_info" => MatrixServiceCall::AccountInfo,
+        "matrix.ignored_users" => MatrixServiceCall::IgnoredUsers,
 
         // --- send ---
 
@@ -192,12 +278,20 @@ pub fn cost(service: &str) -> f64 {
         // ----- rooms: fans out over every room and may hit the network -----
         "matrix.rooms_list" => 5.0,
         "matrix.search_rooms" => 8.0,
+        "matrix.rooms_search" | "matrix.invites" => 5.0,
+        "matrix.room_preview" | "matrix.rooms_messages" => 8.0,
+        "matrix.rooms_info" => 1.0,
         // ----- account -----
         "matrix.profile" => 1.0,
+        "matrix.device" | "matrix.account_info" | "matrix.ignored_users" | "matrix.dm_find" => 1.0,
+        "matrix.user_profile" => 5.0,
         // ----- send: speaks as the user -----
         "matrix.send_message" => 5.0,
 
         // --- spaces ---
+        "matrix.spaces" => 5.0,
+        "matrix.space_info" => 1.0,
+        "matrix.space_rooms" => 8.0,
 
         // --- membership ---
 
@@ -306,5 +400,97 @@ mod tests {
         assert!(matches!(parse_attached("matrix.unread", serde_json::json!({})), Ok(MatrixServiceCall::Unread)));
         assert!(matches!(parse_attached("matrix.power_levels", serde_json::json!({})), Ok(MatrixServiceCall::PowerLevels)));
         assert!(matches!(parse_attached("matrix.successor", serde_json::json!({})), Ok(MatrixServiceCall::Successor)));
+    }
+}
+
+#[cfg(test)]
+mod rooms_and_account_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn rooms_search_needs_a_query_and_clamps_limit() {
+        assert!(parse("matrix.rooms_search", &json!({}), false).is_err());
+        assert!(parse("matrix.rooms_search", &json!({"query": "  "}), false).is_err());
+        let Ok(MatrixServiceCall::RoomsSearch { query, limit }) =
+            parse("matrix.rooms_search", &json!({"query": " rust ", "limit": 500}), false) else { panic!() };
+        assert_eq!((query.as_str(), limit), ("rust", 50));
+        let Ok(MatrixServiceCall::RoomsSearch { limit, .. }) =
+            parse("matrix.rooms_search", &json!({"query": "x", "limit": 0}), false) else { panic!() };
+        assert_eq!(limit, 1);
+        let Ok(MatrixServiceCall::RoomsSearch { limit, .. }) =
+            parse("matrix.rooms_search", &json!({"query": "x"}), false) else { panic!() };
+        assert_eq!(limit, 20);
+    }
+
+    #[test]
+    fn invites_parses_without_a_room() {
+        assert!(matches!(parse("matrix.invites", &json!({}), false), Ok(MatrixServiceCall::Invites)));
+    }
+
+    #[test]
+    fn room_preview_takes_an_id_or_alias_and_via() {
+        assert!(parse("matrix.room_preview", &json!({}), false).is_err());
+        assert!(parse("matrix.room_preview", &json!({"room": "matrix.org"}), false).is_err());
+        let Ok(MatrixServiceCall::RoomPreview { room, via }) =
+            parse("matrix.room_preview", &json!({"room": "#robrix:matrix.org", "via": ["matrix.org", 7]}), false) else { panic!() };
+        assert_eq!(room, "#robrix:matrix.org");
+        assert_eq!(via, vec!["matrix.org"]);
+        let Ok(MatrixServiceCall::RoomPreview { room, via }) =
+            parse("matrix.room_preview", &json!({"room": "!abc:x"}), false) else { panic!() };
+        assert_eq!(room, "!abc:x");
+        assert!(via.is_empty());
+    }
+
+    #[test]
+    fn rooms_info_needs_a_room_id() {
+        assert!(parse("matrix.rooms_info", &json!({}), false).is_err());
+        assert!(parse("matrix.rooms_info", &json!({"room_id": "#alias:x"}), false).is_err());
+        let Ok(MatrixServiceCall::RoomsInfo { room_id }) =
+            parse("matrix.rooms_info", &json!({"room_id": " !abc:x "}), false) else { panic!() };
+        assert_eq!(room_id, "!abc:x");
+    }
+
+    #[test]
+    fn rooms_messages_needs_a_room_id_and_clamps_limit() {
+        assert!(parse("matrix.rooms_messages", &json!({"limit": 5}), false).is_err());
+        let Ok(MatrixServiceCall::RoomsMessages { room_id, limit }) =
+            parse("matrix.rooms_messages", &json!({"room_id": "!abc:x", "limit": 999}), false) else { panic!() };
+        assert_eq!((room_id.as_str(), limit), ("!abc:x", 30));
+        let Ok(MatrixServiceCall::RoomsMessages { limit, .. }) =
+            parse("matrix.rooms_messages", &json!({"room_id": "!abc:x"}), false) else { panic!() };
+        assert_eq!(limit, 10);
+    }
+
+    #[test]
+    fn space_services_parse() {
+        assert!(matches!(parse("matrix.spaces", &json!({}), false), Ok(MatrixServiceCall::Spaces)));
+        assert!(parse("matrix.space_info", &json!({}), false).is_err());
+        assert!(parse("matrix.space_rooms", &json!({"space_id": "bad"}), false).is_err());
+        let Ok(MatrixServiceCall::SpaceInfo { space_id }) =
+            parse("matrix.space_info", &json!({"space_id": "!s:x"}), false) else { panic!() };
+        assert_eq!(space_id, "!s:x");
+        let Ok(MatrixServiceCall::SpaceRooms { space_id }) =
+            parse("matrix.space_rooms", &json!({"space_id": "!s:x"}), false) else { panic!() };
+        assert_eq!(space_id, "!s:x");
+    }
+
+    #[test]
+    fn user_services_need_a_user_id() {
+        assert!(parse("matrix.user_profile", &json!({}), false).is_err());
+        assert!(parse("matrix.dm_find", &json!({"user_id": "alice"}), false).is_err());
+        let Ok(MatrixServiceCall::UserProfile { user_id }) =
+            parse("matrix.user_profile", &json!({"user_id": "@alice:x"}), false) else { panic!() };
+        assert_eq!(user_id, "@alice:x");
+        let Ok(MatrixServiceCall::DmFind { user_id }) =
+            parse("matrix.dm_find", &json!({"user_id": "@alice:x"}), false) else { panic!() };
+        assert_eq!(user_id, "@alice:x");
+    }
+
+    #[test]
+    fn account_services_parse_without_a_room() {
+        assert!(matches!(parse("matrix.device", &json!({}), false), Ok(MatrixServiceCall::Device)));
+        assert!(matches!(parse("matrix.account_info", &json!({}), false), Ok(MatrixServiceCall::AccountInfo)));
+        assert!(matches!(parse("matrix.ignored_users", &json!({}), false), Ok(MatrixServiceCall::IgnoredUsers)));
     }
 }

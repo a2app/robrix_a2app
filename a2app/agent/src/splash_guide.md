@@ -524,10 +524,51 @@ burning a permission.
   (fields null when it wasn't upgraded). Pass `room_id` to `nav.room` to go there.
 
 <!-- rooms -->
+- `"matrix.rooms_search"` (needs `matrix-rooms-list`, works without a room):
+  `{query, limit: N}` (max 50) ->
+  `{rooms: [{room_id, name, is_direct, is_space, member_count, is_encrypted, joined}]}`,
+  the joined and invited rooms whose name or alias contains the text,
+  case-insensitively.
+- `"matrix.invites"` (needs `matrix-rooms-list`, works without a room): `{}` ->
+  `{invites: [{room_id, name, is_space, is_direct, inviter_id, inviter_name}]}`,
+  the rooms you are invited to.
+- `"matrix.room_preview"` (needs `matrix-rooms-list`, works without a room):
+  `{room: "!id or #alias", via: ["server"]}` ->
+  `{room_id, name, topic, member_count, join_rule, is_space, joined}`. Asks the
+  homeserver, so it works for rooms you haven't joined and can be slow.
+- `"matrix.rooms_info"` (needs `matrix-rooms-read`, prompts, works without a
+  room): `{room_id}` -> the `matrix.room_info` shape for any joined room.
+- `"matrix.rooms_messages"` (needs `matrix-rooms-read`, prompts, works without
+  a room): `{room_id, limit: N}` (max 30) -> the `matrix.read_messages` shape
+  for any joined room.
 
 <!-- spaces -->
+- `"matrix.spaces"` (needs `matrix-spaces`, prompts, works without a room): `{}` ->
+  `{spaces: [{space_id, name, topic, member_count}]}`, the spaces you have joined.
+- `"matrix.space_info"` (needs `matrix-spaces`, prompts, works without a room):
+  `{space_id}` ->
+  `{space_id, name, topic, member_count, join_rule, world_readable, children_count}`
+  for a joined space.
+- `"matrix.space_rooms"` (needs `matrix-spaces`, prompts, works without a room):
+  `{space_id}` ->
+  `{rooms: [{room_id, name, topic, is_space, joined, member_count, join_rule}]}`,
+  the space's direct child rooms and subspaces (first 200). Asks the homeserver,
+  so it can be slow. Pass a child's `room_id` to `nav.room` when `joined` is true.
 
 <!-- account -->
+- `"matrix.user_profile"` (needs `matrix-users`, prompts, works without a room):
+  `{user_id}` -> `{user_id, display_name, has_avatar, ignored}`. Asks the
+  homeserver.
+- `"matrix.dm_find"` (needs `matrix-users`, prompts, works without a room):
+  `{user_id}` -> `{room_id, name}`, both null when no DM with that user exists.
+  Never creates one.
+- `"matrix.device"` (needs `matrix-account-read`, prompts, works without a room):
+  `{}` -> `{device_id, name, verified}` for this Robrix session.
+- `"matrix.account_info"` (needs `matrix-account-read`, prompts, works without a
+  room): `{}` -> `{user_id, homeserver, account_management_url}`; the URL is
+  null unless the homeserver uses OAuth.
+- `"matrix.ignored_users"` (needs `matrix-account-read`, prompts, works without a
+  room): `{}` -> `{users: [user_id]}`, the account's ignore list.
 
 <!-- send -->
 

@@ -273,4 +273,105 @@ pub(super) async fn successor(room_id: OwnedRoomId) -> Result<String, String> {
         "name": name,
         "reason": successor.reason,
     }).to_string())
+
+}
+/// `matrix.room_info`, and `matrix.rooms_info` for any joined room.
+pub(super) async fn info(room_id: matrix_sdk::ruma::OwnedRoomId) -> Result<String, String> {
+    use matrix_sdk::RoomState;
+    use crate::sliding_sync::get_client;
+    let client = get_client().ok_or("not logged in")?;
+    let room = client.get_room(&room_id).ok_or("room not found")?;
+    if room.state() != RoomState::Joined {
+        return Err("room not joined".into());
+    }
+    let room_name = room.display_name().await
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| room_id.to_string());
+    let join_rule = room.join_rule()
+        .map(|r| r.as_str().to_string())
+        .unwrap_or_else(|| String::from("unknown"));
+    let history = room.history_visibility_or_default().as_str().to_string();
+    let body = serde_json::json!({
+        "room_id": room_id.to_string(),
+        "room_name": room_name,
+        "topic": room.topic().unwrap_or_default(),
+        "member_count": room.active_members_count(),
+        "encrypted": room.encryption_state().is_encrypted(),
+        "join_rule": join_rule,
+        "history_visibility": history,
+    });
+    Ok(body.to_string())
+}
+
+/// `matrix.read_messages`, and `matrix.rooms_messages` for any joined room.
+pub(super) async fn read_messages(room_id: matrix_sdk::ruma::OwnedRoomId, limit: u32) -> Result<String, String> {
+    use matrix_sdk::RoomState;
+    use matrix_sdk::room::MessagesOptions;
+    use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent};
+    use super::clip_chars;
+    use crate::sliding_sync::get_client;
+    let client = get_client().ok_or("not logged in")?;
+    let room = client.get_room(&room_id).ok_or("room not found")?;
+    if room.state() != RoomState::Joined {
+        return Err("room not joined".into());
+    }
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    // The event cache already holds the recent timeline in
+    // memory; only hit the network when it can't fill the request.
+    if let Ok((cache, _guard)) = client.event_cache().room(&room_id).await {
+        if let Ok(events) = cache.events().await {
+            for event in events.iter().rev() {
+                let Ok(AnySyncTimelineEvent::MessageLike(
+                    AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(msg))
+                )) = event.raw().deserialize() else { continue };
+                let mut body = msg.content.body().to_string();
+                clip_chars(&mut body, 500);
+                out.push(serde_json::json!({
+                    "sender": msg.sender.localpart(),
+                    "sender_id": msg.sender,
+                    "event_id": msg.event_id,
+                    "body": body,
+                }));
+                if out.len() >= limit as usize {
+                    break;
+                }
+            }
+        }
+    }
+    if out.len() < limit as usize {
+        // A room's recent tail can be all state events (profile
+        // changes etc), so keep paginating until we fill `limit`.
+        out.clear();
+        let mut from: Option<String> = None;
+        for _ in 0..4 {
+            let mut options = MessagesOptions::backward();
+            options.limit = 50u32.into();
+            options.from = from;
+            let messages = room.messages(options).await
+                .map_err(|e| format!("couldn't read messages: {e}"))?;
+            for event in messages.chunk {
+                let Ok(AnySyncTimelineEvent::MessageLike(
+                    AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(msg))
+                )) = event.raw().deserialize() else { continue };
+                let mut body = msg.content.body().to_string();
+                clip_chars(&mut body, 500);
+                out.push(serde_json::json!({
+                    "sender": msg.sender.localpart(),
+                    "sender_id": msg.sender,
+                    "event_id": msg.event_id,
+                    "body": body,
+                }));
+                if out.len() >= limit as usize {
+                    break;
+                }
+            }
+            from = messages.end;
+            if out.len() >= limit as usize || from.is_none() {
+                break;
+            }
+        }
+    }
+    // Backward pagination is newest-first; apps read oldest-first.
+    out.reverse();
+    Ok(serde_json::json!({ "messages": out }).to_string())
 }

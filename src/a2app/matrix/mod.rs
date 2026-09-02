@@ -11,7 +11,7 @@ use std::collections::HashSet;
 
 use makepad_widgets::*;
 use matrix_sdk::RoomState;
-use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
+use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedRoomOrAliasId, OwnedServerName, OwnedUserId};
 
 use a2app_core::services::{MatrixServiceCall, Reply, SearchScope};
 
@@ -22,6 +22,7 @@ pub mod account;
 pub mod room;
 pub mod rooms;
 pub mod send;
+pub mod spaces;
 
 /// Matrix work requested by a mini-app (or a share), run on the worker.
 #[derive(Debug)]
@@ -53,10 +54,23 @@ pub enum A2AppMatrixRequest {
     Successor { room_id: OwnedRoomId, reply: Reply },
 
     // --- rooms ---
+    RoomsSearch { query: String, limit: u32, reply: Reply },
+    Invites { reply: Reply },
+    RoomPreview { room: OwnedRoomOrAliasId, via: Vec<OwnedServerName>, reply: Reply },
+    RoomsInfo { room_id: OwnedRoomId, reply: Reply },
+    RoomsMessages { room_id: OwnedRoomId, limit: u32, reply: Reply },
 
     // --- spaces ---
+    Spaces { reply: Reply },
+    SpaceInfo { space_id: OwnedRoomId, reply: Reply },
+    SpaceRooms { space_id: OwnedRoomId, reply: Reply },
 
     // --- account ---
+    UserProfile { user_id: OwnedUserId, reply: Reply },
+    DmFind { user_id: OwnedUserId, reply: Reply },
+    Device { reply: Reply },
+    AccountInfo { reply: Reply },
+    IgnoredUsers { reply: Reply },
 
     // --- send ---
 
@@ -102,6 +116,47 @@ pub fn request_for(
         }
         (MatrixServiceCall::Search { query, scope: SearchScope::Attached, limit, server }, Some(room_id)) =>
             A2AppMatrixRequest::Search { rooms: SearchRooms::One(room_id), query, limit, server, reply },
+        // The room-free rooms, spaces and account services sit above the
+        // no-room guard on purpose; `parse` has already checked the id sigils.
+        (MatrixServiceCall::RoomsSearch { query, limit }, _) =>
+            A2AppMatrixRequest::RoomsSearch { query, limit, reply },
+        (MatrixServiceCall::Invites, _) => A2AppMatrixRequest::Invites { reply },
+        (MatrixServiceCall::RoomPreview { room, via }, _) => {
+            let room = OwnedRoomOrAliasId::try_from(room.as_str()).map_err(|_| "invalid room id or alias")?;
+            let via = via.iter()
+                .filter_map(|s| OwnedServerName::try_from(s.as_str()).ok())
+                .collect();
+            A2AppMatrixRequest::RoomPreview { room, via, reply }
+        }
+        (MatrixServiceCall::RoomsInfo { room_id }, _) => A2AppMatrixRequest::RoomsInfo {
+            room_id: OwnedRoomId::try_from(room_id.as_str()).map_err(|_| "invalid room id")?,
+            reply,
+        },
+        (MatrixServiceCall::RoomsMessages { room_id, limit }, _) => A2AppMatrixRequest::RoomsMessages {
+            room_id: OwnedRoomId::try_from(room_id.as_str()).map_err(|_| "invalid room id")?,
+            limit,
+            reply,
+        },
+        (MatrixServiceCall::Spaces, _) => A2AppMatrixRequest::Spaces { reply },
+        (MatrixServiceCall::SpaceInfo { space_id }, _) => A2AppMatrixRequest::SpaceInfo {
+            space_id: OwnedRoomId::try_from(space_id.as_str()).map_err(|_| "invalid space id")?,
+            reply,
+        },
+        (MatrixServiceCall::SpaceRooms { space_id }, _) => A2AppMatrixRequest::SpaceRooms {
+            space_id: OwnedRoomId::try_from(space_id.as_str()).map_err(|_| "invalid space id")?,
+            reply,
+        },
+        (MatrixServiceCall::UserProfile { user_id }, _) => A2AppMatrixRequest::UserProfile {
+            user_id: OwnedUserId::try_from(user_id.as_str()).map_err(|_| "invalid user id")?,
+            reply,
+        },
+        (MatrixServiceCall::DmFind { user_id }, _) => A2AppMatrixRequest::DmFind {
+            user_id: OwnedUserId::try_from(user_id.as_str()).map_err(|_| "invalid user id")?,
+            reply,
+        },
+        (MatrixServiceCall::Device, _) => A2AppMatrixRequest::Device { reply },
+        (MatrixServiceCall::AccountInfo, _) => A2AppMatrixRequest::AccountInfo { reply },
+        (MatrixServiceCall::IgnoredUsers, _) => A2AppMatrixRequest::IgnoredUsers { reply },
         (_, None) => {
             return Err("this mini-app is not attached to a room");
         }
@@ -182,98 +237,9 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
     use crate::sliding_sync::{current_user_id, get_client};
 
     let (reply, result) = match request {
-        A2AppMatrixRequest::RoomInfo { room_id, reply } => {
-            let result: Result<String, String> = async {
-                let client = get_client().ok_or("not logged in")?;
-                let room = client.get_room(&room_id).ok_or("room not found")?;
-                let room_name = room.display_name().await
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|_| room_id.to_string());
-                let join_rule = room.join_rule()
-                    .map(|r| r.as_str().to_string())
-                    .unwrap_or_else(|| String::from("unknown"));
-                let history = room.history_visibility_or_default().as_str().to_string();
-                let body = serde_json::json!({
-                    "room_id": room_id.to_string(),
-                    "room_name": room_name,
-                    "topic": room.topic().unwrap_or_default(),
-                    "member_count": room.active_members_count(),
-                    "encrypted": room.encryption_state().is_encrypted(),
-                    "join_rule": join_rule,
-                    "history_visibility": history,
-                });
-                Ok(body.to_string())
-            }.await;
-            (reply, result)
-        }
-        A2AppMatrixRequest::ReadMessages { room_id, limit, reply } => {
-            let result: Result<String, String> = async {
-                use matrix_sdk::room::MessagesOptions;
-                use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent};
-                let client = get_client().ok_or("not logged in")?;
-                let room = client.get_room(&room_id).ok_or("room not found")?;
-                let mut out: Vec<serde_json::Value> = Vec::new();
-                // The event cache already holds the recent timeline in
-                // memory; only hit the network when it can't fill the request.
-                if let Ok((cache, _guard)) = client.event_cache().room(&room_id).await {
-                    if let Ok(events) = cache.events().await {
-                        for event in events.iter().rev() {
-                            let Ok(AnySyncTimelineEvent::MessageLike(
-                                AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(msg))
-                            )) = event.raw().deserialize() else { continue };
-                            let mut body = msg.content.body().to_string();
-                            clip_chars(&mut body, 500);
-                            out.push(serde_json::json!({
-                                "sender": msg.sender.localpart(),
-                                "sender_id": msg.sender,
-                                "event_id": msg.event_id,
-                                "body": body,
-                            }));
-                            if out.len() >= limit as usize {
-                                break;
-                            }
-                        }
-                    }
-                }
-                if out.len() < limit as usize {
-                    // A room's recent tail can be all state events (profile
-                    // changes etc), so keep paginating until we fill `limit`.
-                    out.clear();
-                    let mut from: Option<String> = None;
-                    for _ in 0..4 {
-                        let mut options = MessagesOptions::backward();
-                        options.limit = 50u32.into();
-                        options.from = from;
-                        let messages = room.messages(options).await
-                            .map_err(|e| format!("couldn't read messages: {e}"))?;
-                        for event in messages.chunk {
-                            let Ok(AnySyncTimelineEvent::MessageLike(
-                                AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(msg))
-                            )) = event.raw().deserialize() else { continue };
-                            let mut body = msg.content.body().to_string();
-                            clip_chars(&mut body, 500);
-                            out.push(serde_json::json!({
-                                "sender": msg.sender.localpart(),
-                                "sender_id": msg.sender,
-                                "event_id": msg.event_id,
-                                "body": body,
-                            }));
-                            if out.len() >= limit as usize {
-                                break;
-                            }
-                        }
-                        from = messages.end;
-                        if out.len() >= limit as usize || from.is_none() {
-                            break;
-                        }
-                    }
-                }
-                // Backward pagination is newest-first; apps read oldest-first.
-                out.reverse();
-                Ok(serde_json::json!({ "messages": out }).to_string())
-            }.await;
-            (reply, result)
-        }
+        A2AppMatrixRequest::RoomInfo { room_id, reply } => (reply, room::info(room_id).await),
+        A2AppMatrixRequest::ReadMessages { room_id, limit, reply } =>
+            (reply, room::read_messages(room_id, limit).await),
         A2AppMatrixRequest::SendMessage { room_id, body, reply } => {
             let result: Result<String, String> = async {
                 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
@@ -392,15 +358,9 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
                 let client = get_client().ok_or("not logged in")?;
                 let mut out: Vec<serde_json::Value> = Vec::new();
                 for room in client.joined_rooms() {
-                    let name = match room.cached_display_name() {
-                        Some(name) => name.to_string(),
-                        None => room.display_name().await
-                            .map(|n| n.to_string())
-                            .unwrap_or_else(|_| room.room_id().to_string()),
-                    };
                     out.push(serde_json::json!({
                         "room_id": room.room_id(),
-                        "name": name,
+                        "name": rooms::room_name(&room).await,
                         "is_direct": room.is_direct().await.unwrap_or(false),
                         "is_space": room.is_space(),
                         "member_count": room.joined_members_count(),
@@ -593,10 +553,24 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
             (reply, room::successor(room_id).await),
 
         // --- rooms ---
+        A2AppMatrixRequest::RoomsSearch { query, limit, reply } => (reply, rooms::search(query, limit).await),
+        A2AppMatrixRequest::Invites { reply } => (reply, rooms::invites().await),
+        A2AppMatrixRequest::RoomPreview { room, via, reply } => (reply, rooms::preview(room, via).await),
+        A2AppMatrixRequest::RoomsInfo { room_id, reply } => (reply, room::info(room_id).await),
+        A2AppMatrixRequest::RoomsMessages { room_id, limit, reply } =>
+            (reply, room::read_messages(room_id, limit).await),
 
         // --- spaces ---
+        A2AppMatrixRequest::Spaces { reply } => (reply, spaces::list().await),
+        A2AppMatrixRequest::SpaceInfo { space_id, reply } => (reply, spaces::info(space_id).await),
+        A2AppMatrixRequest::SpaceRooms { space_id, reply } => (reply, spaces::rooms(space_id).await),
 
         // --- account ---
+        A2AppMatrixRequest::UserProfile { user_id, reply } => (reply, account::user_profile(user_id).await),
+        A2AppMatrixRequest::DmFind { user_id, reply } => (reply, account::dm_find(user_id).await),
+        A2AppMatrixRequest::Device { reply } => (reply, account::device().await),
+        A2AppMatrixRequest::AccountInfo { reply } => (reply, account::info().await),
+        A2AppMatrixRequest::IgnoredUsers { reply } => (reply, account::ignored_users().await),
 
         // --- send ---
 

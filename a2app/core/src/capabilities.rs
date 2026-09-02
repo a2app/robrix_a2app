@@ -299,10 +299,10 @@ pub const CATALOG: &[Capability] = &[
     // ----- microphone -----
     cap!("device.microphone.record", "Record audio", "OS recorder returning a clip handle for share or attachment.", Read, Outgoing, Device, Some(P::Microphone), PlannedNewPlumbing, High, []),
     // ----- matrix-account-read -----
-    cap!("matrix.account.device.read", "This device", "Device id, name, and verification state.", Read, Outgoing, Account, Some(P::MatrixAccountRead), PlannedMachinery, Medium, []),
-    cap!("matrix.account.info.read", "Account info", "Homeserver URL and account-management URL.", Read, Outgoing, Account, Some(P::MatrixAccountRead), PlannedMachinery, Medium, []),
+    cap!("matrix.account.device.read", "This device", "Device id, name, and verification state.", Read, Outgoing, Account, Some(P::MatrixAccountRead), Available, Medium, ["matrix.device"]),
+    cap!("matrix.account.info.read", "Account info", "Homeserver URL and account-management URL.", Read, Outgoing, Account, Some(P::MatrixAccountRead), Available, Medium, ["matrix.account_info"]),
     cap!("matrix.account.data.read", "Read app account data", "A global account-data event of an app-namespaced type (rs.robius.a2app.<app_id>.*); m.* types are refused.", Read, Outgoing, Account, Some(P::MatrixAccountRead), PlannedNewPlumbing, Medium, []),
-    cap!("matrix.account.ignored.read", "Read your ignore list", "See which users you have ignored.", Read, Outgoing, Account, Some(P::MatrixAccountRead), PlannedMachinery, Medium, []),
+    cap!("matrix.account.ignored.read", "Read your ignore list", "See which users you have ignored.", Read, Outgoing, Account, Some(P::MatrixAccountRead), Available, Medium, ["matrix.ignored_users"]),
     cap!("on_account_data_changed", "App account data changed", "Called when a subscribed app-namespaced type changes on any device.", Read, Incoming, Account, Some(P::MatrixAccountRead), PlannedNewPlumbing, Medium, []),
     // ----- matrix-account-write -----
     cap!("matrix.account.display_name.set", "Change your name", "Set your global display name; the new name is shown on the prompt.", Write, Outgoing, Account, Some(P::MatrixAccountWrite), PlannedMachinery, Critical, []),
@@ -310,8 +310,8 @@ pub const CATALOG: &[Capability] = &[
     cap!("matrix.user.ignore.set", "Block or unblock someone", "Add or remove a user from the account-wide ignore list.", Write, Outgoing, User, Some(P::MatrixAccountWrite), PlannedMachinery, Critical, []),
     cap!("matrix.account.data.write", "Store app account data", "Write an app-namespaced account-data type so app state follows the user across devices.", Write, Outgoing, Account, Some(P::MatrixAccountWrite), PlannedNewPlumbing, High, []),
     // ----- matrix-users -----
-    cap!("matrix.user.profile.read", "Look up a user", "Display name, avatar and ignored flag for any user id through your homeserver.", Read, Outgoing, User, Some(P::MatrixUsers), PlannedMachinery, Medium, []),
-    cap!("matrix.user.dm.find", "Find an existing DM", "The DM room with a user if one exists; never creates one.", Read, Outgoing, User, Some(P::MatrixUsers), PlannedMachinery, Medium, []),
+    cap!("matrix.user.profile.read", "Look up a user", "Display name, avatar and ignored flag for any user id through your homeserver.", Read, Outgoing, User, Some(P::MatrixUsers), Available, Medium, ["matrix.user_profile"]),
+    cap!("matrix.user.dm.find", "Find an existing DM", "The DM room with a user if one exists; never creates one.", Read, Outgoing, User, Some(P::MatrixUsers), Available, Medium, ["matrix.dm_find"]),
     cap!("matrix.user.search", "Find people", "Search the homeserver's user directory.", Read, Outgoing, User, Some(P::MatrixUsers), PlannedNewPlumbing, Medium, []),
     cap!("matrix.user.presence.read", "Presence", "Online / idle / offline for a user, plus the on_user_presence hook.", Read, Outgoing, User, Some(P::MatrixUsers), PlannedNewPlumbing, Medium, []),
     // ----- matrix-room-watch -----
@@ -352,15 +352,15 @@ pub const CATALOG: &[Capability] = &[
     cap!("on_upload_progress", "Upload progress hook", "Be told how an upload it started is progressing, and cancel it.", Read, Incoming, Room, Some(P::MatrixMedia), PlannedMachinery, Low, []),
     // ----- matrix-rooms-list -----
     cap!("matrix.rooms.list", "Your rooms", "Joined rooms and DMs with name, unread, mentions, tags, is_direct, is_space; no message previews; optionally limited to a space.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsList), Available, High, ["matrix.rooms_list"]),
-    cap!("matrix.rooms.search", "Find rooms", "Your rooms and spaces whose name or alias match a query.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsList), PlannedMachinery, Medium, []),
-    cap!("matrix.rooms.invites.list", "Pending invites", "Rooms you are invited to, with inviter.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsList), PlannedMachinery, Medium, []),
-    cap!("matrix.rooms.preview.read", "Preview a room", "Public details of any room by id or alias, joined or not.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsList), PlannedMachinery, Low, []),
+    cap!("matrix.rooms.search", "Find rooms", "Your rooms and spaces whose name or alias match a query.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsList), Available, Medium, ["matrix.rooms_search"]),
+    cap!("matrix.rooms.invites.list", "Pending invites", "Rooms you are invited to, with inviter.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsList), Available, Medium, ["matrix.invites"]),
+    cap!("matrix.rooms.preview.read", "Preview a room", "Public details of any room by id or alias, joined or not.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsList), Available, Low, ["matrix.room_preview"]),
     cap!("on_rooms_changed", "Room list changed", "Rooms joined, left, renamed, reordered, or unread counts changed; coalesced diff per pass.", Read, Incoming, MultiRoom, Some(P::MatrixRoomsList), PlannedMachinery, High, []),
     cap!("on_invite_received", "Invite received", "A new room invite arrived; joining stays a user action unless matrix-membership is granted.", Read, Incoming, MultiRoom, Some(P::MatrixRoomsList), PlannedMachinery, Medium, []),
     cap!("on_unread_totals_changed", "Unread totals changed", "Account-wide unread and mention totals without per-room detail.", Read, Incoming, MultiRoom, Some(P::MatrixRoomsList), PlannedMachinery, Low, []),
     // ----- matrix-rooms-read -----
-    cap!("matrix.rooms.info.read", "Details of another room", "Room details for a room in this app's allowlist.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsRead), PlannedMachinery, Medium, []),
-    cap!("matrix.rooms.messages.read", "Messages in another room", "Recent messages in a room in this app's allowlist.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsRead), PlannedMachinery, Critical, []),
+    cap!("matrix.rooms.info.read", "Details of another room", "Room details for a room in this app's allowlist.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsRead), Available, Medium, ["matrix.rooms_info"]),
+    cap!("matrix.rooms.messages.read", "Messages in another room", "Recent messages in a room in this app's allowlist.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsRead), Available, Critical, ["matrix.rooms_messages"]),
     cap!("matrix.rooms.messages.search", "Search across rooms", "Find messages by text in every joined room or a picked set; local content first, the homeserver for unencrypted rooms when asked. Reads far beyond the attached room.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsRead), Available, Critical, ["matrix.search_rooms"]),
     cap!("on_rooms_message", "New messages in picked rooms", "New messages in allowlisted rooms; only rooms whose timeline Robrix has built deliver, so a firehose over every room is not offered.", Read, Incoming, MultiRoom, Some(P::MatrixRoomsRead), PlannedNewPlumbing, Critical, []),
     // ----- matrix-rooms-send -----
@@ -372,9 +372,9 @@ pub const CATALOG: &[Capability] = &[
     cap!("matrix.room.leave", "Leave this room", "Leave the ATTACHED room as you; Robrix's own leave confirmation is raised on every call, and success kills the instance. Leaving any other room stays never.", Write, Outgoing, Room, Some(P::MatrixMembership), PlannedMachinery, Critical, []),
     cap!("matrix.rooms.create", "Create a room", "Create a room with a name and invitees.", Write, Outgoing, MultiRoom, Some(P::MatrixMembership), PlannedNewPlumbing, High, []),
     // ----- matrix-spaces -----
-    cap!("matrix.spaces.list", "Your spaces", "The spaces you have joined.", Read, Outgoing, Space, Some(P::MatrixSpaces), PlannedMachinery, Medium, []),
-    cap!("matrix.space.info.read", "Space details", "Name, topic, member and room counts, join rule, world-readable.", Read, Outgoing, Space, Some(P::MatrixSpaces), PlannedMachinery, Medium, []),
-    cap!("matrix.space.rooms.list", "Rooms in a space", "Child rooms and subspaces with joined flag.", Read, Outgoing, Space, Some(P::MatrixSpaces), PlannedMachinery, Medium, []),
+    cap!("matrix.spaces.list", "Your spaces", "The spaces you have joined.", Read, Outgoing, Space, Some(P::MatrixSpaces), Available, Medium, ["matrix.spaces"]),
+    cap!("matrix.space.info.read", "Space details", "Name, topic, member and room counts, join rule, world-readable.", Read, Outgoing, Space, Some(P::MatrixSpaces), Available, Medium, ["matrix.space_info"]),
+    cap!("matrix.space.rooms.list", "Rooms in a space", "Child rooms and subspaces with joined flag.", Read, Outgoing, Space, Some(P::MatrixSpaces), Available, Medium, ["matrix.space_rooms"]),
     cap!("on_space_changed", "Space changed", "A subscribed space's children or your space list changed.", Read, Incoming, Space, Some(P::MatrixSpaces), PlannedMachinery, Low, []),
     // ----- robrix-navigation -----
     cap!("host.nav.room", "Open a room", "Switch Robrix to a joined room; unknown or unjoined refused.", Act, Outgoing, MultiRoom, Some(P::RobrixNavigation), Available, Medium, ["nav.room"]),
