@@ -224,6 +224,7 @@ pub fn release_owner_no_cx(surface_uid: WidgetUid) {
             }
         }
     });
+    SignalToUI::set_ui_signal();
 }
 
 /// Owes the instance one `on_surface_changed` / `on_focus_changed` call,
@@ -238,6 +239,7 @@ pub fn note_hook(key: &InstanceKey, hook: LiveId) {
             r.pending_hooks.push(owed);
         }
     });
+    SignalToUI::set_ui_signal();
 }
 
 pub fn surface_of(key: &InstanceKey) -> Option<Surface> {
@@ -360,11 +362,24 @@ pub fn note_size(key: &InstanceKey, size: Vec2d) {
     with_registry(|r| {
         let Some(inst) = r.instances.get_mut(key) else { return };
         let changed = (inst.last_size.x - size.x).abs() > 0.5 || (inst.last_size.y - size.y).abs() > 0.5;
-        if changed {
-            inst.last_size = size;
-            inst.pending_resize = Some(size);
-            r.has_pending_resize = true;
+        if !changed {
+            return;
         }
+        // The first size means the script has booted, so the surface and
+        // focus it was adopted with can reach it now.
+        if inst.last_size == Vec2d::default() {
+            for hook in [live_id!(on_surface_changed), live_id!(on_focus_changed)] {
+                let owed = (key.clone(), hook);
+                if !r.pending_hooks.contains(&owed) {
+                    r.pending_hooks.push(owed);
+                }
+            }
+        }
+        inst.last_size = size;
+        inst.pending_resize = Some(size);
+        r.has_pending_resize = true;
+        // Queued during draw; the hooks go out at the next event pass.
+        SignalToUI::set_ui_signal();
     });
 }
 
@@ -410,14 +425,26 @@ pub fn flush_pending(cx: &mut Cx) {
             cx.widget_tree_insert_child_deep(root, tree_name(&key), host);
         }
     }
+    let trace = std::env::var_os("ROBRIX_A2APP_TRACE_SERVICES").is_some();
     for (host, size) in resizes {
         if let Some(mut splash) = splash_of(cx, &host).borrow_mut::<Splash>() {
-            splash.call_script_fn(cx, live_id!(on_app_resize), &[size.x.into(), size.y.into()]);
+            let called = splash.call_script_fn(cx, live_id!(on_app_resize), &[size.x.into(), size.y.into()]);
+            if trace {
+                log!("a2app hook on_app_resize {size:?} -> {called}");
+            }
+        } else if trace {
+            log!("a2app hook on_app_resize: no splash for host");
         }
     }
     for (host, hook, payload) in hooks {
         if let Some(mut splash) = splash_of(cx, &host).borrow_mut::<Splash>() {
-            splash.call_script_fn_with_strings(cx, hook, &[&payload]);
+            let called = splash.call_script_fn_with_strings(cx, hook, &[&payload]);
+            if trace {
+                let heap = splash.isolate_heap_key(cx);
+                log!("a2app hook {hook} {payload} -> {called} (splash heap {heap:?}, widget {:?})", host.widget_uid());
+            }
+        } else if trace {
+            log!("a2app hook {hook}: no splash for host");
         }
     }
 }
@@ -474,8 +501,13 @@ pub fn deliver_ipc(cx: &mut Cx, from_heap: usize, from: &str, to: &str, data_jso
 /// Returns whether the script defined it.
 pub fn call_hook(cx: &mut Cx, key: &InstanceKey, hook: LiveId, args: &[&str]) -> bool {
     let Some(host) = host_of(key) else { return false };
-    splash_of(cx, &host).borrow_mut::<Splash>()
-        .is_some_and(|mut splash| splash.call_script_fn_with_strings(cx, hook, args))
+    let called = splash_of(cx, &host).borrow_mut::<Splash>()
+        .is_some_and(|mut splash| splash.call_script_fn_with_strings(cx, hook, args));
+    if std::env::var_os("ROBRIX_A2APP_TRACE_SERVICES").is_some() {
+        let heap = splash_of(cx, &host).borrow_mut::<Splash>().and_then(|mut s| s.isolate_heap_key(cx));
+        log!("a2app call_hook {hook} -> {called} (splash heap {heap:?}, widget {:?})", host.widget_uid());
+    }
+    called
 }
 
 /// Like [`call_hook`], addressed by the isolate's heap key.
