@@ -258,8 +258,8 @@ pub const CATALOG: &[Capability] = &[
     cap!("matrix.room.receipts.read", "Read positions", "How far a given person has read, honoring show_read_receipts.", Read, Outgoing, Room, Some(P::MatrixRoomRead), Available, Medium, ["matrix.read_receipts"]),
     // ----- matrix-room-send -----
     cap!("matrix.room.message.send", "Send a message", "Post text to the attached room as you; one per user action; format beyond plain is planned via the slash-command content builders.", Write, Outgoing, Room, Some(P::MatrixRoomSend), RefusedBySwitch, High, ["matrix.send_message"]),
-    cap!("matrix.room.message.reply", "Reply to a message", "Post a reply to a specific event.", Write, Outgoing, Room, Some(P::MatrixRoomSend), PlannedMachinery, High, []),
-    cap!("matrix.room.thread.reply", "Reply in a thread", "Post into a thread.", Write, Outgoing, Room, Some(P::MatrixRoomSend), PlannedMachinery, High, []),
+    cap!("matrix.room.message.reply", "Reply to a message", "Post a reply to a specific event.", Write, Outgoing, Room, Some(P::MatrixRoomSend), RefusedBySwitch, High, ["matrix.reply"]),
+    cap!("matrix.room.thread.reply", "Reply in a thread", "Post into a thread.", Write, Outgoing, Room, Some(P::MatrixRoomSend), RefusedBySwitch, High, ["matrix.thread_reply"]),
     cap!("matrix.room.message.edit", "Edit its own message", "Change the text of an event THIS APP sent; the host keeps a per-instance sent-event set and refuses everything else.", Write, Outgoing, Room, Some(P::MatrixRoomSend), PlannedNewPlumbing, High, []),
     cap!("matrix.room.message.redact", "Delete its own message", "Redact an event THIS APP sent; never the user's other messages, never others'.", Write, Outgoing, Room, Some(P::MatrixRoomSend), PlannedNewPlumbing, Critical, []),
     cap!("matrix.room.attachment.send", "Send a file", "Upload a jail file or pick_binary handle into the room; file name shown on the prompt, host progress UI.", Write, Outgoing, Room, Some(P::MatrixRoomSend), PlannedMachinery, High, []),
@@ -325,23 +325,23 @@ pub const CATALOG: &[Capability] = &[
     cap!("on_room_members_changed", "Members changed", "Someone joined or left the attached room; carries the new member count.", Read, Incoming, Room, Some(P::MatrixRoomWatch), Available, Medium, ["on_room_members_changed"]),
     cap!("on_room_mention", "You were mentioned", "An event the push rules say should notify you, in the attached room.", Read, Incoming, Room, Some(P::MatrixRoomWatch), PlannedNewPlumbing, High, []),
     // ----- matrix-room-interact -----
-    cap!("matrix.room.reaction.toggle", "React", "Add or remove your reaction on an event.", ReadWrite, Outgoing, Room, Some(P::MatrixRoomInteract), PlannedMachinery, Medium, []),
-    cap!("matrix.room.typing.send", "Typing indicator", "Show you as typing; auto-expires; limiter-priced.", Write, Outgoing, Room, Some(P::MatrixRoomInteract), PlannedMachinery, Medium, []),
-    cap!("matrix.room.receipt.send", "Mark as read", "Send a read receipt up to an event, or mark the room fully read; honors read_receipts_privacy.", Write, Outgoing, Room, Some(P::MatrixRoomInteract), PlannedMachinery, Medium, []),
+    cap!("matrix.room.reaction.toggle", "React", "Add or remove your reaction on an event.", ReadWrite, Outgoing, Room, Some(P::MatrixRoomInteract), RefusedBySwitch, Medium, ["matrix.react"]),
+    cap!("matrix.room.typing.send", "Typing indicator", "Show you as typing; auto-expires; limiter-priced.", Write, Outgoing, Room, Some(P::MatrixRoomInteract), RefusedBySwitch, Medium, ["matrix.typing"]),
+    cap!("matrix.room.receipt.send", "Mark as read", "Send a read receipt up to an event, or mark the room fully read; honors read_receipts_privacy.", Write, Outgoing, Room, Some(P::MatrixRoomInteract), RefusedBySwitch, Medium, ["matrix.read_receipt"]),
     // ----- matrix-room-app-data -----
     cap!("matrix.room.app_event.send", "Save app data to the room", "Post this app's own state as an rs.robius.a2app.data event with app_id stamped by the host; other members' copies see it.", Write, Outgoing, Room, Some(P::MatrixRoomAppData), PlannedNewPlumbing, Medium, []),
     cap!("matrix.room.app_event.read", "Load app data from the room", "Latest N of this app's own data events, for state replay on boot.", Read, Outgoing, Room, Some(P::MatrixRoomAppData), PlannedNewPlumbing, Low, []),
     cap!("on_room_app_event", "App data arrived", "Another copy of this app saved state into the room.", Read, Incoming, Room, Some(P::MatrixRoomAppData), PlannedNewPlumbing, Low, []),
     // ----- matrix-room-manage -----
-    cap!("matrix.room.pin.set", "Pin or unpin", "Pin or unpin an event; the SDK enforces power level.", Write, Outgoing, Room, Some(P::MatrixRoomManage), PlannedMachinery, Medium, []),
-    cap!("matrix.room.favorite.set", "Favorite", "Add or remove this room from your favorites.", Write, Outgoing, Room, Some(P::MatrixRoomManage), PlannedMachinery, Low, []),
-    cap!("matrix.room.low_priority.set", "Low priority", "Mark this room low priority or restore it.", Write, Outgoing, Room, Some(P::MatrixRoomManage), PlannedMachinery, Low, []),
-    cap!("matrix.room.unread.set", "Flag unread", "Flag this room unread, or clear the flag, without sending a receipt.", Write, Outgoing, Room, Some(P::MatrixRoomManage), PlannedMachinery, Low, []),
+    cap!("matrix.room.pin.set", "Pin or unpin", "Pin or unpin an event; the SDK enforces power level.", Write, Outgoing, Room, Some(P::MatrixRoomManage), RefusedBySwitch, Medium, ["matrix.pin"]),
+    cap!("matrix.room.favorite.set", "Favorite", "Add or remove this room from your favorites.", Write, Outgoing, Room, Some(P::MatrixRoomManage), RefusedBySwitch, Low, ["matrix.favorite"]),
+    cap!("matrix.room.low_priority.set", "Low priority", "Mark this room low priority or restore it.", Write, Outgoing, Room, Some(P::MatrixRoomManage), RefusedBySwitch, Low, ["matrix.low_priority"]),
+    cap!("matrix.room.unread.set", "Flag unread", "Flag this room unread, or clear the flag, without sending a receipt.", Write, Outgoing, Room, Some(P::MatrixRoomManage), RefusedBySwitch, Low, ["matrix.mark_unread"]),
     cap!("matrix.room.state.send", "Change room settings", "A state event of a declared type (name, topic, avatar, or an app-owned state type); power levels and membership types refused.", Write, Outgoing, Room, Some(P::MatrixRoomManage), PlannedNewPlumbing, Critical, []),
     cap!("matrix.room.account_data.read", "Read room notes", "App-owned per-room account data.", Read, Outgoing, Room, Some(P::MatrixRoomManage), PlannedNewPlumbing, Medium, []),
     cap!("matrix.room.account_data.write", "Store room notes", "Write app-owned per-room account data (never m.* types).", Write, Outgoing, Room, Some(P::MatrixRoomManage), PlannedNewPlumbing, Medium, []),
     // ----- matrix-room-invite -----
-    cap!("matrix.room.invite.send", "Invite someone", "Invite a user to the attached room as you; the user id is shown on every prompt.", Write, Outgoing, Room, Some(P::MatrixRoomInvite), PlannedMachinery, High, []),
+    cap!("matrix.room.invite.send", "Invite someone", "Invite a user to the attached room as you; the user id is shown on every prompt.", Write, Outgoing, Room, Some(P::MatrixRoomInvite), RefusedBySwitch, High, ["matrix.invite"]),
     // ----- matrix-media -----
     cap!("matrix.media.download", "Fetch an attachment", "Bytes of an attachment or thumbnail from the attached room, size-capped, base64 or handle.", Read, Outgoing, Room, Some(P::MatrixMedia), PlannedMachinery, High, []),
     cap!("matrix.media.save", "Download to disk", "Save an attachment from the attached room to Downloads with host progress UI.", Act, Outgoing, Room, Some(P::MatrixMedia), PlannedMachinery, Medium, []),
@@ -364,11 +364,11 @@ pub const CATALOG: &[Capability] = &[
     cap!("matrix.rooms.messages.search", "Search across rooms", "Find messages by text in every joined room or a picked set; local content first, the homeserver for unencrypted rooms when asked. Reads far beyond the attached room.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsRead), Available, Critical, ["matrix.search_rooms"]),
     cap!("on_rooms_message", "New messages in picked rooms", "New messages in allowlisted rooms; only rooms whose timeline Robrix has built deliver, so a firehose over every room is not offered.", Read, Incoming, MultiRoom, Some(P::MatrixRoomsRead), PlannedNewPlumbing, Critical, []),
     // ----- matrix-rooms-send -----
-    cap!("matrix.rooms.message.send", "Send to another room", "Post text to an allowlisted room as you; room name and text shown on every prompt.", Write, Outgoing, MultiRoom, Some(P::MatrixRoomsSend), PlannedMachinery, Critical, []),
+    cap!("matrix.rooms.message.send", "Send to another room", "Post text to an allowlisted room as you; room name and text shown on every prompt.", Write, Outgoing, MultiRoom, Some(P::MatrixRoomsSend), RefusedBySwitch, Critical, ["matrix.rooms_send"]),
     // ----- matrix-membership -----
-    cap!("matrix.rooms.join", "Join or knock", "Join a room by id or alias, or knock if invite-only; room name shown on every prompt.", Write, Outgoing, MultiRoom, Some(P::MatrixMembership), PlannedMachinery, High, []),
-    cap!("matrix.invites.respond", "Answer an invite", "Accept or decline a pending invite.", Write, Outgoing, MultiRoom, Some(P::MatrixMembership), PlannedMachinery, High, []),
-    cap!("matrix.user.dm.open", "Start a direct message", "Open, or create if needed, a DM with someone and navigate there; creation is what makes this membership.", ReadWrite, Outgoing, User, Some(P::MatrixMembership), PlannedMachinery, High, []),
+    cap!("matrix.rooms.join", "Join or knock", "Join a room by id or alias, or knock if invite-only; room name shown on every prompt.", Write, Outgoing, MultiRoom, Some(P::MatrixMembership), RefusedBySwitch, High, ["matrix.join"]),
+    cap!("matrix.invites.respond", "Answer an invite", "Accept or decline a pending invite.", Write, Outgoing, MultiRoom, Some(P::MatrixMembership), RefusedBySwitch, High, ["matrix.invite_respond"]),
+    cap!("matrix.user.dm.open", "Start a direct message", "Open, or create if needed, a DM with someone; creation is what makes this membership.", ReadWrite, Outgoing, User, Some(P::MatrixMembership), RefusedBySwitch, High, ["matrix.dm_open"]),
     cap!("matrix.room.leave", "Leave this room", "Leave the ATTACHED room as you; Robrix's own leave confirmation is raised on every call, and success kills the instance. Leaving any other room stays never.", Write, Outgoing, Room, Some(P::MatrixMembership), PlannedMachinery, Critical, []),
     cap!("matrix.rooms.create", "Create a room", "Create a room with a name and invitees.", Write, Outgoing, MultiRoom, Some(P::MatrixMembership), PlannedNewPlumbing, High, []),
     // ----- matrix-spaces -----

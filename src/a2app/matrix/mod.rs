@@ -2,7 +2,7 @@
 //! against the SDK on the worker, and the request/result types that carry
 //! it there and back.
 //!
-//! One file per domain (`room`, `rooms`, `account`, `send`) holds the worker
+//! One file per domain (`room`, `rooms`, `account`, `send`, `membership`) holds the worker
 //! bodies; this file owns the request enum, the broker-call mapping and the
 //! dispatch. Add a service by adding its variant, its `request_for` arm and
 //! its dispatch arm in the domain's section, and its body in the domain file.
@@ -14,11 +14,13 @@ use matrix_sdk::RoomState;
 use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedRoomOrAliasId, OwnedServerName, OwnedUserId};
 
 use a2app_core::services::{MatrixServiceCall, Reply, SearchScope};
+use a2app_core::services::matrix::RoomFlag;
 
 use crate::a2app::room_watch;
 use crate::shared::popup_list::{enqueue_popup_notification, PopupKind};
 
 pub mod account;
+pub mod membership;
 pub mod room;
 pub mod rooms;
 pub mod send;
@@ -73,8 +75,18 @@ pub enum A2AppMatrixRequest {
     IgnoredUsers { reply: Reply },
 
     // --- send ---
+    Reply { room_id: OwnedRoomId, event_id: OwnedEventId, body: String, in_thread: bool, reply: Reply },
+    React { room_id: OwnedRoomId, event_id: OwnedEventId, key: String, reply: Reply },
+    Typing { room_id: OwnedRoomId, typing: bool, reply: Reply },
+    ReadReceipt { room_id: OwnedRoomId, event_id: Option<OwnedEventId>, reply: Reply },
+    Pin { room_id: OwnedRoomId, event_id: OwnedEventId, pinned: bool, reply: Reply },
+    RoomFlag { room_id: OwnedRoomId, flag: RoomFlag, on: bool, reply: Reply },
 
     // --- membership ---
+    Invite { room_id: OwnedRoomId, user_id: OwnedUserId, reply: Reply },
+    Join { room: OwnedRoomOrAliasId, via: Vec<OwnedServerName>, reply: Reply },
+    InviteRespond { room_id: OwnedRoomId, accept: bool, reply: Reply },
+    DmOpen { user_id: OwnedUserId, reply: Reply },
 }
 
 /// The rooms a search covers.
@@ -157,9 +169,6 @@ pub fn request_for(
         (MatrixServiceCall::Device, _) => A2AppMatrixRequest::Device { reply },
         (MatrixServiceCall::AccountInfo, _) => A2AppMatrixRequest::AccountInfo { reply },
         (MatrixServiceCall::IgnoredUsers, _) => A2AppMatrixRequest::IgnoredUsers { reply },
-        (_, None) => {
-            return Err("this mini-app is not attached to a room");
-        }
         (MatrixServiceCall::RoomInfo, Some(room_id)) =>
             A2AppMatrixRequest::RoomInfo { room_id, reply },
         (MatrixServiceCall::ReadMessages { limit }, Some(room_id)) =>
@@ -218,8 +227,67 @@ pub fn request_for(
         // --- account ---
 
         // --- send ---
+        (MatrixServiceCall::Reply { event_id, body, in_thread }, Some(room_id)) => A2AppMatrixRequest::Reply {
+            room_id,
+            event_id: OwnedEventId::try_from(event_id).map_err(|_| "invalid event_id")?,
+            body,
+            in_thread,
+            reply,
+        },
+        (MatrixServiceCall::React { event_id, key }, Some(room_id)) => A2AppMatrixRequest::React {
+            room_id,
+            event_id: OwnedEventId::try_from(event_id).map_err(|_| "invalid event_id")?,
+            key,
+            reply,
+        },
+        (MatrixServiceCall::Typing { typing }, Some(room_id)) =>
+            A2AppMatrixRequest::Typing { room_id, typing, reply },
+        (MatrixServiceCall::ReadReceipt { event_id }, Some(room_id)) => A2AppMatrixRequest::ReadReceipt {
+            room_id,
+            event_id: event_id.map(OwnedEventId::try_from).transpose().map_err(|_| "invalid event_id")?,
+            reply,
+        },
+        (MatrixServiceCall::Pin { event_id, pinned }, Some(room_id)) => A2AppMatrixRequest::Pin {
+            room_id,
+            event_id: OwnedEventId::try_from(event_id).map_err(|_| "invalid event_id")?,
+            pinned,
+            reply,
+        },
+        (MatrixServiceCall::RoomFlag { flag, on }, Some(room_id)) =>
+            A2AppMatrixRequest::RoomFlag { room_id, flag, on, reply },
+        (MatrixServiceCall::RoomsSend { room_id, body }, _) => A2AppMatrixRequest::SendMessage {
+            room_id: OwnedRoomId::try_from(room_id).map_err(|_| "invalid room_id")?,
+            body,
+            reply,
+        },
 
         // --- membership ---
+        (MatrixServiceCall::Invite { user_id }, Some(room_id)) => A2AppMatrixRequest::Invite {
+            room_id,
+            user_id: OwnedUserId::try_from(user_id).map_err(|_| "invalid user_id")?,
+            reply,
+        },
+        (MatrixServiceCall::Join { room, via }, _) => A2AppMatrixRequest::Join {
+            room: OwnedRoomOrAliasId::try_from(room).map_err(|_| "invalid room id or alias")?,
+            via: via.into_iter()
+                .map(OwnedServerName::try_from)
+                .collect::<Result<_, _>>()
+                .map_err(|_| "invalid via server name")?,
+            reply,
+        },
+        (MatrixServiceCall::InviteRespond { room_id, accept }, _) => A2AppMatrixRequest::InviteRespond {
+            room_id: OwnedRoomId::try_from(room_id).map_err(|_| "invalid room_id")?,
+            accept,
+            reply,
+        },
+        (MatrixServiceCall::DmOpen { user_id }, _) => A2AppMatrixRequest::DmOpen {
+            user_id: OwnedUserId::try_from(user_id).map_err(|_| "invalid user_id")?,
+            reply,
+        },
+
+        (_, None) => {
+            return Err("this mini-app is not attached to a room");
+        }
     })
 }
 
@@ -240,17 +308,8 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
         A2AppMatrixRequest::RoomInfo { room_id, reply } => (reply, room::info(room_id).await),
         A2AppMatrixRequest::ReadMessages { room_id, limit, reply } =>
             (reply, room::read_messages(room_id, limit).await),
-        A2AppMatrixRequest::SendMessage { room_id, body, reply } => {
-            let result: Result<String, String> = async {
-                use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
-                let client = get_client().ok_or("not logged in")?;
-                let room = client.get_room(&room_id).ok_or("room not found")?;
-                room.send(RoomMessageEventContent::text_plain(body)).await
-                    .map_err(|e| format!("couldn't send the message: {e}"))?;
-                Ok(String::from("{}"))
-            }.await;
-            (reply, result)
-        }
+        A2AppMatrixRequest::SendMessage { room_id, body, reply } =>
+            (reply, send::message(room_id, body).await),
         A2AppMatrixRequest::Members { room_id, limit, reply } => {
             let result: Result<String, String> = async {
                 use matrix_sdk::RoomMemberships;
@@ -573,8 +632,28 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
         A2AppMatrixRequest::IgnoredUsers { reply } => (reply, account::ignored_users().await),
 
         // --- send ---
+        A2AppMatrixRequest::Reply { room_id, event_id, body, in_thread, reply } =>
+            (reply, send::reply(room_id, event_id, body, in_thread).await),
+        A2AppMatrixRequest::React { room_id, event_id, key, reply } =>
+            (reply, send::react(room_id, event_id, key).await),
+        A2AppMatrixRequest::Typing { room_id, typing, reply } =>
+            (reply, send::typing(room_id, typing).await),
+        A2AppMatrixRequest::ReadReceipt { room_id, event_id, reply } =>
+            (reply, send::read_receipt(room_id, event_id).await),
+        A2AppMatrixRequest::Pin { room_id, event_id, pinned, reply } =>
+            (reply, send::pin(room_id, event_id, pinned).await),
+        A2AppMatrixRequest::RoomFlag { room_id, flag, on, reply } =>
+            (reply, send::room_flag(room_id, flag, on).await),
 
         // --- membership ---
+        A2AppMatrixRequest::Invite { room_id, user_id, reply } =>
+            (reply, membership::invite(room_id, user_id).await),
+        A2AppMatrixRequest::Join { room, via, reply } =>
+            (reply, membership::join(room, via).await),
+        A2AppMatrixRequest::InviteRespond { room_id, accept, reply } =>
+            (reply, membership::invite_respond(room_id, accept).await),
+        A2AppMatrixRequest::DmOpen { user_id, reply } =>
+            (reply, membership::dm_open(user_id).await),
     };
     Cx::post_action(A2AppMatrixResult { reply, result });
     SignalToUI::set_ui_signal();

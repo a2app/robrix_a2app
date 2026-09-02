@@ -78,8 +78,31 @@ pub enum MatrixServiceCall {
     IgnoredUsers,
 
     // --- send ---
+    /// Reply to `event_id`, or post into the thread rooted there when
+    /// `in_thread`; answers `{event_id}` of the sent event.
+    Reply { event_id: String, body: String, in_thread: bool },
+    /// Toggle the user's reaction `key` on an event; answers `{added}`.
+    React { event_id: String, key: String },
+    /// Show or hide the user as typing.
+    Typing { typing: bool },
+    /// A read receipt up to `event_id`, or fully read when absent.
+    ReadReceipt { event_id: Option<String> },
+    /// Pin or unpin an event.
+    Pin { event_id: String, pinned: bool },
+    /// Turn one of the attached room's own flags on or off.
+    RoomFlag { flag: RoomFlag, on: bool },
+    /// Plain text to any joined room, `room_id` as given.
+    RoomsSend { room_id: String, body: String },
 
     // --- membership ---
+    /// Invite `user_id` to the attached room.
+    Invite { user_id: String },
+    /// Join a room by id or alias, knocking when it is invite-only.
+    Join { room: String, via: Vec<String> },
+    /// Accept or decline a pending invite.
+    InviteRespond { room_id: String, accept: bool },
+    /// The DM with `user_id`, created when there is none.
+    DmOpen { user_id: String },
 }
 
 /// Which rooms a `matrix.search_*` call covers.
@@ -88,6 +111,15 @@ pub enum SearchScope {
     AllJoined,
     /// Room ids as given; the host validates them.
     Rooms(Vec<String>),
+}
+
+/// The per-room flags `matrix.favorite`, `matrix.low_priority` and
+/// `matrix.mark_unread` set.
+#[derive(Debug, Clone, Copy)]
+pub enum RoomFlag {
+    Favorite,
+    LowPriority,
+    Unread,
 }
 
 /// Every wire id the broker routes here.
@@ -104,6 +136,9 @@ fn room_free(service: &str) -> bool {
         | "matrix.spaces" | "matrix.space_info" | "matrix.space_rooms"
         | "matrix.user_profile" | "matrix.dm_find" | "matrix.device"
         | "matrix.account_info" | "matrix.ignored_users"
+
+        | "matrix.rooms_send" | "matrix.join" | "matrix.invite_respond" | "matrix.dm_open"
+
     )
 }
 
@@ -115,6 +150,26 @@ fn id_arg(service: &str, args: &serde_json::Value, key: &str, sigil: char) -> Re
     }
     Ok(id.to_string())
 }
+
+/// A required string argument, trimmed and non-empty.
+fn required_str(service: &str, args: &serde_json::Value, key: &str) -> Result<String, String> {
+    match args[key].as_str().map(str::trim) {
+        Some(s) if !s.is_empty() => Ok(s.to_string()),
+        _ => Err(format!("{service} needs {{{key}}}")),
+    }
+}
+
+fn required_bool(service: &str, args: &serde_json::Value, key: &str) -> Result<bool, String> {
+    args[key].as_bool().ok_or_else(|| format!("{service} needs {{{key}: bool}}"))
+}
+
+/// A message body: `required_str` plus the cap every text send shares.
+fn text_body(service: &str, args: &serde_json::Value) -> Result<String, String> {
+    let body = required_str(service, args, "body")?;
+    if body.chars().count() > 4096 {
+        return Err("message is too long (4096 characters max)".into());
+    }
+    Ok(body)}
 
 /// Validates and clamps a call's arguments. Runs AFTER the permission gate,
 /// so a first-use prompt still reads sensibly before an argument error.
@@ -158,16 +213,7 @@ pub fn parse(service: &str, args: &serde_json::Value, has_room: bool) -> Result<
         "matrix.room_threads" => MatrixServiceCall::Threads {
             limit: args["limit"].as_u64().unwrap_or(20).clamp(1, 50) as u32,
         },
-        "matrix.send_message" => {
-            let body = args["body"].as_str().map(str::trim).unwrap_or_default();
-            if body.is_empty() {
-                return Err("matrix.send_message needs {body}".into());
-            }
-            if body.chars().count() > 4096 {
-                return Err("message is too long (4096 characters max)".into());
-            }
-            MatrixServiceCall::SendMessage { body: body.to_string() }
-        }
+        "matrix.send_message" => MatrixServiceCall::SendMessage { body: text_body(service, args)? },
 
         // --- room ---
         "matrix.thread_replies" => {
@@ -258,8 +304,54 @@ pub fn parse(service: &str, args: &serde_json::Value, has_room: bool) -> Result<
         "matrix.ignored_users" => MatrixServiceCall::IgnoredUsers,
 
         // --- send ---
+        "matrix.reply" | "matrix.thread_reply" => MatrixServiceCall::Reply {
+            event_id: required_str(service, args, "event_id")?,
+            body: text_body(service, args)?,
+            in_thread: service == "matrix.thread_reply",
+        },
+        "matrix.react" => {
+            let key = required_str(service, args, "key")?;
+            if key.chars().count() > 32 {
+                return Err("reaction key is too long (32 characters max)".into());
+            }
+            MatrixServiceCall::React { event_id: required_str(service, args, "event_id")?, key }
+        }
+        "matrix.typing" => MatrixServiceCall::Typing { typing: required_bool(service, args, "typing")? },
+        "matrix.read_receipt" => MatrixServiceCall::ReadReceipt {
+            event_id: args["event_id"].as_str().map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        },
+        "matrix.pin" => MatrixServiceCall::Pin {
+            event_id: required_str(service, args, "event_id")?,
+            pinned: required_bool(service, args, "pinned")?,
+        },
+        "matrix.favorite" | "matrix.low_priority" | "matrix.mark_unread" => MatrixServiceCall::RoomFlag {
+            flag: match service {
+                "matrix.favorite" => RoomFlag::Favorite,
+                "matrix.low_priority" => RoomFlag::LowPriority,
+                _ => RoomFlag::Unread,
+            },
+            on: required_bool(service, args, "on")?,
+        },
+        "matrix.rooms_send" => MatrixServiceCall::RoomsSend {
+            room_id: required_str(service, args, "room_id")?,
+            body: text_body(service, args)?,
+        },
 
         // --- membership ---
+        "matrix.invite" => MatrixServiceCall::Invite { user_id: required_str(service, args, "user_id")? },
+        "matrix.join" => MatrixServiceCall::Join {
+            room: required_str(service, args, "room")?,
+            via: args["via"].as_array()
+                .map(|v| v.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+                .unwrap_or_default(),
+        },
+        "matrix.invite_respond" => MatrixServiceCall::InviteRespond {
+            room_id: required_str(service, args, "room_id")?,
+            accept: required_bool(service, args, "accept")?,
+        },
+        "matrix.dm_open" => MatrixServiceCall::DmOpen { user_id: required_str(service, args, "user_id")? },
 
         _ => return Err(format!("unknown service '{service}'")),
     })
@@ -287,6 +379,10 @@ pub fn cost(service: &str) -> f64 {
         "matrix.user_profile" => 5.0,
         // ----- send: speaks as the user -----
         "matrix.send_message" => 5.0,
+        "matrix.typing" => 1.0,
+        "matrix.favorite" | "matrix.low_priority" | "matrix.mark_unread" => 5.0,
+        "matrix.reply" | "matrix.thread_reply" | "matrix.react" | "matrix.read_receipt"
+        | "matrix.pin" | "matrix.rooms_send" => 8.0,
 
         // --- spaces ---
         "matrix.spaces" => 5.0,
@@ -294,6 +390,7 @@ pub fn cost(service: &str) -> f64 {
         "matrix.space_rooms" => 8.0,
 
         // --- membership ---
+        "matrix.invite" | "matrix.join" | "matrix.invite_respond" | "matrix.dm_open" => 8.0,
 
         _ => 8.0,
     }
@@ -492,5 +589,166 @@ mod rooms_and_account_tests {
         assert!(matches!(parse("matrix.device", &json!({}), false), Ok(MatrixServiceCall::Device)));
         assert!(matches!(parse("matrix.account_info", &json!({}), false), Ok(MatrixServiceCall::AccountInfo)));
         assert!(matches!(parse("matrix.ignored_users", &json!({}), false), Ok(MatrixServiceCall::IgnoredUsers)));
+    }
+}
+
+#[cfg(test)]
+mod send_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn parse_ok(service: &str, args: serde_json::Value) -> MatrixServiceCall {
+        parse(service, &args, true).unwrap_or_else(|e| panic!("{service} should parse: {e}"))
+    }
+
+    fn parse_err(service: &str, args: serde_json::Value) -> String {
+        match parse(service, &args, true) {
+            Ok(_) => panic!("{service} should be rejected"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn reply_needs_an_event_and_a_body() {
+        let MatrixServiceCall::Reply { event_id, body, in_thread } =
+            parse_ok("matrix.reply", json!({"event_id": "$e", "body": "  hi  "})) else { panic!() };
+        assert_eq!(event_id, "$e");
+        assert_eq!(body, "hi", "the body is trimmed");
+        assert!(!in_thread);
+        assert_eq!(parse_err("matrix.reply", json!({"body": "hi"})), "matrix.reply needs {event_id}");
+        assert_eq!(parse_err("matrix.reply", json!({"event_id": "$e", "body": "   "})), "matrix.reply needs {body}");
+        assert!(parse_err("matrix.reply", json!({"event_id": "$e", "body": "x".repeat(4097)})).contains("too long"));
+        assert!(matches!(
+            parse_ok("matrix.reply", json!({"event_id": "$e", "body": "x".repeat(4096)})),
+            MatrixServiceCall::Reply { .. }
+        ));
+    }
+
+    #[test]
+    fn thread_reply_is_a_threaded_reply() {
+        let MatrixServiceCall::Reply { in_thread, .. } =
+            parse_ok("matrix.thread_reply", json!({"event_id": "$root", "body": "hi"})) else { panic!() };
+        assert!(in_thread);
+        assert_eq!(parse_err("matrix.thread_reply", json!({"event_id": "$root"})), "matrix.thread_reply needs {body}");
+    }
+
+    #[test]
+    fn react_bounds_the_key() {
+        let MatrixServiceCall::React { event_id, key } =
+            parse_ok("matrix.react", json!({"event_id": "$e", "key": "👍"})) else { panic!() };
+        assert_eq!((event_id.as_str(), key.as_str()), ("$e", "👍"));
+        assert_eq!(parse_err("matrix.react", json!({"event_id": "$e", "key": ""})), "matrix.react needs {key}");
+        assert_eq!(parse_err("matrix.react", json!({"key": "👍"})), "matrix.react needs {event_id}");
+        // Counted in chars, not bytes, so a multi-byte key isn't short-changed.
+        assert!(matches!(
+            parse_ok("matrix.react", json!({"event_id": "$e", "key": "é".repeat(32)})),
+            MatrixServiceCall::React { .. }
+        ));
+        assert!(parse_err("matrix.react", json!({"event_id": "$e", "key": "é".repeat(33)})).contains("32 characters"));
+    }
+
+    #[test]
+    fn typing_needs_a_real_bool() {
+        assert!(matches!(parse_ok("matrix.typing", json!({"typing": true})), MatrixServiceCall::Typing { typing: true }));
+        assert_eq!(parse_err("matrix.typing", json!({"typing": "yes"})), "matrix.typing needs {typing: bool}");
+        assert_eq!(parse_err("matrix.typing", json!({})), "matrix.typing needs {typing: bool}");
+    }
+
+    #[test]
+    fn read_receipt_event_is_optional() {
+        assert!(matches!(parse_ok("matrix.read_receipt", json!({})), MatrixServiceCall::ReadReceipt { event_id: None }));
+        assert!(matches!(parse_ok("matrix.read_receipt", json!({"event_id": " "})), MatrixServiceCall::ReadReceipt { event_id: None }));
+        let MatrixServiceCall::ReadReceipt { event_id: Some(id) } =
+            parse_ok("matrix.read_receipt", json!({"event_id": "$e"})) else { panic!() };
+        assert_eq!(id, "$e");
+    }
+
+    #[test]
+    fn pin_needs_an_event_and_a_direction() {
+        assert!(matches!(
+            parse_ok("matrix.pin", json!({"event_id": "$e", "pinned": false})),
+            MatrixServiceCall::Pin { pinned: false, .. }
+        ));
+        assert_eq!(parse_err("matrix.pin", json!({"event_id": "$e"})), "matrix.pin needs {pinned: bool}");
+        assert_eq!(parse_err("matrix.pin", json!({"pinned": true})), "matrix.pin needs {event_id}");
+    }
+
+    #[test]
+    fn room_flags_share_one_shape() {
+        assert!(matches!(
+            parse_ok("matrix.favorite", json!({"on": true})),
+            MatrixServiceCall::RoomFlag { flag: RoomFlag::Favorite, on: true }
+        ));
+        assert!(matches!(
+            parse_ok("matrix.low_priority", json!({"on": false})),
+            MatrixServiceCall::RoomFlag { flag: RoomFlag::LowPriority, on: false }
+        ));
+        assert!(matches!(
+            parse_ok("matrix.mark_unread", json!({"on": true})),
+            MatrixServiceCall::RoomFlag { flag: RoomFlag::Unread, on: true }
+        ));
+        assert_eq!(parse_err("matrix.mark_unread", json!({"on": 1})), "matrix.mark_unread needs {on: bool}");
+        assert_eq!(
+            parse("matrix.favorite", &json!({"on": true}), false).err().unwrap(),
+            "this mini-app is not attached to a room"
+        );
+    }
+
+    #[test]
+    fn rooms_send_works_without_a_room_but_needs_one_named() {
+        assert!(matches!(
+            parse("matrix.rooms_send", &json!({"room_id": "!r:s", "body": "hi"}), false),
+            Ok(MatrixServiceCall::RoomsSend { .. })
+        ));
+        assert_eq!(parse_err("matrix.rooms_send", json!({"body": "hi"})), "matrix.rooms_send needs {room_id}");
+        assert_eq!(parse_err("matrix.rooms_send", json!({"room_id": "!r:s"})), "matrix.rooms_send needs {body}");
+        assert!(parse_err("matrix.rooms_send", json!({"room_id": "!r:s", "body": "x".repeat(4097)})).contains("too long"));
+    }
+
+    #[test]
+    fn invite_is_room_scoped() {
+        assert!(matches!(parse_ok("matrix.invite", json!({"user_id": "@u:s"})), MatrixServiceCall::Invite { .. }));
+        assert_eq!(parse_err("matrix.invite", json!({})), "matrix.invite needs {user_id}");
+        assert_eq!(
+            parse("matrix.invite", &json!({"user_id": "@u:s"}), false).err().unwrap(),
+            "this mini-app is not attached to a room"
+        );
+    }
+
+    #[test]
+    fn join_takes_an_optional_via_list() {
+        let MatrixServiceCall::Join { room, via } =
+            parse("matrix.join", &json!({"room": "#a:s", "via": ["s", 7, "t"]}), false).unwrap() else { panic!() };
+        assert_eq!(room, "#a:s");
+        assert_eq!(via, ["s", "t"], "non-string servers are dropped");
+        let MatrixServiceCall::Join { via, .. } =
+            parse("matrix.join", &json!({"room": "!r:s"}), false).unwrap() else { panic!() };
+        assert!(via.is_empty());
+        assert_eq!(parse("matrix.join", &json!({}), false).err().unwrap(), "matrix.join needs {room}");
+    }
+
+    #[test]
+    fn invite_respond_needs_a_room_and_an_answer() {
+        assert!(matches!(
+            parse("matrix.invite_respond", &json!({"room_id": "!r:s", "accept": false}), false),
+            Ok(MatrixServiceCall::InviteRespond { accept: false, .. })
+        ));
+        assert_eq!(
+            parse("matrix.invite_respond", &json!({"room_id": "!r:s"}), false).err().unwrap(),
+            "matrix.invite_respond needs {accept: bool}"
+        );
+        assert_eq!(
+            parse("matrix.invite_respond", &json!({"accept": true}), false).err().unwrap(),
+            "matrix.invite_respond needs {room_id}"
+        );
+    }
+
+    #[test]
+    fn dm_open_needs_a_user() {
+        assert!(matches!(
+            parse("matrix.dm_open", &json!({"user_id": "@u:s"}), false),
+            Ok(MatrixServiceCall::DmOpen { .. })
+        ));
+        assert_eq!(parse("matrix.dm_open", &json!({"user_id": ""}), false).err().unwrap(), "matrix.dm_open needs {user_id}");
     }
 }

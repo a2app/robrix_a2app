@@ -572,18 +572,64 @@ burning a permission.
 
 <!-- send -->
 
+Everything from here down writes as the user. Call these only on an explicit
+user action (a tap, Return), never on a timer or at startup, one call per
+action, and show what was done. The user's "Mini-apps may write to rooms"
+switch (off by default) refuses every one of them like a denial
+(`r.is_ok == false`, `r.error` says why), so never assume a write went through.
+
+- `"matrix.reply"` (needs `matrix-room-send`): `{event_id, body}` ->
+  `{event_id}` of the sent reply; body 4096 chars max. Stays in the target's
+  thread if it has one.
+- `"matrix.thread_reply"` (needs `matrix-room-send`): `{event_id, body}` ->
+  `{event_id}`; posts into the thread rooted at `event_id` (a root from
+  `matrix.room_threads`), starting one if that message has no thread yet.
+- `"matrix.react"` (needs `matrix-room-interact`): `{event_id, key}` ->
+  `{added}`; toggles the user's reaction (`key` is the emoji, 1 to 32 chars),
+  so the same call again removes it. Looks the reactions up on the homeserver.
+- `"matrix.typing"` (needs `matrix-room-interact`): `{typing: bool}` -> `{}`;
+  shows the user as typing (expires on its own). Only while they really are.
+- `"matrix.read_receipt"` (needs `matrix-room-interact`): `{event_id?}` ->
+  `{}`; a read receipt up to `event_id`, or marks the room fully read when it
+  is omitted. Public or private per the user's read-receipt privacy setting.
+- `"matrix.pin"` (needs `matrix-room-manage`): `{event_id, pinned: bool}` ->
+  `{}`; pins or unpins a message (the room's power levels apply).
+- `"matrix.favorite"` (needs `matrix-room-manage`): `{on: bool}` -> `{}`.
+- `"matrix.low_priority"` (needs `matrix-room-manage`): `{on: bool}` -> `{}`.
+- `"matrix.mark_unread"` (needs `matrix-room-manage`): `{on: bool}` -> `{}`;
+  flags the room unread, or clears the flag, without sending a receipt.
+- `"matrix.rooms_send"` (needs `matrix-rooms-send`, works without a room):
+  `{room_id, body}` -> `{}`; plain text to any joined room, 4096 chars max.
+
 <!-- membership -->
 
+- `"matrix.invite"` (needs `matrix-room-invite`): `{user_id}` -> `{}`;
+  invites `@user:server` to the attached room.
+- `"matrix.join"` (needs `matrix-membership`, works without a room):
+  `{room: "!id:server" or "#alias:server", via: ["server"]?}` ->
+  `{room_id, joined, knocked}`; joins via the homeserver, or knocks when the
+  room is invite-only (`knocked: true`, nothing joined yet).
+- `"matrix.invite_respond"` (needs `matrix-membership`, works without a room):
+  `{room_id, accept: bool}` -> `{}`; accepts or declines a pending invite
+  (room ids come from `matrix.invites`).
+- `"matrix.dm_open"` (needs `matrix-membership`, works without a room):
+  `{user_id}` -> `{room_id, created}`; the existing DM with that user, or a
+  new one (`created: true`). It does not navigate; call `nav.room` with the
+  `room_id` if the user asked to go there.
+
 `matrix-room-info` and `matrix-profile` start allowed but revocable;
-`matrix-room-read`, `matrix-room-send`, `matrix-rooms-list` and
-`matrix-rooms-read` prompt the user on first use.
+`matrix-room-read`, `matrix-room-send`, `matrix-room-interact`,
+`matrix-room-manage`, `matrix-room-invite`, `matrix-rooms-list`,
+`matrix-rooms-read`, `matrix-rooms-send` and `matrix-membership` prompt the
+user on first use.
 Sending messages as the user is a serious capability: send ONLY what the
 user explicitly asked to send, one message per user action, never on a
 timer, and show what was sent. The user also has a global "Mini-apps may
-write to rooms" switch, off by default: while it is off every
-`matrix.send_message` fails like a denial (`r.is_ok == false`, `r.error`
-says why) and `host.has("matrix.room.message.send")` is false, so show
-`r.error` and never assume a send went through.
+write to rooms" switch, off by default: while it is off every write above
+(`matrix.send_message` included) fails like a denial (`r.is_ok == false`,
+`r.error` says why) and `host.has(...)` is false for its capability (e.g.
+`host.has("matrix.room.message.send")`), so show `r.error` and never assume
+a write went through.
 
 ## Acting inside Robrix (navigation and composer)
 
