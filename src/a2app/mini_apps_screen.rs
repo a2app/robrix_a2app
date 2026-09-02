@@ -1,20 +1,26 @@
 //! The Mini Apps management screen: create/modify apps with AI, list and
 //! run installed apps, and manage each app's permissions, versions, and data.
 //!
-//! Three panes in one widget (list, per-app info, AI providers) plus a
-//! source-viewer overlay, toggled by visibility. All mutations go through
+//! Several panes in one widget (list, per-app info, AI providers, source
+//! viewer, diff, editor), toggled by visibility. All mutations go through
 //! [`A2AppOp`] actions applied by [`crate::a2app::runtime`].
+
+use std::borrow::Cow;
+use std::cell::RefCell;
 
 use makepad_widgets::*;
 use makepad_code_editor::code_view::CodeViewWidgetExt;
+use matrix_sdk::ruma::OwnedRoomId;
 
+use a2app_core::diff::{line_diff, DiffLine};
 use a2app_core::manifest::{A2AppScope, MiniAppId};
 use a2app_core::permissions::{Effective, GrantState, Permission};
 use a2app_core::persistence;
 use a2app_core::versions::AppVersion;
 
-use crate::a2app::runtime::{with_a2app, A2AppOp};
+use crate::a2app::runtime::{with_a2app, A2AppOp, A2AppRuntimeAction};
 use crate::shared::popup_list::{enqueue_popup_notification, PopupKind};
+use crate::shared::room_picker_modal::{RoomPickerContent, RoomPickerModalAction};
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -181,7 +187,7 @@ script_mod! {
         }
     }
 
-    // One archived version in the app info pane.
+    // One version in the app info pane.
     mod.widgets.MiniAppVersionRow = set_type_default() do #(MiniAppVersionRow::register_widget(vm)) {
         ..mod.widgets.RoundedView
 
@@ -191,18 +197,52 @@ script_mod! {
         align: Align{y: 0.5}
         padding: Inset{top: 4, bottom: 4, left: 10, right: 10}
 
-        version_label := Label {
+        View {
             width: Fill, height: Fit
-            padding: 0, margin: 0
-            draw_text +: {
-                text_style: REGULAR_TEXT {font_size: 10.5},
-                color: (COLOR_TEXT)
+            flow: Down
+            spacing: 1
+            version_label := Label {
+                width: Fill, height: Fit
+                padding: 0, margin: 0
+                draw_text +: {
+                    text_style: REGULAR_TEXT {font_size: 10.5},
+                    color: (COLOR_TEXT)
+                }
+            }
+            version_note := Label {
+                width: Fill, height: Fit
+                padding: 0, margin: 0
+                draw_text +: {
+                    text_style: REGULAR_TEXT {font_size: 9.5},
+                    color: (MESSAGE_TEXT_COLOR)
+                }
             }
         }
-        version_restore_button := RobrixIconButton {
+        version_current := Label {
+            visible: false,
+            width: Fit, height: Fit
+            padding: Inset{top: 2, bottom: 2, left: 6, right: 6}
+            margin: 0
+            draw_text +: {
+                text_style: REGULAR_TEXT {font_size: 9.5},
+                color: (COLOR_FG_ACCEPT_GREEN)
+            }
+            text: "Current"
+        }
+        version_use_button := RobrixIconButton {
             padding: 6,
             icon_walk: Walk{width: 0, height: 0, margin: 0}
-            text: "Restore"
+            text: "Use"
+        }
+        version_diff_button := RobrixNeutralIconButton {
+            padding: 6,
+            icon_walk: Walk{width: 0, height: 0, margin: 0}
+            text: "Diff"
+        }
+        version_view_button := RobrixNeutralIconButton {
+            padding: 6,
+            icon_walk: Walk{width: 0, height: 0, margin: 0}
+            text: "View"
         }
     }
 
@@ -515,11 +555,35 @@ script_mod! {
                     icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
                     text: "View Source"
                 }
+                info_edit_button := RobrixNeutralIconButton {
+                    padding: 10,
+                    draw_icon +: { svg: (ICON_EDIT) }
+                    icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                    text: "Edit Source"
+                }
                 info_export_button := RobrixNeutralIconButton {
                     padding: 10,
                     draw_icon +: { svg: (ICON_COPY) }
                     icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
                     text: "Export"
+                }
+                info_share_button := RobrixNeutralIconButton {
+                    padding: 10,
+                    draw_icon +: { svg: (ICON_SHARE) }
+                    icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                    text: "Share…"
+                }
+                info_send_button := RobrixNeutralIconButton {
+                    padding: 10,
+                    draw_icon +: { svg: (ICON_SEND) }
+                    icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                    text: "Send to room…"
+                }
+                info_open_room_button := RobrixNeutralIconButton {
+                    padding: 10,
+                    draw_icon +: { svg: (ICON_JUMP) }
+                    icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                    text: "Open in room…"
                 }
                 info_modify_button := RobrixNeutralIconButton {
                     padding: 10,
@@ -544,6 +608,13 @@ script_mod! {
                     draw_icon +: { svg: (ICON_TRASH) }
                     icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
                     text: "Uninstall"
+                }
+                info_reset_button := RobrixNegativeIconButton {
+                    visible: false,
+                    padding: 10,
+                    draw_icon +: { svg: (ICON_ROTATE_CW) }
+                    icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                    text: "Reset to stock"
                 }
             }
 
@@ -595,7 +666,7 @@ script_mod! {
                     text_style: REGULAR_TEXT {font_size: 10.5},
                     color: (MESSAGE_TEXT_COLOR)
                 }
-                text: "No archived versions. Every AI modification (and restore) archives the previous state first."
+                text: "No versions yet. Every AI change, hand edit, and switch is kept here, so you can move between them freely."
             }
             versions_list := FlatList {
                 width: Fill, height: Fit
@@ -717,6 +788,128 @@ script_mod! {
                 }
             }
         }
+
+        diff_pane := View {
+            visible: false,
+            width: Fill, height: Fill
+            flow: Down
+            padding: 15
+            spacing: 8
+
+            show_bg: true,
+            draw_bg.color: (COLOR_PRIMARY)
+
+            View {
+                width: Fill, height: Fit
+                flow: Right
+                spacing: 10
+                align: Align{y: 0.5}
+                diff_title := TitleLabel { margin: 0 }
+                diff_close_button := RobrixNeutralIconButton {
+                    padding: 8,
+                    draw_icon +: { svg: (ICON_CLOSE) }
+                    icon_walk: Walk{width: 14, height: 14, margin: 0}
+                    text: ""
+                }
+            }
+            diff_summary := Label {
+                width: Fill, height: Fit
+                padding: 0, margin: 0
+                draw_text +: {
+                    text_style: REGULAR_TEXT {font_size: 10},
+                    color: (MESSAGE_TEXT_COLOR)
+                }
+            }
+            diff_list := PortalList {
+                width: Fill, height: Fill
+                flow: Down
+
+                DiffContext := View {
+                    width: Fill, height: Fit
+                    line := Label {
+                        width: Fill, height: Fit
+                        padding: Inset{top: 1, bottom: 1, left: 6, right: 6}
+                        margin: 0
+                        draw_text +: {
+                            text_style: MESSAGE_TEXT_STYLE {font_size: 9.5},
+                            color: (COLOR_TEXT)
+                        }
+                    }
+                }
+                DiffAdded := View {
+                    width: Fill, height: Fit
+                    show_bg: true
+                    draw_bg +: { color: #xE6FFEC }
+                    line := Label {
+                        width: Fill, height: Fit
+                        padding: Inset{top: 1, bottom: 1, left: 6, right: 6}
+                        margin: 0
+                        draw_text +: {
+                            text_style: MESSAGE_TEXT_STYLE {font_size: 9.5},
+                            color: #x116329
+                        }
+                    }
+                }
+                DiffRemoved := View {
+                    width: Fill, height: Fit
+                    show_bg: true
+                    draw_bg +: { color: #xFFEBE9 }
+                    line := Label {
+                        width: Fill, height: Fit
+                        padding: Inset{top: 1, bottom: 1, left: 6, right: 6}
+                        margin: 0
+                        draw_text +: {
+                            text_style: MESSAGE_TEXT_STYLE {font_size: 9.5},
+                            color: #x82071E
+                        }
+                    }
+                }
+            }
+        }
+
+        edit_pane := View {
+            visible: false,
+            width: Fill, height: Fill
+            flow: Down
+            padding: 15
+            spacing: 8
+
+            show_bg: true,
+            draw_bg.color: (COLOR_PRIMARY)
+
+            View {
+                width: Fill, height: Fit
+                flow: Right
+                spacing: 10
+                align: Align{y: 0.5}
+                edit_title := TitleLabel { margin: 0 }
+                edit_save_button := RobrixIconButton {
+                    padding: 8,
+                    icon_walk: Walk{width: 0, height: 0, margin: 0}
+                    text: "Save as new version"
+                }
+                edit_cancel_button := RobrixNeutralIconButton {
+                    padding: 8,
+                    draw_icon +: { svg: (ICON_CLOSE) }
+                    icon_walk: Walk{width: 14, height: 14, margin: 0}
+                    text: ""
+                }
+            }
+            Label {
+                width: Fill, height: Fit
+                padding: 0, margin: 0
+                draw_text +: {
+                    text_style: REGULAR_TEXT {font_size: 10},
+                    color: (MESSAGE_TEXT_COLOR)
+                }
+                text: "Saving keeps the previous version and restarts the app wherever it is running."
+            }
+            source_editor := mod.widgets.LightCodeEditor {
+                editor +: {
+                    width: Fill, height: Fill
+                }
+            }
+        }
     }
 }
 
@@ -727,7 +920,9 @@ pub enum MiniAppsScreenAction {
     ShowInfo(MiniAppId),
     CyclePermission { app_id: MiniAppId, perm: Permission },
     CycleCapability { app_id: MiniAppId, cap_id: String },
-    RestoreVersion { app_id: MiniAppId, stamp: String },
+    UseVersion { app_id: MiniAppId, stamp: String },
+    DiffVersion(String),
+    ViewVersion(String),
     ProviderAction(String),
     ProviderForget(String),
     #[default]
@@ -878,13 +1073,18 @@ pub struct MiniAppVersionRow {
 impl Widget for MiniAppVersionRow {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
-        if let Event::Actions(actions) = event
-            && self.view.button(cx, ids!(version_restore_button)).clicked(actions)
-        {
-            cx.action(MiniAppsScreenAction::RestoreVersion {
+        let Event::Actions(actions) = event else { return };
+        if self.view.button(cx, ids!(version_use_button)).clicked(actions) {
+            cx.action(MiniAppsScreenAction::UseVersion {
                 app_id: self.app_id.clone(),
                 stamp: self.stamp.clone(),
             });
+        }
+        if self.view.button(cx, ids!(version_diff_button)).clicked(actions) {
+            cx.action(MiniAppsScreenAction::DiffVersion(self.stamp.clone()));
+        }
+        if self.view.button(cx, ids!(version_view_button)).clicked(actions) {
+            cx.action(MiniAppsScreenAction::ViewVersion(self.stamp.clone()));
         }
     }
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -893,19 +1093,22 @@ impl Widget for MiniAppVersionRow {
 }
 
 impl MiniAppVersionRow {
-    fn populate(&mut self, cx: &mut Cx, app_id: &str, version: &AppVersion) {
+    fn populate(&mut self, cx: &mut Cx, app_id: &str, version: &AppVersion, current: bool) {
         self.app_id = app_id.to_string();
         self.stamp = version.stamp.clone();
-        let note = if version.note.is_empty() {
-            String::new()
-        } else {
-            format!(" · {}", version.note)
-        };
         let when = a2app_core::versions::label_for(
             version.at_unix,
             crate::a2app::runtime::utc_offset_secs(),
         );
-        self.view.label(cx, ids!(version_label)).set_text(cx, &format!("{when}{note}"));
+        self.view.label(cx, ids!(version_label))
+            .set_text(cx, &format!("{when} · {}", version.origin.label()));
+        // The note repeats the origin for stock and hand edits; skip it then.
+        let note = self.view.label(cx, ids!(version_note));
+        note.set_visible(cx, !version.note.is_empty() && version.note != version.origin.label());
+        note.set_text(cx, &version.note);
+        self.view.widget(cx, ids!(version_current)).set_visible(cx, current);
+        self.view.widget(cx, ids!(version_use_button)).set_visible(cx, !current);
+        self.view.widget(cx, ids!(version_diff_button)).set_visible(cx, !current);
     }
 }
 
@@ -953,16 +1156,24 @@ enum Pane {
     Info,
     Providers,
     Source,
+    Diff,
+    Edit,
 }
 
 #[derive(Script, ScriptHook, Widget)]
 pub struct MiniAppsScreen {
     #[deref] view: View,
     #[rust] pane: Pane,
-    /// The app shown in the info (or source) pane.
+    /// The app shown in the info (or source, diff, editor) pane.
     #[rust] info_app: Option<MiniAppId>,
-    /// Versions of the info app, loaded once when the pane opens.
+    /// Versions of the info app, newest first, refreshed when the pane opens
+    /// or the runtime says they changed.
     #[rust] versions: Vec<AppVersion>,
+    #[rust] current_stamp: Option<String>,
+    /// A built-in whose working copy differs from its stock source.
+    #[rust] reset_available: bool,
+    /// What the diff pane shows.
+    #[rust] diff_lines: Vec<DiffLine>,
     /// The provider awaiting a pasted key, if any.
     #[rust] key_entry: Option<String>,
 }
@@ -991,6 +1202,12 @@ impl Widget for MiniAppsScreen {
                 && self.pane != Pane::List
             {
                 self.set_pane(cx, Pane::List);
+            }
+            if let Some(A2AppRuntimeAction::VersionsChanged(app_id)) = action.downcast_ref()
+                && self.info_app.as_ref() == Some(app_id)
+            {
+                self.refresh_info(cx);
+                continue;
             }
             match action.downcast_ref::<MiniAppsScreenAction>() {
                 Some(MiniAppsScreenAction::OpenApp(app_id)) => {
@@ -1021,13 +1238,19 @@ impl Widget for MiniAppsScreen {
                     });
                     continue;
                 }
-                Some(MiniAppsScreenAction::RestoreVersion { app_id, stamp }) => {
-                    cx.action(A2AppOp::RestoreVersion {
+                Some(MiniAppsScreenAction::UseVersion { app_id, stamp }) => {
+                    cx.action(A2AppOp::SwitchVersion {
                         app_id: app_id.clone(),
                         stamp: stamp.clone(),
                     });
-                    // Reload the version list on the next info draw.
-                    self.versions.clear();
+                    continue;
+                }
+                Some(MiniAppsScreenAction::DiffVersion(stamp)) => {
+                    self.show_diff(cx, stamp);
+                    continue;
+                }
+                Some(MiniAppsScreenAction::ViewVersion(stamp)) => {
+                    self.show_version_source(cx, stamp);
                     continue;
                 }
                 Some(MiniAppsScreenAction::ProviderAction(id)) => {
@@ -1091,8 +1314,31 @@ impl Widget for MiniAppsScreen {
             if self.view.button(cx, ids!(info_source_button)).clicked(actions) {
                 self.show_source(cx, &app_id);
             }
+            if self.view.button(cx, ids!(info_edit_button)).clicked(actions) {
+                self.show_editor(cx, &app_id);
+            }
             if self.view.button(cx, ids!(info_export_button)).clicked(actions) {
                 cx.action(A2AppOp::Export(app_id.clone()));
+            }
+            if self.view.button(cx, ids!(info_share_button)).clicked(actions) {
+                cx.action(A2AppOp::ShareBundle(app_id.clone()));
+            }
+            if self.view.button(cx, ids!(info_send_button)).clicked(actions) {
+                let name = self.info_name();
+                let app = app_id.clone();
+                self.pick_room(cx, format!("Send \"{name}\" to…"), move |cx, room_id| {
+                    cx.action(A2AppOp::SendToRoom { app_id: app, room_id });
+                });
+            }
+            if self.view.button(cx, ids!(info_open_room_button)).clicked(actions) {
+                let name = self.info_name();
+                let app = app_id.clone();
+                self.pick_room(cx, format!("Open \"{name}\" in…"), move |cx, room_id| {
+                    cx.action(A2AppOp::OpenInRoom { app_id: app, room_id });
+                });
+            }
+            if self.view.button(cx, ids!(info_reset_button)).clicked(actions) {
+                cx.action(A2AppOp::ResetToStock(app_id.clone()));
             }
             if self.view.button(cx, ids!(info_modify_button)).clicked(actions) {
                 // Prefill the composer with a modify hint and go back to it.
@@ -1143,8 +1389,18 @@ impl Widget for MiniAppsScreen {
             self.close_key_entry(cx);
         }
 
-        // ----- source pane -----
-        if self.view.button(cx, ids!(source_close_button)).clicked(actions) {
+        // ----- source, diff, and editor panes -----
+        if self.view.button(cx, ids!(source_close_button)).clicked(actions)
+            || self.view.button(cx, ids!(diff_close_button)).clicked(actions)
+            || self.view.button(cx, ids!(edit_cancel_button)).clicked(actions)
+        {
+            self.set_pane(cx, Pane::Info);
+        }
+        if self.view.button(cx, ids!(edit_save_button)).clicked(actions)
+            && let Some(app_id) = self.info_app.clone()
+        {
+            let source = self.view.code_view(cx, ids!(source_editor)).text();
+            cx.action(A2AppOp::SaveSource { app_id, source });
             self.set_pane(cx, Pane::Info);
         }
     }
@@ -1152,9 +1408,10 @@ impl Widget for MiniAppsScreen {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         self.populate_before_draw(cx);
 
-        // Resolved before the draw loop: once a FlatList is mutably borrowed
+        // Resolved before the draw loop: once a list is mutably borrowed
         // below, a widget query for it would fail and return a zero uid.
         let perms_list_uid = self.view.widget(cx, ids!(perms_list)).widget_uid();
+        let diff_list_uid = self.view.widget(cx, ids!(diff_list)).widget_uid();
 
         while let Some(subview) = self.view.draw_walk(cx, scope, walk).step() {
             let uid = subview.widget_uid();
@@ -1163,7 +1420,11 @@ impl Widget for MiniAppsScreen {
                 continue;
             }
             if let Some(mut list) = subview.as_portal_list().borrow_mut() {
-                self.draw_console_list(cx, &mut list);
+                if uid == diff_list_uid {
+                    self.draw_diff_list(cx, &mut list);
+                } else {
+                    self.draw_console_list(cx, &mut list);
+                }
             }
         }
         DrawStep::done()
@@ -1172,19 +1433,54 @@ impl Widget for MiniAppsScreen {
 
 impl MiniAppsScreen {
     fn set_pane(&mut self, cx: &mut Cx, pane: Pane) {
+        // A hidden editor would still get key events.
+        if self.pane == Pane::Edit && pane != Pane::Edit {
+            cx.set_key_focus(Area::Empty);
+        }
         self.pane = pane;
         let show = |p: Pane| self.pane == p;
         self.view.widget(cx, ids!(list_pane)).set_visible(cx, show(Pane::List));
         self.view.widget(cx, ids!(info_pane)).set_visible(cx, show(Pane::Info));
         self.view.widget(cx, ids!(providers_pane)).set_visible(cx, show(Pane::Providers));
         self.view.widget(cx, ids!(source_pane)).set_visible(cx, show(Pane::Source));
+        self.view.widget(cx, ids!(diff_pane)).set_visible(cx, show(Pane::Diff));
+        self.view.widget(cx, ids!(edit_pane)).set_visible(cx, show(Pane::Edit));
         self.view.redraw(cx);
     }
 
     fn show_info(&mut self, cx: &mut Cx, app_id: MiniAppId) {
-        self.versions = persistence::list_versions(&app_id);
         self.info_app = Some(app_id);
+        self.refresh_info(cx);
         self.set_pane(cx, Pane::Info);
+    }
+
+    /// Re-reads the info app's version list and stock state.
+    fn refresh_info(&mut self, cx: &mut Cx) {
+        let Some(app_id) = self.info_app.clone() else { return };
+        self.versions = persistence::list_versions(&app_id);
+        self.versions.reverse();
+        let (current, builtin, source) = with_a2app(|state| {
+            state.registry.get(&app_id).map(|m| (m.current_version.clone(), m.builtin, m.source.clone()))
+        }).flatten().unwrap_or_default();
+        self.current_stamp = current;
+        self.reset_available = builtin
+            && a2app_core::builtin::stock(&app_id).is_some_and(|stock| stock.source != source);
+        self.view.redraw(cx);
+    }
+
+    fn info_name(&self) -> String {
+        let app_id = self.info_app.clone().unwrap_or_default();
+        with_a2app(|state| state.registry.get(&app_id).map(|a| a.name.clone()))
+            .flatten()
+            .unwrap_or(app_id)
+    }
+
+    /// Opens the room picker; `on_picked` gets the chosen room's id.
+    fn pick_room(&self, cx: &mut Cx, title: String, on_picked: impl FnOnce(&mut Cx, OwnedRoomId) + 'static) {
+        cx.action(RoomPickerModalAction::Show(RefCell::new(Some(RoomPickerContent {
+            title: Cow::Owned(title),
+            on_picked: Some(Box::new(move |cx, room| on_picked(cx, room.room_id().clone()))),
+        }))));
     }
 
     fn show_source(&mut self, cx: &mut Cx, app_id: &str) {
@@ -1194,6 +1490,53 @@ impl MiniAppsScreen {
         self.view.label(cx, ids!(source_title)).set_text(cx, &format!("{name} — Splash source"));
         self.view.code_view(cx, ids!(source_code_view)).set_text(cx, &source);
         self.set_pane(cx, Pane::Source);
+    }
+
+    /// The source pane, showing one archived version instead of the working copy.
+    fn show_version_source(&mut self, cx: &mut Cx, stamp: &str) {
+        let Some(app_id) = self.info_app.clone() else { return };
+        let Some((version, source)) = persistence::load_version(&app_id, stamp) else {
+            enqueue_popup_notification("Couldn't load that version.", PopupKind::Error, Some(4.0));
+            return;
+        };
+        let when = a2app_core::versions::label_for(version.at_unix, crate::a2app::runtime::utc_offset_secs());
+        self.view.label(cx, ids!(source_title))
+            .set_text(cx, &format!("{} · version from {when}", version.name));
+        self.view.code_view(cx, ids!(source_code_view)).set_text(cx, &source);
+        self.set_pane(cx, Pane::Source);
+    }
+
+    /// The diff pane: an archived version against the working copy.
+    fn show_diff(&mut self, cx: &mut Cx, stamp: &str) {
+        let Some(app_id) = self.info_app.clone() else { return };
+        let Some((version, old)) = persistence::load_version(&app_id, stamp) else {
+            enqueue_popup_notification("Couldn't load that version.", PopupKind::Error, Some(4.0));
+            return;
+        };
+        let Some(Some((name, current))) = with_a2app(|state| {
+            state.registry.get(&app_id).map(|a| (a.name.clone(), a.source.clone()))
+        }) else { return };
+        self.diff_lines = line_diff(&old, &current);
+        let added = self.diff_lines.iter().filter(|l| matches!(l, DiffLine::Added(_))).count();
+        let removed = self.diff_lines.iter().filter(|l| matches!(l, DiffLine::Removed(_))).count();
+        let when = a2app_core::versions::label_for(version.at_unix, crate::a2app::runtime::utc_offset_secs());
+        self.view.label(cx, ids!(diff_title)).set_text(cx, &format!("{name} · changes since {when}"));
+        let summary = if added == 0 && removed == 0 {
+            String::from("The current source is identical to that version.")
+        } else {
+            format!("+{added} added, -{removed} removed. Red is that version, green is the current source.")
+        };
+        self.view.label(cx, ids!(diff_summary)).set_text(cx, &summary);
+        self.set_pane(cx, Pane::Diff);
+    }
+
+    fn show_editor(&mut self, cx: &mut Cx, app_id: &str) {
+        let Some(Some((name, source))) = with_a2app(|state| {
+            state.registry.get(app_id).map(|a| (a.name.clone(), a.source.clone()))
+        }) else { return };
+        self.view.label(cx, ids!(edit_title)).set_text(cx, &format!("Edit {name}"));
+        self.view.code_view(cx, ids!(source_editor)).set_text(cx, &source);
+        self.set_pane(cx, Pane::Edit);
     }
 
     /// Cycles a grant Allowed -> Asks -> Blocked -> Allowed. Normal-tier
@@ -1314,6 +1657,7 @@ impl MiniAppsScreen {
                 }).unwrap_or(false);
                 self.view.widget(cx, ids!(no_perms_label)).set_visible(cx, !declares_any);
                 self.view.widget(cx, ids!(no_versions_label)).set_visible(cx, self.versions.is_empty());
+                self.view.widget(cx, ids!(info_reset_button)).set_visible(cx, self.reset_available);
             }
             Pane::Providers => {
                 let blocker = a2app_agent::blocker();
@@ -1322,7 +1666,7 @@ impl MiniAppsScreen {
                     self.view.label(cx, ids!(providers_blocker)).set_text(cx, &blocker.headline());
                 }
             }
-            Pane::Source => {}
+            Pane::Source | Pane::Diff | Pane::Edit => {}
         }
     }
 
@@ -1404,11 +1748,12 @@ impl MiniAppsScreen {
                         }
                     }
                 } else {
-                    for version in self.versions.clone() {
+                    for version in &self.versions {
                         let item_live_id = LiveId::from_str(&version.stamp);
                         let Some(item) = list.item(cx, item_live_id, id!(version_row)) else { continue };
+                        let current = self.current_stamp.as_deref() == Some(version.stamp.as_str());
                         if let Some(mut row) = item.borrow_mut::<MiniAppVersionRow>() {
-                            row.populate(cx, &app_id, &version);
+                            row.populate(cx, &app_id, version, current);
                         }
                         item.draw_all(cx, &mut Scope::empty());
                     }
@@ -1443,17 +1788,32 @@ impl MiniAppsScreen {
                     draw_row(cx, list, &p.id, &p.label, &p.detail(), action, false);
                 }
             }
-            Pane::Source => {}
+            Pane::Source | Pane::Diff | Pane::Edit => {}
         }
     }
 
     fn draw_console_list(&mut self, cx: &mut Cx2d, list: &mut PortalList) {
-        let lines: Vec<String> = with_a2app(|state| state.console.lines.clone()).unwrap_or_default();
-        list.set_item_range(cx, 0, lines.len());
+        let count = with_a2app(|state| state.console.lines.len()).unwrap_or(0);
+        list.set_item_range(cx, 0, count);
         while let Some(item_id) = list.next_visible_item(cx) {
-            let Some(line) = lines.get(item_id) else { continue };
+            let Some(line) = with_a2app(|state| state.console.lines.get(item_id).cloned()).flatten() else { continue };
             let item = list.item(cx, item_id, id!(ConsoleLine));
-            item.set_text(cx, line);
+            item.set_text(cx, &line);
+            item.draw_all(cx, &mut Scope::empty());
+        }
+    }
+
+    fn draw_diff_list(&mut self, cx: &mut Cx2d, list: &mut PortalList) {
+        list.set_item_range(cx, 0, self.diff_lines.len());
+        while let Some(item_id) = list.next_visible_item(cx) {
+            let Some(line) = self.diff_lines.get(item_id) else { continue };
+            let (template, text) = match line {
+                DiffLine::Context(text) => (id!(DiffContext), text),
+                DiffLine::Added(text) => (id!(DiffAdded), text),
+                DiffLine::Removed(text) => (id!(DiffRemoved), text),
+            };
+            let item = list.item(cx, item_id, template);
+            item.label(cx, ids!(line)).set_text(cx, text);
             item.draw_all(cx, &mut Scope::empty());
         }
     }

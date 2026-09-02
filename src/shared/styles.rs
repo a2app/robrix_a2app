@@ -318,6 +318,14 @@ script_mod! {
         }
     }
 
+    // An editable LightCodeView.
+    mod.widgets.LightCodeEditor = mod.widgets.LightCodeView {
+        editor +: {
+            read_only: false
+            show_gutter: true
+        }
+    }
+
     // A read-only CodeView with light-theme color without any syntax highlighting.
     mod.widgets.PlainCodeView = mod.widgets.LightCodeView {
         editor +: {

@@ -267,6 +267,18 @@ pub fn write_export(manifest: &MiniAppManifest) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// The caption that goes with a bundle sent into a room.
+pub fn share_caption(manifest: &MiniAppManifest) -> String {
+    let mut caption = format!(
+        "{} {} · a Robrix mini-app bundle. Save the file and import it from the Mini Apps screen to run it.",
+        manifest.icon, manifest.name,
+    );
+    if !manifest.permissions.is_empty() {
+        caption.push_str(&format!(" It asks for: {}.", manifest.permissions.join(", ")));
+    }
+    caption
+}
+
 /// One importable file found in the exchange folder.
 #[derive(Clone, Debug)]
 pub struct ImportEntry {

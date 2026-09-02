@@ -196,7 +196,7 @@ impl MiniAppHostPaneRef {
     /// Stops showing the active instance. It is quit unless `keep`, which
     /// parks it for a room dock to adopt.
     pub fn close_active(&self, cx: &mut Cx, keep: bool) -> Option<InstanceKey> {
-        let Some(mut inner) = self.borrow_mut() else { return None };
+        let mut inner = self.borrow_mut()?;
         let key = inner.active.take()?;
         let uid = inner.widget_uid();
         inner.view.mini_app_host_area(cx, ids!(host_area)).set_host(None);

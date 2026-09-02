@@ -175,7 +175,18 @@ pub enum A2AppOp {
     Export(MiniAppId),
     ImportText(String),
     ImportFile(PathBuf),
-    RestoreVersion { app_id: MiniAppId, stamp: String },
+    /// Makes an archived version the working copy; every other version stays.
+    SwitchVersion { app_id: MiniAppId, stamp: String },
+    /// Installs hand-edited source as a new version.
+    SaveSource { app_id: MiniAppId, source: String },
+    /// Puts a built-in back on its stock source, as a version like any other.
+    ResetToStock(MiniAppId),
+    /// Hands the app's bundle file to the system share sheet.
+    ShareBundle(MiniAppId),
+    /// Jumps to `room_id` with the app's bundle staged as a file upload.
+    SendToRoom { app_id: MiniAppId, room_id: OwnedRoomId },
+    /// Jumps to `room_id` and docks the app there.
+    OpenInRoom { app_id: MiniAppId, room_id: OwnedRoomId },
     SetPermission { app_id: MiniAppId, perm: Permission, state: GrantState },
     /// A single ability's own answer under its group (`Ask` = follow group).
     SetCapability { app_id: MiniAppId, cap_id: String, state: GrantState },
@@ -220,13 +231,26 @@ struct HookSubscription {
     hooks: HashSet<&'static str>,
 }
 
-/// What a mini-app asked the RoomScreen of its room to do.
+/// What a mini-app (or the Mini Apps screen) asked the RoomScreen of its
+/// room to do.
 #[derive(Clone, Debug)]
 pub enum RoomAction {
     ShowUserProfile(OwnedUserId),
     JumpToEvent(OwnedEventId),
     ReplyTo(OwnedEventId),
     InsertDraft(String),
+    /// Pre-fills the room's file upload with a file Robrix wrote.
+    StageAttachment { path: PathBuf, caption: String },
+    /// Docks the app into the room's pane.
+    OpenApp(MiniAppId),
+}
+
+/// Runtime-side changes the Mini Apps screen re-reads on.
+#[derive(Clone, Debug, Default)]
+pub enum A2AppRuntimeAction {
+    VersionsChanged(MiniAppId),
+    #[default]
+    None,
 }
 
 struct PendingRoomAction {
@@ -623,38 +647,96 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 .and_then(|text| bundle::parse(&text));
             install_import(cx, ui, parsed);
         }
-        A2AppOp::RestoreVersion { app_id, stamp } => {
-            let restored = with_a2app(|state| {
-                let manifest = state.registry.get(&app_id).cloned()?;
-                let source = persistence::load_version_source(&app_id, &stamp)?;
-                let version = persistence::list_versions(&app_id).into_iter().find(|v| v.stamp == stamp)?;
-                // Snapshot what's being replaced so the restore is undoable.
-                let restore_label = a2app_core::versions::label_for(version.at_unix, utc_offset_secs());
-                let _ = persistence::snapshot_version(&manifest, a2app_core::versions::version_of(
-                    &manifest,
-                    &format!("Before restoring {restore_label}"),
-                    a2app_core::versions::now_unix(),
-                    utc_offset_secs(),
-                ));
-                let mut updated = manifest;
-                updated.source = source;
-                updated.name = version.name.clone();
-                updated.icon = version.icon.clone();
-                updated.tint = version.tint;
-                if let Err(e) = persistence::save_user_app(&updated) {
-                    error!("Failed to save restored mini-app: {e}");
-                }
-                state.registry.insert(updated.clone());
-                Some(updated)
+        A2AppOp::SwitchVersion { app_id, stamp } => {
+            let switched = with_a2app(|state| {
+                let mut manifest = state.registry.get(&app_id).cloned()?;
+                let (version, source) = persistence::load_version(&app_id, &stamp)?;
+                archive_current(&mut manifest);
+                let label = versions::label_for(version.at_unix, utc_offset_secs());
+                Some((version.apply_to(&manifest, source), label))
             }).flatten();
-            match restored {
-                Some(updated) => {
-                    // The restarted isolate boots the restored source.
-                    restart_running_app(cx, ui, &updated);
-                    enqueue_popup_notification(format!("Restored \"{}\".", updated.name), PopupKind::Success, Some(4.0));
-                    ui.redraw(cx);
+            match switched {
+                Some((updated, label)) => {
+                    let done = format!("\"{}\" now runs its version from {label}.", updated.name);
+                    install_version(cx, ui, updated, done);
                 }
-                None => enqueue_popup_notification("Couldn't restore that version.", PopupKind::Error, Some(4.0)),
+                None => enqueue_popup_notification("Couldn't load that version.", PopupKind::Error, Some(4.0)),
+            }
+        }
+        A2AppOp::SaveSource { app_id, source } => {
+            let saved = with_a2app(|state| {
+                let mut base = state.registry.get(&app_id).cloned()?;
+                if base.source == source {
+                    return Some(None);
+                }
+                archive_current(&mut base);
+                let mut updated = a2app_core::manifest::rewritten(&base, source);
+                commit_version(&mut updated, VersionOrigin::Manual, "Edited by hand");
+                Some(Some(updated))
+            }).flatten();
+            match saved {
+                Some(Some(updated)) => install_version(cx, ui, updated, String::from("Saved your edit as a new version.")),
+                Some(None) => enqueue_popup_notification("Nothing changed.", PopupKind::Info, Some(3.0)),
+                None => enqueue_popup_notification("That mini-app no longer exists.", PopupKind::Error, Some(4.0)),
+            }
+        }
+        A2AppOp::ResetToStock(app_id) => {
+            let reset = with_a2app(|state| {
+                let mut current = state.registry.get(&app_id).cloned()?;
+                let mut stock = builtin::stock(&app_id)?;
+                if current.source == stock.source {
+                    return Some(None);
+                }
+                archive_current(&mut current);
+                // An archived stock version is reused rather than duplicated.
+                let archived = persistence::list_versions(&app_id).into_iter()
+                    .filter(|v| v.origin == VersionOrigin::Stock)
+                    .find_map(|v| persistence::load_version(&app_id, &v.stamp))
+                    .filter(|(_, source)| *source == stock.source);
+                let updated = match archived {
+                    Some((version, source)) => version.apply_to(&current, source),
+                    None => {
+                        stock.scope = current.scope;
+                        stock.current_version = current.current_version;
+                        commit_version(&mut stock, VersionOrigin::Stock, "Stock");
+                        stock
+                    }
+                };
+                Some(Some(updated))
+            }).flatten();
+            match reset {
+                Some(Some(updated)) => install_version(cx, ui, updated, String::from("Back on the stock version.")),
+                Some(None) => enqueue_popup_notification("This app is already on its stock version.", PopupKind::Info, Some(3.0)),
+                None => enqueue_popup_notification("Only built-in apps have a stock version.", PopupKind::Error, Some(4.0)),
+            }
+        }
+        A2AppOp::ShareBundle(app_id) => {
+            let Some(Some(manifest)) = with_a2app(|state| state.registry.get(&app_id).cloned()) else { return };
+            let shared = bundle::write_export(&manifest).and_then(|path| {
+                robius_share::ShareSheet::new()
+                    .set_title(format!("{} mini-app", manifest.name))
+                    .set_subject(bundle::share_caption(&manifest))
+                    .add_file_with_mime_type(&path, "application/json")
+                    .share()
+                    .map_err(|e| format!("couldn't open the share sheet: {e}"))
+            });
+            if let Err(e) = shared {
+                enqueue_popup_notification(format!("Sharing failed: {e}"), PopupKind::Error, Some(5.0));
+            }
+        }
+        A2AppOp::SendToRoom { app_id, room_id } => {
+            let Some(Some(manifest)) = with_a2app(|state| state.registry.get(&app_id).cloned()) else { return };
+            let staged = bundle::write_export(&manifest).and_then(|path| {
+                let caption = bundle::share_caption(&manifest);
+                queue_room_action(cx, room_id, RoomAction::StageAttachment { path, caption })
+            });
+            if let Err(e) = staged {
+                enqueue_popup_notification(format!("Couldn't send the bundle: {e}"), PopupKind::Error, Some(5.0));
+            }
+        }
+        A2AppOp::OpenInRoom { app_id, room_id } => {
+            if let Err(e) = queue_room_action(cx, room_id, RoomAction::OpenApp(app_id)) {
+                enqueue_popup_notification(format!("Couldn't open it there: {e}"), PopupKind::Error, Some(5.0));
             }
         }
         A2AppOp::SetPermission { app_id, perm, state: new_state } => {
@@ -829,14 +911,10 @@ fn start_generation(
         state.create_room = room_id.clone();
 
         let generation = match refine_target.and_then(|id| state.registry.get(&id).cloned()) {
-            Some(base) => {
-                // Archive the current state first so the rewrite is undoable.
-                let _ = persistence::snapshot_version(&base, a2app_core::versions::version_of(
-                    &base,
-                    &request,
-                    a2app_core::versions::now_unix(),
-                    utc_offset_secs(),
-                ));
+            Some(mut base) => {
+                // The state being rewritten stays reachable as a version.
+                archive_current(&mut base);
+                state.registry.insert(base.clone());
                 Generation::start_refine(request.clone(), base, state.agent_prefs.clone())
             }
             None => Generation::start(request.clone(), taken, scope, state.agent_prefs.clone()),
@@ -895,6 +973,8 @@ fn advance_generation(cx: &mut Cx, ui: &WidgetRef) {
                         manifest.scope = A2AppScope::Room { room_id: room.to_string() };
                     }
                 }
+                let request = state.generation.as_ref().map(|g| g.request().to_string()).unwrap_or_default();
+                commit_version(&mut manifest, VersionOrigin::Ai, &request);
                 if let Err(e) = persistence::save_user_app(&manifest) {
                     error!("Failed to save generated mini-app: {e}");
                 }
@@ -1097,6 +1177,79 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
 
 /// Applies one nav.* / composer.* call. Global moves happen right here;
 /// room-scoped ones open the room and park the action for its RoomScreen.
+/// The name of a room the user is in. Anything else would open a join
+/// dialog on an app's say-so.
+fn joined_room_name(cx: &mut Cx, room_id: &OwnedRoomId) -> Result<RoomNameId, String> {
+    let rooms = cx.get_global::<RoomsListRef>();
+    if rooms.get_room_state(room_id) != Some(RoomState::Joined) {
+        return Err(String::from("not a room you're in"));
+    }
+    Ok(rooms.get_room_name(room_id).unwrap_or_else(|| RoomNameId::empty(room_id.clone())))
+}
+
+/// Parks `action` for `room_id`'s RoomScreen and navigates there. The
+/// caller may be on the Mini Apps tab; the room lives on Home.
+fn queue_room_action(cx: &mut Cx, room_id: OwnedRoomId, action: RoomAction) -> Result<(), String> {
+    let destination_room = BasicRoomDetails::Name(joined_room_name(cx, &room_id)?);
+    with_a2app(|state| {
+        state.room_action = Some(PendingRoomAction {
+            room_id: room_id.clone(),
+            action,
+            since: Instant::now(),
+        });
+    });
+    cx.action(NavigationBarAction::GoToHome);
+    cx.action(AppStateAction::NavigateToRoom { room_to_close: None, destination_room });
+    cx.action(A2AppRoomAction::Pending { room_id });
+    Ok(())
+}
+
+/// Archives the working copy as a new version and points the app at it.
+fn commit_version(manifest: &mut MiniAppManifest, origin: VersionOrigin, note: &str) {
+    let parent = manifest.current_version.take();
+    let version = versions::new_version(
+        manifest, origin, note, parent.as_deref(), versions::now_unix(), utc_offset_secs(),
+    );
+    match persistence::append_version(manifest, version) {
+        Ok(stamp) => manifest.current_version = Some(stamp),
+        Err(e) => {
+            error!("Failed to archive a version of {}: {e}", manifest.id);
+            manifest.current_version = parent;
+        }
+    }
+}
+
+/// Before the working copy gets replaced: makes sure it is a version, so it
+/// stays reachable. A pristine built-in archives as its stock version.
+fn archive_current(manifest: &mut MiniAppManifest) {
+    let pristine = manifest.builtin
+        && builtin::stock(&manifest.id).is_some_and(|stock| stock.source == manifest.source);
+    let (origin, note) = if pristine {
+        (VersionOrigin::Stock, "Stock")
+    } else {
+        (VersionOrigin::Legacy, "Before version history")
+    };
+    if let Err(e) = persistence::ensure_current_version(
+        manifest, origin, note, versions::now_unix(), utc_offset_secs(),
+    ) {
+        error!("Failed to archive the current version of {}: {e}", manifest.id);
+    }
+}
+
+/// Makes `updated` the app's working copy: saved, registered, restarted
+/// where it runs, and announced.
+fn install_version(cx: &mut Cx, ui: &WidgetRef, updated: MiniAppManifest, done: String) {
+    if let Err(e) = persistence::save_user_app(&updated) {
+        error!("Failed to save mini-app {}: {e}", updated.id);
+    }
+    with_a2app(|state| state.registry.insert(updated.clone()));
+    publish_grants(cx);
+    restart_running_app(cx, ui, &updated);
+    cx.action(A2AppRuntimeAction::VersionsChanged(updated.id.clone()));
+    enqueue_popup_notification(done, PopupKind::Success, Some(4.0));
+    ui.redraw(cx);
+}
+
 fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, action: HostAction) -> Result<(), String> {
     let room_of = |room: Option<String>| -> Result<OwnedRoomId, String> {
         let room = room.ok_or("this mini-app is not attached to a room; pass {room_id}")?;
@@ -1105,38 +1258,18 @@ fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, action: HostAction) -> Resul
     let event_of = |event_id: &str| {
         OwnedEventId::try_from(event_id).map_err(|_| String::from("not a valid event id"))
     };
-    // Only rooms (and spaces) the user is in: anything else would open a
-    // join dialog on the app's say-so.
-    let joined_name = |cx: &mut Cx, room_id: &OwnedRoomId| -> Result<RoomNameId, String> {
-        let rooms = cx.get_global::<RoomsListRef>();
-        if rooms.get_room_state(room_id) != Some(RoomState::Joined) {
-            return Err(String::from("not a room you're in"));
-        }
-        Ok(rooms.get_room_name(room_id).unwrap_or_else(|| RoomNameId::empty(room_id.clone())))
-    };
-    let queue_room_action = |cx: &mut Cx, room_id: OwnedRoomId, action: RoomAction| -> Result<(), String> {
-        let destination_room = BasicRoomDetails::Name(joined_name(cx, &room_id)?);
-        with_a2app(|state| {
-            state.room_action = Some(PendingRoomAction {
-                room_id: room_id.clone(),
-                action,
-                since: Instant::now(),
-            });
-        });
-        cx.action(AppStateAction::NavigateToRoom { room_to_close: None, destination_room });
-        cx.action(A2AppRoomAction::Pending { room_id });
-        Ok(())
-    };
     match action {
         HostAction::OpenRoom { room } => {
             let room_id = room_of(Some(room))?;
-            let destination_room = BasicRoomDetails::Name(joined_name(cx, &room_id)?);
+            let destination_room = BasicRoomDetails::Name(joined_room_name(cx, &room_id)?);
+            cx.action(NavigationBarAction::GoToHome);
             cx.action(AppStateAction::NavigateToRoom { room_to_close: None, destination_room });
         }
         HostAction::OpenThread { room, event_id } => {
             let room_id = room_of(room)?;
             let thread_root_event_id = event_of(&event_id)?;
-            let room_name_id = joined_name(cx, &room_id)?;
+            let room_name_id = joined_room_name(cx, &room_id)?;
+            cx.action(NavigationBarAction::GoToHome);
             cx.widget_action(
                 ui.widget_uid(),
                 RoomsListAction::Selected(SelectedRoom::Thread { room_name_id, thread_root_event_id }),
@@ -1144,7 +1277,7 @@ fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, action: HostAction) -> Resul
         }
         HostAction::OpenSpace { space } => {
             let space_id = room_of(Some(space))?;
-            let space_name_id = joined_name(cx, &space_id)?;
+            let space_name_id = joined_room_name(cx, &space_id)?;
             cx.action(NavigationBarAction::GoToSpace { space_name_id });
         }
         HostAction::OpenScreen { screen } => {

@@ -3014,6 +3014,19 @@ impl RoomScreen {
             RoomAction::InsertDraft(text) => {
                 self.view.room_input_bar(cx, ids!(room_input_bar)).append_draft(cx, &text);
             }
+            RoomAction::StageAttachment { path, caption } => {
+                let Some(tl) = self.tl_state.as_ref() else { return };
+                self.view.room_input_bar(cx, ids!(room_input_bar))
+                    .stage_file(cx, tl.kind.clone(), path, Some(caption));
+            }
+            RoomAction::OpenApp(app_id) => {
+                let Some(room_id) = self.room_id().cloned() else { return };
+                cx.action(crate::a2app::runtime::A2AppOp::OpenApp {
+                    app_id,
+                    room_id: Some(room_id),
+                    in_room_pane: true,
+                });
+            }
         }
     }
 
