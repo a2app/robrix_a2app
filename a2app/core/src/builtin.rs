@@ -87,10 +87,10 @@ fn reasons_for(id: &str) -> std::collections::BTreeMap<String, String> {
     let r: &[(&str, &str)] = match id {
         "room-peek" => &[
             ("matrix-room-info", "Shows this room's name and member count."),
-            ("matrix-room-read", "Lists the latest messages in this room."),
+            ("matrix-room-read", "Lists the latest messages in this room and their reactions."),
             ("matrix-room-send", "Sends the message you type into this room."),
             ("robrix-navigation", "Jumps to a message you tap."),
-            ("matrix-room-watch", "Shows new messages as they arrive."),
+            ("matrix-room-watch", "Shows new messages, typing, edits and reactions as they arrive."),
         ],
         "roll-call" => &[
             ("matrix-profile", "Shows who is rolling."),
@@ -110,8 +110,8 @@ fn reasons_for(id: &str) -> std::collections::BTreeMap<String, String> {
             ("matrix-room-info", "Refreshes when the pins change."),
         ],
         "room-threads" => &[
-            ("matrix-room-read", "Lists the discussion threads in this room."),
-            ("robrix-navigation", "Opens a thread you tap."),
+            ("matrix-room-read", "Lists the discussion threads in this room and shows the one you open."),
+            ("robrix-navigation", "Opens the thread you're reading in Robrix."),
             ("matrix-room-watch", "Refreshes as new messages arrive."),
         ],
         "search" => &[

@@ -87,7 +87,7 @@ fn count_sender(m){
     let i = 0
     while i < senders.len() {
         if senders[i].user_id == m.sender_id {
-            senders[i] += {count: senders[i].count + 1}
+            senders[i].count += 1
             bump(i)
             return nil
         }

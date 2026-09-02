@@ -106,7 +106,8 @@ fn on_room_receipt(json){
         while k < rows.len() {
             if rows[k].user_id == rc.user_id {
                 known = true
-                rows[k] += {event_id: rc.event_id, ts: rc.ts}
+                rows[k].event_id = rc.event_id
+                rows[k].ts = rc.ts
             }
             let next = k + 1
             k = next

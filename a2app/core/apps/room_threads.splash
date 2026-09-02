@@ -2,17 +2,19 @@
 // icon: 🧵
 // tint: #8A5CA8
 // permissions: matrix-room-read, robrix-navigation, matrix-room-watch
-// why-matrix-room-read: Lists the discussion threads in this room.
-// why-robrix-navigation: Opens a thread you tap.
+// why-matrix-room-read: Lists the discussion threads in this room and shows the one you open.
+// why-robrix-navigation: Opens the thread you're reading in Robrix.
 // why-matrix-room-watch: Refreshes as new messages arrive.
 
 let items = []
+let open_id = ""
+let replies = []
 
 fn load(){
     host.request("matrix.room_threads", {limit: 20}, fn(r){
         if r.is_ok {
             items = r.data.threads
-            ui.header.set_text("" + items.len() + " threads · tap one to open it")
+            ui.header.set_text("" + items.len() + " threads · tap one to read it")
         } else {
             items = []
             ui.header.set_text(r.error)
@@ -21,7 +23,65 @@ fn load(){
     })
 }
 
+fn load_thread(){
+    host.request("matrix.thread_replies", {event_id: open_id, limit: 50}, fn(r){
+        replies = []
+        if r.is_ok {
+            if r.data.root != nil { replies.push(r.data.root) }
+            for m in r.data.replies { replies.push(m) }
+            let word = " replies"
+            if r.data.replies.len() == 1 { word = " reply" }
+            ui.thread_header.set_text("" + r.data.replies.len() + word)
+        } else {
+            ui.thread_header.set_text(r.error)
+        }
+        ui.reply_list.render()
+    })
+}
+
+fn ago(ts){
+    let s = time_now() - ts / 1000.0
+    if s < 60.0 { return "just now" }
+    if s < 3600.0 { return "" + floor(s / 60.0) + "m ago" }
+    if s < 86400.0 { return "" + floor(s / 3600.0) + "h ago" }
+    return "" + floor(s / 86400.0) + "d ago"
+}
+
+fn reply_line(m){
+    let line = m.sender + " · " + ago(m.ts)
+    if m.event_id == open_id { line = "🧵 " + line }
+    return line
+}
+
+fn open_thread(i){
+    if i >= items.len() { return nil }
+    open_id = items[i].event_id
+    replies = []
+    ui.thread_header.set_text("Loading…")
+    ui.reply_list.render()
+    ui.list_wrap.set_visible(false)
+    ui.thread_wrap.set_visible(true)
+    load_thread()
+}
+
+fn show_list(){
+    open_id = ""
+    ui.thread_wrap.set_visible(false)
+    ui.list_wrap.set_visible(true)
+    load()
+}
+
+fn open_in_robrix(){
+    host.request("nav.thread", {event_id: open_id}, fn(r){
+        if !r.is_ok { ui.thread_header.set_text(r.error) }
+    })
+}
+
 fn on_room_message(json){
+    if open_id != "" {
+        load_thread()
+        return nil
+    }
     load()
 }
 
@@ -30,15 +90,8 @@ fn watch(){
 }
 
 fn on_permissions_changed(caps){
-    load()
+    if open_id != "" { load_thread() } else { load() }
     watch()
-}
-
-fn open_thread(i){
-    if i >= items.len() { return nil }
-    host.request("nav.thread", {event_id: items[i].event_id}, fn(r){
-        if !r.is_ok { ui.header.set_text(r.error) }
-    })
 }
 
 let _boot = start_timeout(0.05, || {
@@ -54,46 +107,97 @@ View{
             text: "Room Threads" padding: 0 margin: 0
             draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }
         }
-        header := Label{
-            text: "Loading…" padding: 0 margin: 0
-            width: Fill
-            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 13} }
-        }
-        item_list := ScrollYView{
-            width: Fill height: 330 flow: Down spacing: 5
-            on_item_tap: |i| open_thread(i)
-            on_render: || {
-                if items.len() == 0 {
-                    Label{
-                        text: "Nothing to show. This app needs to be opened from a room, and needs your permission to read it."
-                        width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
-                    }
-                } else {
-                    for it in items {
-                        RoundedView{
-                            width: Fill height: Fit flow: Down spacing: 2 padding: 10
-                            show_bg: true
-                            draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
-                            Label{
-                                text: it.sender padding: 0 margin: 0
-                                width: Fill
-                                draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
-                            }
-                            Label{
-                                text: it.body width: Fill padding: 0 margin: 0
-                                draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+        list_wrap := View{
+            width: Fill height: Fit flow: Down spacing: 10
+            header := Label{
+                text: "Loading…" padding: 0 margin: 0
+                width: Fill
+                draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 13} }
+            }
+            item_list := ScrollYView{
+                width: Fill height: 330 flow: Down spacing: 5
+                on_item_tap: |i| open_thread(i)
+                on_render: || {
+                    if items.len() == 0 {
+                        Label{
+                            text: "Nothing to show. This app needs to be opened from a room, and needs your permission to read it."
+                            width: Fill padding: 0 margin: 0
+                            draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                        }
+                    } else {
+                        for it in items {
+                            RoundedView{
+                                width: Fill height: Fit flow: Down spacing: 2 padding: 10
+                                show_bg: true
+                                draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                                Label{
+                                    text: it.sender padding: 0 margin: 0
+                                    width: Fill
+                                    draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+                                }
+                                Label{
+                                    text: it.body width: Fill padding: 0 margin: 0
+                                    draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                                }
                             }
                         }
                     }
                 }
             }
+            View{
+                width: Fill height: Fit flow: Right align: Align{x: 0.5}
+                Button{
+                    text: "Refresh" on_click: || load()
+                    draw_text +: { color: #x1C274C }
+                }
+            }
         }
-        View{
-            width: Fill height: Fit flow: Right align: Align{x: 0.5}
-            Button{
-                text: "Refresh" on_click: || load()
-                draw_text +: { color: #x1C274C }
+        thread_wrap := View{
+            width: Fill height: Fit flow: Down spacing: 10 visible: false
+            View{
+                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 6
+                Button{
+                    text: "‹ Back to threads" on_click: || show_list()
+                    draw_text +: { color: #x1C274C }
+                }
+                Button{
+                    text: "Open in Robrix" on_click: || open_in_robrix()
+                    draw_text +: { color: #x1C274C }
+                }
+            }
+            thread_header := Label{
+                text: "Loading…" padding: 0 margin: 0
+                width: Fill
+                draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 13} }
+            }
+            reply_list := ScrollYView{
+                width: Fill height: 330 flow: Down spacing: 5
+                on_render: || {
+                    if replies.len() == 0 {
+                        Label{
+                            text: "No replies to show."
+                            width: Fill padding: 0 margin: 0
+                            draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                        }
+                    } else {
+                        for m in replies {
+                            RoundedView{
+                                width: Fill height: Fit flow: Down spacing: 2 padding: 10
+                                show_bg: true
+                                draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                                Label{
+                                    text: reply_line(m) padding: 0 margin: 0
+                                    width: Fill
+                                    draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+                                }
+                                Label{
+                                    text: m.body width: Fill padding: 0 margin: 0
+                                    draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

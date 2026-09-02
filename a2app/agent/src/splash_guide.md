@@ -259,7 +259,8 @@ let _boot = start_timeout(0.05, || refresh())
 - Arrays: `[a, b]`, `.push(x)`, `.len()`, `.clear()`, `.retain(|x| cond)`,
   index `items[i]`, iterate `for item in items { ... }`.
 - Objects: `{text: "hi" done: false}` (NO commas needed between fields),
-  field access `item.done`, update-merge `items[i] += {done: true}`.
+  field access `item.done`, field assignment `items[i].done = true` (the
+  merge form `items[i] += {done: true}` only works with a literal index).
 - Strings: concatenation with `+`, `.trim()`. Convert: `"" + number`.
 - `if`/`else`, `return`, `let`, `+=`, `-=`, `!`, `==`, `<`, `>` as usual.
 

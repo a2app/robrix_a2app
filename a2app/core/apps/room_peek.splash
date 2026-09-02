@@ -3,14 +3,16 @@
 // tint: #4A90D9
 // permissions: matrix-room-info, matrix-room-read, matrix-room-send, robrix-navigation, matrix-room-watch
 // why-matrix-room-info: Shows this room's name and member count.
-// why-matrix-room-read: Lists the latest messages in this room.
+// why-matrix-room-read: Lists the latest messages in this room and their reactions.
 // why-matrix-room-send: Sends the message you type into this room.
 // why-robrix-navigation: Jumps to a message you tap.
-// why-matrix-room-watch: Shows new messages as they arrive.
+// why-matrix-room-watch: Shows new messages, typing, edits and reactions as they arrive.
 
 let room_name = "Room Peek"
 let room_line = "Open me from a room to see its info."
 let messages = []
+let rx_queue = []
+let rx_busy = false
 
 fn show_room(){
     ui.room_title.set_text(room_name)
@@ -29,15 +31,66 @@ fn load_room(){
     })
 }
 
+fn index_of(list, id){
+    let i = 0
+    while i < list.len() {
+        if list[i].event_id == id { return i }
+        i += 1
+    }
+    return -1
+}
+
+// One matrix.event a second: each costs 5 of a 30 token budget refilling 6 a second.
+fn fetch_reactions(){
+    let id = rx_queue[0]
+    rx_queue.remove(0)
+    host.request("matrix.event", {event_id: id}, fn(r){
+        if !r.is_ok { rx_queue.clear() }
+        let i = index_of(messages, id)
+        if r.is_ok && i >= 0 {
+            messages[i].reactions = r.data.reactions
+            ui.msg_list.render()
+        }
+        rx_busy = rx_queue.len() > 0 && start_timeout(1.0, || fetch_reactions()) != nil
+    })
+}
+
 fn load_messages(){
     host.request("matrix.read_messages", {limit: 15}, fn(r){
+        let old = messages
+        let pending = rx_queue
+        messages = []
+        rx_queue = []
         if r.is_ok {
-            messages = r.data.messages
-        } else {
-            messages = []
+            for m in r.data.messages {
+                let i = index_of(old, m.event_id)
+                if i >= 0 {
+                    m.reactions = old[i].reactions
+                } else {
+                    m.reactions = []
+                    pending.push(m.event_id)
+                }
+                messages.push(m)
+            }
+        }
+        for id in pending {
+            if index_of(messages, id) >= 0 { rx_queue.push(id) }
         }
         ui.msg_list.render()
+        if rx_busy || rx_queue.len() == 0 { return nil }
+        rx_busy = true
+        fetch_reactions()
     })
+}
+
+fn reactions_line(m){
+    let line = ""
+    for r in m.reactions {
+        if line != "" { line = line + " · " }
+        line = line + r.key + " " + r.count
+        if r.mine { line = line + " (you)" }
+    }
+    return line
 }
 
 fn jump_to_message(i){
@@ -64,11 +117,51 @@ fn send_msg(){
 fn on_room_message(json){
     let batch = json.parse_json()
     for m in batch {
+        m.reactions = []
         messages.push(m)
     }
-    while messages.len() > 15 {
-        messages.remove(0)
+    while messages.len() > 15 { messages.remove(0) }
+    ui.msg_list.render()
+}
+
+fn on_room_typing(json){
+    let who = json.parse_json().typing
+    let line = ""
+    if who.len() == 1 { line = who[0].name + " is typing…" }
+    elif who.len() == 2 { line = who[0].name + " and " + who[1].name + " are typing…" }
+    elif who.len() > 2 { line = who[0].name + ", " + who[1].name + " and " + (who.len() - 2) + " more are typing…" }
+    ui.typing.set_text(line)
+    ui.typing_wrap.set_visible(line != "")
+}
+
+fn on_room_reaction(json){
+    let p = json.parse_json()
+    let i = index_of(messages, p.event_id)
+    if i < 0 { return nil }
+    let rx = messages[i].reactions
+    let found = false
+    let j = 0
+    while j < rx.len() {
+        if rx[j].key == p.key {
+            let delta = -1
+            if p.added { delta = 1 }
+            rx[j].count += delta
+            found = true
+        }
+        j += 1
     }
+    if !found && p.added { rx.push({key: p.key count: 1 mine: false}) }
+    rx.retain(|x| x.count > 0)
+    ui.msg_list.render()
+}
+
+fn on_room_message_changed(json){
+    let p = json.parse_json()
+    let i = index_of(messages, p.event_id)
+    if i < 0 { return nil }
+    let body = p.body
+    if p.redacted { body = "(deleted)" }
+    messages[i].body = body
     ui.msg_list.render()
 }
 
@@ -79,6 +172,9 @@ fn on_room_members_changed(json){
 fn watch(){
     host.request("events.subscribe", {event: "on_room_message"}, nil)
     host.request("events.subscribe", {event: "on_room_members_changed"}, nil)
+    host.request("events.subscribe", {event: "on_room_typing"}, nil)
+    host.request("events.subscribe", {event: "on_room_reaction"}, nil)
+    host.request("events.subscribe", {event: "on_room_message_changed"}, nil)
 }
 
 fn on_permissions_changed(caps){
@@ -129,10 +225,18 @@ View{
                                 text: m.body width: Fill padding: 0 margin: 0
                                 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
                             }
+                            View{
+                                width: Fill height: Fit visible: m.reactions.len() > 0
+                                Label{ text: reactions_line(m) width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 11} } }
+                            }
                         }
                     }
                 }
             }
+        }
+        typing_wrap := View{
+            width: Fill height: Fit visible: false
+            typing := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 11} } }
         }
         View{
             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}

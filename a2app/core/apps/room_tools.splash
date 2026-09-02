@@ -38,7 +38,7 @@ fn toggle(i){
             ui.status.set_text(r.error)
             return nil
         }
-        flags[i] += {on: want}
+        flags[i].on = want
         let note = flags[i].done_off
         if want { note = flags[i].done_on }
         ui.status.set_text(note)
@@ -48,7 +48,7 @@ fn toggle(i){
 
 fn load_unread(){
     host.request("matrix.unread", nil, fn(r){
-        if r.is_ok { flags[2] += {on: r.data.marked_unread} }
+        if r.is_ok { flags[2].on = r.data.marked_unread }
         show_flags()
     })
 }
