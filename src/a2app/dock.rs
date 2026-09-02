@@ -15,6 +15,7 @@ use crate::a2app::host_set::{MiniAppHostAreaWidgetRefExt, Templates};
 use crate::a2app::instances::{self, InstanceKey, MiniAppInstanceAction};
 use crate::a2app::runtime::{with_a2app, A2AppOp};
 use crate::app::{AppStateAction, SelectedRoom};
+use crate::home::home_screen::{effective_is_desktop, MainViewVariantChangedAction};
 pub use a2app_core::layout::{PaneLayout, PaneSide};
 
 script_mod! {
@@ -351,6 +352,19 @@ impl Widget for MiniAppDock {
                     }
                     Some(DockCmd::None) | None => {}
                 }
+                // Going narrow moves side panes to the bottom; either way the
+                // edge button's "next side" changes.
+                if action.downcast_ref::<MainViewVariantChangedAction>().is_some() {
+                    let desktop = effective_is_desktop(cx);
+                    let app_ids: Vec<MiniAppId> = self.instances.keys().cloned().collect();
+                    for app_id in app_ids {
+                        if !desktop && self.instances[&app_id].layout.side.is_vertical() {
+                            self.move_pane(cx, &app_id, PaneSide::Bottom);
+                        }
+                        self.apply_edge_icon(cx, &app_id);
+                    }
+                    continue;
+                }
                 if self.needs_full_redraw
                     && let Some(AppStateAction::RoomFocused(SelectedRoom::JoinedRoom { room_name_id })) = action.downcast_ref()
                     && self.room_id.as_ref() == Some(room_name_id.room_id())
@@ -410,7 +424,7 @@ impl Widget for MiniAppDock {
                         let Some(room_id) = self.room_id.clone() else { continue };
                         let room_name = self.room_name.clone();
                         self.release_instance(cx, &app_id);
-                        if crate::home::home_screen::effective_is_desktop(cx) {
+                        if effective_is_desktop(cx) {
                             cx.action(crate::a2app::tab_screen::A2AppTabRequest::Open {
                                 app_id,
                                 room_id,
@@ -510,7 +524,12 @@ impl MiniAppDock {
         // showing it; only one may.
         let Some(host) = instances::adopt(cx, key, uid) else { return };
         let app_id = key.0.clone();
-        let layout = instances::layout(key);
+        let mut layout = instances::layout(key);
+        // A side pane on a phone-width window leaves no room for the room.
+        if layout.side.is_vertical() && !effective_is_desktop(cx) {
+            layout.side = PaneSide::Bottom;
+            instances::set_layout(key, layout);
+        }
 
         let Some(pane) = self.instantiate(cx, live_id!(PaneFrame)) else { return };
         pane.set_visible(cx, true);
@@ -675,7 +694,7 @@ impl MiniAppDock {
     fn apply_edge_icon(&self, cx: &mut Cx, app_id: &str) {
         let Some(inst) = self.instances.get(app_id) else { return };
         let mut button = inst.pane.button(cx, ids!(pane_edge_button));
-        match inst.layout.side.next() {
+        match inst.layout.side.next(effective_is_desktop(cx)) {
             PaneSide::Top => {
                 script_apply_eval!(cx, button, { draw_icon +: { svg: (mod.widgets.ICON_PANEL_TOP) } });
             }
@@ -716,9 +735,17 @@ impl MiniAppDock {
     }
 
     fn cycle_edge(&mut self, cx: &mut Cx, app_id: &str) {
+        let Some(inst) = self.instances.get(app_id) else { return };
+        let new = inst.layout.side.next(effective_is_desktop(cx));
+        self.move_pane(cx, app_id, new);
+    }
+
+    fn move_pane(&mut self, cx: &mut Cx, app_id: &str, new: PaneSide) {
         let Some(inst) = self.instances.get_mut(app_id) else { return };
         let old = inst.layout.side;
-        let new = old.next();
+        if old == new {
+            return;
+        }
         inst.layout.side = new;
         let (pane, edge_size) = (inst.pane.clone(), inst.layout.edge_size);
         self.edge(cx, old).remove_pane(app_id);

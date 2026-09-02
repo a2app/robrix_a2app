@@ -139,11 +139,24 @@ impl Drop for MiniAppHostPane {
     }
 }
 
+impl MiniAppHostPane {
+    /// Desktop keeps a floating card; a phone-width window gets nearly all
+    /// of the screen.
+    fn fit_window(&mut self, cx: &mut Cx) {
+        let m = if crate::home::home_screen::effective_is_desktop(cx) { 40.0 } else { 6.0 };
+        self.view.walk.margin = Inset { left: m, top: m, right: m, bottom: m };
+        self.view.redraw(cx);
+    }
+}
+
 impl Widget for MiniAppHostPane {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
 
         if let Event::Actions(actions) = event {
+            if actions.iter().any(|a| a.downcast_ref::<crate::home::home_screen::MainViewVariantChangedAction>().is_some()) {
+                self.fit_window(cx);
+            }
             if self.view.button(cx, ids!(close_button)).clicked(actions) {
                 cx.action(MiniAppHostPaneAction::CloseClicked);
             }
@@ -185,6 +198,7 @@ impl MiniAppHostPaneRef {
         {
             instances::release(cx, &previous, uid);
         }
+        inner.fit_window(cx);
         inner.view.button(cx, ids!(return_button)).set_visible(cx, key.1.is_some());
         inner.view.mini_app_host_area(cx, ids!(host_area)).set_host(Some(host));
         inner.view.label(cx, ids!(app_glyph)).set_text(cx, &manifest.icon);
