@@ -424,6 +424,8 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
                         "is_space": room.is_space(),
                         "member_count": room.joined_members_count(),
                         "is_encrypted": room.encryption_state().is_encrypted(),
+                        "unread": room.num_unread_messages(),
+                        "mentions": room.num_unread_mentions(),
                     }));
                 }
                 Ok(serde_json::json!({ "rooms": out }).to_string())

@@ -34,6 +34,8 @@ pub(super) async fn search(query: String, limit: u32) -> Result<String, String> 
             "is_space": room.is_space(),
             "member_count": room.joined_members_count(),
             "is_encrypted": room.encryption_state().is_encrypted(),
+            "unread": room.num_unread_messages(),
+            "mentions": room.num_unread_mentions(),
             "joined": room.state() == RoomState::Joined,
         }));
         if out.len() >= limit as usize {

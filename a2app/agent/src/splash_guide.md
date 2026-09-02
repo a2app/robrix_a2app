@@ -474,7 +474,7 @@ burning a permission.
 - `"matrix.pinned_events"` (needs `matrix-room-read`): `{}` ->
   `{pinned: [{sender, sender_id, event_id, body}]}`, the room's pinned messages.
 - `"matrix.rooms_list"` (needs `matrix-rooms-list`, works without a room): `{}` ->
-  `{rooms: [{room_id, name, is_direct, is_space, member_count, is_encrypted}]}`.
+  `{rooms: [{room_id, name, is_direct, is_space, member_count, is_encrypted, unread, mentions}]}`.
 - `"matrix.search_room"` (needs `matrix-room-read`, attached room):
   `{query, limit: N, server: bool}` ->
   `{results: [{room_id, room_name, event_id, sender, sender_id, body, ts, source}],
