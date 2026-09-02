@@ -16,9 +16,28 @@ use matrix_sdk::ruma::{OwnedRoomId, RoomId};
 
 use a2app_core::layout::PaneLayout;
 use a2app_core::manifest::{instance_tag, MiniAppId, MiniAppManifest};
+use a2app_core::services::PaneState;
 
 /// `(app, room)`; `None` is a room-less app in the host modal.
 pub type InstanceKey = (MiniAppId, Option<OwnedRoomId>);
+
+/// What kind of surface shows an instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Surface {
+    Dock,
+    Tab,
+    Modal,
+}
+
+impl Surface {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Surface::Dock => "dock",
+            Surface::Tab => "tab",
+            Surface::Modal => "modal",
+        }
+    }
+}
 
 struct MiniAppInstance {
     host: WidgetRef,
@@ -29,8 +48,19 @@ struct MiniAppInstance {
     layout: PaneLayout,
     /// The surface drawing it; `None` while parked.
     shown_by: Option<WidgetUid>,
+    surface: Option<Surface>,
     /// False after its surface died without a `Cx` to re-anchor it.
     anchored: bool,
+}
+
+impl MiniAppInstance {
+    fn foreground(&self) -> bool {
+        match self.surface {
+            Some(Surface::Dock) => !self.layout.minimized,
+            Some(_) => true,
+            None => false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -39,6 +69,9 @@ struct Registry {
     instances: HashMap<InstanceKey, MiniAppInstance>,
     needs_anchor: bool,
     has_pending_resize: bool,
+    /// Surface and focus hooks owed to instances; payloads are built at
+    /// flush time, so a burst of changes is one call with the final state.
+    pending_hooks: Vec<(InstanceKey, LiveId)>,
 }
 
 thread_local! {
@@ -129,6 +162,7 @@ pub fn ensure(
             pending_resize: None,
             layout: seed,
             shown_by: None,
+            surface: None,
             anchored: true,
         });
     });
@@ -137,17 +171,20 @@ pub fn ensure(
 
 /// Claims the instance for `surface_uid` to draw. `None` if it doesn't
 /// exist or another surface is already showing it.
-pub fn adopt(cx: &mut Cx, key: &InstanceKey, surface_uid: WidgetUid) -> Option<WidgetRef> {
+pub fn adopt(cx: &mut Cx, key: &InstanceKey, surface_uid: WidgetUid, surface: Surface) -> Option<WidgetRef> {
     let host = with_registry(|r| {
         let inst = r.instances.get_mut(key)?;
         if inst.shown_by.is_some_and(|uid| uid != surface_uid) {
             return None;
         }
         inst.shown_by = Some(surface_uid);
+        inst.surface = Some(surface);
         inst.anchored = true;
         Some(inst.host.clone())
     })?;
     cx.widget_tree_insert_child_deep(surface_uid, tree_name(key), host.clone());
+    note_hook(key, live_id!(on_surface_changed));
+    note_hook(key, live_id!(on_focus_changed));
     Some(host)
 }
 
@@ -159,12 +196,14 @@ pub fn release(cx: &mut Cx, key: &InstanceKey, surface_uid: WidgetUid) {
             return None;
         }
         inst.shown_by = None;
+        inst.surface = None;
         inst.anchored = true;
         Some(inst.host.clone())
     });
     if let Some(host) = host {
         let root = cx.widget_tree().root_uid();
         cx.widget_tree_insert_child_deep(root, tree_name(key), host);
+        note_hook(key, live_id!(on_focus_changed));
     }
 }
 
@@ -172,14 +211,52 @@ pub fn release(cx: &mut Cx, key: &InstanceKey, surface_uid: WidgetUid) {
 /// for the next event pass, which has a `Cx`.
 pub fn release_owner_no_cx(surface_uid: WidgetUid) {
     with_registry(|r| {
-        for inst in r.instances.values_mut() {
+        for (key, inst) in r.instances.iter_mut() {
             if inst.shown_by == Some(surface_uid) {
                 inst.shown_by = None;
+                inst.surface = None;
                 inst.anchored = false;
                 r.needs_anchor = true;
+                let owed = (key.clone(), live_id!(on_focus_changed));
+                if !r.pending_hooks.contains(&owed) {
+                    r.pending_hooks.push(owed);
+                }
             }
         }
     });
+}
+
+/// Owes the instance one `on_surface_changed` / `on_focus_changed` call,
+/// delivered by `flush_pending` with the state at that time.
+pub fn note_hook(key: &InstanceKey, hook: LiveId) {
+    with_registry(|r| {
+        if !r.instances.contains_key(key) {
+            return;
+        }
+        let owed = (key.clone(), hook);
+        if !r.pending_hooks.contains(&owed) {
+            r.pending_hooks.push(owed);
+        }
+    });
+}
+
+pub fn surface_of(key: &InstanceKey) -> Option<Surface> {
+    with_registry(|r| r.instances.get(key).and_then(|i| i.surface))
+}
+
+/// The pane of the isolate with `heap_key`, for `env` and `ui.pane.read`.
+pub fn pane_state(heap_key: usize) -> Option<PaneState> {
+    with_registry(|r| {
+        let inst = r.instances.values().find(|i| i.heap_key == Some(heap_key))?;
+        Some(PaneState {
+            surface: inst.surface.map_or("parked", Surface::as_str),
+            side: (inst.surface == Some(Surface::Dock)).then_some(inst.layout.side),
+            minimized: inst.surface == Some(Surface::Dock) && inst.layout.minimized,
+            foreground: inst.foreground(),
+            width: inst.last_size.x,
+            height: inst.last_size.y,
+        })
+    })
 }
 
 pub fn shown_by(key: &InstanceKey) -> Option<WidgetUid> {
@@ -294,9 +371,9 @@ pub fn note_size(key: &InstanceKey, size: Vec2d) {
 /// Event-time housekeeping: re-anchors hosts whose surface died and
 /// delivers queued `on_app_resize` calls.
 pub fn flush_pending(cx: &mut Cx) {
-    let (to_anchor, resizes) = with_registry(|r| {
-        if !r.needs_anchor && !r.has_pending_resize {
-            return (Vec::new(), Vec::new());
+    let (to_anchor, resizes, hooks) = with_registry(|r| {
+        if !r.needs_anchor && !r.has_pending_resize && r.pending_hooks.is_empty() {
+            return (Vec::new(), Vec::new(), Vec::new());
         }
         r.needs_anchor = false;
         r.has_pending_resize = false;
@@ -311,7 +388,21 @@ pub fn flush_pending(cx: &mut Cx) {
                 resizes.push((inst.host.clone(), size));
             }
         }
-        (to_anchor, resizes)
+        let hooks: Vec<(WidgetRef, LiveId, String)> = std::mem::take(&mut r.pending_hooks).into_iter()
+            .filter_map(|(key, hook)| {
+                let inst = r.instances.get(&key)?;
+                let payload = if hook == live_id!(on_focus_changed) {
+                    serde_json::json!({ "foreground": inst.foreground() })
+                } else {
+                    serde_json::json!({
+                        "surface": inst.surface.map_or("parked", Surface::as_str),
+                        "side": (inst.surface == Some(Surface::Dock)).then(|| inst.layout.side.as_str()),
+                    })
+                };
+                Some((inst.host.clone(), hook, payload.to_string()))
+            })
+            .collect();
+        (to_anchor, resizes, hooks)
     });
     if !to_anchor.is_empty() {
         let root = cx.widget_tree().root_uid();
@@ -322,6 +413,11 @@ pub fn flush_pending(cx: &mut Cx) {
     for (host, size) in resizes {
         if let Some(mut splash) = splash_of(cx, &host).borrow_mut::<Splash>() {
             splash.call_script_fn(cx, live_id!(on_app_resize), &[size.x.into(), size.y.into()]);
+        }
+    }
+    for (host, hook, payload) in hooks {
+        if let Some(mut splash) = splash_of(cx, &host).borrow_mut::<Splash>() {
+            splash.call_script_fn_with_strings(cx, hook, &[&payload]);
         }
     }
 }

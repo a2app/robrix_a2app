@@ -29,6 +29,25 @@ impl PaneSide {
     pub fn is_vertical(self) -> bool {
         matches!(self, PaneSide::Left | PaneSide::Right)
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PaneSide::Top => "top",
+            PaneSide::Bottom => "bottom",
+            PaneSide::Left => "left",
+            PaneSide::Right => "right",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "top" => Some(PaneSide::Top),
+            "bottom" => Some(PaneSide::Bottom),
+            "left" => Some(PaneSide::Left),
+            "right" => Some(PaneSide::Right),
+            _ => None,
+        }
+    }
 }
 
 /// A pane's dock position; survives room switches and restarts.

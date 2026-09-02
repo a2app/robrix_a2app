@@ -299,7 +299,7 @@ and scope (this room, account, device, app-local). Available today:
 | notifications | `notifications.post`, `notifications.clear` | write · device |
 | clipboard-read | `device.clipboard.read` | read · device |
 | clipboard-write | `device.clipboard.write` | write · device |
-| ipc | `ipc.send` (write), `on_ipc_message` (Robrix→app hook) | app-local |
+| ipc | `ipc.send` (write), `ipc.apps.list` (read), `on_ipc_message` (Robrix→app hook) | app-local |
 | open-url | `device.url.open` | write · device |
 | share | `device.share` | write · device |
 | files | `device.files.pick` (read), `device.files.save` (write) | device |
@@ -315,11 +315,16 @@ and scope (this room, account, device, app-local). Available today:
 | matrix-room-watch | `on_room_message`, `on_room_message_changed`, `on_room_reaction`, `on_room_typing`, `on_room_receipt`, `on_room_members_changed` (Robrix→app hooks) | read · this room |
 | matrix-room-info | `on_room_pins_changed`, `on_room_info_changed`, `on_room_unread_changed` (Robrix→app hooks) | read · this room |
 | matrix-rooms-list | `on_rooms_changed`, `on_invite_received`, `on_unread_totals_changed` (Robrix→app hooks) | read · many rooms |
+| robrix-ui | `ui.pane.set_side`, `ui.pane.minimize`, `ui.pane.break_out` | act · this pane |
+| robrix-preferences | `host.prefs.read`, `on_prefs_changed` (Robrix→app hook) | read · account |
+| robrix-observe | `on_active_room_changed`, `on_navigation_changed` (Robrix→app hooks) | read · many rooms · high risk |
+| device-info | `device.info.read` | read · device |
 
 Ungated plumbing every app has: `host.env.read` (`"env"`),
 `permissions.query`, `permissions.request`, `events.subscribe` /
-`events.unsubscribe`, and the hooks `on_permissions_changed(caps)` /
-`on_app_resize(w, h)`.
+`events.unsubscribe`, `ui.pane.read`, `ui.pane.close`, `storage.quota`,
+and the hooks `on_permissions_changed(caps)`, `on_app_resize(w, h)`,
+`on_focus_changed(json)`, `on_surface_changed(json)`; see "Your own pane".
 
 ## Live room updates (Robrix -> app hooks)
 
@@ -415,8 +420,8 @@ Two doorways:
   `r.is_ok` / `r.data` (parsed JSON) / `r.error`. NOTE it is `r.is_ok`, not
   `r.ok` (`ok` is a keyword). ALWAYS handle `r.is_ok == false`: that is the
   denial path, and it is not an error case you can ignore. Services:
-  `"env"` (endpoint
-  URLs — never hardcode them), `"location.get"`, `"clipboard.write"`,
+  `"env"` (where you run;
+  see "Your own pane"), `"location.get"`, `"clipboard.write"`,
   `"clipboard.read"`, `"url.open"`, `"notify.post"`/`"notify.clear"`,
   `"share"`, `"files.pick"`/`"files.save"`, `"auth.check"`,
   `"ipc.send"` (`{to: "self"}` is free of any permission; receivers define
@@ -713,6 +718,63 @@ fn open_member(i){
     })
 }
 ```
+
+## Your own pane, Robrix's settings, this device
+
+Every app can read where it is and quit itself; nothing to declare:
+
+- `"env"` -> `{app_id, room_attached, room_id, instance_tag, surface,
+  platform, view_mode}`. `surface` is `"dock"` (a pane on a room), `"tab"`
+  (its own desktop tab), `"modal"` (the full-screen host) or `"parked"`;
+  `platform` is `macos | ios | android | windows | linux | other`;
+  `view_mode` is `"desktop"` or `"mobile"`.
+- `"ui.pane.read"` -> `{surface, side, minimized, foreground, width,
+  height}`; `side` is set only while docked.
+- `"ui.pane.close"` -> `{}`: quits this instance, same as its Close button.
+  Only from a button the user taps, never on load.
+- `"storage.quota"` -> `{used, cap}`: bytes in your `fs` jail; `cap` is
+  `nil` today.
+- Hooks, called whenever you define them (no subscribe):
+  `fn on_focus_changed(json)` with `{foreground: bool}`, true while the
+  user can see the pane (docked and not minimized, in a tab, or in the
+  modal); `fn on_surface_changed(json)` with `{surface, side}` after a
+  dock, break-out, return or side change. Pause timers and polling while
+  not foreground.
+
+Needs `robrix-ui` (prompts on first use), only while docked in a room, and
+only from a tap:
+
+- `"ui.pane.set_side"` `{side}`: `"top" | "bottom" | "left" | "right"`;
+  left and right are refused in the mobile layout.
+- `"ui.pane.minimize"` `{}`: collapses to a chip. An app can never
+  un-minimize itself.
+- `"ui.pane.break_out"` `{}`: moves to its own desktop tab; refused in the
+  mobile layout.
+
+Needs `robrix-preferences` (prompts on first use):
+
+- `"host.prefs"` -> `{view_mode, view_mode_override, ui_zoom,
+  send_on_enter, thumbnail_max_height, show_read_receipts}`.
+- `on_prefs_changed(json)`, the same shape, after
+  `events.subscribe {event: "on_prefs_changed"}`.
+
+Needs `robrix-observe` (prompts on first use; it reveals what the user is
+looking at, so declare it only when the app really follows them). Both
+hooks come after `events.subscribe {event: ...}` and work without an
+attached room:
+
+- `on_active_room_changed(json)`: `{kind: "room" | "thread" | "invite" |
+  "space", room_id, name, thread_root}` whenever Robrix shows a different
+  room or thread; latest only per pass.
+- `on_navigation_changed(json)`: `{screen: "home" | "add_room" |
+  "mini_apps" | "settings" | "space", space_id}`.
+
+Needs `device-info`: `"device.info"` -> `{platform, locale, time_zone,
+utc_offset_minutes, desktop_view, ui_zoom}`; `locale` and `time_zone` may
+be `nil`.
+
+Needs `ipc`: `"ipc.apps_list"` -> `{apps: [{app_id, name, running}]}`, the
+installed apps that accept `ipc.send`.
 
 ## Hard rules
 

@@ -25,8 +25,23 @@ use makepad_widgets::splash_host::{
 };
 use makepad_widgets::*;
 
+use crate::layout::PaneSide;
 use crate::manifest::{AppRegistry, MiniAppId};
 use crate::permissions::{Effective, Permission, PermissionStore};
+
+pub const PLATFORM: &str = if cfg!(target_os = "macos") {
+    "macos"
+} else if cfg!(target_os = "ios") {
+    "ios"
+} else if cfg!(target_os = "android") {
+    "android"
+} else if cfg!(target_os = "windows") {
+    "windows"
+} else if cfg!(target_os = "linux") {
+    "linux"
+} else {
+    "other"
+};
 
 /// The IP-geolocation fallback endpoint (city-level, no key needed).
 const GEO_URL: &str = "https://ipapi.co/json/";
@@ -153,6 +168,38 @@ pub enum BrokerAsk {
         heap_key: usize,
         hook: Option<&'static str>,
     },
+    /// A fact only the host holds; answered with `reply` on the UI thread.
+    HostQuery { reply: Reply, query: HostQuery },
+}
+
+pub enum HostQuery {
+    Prefs,
+    DeviceInfo,
+}
+
+/// Where the calling instance is on screen, for `env` and `ui.pane.read`.
+#[derive(Clone, Debug)]
+pub struct PaneState {
+    /// `dock`, `tab` or `modal`; `parked` while nothing shows it.
+    pub surface: &'static str,
+    pub side: Option<PaneSide>,
+    pub minimized: bool,
+    pub foreground: bool,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl PaneState {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "surface": self.surface,
+            "side": self.side.map(PaneSide::as_str),
+            "minimized": self.minimized,
+            "foreground": self.foreground,
+            "width": self.width,
+            "height": self.height,
+        })
+    }
 }
 
 /// A parsed nav.* / composer.* call. `room` is the explicit `room_id`
@@ -170,6 +217,11 @@ pub enum HostAction {
     OpenApp { room: Option<String>, app_id: MiniAppId },
     ComposerInsert { room: Option<String>, text: String },
     ComposerReplyTo { room: Option<String>, event_id: String },
+    /// The `ui.pane.*` calls, acting on the calling instance's own pane.
+    ClosePane,
+    SetSide { side: PaneSide },
+    Minimize,
+    BreakOut,
 }
 
 
@@ -195,6 +247,10 @@ pub struct BrokerCtx<'a> {
     /// Whether an app has a live instance docked on a room screen; those are
     /// on screen too, so UI-class services must not treat them as background.
     pub is_docked: &'a dyn Fn(&str) -> bool,
+    pub is_running: &'a dyn Fn(&str) -> bool,
+    /// The calling isolate's pane, by heap key.
+    pub pane_state: &'a dyn Fn(usize) -> Option<PaneState>,
+    pub desktop_view: bool,
 }
 
 /// The refusal every switch-gated write gets while the user keeps writes off.
@@ -463,11 +519,58 @@ impl Broker {
 
         match req.service.as_str() {
             "env" => {
+                let pane = (ctx.pane_state)(req.heap_key);
                 let data = serde_json::json!({
                     "app_id": manifest.id,
                     "room_attached": instance_room.is_some(),
+                    "room_id": instance_room,
+                    "instance_tag": req.app_tag,
+                    "surface": pane.as_ref().map_or("parked", |p| p.surface),
+                    "platform": PLATFORM,
+                    "view_mode": if ctx.desktop_view { "desktop" } else { "mobile" },
                 });
                 respond(cx, reply, Ok(&data.to_string()));
+            }
+            "ui.pane.read" => match (ctx.pane_state)(req.heap_key) {
+                Some(pane) => respond(cx, reply, Ok(&pane.to_json().to_string())),
+                None => respond(cx, reply, Err("this instance has no pane")),
+            },
+            "ui.pane.close" | "ui.pane.set_side" | "ui.pane.minimize" | "ui.pane.break_out" => {
+                let action = match req.service.as_str() {
+                    "ui.pane.close" => Ok(HostAction::ClosePane),
+                    "ui.pane.minimize" => Ok(HostAction::Minimize),
+                    "ui.pane.break_out" => Ok(HostAction::BreakOut),
+                    _ => args["side"].as_str().and_then(PaneSide::from_str)
+                        .map(|side| HostAction::SetSide { side })
+                        .ok_or("ui.pane.set_side needs {side: top | bottom | left | right}"),
+                };
+                match action {
+                    Ok(action) => asks.push(BrokerAsk::HostAction { reply, app_id: manifest.id.clone(), action }),
+                    Err(e) => respond(cx, reply, Err(e)),
+                }
+            }
+            "host.prefs" => asks.push(BrokerAsk::HostQuery { reply, query: HostQuery::Prefs }),
+            "device.info" => asks.push(BrokerAsk::HostQuery { reply, query: HostQuery::DeviceInfo }),
+            "ipc.apps_list" => {
+                let apps: Vec<serde_json::Value> = ctx.registry.iter()
+                    .filter(|m| m.declares(Permission::Ipc))
+                    .map(|m| serde_json::json!({
+                        "app_id": m.id,
+                        "name": m.name,
+                        "running": (ctx.is_running)(&m.id),
+                    }))
+                    .collect();
+                respond(cx, reply, Ok(&serde_json::json!({ "apps": apps }).to_string()));
+            }
+            "storage.quota" => {
+                // Walks the jail off-thread; there is no byte cap today.
+                let dir = crate::app_sandbox_dir(&manifest.id);
+                let tx = self.tx.clone();
+                std::thread::spawn(move || {
+                    let data = serde_json::json!({ "used": dir_bytes(&dir), "cap": serde_json::Value::Null });
+                    tx.send(Completion::Respond(reply, Ok(data.to_string()))).ok();
+                    SignalToUI::set_ui_signal();
+                });
             }
             "permissions.query" => {
                 let mut map = serde_json::Map::new();
@@ -913,6 +1016,17 @@ impl robius_location::Handler for LocationHandler {
         tx.send(Completion::LocationFailed).ok();
         SignalToUI::set_ui_signal();
     }
+}
+
+fn dir_bytes(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    entries.flatten().map(|entry| {
+        match entry.metadata() {
+            Ok(meta) if meta.is_dir() => dir_bytes(&entry.path()),
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
+        }
+    }).sum()
 }
 
 /// Accepts every common IP-geolocation response shape (ipapi.co and

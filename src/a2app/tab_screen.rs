@@ -6,9 +6,9 @@ use makepad_widgets::*;
 use matrix_sdk::ruma::OwnedRoomId;
 
 use a2app_core::manifest::MiniAppId;
-use crate::a2app::dock::DockCmd;
+use crate::a2app::dock::{DockCmd, PaneOp};
 use crate::a2app::host_set::{MiniAppHostAreaWidgetExt, Templates};
-use crate::a2app::instances::{self, InstanceKey, MiniAppInstanceAction};
+use crate::a2app::instances::{self, InstanceKey, MiniAppInstanceAction, Surface};
 use crate::a2app::runtime::with_a2app;
 
 script_mod! {
@@ -153,6 +153,13 @@ impl Widget for MiniAppTabScreen {
                             self.vacate(cx, false);
                         }
                     }
+                    Some(DockCmd::Pane { app_id, room_id, op: PaneOp::Close }) => {
+                        let mine = self.key.as_ref()
+                            .is_some_and(|(app, room)| app == app_id && room.as_ref() == Some(room_id));
+                        if mine {
+                            self.vacate(cx, false);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -212,7 +219,7 @@ impl MiniAppTabScreenRef {
         if instances::ensure(cx, &key, &manifest, &grants, seed).is_none() {
             return;
         }
-        let Some(host) = instances::adopt(cx, &key, uid) else { return };
+        let Some(host) = instances::adopt(cx, &key, uid, Surface::Tab) else { return };
         inner.view.mini_app_host_area(cx, ids!(host_area)).set_host(Some(host));
         inner.view.label(cx, ids!(tab_glyph)).set_text(cx, &manifest.icon);
         inner.view.label(cx, ids!(tab_title)).set_text(cx, &manifest.name);

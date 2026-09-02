@@ -20,7 +20,7 @@ use a2app_core::bundle;
 use a2app_core::manifest::{A2AppScope, AppRegistry, MiniAppId, MiniAppManifest};
 use a2app_core::permissions::{Effective, GrantState, Permission, PermissionStore};
 use a2app_core::persistence::{self, A2AppPersistedState};
-use a2app_core::services::{self, Broker, BrokerAsk, BrokerCtx, HostAction, Reply, MATRIX_WRITE_OFF_MSG};
+use a2app_core::services::{self, Broker, BrokerAsk, BrokerCtx, HostAction, HostQuery, Reply, MATRIX_WRITE_OFF_MSG};
 use a2app_core::versions::{self, VersionOrigin};
 use a2app_agent::intent::Intent;
 use a2app_agent::pipeline::{GenOutcome, Generation};
@@ -30,8 +30,8 @@ use crate::a2app::host_pane::{MiniAppHostPaneAction, MiniAppHostPaneWidgetRefExt
 use crate::a2app::permission_prompt::{
     MiniAppPermissionPromptWidgetRefExt, PermissionPromptAction, PromptInfo,
 };
-use crate::a2app::dock::DockCmd;
-use crate::a2app::instances::{self, MiniAppInstanceAction};
+use crate::a2app::dock::{DockCmd, PaneOp};
+use crate::a2app::instances::{self, MiniAppInstanceAction, Surface};
 use crate::a2app::matrix::{self, A2AppMatrixRequest, A2AppMatrixResult};
 use crate::a2app::room_watch::{A2AppRoomWatchEvent, RoomWatchKind};
 use crate::a2app::account_watch::{A2AppAccountWatchEvent, AccountWatchKind, ACCOUNT_HOOKS};
@@ -40,7 +40,8 @@ use crate::app::{AppStateAction, SelectedRoom};
 use crate::home::navigation_tab_bar::NavigationBarAction;
 use crate::home::rooms_list::{RoomsListAction, RoomsListRef};
 use crate::room::BasicRoomDetails;
-use crate::settings::app_preferences::AppPreferencesGlobal;
+use crate::home::home_screen::effective_is_desktop;
+use crate::settings::app_preferences::{AppPreferencesAction, AppPreferencesGlobal, ThumbnailMaxHeight, ViewModeOverride};
 use crate::shared::popup_list::{enqueue_popup_notification, PopupKind};
 use crate::sliding_sync::{submit_async_request, MatrixRequest};
 use crate::utils::RoomNameId;
@@ -309,6 +310,7 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     let mut stopped: Vec<MiniAppId> = Vec::new();
     let mut watch_events: Vec<A2AppRoomWatchEvent> = Vec::new();
     let mut account_events: Vec<A2AppAccountWatchEvent> = Vec::new();
+    let mut host_events: Vec<(&'static str, serde_json::Value)> = Vec::new();
     if let Event::Actions(actions) = event {
         for action in actions {
             if let Some(watch_event) = action.downcast_ref::<A2AppRoomWatchEvent>() {
@@ -337,6 +339,42 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
             }
             if let Some(MiniAppInstanceAction::AppStopped(app_id)) = action.downcast_ref() {
                 stopped.push(app_id.clone());
+                continue;
+            }
+            if let Some(AppStateAction::RoomFocused(selected)) = action.downcast_ref() {
+                let room = |r: &RoomNameId| (r.room_id().to_string(), r.display_name().to_string());
+                let payload = match selected {
+                    SelectedRoom::JoinedRoom { room_name_id } => {
+                        let (room_id, name) = room(room_name_id);
+                        serde_json::json!({ "kind": "room", "room_id": room_id, "name": name })
+                    }
+                    SelectedRoom::Thread { room_name_id, thread_root_event_id } => {
+                        let (room_id, name) = room(room_name_id);
+                        serde_json::json!({ "kind": "thread", "room_id": room_id, "name": name, "thread_root": thread_root_event_id })
+                    }
+                    SelectedRoom::InvitedRoom { room_name_id } => {
+                        let (room_id, name) = room(room_name_id);
+                        serde_json::json!({ "kind": "invite", "room_id": room_id, "name": name })
+                    }
+                    _ => serde_json::json!({ "kind": "space" }),
+                };
+                host_events.push(("on_active_room_changed", payload));
+                continue;
+            }
+            if let Some(nav) = action.downcast_ref::<NavigationBarAction>() {
+                let (screen, space_id) = match nav {
+                    NavigationBarAction::GoToHome => ("home", None),
+                    NavigationBarAction::GoToAddRoom => ("add_room", None),
+                    NavigationBarAction::GoToMiniApps => ("mini_apps", None),
+                    NavigationBarAction::OpenSettings => ("settings", None),
+                    NavigationBarAction::GoToSpace { space_name_id } => ("space", Some(space_name_id.room_id().to_string())),
+                    _ => continue,
+                };
+                host_events.push(("on_navigation_changed", serde_json::json!({ "screen": screen, "space_id": space_id })));
+                continue;
+            }
+            if action.downcast_ref::<AppPreferencesAction>().is_some() {
+                host_events.push(("on_prefs_changed", prefs_json(cx)));
             }
         }
     }
@@ -381,8 +419,8 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     for op in ops {
         apply_op(cx, ui, op);
     }
-    if !watch_events.is_empty() || !account_events.is_empty() {
-        deliver_room_hooks(cx, ui, watch_events, account_events);
+    if !watch_events.is_empty() || !account_events.is_empty() || !host_events.is_empty() {
+        deliver_room_hooks(cx, ui, watch_events, account_events, host_events);
     }
 
     advance_generation(cx, ui);
@@ -461,6 +499,7 @@ fn deliver_room_hooks(
     ui: &WidgetRef,
     events: Vec<A2AppRoomWatchEvent>,
     account_events: Vec<A2AppAccountWatchEvent>,
+    host_events: Vec<(&'static str, serde_json::Value)>,
 ) {
     prune_hook_subs();
     let show_receipts = cx.global::<AppPreferencesGlobal>().0.show_read_receipts;
@@ -584,6 +623,9 @@ fn deliver_room_hooks(
             (None, "on_rooms_changed"),
             serde_json::json!({ "joined": joined, "left": left, "changed": changed }),
         );
+    }
+    for (hook, payload) in host_events {
+        latest.insert((None, hook), payload);
     }
     let subs: Vec<(usize, Option<OwnedRoomId>, HashSet<&'static str>)> = with_a2app(|state| {
         state.hook_subs.iter().map(|(heap, s)| (*heap, s.room_id.clone(), s.hooks.clone())).collect()
@@ -1128,11 +1170,15 @@ fn process_broker(cx: &mut Cx, ui: &WidgetRef) {
     let asks = with_a2app(|state| {
         let A2AppState { broker, registry, permissions, foreground_app, .. } = state;
         let is_docked = |app_id: &str| instances::is_docked(app_id);
+        let desktop_view = effective_is_desktop(cx);
         broker.process(cx, BrokerCtx {
             registry,
             permissions,
             foreground_app: foreground_app.as_deref(),
             is_docked: &is_docked,
+            is_running: &instances::is_running,
+            pane_state: &instances::pane_state,
+            desktop_view,
         })
     }).unwrap_or_default();
 
@@ -1218,6 +1264,20 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
             prune_hook_subs();
             services::respond(cx, reply, Ok("{}"));
         }
+        BrokerAsk::HostQuery { reply, query } => {
+            let data = match query {
+                HostQuery::Prefs => prefs_json(cx),
+                HostQuery::DeviceInfo => serde_json::json!({
+                    "platform": services::PLATFORM,
+                    "locale": std::env::var("LANG").ok(),
+                    "time_zone": iana_time_zone::get_timezone().ok(),
+                    "utc_offset_minutes": chrono::Local::now().offset().local_minus_utc() / 60,
+                    "desktop_view": effective_is_desktop(cx),
+                    "ui_zoom": cx.global::<AppPreferencesGlobal>().0.ui_zoom.0,
+                }),
+            };
+            services::respond(cx, reply, Ok(&data.to_string()));
+        }
         BrokerAsk::HostAction { reply, app_id, action } => {
             // Only the modal's own isolate has to get out of the way when it
             // sends the user elsewhere; closing quits it, like its Close button.
@@ -1225,7 +1285,7 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
                 && host_pane(cx, ui).active().is_some_and(|key| {
                     key.0 == app_id && instances::heap_of(&key) == Some(reply.heap_key)
                 });
-            match perform_host_action(cx, ui, action) {
+            match perform_host_action(cx, ui, reply.heap_key, action) {
                 Ok(()) => services::respond(cx, reply, Ok("{}")),
                 Err(e) => {
                     services::respond(cx, reply, Err(&e));
@@ -1333,7 +1393,7 @@ fn install_version(cx: &mut Cx, ui: &WidgetRef, updated: MiniAppManifest, done: 
     ui.redraw(cx);
 }
 
-fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, action: HostAction) -> Result<(), String> {
+fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, heap: usize, action: HostAction) -> Result<(), String> {
     let room_of = |room: Option<String>| -> Result<OwnedRoomId, String> {
         let room = room.ok_or("this mini-app is not attached to a room; pass {room_id}")?;
         OwnedRoomId::try_from(room.as_str()).map_err(|_| String::from("not a valid room id"))
@@ -1387,7 +1447,7 @@ fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, action: HostAction) -> Resul
                 }
                 _ => return Err(String::from("room aliases can't be resolved yet")),
             };
-            return perform_host_action(cx, ui, action);
+            return perform_host_action(cx, ui, heap, action);
         }
         HostAction::OpenApp { room, app_id } => {
             let installed = with_a2app(|state| {
@@ -1420,8 +1480,62 @@ fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, action: HostAction) -> Resul
             let room_id = room_of(room)?;
             queue_room_action(cx, room_id, RoomAction::ReplyTo(event_of(&event_id)?))?;
         }
+        HostAction::ClosePane | HostAction::SetSide { .. } | HostAction::Minimize | HostAction::BreakOut => {
+            let key = instances::key_of_heap(heap).ok_or("this instance has no pane")?;
+            let desktop = effective_is_desktop(cx);
+            let op = match (&action, instances::surface_of(&key)) {
+                // The caller closes the modal once this answers.
+                (HostAction::ClosePane, Some(Surface::Modal)) => return Ok(()),
+                (HostAction::ClosePane, None) => {
+                    if instances::quit(cx, &key) {
+                        cx.action(MiniAppInstanceAction::AppStopped(key.0));
+                    }
+                    return Ok(());
+                }
+                (HostAction::ClosePane, _) => PaneOp::Close,
+                (HostAction::BreakOut, Some(Surface::Tab)) => return Ok(()),
+                (HostAction::SetSide { side }, Some(Surface::Dock)) => {
+                    if side.is_vertical() && !desktop {
+                        return Err(String::from("side panes need the desktop layout"));
+                    }
+                    PaneOp::SetSide(*side)
+                }
+                (HostAction::Minimize, Some(Surface::Dock)) => PaneOp::Minimize,
+                (HostAction::BreakOut, Some(Surface::Dock)) if desktop => PaneOp::BreakOut,
+                (HostAction::BreakOut, Some(Surface::Dock)) => {
+                    return Err(String::from("breaking out needs the desktop layout"));
+                }
+                _ => return Err(String::from("this instance is not docked in a room")),
+            };
+            let (app_id, room_id) = key;
+            let room_id = room_id.ok_or("this instance is not docked in a room")?;
+            cx.action(DockCmd::Pane { app_id, room_id, op });
+        }
     }
     Ok(())
+}
+
+/// The display settings an app may read, also the `on_prefs_changed` payload.
+fn prefs_json(cx: &mut Cx) -> serde_json::Value {
+    let desktop = effective_is_desktop(cx);
+    let prefs = &cx.global::<AppPreferencesGlobal>().0;
+    serde_json::json!({
+        "view_mode": if desktop { "desktop" } else { "mobile" },
+        "view_mode_override": match prefs.view_mode {
+            ViewModeOverride::Automatic => "auto",
+            ViewModeOverride::ForceWide => "desktop",
+            ViewModeOverride::ForceNarrow => "mobile",
+        },
+        "ui_zoom": prefs.ui_zoom.0,
+        "send_on_enter": prefs.send_on_enter,
+        "thumbnail_max_height": match prefs.thumbnail_max_height {
+            ThumbnailMaxHeight::Small => 200,
+            ThumbnailMaxHeight::Medium => 300,
+            ThumbnailMaxHeight::Large => 400,
+            ThumbnailMaxHeight::Custom(px) => px,
+        },
+        "show_read_receipts": prefs.show_read_receipts,
+    })
 }
 
 fn queue_permission_prompt(
@@ -1539,11 +1653,15 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
             let asks = with_a2app(|state| {
                 let A2AppState { broker, registry, permissions, foreground_app, .. } = state;
                 let is_docked = |app_id: &str| instances::is_docked(app_id);
+                let desktop_view = effective_is_desktop(cx);
                 broker.dispatch_after_grant(cx, BrokerCtx {
                     registry,
                     permissions,
                     foreground_app: foreground_app.as_deref(),
                     is_docked: &is_docked,
+                    is_running: &instances::is_running,
+                    pane_state: &instances::pane_state,
+                    desktop_view,
                 }, request)
             }).unwrap_or_default();
             for ask in asks {

@@ -49,18 +49,20 @@ fn cost_of(service: &str) -> f64 {
         // each one still crosses the bridge, builds a JSON answer and re-enters
         // the isolate, so a script polling these in a loop is still a script
         // the host has to keep up with.
-        "env" | "permissions.query" | "events.subscribe" | "events.unsubscribe" => 1.0,
+        "env" | "permissions.query" | "events.subscribe" | "events.unsubscribe"
+        | "ui.pane.read" | "host.prefs" | "device.info" | "ipc.apps_list" => 1.0,
         // Touch host state or another isolate.
         "notify.post" | "notify.clear" | "clipboard.write" | "ipc.send" => 1.0,
         // Leave the process: network, a child process, the OS.
-        "location.get" | "clipboard.read" | "permissions.request" => 5.0,
+        "location.get" | "clipboard.read" | "permissions.request" | "storage.quota" => 5.0,
         // Priced by domain where the services live.
         s if super::matrix::is_service(s) => super::matrix::cost(s),
         // Put something on screen the user has to deal with.
         "files.pick" | "files.save" | "auth.check" | "share" | "url.open" => 8.0,
         // Steer Robrix itself: a pane, a room switch, the composer.
         "nav.room" | "nav.event" | "nav.thread" | "nav.user" | "nav.space" | "nav.screen"
-        | "nav.link" | "nav.app" | "composer.insert" | "composer.reply_to" => 8.0,
+        | "nav.link" | "nav.app" | "composer.insert" | "composer.reply_to"
+        | "ui.pane.close" | "ui.pane.set_side" | "ui.pane.minimize" | "ui.pane.break_out" => 8.0,
         // Unknown services are refused upstream; price them like the worst.
         _ => 8.0,
     }

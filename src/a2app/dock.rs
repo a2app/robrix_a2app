@@ -12,7 +12,7 @@ use matrix_sdk::ruma::OwnedRoomId;
 
 use a2app_core::manifest::{MiniAppId, MiniAppManifest};
 use crate::a2app::host_set::{MiniAppHostAreaWidgetRefExt, Templates};
-use crate::a2app::instances::{self, InstanceKey, MiniAppInstanceAction};
+use crate::a2app::instances::{self, InstanceKey, MiniAppInstanceAction, Surface};
 use crate::a2app::runtime::{with_a2app, A2AppOp};
 use crate::app::{AppStateAction, SelectedRoom};
 use crate::home::home_screen::{effective_is_desktop, MainViewVariantChangedAction};
@@ -250,8 +250,18 @@ pub enum DockCmd {
     Open { app_id: MiniAppId, room_id: OwnedRoomId },
     /// The registry dropped every instance of this app: let go of its chrome.
     QuitEverywhere(MiniAppId),
+    /// A `ui.pane.*` call from the instance docked in `room_id`.
+    Pane { app_id: MiniAppId, room_id: OwnedRoomId, op: PaneOp },
     #[default]
     None,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum PaneOp {
+    Close,
+    SetSide(PaneSide),
+    Minimize,
+    BreakOut,
 }
 
 struct Instance {
@@ -350,6 +360,17 @@ impl Widget for MiniAppDock {
                         instances::gc(cx);
                         continue;
                     }
+                    Some(DockCmd::Pane { app_id, room_id, op }) => {
+                        if self.room_id.as_ref() == Some(room_id) && self.instances.contains_key(app_id) {
+                            match *op {
+                                PaneOp::Close => self.quit_app(cx, app_id.clone()),
+                                PaneOp::SetSide(side) => self.move_pane(cx, app_id, side),
+                                PaneOp::Minimize => self.set_minimized(cx, app_id, true),
+                                PaneOp::BreakOut => self.break_out(cx, app_id.clone()),
+                            }
+                        }
+                        continue;
+                    }
                     Some(DockCmd::None) | None => {}
                 }
                 // Going narrow moves side panes to the bottom; either way the
@@ -418,22 +439,7 @@ impl Widget for MiniAppDock {
                     PaneButton::Minimize => self.set_minimized(cx, &app_id, true),
                     PaneButton::Chip => self.set_minimized(cx, &app_id, false),
                     PaneButton::CycleEdge => self.cycle_edge(cx, &app_id),
-                    PaneButton::BreakOutTab => {
-                        // Park the instance; its new home adopts it with its
-                        // state intact: a dock tab on desktop, else the host.
-                        let Some(room_id) = self.room_id.clone() else { continue };
-                        let room_name = self.room_name.clone();
-                        self.release_instance(cx, &app_id);
-                        if effective_is_desktop(cx) {
-                            cx.action(crate::a2app::tab_screen::A2AppTabRequest::Open {
-                                app_id,
-                                room_id,
-                                room_name,
-                            });
-                        } else {
-                            cx.action(A2AppOp::OpenApp { app_id, room_id: Some(room_id), in_room_pane: false });
-                        }
-                    }
+                    PaneButton::BreakOutTab => self.break_out(cx, app_id),
                 }
             }
         }
@@ -522,7 +528,7 @@ impl MiniAppDock {
         let uid = self.widget_uid();
         // Another surface (a tab, the host modal, this room's other tab) is
         // showing it; only one may.
-        let Some(host) = instances::adopt(cx, key, uid) else { return };
+        let Some(host) = instances::adopt(cx, key, uid, Surface::Dock) else { return };
         let app_id = key.0.clone();
         let mut layout = instances::layout(key);
         // A side pane on a phone-width window leaves no room for the room.
@@ -731,7 +737,23 @@ impl MiniAppDock {
             self.edge(cx, side).add_pane(app_id, pane);
         }
         self.save_layout(app_id);
+        if let Some(key) = self.key_for(app_id) {
+            instances::note_hook(&key, live_id!(on_focus_changed));
+        }
         self.view.redraw(cx);
+    }
+
+    /// Parks the instance; its new home adopts it with its state intact: a
+    /// dock tab on desktop, else the host modal.
+    fn break_out(&mut self, cx: &mut Cx, app_id: MiniAppId) {
+        let Some(room_id) = self.room_id.clone() else { return };
+        let room_name = self.room_name.clone();
+        self.release_instance(cx, &app_id);
+        if effective_is_desktop(cx) {
+            cx.action(crate::a2app::tab_screen::A2AppTabRequest::Open { app_id, room_id, room_name });
+        } else {
+            cx.action(A2AppOp::OpenApp { app_id, room_id: Some(room_id), in_room_pane: false });
+        }
     }
 
     fn cycle_edge(&mut self, cx: &mut Cx, app_id: &str) {
@@ -754,6 +776,9 @@ impl MiniAppDock {
         edge.add_pane(app_id, pane);
         self.apply_edge_icon(cx, app_id);
         self.save_layout(app_id);
+        if let Some(key) = self.key_for(app_id) {
+            instances::note_hook(&key, live_id!(on_surface_changed));
+        }
         self.view.redraw(cx);
     }
 }

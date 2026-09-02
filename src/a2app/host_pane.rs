@@ -6,7 +6,7 @@ use makepad_widgets::*;
 
 use a2app_core::manifest::{MiniAppId, MiniAppManifest};
 use crate::a2app::host_set::{MiniAppHostAreaWidgetExt, Templates};
-use crate::a2app::instances::{self, InstanceKey};
+use crate::a2app::instances::{self, InstanceKey, Surface};
 use matrix_sdk::ruma::OwnedRoomId;
 
 script_mod! {
@@ -192,7 +192,7 @@ impl MiniAppHostPaneRef {
         if instances::ensure(cx, &key, manifest, &grants, seed).is_none() {
             return false;
         }
-        let Some(host) = instances::adopt(cx, &key, uid) else { return false };
+        let Some(host) = instances::adopt(cx, &key, uid, Surface::Modal) else { return false };
         if let Some(previous) = inner.active.replace(key.clone())
             && previous != key
         {
