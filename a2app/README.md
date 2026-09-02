@@ -24,11 +24,22 @@ cargo run --features a2app
   Capabilities are declared in the app's manifest, prompted at first use
   (Allow / Allow Once / Don't Allow / Not Now), revocable at any time, and a
   request-flooding app gets stopped and restricted.
-- **Matrix services** for apps attached to a room: `matrix.room_info`,
-  `matrix.read_messages`, `matrix.send_message`, and `matrix.profile`, each
-  behind its own permission.
-- **Live room updates**: an app can subscribe to its room (new messages,
-  membership, pins) and refresh itself instead of polling; the built-ins do.
+- **Matrix services**, each behind its own permission group: the attached
+  room (info, messages, older history, one event, threads and replies,
+  members, pins, search, read receipts, unread counts, power levels,
+  permalinks, upgrades), rooms and spaces (list, search, invites, previews,
+  cross-room read and search, space trees), the account (profile, device,
+  homeserver, ignored users, other users' profiles, DM lookup), and, behind
+  the write switch, sends, replies, reactions, typing, read receipts, pins,
+  room flags, invites, joins and DMs.
+- **Live updates instead of polling**: room hooks (messages, edits and
+  redactions, reactions, typing, read receipts, members, pins, room details,
+  unread counts), account hooks (room list, invites, unread totals), and host
+  hooks (focus, surface, display settings, which room or screen the user is
+  on).
+- **Host and pane services**: an app can read where it runs (surface, dock
+  side, size, platform, view mode), move, minimize, break out or close its
+  own pane, and read Robrix's display settings and device facts.
 - **Writes are off by default**: the "Mini-apps may write to rooms" switch on
   the Mini Apps screen gates every send, on top of per-app permissions.
 - **Version history**: every AI change, hand edit (there is a source editor),
@@ -40,10 +51,15 @@ cargo run --features a2app
   it with `/miniapp share <name>`, where it renders as a card other Robrix
   users can install and run. "Open in room…" docks an app into any room you
   pick, straight from the Mini Apps screen.
-- Built-in demo apps, including **Room Peek** (room info + recent messages + send),
-  **Roll Call** (dice roller that can post its roll to the room), **Search**
-  (messages across one room or many), and **Watcher** (keyword rules that
-  notify you when a message matches and can auto-reply).
+- Fifteen built-in apps: **Room Peek** (room info + recent messages + send),
+  **Roll Call** (dice roller that can post its roll), **Room Info**,
+  **Room Members**, **Pinned Events**, **Room Threads**, **Search**
+  (messages across one room or many), **Watcher** (keyword rules that notify
+  and can auto-reply), **Who's Here** (typing and read positions), **Room
+  Tools** (favorite, low priority, unread, pins, links), **Room Stats** (who
+  posts when), **Spaces** (explore and join), **Inbox** (invites and unread
+  rooms), **Account** (you, this device, look up a user), and **Inspector**
+  (what Robrix tells an app about its pane, settings and device).
 
 ## Crates
 
