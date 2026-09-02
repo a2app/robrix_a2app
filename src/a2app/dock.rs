@@ -14,6 +14,7 @@ use a2app_core::manifest::{MiniAppId, MiniAppManifest};
 use crate::a2app::host_set::{MiniAppHostAreaWidgetRefExt, Templates};
 use crate::a2app::instances::{self, InstanceKey, MiniAppInstanceAction};
 use crate::a2app::runtime::{with_a2app, A2AppOp};
+use crate::app::{AppStateAction, SelectedRoom};
 pub use a2app_core::layout::{PaneLayout, PaneSide};
 
 script_mod! {
@@ -273,6 +274,9 @@ pub struct MiniAppDock {
     #[rust] room_name: String,
     #[rust] instances: HashMap<MiniAppId, Instance>,
     #[rust] sides_assigned: bool,
+    /// Chrome was dropped while this room's tab was hidden, so the timeline
+    /// under it never relaid out; the next focus redraws everything.
+    #[rust] needs_full_redraw: bool,
 }
 
 impl ScriptHook for MiniAppDock {
@@ -346,6 +350,13 @@ impl Widget for MiniAppDock {
                         continue;
                     }
                     Some(DockCmd::None) | None => {}
+                }
+                if self.needs_full_redraw
+                    && let Some(AppStateAction::RoomFocused(SelectedRoom::JoinedRoom { room_name_id })) = action.downcast_ref()
+                    && self.room_id.as_ref() == Some(room_name_id.room_id())
+                {
+                    self.needs_full_redraw = false;
+                    cx.redraw_all();
                 }
                 // The user let go of a grip: every pane on that edge keeps
                 // the new size.
@@ -558,6 +569,7 @@ impl MiniAppDock {
         self.view.mini_app_chips_row(cx, ids!(chips_row)).remove_chip(app_id);
         inst.pane.mini_app_host_area(cx, ids!(host_area)).set_host(None);
         self.view.redraw(cx);
+        self.needs_full_redraw = true;
         Some(inst)
     }
 
