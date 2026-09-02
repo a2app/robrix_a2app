@@ -28,7 +28,10 @@ use crate::a2app::host_pane::{MiniAppHostPaneAction, MiniAppHostPaneWidgetRefExt
 use crate::a2app::permission_prompt::{
     MiniAppPermissionPromptWidgetRefExt, PermissionPromptAction, PromptInfo,
 };
-use crate::a2app::dock::{DockCmd, MiniAppDockAction};
+use crate::a2app::dock::DockCmd;
+use crate::a2app::instances::{self, InstanceKey, MiniAppInstanceAction};
+use crate::a2app::room_watch::{self, A2AppRoomWatchEvent, RoomWatchKind};
+use a2app_core::layout::PaneLayout;
 use crate::app::{AppStateAction, SelectedRoom};
 use crate::home::navigation_tab_bar::NavigationBarAction;
 use crate::home::rooms_list::{RoomsListAction, RoomsListRef};
@@ -91,8 +94,6 @@ pub struct A2AppState {
     pub agent_prefs: AgentPrefs,
     /// The room the next created app will be scoped to, if any.
     pub create_room: Option<OwnedRoomId>,
-    /// The rooms each app currently runs in (one isolate per (app, room)).
-    pub room_instances: HashMap<MiniAppId, HashSet<OwnedRoomId>>,
     /// The app whose host pane is currently shown, gating UI-class services.
     pub foreground_app: Option<MiniAppId>,
     /// While true (the default), mini-apps can only READ matrix data:
@@ -115,8 +116,7 @@ impl A2AppState {
     }
 
     pub fn is_running(&self, app_id: &str) -> bool {
-        self.foreground_app.as_deref() == Some(app_id)
-            || self.room_instances.get(app_id).is_some_and(|rooms| !rooms.is_empty())
+        instances::is_running(app_id)
     }
 }
 
@@ -148,7 +148,6 @@ pub fn init() {
             failed_request: None,
             agent_prefs: a2app_agent::prefs::load_agent_prefs(),
             create_room: None,
-            room_instances: HashMap::new(),
             foreground_app: None,
             matrix_read_only: true,
             room_action: None,
@@ -266,14 +265,17 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     let mut prompt_answers: Vec<PermissionPromptAction> = Vec::new();
     let mut matrix_results: Vec<(Reply, Result<String, String>)> = Vec::new();
     let mut pane_actions: Vec<MiniAppHostPaneAction> = Vec::new();
-    let mut dock_actions: Vec<MiniAppDockAction> = Vec::new();
+    let mut stopped: Vec<MiniAppId> = Vec::new();
+    let mut watch_events: Vec<A2AppRoomWatchEvent> = Vec::new();
     if let Event::Actions(actions) = event {
+        instances::handle_network_responses(cx, event, &mut Scope::empty());
         for action in actions {
             if let Some(op) = action.downcast_ref::<A2AppOp>() {
                 ops.push(op.clone());
                 continue;
             }
             if let Some(answer) = action.downcast_ref::<PermissionPromptAction>() {
+    instances::flush_pending(cx);
                 prompt_answers.push(*answer);
                 continue;
             }
@@ -285,8 +287,8 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
                 pane_actions.push(pane_action.clone());
                 continue;
             }
-            if let Some(dock_action) = action.downcast_ref::<MiniAppDockAction>() {
-                dock_actions.push(dock_action.clone());
+            if let Some(MiniAppInstanceAction::AppStopped(app_id)) = action.downcast_ref() {
+                stopped.push(app_id.clone());
             }
         }
     }
@@ -317,43 +319,16 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
             MiniAppHostPaneAction::CloseClicked => ops.push(A2AppOp::CloseHostPane),
             // Closing quits the popped-out instance; the room's dock starts its own.
             MiniAppHostPaneAction::ReturnToRoom { app_id, room_id } => {
-                ops.push(A2AppOp::CloseHostPane);
+                host_pane(cx, ui).close_active(cx, true);
+                with_a2app(|state| state.foreground_app = None);
+                ui.modal(cx, ids!(mini_app_host_modal)).close(cx);
                 cx.action(DockCmd::Open { app_id, room_id });
             }
             MiniAppHostPaneAction::None => {}
         }
     }
-    for dock_action in dock_actions {
-        match dock_action {
-            MiniAppDockAction::Opened { app_id, room_id } => {
-                with_a2app(|state| {
-                    state.room_instances.entry(app_id).or_default().insert(room_id);
-                });
-            }
-            MiniAppDockAction::Quit { app_id, room_id } => {
-                let last_instance_gone = with_a2app(|state| {
-                    if let Some(rooms) = state.room_instances.get_mut(&app_id) {
-                        rooms.remove(&room_id);
-                        if rooms.is_empty() {
-                            state.room_instances.remove(&app_id);
-                        }
-                    }
-                    if state.is_running(&app_id) {
-                        false
-                    } else {
-                        // One-time grants die with the app's last isolate.
-                        state.permissions.clear_once_for(&app_id);
-                        state.mark_perms_dirty();
-                        true
-                    }
-                }).unwrap_or(false);
-                if last_instance_gone {
-                    publish_grants(cx);
-                }
-                ui.redraw(cx);
-            }
-            MiniAppDockAction::None => {}
-        }
+    for app_id in stopped {
+        app_stopped(cx, &app_id);
     }
     for op in ops {
         apply_op(cx, ui, op);
@@ -389,6 +364,137 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 enqueue_popup_notification(
                     format!("\"{}\" was stopped for hammering the host with requests. You can let it run again from its app info.", manifest.name),
                     PopupKind::Warning, Some(6.0),
+/// One-time grants die with the app's last isolate.
+fn app_stopped(cx: &mut Cx, app_id: &str) {
+    prune_hook_subs();
+    if instances::is_running(app_id) {
+        return;
+    }
+    with_a2app(|state| {
+        state.permissions.clear_once_for(app_id);
+        state.mark_perms_dirty();
+        state.foreground_app.take_if(|f| f == app_id);
+    });
+    publish_grants(cx);
+}
+
+/// The dock position an instance last had, for its next open.
+pub fn saved_layout(tag: &str) -> PaneLayout {
+    with_a2app(|state| state.persisted.pane_layouts.get(tag).copied())
+        .flatten()
+        .unwrap_or_default()
+}
+
+pub fn remember_layout(tag: &str, layout: PaneLayout) {
+    with_a2app(|state| {
+        state.persisted.pane_layouts.insert(tag.to_string(), layout);
+        state.registry_dirty = true;
+    });
+}
+
+/// Forgets subscriptions whose isolate is gone or whose grant was pulled,
+/// and stops watching rooms nobody listens to any more.
+fn prune_hook_subs() {
+    with_a2app(|state| {
+        let A2AppState { hook_subs, registry, permissions, watched_rooms, .. } = state;
+        hook_subs.retain(|heap, sub| {
+            if instances::key_of_heap(*heap).is_none() {
+                return false;
+            }
+            let Some(manifest) = registry.get(&sub.app_id) else { return false };
+            sub.hooks.retain(|hook| {
+                a2app_core::capabilities::for_hook(hook)
+                    .is_some_and(|cap| permissions.effective_capability(manifest, cap) == Effective::Granted)
+            });
+            !sub.hooks.is_empty()
+        });
+        let wanted: HashSet<OwnedRoomId> = hook_subs.values().map(|s| s.room_id.clone()).collect();
+        for room_id in watched_rooms.difference(&wanted) {
+            submit_async_request(MatrixRequest::A2App(A2AppMatrixRequest::UnwatchRoom { room_id: room_id.clone() }));
+        }
+        for room_id in wanted.difference(watched_rooms) {
+            submit_async_request(MatrixRequest::A2App(A2AppMatrixRequest::WatchRoom { room_id: room_id.clone() }));
+        }
+        *watched_rooms = wanted;
+    });
+}
+
+/// Hands each watched room's news to the isolates subscribed to it.
+fn deliver_room_hooks(cx: &mut Cx, ui: &WidgetRef, events: Vec<A2AppRoomWatchEvent>) {
+    prune_hook_subs();
+    // Messages batch into one call per pass; the other kinds coalesce to
+    // their latest value.
+    let mut messages: HashMap<OwnedRoomId, Vec<serde_json::Value>> = HashMap::new();
+    let mut members: HashMap<OwnedRoomId, u64> = HashMap::new();
+    let mut pins: HashMap<OwnedRoomId, Vec<OwnedEventId>> = HashMap::new();
+    let mut closed: Vec<OwnedRoomId> = Vec::new();
+    for event in events {
+        match event.kind {
+            RoomWatchKind::Message { event_id, sender, sender_name, body, msgtype, ts, is_own } => {
+                messages.entry(event.room_id.clone()).or_default().push(serde_json::json!({
+                    "room_id": event.room_id,
+                    "event_id": event_id,
+                    "sender": sender.localpart(),
+                    "sender_id": sender,
+                    "sender_name": sender_name,
+                    "body": body,
+                    "ts": ts,
+                    "msgtype": msgtype,
+                    "is_own": is_own,
+                }));
+            }
+            RoomWatchKind::MembersChanged { count } => { members.insert(event.room_id, count); }
+            RoomWatchKind::PinsChanged { pinned } => { pins.insert(event.room_id, pinned); }
+            RoomWatchKind::Closed => closed.push(event.room_id),
+        }
+    }
+    let subs: Vec<(usize, OwnedRoomId, HashSet<&'static str>)> = with_a2app(|state| {
+        state.hook_subs.iter().map(|(heap, s)| (*heap, s.room_id.clone(), s.hooks.clone())).collect()
+    }).unwrap_or_default();
+    let mut delivered = false;
+    for (heap, room_id, hooks) in subs {
+        if hooks.contains("on_room_message")
+            && let Some(batch) = messages.get(&room_id)
+        {
+            let payload = serde_json::Value::Array(batch.clone()).to_string();
+            delivered |= instances::call_hook_by_heap(cx, heap, live_id!(on_room_message), &[&payload]);
+        }
+        if hooks.contains("on_room_members_changed")
+            && let Some(count) = members.get(&room_id)
+        {
+            let payload = serde_json::json!({ "room_id": room_id, "count": count }).to_string();
+            delivered |= instances::call_hook_by_heap(cx, heap, live_id!(on_room_members_changed), &[&payload]);
+        }
+        if hooks.contains("on_room_pins_changed")
+            && let Some(pinned) = pins.get(&room_id)
+        {
+            let payload = serde_json::json!({ "room_id": room_id, "pinned": pinned }).to_string();
+            delivered |= instances::call_hook_by_heap(cx, heap, live_id!(on_room_pins_changed), &[&payload]);
+        }
+    }
+    if !closed.is_empty() {
+        with_a2app(|state| {
+            state.hook_subs.retain(|_, s| !closed.contains(&s.room_id));
+            for room_id in &closed {
+                state.watched_rooms.remove(room_id);
+            }
+        });
+    }
+    if delivered {
+        // Same as a service reply: the hook likely re-rendered the app.
+        SignalToUI::set_ui_signal();
+        let _ = cx.new_next_frame();
+        ui.redraw(cx);
+    }
+}
+
+/// Drops every instance of the app, on every surface.
+fn stop_app_everywhere(cx: &mut Cx, ui: &WidgetRef, app_id: &str) {
+    host_pane(cx, ui).drop_app(cx, app_id);
+    cx.action(DockCmd::QuitEverywhere(app_id.to_string()));
+    instances::quit_app(cx, app_id);
+}
+
                 );
                 return;
             }
@@ -399,31 +505,28 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                     cx.action(DockCmd::Open { app_id, room_id: pane_room });
                 }
                 (_, room) => {
-                    with_a2app(|state| state.foreground_app = Some(app_id.clone()));
-                    host_pane(cx, ui).open_app(cx, &manifest, grants, room);
-                    ui.modal(cx, ids!(mini_app_host_modal)).open(cx);
+                    if host_pane(cx, ui).open_app(cx, &manifest, grants, room.clone()) {
+                        with_a2app(|state| state.foreground_app = Some(app_id.clone()));
+                        ui.modal(cx, ids!(mini_app_host_modal)).open(cx);
+                    } else if let Some(room_id) = room {
+                        // Shown in a room already: bring that up instead.
+                        cx.action(DockCmd::Open { app_id, room_id });
+                    }
                 }
             }
         }
         A2AppOp::CloseHostPane => {
             // Close QUITS: keeping apps alive is what minimize is for.
-            let closed = with_a2app(|state| state.foreground_app.take());
-            if let Some(Some(app_id)) = closed {
-                host_pane(cx, ui).force_stop(cx, &app_id);
-                with_a2app(|state| {
-                    state.permissions.clear_once_for(&app_id);
-                    state.mark_perms_dirty();
-                });
-                publish_grants(cx);
+            with_a2app(|state| state.foreground_app = None);
+            if let Some((app_id, _)) = host_pane(cx, ui).close_active(cx, false) {
+                app_stopped(cx, &app_id);
             }
             ui.modal(cx, ids!(mini_app_host_modal)).close(cx);
             ui.redraw(cx);
         }
         A2AppOp::ForceStop(app_id) => {
-            host_pane(cx, ui).force_stop(cx, &app_id);
-            cx.action(DockCmd::QuitEverywhere(app_id.clone()));
+            stop_app_everywhere(cx, ui, &app_id);
             let was_foreground = with_a2app(|state| {
-                state.room_instances.remove(&app_id);
                 // One-time grants die with the isolate.
                 state.permissions.clear_once_for(&app_id);
                 state.mark_perms_dirty();
@@ -441,10 +544,8 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 enqueue_popup_notification("Built-in mini-apps can't be uninstalled.", PopupKind::Warning, Some(4.0));
                 return;
             }
-            host_pane(cx, ui).force_stop(cx, &app_id);
-            cx.action(DockCmd::QuitEverywhere(app_id.clone()));
+            stop_app_everywhere(cx, ui, &app_id);
             with_a2app(|state| {
-                state.room_instances.remove(&app_id);
                 // A generated/imported app exists nowhere else; keep the
                 // manifest so uninstall isn't destruction.
                 state.persisted.archived.retain(|a| a.id != app_id);
@@ -598,6 +699,26 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
 
 fn install_import(cx: &mut Cx, ui: &WidgetRef, parsed: Result<MiniAppManifest, String>) {
     match parsed {
+        A2AppOp::SetMatrixWrite(on) => {
+            let senders: Vec<MiniAppId> = with_a2app(|state| {
+                state.permissions.set_matrix_write(on);
+                state.perms_dirty = true;
+                state.registry.iter()
+                    .filter(|m| m.declares(Permission::MatrixRoomSend) && instances::is_running(&m.id))
+                    .map(|m| m.id.clone())
+                    .collect()
+            }).unwrap_or_default();
+            publish_grants(cx);
+            for app_id in senders {
+                apply_permission_to_running(cx, ui, &app_id, Permission::MatrixRoomSend);
+            }
+            enqueue_popup_notification(
+                if on { "Mini-apps may now write to rooms; each one still asks you first." }
+                else { "Mini-apps can no longer write to rooms." },
+                PopupKind::Info, Some(4.0),
+            );
+            ui.redraw(cx);
+        }
         Ok(mut manifest) => {
             with_a2app(|state| {
                 // An import can never overwrite an app you already have.
@@ -798,8 +919,8 @@ fn refresh_console(state: &mut A2AppState, force: bool) {
 
 fn process_broker(cx: &mut Cx, ui: &WidgetRef) {
     let asks = with_a2app(|state| {
-        let A2AppState { broker, registry, permissions, foreground_app, room_instances, matrix_read_only, .. } = state;
-        let is_docked = |app_id: &str| room_instances.get(app_id).is_some_and(|r| !r.is_empty());
+        let A2AppState { broker, registry, permissions, foreground_app, .. } = state;
+        let is_docked = |app_id: &str| instances::is_docked(app_id);
         broker.process(cx, BrokerCtx {
             registry,
             permissions,
@@ -853,11 +974,9 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
                 let refusals = state.broker.refusal_count(&app_id);
                 state.permissions.restrict(&app_id, &reason, a2app_core::versions::now_unix(), refusals);
                 state.perms_dirty = true;
-                state.room_instances.remove(&app_id);
                 state.foreground_app.take_if(|f| *f == app_id);
             });
-            host_pane(cx, ui).force_stop(cx, &app_id);
-            cx.action(DockCmd::QuitEverywhere(app_id.clone()));
+            stop_app_everywhere(cx, ui, &app_id);
             publish_grants(cx);
             enqueue_popup_notification(
                 format!("A mini-app was stopped for flooding the host with requests ({reason}). You can let it run again from its app info."),
@@ -866,19 +985,7 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
             ui.redraw(cx);
         }
         BrokerAsk::IpcDeliver { reply, from, from_heap, to, data_json } => {
-            let modal = host_pane(cx, ui).deliver_ipc(cx, from_heap, &from, &to, &data_json);
-            let docked = with_a2app(|state| {
-                state.room_instances.get(&to).is_some_and(|r| !r.is_empty())
-            }).unwrap_or(false);
-            if docked {
-                cx.action(DockCmd::DeliverIpc {
-                    from_heap,
-                    from: from.clone(),
-                    to: to.clone(),
-                    data_json: data_json.clone(),
-                });
-            }
-            let delivered = modal || docked;
+            let delivered = instances::deliver_ipc(cx, from_heap, &from, &to, &data_json);
             let body = format!("{{\"delivered\":{delivered}}}");
             services::respond(cx, reply, Ok(&body));
         }
@@ -914,7 +1021,9 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
             // Only the modal's own isolate has to get out of the way when it
             // sends the user elsewhere; closing quits it, like its Close button.
             let leaves_modal = !matches!(action, HostAction::OpenApp { .. })
-                && host_pane(cx, ui).heap_of(&app_id) == Some(reply.heap_key);
+                && host_pane(cx, ui).active().is_some_and(|key| {
+                    key.0 == app_id && instances::heap_of(&key) == Some(reply.heap_key)
+                });
             match perform_host_action(cx, ui, action) {
                 Ok(()) => services::respond(cx, reply, Ok("{}")),
                 Err(e) => {
@@ -1147,8 +1256,8 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
     for request in prompt.parked {
         if granted {
             let asks = with_a2app(|state| {
-                let A2AppState { broker, registry, permissions, foreground_app, room_instances, matrix_read_only, .. } = state;
-                let is_docked = |app_id: &str| room_instances.get(app_id).is_some_and(|r| !r.is_empty());
+                let A2AppState { broker, registry, permissions, foreground_app, .. } = state;
+                let is_docked = |app_id: &str| instances::is_docked(app_id);
                 broker.dispatch_after_grant(cx, BrokerCtx {
                     registry,
                     permissions,
@@ -1182,11 +1291,7 @@ fn apply_permission_to_running(cx: &mut Cx, ui: &WidgetRef, app_id: &str, perm: 
         let Some(Some(manifest)) = with_a2app(|state| state.registry.get(app_id).cloned()) else { return };
         restart_running_app(cx, ui, &manifest);
     } else {
-        host_pane(cx, ui).update_app_caps(cx, app_id, grants.clone());
-        cx.action(DockCmd::UpdateCaps {
-            app_id: app_id.to_string(),
-            grants,
-        });
+        instances::update_app_caps(cx, app_id, grants);
     }
 }
 
@@ -1195,11 +1300,16 @@ fn apply_permission_to_running(cx: &mut Cx, ui: &WidgetRef, app_id: &str, perm: 
 /// is baked in at VM alloc).
 fn restart_running_app(cx: &mut Cx, ui: &WidgetRef, manifest: &MiniAppManifest) {
     let grants = a2app_core::permissions::snapshot_grants_for(&manifest.id);
-    host_pane(cx, ui).restart_if_running(cx, manifest, grants.clone());
-    cx.action(DockCmd::Restart {
-        app_id: manifest.id.clone(),
-        grants,
-    });
+    let keys: Vec<InstanceKey> = instances::keys_of_app(&manifest.id);
+    for key in &keys {
+        instances::restart(cx, key, manifest, &grants);
+    }
+    prune_hook_subs();
+    if keys.is_empty() {
+        return;
+    }
+    host_pane(cx, ui).refresh_host(cx);
+    cx.action(DockCmd::Restart(manifest.id.clone()));
 }
 
 fn expire_timed_grants(cx: &mut Cx, ui: &WidgetRef) {

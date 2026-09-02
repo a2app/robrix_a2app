@@ -9,8 +9,10 @@ use makepad_widgets::*;
 
 /// The modal pane that hosts running mini-apps.
 pub mod host_pane;
-/// Shared Splash isolate hosting used by every host surface.
+/// Shared host widgets used by every host surface.
 pub mod host_set;
+/// The registry of live (app, room) instances that surfaces adopt and release.
+pub mod instances;
 /// The Mini Apps management screen (a top-level navigation tab page).
 pub mod mini_apps_screen;
 /// The runtime permission prompt modal.

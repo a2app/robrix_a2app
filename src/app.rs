@@ -294,6 +294,8 @@ impl MatchEvent for App {
                 Some(LogoutAction::ClearAppState { on_clear_appstate }) =>  {
                     // Clear and reset all app state to its default.
                     clear_all_app_state(cx);
+                    #[cfg(feature = "a2app")]
+                    crate::a2app::instances::quit_everything(cx);
                     self.ui.modal(cx, ids!(verification_modal)).close(cx);
                     self.app_state = Default::default();
                     // We also need to broadcast those default values out,

@@ -1,13 +1,14 @@
-//! A mini-app broken out into its own desktop dock tab. The tab owns its own
-//! isolate instance for the (app, room) pair; "Return to room" moves it back
-//! into that room's dock.
+//! A mini-app broken out into its own desktop dock tab. The tab adopts the
+//! (app, room) instance from the registry, so its script state carries over
+//! from the room's dock; "Return to room" hands it back.
 
 use makepad_widgets::*;
 use matrix_sdk::ruma::OwnedRoomId;
 
-use a2app_core::manifest::{instance_tag, MiniAppId};
-use crate::a2app::dock::{DockCmd, MiniAppDockAction};
-use crate::a2app::host_set::{MiniAppHostAreaWidgetExt, SplashHostSet};
+use a2app_core::manifest::MiniAppId;
+use crate::a2app::dock::DockCmd;
+use crate::a2app::host_set::{MiniAppHostAreaWidgetExt, Templates};
+use crate::a2app::instances::{self, InstanceKey, MiniAppInstanceAction};
 use crate::a2app::runtime::with_a2app;
 
 script_mod! {
@@ -99,9 +100,8 @@ pub enum MiniAppTabScreenAction {
 #[derive(Script, Widget)]
 pub struct MiniAppTabScreen {
     #[deref] view: View,
-    #[rust] host_set: SplashHostSet,
-    #[rust] app_id: Option<MiniAppId>,
-    #[rust] room_id: Option<OwnedRoomId>,
+    #[rust] templates: Templates,
+    #[rust] key: Option<InstanceKey>,
     /// The room's display name, kept so returning can name the room's tab
     /// even when it is no longer open.
     #[rust] room_name: String,
@@ -116,7 +116,7 @@ impl ScriptHook for MiniAppTabScreen {
         _value: ScriptValue,
     ) {
         if apply.is_reload() {
-            self.host_set.clear_templates();
+            self.templates.clear();
         }
     }
 
@@ -127,53 +127,39 @@ impl ScriptHook for MiniAppTabScreen {
         _scope: &mut Scope,
         value: ScriptValue,
     ) {
-        self.host_set.capture_templates(vm, apply, value);
+        self.templates.capture(vm, apply, value);
+        if let Some(template) = self.templates.get(live_id!(AppHost)) {
+            instances::set_host_template(template);
+        }
         vm.cx_mut().widget_tree_mark_dirty(self.widget_uid());
+    }
+}
+
+impl Drop for MiniAppTabScreen {
+    fn drop(&mut self) {
+        instances::release_owner_no_cx(self.widget_uid());
     }
 }
 
 impl Widget for MiniAppTabScreen {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        if self.host_set.has_pending_resize() {
-            self.host_set.flush_resize_notifications(cx);
-        }
-
         self.view.handle_event(cx, event, scope);
 
         if let Event::Actions(actions) = event {
             for action in actions {
                 match action.downcast_ref::<DockCmd>() {
                     Some(DockCmd::QuitEverywhere(app_id)) => {
-                        if self.app_id.as_ref() == Some(app_id) {
+                        if self.key.as_ref().is_some_and(|(app, _)| app == app_id) {
                             self.vacate(cx, false);
                         }
-                        continue;
                     }
-                    Some(DockCmd::UpdateCaps { app_id, grants }) => {
-                        if self.host_set.is_running(app_id) {
-                            self.host_set.update_app_caps(cx, app_id, grants.clone());
-                        }
-                        continue;
-                    }
-                    Some(DockCmd::DeliverIpc { from_heap, from, to, data_json }) => {
-                        self.host_set.deliver_ipc(cx, *from_heap, from, to, data_json);
-                        continue;
-                    }
-                    Some(DockCmd::Restart { app_id, grants }) => {
-                        if self.host_set.is_running(app_id) {
-                            let Some(room_id) = self.room_id.clone() else { continue };
-                            let uid = self.widget_uid();
-                            self.host_set.teardown(cx, uid, app_id);
-                            let manifest = with_a2app(|state| state.registry.get(app_id).cloned()).flatten();
-                            if let Some(manifest) = manifest {
-                                let tag = instance_tag(app_id, Some(room_id.as_str()));
-                                self.host_set.ensure_host(cx, uid, &manifest, grants, &tag);
-                                let host = self.host_set.host_of(app_id);
-                                self.view.mini_app_host_area(cx, ids!(host_area)).set_host(host);
-                            }
+                    Some(DockCmd::Restart(app_id)) => {
+                        if let Some(key) = self.key.clone()
+                            && key.0 == *app_id
+                        {
+                            self.view.mini_app_host_area(cx, ids!(host_area)).set_host(instances::host_of(&key));
                             self.view.redraw(cx);
                         }
-                        continue;
                     }
                     _ => {}
                 }
@@ -183,72 +169,64 @@ impl Widget for MiniAppTabScreen {
                 self.vacate(cx, true);
             }
         }
-
-        if let Event::NetworkResponses(_) = event {
-            self.host_set.handle_network_responses(cx, event, scope);
-        }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         self.view.draw_walk(cx, scope, walk)?;
 
-        if let Some(app_id) = self.app_id.clone() {
+        if let Some(key) = &self.key {
             let size = self.view.mini_app_host_area(cx, ids!(host_area)).last_size();
-            self.host_set.note_host_size(&app_id, size);
+            instances::note_size(key, size);
         }
         DrawStep::done()
     }
 }
 
 impl MiniAppTabScreen {
-    /// Stops this tab's instance. With `back_to_room`, the room's dock is
-    /// asked to open a fresh instance in its place.
+    /// Lets go of the instance: back to the room's dock (state intact)
+    /// when `back_to_room`, otherwise quit for good.
     fn vacate(&mut self, cx: &mut Cx, back_to_room: bool) {
-        let (Some(app_id), Some(room_id)) = (self.app_id.take(), self.room_id.take()) else { return };
+        let Some(key) = self.key.take() else { return };
         let uid = self.widget_uid();
-        self.host_set.teardown(cx, uid, &app_id);
         self.view.mini_app_host_area(cx, ids!(host_area)).set_host(None);
-        cx.action(MiniAppDockAction::Quit {
-            app_id: app_id.clone(),
-            room_id: room_id.clone(),
-        });
+        let (app_id, room_id) = key.clone();
+        let Some(room_id) = room_id else { return };
+        if back_to_room {
+            instances::release(cx, &key, uid);
+            cx.action(DockCmd::Open { app_id: app_id.clone(), room_id: room_id.clone() });
+        } else if instances::quit(cx, &key) {
+            cx.action(MiniAppInstanceAction::AppStopped(app_id.clone()));
+        }
         cx.action(MiniAppTabScreenAction::Vacated {
-            app_id: app_id.clone(),
-            room_id: room_id.clone(),
+            app_id,
+            room_id,
             room_name: std::mem::take(&mut self.room_name),
             returning: back_to_room,
         });
-        if back_to_room {
-            cx.action(DockCmd::Open { app_id, room_id });
-        }
         self.view.redraw(cx);
     }
 }
 
 impl MiniAppTabScreenRef {
-    /// Starts (or restarts) the tab's own instance of the app.
+    /// Shows the app's instance for `room_id`, starting it if needed.
     pub fn open(&self, cx: &mut Cx, app_id: MiniAppId, room_id: OwnedRoomId, room_name: &str) {
         let Some(mut inner) = self.borrow_mut() else { return };
         let manifest = with_a2app(|state| state.registry.get(&app_id).cloned()).flatten();
         let Some(manifest) = manifest else { return };
         let grants = a2app_core::permissions::snapshot_grants_for(&app_id);
         let uid = inner.widget_uid();
-        let tag = instance_tag(&app_id, Some(room_id.as_str()));
-        if inner.host_set.ensure_host(cx, uid, &manifest, &grants, &tag).is_none() {
+        let key: InstanceKey = (app_id, Some(room_id));
+        let seed = crate::a2app::runtime::saved_layout(&instances::tag_of(&key));
+        if instances::ensure(cx, &key, &manifest, &grants, seed).is_none() {
             return;
         }
-        let host = inner.host_set.host_of(&app_id);
-        inner.view.mini_app_host_area(cx, ids!(host_area)).set_host(host);
+        let Some(host) = instances::adopt(cx, &key, uid) else { return };
+        inner.view.mini_app_host_area(cx, ids!(host_area)).set_host(Some(host));
         inner.view.label(cx, ids!(tab_glyph)).set_text(cx, &manifest.icon);
         inner.view.label(cx, ids!(tab_title)).set_text(cx, &manifest.name);
         inner.view.label(cx, ids!(tab_room)).set_text(cx, room_name);
         inner.room_name = room_name.to_string();
-        cx.action(MiniAppDockAction::Opened {
-            app_id: app_id.clone(),
-            room_id: room_id.clone(),
-        });
-        inner.app_id = Some(app_id);
-        inner.room_id = Some(room_id);
+        inner.key = Some(key);
         inner.view.redraw(cx);
     }
 
@@ -261,7 +239,8 @@ impl MiniAppTabScreenRef {
 
     pub fn instance(&self) -> Option<(MiniAppId, OwnedRoomId)> {
         self.borrow().and_then(|inner| {
-            Some((inner.app_id.clone()?, inner.room_id.clone()?))
+            let (app_id, room_id) = inner.key.clone()?;
+            Some((app_id, room_id?))
         })
     }
 }

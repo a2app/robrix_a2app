@@ -63,6 +63,9 @@ pub struct A2AppPersistedState {
     /// Unix timestamp (secs) of when each app was last opened, for "recents".
     #[serde(default)]
     pub recents: BTreeMap<MiniAppId, u64>,
+    /// Each (app, room) instance's last dock position, keyed by instance tag.
+    #[serde(default)]
+    pub pane_layouts: BTreeMap<String, crate::layout::PaneLayout>,
 }
 
 pub fn save_registry_state(state: &A2AppPersistedState) -> Result<()> {

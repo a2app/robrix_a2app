@@ -3428,13 +3428,15 @@ impl RoomScreen {
         self.view.room_input_bar(cx, ids!(room_input_bar))
             .set_room_context(cx, self.widget_uid(), timeline_kind.clone(), None);
 
-        // Tell the mini-app dock too: reusing this screen for a different
-        // room quits the old room's instances.
+        // Tell the mini-app dock too. Only a main-room screen hosts panes;
+        // a thread of the same room must not adopt them away from it.
         #[cfg(feature = "a2app")]
         {
             use crate::a2app::dock::MiniAppDockWidgetExt;
+            let dock_room = matches!(timeline_kind, TimelineKind::MainRoom { .. })
+                .then(|| timeline_kind.room_id().clone());
             self.view.mini_app_dock(cx, ids!(mini_app_dock))
-                .set_room(cx, Some(timeline_kind.room_id().clone()), &room_name_id.display());
+                .set_room(cx, dock_room, &room_name_id.display());
         }
 
         self.show_timeline(cx);
@@ -3455,6 +3457,11 @@ impl RoomScreen {
     pub fn hide_displayed_room(&mut self, cx: &mut Cx) {
         if self.tl_state.is_some() {
             self.hide_timeline();
+        }
+        #[cfg(feature = "a2app")]
+        {
+            use crate::a2app::dock::MiniAppDockWidgetExt;
+            self.view.mini_app_dock(cx, ids!(mini_app_dock)).set_room(cx, None, "");
         }
         // Dropping the loading pane state cancels any in-progress event search.
         self.loading_pane(cx, ids!(loading_pane)).hide(cx);

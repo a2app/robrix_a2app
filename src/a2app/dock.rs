@@ -10,9 +10,11 @@ use std::collections::HashMap;
 use makepad_widgets::*;
 use matrix_sdk::ruma::OwnedRoomId;
 
-use a2app_core::manifest::{instance_tag, MiniAppId};
-use crate::a2app::host_set::{MiniAppHostAreaWidgetRefExt, SplashHostSet};
+use a2app_core::manifest::{MiniAppId, MiniAppManifest};
+use crate::a2app::host_set::{MiniAppHostAreaWidgetRefExt, Templates};
+use crate::a2app::instances::{self, InstanceKey, MiniAppInstanceAction};
 use crate::a2app::runtime::{with_a2app, A2AppOp};
+pub use a2app_core::layout::{PaneLayout, PaneSide};
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -238,54 +240,16 @@ script_mod! {
     }
 }
 
-/// Which edge of the room screen a pane is docked to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum PaneSide {
-    Top,
-    Bottom,
-    Left,
-    #[default]
-    Right,
-}
-
-impl PaneSide {
-    fn next(self) -> Self {
-        match self {
-            PaneSide::Right => PaneSide::Bottom,
-            PaneSide::Bottom => PaneSide::Left,
-            PaneSide::Left => PaneSide::Top,
-            PaneSide::Top => PaneSide::Right,
-        }
-    }
-    fn is_vertical(self) -> bool {
-        matches!(self, PaneSide::Left | PaneSide::Right)
-    }
-}
-
 /// Commands broadcast by the a2app runtime; each dock applies the ones that
 /// concern its room / its running instances. Fire-and-forget by design.
 #[derive(Clone, Debug, Default)]
 pub enum DockCmd {
     /// Open (or restore) `app_id` in the dock of the RoomScreen showing `room_id`.
     Open { app_id: MiniAppId, room_id: OwnedRoomId },
-    /// Quit every docked instance of this app, in every room.
+    /// The registry dropped every instance of this app: let go of its chrome.
     QuitEverywhere(MiniAppId),
-    /// Push a fresh grants list into this app's running instances.
-    UpdateCaps { app_id: MiniAppId, grants: Vec<String> },
-    /// Restart this app's running instances with fresh grants.
-    Restart { app_id: MiniAppId, grants: Vec<String> },
-    /// Deliver an IPC message to `to`'s docked instances (skipping the
-    /// sender's own heap).
-    DeliverIpc { from_heap: usize, from: MiniAppId, to: MiniAppId, data_json: String },
-    #[default]
-    None,
-}
-
-/// Notifications from a dock back to the runtime's instance bookkeeping.
-#[derive(Clone, Debug, Default)]
-pub enum MiniAppDockAction {
-    Opened { app_id: MiniAppId, room_id: OwnedRoomId },
-    Quit { app_id: MiniAppId, room_id: OwnedRoomId },
+    /// The registry restarted this app's isolates: re-fetch the hosts.
+    Restart(MiniAppId),
     #[default]
     None,
 }
@@ -298,15 +262,15 @@ struct Instance {
     /// The widest title line laid out unwrapped: the room the buttons
     /// must leave before they may take another column.
     title_width: f64,
-    side: PaneSide,
-    minimized: bool,
+    /// Mirrors the registry's layout for the per-event paths.
+    layout: PaneLayout,
     chip: WidgetRef,
 }
 
 #[derive(Script, Widget)]
 pub struct MiniAppDock {
     #[deref] view: View,
-    #[rust] host_set: SplashHostSet,
+    #[rust] templates: Templates,
     #[rust] room_id: Option<OwnedRoomId>,
     #[rust] room_name: String,
     #[rust] instances: HashMap<MiniAppId, Instance>,
@@ -322,7 +286,7 @@ impl ScriptHook for MiniAppDock {
         _value: ScriptValue,
     ) {
         if apply.is_reload() {
-            self.host_set.clear_templates();
+            self.templates.clear();
         }
     }
 
@@ -333,8 +297,17 @@ impl ScriptHook for MiniAppDock {
         _scope: &mut Scope,
         value: ScriptValue,
     ) {
-        self.host_set.capture_templates(vm, apply, value);
+        self.templates.capture(vm, apply, value);
+        if let Some(template) = self.templates.get(live_id!(AppHost)) {
+            instances::set_host_template(template);
+        }
         vm.cx_mut().widget_tree_mark_dirty(self.widget_uid());
+    }
+}
+
+impl Drop for MiniAppDock {
+    fn drop(&mut self) {
+        instances::release_owner_no_cx(self.widget_uid());
     }
 }
 
@@ -346,10 +319,6 @@ impl Widget for MiniAppDock {
                 self.edge(cx, side).set_side(side);
             }
         }
-        if self.host_set.has_pending_resize() {
-            self.host_set.flush_resize_notifications(cx);
-        }
-
         self.reflow_headers(cx);
 
         // Chips and panes FIRST. Makepad resolves overlapping hits by
@@ -358,7 +327,7 @@ impl Widget for MiniAppDock {
         // timeline first would let it swallow every click on the chip.
         for inst in self.instances.values() {
             inst.chip.handle_event(cx, event, scope);
-            if !inst.minimized {
+            if !inst.layout.minimized {
                 inst.pane.handle_event(cx, event, scope);
             }
         }
@@ -374,24 +343,33 @@ impl Widget for MiniAppDock {
                         continue;
                     }
                     Some(DockCmd::QuitEverywhere(app_id)) => {
-                        self.quit_app(cx, app_id.clone(), false);
+                        self.drop_chrome(cx, app_id);
+                        instances::gc(cx);
                         continue;
                     }
-                    Some(DockCmd::UpdateCaps { app_id, grants }) => {
-                        if self.host_set.is_running(app_id) {
-                            self.host_set.update_app_caps(cx, app_id, grants.clone());
+                    Some(DockCmd::Restart(app_id)) => {
+                        if let Some(key) = self.key_for(app_id) {
+                            self.pane_host_area(cx, app_id)
+                                .map(|area| area.set_host(instances::host_of(&key)));
+                            self.view.redraw(cx);
                         }
                         continue;
                     }
-                    Some(DockCmd::Restart { app_id, grants }) => {
-                        self.restart_app(cx, app_id, grants);
-                        continue;
-                    }
-                    Some(DockCmd::DeliverIpc { from_heap, from, to, data_json }) => {
-                        self.host_set.deliver_ipc(cx, *from_heap, from, to, data_json);
-                        continue;
-                    }
                     Some(DockCmd::None) | None => {}
+                }
+                // The user let go of a grip: every pane on that edge keeps
+                // the new size.
+                if let MiniAppEdgeAction::Resized { side, size } = action.as_widget_action().cast() {
+                    let on_side: Vec<MiniAppId> = self.instances.iter()
+                        .filter(|(_, inst)| inst.layout.side == side)
+                        .map(|(app_id, _)| app_id.clone())
+                        .collect();
+                    for app_id in on_side {
+                        if let Some(inst) = self.instances.get_mut(&app_id) {
+                            inst.layout.edge_size = size;
+                        }
+                        self.save_layout(&app_id);
+                    }
                 }
             }
 
@@ -401,7 +379,7 @@ impl Widget for MiniAppDock {
                     // lose the finger capture, so these manually-drawn frames
                     // never see Clicked reliably. Pressed always arrives.
                     let hit = |id: &[LiveId]| inst.pane.button(cx, id).pressed(actions);
-                    if inst.minimized {
+                    if inst.layout.minimized {
                         return inst.chip.as_button().pressed(actions)
                             .then(|| (app_id.clone(), PaneButton::Chip));
                     }
@@ -421,16 +399,16 @@ impl Widget for MiniAppDock {
                 .collect();
             for (app_id, button) in clicked {
                 match button {
-                    PaneButton::Close => self.quit_app(cx, app_id, true),
+                    PaneButton::Close => self.quit_app(cx, app_id),
                     PaneButton::Minimize => self.set_minimized(cx, &app_id, true),
                     PaneButton::Chip => self.set_minimized(cx, &app_id, false),
                     PaneButton::CycleEdge => self.cycle_edge(cx, &app_id),
                     PaneButton::BreakOutTab => {
-                        // Quit the docked instance; the new home starts its own:
-                        // a dock tab on desktop, the full-screen host otherwise.
+                        // Park the instance; its new home adopts it with its
+                        // state intact: a dock tab on desktop, else the host.
                         let Some(room_id) = self.room_id.clone() else { continue };
                         let room_name = self.room_name.clone();
-                        self.quit_app(cx, app_id.clone(), false);
+                        self.release_instance(cx, &app_id);
                         if crate::home::home_screen::effective_is_desktop(cx) {
                             cx.action(crate::a2app::tab_screen::A2AppTabRequest::Open {
                                 app_id,
@@ -445,19 +423,17 @@ impl Widget for MiniAppDock {
             }
         }
 
-        if let Event::NetworkResponses(_) = event {
-            self.host_set.handle_network_responses(cx, event, scope);
-        }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         self.view.draw_walk(cx, scope, walk)?;
 
-        for (app_id, _) in self.instances.iter().filter(|(_, i)| !i.minimized) {
+        let Some(room_id) = self.room_id.clone() else { return DrawStep::done() };
+        for (app_id, _) in self.instances.iter().filter(|(_, i)| !i.layout.minimized) {
             let size = self.pane_host_area(cx, app_id)
                 .map(|area| area.last_size())
                 .unwrap_or_default();
-            self.host_set.note_host_size(app_id, size);
+            instances::note_size(&(app_id.clone(), Some(room_id.clone())), size);
         }
         DrawStep::done()
     }
@@ -489,32 +465,51 @@ impl MiniAppDock {
         Some(inst.pane.mini_app_host_area(cx, ids!(host_area)))
     }
 
+    fn key_for(&self, app_id: &str) -> Option<InstanceKey> {
+        Some((app_id.to_string(), Some(self.room_id.clone()?)))
+    }
+
+    /// Runs the app here, or shows its already-running instance for this room.
     fn open_app(&mut self, cx: &mut Cx, app_id: MiniAppId) {
-        let Some(room_id) = self.room_id.clone() else { return };
         if let Some(inst) = self.instances.get(&app_id) {
             // Already here: restoring a minimized instance is the "open".
-            if inst.minimized {
+            if inst.layout.minimized {
                 self.set_minimized(cx, &app_id, false);
             }
             return;
         }
-        // The same room can be open in several tabs (= several docks); only
-        // one of them may own the (app, room) instance.
-        let already_running_elsewhere = with_a2app(|state| {
-            state.room_instances.get(&app_id).is_some_and(|rooms| rooms.contains(&room_id))
-        }).unwrap_or(false);
-        if already_running_elsewhere {
-            return;
-        }
+        let Some(key) = self.key_for(&app_id) else { return };
         let manifest = with_a2app(|state| state.registry.get(&app_id).cloned()).flatten();
         let Some(manifest) = manifest else { return };
         let grants = a2app_core::permissions::snapshot_grants_for(&app_id);
-        let uid = self.widget_uid();
-        let tag = instance_tag(&app_id, Some(room_id.as_str()));
-        if self.host_set.ensure_host(cx, uid, &manifest, &grants, &tag).is_none() {
+        let seed = crate::a2app::runtime::saved_layout(&instances::tag_of(&key));
+        if instances::ensure(cx, &key, &manifest, &grants, seed).is_none() {
             return;
         }
-        let Some(host) = self.host_set.host_of(&app_id) else { return };
+        self.adopt(cx, &key, &manifest);
+    }
+
+    /// Shows every parked instance of this room.
+    fn adopt_room(&mut self, cx: &mut Cx) {
+        let Some(room_id) = self.room_id.clone() else { return };
+        for app_id in instances::apps_in_room(&room_id) {
+            if self.instances.contains_key(&app_id) {
+                continue;
+            }
+            let manifest = with_a2app(|state| state.registry.get(&app_id).cloned()).flatten();
+            let Some(manifest) = manifest else { continue };
+            self.adopt(cx, &(app_id, Some(room_id.clone())), &manifest);
+        }
+    }
+
+    /// Claims the instance and builds its pane chrome at its remembered layout.
+    fn adopt(&mut self, cx: &mut Cx, key: &InstanceKey, manifest: &MiniAppManifest) {
+        let uid = self.widget_uid();
+        // Another surface (a tab, the host modal, this room's other tab) is
+        // showing it; only one may.
+        let Some(host) = instances::adopt(cx, key, uid) else { return };
+        let app_id = key.0.clone();
+        let layout = instances::layout(key);
 
         let Some(pane) = self.instantiate(cx, live_id!(PaneFrame)) else { return };
         pane.set_visible(cx, true);
@@ -538,59 +533,80 @@ impl MiniAppDock {
         chip.set_text(cx, &format!("{} {}", manifest.icon, manifest.name));
         cx.widget_tree_insert_child_deep(uid, LiveId::from_str(&format!("chip_{app_id}")), chip.clone());
 
-        let side = PaneSide::default();
-        self.edge(cx, side).add_pane(&app_id, pane.clone());
+        let edge = self.edge(cx, layout.side);
+        edge.set_size(layout.edge_size);
+        if layout.minimized {
+            pane.set_visible(cx, false);
+            chip.set_visible(cx, true);
+            self.view.mini_app_chips_row(cx, ids!(chips_row)).add_chip(&app_id, chip.clone());
+        } else {
+            edge.add_pane(&app_id, pane.clone());
+        }
         self.instances.insert(app_id.clone(), Instance {
             pane,
             header_width: 0.0,
             title_width,
-            side,
-            minimized: false,
+            layout,
             chip,
         });
         self.apply_edge_icon(cx, &app_id);
-        cx.action(MiniAppDockAction::Opened { app_id, room_id });
         self.view.redraw(cx);
     }
 
     /// Instantiates one of this dock's DSL templates.
     fn instantiate(&mut self, cx: &mut Cx, template: LiveId) -> Option<WidgetRef> {
-        let obj = self.host_set.template(template)?;
+        let obj = self.templates.get(template)?;
         let value: ScriptValue = obj.as_object().into();
         Some(cx.with_vm(|vm| WidgetRef::script_from_value(vm, value)))
     }
 
-    /// Quits one instance (close = quit). `user_clicked` controls the action
-    /// emitted so the runtime can drop its once-grants when the last instance
-    /// of the app dies.
-    fn quit_app(&mut self, cx: &mut Cx, app_id: MiniAppId, _user_clicked: bool) {
-        let Some(inst) = self.instances.remove(&app_id) else { return };
-        self.edge(cx, inst.side).remove_pane(&app_id);
-        self.view.mini_app_chips_row(cx, ids!(chips_row)).remove_chip(&app_id);
-        let uid = self.widget_uid();
-        self.host_set.teardown(cx, uid, &app_id);
-        if let Some(room_id) = self.room_id.clone() {
-            cx.action(MiniAppDockAction::Quit { app_id, room_id });
-        }
+    /// Takes the pane and chip down and lets go of the host clone; the
+    /// instance itself is left to the caller.
+    fn drop_chrome(&mut self, cx: &mut Cx, app_id: &str) -> Option<Instance> {
+        let inst = self.instances.remove(app_id)?;
+        self.edge(cx, inst.layout.side).remove_pane(app_id);
+        self.view.mini_app_chips_row(cx, ids!(chips_row)).remove_chip(app_id);
+        inst.pane.mini_app_host_area(cx, ids!(host_area)).set_host(None);
         self.view.redraw(cx);
+        Some(inst)
     }
 
-    fn restart_app(&mut self, cx: &mut Cx, app_id: &str, grants: &[String]) {
-        if !self.host_set.is_running(app_id) {
+    /// Close = quit.
+    fn quit_app(&mut self, cx: &mut Cx, app_id: MiniAppId) {
+        let Some(key) = self.key_for(&app_id) else { return };
+        if self.drop_chrome(cx, &app_id).is_none() {
             return;
         }
-        let Some(room_id) = self.room_id.clone() else { return };
-        let uid = self.widget_uid();
-        self.host_set.teardown(cx, uid, app_id);
-        let manifest = with_a2app(|state| state.registry.get(app_id).cloned()).flatten();
-        let Some(manifest) = manifest else { return };
-        let tag = instance_tag(app_id, Some(room_id.as_str()));
-        self.host_set.ensure_host(cx, uid, &manifest, grants, &tag);
-        if let Some(inst) = self.instances.get(app_id) {
-            let host = self.host_set.host_of(app_id);
-            inst.pane.mini_app_host_area(cx, ids!(host_area)).set_host(host);
+        if instances::quit(cx, &key) {
+            cx.action(MiniAppInstanceAction::AppStopped(app_id));
         }
-        self.view.redraw(cx);
+    }
+
+    /// Parks the instance, state intact, for another surface to adopt.
+    fn release_instance(&mut self, cx: &mut Cx, app_id: &str) {
+        let Some(key) = self.key_for(app_id) else { return };
+        let Some(inst) = self.drop_chrome(cx, app_id) else { return };
+        let mut layout = inst.layout;
+        layout.edge_size = self.edge(cx, layout.side).size();
+        instances::set_layout(&key, layout);
+        instances::release(cx, &key, self.widget_uid());
+    }
+
+    /// Parks every instance; the room they belong to is going away from
+    /// this screen, not from the app.
+    fn release_all(&mut self, cx: &mut Cx) {
+        let apps: Vec<MiniAppId> = self.instances.keys().cloned().collect();
+        for app_id in apps {
+            self.release_instance(cx, &app_id);
+        }
+    }
+
+    /// Writes an instance's layout through to the registry and to disk.
+    fn save_layout(&self, app_id: &str) {
+        let Some(key) = self.key_for(app_id) else { return };
+        let Some(inst) = self.instances.get(app_id) else { return };
+        instances::set_layout(&key, inst.layout);
+        crate::a2app::runtime::remember_layout(&instances::tag_of(&key), inst.layout);
     }
 
     /// The buttons stack in one column and take more columns, leftwards,
@@ -605,7 +621,7 @@ impl MiniAppDock {
         const SPACING: f64 = 2.0;
         let mut updates: Vec<(MiniAppId, f64)> = Vec::new();
         for (app_id, inst) in self.instances.iter() {
-            if inst.minimized {
+            if inst.layout.minimized {
                 continue;
             }
             // Measure the header itself, not the pane: the frame's padding
@@ -657,7 +673,7 @@ impl MiniAppDock {
     fn apply_edge_icon(&self, cx: &mut Cx, app_id: &str) {
         let Some(inst) = self.instances.get(app_id) else { return };
         let mut button = inst.pane.button(cx, ids!(pane_edge_button));
-        match inst.side.next() {
+        match inst.layout.side.next() {
             PaneSide::Top => {
                 script_apply_eval!(cx, button, { draw_icon +: { svg: (mod.widgets.ICON_PANEL_TOP) } });
             }
@@ -675,11 +691,11 @@ impl MiniAppDock {
 
     fn set_minimized(&mut self, cx: &mut Cx, app_id: &str, minimized: bool) {
         let Some(inst) = self.instances.get_mut(app_id) else { return };
-        if inst.minimized == minimized {
+        if inst.layout.minimized == minimized {
             return;
         }
-        inst.minimized = minimized;
-        let side = inst.side;
+        inst.layout.minimized = minimized;
+        let side = inst.layout.side;
         let (pane, chip) = (inst.pane.clone(), inst.chip.clone());
         let chips_row = self.view.mini_app_chips_row(cx, ids!(chips_row));
         if minimized {
@@ -693,38 +709,38 @@ impl MiniAppDock {
             chips_row.remove_chip(app_id);
             self.edge(cx, side).add_pane(app_id, pane);
         }
+        self.save_layout(app_id);
         self.view.redraw(cx);
     }
 
     fn cycle_edge(&mut self, cx: &mut Cx, app_id: &str) {
         let Some(inst) = self.instances.get_mut(app_id) else { return };
-        let old = inst.side;
+        let old = inst.layout.side;
         let new = old.next();
-        inst.side = new;
-        let pane = inst.pane.clone();
+        inst.layout.side = new;
+        let (pane, edge_size) = (inst.pane.clone(), inst.layout.edge_size);
         self.edge(cx, old).remove_pane(app_id);
-        self.edge(cx, new).add_pane(app_id, pane);
+        let edge = self.edge(cx, new);
+        edge.set_size(edge_size);
+        edge.add_pane(app_id, pane);
         self.apply_edge_icon(cx, app_id);
+        self.save_layout(app_id);
         self.view.redraw(cx);
     }
 }
 
 impl MiniAppDockRef {
     /// Tells the dock which room its RoomScreen now shows (plus the display
-    /// name for pane headers). Reusing this screen for a DIFFERENT room quits
-    /// the old room's instances: they belong to that room, not this screen.
+    /// name for pane headers). The old room's instances are parked, not
+    /// quit; the new room's parked instances come back on screen.
     pub fn set_room(&self, cx: &mut Cx, room_id: Option<OwnedRoomId>, room_name: &str) {
         let Some(mut inner) = self.borrow_mut() else { return };
-        if inner.room_id == room_id {
-            inner.room_name = room_name.to_string();
-            return;
+        if inner.room_id != room_id {
+            inner.release_all(cx);
+            inner.room_id = room_id;
         }
-        let apps: Vec<MiniAppId> = inner.instances.keys().cloned().collect();
-        for app_id in apps {
-            inner.quit_app(cx, app_id, false);
-        }
-        inner.room_id = room_id;
         inner.room_name = room_name.to_string();
+        inner.adopt_room(cx);
     }
 }
 
@@ -739,6 +755,14 @@ const GRAB_LEN: f64 = 38.0;
 const GRAB_THICK: f64 = 8.0;
 /// Small floor so the drag handle itself stays grabbable.
 const EDGE_MIN_SIZE: f64 = 60.0;
+
+/// The user finished dragging an edge's grip.
+#[derive(Clone, Debug, Default)]
+pub enum MiniAppEdgeAction {
+    Resized { side: PaneSide, size: f64 },
+    #[default]
+    None,
+}
 
 #[derive(Script, ScriptHook, Widget)]
 pub struct MiniAppEdge {
@@ -840,7 +864,10 @@ impl Widget for MiniAppEdge {
                 }
             }
             Hit::FingerUp(fe) => {
-                self.drag = None;
+                if self.drag.take().is_some() {
+                    let uid = self.widget_uid();
+                    cx.widget_action(uid, MiniAppEdgeAction::Resized { side: self.side, size: self.size });
+                }
                 self.hovering = fe.is_over && fe.device.has_hovers();
                 self.draw_handle.redraw(cx);
             }
@@ -1012,6 +1039,17 @@ impl MiniAppEdgeRef {
             inner.side = side;
             inner.apply_walk();
         }
+    }
+
+    pub fn set_size(&self, size: f64) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.size = size.max(EDGE_MIN_SIZE);
+            inner.apply_walk();
+        }
+    }
+
+    pub fn size(&self) -> f64 {
+        self.borrow().map_or(0.0, |inner| inner.size)
     }
 }
 
