@@ -193,9 +193,6 @@ pub struct BrokerCtx<'a> {
     /// Whether an app has a live instance docked on a room screen; those are
     /// on screen too, so UI-class services must not treat them as background.
     pub is_docked: &'a dyn Fn(&str) -> bool,
-    /// While true, every write to Matrix is refused before any prompt or
-    /// use is recorded.
-    pub matrix_read_only: bool,
 }
 
 pub struct Broker {
@@ -212,6 +209,10 @@ pub struct Broker {
     /// app from turning the bridge into a denial-of-service on the host.
     limits: limits::AbuseLimiter,
     /// Which app owns each on-screen OS dialog, so the one-at-a-time guard
+/// The refusal every switch-gated write gets while the user keeps writes off.
+pub const MATRIX_WRITE_OFF_MSG: &str =
+    "Mini-apps may not write to rooms: turn on \"Mini-apps may write to rooms\" in the Mini Apps screen";
+
     /// can be released when the completion comes home from another thread.
     dialog_owner: HashMap<(usize, u64), MiniAppId>,
 }
@@ -367,10 +368,6 @@ impl Broker {
         // Abuse control comes BEFORE the permission check, because refusing a
         // request is itself work and an app in a tight loop must not be able
         // to make the host do it forever.
-        // Refuse switched-off writes up front: no prompt, no recorded use.
-        if ctx.matrix_read_only && req.service == "matrix.send_message" {
-            return respond(cx, reply, Err("Robrix mini-apps are read-only right now: sending to rooms is disabled"));
-        }
         let on_screen = ctx.foreground_app == Some(manifest.id.as_str())
             || (ctx.is_docked)(&manifest.id);
         if charge == Charge::Yes {
@@ -431,6 +428,12 @@ impl Broker {
                 Effective::Granted => {
                     asks.push(BrokerAsk::Used { app_id: manifest.id.clone(), perm });
                 }
+        // A write behind the user's switch: refused without a prompt.
+        if capability.status == crate::capabilities::Status::RefusedBySwitch
+            && !ctx.permissions.matrix_write()
+        {
+            return respond(cx, reply, Err(MATRIX_WRITE_OFF_MSG));
+        }
                 Effective::Denied => return Self::respond_denied(cx, &req),
                 Effective::Undeclared => {
                     return respond(
@@ -494,6 +497,14 @@ impl Broker {
                             app_id: manifest.id.clone(),
                             perm,
                             request: Some(req),
+                // No point prompting for a group the write switch refuses anyway.
+                let switched_off = !ctx.permissions.matrix_write()
+                    && crate::capabilities::in_group(perm)
+                        .filter(|c| c.is_available())
+                        .all(|c| c.status == crate::capabilities::Status::RefusedBySwitch);
+                if switched_off {
+                    return respond(cx, reply, Ok("{\"granted\": false}"));
+                }
                         });
                     }
                 }

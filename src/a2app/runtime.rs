@@ -20,7 +20,7 @@ use a2app_core::bundle;
 use a2app_core::manifest::{A2AppScope, AppRegistry, MiniAppId, MiniAppManifest};
 use a2app_core::permissions::{GrantState, Permission, PermissionStore};
 use a2app_core::persistence::{self, A2AppPersistedState};
-use a2app_core::services::{self, Broker, BrokerAsk, BrokerCtx, HostAction, MatrixServiceCall, Reply};
+use a2app_core::services::{self, Broker, BrokerAsk, BrokerCtx, HostAction, MatrixServiceCall, Reply, MATRIX_WRITE_OFF_MSG};
 use a2app_agent::pipeline::{GenOutcome, Generation};
 use a2app_agent::prefs::AgentPrefs;
 
@@ -96,10 +96,6 @@ pub struct A2AppState {
     pub create_room: Option<OwnedRoomId>,
     /// The app whose host pane is currently shown, gating UI-class services.
     pub foreground_app: Option<MiniAppId>,
-    /// While true (the default), mini-apps can only READ matrix data:
-    /// `matrix.send_message` is refused without prompting, and sharing an
-    /// app into a room is blocked, since that posts an event.
-    pub matrix_read_only: bool,
     /// A mini-app's request of a room's RoomScreen, waiting to be taken by
     /// the screen showing that room (see [`take_room_action`]).
     room_action: Option<PendingRoomAction>,
@@ -149,7 +145,6 @@ pub fn init() {
             agent_prefs: a2app_agent::prefs::load_agent_prefs(),
             create_room: None,
             foreground_app: None,
-            matrix_read_only: true,
             room_action: None,
             perms_dirty: false,
             registry_dirty: false,
@@ -193,6 +188,8 @@ pub enum A2AppOp {
 #[derive(Debug)]
 pub enum A2AppMatrixRequest {
     RoomInfo { room_id: OwnedRoomId, reply: Reply },
+    /// The user's "Mini-apps may write to rooms" switch.
+    SetMatrixWrite(bool),
     ReadMessages { room_id: OwnedRoomId, limit: u32, reply: Reply },
     SendMessage { room_id: OwnedRoomId, body: String, reply: Reply },
     Profile { reply: Reply },
@@ -679,26 +676,6 @@ fn stop_app_everywhere(cx: &mut Cx, ui: &WidgetRef, app_id: &str) {
             });
             ui.redraw(cx);
         }
-        A2AppOp::ShareToRoom { app_id, room_id } => {
-            if with_a2app(|state| state.matrix_read_only).unwrap_or(true) {
-                enqueue_popup_notification(
-                    format!("{MATRIX_READ_ONLY_MSG}, so sharing an app into a room is blocked too."),
-                    PopupKind::Warning, Some(5.0),
-                );
-                return;
-            }
-            let Some(Some(manifest)) = with_a2app(|state| state.registry.get(&app_id).cloned()) else { return };
-            submit_async_request(MatrixRequest::A2App(A2AppMatrixRequest::ShareApp {
-                room_id,
-                bundle_json: bundle::to_text(&manifest),
-                app_name: manifest.name.clone(),
-            }));
-        }
-    }
-}
-
-fn install_import(cx: &mut Cx, ui: &WidgetRef, parsed: Result<MiniAppManifest, String>) {
-    match parsed {
         A2AppOp::SetMatrixWrite(on) => {
             let senders: Vec<MiniAppId> = with_a2app(|state| {
                 state.permissions.set_matrix_write(on);
@@ -742,6 +719,26 @@ fn install_import(cx: &mut Cx, ui: &WidgetRef, parsed: Result<MiniAppManifest, S
 
 fn manifest_name_for_popup(manifest: &MiniAppManifest) -> String {
     if manifest.name.is_empty() { manifest.id.clone() } else { manifest.name.clone() }
+        A2AppOp::ShareToRoom { app_id, room_id } => {
+            if !with_a2app(|state| state.permissions.matrix_write()).unwrap_or(false) {
+                enqueue_popup_notification(
+                    format!("{MATRIX_WRITE_OFF_MSG}, so sharing an app into a room is blocked too."),
+                    PopupKind::Warning, Some(5.0),
+                );
+                return;
+            }
+            let Some(Some(manifest)) = with_a2app(|state| state.registry.get(&app_id).cloned()) else { return };
+            submit_async_request(MatrixRequest::A2App(A2AppMatrixRequest::ShareApp {
+                room_id,
+                bundle_json: bundle::to_text(&manifest),
+                app_name: manifest.name.clone(),
+            }));
+        }
+    }
+}
+
+fn install_import(cx: &mut Cx, ui: &WidgetRef, parsed: Result<MiniAppManifest, String>) {
+    match parsed {
 }
 
 fn unique_import_id(base: &str, taken: &[MiniAppId]) -> MiniAppId {
@@ -926,7 +923,6 @@ fn process_broker(cx: &mut Cx, ui: &WidgetRef) {
             permissions,
             foreground_app: foreground_app.as_deref(),
             is_docked: &is_docked,
-            matrix_read_only: *matrix_read_only,
         })
     }).unwrap_or_default();
 
@@ -939,22 +935,9 @@ fn process_broker(cx: &mut Cx, ui: &WidgetRef) {
     }
 }
 
-/// The refusal every write-to-matrix path answers with while read-only mode is on.
-const MATRIX_READ_ONLY_MSG: &str =
-    "Robrix mini-apps are read-only right now: sending to rooms is disabled";
-
 fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
-    let read_only = with_a2app(|state| state.matrix_read_only).unwrap_or(true);
     match ask {
         BrokerAsk::Prompt { app_id, perm, request } => {
-            // Don't prompt for a capability that would be refused anyway.
-            if read_only && perm == Permission::MatrixRoomSend {
-                if let Some(request) = request {
-                    let reply = Reply { heap_key: request.heap_key, req_id: request.req_id };
-                    services::respond(cx, reply, Err(MATRIX_READ_ONLY_MSG));
-                }
-                return;
-            }
             queue_permission_prompt(cx, ui, app_id, perm, request);
         }
         BrokerAsk::Notify { app_id, summary } => {
@@ -991,10 +974,6 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
         }
         BrokerAsk::Matrix { reply, app_id, room, call } => {
             let _ = &app_id;
-            if read_only && matches!(call, MatrixServiceCall::SendMessage { .. }) {
-                services::respond(cx, reply, Err(MATRIX_READ_ONLY_MSG));
-                return;
-            }
             let room = room.and_then(|r| OwnedRoomId::try_from(r.as_str()).ok());
             let request = match (call, room) {
                 (MatrixServiceCall::Profile, _) => A2AppMatrixRequest::Profile { reply },
@@ -1263,7 +1242,6 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
                     permissions,
                     foreground_app: foreground_app.as_deref(),
                     is_docked: &is_docked,
-                    matrix_read_only: *matrix_read_only,
                 }, request)
             }).unwrap_or_default();
             for ask in asks {

@@ -266,14 +266,22 @@ script_mod! {
                 }
                 text: "Sandboxed Splash mini-apps that run inside Robrix. Each app runs in its own isolate with no access to anything you haven't granted it."
             }
+            matrix_write_toggle := ToggleFlat {
+                margin: Inset{left: 0.5, top: 4, bottom: 2}
+                padding: Inset{left: 15}
+                active: false
+                draw_bg +: { size: 21 }
+                text: "Mini-apps may write to rooms"
+                draw_text +: { text_style: theme.font_bold {font_size: 11} }
+            }
             Label {
                 width: Fill, height: Fit
                 flow: Flow.Right{wrap: true}
                 draw_text +: {
                     text_style: REGULAR_TEXT {font_size: 10},
-                    color: (COLOR_FG_ACCEPT_GREEN)
+                    color: (MESSAGE_TEXT_COLOR)
                 }
-                text: "Matrix access is read-only for now: mini-apps can never send messages or events to your rooms."
+                text: "Off: no mini-app can send messages or events to your rooms, and /miniapp share is blocked. On: an app still has to ask you before it sends anything, and it sends as you."
             }
 
             create_section := RoundedView {
@@ -972,6 +980,10 @@ impl Widget for MiniAppsScreen {
 
         let Event::Actions(actions) = event else { return };
 
+        if let Some(on) = self.view.check_box(cx, ids!(matrix_write_toggle)).changed(actions) {
+            cx.action(A2AppOp::SetMatrixWrite(on));
+        }
+
         for action in actions {
             // A /miniapp generation lands on this screen; make sure the
             // console (list pane) is showing, not a leftover info pane.
@@ -1256,6 +1268,8 @@ impl MiniAppsScreen {
                     )
                 }).unwrap_or((false, (false, String::new(), false, false)));
                 self.view.widget(cx, ids!(no_apps_label)).set_visible(cx, !any_apps);
+                let writes_on = with_a2app(|state| state.permissions.matrix_write()).unwrap_or(false);
+                self.view.check_box(cx, ids!(matrix_write_toggle)).set_active(cx, writes_on, Animate::No);
                 let (active, status, running, can_retry) = console;
                 self.view.widget(cx, ids!(console_section)).set_visible(cx, active);
                 if active {

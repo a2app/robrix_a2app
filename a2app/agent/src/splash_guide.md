@@ -448,7 +448,11 @@ burning a permission.
 `matrix-room-read` and `matrix-room-send` prompt the user on first use.
 Sending messages as the user is a serious capability: send ONLY what the
 user explicitly asked to send, one message per user action, never on a
-timer, and show what was sent.
+timer, and show what was sent. The user also has a global "Mini-apps may
+write to rooms" switch, off by default: while it is off every
+`matrix.send_message` fails like a denial (`r.is_ok == false`, `r.error`
+says why) and `host.has("matrix.room.message.send")` is false, so show
+`r.error` and never assume a send went through.
 
 ## Acting inside Robrix (navigation and composer)
 

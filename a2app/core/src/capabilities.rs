@@ -59,8 +59,8 @@ pub enum Scope {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Status {
     Available,
-    /// Shipped, but refused without prompting while its global switch is
-    /// off (today: the matrix read-only mode).
+    /// Shipped, but refused without prompting while the user's "Mini-apps
+    /// may write to rooms" switch is off.
     RefusedBySwitch,
     /// Robrix already has the SDK call or update stream; needs a service or
     /// hook, a worker arm, and delivery.
