@@ -1278,6 +1278,10 @@ pub struct MiniAppsScreen {
     #[rust] diff_lines: Vec<DiffLine>,
     /// The provider awaiting a pasted key, if any.
     #[rust] key_entry: Option<String>,
+    /// The installed app the create bar's text reads as a rewrite of, and
+    /// whether the user overrode that to create a new app anyway.
+    #[rust] modify_target: Option<(MiniAppId, String)>,
+    #[rust] force_create: bool,
 }
 
 impl Widget for MiniAppsScreen {
@@ -1372,13 +1376,25 @@ impl Widget for MiniAppsScreen {
         }
 
         // ----- list pane -----
+        if let Some(text) = self.view.text_input(cx, ids!(prompt_input)).changed(actions) {
+            self.reclassify(cx, &text);
+        }
+        if self.view.button(cx, ids!(intent_switch_button)).clicked(actions) {
+            self.force_create = !self.force_create;
+            self.show_intent_hint(cx);
+        }
         if self.view.button(cx, ids!(generate_button)).clicked(actions) {
             let request = self.view.text_input(cx, ids!(prompt_input)).text();
             let request = request.trim().to_string();
             if request.is_empty() {
                 enqueue_popup_notification("Describe the app you want first.", PopupKind::Warning, Some(3.0));
             } else {
-                cx.action(A2AppOp::StartGeneration { request, room_id: None });
+                let op = match (&self.modify_target, self.force_create) {
+                    (Some((app_id, _)), false) => A2AppOp::StartModify { app_id: app_id.clone(), request },
+                    (Some(_), true) => A2AppOp::StartCreate { request, room_id: None },
+                    (None, _) => A2AppOp::StartGeneration { request, room_id: None },
+                };
+                cx.action(op);
                 self.view.redraw(cx);
             }
         }
@@ -1393,6 +1409,7 @@ impl Widget for MiniAppsScreen {
         }
         if self.view.button(cx, ids!(new_prompt_button)).clicked(actions) {
             self.view.text_input(cx, ids!(prompt_input)).set_text(cx, "");
+            self.reclassify(cx, "");
             cx.action(A2AppOp::NewPrompt);
         }
         if self.view.button(cx, ids!(import_button)).clicked(actions) {
@@ -1534,6 +1551,42 @@ impl Widget for MiniAppsScreen {
 }
 
 impl MiniAppsScreen {
+    /// Re-reads what the create bar's text would do, the same way the
+    /// runtime will when Generate is pressed.
+    fn reclassify(&mut self, cx: &mut Cx, text: &str) {
+        let apps: Vec<(MiniAppId, String)> = with_a2app(|state| {
+            state.registry.iter().map(|a| (a.id.clone(), a.name.clone())).collect()
+        }).unwrap_or_default();
+        let target = match a2app_agent::intent::classify(text, &apps) {
+            a2app_agent::intent::Intent::Modify(id) => {
+                apps.iter().find(|(app_id, _)| *app_id == id).map(|(id, name)| (id.clone(), name.clone()))
+            }
+            a2app_agent::intent::Intent::Create => None,
+        };
+        if target != self.modify_target {
+            self.force_create = false;
+        }
+        self.modify_target = target;
+        self.show_intent_hint(cx);
+    }
+
+    fn show_intent_hint(&mut self, cx: &mut Cx) {
+        let Some((_, name)) = &self.modify_target else {
+            self.view.widget(cx, ids!(intent_hint)).set_visible(cx, false);
+            self.view.redraw(cx);
+            return;
+        };
+        let (label, switch) = if self.force_create {
+            (format!("Creates a new app; \"{name}\" stays as it is"), format!("Rewrite \"{name}\" instead"))
+        } else {
+            (format!("Rewrites \"{name}\" (the current version is kept)"), String::from("Create a new app instead"))
+        };
+        self.view.label(cx, ids!(intent_label)).set_text(cx, &label);
+        self.view.button(cx, ids!(intent_switch_button)).set_text(cx, &switch);
+        self.view.widget(cx, ids!(intent_hint)).set_visible(cx, true);
+        self.view.redraw(cx);
+    }
+
     fn set_pane(&mut self, cx: &mut Cx, pane: Pane) {
         // A hidden editor would still get key events.
         if self.pane == Pane::Edit && pane != Pane::Edit {

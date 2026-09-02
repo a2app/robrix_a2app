@@ -22,6 +22,7 @@ use a2app_core::permissions::{Effective, GrantState, Permission, PermissionStore
 use a2app_core::persistence::{self, A2AppPersistedState};
 use a2app_core::services::{self, Broker, BrokerAsk, BrokerCtx, HostAction, Reply, MATRIX_WRITE_OFF_MSG};
 use a2app_core::versions::{self, VersionOrigin};
+use a2app_agent::intent::Intent;
 use a2app_agent::pipeline::{GenOutcome, Generation};
 use a2app_agent::prefs::AgentPrefs;
 
@@ -212,6 +213,9 @@ pub enum A2AppOp {
     Unrestrict(MiniAppId),
     /// Starts a generation; `Modify` intent is classified from the text.
     StartGeneration { request: String, room_id: Option<OwnedRoomId> },
+    /// Starts a generation that must create a new app, whatever the text
+    /// looks like.
+    StartCreate { request: String, room_id: Option<OwnedRoomId> },
     StartModify { app_id: MiniAppId, request: String },
     CancelGeneration,
     RetryGeneration,
@@ -860,7 +864,8 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             ui.redraw(cx);
         }
         A2AppOp::StartGeneration { request, room_id } => start_generation(cx, ui, request, room_id, None),
-        A2AppOp::StartModify { app_id, request } => start_generation(cx, ui, request, None, Some(app_id)),
+        A2AppOp::StartCreate { request, room_id } => start_generation(cx, ui, request, room_id, Some(Intent::Create)),
+        A2AppOp::StartModify { app_id, request } => start_generation(cx, ui, request, None, Some(Intent::Modify(app_id))),
         A2AppOp::CancelGeneration => {
             with_a2app(|state| {
                 // Dropping the Generation kills the agent child process.
@@ -970,7 +975,7 @@ fn start_generation(
     ui: &WidgetRef,
     request: String,
     room_id: Option<OwnedRoomId>,
-    modify: Option<MiniAppId>,
+    intent: Option<Intent>,
 ) {
     if let Some(blocker) = a2app_agent::blocker() {
         enqueue_popup_notification(blocker.headline(), PopupKind::Warning, Some(6.0));
@@ -986,13 +991,11 @@ fn start_generation(
             .collect();
         let taken: Vec<MiniAppId> = apps.iter().map(|(id, _)| id.clone()).collect();
 
-        // An explicit Modify wins; otherwise classify the request text.
-        let refine_target = modify.or_else(|| {
-            match a2app_agent::intent::classify(&request, &apps) {
-                a2app_agent::intent::Intent::Modify(id) => Some(id),
-                a2app_agent::intent::Intent::Create => None,
-            }
-        });
+        // An explicit intent wins; otherwise classify the request text.
+        let refine_target = match intent.unwrap_or_else(|| a2app_agent::intent::classify(&request, &apps)) {
+            Intent::Modify(id) => Some(id),
+            Intent::Create => None,
+        };
 
         let scope = match &room_id {
             Some(r) => A2AppScope::Room { room_id: r.to_string() },
@@ -1000,6 +1003,10 @@ fn start_generation(
         };
         state.create_room = room_id.clone();
 
+        let status = match refine_target.as_ref().and_then(|id| state.registry.get(id)) {
+            Some(target) => format!("Connecting to the agent to rewrite \"{}\"…", target.name),
+            None => String::from("Connecting to the agent to create a new app…"),
+        };
         let generation = match refine_target.and_then(|id| state.registry.get(&id).cloned()) {
             Some(mut base) => {
                 // The state being rewritten stays reachable as a version.
@@ -1013,7 +1020,7 @@ fn start_generation(
             Ok(generation) => {
                 state.generation = Some(generation);
                 state.console = GenConsole {
-                    status: String::from("Connecting to the agent…"),
+                    status,
                     lines: Vec::new(),
                     active: true,
                     last_render: None,
