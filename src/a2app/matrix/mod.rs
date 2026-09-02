@@ -16,7 +16,7 @@ use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedRoomOrAliasId, OwnedServe
 use a2app_core::services::{MatrixServiceCall, Reply, SearchScope};
 use a2app_core::services::matrix::RoomFlag;
 
-use crate::a2app::room_watch;
+use crate::a2app::{account_watch, room_watch};
 use crate::shared::popup_list::{enqueue_popup_notification, PopupKind};
 
 pub mod account;
@@ -41,6 +41,8 @@ pub enum A2AppMatrixRequest {
     /// Start or stop the worker's watch on a room for the incoming hooks.
     WatchRoom { room_id: OwnedRoomId },
     UnwatchRoom { room_id: OwnedRoomId },
+    /// Same for the account-wide hooks (rooms list, invites, unread totals).
+    WatchAccount { watch: bool },
     /// Sends an app bundle into a room as an `rs.robius.a2app` event.
     /// No reply: outcome is reported via a popup notification.
     ShareApp { room_id: OwnedRoomId, bundle_json: String, app_name: String },
@@ -554,6 +556,10 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
         }
         A2AppMatrixRequest::UnwatchRoom { room_id } => {
             room_watch::stop_watch(&room_id);
+            return;
+        }
+        A2AppMatrixRequest::WatchAccount { watch } => {
+            if watch { account_watch::start_watch() } else { account_watch::stop_watch() }
             return;
         }
         A2AppMatrixRequest::Profile { reply } => {

@@ -33,11 +33,13 @@ use crate::a2app::dock::DockCmd;
 use crate::a2app::instances::{self, MiniAppInstanceAction};
 use crate::a2app::matrix::{self, A2AppMatrixRequest, A2AppMatrixResult};
 use crate::a2app::room_watch::{A2AppRoomWatchEvent, RoomWatchKind};
+use crate::a2app::account_watch::{A2AppAccountWatchEvent, AccountWatchKind, ACCOUNT_HOOKS};
 use a2app_core::layout::PaneLayout;
 use crate::app::{AppStateAction, SelectedRoom};
 use crate::home::navigation_tab_bar::NavigationBarAction;
 use crate::home::rooms_list::{RoomsListAction, RoomsListRef};
 use crate::room::BasicRoomDetails;
+use crate::settings::app_preferences::AppPreferencesGlobal;
 use crate::shared::popup_list::{enqueue_popup_notification, PopupKind};
 use crate::sliding_sync::{submit_async_request, MatrixRequest};
 use crate::utils::RoomNameId;
@@ -105,6 +107,8 @@ pub struct A2AppState {
     hook_subs: HashMap<usize, HookSubscription>,
     /// Rooms the worker is watching for those subscriptions.
     watched_rooms: HashSet<OwnedRoomId>,
+    /// Whether the worker runs the account watch for them too.
+    account_watched: bool,
     perms_dirty: bool,
     registry_dirty: bool,
     last_persist: Instant,
@@ -154,6 +158,7 @@ pub fn init() {
             room_action: None,
             hook_subs: HashMap::new(),
             watched_rooms: HashSet::new(),
+            account_watched: false,
             perms_dirty: false,
             registry_dirty: false,
             last_persist: Instant::now(),
@@ -206,10 +211,11 @@ pub enum A2AppOp {
 }
 
 
-/// One isolate's live room hooks.
+/// One isolate's live hooks; `room_id` is its attached room, which the
+/// account-wide hooks don't need.
 struct HookSubscription {
     app_id: MiniAppId,
-    room_id: OwnedRoomId,
+    room_id: Option<OwnedRoomId>,
     hooks: HashSet<&'static str>,
 }
 
@@ -285,10 +291,15 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     let mut pane_actions: Vec<MiniAppHostPaneAction> = Vec::new();
     let mut stopped: Vec<MiniAppId> = Vec::new();
     let mut watch_events: Vec<A2AppRoomWatchEvent> = Vec::new();
+    let mut account_events: Vec<A2AppAccountWatchEvent> = Vec::new();
     if let Event::Actions(actions) = event {
         for action in actions {
             if let Some(watch_event) = action.downcast_ref::<A2AppRoomWatchEvent>() {
                 watch_events.push(watch_event.clone());
+                continue;
+            }
+            if let Some(watch_event) = action.downcast_ref::<A2AppAccountWatchEvent>() {
+                account_events.push(watch_event.clone());
                 continue;
             }
             if let Some(op) = action.downcast_ref::<A2AppOp>() {
@@ -353,8 +364,8 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     for op in ops {
         apply_op(cx, ui, op);
     }
-    if !watch_events.is_empty() {
-        deliver_room_hooks(cx, ui, watch_events);
+    if !watch_events.is_empty() || !account_events.is_empty() {
+        deliver_room_hooks(cx, ui, watch_events, account_events);
     }
 
     advance_generation(cx, ui);
@@ -396,10 +407,10 @@ pub fn remember_layout(tag: &str, layout: PaneLayout) {
 }
 
 /// Forgets subscriptions whose isolate is gone or whose grant was pulled,
-/// and stops watching rooms nobody listens to any more.
+/// and starts or stops the worker's watches to match what's left.
 fn prune_hook_subs() {
     with_a2app(|state| {
-        let A2AppState { hook_subs, registry, permissions, watched_rooms, .. } = state;
+        let A2AppState { hook_subs, registry, permissions, watched_rooms, account_watched, .. } = state;
         hook_subs.retain(|heap, sub| {
             if instances::key_of_heap(*heap).is_none() {
                 return false;
@@ -411,7 +422,7 @@ fn prune_hook_subs() {
             });
             !sub.hooks.is_empty()
         });
-        let wanted: HashSet<OwnedRoomId> = hook_subs.values().map(|s| s.room_id.clone()).collect();
+        let wanted: HashSet<OwnedRoomId> = hook_subs.values().filter_map(|s| s.room_id.clone()).collect();
         for room_id in watched_rooms.difference(&wanted) {
             submit_async_request(MatrixRequest::A2App(A2AppMatrixRequest::UnwatchRoom { room_id: room_id.clone() }));
         }
@@ -419,23 +430,36 @@ fn prune_hook_subs() {
             submit_async_request(MatrixRequest::A2App(A2AppMatrixRequest::WatchRoom { room_id: room_id.clone() }));
         }
         *watched_rooms = wanted;
+        let wants_account = hook_subs.values().any(|s| s.hooks.iter().any(|hook| ACCOUNT_HOOKS.contains(hook)));
+        if wants_account != *account_watched {
+            submit_async_request(MatrixRequest::A2App(A2AppMatrixRequest::WatchAccount { watch: wants_account }));
+            *account_watched = wants_account;
+        }
     });
 }
 
-/// Hands each watched room's news to the isolates subscribed to it.
-fn deliver_room_hooks(cx: &mut Cx, ui: &WidgetRef, events: Vec<A2AppRoomWatchEvent>) {
+/// Hands each watch's news to the isolates subscribed to it.
+fn deliver_room_hooks(
+    cx: &mut Cx,
+    ui: &WidgetRef,
+    events: Vec<A2AppRoomWatchEvent>,
+    account_events: Vec<A2AppAccountWatchEvent>,
+) {
     prune_hook_subs();
-    // Messages batch into one call per pass; the other kinds coalesce to
-    // their latest value.
+    let show_receipts = cx.global::<AppPreferencesGlobal>().0.show_read_receipts;
+    // Messages and receipts batch per pass, reactions, edits and invites get
+    // a call each, the rest coalesce to the latest; a `None` room is account-wide.
     let mut messages: HashMap<OwnedRoomId, Vec<serde_json::Value>> = HashMap::new();
-    let mut members: HashMap<OwnedRoomId, u64> = HashMap::new();
-    let mut pins: HashMap<OwnedRoomId, Vec<OwnedEventId>> = HashMap::new();
+    let mut receipts: HashMap<OwnedRoomId, Vec<serde_json::Value>> = HashMap::new();
+    let mut each: Vec<(Option<OwnedRoomId>, &'static str, serde_json::Value)> = Vec::new();
+    let mut latest: HashMap<(Option<OwnedRoomId>, &'static str), serde_json::Value> = HashMap::new();
     let mut closed: Vec<OwnedRoomId> = Vec::new();
     for event in events {
+        let room_id = event.room_id;
         match event.kind {
             RoomWatchKind::Message { event_id, sender, sender_name, body, msgtype, ts, is_own } => {
-                messages.entry(event.room_id.clone()).or_default().push(serde_json::json!({
-                    "room_id": event.room_id,
+                messages.entry(room_id.clone()).or_default().push(serde_json::json!({
+                    "room_id": room_id,
                     "event_id": event_id,
                     "sender": sender.localpart(),
                     "sender_id": sender,
@@ -446,38 +470,138 @@ fn deliver_room_hooks(cx: &mut Cx, ui: &WidgetRef, events: Vec<A2AppRoomWatchEve
                     "is_own": is_own,
                 }));
             }
-            RoomWatchKind::MembersChanged { count } => { members.insert(event.room_id, count); }
-            RoomWatchKind::PinsChanged { pinned } => { pins.insert(event.room_id, pinned); }
-            RoomWatchKind::Closed => closed.push(event.room_id),
+            RoomWatchKind::MessageChanged { event_id, edited, redacted, body } => {
+                each.push((Some(room_id.clone()), "on_room_message_changed", serde_json::json!({
+                    "room_id": room_id,
+                    "event_id": event_id,
+                    "edited": edited,
+                    "redacted": redacted,
+                    "body": body,
+                })));
+            }
+            RoomWatchKind::Reaction { event_id, key, sender, added } => {
+                each.push((Some(room_id.clone()), "on_room_reaction", serde_json::json!({
+                    "room_id": room_id,
+                    "event_id": event_id,
+                    "key": key,
+                    "sender_id": sender,
+                    "added": added,
+                })));
+            }
+            RoomWatchKind::Typing { users } => {
+                let typing: Vec<_> = users.iter()
+                    .map(|(user_id, name)| serde_json::json!({ "user_id": user_id, "name": name }))
+                    .collect();
+                latest.insert(
+                    (Some(room_id.clone()), "on_room_typing"),
+                    serde_json::json!({ "room_id": room_id, "typing": typing }),
+                );
+            }
+            RoomWatchKind::Receipts { receipts: batch } => {
+                receipts.entry(room_id).or_default().extend(batch.into_iter().map(|r| {
+                    serde_json::json!({ "user_id": r.user_id, "event_id": r.event_id, "ts": r.ts })
+                }));
+            }
+            RoomWatchKind::MembersChanged { count } => {
+                latest.insert(
+                    (Some(room_id.clone()), "on_room_members_changed"),
+                    serde_json::json!({ "room_id": room_id, "count": count }),
+                );
+            }
+            RoomWatchKind::PinsChanged { pinned } => {
+                latest.insert(
+                    (Some(room_id.clone()), "on_room_pins_changed"),
+                    serde_json::json!({ "room_id": room_id, "pinned": pinned }),
+                );
+            }
+            RoomWatchKind::InfoChanged { name, topic, encrypted, is_favorite, is_low_priority, upgraded } => {
+                latest.insert((Some(room_id.clone()), "on_room_info_changed"), serde_json::json!({
+                    "room_id": room_id,
+                    "name": name,
+                    "topic": topic,
+                    "encrypted": encrypted,
+                    "is_favorite": is_favorite,
+                    "is_low_priority": is_low_priority,
+                    "upgraded": upgraded,
+                }));
+            }
+            RoomWatchKind::UnreadChanged { unread, mentions, marked_unread } => {
+                latest.insert((Some(room_id.clone()), "on_room_unread_changed"), serde_json::json!({
+                    "room_id": room_id,
+                    "unread": unread,
+                    "mentions": mentions,
+                    "marked_unread": marked_unread,
+                }));
+            }
+            RoomWatchKind::Closed => closed.push(room_id),
         }
     }
-    let subs: Vec<(usize, OwnedRoomId, HashSet<&'static str>)> = with_a2app(|state| {
+    let mut rooms_changed: Option<(Vec<OwnedRoomId>, Vec<OwnedRoomId>, Vec<OwnedRoomId>)> = None;
+    for event in account_events {
+        match event.kind {
+            AccountWatchKind::RoomsChanged { joined, left, changed } => {
+                let (all_joined, all_left, all_changed) = rooms_changed.get_or_insert_default();
+                all_joined.extend(joined);
+                all_left.extend(left);
+                all_changed.extend(changed);
+            }
+            AccountWatchKind::InviteReceived { room_id, name, inviter, inviter_name, is_space } => {
+                each.push((None, "on_invite_received", serde_json::json!({
+                    "room_id": room_id,
+                    "name": name,
+                    "inviter_id": inviter,
+                    "inviter_name": inviter_name,
+                    "is_space": is_space,
+                })));
+            }
+            AccountWatchKind::UnreadTotalsChanged { unread, mentions } => {
+                latest.insert(
+                    (None, "on_unread_totals_changed"),
+                    serde_json::json!({ "unread": unread, "mentions": mentions }),
+                );
+            }
+        }
+    }
+    if let Some((joined, left, changed)) = rooms_changed {
+        latest.insert(
+            (None, "on_rooms_changed"),
+            serde_json::json!({ "joined": joined, "left": left, "changed": changed }),
+        );
+    }
+    let subs: Vec<(usize, Option<OwnedRoomId>, HashSet<&'static str>)> = with_a2app(|state| {
         state.hook_subs.iter().map(|(heap, s)| (*heap, s.room_id.clone(), s.hooks.clone())).collect()
     }).unwrap_or_default();
     let mut delivered = false;
     for (heap, room_id, hooks) in subs {
-        if hooks.contains("on_room_message")
-            && let Some(batch) = messages.get(&room_id)
-        {
-            let payload = serde_json::Value::Array(batch.clone()).to_string();
-            delivered |= instances::call_hook_by_heap(cx, heap, live_id!(on_room_message), &[&payload]);
+        if let Some(room_id) = &room_id {
+            if hooks.contains("on_room_message")
+                && let Some(batch) = messages.get(room_id)
+            {
+                let payload = serde_json::Value::Array(batch.clone()).to_string();
+                delivered |= instances::call_hook_by_heap(cx, heap, live_id!(on_room_message), &[&payload]);
+            }
+            if show_receipts
+                && hooks.contains("on_room_receipt")
+                && let Some(batch) = receipts.get(room_id)
+            {
+                let payload = serde_json::json!({ "room_id": room_id, "receipts": batch }).to_string();
+                delivered |= instances::call_hook_by_heap(cx, heap, live_id!(on_room_receipt), &[&payload]);
+            }
         }
-        if hooks.contains("on_room_members_changed")
-            && let Some(count) = members.get(&room_id)
-        {
-            let payload = serde_json::json!({ "room_id": room_id, "count": count }).to_string();
-            delivered |= instances::call_hook_by_heap(cx, heap, live_id!(on_room_members_changed), &[&payload]);
+        // A room's payloads go to its own subscribers; account-wide ones to anyone with the hook.
+        let mine = |room: &Option<OwnedRoomId>, hook: &&'static str| {
+            (room.is_none() || *room == room_id) && hooks.contains(hook)
+        };
+        for (_, hook, payload) in each.iter().filter(|(room, hook, _)| mine(room, hook)) {
+            delivered |= instances::call_hook_by_heap(cx, heap, LiveId::from_str(hook), &[&payload.to_string()]);
         }
-        if hooks.contains("on_room_pins_changed")
-            && let Some(pinned) = pins.get(&room_id)
-        {
-            let payload = serde_json::json!({ "room_id": room_id, "pinned": pinned }).to_string();
-            delivered |= instances::call_hook_by_heap(cx, heap, live_id!(on_room_pins_changed), &[&payload]);
+        for ((_, hook), payload) in latest.iter().filter(|((room, hook), _)| mine(room, hook)) {
+            delivered |= instances::call_hook_by_heap(cx, heap, LiveId::from_str(hook), &[&payload.to_string()]);
         }
     }
     if !closed.is_empty() {
         with_a2app(|state| {
-            state.hook_subs.retain(|_, s| !closed.contains(&s.room_id));
+            state.hook_subs.retain(|_, s| !s.room_id.as_ref().is_some_and(|r| closed.contains(r)));
             for room_id in &closed {
                 state.watched_rooms.remove(room_id);
             }
@@ -1061,13 +1185,13 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
             }
         }
         BrokerAsk::Subscribe { reply, app_id, heap_key, room, hook } => {
-            let Ok(room_id) = OwnedRoomId::try_from(room.as_str()) else {
+            let Ok(room_id) = room.as_deref().map(OwnedRoomId::try_from).transpose() else {
                 return services::respond(cx, reply, Err("not a valid room id"));
             };
             with_a2app(|state| {
                 let sub = state.hook_subs.entry(heap_key).or_insert_with(|| HookSubscription {
                     app_id,
-                    room_id: room_id.clone(),
+                    room_id,
                     hooks: HashSet::new(),
                 });
                 sub.hooks.insert(hook);

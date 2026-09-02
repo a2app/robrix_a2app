@@ -26,6 +26,8 @@ pub mod runtime;
 pub mod matrix;
 /// Worker-side room watches that feed the mini-app hooks.
 pub mod room_watch;
+/// The worker-side account watch behind the rooms-list hooks.
+pub mod account_watch;
 /// The timeline card for `rs.robius.a2app` events (apps shared into rooms).
 pub mod timeline_card;
 

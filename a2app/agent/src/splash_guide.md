@@ -312,8 +312,9 @@ and scope (this room, account, device, app-local). Available today:
 | matrix-rooms-read | `matrix.rooms.messages.search` | read · many rooms · critical |
 | robrix-navigation | `host.nav.user`, `host.nav.thread`, `host.nav.event`, `host.nav.room`, `host.nav.space`, `host.nav.screen`, `host.nav.link`, `host.nav.app` | act · app→Robrix · this room / account |
 | robrix-composer | `host.composer.insert`, `host.composer.reply_to` | act · app→Robrix · this room |
-| matrix-room-watch | `on_room_message`, `on_room_members_changed` (Robrix→app hooks) | read · this room |
-| matrix-room-info | `on_room_pins_changed` (Robrix→app hook) | read · this room |
+| matrix-room-watch | `on_room_message`, `on_room_message_changed`, `on_room_reaction`, `on_room_typing`, `on_room_receipt`, `on_room_members_changed` (Robrix→app hooks) | read · this room |
+| matrix-room-info | `on_room_pins_changed`, `on_room_info_changed`, `on_room_unread_changed` (Robrix→app hooks) | read · this room |
+| matrix-rooms-list | `on_rooms_changed`, `on_invite_received`, `on_unread_totals_changed` (Robrix→app hooks) | read · many rooms |
 
 Ungated plumbing every app has: `host.env.read` (`"env"`),
 `permissions.query`, `permissions.request`, `events.subscribe` /
@@ -334,16 +335,55 @@ fn on_room_message(json){
     for m in batch { messages.push(m) }
     ui.msg_list.render()
 }
+fn on_room_message_changed(json){ load() }   // {room_id, event_id, edited, redacted, body}
+fn on_room_reaction(json){ load() }          // {room_id, event_id, key, sender_id, added}
+fn on_room_typing(json){ show_typing(json.parse_json().typing) }   // {room_id, typing: [{user_id, name}, ...]}
+fn on_room_receipt(json){ load() }           // {room_id, receipts: [{user_id, event_id, ts}, ...]}
 fn on_room_members_changed(json){ load() }   // {room_id, count}
 fn on_room_pins_changed(json){ load() }      // {room_id, pinned: [event_id, ...]}
+fn on_room_info_changed(json){ load() }      // {room_id, name, topic, encrypted, is_favorite, is_low_priority, upgraded}
+fn on_room_unread_changed(json){ load() }    // {room_id, unread, mentions, marked_unread}
+fn on_rooms_changed(json){ load() }          // {joined: [room_id, ...], left: [room_id, ...], changed: [room_id, ...]}
+fn on_invite_received(json){ load() }        // {room_id, name, inviter_id, inviter_name, is_space}
+fn on_unread_totals_changed(json){ load() }  // {unread, mentions}
 fn watch(){
     host.request("events.subscribe", {event: "on_room_message"}, nil)
 }
 ```
 
-`on_room_message` gets every new message since you subscribed, batched
-into one call per burst and never replayed from history; `sender` is the
-short name and `sender_id` the full id, like `matrix.read_messages`.
+Each hook gets one JSON string argument:
+
+- `on_room_message`: every new message since you subscribed, batched
+  into one call per burst and never replayed from history; `sender` is
+  the short name and `sender_id` the full id, like `matrix.read_messages`.
+  Edits do not show up here (see the next hook).
+- `on_room_message_changed`: one call per edit or redaction of a message;
+  `event_id` is the message that changed, `body` its new text (up to 500
+  chars) or `""` when redacted.
+- `on_room_reaction`: one call per reaction added (`added: true`) or
+  removed; `event_id` is the reacted-to message and `sender_id` who
+  reacted. A removal only knows `event_id` and `key` when the app saw that
+  reaction added, otherwise they are `null`.
+- `on_room_typing`: the current set of other users typing, latest set only
+  (an empty list means nobody).
+- `on_room_receipt`: read positions that moved, own and others', batched
+  per burst; `ts` is unix millis or `null`. Stays silent while the user has
+  hidden read receipts in Robrix's settings.
+- `on_room_members_changed`: someone joined or left; `count` is the new
+  joined-member count.
+- `on_room_pins_changed`: the new list of pinned event ids.
+- `on_room_info_changed`: name, topic, encryption, favorite / low-priority
+  tags or a room upgrade changed; only sent when something differs.
+- `on_room_unread_changed`: the room's unread and mention counts and its
+  marked-unread flag; only sent when something differs.
+- `on_rooms_changed` (account-wide): per sync, the rooms newly joined,
+  left, and those that had any update (`changed`).
+- `on_invite_received` (account-wide): one call per new invite.
+- `on_unread_totals_changed` (account-wide): the sums over every joined
+  room, only when they change.
+
+The three account-wide hooks need `matrix-rooms-list` and work with or
+without an attached room; the others need a room.
 `events.unsubscribe` `{event: "on_room_message"}` (or `"*"`) stops them.
 Hooks arrive only while the app is running (its pane, chip, tab or
 modal); nothing is queued for a closed app.

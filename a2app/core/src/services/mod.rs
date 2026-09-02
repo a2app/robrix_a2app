@@ -138,12 +138,13 @@ pub enum BrokerAsk {
         app_id: MiniAppId,
         action: HostAction,
     },
-    /// This isolate wants `hook` for its room; already permission-checked.
+    /// This isolate wants `hook` for its room (none for an account-wide
+    /// hook); already permission-checked.
     Subscribe {
         reply: Reply,
         app_id: MiniAppId,
         heap_key: usize,
-        room: String,
+        room: Option<String>,
         hook: &'static str,
     },
     /// Drop one hook (or all with `None`) for this isolate.
@@ -669,9 +670,10 @@ impl Broker {
                 let Some(hook) = crate::capabilities::for_hook(name).filter(|c| c.is_available()) else {
                     return respond(cx, reply, Err(&format!("unknown event '{name}'")));
                 };
-                let Some(room) = instance_room.clone() else {
+                let room = instance_room.clone();
+                if room.is_none() && hook.scope == crate::capabilities::Scope::Room {
                     return respond(cx, reply, Err("this mini-app is not attached to a room"));
-                };
+                }
                 // The hook's own group answers, exactly like an outgoing call.
                 match ctx.permissions.effective_capability(&manifest, hook) {
                     Effective::Granted => {
