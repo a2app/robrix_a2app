@@ -60,18 +60,23 @@ fn cost_of(service: &str) -> f64 {
         | "matrix.pinned_events" | "matrix.room_threads" => 5.0,
         // Put something on screen the user has to deal with.
         "files.pick" | "files.save" | "auth.check" | "share" | "url.open" => 8.0,
+        // Steer Robrix itself: a pane, a room switch, the composer.
+        "nav.room" | "nav.event" | "nav.thread" | "nav.user" | "nav.space" | "nav.screen"
+        | "nav.link" | "nav.app" | "composer.insert" | "composer.reply_to" => 8.0,
         // Unknown services are refused upstream; price them like the worst.
         _ => 8.0,
     }
 }
 
-/// Services that put OS UI on screen or hand the user to another app. These
-/// are foreground-only: an app whose pane isn't the one on screen has no
-/// business raising a file picker or launching a browser.
+/// Services that put OS UI on screen, hand the user to another app, or steer
+/// Robrix around. These are foreground-only: an app whose pane isn't the one
+/// on screen has no business raising a file picker or switching rooms.
 pub fn is_ui_service(service: &str) -> bool {
     matches!(
         service,
         "files.pick" | "files.save" | "auth.check" | "share" | "url.open"
+        | "nav.room" | "nav.event" | "nav.thread" | "nav.user" | "nav.space" | "nav.screen"
+        | "nav.link" | "nav.app" | "composer.insert" | "composer.reply_to"
     )
 }
 

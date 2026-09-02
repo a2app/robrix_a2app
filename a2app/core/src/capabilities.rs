@@ -197,8 +197,6 @@ macro_rules! cap {
 
 use Permission as P;
 
-/// Every capability, grouped by permission in display order. Available ones
-/// map 1:1 onto the broker services and hooks that exist today.
 /// Every capability, grouped by permission in display order. Available
 /// rows map 1:1 onto the broker services and hooks that exist today; the
 /// planned and never rows document the full intended surface.
@@ -377,17 +375,17 @@ pub const CATALOG: &[Capability] = &[
     cap!("matrix.space.rooms.list", "Rooms in a space", "Child rooms and subspaces with joined flag.", Read, Outgoing, Space, Some(P::MatrixSpaces), PlannedMachinery, Medium, []),
     cap!("on_space_changed", "Space changed", "A subscribed space's children or your space list changed.", Read, Incoming, Space, Some(P::MatrixSpaces), PlannedMachinery, Low, []),
     // ----- robrix-navigation -----
-    cap!("host.nav.room", "Open a room", "Switch Robrix to a joined room; unknown or unjoined refused.", Act, Outgoing, MultiRoom, Some(P::RobrixNavigation), PlannedMachinery, Medium, []),
-    cap!("host.nav.event", "Jump to a message", "Scroll the attached room to an event and highlight it.", Act, Outgoing, Room, Some(P::RobrixNavigation), PlannedMachinery, Low, []),
-    cap!("host.nav.thread", "Open a thread", "Open a thread of the attached room.", Act, Outgoing, Room, Some(P::RobrixNavigation), PlannedMachinery, Low, []),
-    cap!("host.nav.user", "Show a profile", "Open the user profile pane for a user.", Act, Outgoing, User, Some(P::RobrixNavigation), PlannedMachinery, Low, []),
-    cap!("host.nav.space", "Open a space", "Go to a space's lobby.", Act, Outgoing, Space, Some(P::RobrixNavigation), PlannedMachinery, Low, []),
-    cap!("host.nav.screen", "Open a screen", "Home, add/join room, Mini Apps, Settings.", Act, Outgoing, Client, Some(P::RobrixNavigation), PlannedMachinery, Low, []),
-    cap!("host.nav.link", "Open a Matrix link in-app", "Resolve a matrix.to / matrix: URI to a room, event or user inside Robrix.", Act, Outgoing, MultiRoom, Some(P::RobrixNavigation), PlannedNewPlumbing, Medium, []),
-    cap!("host.nav.app", "Open another mini-app", "Open an installed app in this room's dock; target must be installed and unrestricted.", Act, Outgoing, Apps, Some(P::RobrixNavigation), PlannedMachinery, Low, []),
+    cap!("host.nav.room", "Open a room", "Switch Robrix to a joined room; unknown or unjoined refused.", Act, Outgoing, MultiRoom, Some(P::RobrixNavigation), Available, Medium, ["nav.room"]),
+    cap!("host.nav.event", "Jump to a message", "Scroll the attached room to an event and highlight it.", Act, Outgoing, Room, Some(P::RobrixNavigation), Available, Low, ["nav.event"]),
+    cap!("host.nav.thread", "Open a thread", "Open a thread of the attached room.", Act, Outgoing, Room, Some(P::RobrixNavigation), Available, Low, ["nav.thread"]),
+    cap!("host.nav.user", "Show a profile", "Open the user profile pane for a user.", Act, Outgoing, User, Some(P::RobrixNavigation), Available, Low, ["nav.user"]),
+    cap!("host.nav.space", "Open a space", "Go to a space's lobby.", Act, Outgoing, Space, Some(P::RobrixNavigation), Available, Low, ["nav.space"]),
+    cap!("host.nav.screen", "Open a screen", "Home, add/join room, Mini Apps, Settings.", Act, Outgoing, Client, Some(P::RobrixNavigation), Available, Low, ["nav.screen"]),
+    cap!("host.nav.link", "Open a Matrix link in-app", "Resolve a matrix.to / matrix: URI to a room, event or user inside Robrix; aliases are not resolved yet.", Act, Outgoing, MultiRoom, Some(P::RobrixNavigation), Available, Medium, ["nav.link"]),
+    cap!("host.nav.app", "Open another mini-app", "Open an installed app in this room's dock; target must be installed and unrestricted.", Act, Outgoing, Apps, Some(P::RobrixNavigation), Available, Low, ["nav.app"]),
     // ----- robrix-composer -----
-    cap!("host.composer.insert", "Draft a message for you", "Put text into the attached room's message box, optionally as a reply; the user still presses send.", Act, Outgoing, Room, Some(P::RobrixComposer), PlannedNewPlumbing, Medium, []),
-    cap!("host.composer.reply_to", "Set reply target", "Put the composer into reply or thread-reply mode for an event.", Act, Outgoing, Room, Some(P::RobrixComposer), PlannedMachinery, Low, []),
+    cap!("host.composer.insert", "Draft a message for you", "Put text into the attached room's message box; the user still presses send.", Act, Outgoing, Room, Some(P::RobrixComposer), Available, Medium, ["composer.insert"]),
+    cap!("host.composer.reply_to", "Set reply target", "Put the attached room's composer into reply mode for a message.", Act, Outgoing, Room, Some(P::RobrixComposer), Available, Low, ["composer.reply_to"]),
     // ----- robrix-ui -----
     cap!("ui.pane.request_size", "Preferred size", "Hint the size along the pane's resizable axis; the dock clamps and the user's drag always wins; rate-limited harder since it reflows the timeline.", Act, Outgoing, Instance, Some(P::RobrixUi), PlannedNewPlumbing, Low, []),
     cap!("ui.pane.set_side", "Choose dock side", "Move to top/bottom/left/right, same as the CycleEdge button.", Act, Outgoing, Instance, Some(P::RobrixUi), PlannedMachinery, Low, []),

@@ -128,6 +128,30 @@ pub enum BrokerAsk {
         room: Option<String>,
         call: MatrixServiceCall,
     },
+    /// Steer the host UI (navigate, or touch the composer), then answer
+    /// `reply`. Ids are validated by the host, which knows the id types.
+    HostAction {
+        reply: Reply,
+        app_id: MiniAppId,
+        action: HostAction,
+    },
+}
+
+/// A parsed nav.* / composer.* call. `room` is the explicit `room_id`
+/// argument, else the instance's own room; `None` means neither was given.
+pub enum HostAction {
+    OpenRoom { room: String },
+    JumpToEvent { room: Option<String>, event_id: String },
+    OpenThread { room: Option<String>, event_id: String },
+    ShowUser { room: Option<String>, user_id: String },
+    OpenSpace { space: String },
+    /// One of `home`, `add_room`, `mini_apps`, `settings`.
+    OpenScreen { screen: String },
+    /// A `matrix.to` / `matrix:` link, resolved host-side.
+    OpenLink { room: Option<String>, url: String },
+    OpenApp { room: Option<String>, app_id: MiniAppId },
+    ComposerInsert { room: Option<String>, text: String },
+    ComposerReplyTo { room: Option<String>, event_id: String },
 }
 
 /// A matrix.* service call, parsed and validated by the broker.
@@ -657,6 +681,40 @@ impl Broker {
                     room: instance_room.clone(),
                     call,
                 });
+            }
+            "nav.room" | "nav.event" | "nav.thread" | "nav.user" | "nav.space"
+            | "nav.screen" | "nav.link" | "nav.app" | "composer.insert"
+            | "composer.reply_to" => {
+                let arg = |key: &str| args[key].as_str().map(str::trim).filter(|v| !v.is_empty());
+                let room = arg("room_id").map(str::to_string).or_else(|| instance_room.clone());
+                let need = |key: &str| arg(key).map(str::to_string).ok_or(format!("{} needs {{{key}}}", req.service));
+                let action = match req.service.as_str() {
+                    "nav.room" => need("room_id").map(|room| HostAction::OpenRoom { room }),
+                    "nav.event" => need("event_id").map(|event_id| HostAction::JumpToEvent { room, event_id }),
+                    "nav.thread" => need("event_id").map(|event_id| HostAction::OpenThread { room, event_id }),
+                    "nav.user" => need("user_id").map(|user_id| HostAction::ShowUser { room, user_id }),
+                    "nav.space" => need("space_id").map(|space| HostAction::OpenSpace { space }),
+                    "nav.screen" => need("screen").map(|screen| HostAction::OpenScreen { screen }),
+                    "nav.link" => need("url").map(|url| HostAction::OpenLink { room, url }),
+                    "nav.app" => need("app_id").map(|app_id| HostAction::OpenApp { room, app_id }),
+                    "composer.reply_to" => need("event_id").map(|event_id| HostAction::ComposerReplyTo { room, event_id }),
+                    "composer.insert" => need("text").and_then(|text| {
+                        // A draft is the app's words in the user's composer, so it
+                        // gets the same ceiling a sent message does.
+                        (text.chars().count() <= 4096)
+                            .then_some(HostAction::ComposerInsert { room, text })
+                            .ok_or_else(|| String::from("text is too long (4096 characters max)"))
+                    }),
+                    _ => unreachable!("service list checked above"),
+                };
+                match action {
+                    Ok(action) => asks.push(BrokerAsk::HostAction {
+                        reply,
+                        app_id: manifest.id.clone(),
+                        action,
+                    }),
+                    Err(e) => respond(cx, reply, Err(&e)),
+                }
             }
             _ => unreachable!("service list checked above"),
         }
