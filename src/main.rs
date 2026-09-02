@@ -10,5 +10,12 @@
 )]
 
 fn main() {
+    // Headless MCP tool-bridge mode: when an agent spawns Robrix as its MCP
+    // server (`robrix --mcp-bridge --socket <path>`), relay the agent's MCP
+    // stdio to the real Robrix process and exit — no window, no makepad.
+    #[cfg(all(feature = "a2app", unix))]
+    if let Some(code) = robrix::a2app::ai::bridge::maybe_run() {
+        std::process::exit(code);
+    }
     robrix::app::app_main()
 }

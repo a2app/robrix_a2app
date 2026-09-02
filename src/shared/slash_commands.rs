@@ -134,6 +134,12 @@ pub static SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Open, run, create, or share Splash mini-apps in this room",
         usage: "/miniapp [run <app name> | share <app name> | <describe an app to create>]",
     },
+    SlashCommand {
+        name: "ai",
+        aliases: &["agent", "ask"],
+        description: "Talk to the Robrix AI agent in this room (mini-apps feature)",
+        usage: "/ai <what you want>",
+    },
 
     // TODO: add more of the commands below, most of which need backend matrix requests:
     //
@@ -193,6 +199,11 @@ pub enum SlashCommandAction {
     /// and anything else starts a room-scoped generation.
     /// Only produced in builds with the `a2app` feature.
     MiniApp(String),
+    /// Send the text to the room's long-lived AI agent session, creating it
+    /// on first use. The agent's replies come back into the room, and it can
+    /// build mini-apps (`launch_splash_app`) while it chats.
+    /// Only produced in builds with the `a2app` feature.
+    Ai(String),
 }
 
 /// Returns an iterator over all slash commands matching the given query.
@@ -243,6 +254,15 @@ pub fn parse_input(text: &str) -> SlashCommandOutcome {
         #[cfg(not(feature = "a2app"))]
         return SlashCommandOutcome::Error(
             "Mini apps aren't enabled in this build of Robrix (the `a2app` feature is off).".to_owned()
+        );
+    }
+
+    if command.name == "ai" {
+        #[cfg(feature = "a2app")]
+        return SlashCommandOutcome::Action(SlashCommandAction::Ai(arg.to_owned()));
+        #[cfg(not(feature = "a2app"))]
+        return SlashCommandOutcome::Error(
+            "The AI agent isn't enabled in this build of Robrix (the `a2app` feature is off).".to_owned()
         );
     }
 

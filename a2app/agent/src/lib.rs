@@ -8,6 +8,7 @@
 
 pub mod acp_client;
 pub mod intent;
+pub mod mcp;
 #[cfg(feature = "embedded")]
 mod octos_embedded;
 pub mod pipeline;
@@ -508,6 +509,27 @@ pub fn start_backend(
     workspace: &std::path::Path,
     prefs: &prefs::AgentPrefs,
 ) -> Result<Box<dyn AgentTransport>, String> {
+    start_backend_with_mcp(workspace, prefs, &[])
+}
+
+/// [`start_backend`] plus the stdio MCP servers the spawned agent is told
+/// about in `session/new` (`mcpServers`). A long-lived AI session passes the
+/// one Robrix tool server it bound for itself here; the one-shot create-app
+/// pipeline calls [`start_backend`], which advertises none.
+///
+/// Which agents honor the advertisement: claude-code-acp (the bridged
+/// backend) and any `ROBRIX_AGENT_CMD` override read `mcpServers` from
+/// `session/new`, so the tools reach their models. octos does NOT — it only
+/// registers MCP servers named in its own config file — so a session whose
+/// backend is octos runs without host tools until that path grows per-session
+/// config injection (`OCTOS_CONFIG_DIR` + an `mcp_servers` entry). An
+/// in-process embedded agent can't exec the Robrix relay child at all, so the
+/// config is silently ignored there too.
+pub fn start_backend_with_mcp(
+    workspace: &std::path::Path,
+    prefs: &prefs::AgentPrefs,
+    mcp_servers: &[crate::mcp::McpServerConfig],
+) -> Result<Box<dyn AgentTransport>, String> {
     // Refuse before spawning rather than translating an errno afterwards: the
     // check knows WHICH program is missing, so it can name it and the install.
     if let Some(blocked) = blocker() {
@@ -531,10 +553,13 @@ pub fn start_backend(
         if let Ok(model) = std::env::var("ROBRIX_AGENT_MODEL") {
             env.push((String::from("ANTHROPIC_MODEL"), model));
         }
-        return Ok(Box::new(AcpClient::spawn(&cmd, workspace, &env, &extra)?));
+        return Ok(Box::new(AcpClient::spawn(&cmd, workspace, &env, &extra, mcp_servers)?));
     }
     #[cfg(feature = "embedded")]
     {
+        // An in-process agent cannot exec the Robrix relay child, so the
+        // tool config above can never be honored; drop it silently.
+        let _ = mcp_servers;
         return Ok(Box::new(octos_embedded::EmbeddedOctos::start(workspace, prefs)?));
     }
     #[cfg(not(feature = "embedded"))]
@@ -544,9 +569,9 @@ pub fn start_backend(
             // The bridge gets its own env only: `backend.env(prefs)` carries
             // octos's knobs, and the model/effort names in it mean nothing to
             // another provider's endpoint.
-            return Ok(Box::new(AcpClient::spawn(&cmd, workspace, &bridge_env, &[])?));
+            return Ok(Box::new(AcpClient::spawn(&cmd, workspace, &bridge_env, &[], mcp_servers)?));
         }
-        Ok(Box::new(AcpClient::spawn(&octos_acp_command(prefs), workspace, &env, &extra)?))
+        Ok(Box::new(AcpClient::spawn(&octos_acp_command(prefs), workspace, &env, &extra, mcp_servers)?))
     }
 }
 
