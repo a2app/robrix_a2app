@@ -170,6 +170,24 @@ fn agent_thread(
     evt_tx: Sender<AcpEvent>,
     shutdown: Arc<Shutdown>,
 ) {
+    // Debug builds only: surface octos's own tracing (MCP connect/discovery,
+    // provider resolution) on stderr so an embedded-agent failure is visible
+    // in the `cargo run` console instead of vanishing into a dead subscriber.
+    // Robrix itself doesn't use tracing, so this prints octos lines only.
+    #[cfg(debug_assertions)]
+    {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(std::io::stderr)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| {
+                        "octos_agent::mcp=debug,octos_cli=info,octos=info".into()
+                    }),
+            )
+            .try_init();
+    }
+
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         // Deep agent futures; octos's own entrypoints use an 8MB stack.

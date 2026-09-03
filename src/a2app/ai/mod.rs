@@ -31,3 +31,8 @@ pub mod bridge;
 pub mod server;
 #[cfg(unix)]
 pub mod session;
+/// AI Rooms: Matrix operations (create/mark/attach, forwarding cursor,
+/// `ai_reply` writes) run on the async worker. Unix-only, like [`session`],
+/// since a session is what a room attaches to.
+#[cfg(unix)]
+pub mod rooms;

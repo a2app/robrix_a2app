@@ -21,6 +21,10 @@ use std::time::Duration;
 use a2app_agent::mcp::{MAX_FRAME_BYTES, McpServer, read_frame};
 
 /// Handles one accepted connection until the peer closes it (or sends a frame
+/// too large to be a protocol we can answer). Reports WHY the connection
+/// ended on stderr, so a relay that dies mid-session ("socket EOF right after
+/// initialize") can be traced to the exact serve-thread exit.
+/// Handles one accepted connection until the peer closes it (or sends a frame
 /// too large to be a protocol we can answer).
 fn serve_connection(mut stream: UnixStream, server: McpServer) {
     let read_half = match stream.try_clone() {
@@ -69,6 +73,21 @@ fn accept_loop(
             Ok((stream, _)) => {
                 let id = next_id;
                 next_id += 1;
+                // macOS/BSD `accept()` inherits the listener's O_NONBLOCK onto
+                // the accepted socket. Each connection is served on its own
+                // thread with BLOCKING reads, so clear it: without this, a
+                // quiet moment between requests (e.g. right after the
+                // initialize reply, before the client's next frame lands)
+                // makes the serve thread's read return EAGAIN, which the
+                // frame reader treats as a dead peer and drops the
+                // connection. Linux does not inherit the flag, which is why
+                // this only ever broke on macOS.
+                if let Err(e) = stream.set_nonblocking(false) {
+                    // A connection we can't serve on its own thread is not a
+                    // connection at all; drop it and keep accepting.
+                    eprintln!("robrix tool server: could not clear nonblocking on an accepted connection: {e}");
+                    continue;
+                }
                 // Register a write handle so session teardown (Drop) can
                 // interrupt this connection even while its serve thread is
                 // blocked reading from it.
