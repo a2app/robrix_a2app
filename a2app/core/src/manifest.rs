@@ -91,9 +91,9 @@ impl MiniAppManifest {
                 _ => {}
             }
         }
-        match (rooms, spaces) {
-            (true, _) => RunsIn::Rooms,
-            (false, true) => RunsIn::Spaces,
+        match (spaces, rooms) {
+            (true, _) => RunsIn::Spaces,
+            (false, true) => RunsIn::Rooms,
             (false, false) => RunsIn::Account,
         }
     }

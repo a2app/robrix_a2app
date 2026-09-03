@@ -221,6 +221,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn built_ins_run_where_they_say() {
+        use crate::manifest::RunsIn;
+        let apps = builtin_apps();
+        let runs_in = |id: &str| apps.iter().find(|a| a.id == id).unwrap().runs_in();
+        assert_eq!(runs_in("room-peek"), RunsIn::Room);
+        assert_eq!(runs_in("search"), RunsIn::Room);
+        assert_eq!(runs_in("inbox"), RunsIn::Rooms);
+        assert_eq!(runs_in("spaces"), RunsIn::Spaces);
+        assert_eq!(runs_in("account"), RunsIn::Account);
+        assert_eq!(runs_in("inspector"), RunsIn::Account);
+    }
+
     /// Every stock app must parse with the real Splash parser, or it would
     /// launch to an empty pane.
     #[test]

@@ -1317,7 +1317,7 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
 /// the home screen is up).
 pub fn room_display_name(rooms: &RoomsListRef, room_id: &str) -> Option<String> {
     let room_id = OwnedRoomId::try_from(room_id).ok()?;
-    rooms.get_room_name(&room_id).map(|name| name.display_name().to_string())
+    rooms.get_room_name(&room_id).map(|name| name.display().into_owned())
 }
 
 /// The name of a room the user is in. Anything else would open a join
