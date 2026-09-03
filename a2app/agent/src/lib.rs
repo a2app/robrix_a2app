@@ -360,6 +360,10 @@ pub fn bridged_provider() -> Option<String> {
         .map(|(id, _)| id.to_string())
 }
 
+/// The child-backend bridge: only reachable when the embedded backend is NOT
+/// compiled in (an embedded agent never falls back to a Claude Code bridge),
+/// so the whole helper is gated rather than left dead in embedded builds.
+#[cfg(not(feature = "embedded"))]
 fn anthropic_compatible_bridge() -> Option<(String, Vec<(String, String)>)> {
     if on_path("octos") || !on_path("claude-code-acp") {
         return None;
