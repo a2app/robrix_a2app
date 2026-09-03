@@ -60,7 +60,7 @@ pub enum Scope {
 pub enum Status {
     Available,
     /// Shipped, but refused without prompting while the user's "Mini-apps
-    /// may write to rooms" switch is off.
+    /// can write to rooms" switch is off.
     RefusedBySwitch,
     /// Robrix already has the SDK call or update stream; needs a service or
     /// hook, a worker arm, and delivery.

@@ -224,7 +224,7 @@ pub enum A2AppOp {
     NewPrompt,
     /// Posts an app's bundle into a room as a custom event.
     ShareToRoom { app_id: MiniAppId, room_id: OwnedRoomId },
-    /// The user's "Mini-apps may write to rooms" switch.
+    /// The user's "Mini-apps can write to rooms" switch.
     SetMatrixWrite(bool),
 }
 
@@ -425,6 +425,15 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
 
     advance_generation(cx, ui);
     process_broker(cx, ui);
+
+    // An action the user took that was refused or failed gets a popup that
+    // says why, on top of the script's own error handling.
+    for (app_id, error) in with_a2app(|state| state.broker.failed_acts()).unwrap_or_default() {
+        let name = with_a2app(|state| state.registry.get(&app_id).map(|a| a.name.clone()))
+            .flatten()
+            .unwrap_or(app_id);
+        enqueue_popup_notification(format!("{name}: {error}"), PopupKind::Warning, Some(7.0));
+    }
     expire_timed_grants(cx, ui);
     persist_if_dirty();
 }
@@ -1171,6 +1180,8 @@ fn process_broker(cx: &mut Cx, ui: &WidgetRef) {
         let A2AppState { broker, registry, permissions, foreground_app, .. } = state;
         let is_docked = |app_id: &str| instances::is_docked(app_id);
         let desktop_view = effective_is_desktop(cx);
+        let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
+        let room_name = |id: &str| room_display_name(rooms.as_ref()?, id);
         broker.process(cx, BrokerCtx {
             registry,
             permissions,
@@ -1178,10 +1189,9 @@ fn process_broker(cx: &mut Cx, ui: &WidgetRef) {
             is_docked: &is_docked,
             is_running: &instances::is_running,
             pane_state: &instances::pane_state,
+            room_name: &room_name,
             desktop_view,
         })
-        let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
-        let room_name = |id: &str| room_display_name(rooms.as_ref()?, id);
     }).unwrap_or_default();
 
     let had_asks = !asks.is_empty();
@@ -1189,7 +1199,6 @@ fn process_broker(cx: &mut Cx, ui: &WidgetRef) {
         apply_broker_ask(cx, ui, ask);
     }
     if had_asks {
-            room_name: &room_name,
         ui.redraw(cx);
     }
 }
@@ -1304,6 +1313,13 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
 
 /// Applies one nav.* / composer.* call. Global moves happen right here;
 /// room-scoped ones open the room and park the action for its RoomScreen.
+/// A room's display name, once the rooms list exists (it does not before
+/// the home screen is up).
+pub fn room_display_name(rooms: &RoomsListRef, room_id: &str) -> Option<String> {
+    let room_id = OwnedRoomId::try_from(room_id).ok()?;
+    rooms.get_room_name(&room_id).map(|name| name.display_name().to_string())
+}
+
 /// The name of a room the user is in. Anything else would open a join
 /// dialog on an app's say-so.
 fn joined_room_name(cx: &mut Cx, room_id: &OwnedRoomId) -> Result<RoomNameId, String> {
@@ -1313,13 +1329,6 @@ fn joined_room_name(cx: &mut Cx, room_id: &OwnedRoomId) -> Result<RoomNameId, St
     }
     Ok(rooms.get_room_name(room_id).unwrap_or_else(|| RoomNameId::empty(room_id.clone())))
 }
-/// A room's display name, once the rooms list exists (it does not before
-/// the home screen is up).
-pub fn room_display_name(rooms: &RoomsListRef, room_id: &str) -> Option<String> {
-    let room_id = OwnedRoomId::try_from(room_id).ok()?;
-    rooms.get_room_name(&room_id).map(|name| name.display_name().to_string())
-}
-
 
 /// Parks `action` for `room_id`'s RoomScreen and navigates there. The
 /// caller may be on the Mini Apps tab; the room lives on Home.
@@ -1664,6 +1673,8 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
                 let A2AppState { broker, registry, permissions, foreground_app, .. } = state;
                 let is_docked = |app_id: &str| instances::is_docked(app_id);
                 let desktop_view = effective_is_desktop(cx);
+                let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
+                let room_name = |id: &str| room_display_name(rooms.as_ref()?, id);
                 broker.dispatch_after_grant(cx, BrokerCtx {
                     registry,
                     permissions,
@@ -1671,10 +1682,9 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
                     is_docked: &is_docked,
                     is_running: &instances::is_running,
                     pane_state: &instances::pane_state,
+                    room_name: &room_name,
                     desktop_view,
                 }, request)
-                let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
-                let room_name = |id: &str| room_display_name(rooms.as_ref()?, id);
             }).unwrap_or_default();
             for ask in asks {
                 apply_broker_ask(cx, ui, ask);
@@ -1682,7 +1692,6 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
         } else {
             Broker::respond_denied(cx, &request);
         }
-                    room_name: &room_name,
     }
 
     apply_permission_to_running(cx, ui, &prompt.app_id, prompt.perm);

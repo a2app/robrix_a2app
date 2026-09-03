@@ -355,9 +355,14 @@ fn on_rooms_changed(json){ load() }          // {joined: [room_id, ...], left: [
 fn on_invite_received(json){ load() }        // {room_id, name, inviter_id, inviter_name, is_space}
 fn on_unread_totals_changed(json){ load() }  // {unread, mentions}
 fn watch(){
-    host.request("events.subscribe", {event: "on_room_message"}, nil)
+    host.request("events.subscribe", {event: "on_room_message"}, fn(r){
+        if !r.is_ok { ui.status.set_text("Live updates are off: " + r.error) }
+    })
 }
 ```
+
+Subscribe with a callback and say so when it is refused; a silent
+subscribe leaves the user wondering why nothing updates.
 
 Each hook gets one JSON string argument:
 
@@ -622,7 +627,7 @@ burning a permission.
 
 Everything from here down writes as the user. Call these only on an explicit
 user action (a tap, Return), never on a timer or at startup, one call per
-action, and show what was done. The user's "Mini-apps may write to rooms"
+action, and show what was done. The user's "Mini-apps can write to rooms"
 switch (off by default) refuses every one of them like a denial
 (`r.is_ok == false`, `r.error` says why), so never assume a write went through.
 

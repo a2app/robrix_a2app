@@ -16,6 +16,7 @@ pub mod matrix;
 
 pub use matrix::{MatrixServiceCall, SearchScope};
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Mutex;
@@ -86,9 +87,16 @@ fn trace_on() -> bool {
     std::env::var("ROBRIX_A2APP_TRACE_SERVICES").is_ok()
 }
 
+thread_local! {
+    /// Every answer given this pass, so the host can tell the user about a
+    /// failed action after the fact (see [`Broker::failed_acts`]).
+    static ANSWERS: RefCell<Vec<(Reply, Option<String>)>> = RefCell::new(Vec::new());
+}
+
 /// Answers one request. `Ok` carries the `data` JSON, `Err` the user-visible
 /// error string.
 pub fn respond(cx: &mut Cx, reply: Reply, result: Result<&str, &str>) {
+    ANSWERS.with(|a| a.borrow_mut().push((reply, result.err().map(str::to_string))));
     let outcome = splash_host_respond(cx, reply.heap_key, reply.req_id, result);
     if trace_on() {
         let mut preview = match result {
@@ -250,16 +258,16 @@ pub struct BrokerCtx<'a> {
     pub is_running: &'a dyn Fn(&str) -> bool,
     /// The calling isolate's pane, by heap key.
     pub pane_state: &'a dyn Fn(usize) -> Option<PaneState>,
+    /// A room's display name, for `env`.
+    pub room_name: &'a dyn Fn(&str) -> Option<String>,
     pub desktop_view: bool,
 }
 
 /// The refusal every switch-gated write gets while the user keeps writes off.
 pub const MATRIX_WRITE_OFF_MSG: &str =
-    "Mini-apps may not write to rooms: turn on \"Mini-apps may write to rooms\" in the Mini Apps screen";
+    "writing to rooms is switched off for all mini-apps; turn on \"Mini-apps can write to rooms\" in the Mini Apps screen";
 
 pub struct Broker {
-    /// A room's display name, for `env`.
-    pub room_name: &'a dyn Fn(&str) -> Option<String>,
     tx: Sender<Completion>,
     rx: Receiver<Completion>,
     /// Kept alive so CoreLocation's delegate keeps reporting; created lazily
@@ -275,6 +283,9 @@ pub struct Broker {
     /// Which app owns each on-screen OS dialog, so the one-at-a-time guard
     /// can be released when the completion comes home from another thread.
     dialog_owner: HashMap<(usize, u64), MiniAppId>,
+    /// Requests that act on the user's behalf (a send, a join, a navigation),
+    /// whose refusal or failure the user must see, not just the script.
+    acts: HashMap<(usize, u64), MiniAppId>,
 }
 
 impl Default for Broker {
@@ -294,7 +305,24 @@ impl Broker {
             pending_geo: HashMap::new(),
             limits: limits::AbuseLimiter::default(),
             dialog_owner: HashMap::new(),
+            acts: HashMap::new(),
         }
+    }
+
+    /// The actions answered with an error since the last call, as
+    /// `(app, message)`, for the host to put in front of the user.
+    pub fn failed_acts(&mut self) -> Vec<(MiniAppId, String)> {
+        let answers = ANSWERS.with(|a| std::mem::take(&mut *a.borrow_mut()));
+        let mut failed: Vec<(MiniAppId, String)> = Vec::new();
+        for (reply, error) in answers {
+            let app = self.acts.remove(&(reply.heap_key, reply.req_id));
+            if let (Some(app), Some(error)) = (app, error)
+                && !failed.iter().any(|(a, e)| *a == app && *e == error)
+            {
+                failed.push((app, error));
+            }
+        }
+        failed
     }
 
     /// Drops an app's rate-limit budget, strikes and dialog guard. Called when
@@ -304,6 +332,7 @@ impl Broker {
     pub fn forget_app(&mut self, app_id: &str) {
         self.limits.forget(app_id);
         self.dialog_owner.retain(|_, owner| owner != app_id);
+        self.acts.retain(|_, owner| owner != app_id);
     }
 
     /// How many of this app's requests have been refused this run, for the
@@ -372,7 +401,7 @@ impl Broker {
         // Name the exact capability, so an author learns which single
         // ability is blocked rather than just its group.
         let msg = match crate::capabilities::for_service(&req.service) {
-            Some(cap) => format!("permission denied: {}", cap.id),
+            Some(cap) => format!("permission denied: {} (allow it in the app's settings)", cap.id),
             None => "permission denied".to_string(),
         };
         respond(cx, Reply::of(req), Err(&msg));
@@ -471,6 +500,15 @@ impl Broker {
         let Some(capability) = crate::capabilities::for_service(&req.service) else {
             return respond(cx, reply, Err(&format!("unknown service '{}'", req.service)));
         };
+        // Writes and acts are what buttons do; a refusal from here on is
+        // shown to the user as well as answered to the script.
+        let acts = capability.direction == crate::capabilities::Direction::Outgoing
+            && (matches!(capability.access, crate::capabilities::Access::Write | crate::capabilities::Access::Act)
+                || capability.status == crate::capabilities::Status::RefusedBySwitch)
+            && !matches!(req.service.as_str(), "events.subscribe" | "events.unsubscribe" | "permissions.request" | "notify.clear");
+        if acts {
+            self.acts.insert((reply.heap_key, reply.req_id), manifest.id.clone());
+        }
         if !capability.is_available() {
             return respond(cx, reply, Err(&format!("'{}' is not available in this Robrix", req.service)));
         }
@@ -526,6 +564,7 @@ impl Broker {
                     "app_id": manifest.id,
                     "room_attached": instance_room.is_some(),
                     "room_id": instance_room,
+                    "room_name": instance_room.as_deref().and_then(|r| (ctx.room_name)(r)),
                     "instance_tag": req.app_tag,
                     "surface": pane.as_ref().map_or("parked", |p| p.surface),
                     "platform": PLATFORM,
@@ -564,7 +603,6 @@ impl Broker {
                     .collect();
                 respond(cx, reply, Ok(&serde_json::json!({ "apps": apps }).to_string()));
             }
-                    "room_name": instance_room.as_deref().and_then(|r| (ctx.room_name)(r)),
             "storage.quota" => {
                 // Walks the jail off-thread; there is no byte cap today.
                 let dir = crate::app_sandbox_dir(&manifest.id);
