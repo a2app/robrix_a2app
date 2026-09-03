@@ -142,7 +142,7 @@ impl MiniAppTimelineCardRef {
                 };
                 inner.view.label(cx, ids!(card_glyph)).set_text(cx, &manifest.icon);
                 inner.view.label(cx, ids!(card_name))
-                    .set_text(cx, &format!("{} — Splash mini-app", manifest.name));
+                    .set_text(cx, &format!("{} · Splash mini-app", manifest.name));
                 inner.view.label(cx, ids!(card_detail))
                     .set_text(cx, &format!("Shared by {sender_name} · wants: {wants}. Installing is not granting; you approve each permission."));
             }

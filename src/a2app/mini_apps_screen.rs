@@ -661,7 +661,7 @@ script_mod! {
                     padding: Inset{top: 9, bottom: 9, left: 12, right: 12},
                     draw_icon +: { svg: (ICON_JOIN_ROOM) }
                     icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
-                    text: "Open in room…"
+                    text: "Run in room…"
                 }
                 info_force_stop_button := RobrixNegativeIconButton {
                     visible: false,
@@ -687,85 +687,100 @@ script_mod! {
 
                 View {
                     width: Fill, height: Fit
-                    flow: Flow.Right{wrap: true}
+                    flow: Right
                     spacing: 8
-                    align: Align{y: 0.5}
                     mod.widgets.MiniAppGroupLabel { text: "Source" }
-                    info_source_button := RobrixNeutralIconButton {
-                        padding: 8,
-                        draw_icon +: { svg: (ICON_VIEW_SOURCE) }
-                        icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
-                        text: "View"
-                    }
-                    info_edit_button := RobrixNeutralIconButton {
-                        padding: 8,
-                        draw_icon +: { svg: (ICON_EDIT) }
-                        icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
-                        text: "Edit"
-                    }
-                    info_modify_button := RobrixNeutralIconButton {
-                        padding: 8,
-                        draw_icon +: { svg: (ICON_SPARKLE) }
-                        icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
-                        text: "Modify with AI"
-                    }
-                }
-                View {
-                    width: Fill, height: Fit
-                    flow: Flow.Right{wrap: true}
-                    spacing: 8
-                    align: Align{y: 0.5}
-                    mod.widgets.MiniAppGroupLabel { text: "Share" }
-                    info_export_button := RobrixNeutralIconButton {
-                        padding: 8,
-                        draw_icon +: { svg: (ICON_COPY) }
-                        icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
-                        text: "Export"
-                    }
-                    info_share_button := RobrixNeutralIconButton {
-                        padding: 8,
-                        draw_icon +: { svg: (ICON_SHARE) }
-                        icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
-                        text: "Share…"
-                    }
-                    info_send_button := RobrixNeutralIconButton {
-                        padding: 8,
-                        draw_icon +: { svg: (ICON_SEND) }
-                        icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
-                        text: "Send to room…"
-                    }
-                }
-                View {
-                    width: Fill, height: Fit
-                    flow: Flow.Right{wrap: true}
-                    spacing: 8
-                    align: Align{y: 0.5}
-                    mod.widgets.MiniAppGroupLabel { text: "Storage" }
-                    info_storage_label := Label {
-                        width: Fit, height: 30
-                        padding: Inset{top: 8, bottom: 0, left: 0, right: 0}, margin: Inset{right: 4}
-                        draw_text +: {
-                            text_style: REGULAR_TEXT {font_size: 10},
-                            color: (MESSAGE_TEXT_COLOR)
+                    View {
+                        width: Fill, height: Fit
+                        flow: Flow.Right{wrap: true}
+                        spacing: 8
+                        align: Align{y: 0.5}
+                        info_source_button := RobrixNeutralIconButton {
+                            padding: 8,
+                            draw_icon +: { svg: (ICON_VIEW_SOURCE) }
+                            icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                            text: "View"
+                        }
+                        info_edit_button := RobrixNeutralIconButton {
+                            padding: 8,
+                            draw_icon +: { svg: (ICON_EDIT) }
+                            icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                            text: "Edit"
+                        }
+                        info_modify_button := RobrixNeutralIconButton {
+                            padding: 8,
+                            draw_icon +: { svg: (ICON_SPARKLE) }
+                            icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                            text: "Modify with AI"
                         }
                     }
-                    info_clear_data_button := RobrixNegativeIconButton {
-                        padding: 8,
-                        icon_walk: Walk{width: 0, height: 0, margin: 0}
-                        text: "Clear Data"
+                }
+                View {
+                    width: Fill, height: Fit
+                    flow: Right
+                    spacing: 8
+                    mod.widgets.MiniAppGroupLabel { text: "Share" }
+                    View {
+                        width: Fill, height: Fit
+                        flow: Flow.Right{wrap: true}
+                        spacing: 8
+                        align: Align{y: 0.5}
+                        info_export_button := RobrixNeutralIconButton {
+                            padding: 8,
+                            draw_icon +: { svg: (ICON_COPY) }
+                            icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                            text: "Export"
+                        }
+                        info_share_button := RobrixNeutralIconButton {
+                            padding: 8,
+                            draw_icon +: { svg: (ICON_SHARE) }
+                            icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                            text: "Share…"
+                        }
+                        info_send_button := RobrixNeutralIconButton {
+                            padding: 8,
+                            draw_icon +: { svg: (ICON_SEND) }
+                            icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                            text: "Send to room…"
+                        }
                     }
-                    info_reset_button := RobrixNegativeIconButton {
-                        visible: false,
-                        padding: 8,
-                        draw_icon +: { svg: (ICON_ROTATE_CW) }
-                        icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
-                        text: "Reset to stock"
-                    }
-                    info_uninstall_button := RobrixNegativeIconButton {
-                        padding: 8,
-                        draw_icon +: { svg: (ICON_TRASH) }
-                        icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
-                        text: "Uninstall"
+                }
+                View {
+                    width: Fill, height: Fit
+                    flow: Right
+                    spacing: 8
+                    mod.widgets.MiniAppGroupLabel { text: "Storage" }
+                    View {
+                        width: Fill, height: Fit
+                        flow: Flow.Right{wrap: true}
+                        spacing: 8
+                        align: Align{y: 0.5}
+                        info_storage_label := Label {
+                            width: Fit, height: 30
+                            padding: Inset{top: 8, bottom: 0, left: 0, right: 0}, margin: Inset{right: 4}
+                            draw_text +: {
+                                text_style: REGULAR_TEXT {font_size: 10},
+                                color: (MESSAGE_TEXT_COLOR)
+                            }
+                        }
+                        info_clear_data_button := RobrixNegativeIconButton {
+                            padding: 8,
+                            icon_walk: Walk{width: 0, height: 0, margin: 0}
+                            text: "Clear Data"
+                        }
+                        info_reset_button := RobrixNegativeIconButton {
+                            visible: false,
+                            padding: 8,
+                            draw_icon +: { svg: (ICON_ROTATE_CW) }
+                            icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                            text: "Reset to stock"
+                        }
+                        info_uninstall_button := RobrixNegativeIconButton {
+                            padding: 8,
+                            draw_icon +: { svg: (ICON_TRASH) }
+                            icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                            text: "Uninstall"
+                        }
                     }
                 }
             }
@@ -919,7 +934,7 @@ script_mod! {
                 align: Align{y: 0.5}
                 source_title := TitleLabel { margin: 0 }
                 source_close_button := RobrixNeutralIconButton {
-                spacing: 0,
+                    spacing: 0,
                     padding: 8,
                     draw_icon +: { svg: (ICON_CLOSE) }
                     icon_walk: Walk{width: 14, height: 14, margin: 0}
@@ -950,7 +965,7 @@ script_mod! {
                 align: Align{y: 0.5}
                 diff_title := TitleLabel { margin: 0 }
                 diff_close_button := RobrixNeutralIconButton {
-                spacing: 0,
+                    spacing: 0,
                     padding: 8,
                     draw_icon +: { svg: (ICON_CLOSE) }
                     icon_walk: Walk{width: 14, height: 14, margin: 0}
@@ -1034,7 +1049,7 @@ script_mod! {
                     text: "Save as new version"
                 }
                 edit_cancel_button := RobrixNeutralIconButton {
-                spacing: 0,
+                    spacing: 0,
                     padding: 8,
                     draw_icon +: { svg: (ICON_CLOSE) }
                     icon_walk: Walk{width: 14, height: 14, margin: 0}
@@ -1319,6 +1334,16 @@ impl MiniAppProviderRow {
     }
 }
 
+/// The primary button's text for an app: bound and room apps run in a room,
+/// everything else just opens.
+fn run_label(scope: &A2AppScope, runs_in: RunsIn) -> &'static str {
+    match (scope, runs_in) {
+        (A2AppScope::Room { .. }, _) => "Run in room",
+        (_, RunsIn::Room) => "Run in room…",
+        _ => "Open",
+    }
+}
+
 fn room_label(cx: &mut Cx, room_id: &str) -> String {
     cx.has_global::<RoomsListRef>()
         .then(|| room_display_name(cx.get_global::<RoomsListRef>(), room_id))
@@ -1528,7 +1553,7 @@ impl Widget for MiniAppsScreen {
         }
         if let Some(app_id) = self.info_app.clone() {
             if self.view.button(cx, ids!(info_open_button)).clicked(actions) {
-                cx.action(A2AppOp::OpenApp { app_id: app_id.clone(), room_id: None, in_room_pane: false });
+                self.open_app(cx, app_id.clone());
             }
             if self.view.button(cx, ids!(info_source_button)).clicked(actions) {
                 self.show_source(cx, &app_id);
@@ -1768,7 +1793,7 @@ impl MiniAppsScreen {
         let Some(Some((name, source))) = with_a2app(|state| {
             state.registry.get(app_id).map(|a| (a.name.clone(), a.source.clone()))
         }) else { return };
-        self.view.label(cx, ids!(source_title)).set_text(cx, &format!("{name} — Splash source"));
+        self.view.label(cx, ids!(source_title)).set_text(cx, &format!("{name} · Splash source"));
         self.view.code_view(cx, ids!(source_code_view)).set_text(cx, &source);
         self.set_pane(cx, Pane::Source);
     }
@@ -1848,6 +1873,8 @@ impl MiniAppsScreen {
 
     /// Opens the app where it belongs: a room-bound app in its room, a
     /// room app in a room the user picks, anything else in the host.
+    /// Runs the app the way its scope calls for: in its bound room, in a
+    /// room the user picks, or on its own.
     fn open_app(&mut self, cx: &mut Cx, app_id: MiniAppId) {
         let target = with_a2app(|state| {
             state.registry.get(&app_id).map(|m| (m.name.clone(), m.scope.clone(), m.runs_in()))
@@ -1958,6 +1985,9 @@ impl MiniAppsScreen {
                 };
                 let kind = format!("{origin} · {place}");
                 self.view.label(cx, ids!(info_kind)).set_text(cx, &kind);
+                let open_label = run_label(&scope, runs_in);
+                self.view.button(cx, ids!(info_open_button)).set_text(cx, open_label);
+                self.view.widget(cx, ids!(info_open_room_button)).set_visible(cx, open_label == "Open");
                 self.view.widget(cx, ids!(restricted_banner)).set_visible(cx, restricted);
                 let running = crate::a2app::runtime::with_a2app(|state| {
                     state.is_running(&app_id)
@@ -2002,12 +2032,13 @@ impl MiniAppsScreen {
                 let rows: Vec<MiniAppRowData> = with_a2app(|state| {
                     state.registry.iter().map(|m| {
                         let running = state.is_running(&m.id);
-                        let (mut detail, open_label) = match (&m.scope, m.runs_in()) {
-                            (A2AppScope::Room { room_id }, _) => (format!("Runs in {}", room_label(cx, room_id)), "Run in room"),
-                            (_, RunsIn::Room) => (String::from("Runs in a room"), "Run in room…"),
-                            (_, RunsIn::Rooms) => (String::from("Works across your rooms"), "Open"),
-                            (_, RunsIn::Spaces) => (String::from("Works across your spaces"), "Open"),
-                            (_, RunsIn::Account) => (String::from("Account-wide"), "Open"),
+                        let open_label = run_label(&m.scope, m.runs_in());
+                        let mut detail = match (&m.scope, m.runs_in()) {
+                            (A2AppScope::Room { room_id }, _) => format!("Runs in {}", room_label(cx, room_id)),
+                            (_, RunsIn::Room) => String::from("Runs in a room"),
+                            (_, RunsIn::Rooms) => String::from("Works across your rooms"),
+                            (_, RunsIn::Spaces) => String::from("Works across your spaces"),
+                            (_, RunsIn::Account) => String::from("Account-wide"),
                         };
                         if state.permissions.is_restricted(&m.id) {
                             detail.push_str(" · stopped for abuse");
