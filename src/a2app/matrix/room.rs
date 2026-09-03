@@ -5,6 +5,7 @@ use matrix_sdk::ruma::events::room::message::sanitize::remove_plain_reply_fallba
 use matrix_sdk::ruma::events::room::message::{OriginalSyncRoomMessageEvent, Relation};
 use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent};
 use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
+use std::collections::HashMap;
 
 use crate::sliding_sync::{current_user_id, get_client};
 use super::clip_chars;
@@ -304,12 +305,30 @@ pub(super) async fn info(room_id: matrix_sdk::ruma::OwnedRoomId) -> Result<Strin
     Ok(body.to_string())
 }
 
+/// One row of `read_messages`. The walk is newest-first, so an edit shows up
+/// before the message it replaces: keep its body and hand it to the original.
+fn push_message(
+    out: &mut Vec<serde_json::Value>,
+    edits: &mut HashMap<OwnedEventId, String>,
+    msg: OriginalSyncRoomMessageEvent,
+) {
+    if let Some(Relation::Replacement(edit)) = &msg.content.relates_to {
+        edits.entry(edit.event_id.clone())
+            .or_insert_with(|| remove_plain_reply_fallback(edit.new_content.msgtype.body()).to_string());
+        return;
+    }
+    let mut row = message_json(&msg);
+    if let Some(mut body) = edits.remove(&msg.event_id) {
+        clip_chars(&mut body, 500);
+        row["body"] = body.into();
+    }
+    out.push(row);
+}
+
 /// `matrix.read_messages`, and `matrix.rooms_messages` for any joined room.
 pub(super) async fn read_messages(room_id: matrix_sdk::ruma::OwnedRoomId, limit: u32) -> Result<String, String> {
     use matrix_sdk::RoomState;
     use matrix_sdk::room::MessagesOptions;
-    use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent};
-    use super::clip_chars;
     use crate::sliding_sync::get_client;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
@@ -317,6 +336,7 @@ pub(super) async fn read_messages(room_id: matrix_sdk::ruma::OwnedRoomId, limit:
         return Err("room not joined".into());
     }
     let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut edits = HashMap::new();
     // The event cache already holds the recent timeline in
     // memory; only hit the network when it can't fill the request.
     if let Ok((cache, _guard)) = client.event_cache().room(&room_id).await {
@@ -325,14 +345,7 @@ pub(super) async fn read_messages(room_id: matrix_sdk::ruma::OwnedRoomId, limit:
                 let Ok(AnySyncTimelineEvent::MessageLike(
                     AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(msg))
                 )) = event.raw().deserialize() else { continue };
-                let mut body = msg.content.body().to_string();
-                clip_chars(&mut body, 500);
-                out.push(serde_json::json!({
-                    "sender": msg.sender.localpart(),
-                    "sender_id": msg.sender,
-                    "event_id": msg.event_id,
-                    "body": body,
-                }));
+                push_message(&mut out, &mut edits, msg);
                 if out.len() >= limit as usize {
                     break;
                 }
@@ -343,6 +356,7 @@ pub(super) async fn read_messages(room_id: matrix_sdk::ruma::OwnedRoomId, limit:
         // A room's recent tail can be all state events (profile
         // changes etc), so keep paginating until we fill `limit`.
         out.clear();
+        edits.clear();
         let mut from: Option<String> = None;
         for _ in 0..4 {
             let mut options = MessagesOptions::backward();
@@ -354,14 +368,7 @@ pub(super) async fn read_messages(room_id: matrix_sdk::ruma::OwnedRoomId, limit:
                 let Ok(AnySyncTimelineEvent::MessageLike(
                     AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(msg))
                 )) = event.raw().deserialize() else { continue };
-                let mut body = msg.content.body().to_string();
-                clip_chars(&mut body, 500);
-                out.push(serde_json::json!({
-                    "sender": msg.sender.localpart(),
-                    "sender_id": msg.sender,
-                    "event_id": msg.event_id,
-                    "body": body,
-                }));
+                push_message(&mut out, &mut edits, msg);
                 if out.len() >= limit as usize {
                     break;
                 }
