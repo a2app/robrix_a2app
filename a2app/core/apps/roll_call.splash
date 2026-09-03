@@ -53,20 +53,15 @@ fn on_permissions_changed(caps){
 let _boot = start_timeout(0.05, || load_profile())
 
 View{
-    width: Fill height: Fit flow: Down align: Align{x: 0.5}
-    col := View{
-        width: Fill{max: 420.0} height: Fit flow: Down spacing: 14 padding: 16
-        align: Align{x: 0.5}
-        Label{
-            text: "Roll Call" padding: 0 margin: 0
-            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 22} }
-        }
+    width: Fill height: Fill flow: Down align: Align{x: 0.5}
+    col := ScrollYView{
+        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
         who := Label{
-            text: "Rolling as you" padding: 0 margin: 0
-            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 13} }
+            text: "Rolling as you" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
+            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
         }
         RoundedView{
-            width: Fill height: Fit align: Align{x: 0.5, y: 0.5} padding: 26 flow: Down spacing: 6
+            width: Fill height: Fit align: Align{x: 0.5, y: 0.5} padding: 16 flow: Down spacing: 6
             show_bg: true
             draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
             dice := Label{
@@ -90,8 +85,7 @@ View{
             }
         }
         note := Label{
-            text: "" padding: 0 margin: 0
-            width: Fill
+            text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
             draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
         }
     }

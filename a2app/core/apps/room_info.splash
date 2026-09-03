@@ -21,7 +21,9 @@ fn load(){
             ui.row_encrypted.set_text("Encrypted:  " + enc)
             ui.row_join.set_text("Join rule:  " + r.data.join_rule)
             ui.row_history.set_text("History:  " + r.data.history_visibility)
-            ui.row_id.set_text(r.data.room_id)
+            let alias = r.data.alias
+            ui.address_wrap.set_visible(!alias.is_nil())
+            if !alias.is_nil() { ui.row_alias.set_text(alias) }
             ui.note.set_text("")
             return nil
         }
@@ -37,13 +39,9 @@ fn on_permissions_changed(caps){
 let _boot = start_timeout(0.05, || load())
 
 View{
-    width: Fill height: Fit flow: Down align: Align{x: 0.5}
-    col := View{
-        width: Fill{max: 460.0} height: Fit flow: Down spacing: 10 padding: 14
-        Label{
-            text: "ROOM" padding: 0 margin: 0
-            draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
-        }
+    width: Fill height: Fill flow: Down align: Align{x: 0.5}
+    col := ScrollYView{
+        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
         room_name := Label{
             text: "Loading…" padding: 0 margin: 0
             width: Fill
@@ -75,14 +73,17 @@ View{
                 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
             }
         }
-        Label{
-            text: "ROOM ID" padding: 0 margin: 0
-            draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
-        }
-        row_id := Label{
-            text: "…" padding: 0 margin: 0
-            width: Fill
-            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 10} }
+        address_wrap := View{
+            width: Fill height: Fit flow: Down spacing: 2 visible: false
+            Label{
+                text: "ADDRESS" padding: 0 margin: 0
+                draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+            }
+            row_alias := Label{
+                text: "" padding: 0 margin: 0
+                width: Fill
+                draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 11} }
+            }
         }
         View{
             width: Fill height: Fit flow: Right align: Align{x: 0.5}
@@ -94,7 +95,7 @@ View{
         note := Label{
             text: "" padding: 0 margin: 0
             width: Fill
-            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 11} }
+            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
         }
     }
 }

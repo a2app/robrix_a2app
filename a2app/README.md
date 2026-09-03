@@ -57,7 +57,7 @@ cargo run --features a2app
   pick, straight from the Mini Apps screen.
 - Fifteen built-in apps: **Room Peek** (room info + recent messages + send),
   **Roll Call** (dice roller that can post its roll), **Room Info**,
-  **Room Members**, **Pinned Events**, **Room Threads**, **Search**
+  **Room Members**, **Pinned Messages**, **Room Threads**, **Search**
   (messages across one room or many), **Watcher** (keyword rules that notify
   and can auto-reply), **Who's Here** (typing and read positions), **Room
   Tools** (favorite, low priority, unread, pins, links), **Room Stats** (who

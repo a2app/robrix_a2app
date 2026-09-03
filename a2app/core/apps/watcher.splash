@@ -133,13 +133,9 @@ let _boot = start_timeout(0.05, || {
 })
 
 View{
-    width: Fill height: Fit flow: Down align: Align{x: 0.5}
-    col := View{
-        width: Fill{max: 460.0} height: Fit flow: Down spacing: 10 padding: 14
-        Label{
-            text: "Watcher" padding: 0 margin: 0
-            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }
-        }
+    width: Fill height: Fill flow: Down align: Align{x: 0.5}
+    col := ScrollYView{
+        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
         status := Label{
             text: "Starting…" width: Fill padding: 0 margin: 0
             draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }

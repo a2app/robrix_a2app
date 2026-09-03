@@ -9,10 +9,10 @@
 // why-robrix-navigation: Jumps to a message you tap.
 // why-matrix-room-watch: Shows new messages, typing, edits and reactions as they arrive.
 
-let room_name = "Room Peek"
-let room_line = "Open me from a room to see its info."
+let room_name = ""
+let room_line = "Loading…"
 let live_note = ""
-let empty_line = "No messages to show. This app needs to be opened from a room, and needs your permission to read it."
+let empty_line = "Loading…"
 let messages = []
 let rx_queue = []
 let rx_busy = false
@@ -199,6 +199,10 @@ fn watch(){
     subscribe("on_room_message_changed")
 }
 
+fn on_app_resize(w, h){
+    ui.title_wrap.set_visible(h >= 520)
+}
+
 fn on_permissions_changed(caps){
     load_room()
     load_messages()
@@ -212,19 +216,22 @@ let _boot = start_timeout(0.05, || {
 })
 
 View{
-    width: Fill height: Fit flow: Down align: Align{x: 0.5}
+    width: Fill height: Fill flow: Down align: Align{x: 0.5}
     col := View{
-        width: Fill{max: 520.0} height: Fit flow: Down spacing: 12 padding: 16
-        room_title := Label{
-            text: "Room Peek" padding: 0 margin: 0
-            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 22} }
+        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
+        title_wrap := View{
+            width: Fill height: Fit
+            room_title := Label{
+                text: "" width: Fill padding: 0 margin: 0
+                draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }
+            }
         }
         room_line := Label{
-            text: "Open me from a room to see its info." padding: 0 margin: 0
-            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 13} }
+            text: "Loading…" width: Fill padding: 0 margin: 0
+            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
         }
         msg_list := ScrollYView{
-            width: Fill height: 260 flow: Down spacing: 6
+            width: Fill height: Fill flow: Down spacing: 6
             on_item_tap: |i| jump_to_message(i)
             on_render: || {
                 if messages.len() == 0 {
@@ -240,7 +247,7 @@ View{
                             show_bg: true
                             draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
                             Label{
-                                text: m.sender padding: 0 margin: 0
+                                text: m.sender width: Fill padding: 0 margin: 0
                                 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
                             }
                             Label{

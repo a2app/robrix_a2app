@@ -10,6 +10,7 @@
 // why-robrix-navigation: Opens the DM you already have with a user you look up.
 
 let ignored = []
+let ignored_note = "Loading…"
 let manage_url = nil
 let dm_room = nil
 
@@ -50,10 +51,12 @@ fn load(){
     host.request("matrix.ignored_users", nil, fn(r){
         if r.is_ok {
             ignored = r.data.users
-            ui.ignored_head.set_text("" + ignored.len() + " ignored · tap one to look them up")
+            ignored_note = "Nobody is ignored."
+            ui.ignored_head.set_text("IGNORED USERS · " + ignored.len())
         } else {
             ignored = []
-            ui.ignored_head.set_text(r.error)
+            ignored_note = r.error
+            ui.ignored_head.set_text("IGNORED USERS")
         }
         ui.ignored_list.render()
     })
@@ -119,16 +122,16 @@ fn on_permissions_changed(caps){ load() }
 let _boot = start_timeout(0.05, || load())
 
 View{
-    width: Fill height: Fit flow: Down align: Align{x: 0.5}
-    col := View{
-        width: Fill{max: 520.0} height: Fit flow: Down spacing: 10 padding: 14
-        Label{
-            text: "Account" padding: 0 margin: 0
-            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }
-        }
-        Label{
-            text: "YOU" padding: 0 margin: 0
-            draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+    width: Fill height: Fill flow: Down align: Align{x: 0.5}
+    col := ScrollYView{
+        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
+        View{
+            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+            Label{
+                text: "YOU" width: Fill padding: 0 margin: 0
+                draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+            }
+            Button{ text: "Refresh" on_click: || load() draw_text +: { color: #x1C274C } }
         }
         RoundedView{
             width: Fill height: Fit flow: Down spacing: 4 padding: 12
@@ -180,7 +183,7 @@ View{
         View{
             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
             user_input := TextInput{
-                width: Fill height: Fit empty_text: "@user:server, then press Return"
+                width: Fill height: Fit empty_text: "@user:server"
                 on_return: |t| lookup(t)
             }
             Button{ text: "Look up" on_click: || lookup(ui.user_input.text()) draw_text +: { color: #x1C274C } }
@@ -201,17 +204,16 @@ View{
             }
         }
         ignored_head := Label{
-            text: "IGNORED USERS" padding: 0 margin: 0
+            text: "IGNORED USERS" width: Fill padding: 0 margin: 0
             draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
         }
         ignored_list := ScrollYView{
-            width: Fill height: 140 flow: Down spacing: 4
+            width: Fill height: Fit{max: FitBound.Abs(140.0)} flow: Down spacing: 4
             on_item_tap: |i| lookup_ignored(i)
             on_render: || {
                 if ignored.len() == 0 {
                     Label{
-                        text: "Nobody is ignored, or this app may not read your account yet."
-                        width: Fill padding: 0 margin: 0
+                        text: ignored_note width: Fill padding: 0 margin: 0
                         draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
                     }
                 } else {
@@ -228,10 +230,6 @@ View{
                     }
                 }
             }
-        }
-        View{
-            width: Fill height: Fit flow: Right align: Align{x: 0.5}
-            Button{ text: "Refresh" on_click: || load() draw_text +: { color: #x1C274C } }
         }
     }
 }

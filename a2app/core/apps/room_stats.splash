@@ -10,6 +10,8 @@
 let depth = 300
 let loading = false
 let load_error = ""
+let empty_note = "Counting…"
+let bar_w = 320
 // The newest batch comes without timestamps, so it's kept apart from the older pages.
 let latest = []
 let older = []
@@ -152,6 +154,8 @@ fn compute(){
 
 fn finish(){
     loading = false
+    empty_note = "No messages in this room yet."
+    if load_error != "" { empty_note = load_error }
     compute()
 }
 
@@ -191,6 +195,7 @@ fn load(){
     ui.status.set_text("Loading…")
     loading = true
     load_error = ""
+    empty_note = "Counting…"
     latest = []
     older = []
     host.request("matrix.read_messages", {limit: 30}, fn(r){
@@ -251,17 +256,21 @@ fn set_depth(d){
     load()
 }
 
+fn on_app_resize(w, h){
+    bar_w = min(w, 460) - 44
+    ui.sender_list.render()
+}
+
 fn on_permissions_changed(caps){ load() }
 
 let _boot = start_timeout(0.05, || load())
 
 View{
-    width: Fill height: Fit flow: Down align: Align{x: 0.5}
-    col := View{
-        width: Fill{max: 520.0} height: Fit flow: Down spacing: 10 padding: 14
-        Label{ text: "Room Stats" padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} } }
-        status := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 13} } }
-        range_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 11} } }
+    width: Fill height: Fill flow: Down align: Align{x: 0.5}
+    col := ScrollYView{
+        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
+        status := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
+        range_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
         View{
             width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 6 align: Align{y: 0.5}
             depth_100 := Button{ text: "○ 100" on_click: || set_depth(100) draw_text +: { color: #x1C274C } }
@@ -269,14 +278,14 @@ View{
             depth_1000 := Button{ text: "○ 1000" on_click: || set_depth(1000) draw_text +: { color: #x1C274C } }
             Button{ text: "Refresh" on_click: || load() draw_text +: { color: #x1C274C } }
         }
-        Label{ text: "TOP SENDERS · tap one for their profile" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
-        sender_list := ScrollYView{
-            width: Fill height: 230 flow: Down spacing: 5
+        Label{ text: "TOP SENDERS · tap one for their profile" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
+        sender_list := View{
+            width: Fill height: Fit flow: Down spacing: 5
             on_item_tap: |i| open_sender(i)
             on_render: || {
                 if top.len() == 0 {
                     Label{
-                        text: "Nothing counted yet. This app needs to be opened from a room, and needs your permission to read it."
+                        text: empty_note
                         width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
                     }
                 } else {
@@ -291,25 +300,29 @@ View{
                             }
                             View{
                                 width: Fill height: 8
-                                RoundedView{ width: Fill{max: max(6, floor(320 * s.count / most))} height: 8 show_bg: true draw_bg +: { color: #x0f88fe border_radius: 4.0 } }
+                                RoundedView{ width: Fill{max: max(6, floor(bar_w * s.count / most))} height: 8 show_bg: true draw_bg +: { color: #x0f88fe border_radius: 4.0 } }
                             }
                         }
                     }
                 }
             }
         }
+        Label{ text: "HOURS, UTC · tap a bar for its count" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
         hour_line := Label{ text: "Busiest hour: …" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
         hour_bars := View{
-            width: Fill height: 44 flow: Right spacing: 2 align: Align{y: 1.0}
+            width: Fill height: 44 flow: Right spacing: 2
             on_item_tap: |i| show_hour(i)
             on_render: || {
                 let most = max(1, hours[peak(hours)])
                 for h in hours {
-                    RoundedView{ width: Fill height: max(3, floor(40 * h / most)) show_bg: true draw_bg +: { color: #x0f88fe border_radius: 2.0 } }
+                    View{
+                        width: Fill height: Fill align: Align{y: 1.0}
+                        RoundedView{ width: Fill height: max(3, floor(40 * h / most)) show_bg: true draw_bg +: { color: #x0f88fe border_radius: 2.0 } }
+                    }
                 }
             }
         }
-        Label{ text: "0h to 23h, UTC · tap a bar for its count" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
+        Label{ text: "WEEKDAYS · tap a bar for its count" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
         day_line := Label{ text: "Busiest weekday: …" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
         day_bars := View{
             width: Fill height: 58 flow: Right spacing: 4

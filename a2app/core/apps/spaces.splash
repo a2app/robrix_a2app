@@ -10,7 +10,7 @@
 
 let items = []
 let trail = []
-let empty_note = "Loading…"
+let empty_note = ""
 let preview_id = ""
 
 fn plural(n, word){
@@ -57,7 +57,7 @@ fn show_level(){
 
 fn clear_list(){
     items = []
-    empty_note = "Loading…"
+    empty_note = ""
     ui.item_list.render()
 }
 
@@ -89,7 +89,7 @@ fn load_rooms(){
         if r.is_ok {
             items = r.data.rooms
             empty_note = "This space has no rooms yet."
-            ui.status.set_text("" + items.len() + " " + plural(items.len(), "room") + " · tap a room to open it, a subspace to enter it")
+            ui.status.set_text("" + items.len() + " " + plural(items.len(), "room"))
         } else {
             empty_note = "Nothing to show."
             ui.status.set_text(r.error)
@@ -182,31 +182,46 @@ fn on_permissions_changed(caps){ reload() }
 let _boot = start_timeout(0.05, || reload())
 
 View{
-    width: Fill height: Fit flow: Down align: Align{x: 0.5}
+    width: Fill height: Fill flow: Down align: Align{x: 0.5}
     col := View{
-        width: Fill{max: 520.0} height: Fit flow: Down spacing: 10 padding: 14
+        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
         View{
             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-            Label{ text: "Spaces" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} } }
+            crumb := Label{ text: "Spaces" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
             back_wrap := View{
                 width: Fit height: Fit visible: false
                 Button{ text: "Back" on_click: || go_back() draw_text +: { color: #x1C274C } }
             }
         }
-        crumb := Label{ text: "Spaces" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
         status := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
         info_wrap := View{
             width: Fill height: Fit flow: Down visible: false
             RoundedView{
                 width: Fill height: Fit flow: Down spacing: 4 padding: 12
                 show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
-                space_title := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 16} } }
+                space_title := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 14} } }
                 space_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
-                space_topic := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
+                space_topic := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
+            }
+        }
+        preview_wrap := View{
+            width: Fill height: Fit flow: Down visible: false
+            RoundedView{
+                width: Fill height: Fit flow: Down spacing: 6 padding: 12
+                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
+                Label{ text: "NOT JOINED" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
+                preview_title := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 14} } }
+                preview_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
+                View{
+                    width: Fill height: Fit flow: Right spacing: 8
+                    Button{ text: "Join" on_click: || join_room() draw_text +: { color: #x1C274C } }
+                    Button{ text: "Close" on_click: || ui.preview_wrap.set_visible(false) draw_text +: { color: #x1C274C } }
+                }
+                join_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
             }
         }
         item_list := ScrollYView{
-            width: Fill height: 300 flow: Down spacing: 5
+            width: Fill height: Fill flow: Down spacing: 5
             on_item_tap: |i| tap_item(i)
             on_render: || {
                 if items.len() == 0 {
@@ -227,22 +242,6 @@ View{
                         }
                     }
                 }
-            }
-        }
-        preview_wrap := View{
-            width: Fill height: Fit flow: Down visible: false
-            RoundedView{
-                width: Fill height: Fit flow: Down spacing: 6 padding: 12
-                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
-                Label{ text: "NOT JOINED" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
-                preview_title := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 14} } }
-                preview_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
-                View{
-                    width: Fill height: Fit flow: Right spacing: 8
-                    Button{ text: "Join" on_click: || join_room() draw_text +: { color: #x1C274C } }
-                    Button{ text: "Close" on_click: || ui.preview_wrap.set_visible(false) draw_text +: { color: #x1C274C } }
-                }
-                join_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 11} } }
             }
         }
     }

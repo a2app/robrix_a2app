@@ -15,6 +15,7 @@ let rooms = []
 let rooms_line = "Loading rooms…"
 let picked = []
 let results = []
+let searched = false
 
 fn mode_label(m, text){
     if mode == m { return "● " + text }
@@ -83,7 +84,13 @@ fn plural(n, word){
     return word + "s"
 }
 
+fn empty_line(){
+    if searched { return "Nothing matched." }
+    return "No results yet. Tap a result to jump to that message."
+}
+
 fn on_results(r){
+    searched = true
     if r.is_ok {
         results = r.data.results
         let note = "" + results.len() + " " + plural(results.len(), "result") + " in " + r.data.searched_rooms + " " + plural(r.data.searched_rooms, "room")
@@ -138,17 +145,13 @@ let _boot = start_timeout(0.05, || {
 })
 
 View{
-    width: Fill height: Fit flow: Down align: Align{x: 0.5}
+    width: Fill height: Fill flow: Down align: Align{x: 0.5}
     col := View{
-        width: Fill{max: 520.0} height: Fit flow: Down spacing: 10 padding: 14
-        Label{
-            text: "Search" padding: 0 margin: 0
-            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }
-        }
+        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
         View{
             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
             q := TextInput{
-                width: Fill height: Fit empty_text: "Search messages, then press Return"
+                width: Fill height: Fit empty_text: "Search messages"
                 on_return: |t| run_search(t)
             }
             Button{
@@ -157,15 +160,19 @@ View{
             }
         }
         View{
-            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 6
+            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 6 align: Align{y: 0.5}
             mode_room := Button{ text: "● This room" on_click: || set_mode("room") draw_text +: { color: #x1C274C } }
             mode_all := Button{ text: "○ All rooms" on_click: || set_mode("all") draw_text +: { color: #x1C274C } }
             mode_pick := Button{ text: "○ Pick rooms" on_click: || set_mode("pick") draw_text +: { color: #x1C274C } }
+            Toggle{
+                text: "Ask the server too"
+                on_click: |on| { server = on }
+                draw_text +: { color: #x333333 }
+            }
         }
-        Toggle{
-            text: "Also ask the server (unencrypted rooms only)"
-            on_click: |on| { server = on }
-            draw_text +: { color: #x333333 }
+        Label{
+            text: "Server search covers unencrypted rooms only" width: Fill padding: 0 margin: 0
+            draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
         }
         room_list_wrap := View{
             width: Fill height: Fit flow: Down spacing: 4 visible: false
@@ -178,13 +185,16 @@ View{
                 on_item_tap: |i| toggle_pick(i)
                 on_render: || {
                     if rooms.len() == 0 {
-                        Label{ text: rooms_line width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 } }
+                        Label{
+                            text: rooms_line width: Fill padding: 0 margin: 0
+                            draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                        }
                     } else {
                         for it in rooms {
                             RoundedView{
                                 width: Fill height: Fit flow: Right spacing: 6 padding: 8
                                 show_bg: true
-                                draw_bg +: { color: #xF0F5FF border_radius: 6.0 }
+                                draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
                                 Label{
                                     text: mode_label_room(it) width: Fill padding: 0 margin: 0
                                     draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
@@ -200,13 +210,12 @@ View{
             draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
         }
         result_list := ScrollYView{
-            width: Fill height: 300 flow: Down spacing: 5
+            width: Fill height: Fill flow: Down spacing: 5
             on_item_tap: |i| open_result(i)
             on_render: || {
                 if results.len() == 0 {
                     Label{
-                        text: "No results yet. Tap a result to jump to that message."
-                        width: Fill padding: 0 margin: 0
+                        text: empty_line() width: Fill padding: 0 margin: 0
                         draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
                     }
                 } else {

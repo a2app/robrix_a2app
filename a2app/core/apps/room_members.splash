@@ -8,16 +8,21 @@
 // why-matrix-room-watch: Refreshes the list as people join or leave.
 
 let items = []
+let status = "Loading…"
+let live_note = ""
+
+fn show_header(){ ui.header.set_text(status + live_note) }
 
 fn load(){
     host.request("matrix.room_members", {limit: 60}, fn(r){
         if r.is_ok {
             items = r.data.members
-            ui.header.set_text("" + r.data.count + " members · tap one for their profile")
+            status = "" + r.data.count + " members · tap one for their profile"
         } else {
             items = []
-            ui.header.set_text(r.error)
+            status = r.error
         }
+        show_header()
         ui.item_list.render()
     })
 }
@@ -28,11 +33,8 @@ fn on_room_members_changed(json){
 
 fn watch(){
     host.request("events.subscribe", {event: "on_room_members_changed"}, fn(r){
-        if r.is_ok {
-            ui.note.set_text("")
-        } else {
-            ui.note.set_text("Live updates off: " + r.error)
-        }
+        if r.is_ok { live_note = "" } else { live_note = " · live updates off: " + r.error }
+        show_header()
     })
 }
 
@@ -60,20 +62,16 @@ let _boot = start_timeout(0.05, || {
 })
 
 View{
-    width: Fill height: Fit flow: Down align: Align{x: 0.5}
+    width: Fill height: Fill flow: Down align: Align{x: 0.5}
     col := View{
-        width: Fill{max: 460.0} height: Fit flow: Down spacing: 10 padding: 14
-        Label{
-            text: "Room Members" padding: 0 margin: 0
-            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }
-        }
+        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
         header := Label{
             text: "Loading…" padding: 0 margin: 0
             width: Fill
-            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 13} }
+            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
         }
         item_list := ScrollYView{
-            width: Fill height: 330 flow: Down spacing: 5
+            width: Fill height: Fill flow: Down spacing: 5
             on_item_tap: |i| open_member(i)
             on_render: || {
                 if items.len() == 0 {
@@ -105,14 +103,9 @@ View{
         View{
             width: Fill height: Fit flow: Right align: Align{x: 0.5}
             Button{
-                text: "Refresh" on_click: || load()
+                text: "Refresh" on_click: || { status = "Loading…" show_header() load() }
                 draw_text +: { color: #x1C274C }
             }
-        }
-        note := Label{
-            text: "" padding: 0 margin: 0
-            width: Fill
-            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 11} }
         }
     }
 }

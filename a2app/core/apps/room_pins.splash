@@ -1,4 +1,4 @@
-// name: Pinned Events
+// name: Pinned Messages
 // icon: 📌
 // tint: #C0533E
 // description: The messages pinned in this room.
@@ -10,6 +10,7 @@
 let items = []
 let status = "Loading…"
 let live_note = ""
+let empty_msg = "Nothing to show. This app needs to be opened from a room, and needs your permission to read it."
 
 fn show_header(){ ui.header.set_text(status + live_note) }
 
@@ -17,9 +18,12 @@ fn load(){
     host.request("matrix.pinned_events", nil, fn(r){
         if r.is_ok {
             items = r.data.pinned
+            empty_msg = "No pinned messages in this room yet."
             status = "" + items.len() + " pinned · tap one to jump to it"
+            if items.len() == 0 { status = "No pinned messages" }
         } else {
             items = []
+            empty_msg = "Nothing to show. This app needs to be opened from a room, and needs your permission to read it."
             status = r.error
         }
         show_header()
@@ -56,25 +60,21 @@ let _boot = start_timeout(0.05, || {
 })
 
 View{
-    width: Fill height: Fit flow: Down align: Align{x: 0.5}
+    width: Fill height: Fill flow: Down align: Align{x: 0.5}
     col := View{
-        width: Fill{max: 460.0} height: Fit flow: Down spacing: 10 padding: 14
-        Label{
-            text: "Pinned Events" padding: 0 margin: 0
-            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }
-        }
+        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
         header := Label{
             text: "Loading…" padding: 0 margin: 0
             width: Fill
-            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 13} }
+            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
         }
         item_list := ScrollYView{
-            width: Fill height: 330 flow: Down spacing: 5
+            width: Fill height: Fill flow: Down spacing: 5
             on_item_tap: |i| jump_to_pin(i)
             on_render: || {
                 if items.len() == 0 {
                     Label{
-                        text: "Nothing to show. This app needs to be opened from a room, and needs your permission to read it."
+                        text: empty_msg
                         width: Fill padding: 0 margin: 0
                         draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
                     }

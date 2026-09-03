@@ -185,7 +185,7 @@ pub fn builtin_apps() -> Vec<MiniAppManifest> {
         app("roll-call", "Roll Call", "🎲", 0x7C6CF0, app_source!("roll_call.splash")),
         app("room-info", "Room Info", "🏷", 0x2E86AB, app_source!("room_info.splash")),
         app("room-members", "Room Members", "👥", 0x6C8E3A, app_source!("room_members.splash")),
-        app("room-pins", "Pinned Events", "📌", 0xC0533E, app_source!("room_pins.splash")),
+        app("room-pins", "Pinned Messages", "📌", 0xC0533E, app_source!("room_pins.splash")),
         app("room-threads", "Room Threads", "🧵", 0x8A5CA8, app_source!("room_threads.splash")),
         app("search", "Search", "🔍", 0x0F88FE, app_source!("search.splash")),
         app("watcher", "Watcher", "👁", 0xD9822B, app_source!("watcher.splash")),

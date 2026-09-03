@@ -513,7 +513,7 @@ burning a permission.
 
 - `"matrix.room_info"` (needs `matrix-room-info`): `{}` ->
   `{room_id, room_name, topic, member_count, encrypted, join_rule,
-  history_visibility}` for the attached room.
+  history_visibility, alias}` for the attached room.
 - `"matrix.read_messages"` (needs `matrix-room-read`): `{limit: N}` (max 30)
   -> `{messages: [{sender, sender_id, event_id, body}]}`, the latest text
   messages, oldest first. `sender` is the short name, `sender_id` the full

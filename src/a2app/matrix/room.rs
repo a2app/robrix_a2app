@@ -299,6 +299,7 @@ pub(super) async fn info(room_id: matrix_sdk::ruma::OwnedRoomId) -> Result<Strin
         "encrypted": room.encryption_state().is_encrypted(),
         "join_rule": join_rule,
         "history_visibility": history,
+        "alias": room.canonical_alias().map(|a| a.to_string()),
     });
     Ok(body.to_string())
 }

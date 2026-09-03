@@ -18,6 +18,7 @@ let flags = [
 let messages = []
 let pins = []
 let successor = ""
+let empty_note = "Loading…"
 
 fn flag_text(f){
     if f.on.is_nil() { return f.off_text + "…" }
@@ -82,8 +83,10 @@ fn load_messages(){
     host.request("matrix.read_messages", {limit: 15}, fn(r){
         if r.is_ok {
             messages = r.data.messages
+            empty_note = "No messages in this room yet."
         } else {
             messages = []
+            empty_note = r.error
             ui.status.set_text(r.error)
         }
         ui.msg_list.render()
@@ -162,21 +165,21 @@ fn on_permissions_changed(caps){ load_all() }
 let _boot = start_timeout(0.05, || load_all())
 
 View{
-    width: Fill height: Fit flow: Down align: Align{x: 0.5}
+    width: Fill height: Fill flow: Down align: Align{x: 0.5}
     col := View{
-        width: Fill{max: 460.0} height: Fit flow: Down spacing: 10 padding: 14
-        Label{
-            text: "Room Tools" padding: 0 margin: 0
-            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }
-        }
+        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
         status := Label{
             text: "Each button changes this room only when you tap it." width: Fill padding: 0 margin: 0
             draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
         }
         upgraded_wrap := View{
-            width: Fill height: Fit visible: false
+            width: Fill height: Fit flow: Down spacing: 4 visible: false
+            Label{
+                text: "This room was upgraded." width: Fill padding: 0 margin: 0
+                draw_text +: { color: #xB91C1C text_style: theme.font_bold{font_size: 10} }
+            }
             Button{
-                text: "This room was upgraded. Tap to open the new one" width: Fill
+                text: "Open the upgraded room" width: Fill
                 on_click: || open_successor()
                 draw_text +: { color: #xB91C1C }
             }
@@ -186,24 +189,20 @@ View{
             fav_btn := Button{ text: "Favorite…" on_click: || toggle(0) draw_text +: { color: #x1C274C } }
             low_btn := Button{ text: "Low priority…" on_click: || toggle(1) draw_text +: { color: #x1C274C } }
             unread_btn := Button{ text: "Mark unread…" on_click: || toggle(2) draw_text +: { color: #x1C274C } }
-        }
-        View{
-            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 6
             Button{ text: "Copy room link" on_click: || copy_link("") draw_text +: { color: #x1C274C } }
             Button{ text: "Copy link to latest message" on_click: || copy_latest() draw_text +: { color: #x1C274C } }
         }
         Label{
-            text: "Recent messages  ·  tap one to pin or unpin it" padding: 0 margin: 0
+            text: "RECENT MESSAGES · tap one to pin or unpin it" width: Fill padding: 0 margin: 0
             draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
         }
         msg_list := ScrollYView{
-            width: Fill height: 260 flow: Down spacing: 5
+            width: Fill height: Fill flow: Down spacing: 5
             on_item_tap: |i| toggle_pin(i)
             on_render: || {
                 if messages.len() == 0 {
                     Label{
-                        text: "No messages to show. This app needs to be opened from a room, and needs your permission to read it."
-                        width: Fill padding: 0 margin: 0
+                        text: empty_note width: Fill padding: 0 margin: 0
                         draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
                     }
                 } else {

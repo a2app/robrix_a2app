@@ -174,12 +174,8 @@ View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
     col := ScrollYView{
         width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
-        Label{
-            text: "Inspector" padding: 0 margin: 0
-            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }
-        }
         RoundedView{
-            width: Fill height: Fit flow: Down spacing: 4 padding: 10
+            width: Fill height: Fit flow: Down spacing: 4 padding: 12
             show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
             Label{ text: "THIS PANE" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
             env_line := Label{ text: "…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
@@ -197,28 +193,28 @@ View{
             }
         }
         RoundedView{
-            width: Fill height: Fit flow: Down spacing: 4 padding: 10
+            width: Fill height: Fit flow: Down spacing: 4 padding: 12
             show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
             Label{ text: "ROBRIX SETTINGS" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
             prefs_line := Label{ text: "…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
             prefs_more := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
         }
         RoundedView{
-            width: Fill height: Fit flow: Down spacing: 4 padding: 10
+            width: Fill height: Fit flow: Down spacing: 4 padding: 12
             show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
             Label{ text: "DEVICE" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
             device_line := Label{ text: "…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
         }
         Label{
-            text: "What Robrix told this app, newest first" padding: 0 margin: 0
+            text: "EVENTS · newest first" width: Fill padding: 0 margin: 0
             draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
         }
         event_list := ScrollYView{
-            width: Fill height: 180 flow: Down spacing: 3
+            width: Fill height: 300 flow: Down spacing: 3
             on_render: || {
                 if events.len() == 0 {
                     Label{
-                        text: "Nothing yet. Switch rooms, resize the window, or move this pane." width: Fill padding: 0 margin: 0
+                        text: "Nothing yet. Switch rooms, change a setting, or move this pane." width: Fill padding: 0 margin: 0
                         draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
                     }
                 } else {

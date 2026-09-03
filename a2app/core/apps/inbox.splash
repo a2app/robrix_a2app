@@ -176,19 +176,18 @@ let _boot = start_timeout(0.05, || {
 })
 
 View{
-    width: Fill height: Fit flow: Down align: Align{x: 0.5}
+    width: Fill height: Fill flow: Down align: Align{x: 0.5}
     col := View{
-        width: Fill{max: 520.0} height: Fit flow: Down spacing: 10 padding: 14
+        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
         View{
             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-            Label{ text: "Inbox" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} } }
+            totals := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
             Button{ text: "Refresh" on_click: || load_all() draw_text +: { color: #x1C274C } }
         }
-        totals := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_bold{font_size: 13} } }
-        status := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
-        invite_head := Label{ text: "INVITES" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
+        status := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
+        invite_head := Label{ text: "INVITES" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
         invite_list := ScrollYView{
-            width: Fill height: 140 flow: Down spacing: 5
+            width: Fill height: Fit{max: FitBound.Abs(140.0)} flow: Down spacing: 5
             on_item_tap: |i| pick_invite(i)
             on_render: || {
                 if invites.len() == 0 {
@@ -222,12 +221,12 @@ View{
                     Button{ text: "Accept" on_click: || answer_invite(true) draw_text +: { color: #x138808 } }
                     Button{ text: "Decline" on_click: || answer_invite(false) draw_text +: { color: #xB91C1C } }
                 }
-                pick_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 11} } }
+                pick_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
             }
         }
-        unread_head := Label{ text: "UNREAD" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
+        unread_head := Label{ text: "UNREAD" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
         unread_list := ScrollYView{
-            width: Fill height: 240 flow: Down spacing: 5
+            width: Fill height: Fill flow: Down spacing: 5
             on_item_tap: |i| open_room(i)
             on_render: || {
                 if unread.len() == 0 {

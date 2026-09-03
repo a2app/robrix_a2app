@@ -34,7 +34,10 @@ fn refresh(){
     for row in rows {
         let body = body_of(row.event_id)
         if body.is_nil() { body = "…" }
-        cells.push({who: true, text: row.name + "  ·  " + ago(row.ts), user_id: row.user_id})
+        let who = row.name
+        let when = ago(row.ts)
+        if when != "" { who = who + "  ·  " + when }
+        cells.push({who: true, text: who, user_id: row.user_id})
         cells.push({who: false, text: body, event_id: row.event_id})
     }
     ui.receipt_list.render()
@@ -68,7 +71,7 @@ fn load(){
         if r.is_ok {
             rows = r.data.receipts
             if rows.len() == 0 {
-                ui.header.set_text("No read positions: read receipts are turned off in your settings.")
+                ui.header.set_text("No read positions yet.")
             } else {
                 ui.header.set_text("" + rows.len() + " read positions · tap a person, or the message they read")
             }
@@ -152,55 +155,43 @@ let _boot = start_timeout(0.05, || {
 })
 
 View{
-    width: Fill height: Fit flow: Down align: Align{x: 0.5}
+    width: Fill height: Fill flow: Down align: Align{x: 0.5}
     col := View{
-        width: Fill{max: 460.0} height: Fit flow: Down spacing: 10 padding: 14
-        Label{
-            text: "Who's Here" padding: 0 margin: 0
-            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }
-        }
+        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
         RoundedView{
             width: Fill height: Fit padding: 10
             show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
             typing := Label{
                 text: "Nobody is typing" width: Fill padding: 0 margin: 0
-                draw_text +: { color: #x0f88fe text_style: theme.font_bold{font_size: 13} }
+                draw_text +: { color: #x0f88fe text_style: theme.font_bold{font_size: 12} }
             }
         }
         header := Label{
             text: "Loading…" width: Fill padding: 0 margin: 0
-            draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 12} }
+            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
         }
         receipt_list := ScrollYView{
-            width: Fill height: 330 flow: Down spacing: 0
+            width: Fill height: Fill flow: Down spacing: 0
             on_item_tap: |i| tap_cell(i)
             on_render: || {
-                if cells.len() == 0 {
-                    Label{
-                        text: "Nothing to show. This app needs to be opened from a room, and needs your permission to read it."
-                        width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
-                    }
-                } else {
-                    for c in cells {
-                        if c.who {
-                            RoundedView{
-                                width: Fill height: Fit padding: Inset{top: 8, bottom: 2, left: 10, right: 10}
-                                margin: Inset{top: 6}
-                                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
-                                Label{
-                                    text: c.text width: Fill padding: 0 margin: 0
-                                    draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} }
-                                }
+                for c in cells {
+                    if c.who {
+                        RoundedAllView{
+                            width: Fill height: Fit padding: Inset{top: 8, bottom: 2, left: 10, right: 10}
+                            margin: Inset{top: 6}
+                            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: vec4(8.0, 8.0, 0.0, 0.0) }
+                            Label{
+                                text: c.text width: Fill padding: 0 margin: 0
+                                draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} }
                             }
-                        } else {
-                            RoundedView{
-                                width: Fill height: Fit padding: Inset{top: 2, bottom: 8, left: 10, right: 10}
-                                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
-                                Label{
-                                    text: c.text width: Fill padding: 0 margin: 0
-                                    draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
-                                }
+                        }
+                    } else {
+                        RoundedAllView{
+                            width: Fill height: Fit padding: Inset{top: 2, bottom: 8, left: 10, right: 10}
+                            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: vec4(0.0, 0.0, 8.0, 8.0) }
+                            Label{
+                                text: c.text width: Fill padding: 0 margin: 0
+                                draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
                             }
                         }
                     }
