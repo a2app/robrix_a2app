@@ -721,6 +721,7 @@ impl AppMain for App {
         script_eval!(vm, {
             mod.theme = mod.themes.light
         });
+        makepad_widgets::set_splash_theme(makepad_widgets::SplashTheme::Light);
         makepad_widgets::widgets_mod(vm);
         makepad_code_editor::script_mod(vm);
         crate::shared::script_mod(vm);
