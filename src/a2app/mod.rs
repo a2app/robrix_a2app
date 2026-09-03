@@ -10,6 +10,10 @@ use makepad_widgets::*;
 /// AI agent sessions and the MCP tool bridge (per-AI-room sessions whose
 /// models call host tools like `launch_splash_app` / `send_message`).
 pub mod ai;
+/// AI Rooms' shared event types and the `ai_reply` timeline widget
+/// (cross-platform; the session/forwarding logic that acts on them is in
+/// `ai::rooms`, which is unix-only).
+pub mod ai_room_events;
 
 /// The modal pane that hosts running mini-apps.
 pub mod host_pane;
@@ -38,6 +42,7 @@ pub mod timeline_card;
 pub fn script_mod(vm: &mut ScriptVm) {
     host_set::script_mod(vm);
     permission_prompt::script_mod(vm);
+    ai_room_events::script_mod(vm);
     host_pane::script_mod(vm);
     dock::script_mod(vm);
     tab_screen::script_mod(vm);

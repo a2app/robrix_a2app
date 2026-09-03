@@ -111,6 +111,71 @@ three commits). Move back to Robrix's shared pin once the PR lands.
 | `a2app-persistent-guide` | Install the Splash dialect guide on the agent once, so per-turn prompts shrink to a pointer line. |
 | `a2app-research` | Let the agent research with its tools (web search/fetch) before generating, baking found data into the app as constants. |
 
+## AI Rooms (agent chat sessions per Matrix room)
+
+An AI Room is an ordinary Matrix room backed by a Robrix agent session — the
+room *is* the session's transcript. Messages any member sends drive the agent;
+its output is written back as `rs.robius.robrix.ai_reply` **state events** (never
+`m.room.message`, so it can never loop back as input), rendered as timeline
+cards, and it survives restarts. The code lives in `src/a2app/ai/` (room
+creation + marker/cursor bookkeeping: `rooms.rs`), `src/a2app/runtime.rs`
+(session attach, message forwarding, reply posting) and
+`src/a2app/ai_room_events.rs` (event wire types + the timeline card). Unix-only:
+a session is an `a2app_agent::AgentTransport`, spawned per room with a
+session-scoped MCP tool server (`src/a2app/ai/server.rs` + `bridge.rs`).
+
+### How it works
+
+1. **Create** (Add Room screen → "start a new AI room"): a private encrypted
+   room whose `initial_state` carries a `rs.robius.robrix.ai_room` marker, so
+   there is no window where the room exists but isn't an AI room.
+2. **Attach**: opening a room checks the marker once (after its state has
+   synced — a brand-new room's state lags sliding sync, so a marker miss only
+   counts once `m.room.create` is cached; our own creations are recorded
+   immediately from the create response). A marked room gets its session.
+3. **Forward**: member text messages after the saved forwarding cursor (room
+   account data `rs.robius.robrix.ai_session_data`) are sent to the session as
+   prompts; the first prompt after a (re)start carries a short plaintext
+   transcript preamble for context.
+4. **Answer**: the agent calls Robrix's own MCP tools — `send_message` (posts
+   an `ai_reply`) and `launch_splash_app` (runs the mini-app generation
+   pipeline) — or ends its turn with text, which is posted as the `ai_reply`.
+   A turn that already spoke through `send_message` has its redundant trailing
+   text dropped, so one turn = one card.
+
+### Trying it offline (no API key)
+
+The octos `scenario` provider (`octos/crates/octos-llm/src/registry/`
+`scenario.rs`) is a deterministic, key-less model built for exactly this. After
+`sh a2app/dev/offline-ai-setup.sh` (writes `provider: "scenario"` to
+`~/.octos/config.json`), run the app and chat in an AI room:
+
+```sh
+cargo run --features a2app-embedded-agent
+```
+
+- 1st message → `send_message` tool → a "pong" `ai_reply` card.
+- 2nd message → `launch_splash_app` → the offline demo installs a minimal
+  "this is a mini-app" app (the writer role's canned source — deliberately
+  free of `glass.*` widgets and `Fill` heights, both of which render blank in
+  the host's `Fit`-mounted Splash).
+- 3rd+ message → "pong" again.
+
+The sequence is tracked inside the session's scenario provider, not by
+scanning message history, because a failed turn makes octos drop history.
+
+### Notes for maintainers
+
+- The `robrix --mcp-bridge` relay + tool server are exercised headlessly by
+  `tests/mcp_transport.rs` (hand-written client) and `tests/mcp_rmcp.rs` (the
+  real rmcp client octos uses). `mcp_rmcp` is the regression test for a
+  macOS-only bug where `accept()` inherits the listener's `O_NONBLOCK` and the
+  blocking serve loop read EAGAIN between requests, dropping the connection
+  and silently removing the host tools.
+- `glass.*` widgets and `height: Fill` roots do not render in a mini-app host
+  today; built-in demo apps (`a2app/core/apps/*.splash`) show the working
+  idioms (natural sizes throughout).
+
 ## Not included yet
 
 - Splash resource limiting (CPU/memory/timer shares) — needs makepad#1189.

@@ -49,9 +49,9 @@ use crate::utils::RoomNameId;
 #[cfg(unix)]
 use crate::a2app::ai::session::{AiSession, PromptOutcome, SessionJob, SessionUpdate};
 #[cfg(unix)]
-use crate::sliding_sync::TimelineKind;
+use crate::a2app::ai::rooms::{AiRoomAction, AiRoomRequest};
 #[cfg(unix)]
-use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+use crate::a2app::ai_room_events::AiReplyContent;
 
 /// How long between saves of dirty permission/registry state.
 const PERSIST_THROTTLE: Duration = Duration::from_secs(2);
@@ -90,6 +90,25 @@ pub struct GenConsole {
     pub last_render: Option<Instant>,
 }
 
+/// An AI room's marker/forwarding state, tracked once the room is opened.
+#[cfg(unix)]
+pub struct AiRoomInfo {
+    /// The last member message successfully forwarded to this room's
+    /// session, also persisted as its `ai_session_data` account-data
+    /// cursor. Only events after this one are forwarded.
+    pub cursor: Option<OwnedEventId>,
+    /// True until the next forwarded prompt has carried a replayed-transcript
+    /// preamble. Set back to `true` whenever the session is (re)started,
+    /// since the in-memory agent has no memory of a prior process's turns.
+    pub needs_priming: bool,
+    /// Whether a `send_message` tool call posted to the room during the
+    /// session's current turn. When that turn's final text arrives it is
+    /// redundant (the tool already said it), so the runtime drops it — a
+    /// tool turn must leave exactly one `ai_reply`. Cleared when the turn
+    /// ends (its reply is consumed, or the turn errors out).
+    posted_by_tool_this_turn: bool,
+}
+
 /// All a2app state, owned by the UI thread.
 pub struct A2AppState {
     pub registry: AppRegistry,
@@ -118,11 +137,20 @@ pub struct A2AppState {
     watched_rooms: HashSet<OwnedRoomId>,
     /// Whether the worker runs the account watch for them too.
     account_watched: bool,
-    /// One long-lived AI agent session per room (the `/ai` chat). Sessions
-    /// bind their own tool server, spawn their agent, and answer tool calls
-    /// drained here each event pass.
+    /// One long-lived AI agent session per AI room. Sessions bind their own
+    /// tool server, spawn their agent, and answer tool calls drained here
+    /// each event pass.
     #[cfg(unix)]
     pub ai_sessions: HashMap<OwnedRoomId, AiSession>,
+    /// Rooms known to carry the `rs.robius.robrix.ai_room` marker, and their
+    /// forwarding progress. Populated by [`on_room_shown`] the first time a
+    /// room is opened.
+    #[cfg(unix)]
+    pub ai_rooms: HashMap<OwnedRoomId, AiRoomInfo>,
+    /// Rooms already checked and found to have no marker, so re-opening the
+    /// same ordinary room doesn't re-check it every time.
+    #[cfg(unix)]
+    known_non_ai_rooms: HashSet<OwnedRoomId>,
     /// The room whose session launched the current generation, while one is
     /// running for a `launch_splash_app` tool call. `None` when the current
     /// (or last-finished) generation came from the Mini Apps screen instead —
@@ -196,6 +224,10 @@ pub fn init() {
             #[cfg(unix)]
             ai_sessions: HashMap::new(),
             #[cfg(unix)]
+            ai_rooms: HashMap::new(),
+            #[cfg(unix)]
+            known_non_ai_rooms: HashSet::new(),
+            #[cfg(unix)]
             ai_generation_room: None,
             perms_dirty: false,
             registry_dirty: false,
@@ -249,13 +281,6 @@ pub enum A2AppOp {
     ShareToRoom { app_id: MiniAppId, room_id: OwnedRoomId },
     /// The user's "Mini-apps can write to rooms" switch.
     SetMatrixWrite(bool),
-    /// Talk to (creating it if needed) the room's AI agent session: the text
-    /// after `/ai` goes to the agent, and its replies land back in the room.
-    #[cfg(unix)]
-    AiCommand { request: String, room_id: OwnedRoomId },
-    /// Ends the room's AI agent session, killing its agent and socket.
-    #[cfg(unix)]
-    StopAiSession { room_id: OwnedRoomId },
 }
 
 
@@ -342,6 +367,8 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     let mut watch_events: Vec<A2AppRoomWatchEvent> = Vec::new();
     let mut account_events: Vec<A2AppAccountWatchEvent> = Vec::new();
     let mut host_events: Vec<(&'static str, serde_json::Value)> = Vec::new();
+    #[cfg(unix)]
+    let mut ai_room_actions: Vec<AiRoomAction> = Vec::new();
     if let Event::Actions(actions) = event {
         for action in actions {
             if let Some(watch_event) = action.downcast_ref::<A2AppRoomWatchEvent>() {
@@ -407,6 +434,10 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
             if action.downcast_ref::<AppPreferencesAction>().is_some() {
                 host_events.push(("on_prefs_changed", prefs_json(cx)));
             }
+            #[cfg(unix)]
+            if let Some(ai_room_action) = action.downcast_ref::<AiRoomAction>() {
+                ai_room_actions.push(ai_room_action.clone());
+            }
         }
     }
 
@@ -452,6 +483,10 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     }
     if !watch_events.is_empty() || !account_events.is_empty() || !host_events.is_empty() {
         deliver_room_hooks(cx, ui, watch_events, account_events, host_events);
+    }
+    #[cfg(unix)]
+    for action in ai_room_actions {
+        apply_ai_room_action(cx, ui, action);
     }
 
     // Sessions drain their tool calls and agent events every pass; a tool
@@ -1023,12 +1058,6 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 bundle_json: bundle::to_text(&manifest),
                 app_name: manifest.name.clone(),
             }));
-        }
-        #[cfg(unix)]
-        A2AppOp::AiCommand { request, room_id } => ai_command(cx, ui, request, room_id),
-        #[cfg(unix)]
-        A2AppOp::StopAiSession { room_id } => {
-            stop_ai_session(cx, ui, &room_id);
         }
     }
 }
@@ -1938,91 +1967,197 @@ pub fn run_miniapp_command(cx: &mut Cx, arg: &str, room_id: &OwnedRoomId) {
 }
 
 // -----------------------------------------------------------------------
-// AI agent sessions (/ai)
+// AI Rooms
 // -----------------------------------------------------------------------
 
-/// The `/ai` slash command: sends everything after the command to the room's
-/// agent session, creating the session on first use. `/ai stop` (or `end`,
-/// `quit`) ends the room's session instead — the one way to reclaim the
-/// agent process without leaving the room forever.
+/// Called when a `RoomScreen` first opens a room: checks (once) whether it
+/// carries the `rs.robius.robrix.ai_room` marker, so its session can be
+/// attached. Cheap to call on every room open — a room already known either
+/// way is a synchronous map lookup, no request goes out.
 #[cfg(unix)]
-pub fn run_ai_command(cx: &mut Cx, arg: &str, room_id: &OwnedRoomId) {
-    let arg = arg.trim();
-    if arg.is_empty() {
-        enqueue_popup_notification(
-            "/ai <request>: talk to this room's agent. It can also build Splash mini-apps \
-             (like /miniapp) while you chat. `/ai stop` ends the session.",
-            PopupKind::Info, Some(5.0),
-        );
+pub fn on_room_shown(room_id: &OwnedRoomId) {
+    let already_known = with_a2app(|state| {
+        state.ai_rooms.contains_key(room_id) || state.known_non_ai_rooms.contains(room_id)
+    }).unwrap_or(true);
+    if already_known {
+        log!("AI Rooms: room {room_id} already known (ai_room? {}); no re-check.", with_a2app(|s| s.ai_rooms.contains_key(room_id)).unwrap_or(false));
         return;
     }
-    if matches!(arg.to_ascii_lowercase().as_str(), "stop" | "end" | "quit") {
-        cx.action(A2AppOp::StopAiSession {
-            room_id: room_id.clone(),
-        });
-        return;
-    }
-    cx.action(A2AppOp::AiCommand {
-        request: arg.to_string(),
+    log!("AI Rooms: room {room_id} shown for the first time; checking for the ai_room marker...");
+    submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::CheckMarker {
         room_id: room_id.clone(),
-    });
+    }));
 }
 
-/// Handles `A2AppOp::AiCommand`: starts the room's agent session when it
-/// isn't running, then sends the request to it (queued while it's busy).
+/// Applies one Matrix-worker result for an AI-room operation. Room creation
+/// (`Created`/`CreateFailed`) is navigation, so `app.rs` handles it instead.
 #[cfg(unix)]
-fn ai_command(cx: &mut Cx, ui: &WidgetRef, request: String, room_id: OwnedRoomId) {
+fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
+    match action {
+        AiRoomAction::Created { room_name_id } => {
+            // The room was just created with the ai_room marker in its
+            // initial_state, so record it as an AI room right away. Its
+            // marker state event can lag sliding sync by a second or two
+            // after creation; recording it here means the room is already
+            // recognized (session attached on its first forwarded message)
+            // without waiting for that sync to land.
+            let room_id = room_name_id.room_id().clone();
+            log!("AI Rooms: recording newly-created AI room {room_id} ({}); no marker check needed.", room_name_id.display());
+            with_a2app(|state| {
+                state
+                    .ai_rooms
+                    .entry(room_id)
+                    .or_insert(AiRoomInfo { cursor: None, needs_priming: true, posted_by_tool_this_turn: false });
+            });
+        }
+        AiRoomAction::CreateFailed { error } => {
+            // app.rs already showed the error popup.
+            log!("AI Rooms: AI room creation failed: {error}");
+        }
+        AiRoomAction::NotAiRoom { room_id } => {
+            log!("AI Rooms: room {room_id} has no ai_room marker; treating it as an ordinary room.");
+            with_a2app(|state| { state.known_non_ai_rooms.insert(room_id); });
+        }
+        AiRoomAction::Attached { room_id, name, cursor } => {
+            log!("AI Rooms: room {room_id} is an AI room (name: {name:?}, saved forwarding cursor: {cursor:?}); attaching session.");
+            with_a2app(|state| {
+                state.ai_rooms.insert(room_id.clone(), AiRoomInfo { cursor, needs_priming: true, posted_by_tool_this_turn: false });
+            });
+            attach_ai_session(cx, ui, &room_id, name);
+        }
+        AiRoomAction::PostReplyFailed { error } => {
+            log!("AI Rooms: FAILED to post an ai_reply state event: {error}");
+            enqueue_popup_notification(
+                format!("Couldn't post the AI agent's reply: {error}"),
+                PopupKind::Error, Some(6.0),
+            );
+        }
+    }
+}
+
+/// Starts an AI room's session if it isn't already running. Started idle
+/// (no prompt sent yet) — the first forwarded message primes it with the
+/// replayed transcript and sends it as one prompt.
+#[cfg(unix)]
+fn attach_ai_session(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, _name: Option<String>) {
+    let already_running = with_a2app(|state| state.ai_sessions.contains_key(room_id)).unwrap_or(true);
+    if already_running {
+        log!("AI Rooms: room {room_id}'s agent session is already running; keeping it.");
+        return;
+    }
     let prefs = with_a2app(|state| state.agent_prefs.clone())
         .unwrap_or_else(a2app_agent::prefs::load_agent_prefs);
-    // A fresh session queues its first prompt until the handshake finishes,
-    // which is expected startup, not "you're behind" — only a prompt queued
-    // behind a pre-existing session's busy turn gets the popup below.
-    let mut fresh = false;
-    let outcome = with_a2app(|state| {
-        if !state.ai_sessions.contains_key(&room_id) {
-            match AiSession::start(room_id.clone(), prefs.clone()) {
-                Ok(session) => {
-                    fresh = true;
-                    state.ai_sessions.insert(room_id.clone(), session);
-                }
-                Err(e) => {
-                    enqueue_popup_notification(e, PopupKind::Error, Some(6.0));
-                    return None;
-                }
-            }
-        }
-        state
-            .ai_sessions
-            .get_mut(&room_id)
-            .map(|session| session.prompt(request))
-    }).flatten();
-    match outcome {
-        Some(PromptOutcome::Queued) if !fresh => {
-            enqueue_popup_notification(
-                "The agent in this room is still working; your request is queued.",
-                PopupKind::Info, Some(4.0),
-            );
-        }
-        Some(PromptOutcome::Dead) => {
-            enqueue_popup_notification(
-                "The agent in this room has stopped; try /ai stop, then /ai again.",
-                PopupKind::Warning, Some(6.0),
-            );
-        }
-        _ => {}
+    let started = with_a2app(|state| {
+        AiSession::start(room_id.clone(), prefs).map(|session| {
+            state.ai_sessions.insert(room_id.clone(), session);
+        })
+    });
+    if let Some(Err(e)) = started {
+        log!("AI Rooms: FAILED to start the agent session for AI room {room_id}: {e}");
+        enqueue_popup_notification(
+            format!("Couldn't start this AI room's agent: {e}"),
+            PopupKind::Error, Some(6.0),
+        );
+    } else {
+        log!("AI Rooms: started the agent session for AI room {room_id}.");
     }
     ui.redraw(cx);
 }
 
-/// Ends the room's agent session: the agent child is killed and its socket
-/// closed (both by [`AiSession`]'s drop). A generation the session started
-/// keeps running — the app it was building is still wanted — and its launch
-/// tool call is answered with an error by the drop.
+/// What `room_screen.rs` needs to scan an AI room's currently-loaded
+/// timeline items for new member messages to forward.
 #[cfg(unix)]
-fn stop_ai_session(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
-    let removed = with_a2app(|state| state.ai_sessions.remove(room_id)).is_some();
-    if removed {
-        ui.redraw(cx);
+pub struct AiRoomScanState {
+    /// Only items after this event (by timeline position) are new.
+    /// `None` means the room has never forwarded anything yet.
+    pub cursor: Option<OwnedEventId>,
+    /// Whether the next forwarded prompt still needs the replayed-transcript
+    /// preamble.
+    pub needs_priming: bool,
+}
+
+/// Returns this room's forwarding state, or `None` if it isn't (or isn't yet
+/// known to be) an AI room — the caller's cue to skip scanning entirely.
+#[cfg(unix)]
+pub fn ai_room_scan_state(room_id: &OwnedRoomId) -> Option<AiRoomScanState> {
+    with_a2app(|state| {
+        state.ai_rooms.get(room_id).map(|info| AiRoomScanState {
+            cursor: info.cursor.clone(),
+            needs_priming: info.needs_priming,
+        })
+    }).flatten()
+}
+
+/// Forwards newly-seen member messages (in timeline order) to an AI room's
+/// session as prompts, attaching the session first if needed. `preamble`,
+/// when given, is folded into the *first* prompt only (see `needs_priming`).
+///
+/// Each successfully-forwarded event becomes the room's new cursor,
+/// persisted as room account data for restart continuity.
+#[cfg(unix)]
+pub fn forward_ai_room_texts(
+    room_id: &OwnedRoomId,
+    new_texts: Vec<(OwnedEventId, String)>,
+    preamble: Option<String>,
+) {
+    if new_texts.is_empty() {
+        return;
+    }
+    log!("AI Rooms: forwarding {} new message(s) to room {room_id}'s session (priming preamble: {})...", new_texts.len(), preamble.as_ref().map(|p| !p.is_empty()).unwrap_or(false));
+    for (event_id, text) in &new_texts {
+        log!("AI Rooms:   -> forwarding {event_id}: {}", text.chars().take(120).collect::<String>());
+    }
+    let prefs = with_a2app(|state| state.agent_prefs.clone())
+        .unwrap_or_else(a2app_agent::prefs::load_agent_prefs);
+    let mut preamble = preamble.filter(|p| !p.is_empty());
+    let mut last_cursor = None;
+    for (event_id, text) in new_texts {
+        let prompt_text = match preamble.take() {
+            Some(p) => format!("{p}\n\n{text}"),
+            None => text,
+        };
+        let outcome: Result<PromptOutcome, String> = with_a2app(|state| {
+            if !state.ai_sessions.contains_key(room_id) {
+                AiSession::start(room_id.clone(), prefs.clone())
+                    .map(|session| { state.ai_sessions.insert(room_id.clone(), session); })?;
+            }
+            let outcome = state.ai_sessions.get_mut(room_id)
+                .map(|session| session.prompt(prompt_text))
+                .unwrap_or(PromptOutcome::Dead);
+            if outcome != PromptOutcome::Dead {
+                if let Some(info) = state.ai_rooms.get_mut(room_id) {
+                    info.cursor = Some(event_id.clone());
+                    info.needs_priming = false;
+                }
+            }
+            Ok(outcome)
+        }).unwrap_or(Ok(PromptOutcome::Dead));
+        match outcome {
+            Ok(PromptOutcome::Dead) => {
+                log!("AI Rooms: room {room_id}'s agent session is dead; NOT forwarding {event_id}.");
+                enqueue_popup_notification(
+                    "This AI room's agent has stopped; reopen the room to restart it.",
+                    PopupKind::Warning, Some(6.0),
+                );
+                return;
+            }
+            Err(e) => {
+                log!("AI Rooms: FAILED to start/use room {room_id}'s agent session: {e}");
+                enqueue_popup_notification(
+                    format!("Couldn't start this AI room's agent: {e}"),
+                    PopupKind::Error, Some(6.0),
+                );
+                return;
+            }
+            Ok(other) => log!("AI Rooms: forwarded {event_id} to room {room_id}'s session: {other:?}"),
+        }
+        last_cursor = Some(event_id);
+    }
+    if let Some(cursor) = last_cursor {
+        submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::SaveCursor {
+            room_id: room_id.clone(),
+            cursor,
+        }));
     }
 }
 
@@ -2067,18 +2202,51 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
         for (room_id, updates) in updates {
             for update in updates {
                 match update {
-                    SessionUpdate::Ready => {}
-                    SessionUpdate::Reply { text } => to_post.push((room_id.clone(), text)),
-                    SessionUpdate::Error(msg) => errors.push(msg),
-                    SessionUpdate::Gone(msg) => deaths.push((room_id.clone(), msg)),
+                    SessionUpdate::Ready => log!("AI Rooms: room {room_id}'s agent session is ready."),
+                    SessionUpdate::Reply { text } => {
+                        log!("AI Rooms: room {room_id}'s agent finished a turn ({} chars).", text.len());
+                        // A turn whose `send_message` tool already posted to
+                        // the room ends with a redundant confirmation from the
+                        // agent; drop it so the tool's message is the turn's
+                        // one `ai_reply` (octos still required the non-empty
+                        // text to accept the end-of-turn response).
+                        let posted_by_tool = with_a2app(|state| {
+                            state
+                                .ai_rooms
+                                .get_mut(&room_id)
+                                .map(|info| std::mem::take(&mut info.posted_by_tool_this_turn))
+                                .unwrap_or(false)
+                        }).unwrap_or(false);
+                        if posted_by_tool {
+                            log!("AI Rooms: room {room_id}'s turn already posted via the send_message tool; dropping its {} trailing text.", text.chars().count());
+                        } else {
+                            to_post.push((room_id.clone(), text))
+                        }
+                    }
+                    SessionUpdate::Error(msg) => {
+                        // The turn is over without a reply; clear the tool-post
+                        // flag so the next turn's reply is not wrongly dropped.
+                        with_a2app(|state| {
+                            if let Some(info) = state.ai_rooms.get_mut(&room_id) {
+                                info.posted_by_tool_this_turn = false;
+                            }
+                        });
+                        log!("AI Rooms: room {room_id}'s agent session reported an error: {msg}");
+                        errors.push(msg)
+                    }
+                    SessionUpdate::Gone(msg) => {
+                        log!("AI Rooms: room {room_id}'s agent session is GONE: {msg}");
+                        deaths.push((room_id.clone(), msg))
+                    }
                 }
             }
         }
     }
     for (room_id, text) in to_post {
-        post_to_room(&room_id, text);
+        post_ai_reply(&room_id, text);
     }
     for msg in errors {
+        log!("AI Rooms: showing session error popup: {msg}");
         enqueue_popup_notification(format!("AI session error: {msg}"), PopupKind::Error, Some(6.0));
     }
     for (room_id, msg) in deaths {
@@ -2088,6 +2256,12 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
         );
         with_a2app(|state| {
             state.ai_sessions.remove(&room_id);
+            // The next attach must re-prime: the in-memory agent (and its
+            // context) is gone with the process, even though the room's
+            // marker and cursor persist.
+            if let Some(info) = state.ai_rooms.get_mut(&room_id) {
+                info.needs_priming = true;
+            }
         });
         ui.redraw(cx);
     }
@@ -2099,7 +2273,16 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
 fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: SessionJob) {
     match job {
         SessionJob::SendRoomMessage { text, answer } => {
-            post_to_room(room_id, text);
+            // Remember this turn already spoke to the room through the tool,
+            // so its eventual trailing text (octos requires a non-empty
+            // end-of-turn response) is dropped as redundant rather than
+            // posted as a second `ai_reply`.
+            with_a2app(|state| {
+                if let Some(info) = state.ai_rooms.get_mut(room_id) {
+                    info.posted_by_tool_this_turn = true;
+                }
+            });
+            post_ai_reply(room_id, text);
             let _ = answer.send(Ok(String::from("Posted to the room.")));
         }
         SessionJob::LaunchSplashApp { description, answer } => {
@@ -2195,16 +2378,32 @@ fn resolve_session_generation(
     }
 }
 
-/// Posts `text` into a room's main timeline as the logged-in user — the same
-/// path the room's own input bar uses. This is how an agent's replies (and
-/// its `send_message` tool calls) reach the room.
+/// Writes `text` as an `ai_reply` state event — the agent's only output
+/// channel (never `m.room.message`, so it can't loop back into the
+/// forwarder as input). This is how both a completed turn's natural reply
+/// and the `send_message` tool call reach the room.
 #[cfg(unix)]
-fn post_to_room(room_id: &OwnedRoomId, text: String) {
-    submit_async_request(MatrixRequest::SendMessage {
-        timeline_kind: TimelineKind::MainRoom { room_id: room_id.clone() },
-        message: RoomMessageEventContent::text_markdown(text),
-        replied_to: None,
-        #[cfg(feature = "tsp")]
-        sign_with_tsp: false,
-    });
+fn post_ai_reply(room_id: &OwnedRoomId, text: String) {
+    // Best-effort traceability, not a precise per-turn link: under queueing,
+    // a reply may technically answer an earlier message than the most
+    // recently forwarded one.
+    let in_reply_to = with_a2app(|state| {
+        state.ai_rooms.get(room_id).and_then(|info| info.cursor.as_ref()).map(ToString::to_string)
+    }).flatten();
+    log!("AI Rooms: posting ai_reply to room {room_id} (in_reply_to: {in_reply_to:?}).");
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::PostReply {
+        room_id: room_id.clone(),
+        content: AiReplyContent {
+            v: 1,
+            text,
+            tool_calls: Vec::new(),
+            model: None,
+            created_at,
+            in_reply_to,
+        },
+    }));
 }

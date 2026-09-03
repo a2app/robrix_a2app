@@ -23,6 +23,10 @@ serde_json = "1.0"
 octos-agent = { git = "https://github.com/project-robius/octos", branch = "acp-embedding-seam", default-features = false, optional = true }
 octos-core  = { git = "https://github.com/project-robius/octos", branch = "acp-embedding-seam", optional = true }
 octos-cli   = { git = "https://github.com/project-robius/octos", branch = "acp-embedding-seam", optional = true }
+## Debug-only: surface octos's tracing (MCP connect, provider resolution) on
+## stderr in debug builds of the embedded backend. Not used in release builds.
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+tracing = { version = "0.1", optional = true }
 tokio  = { version = "1", features = ["rt-multi-thread"], optional = true }
 chrono = { version = "0.4", optional = true }
 
@@ -31,7 +35,7 @@ chrono = { version = "0.4", optional = true }
 ## spawning `octos acp` as a child process. Same agent either way; this picks
 ## how it runs, not what it is. The only local option on iOS, where exec() is
 ## prohibited. ROBRIX_AGENT_CMD still wins over it.
-embedded = ["dep:octos-agent", "dep:octos-core", "dep:octos-cli", "dep:tokio", "dep:chrono"]
+embedded = ["dep:octos-agent", "dep:octos-core", "dep:octos-cli", "dep:tokio", "dep:chrono", "dep:tracing-subscriber", "dep:tracing"]
 
 ## Install the Splash dialect guide ON THE AGENT once, so each prompt can
 ## point at it instead of inlining ~6KB of guide per generation.

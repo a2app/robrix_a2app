@@ -78,6 +78,50 @@ script_mod! {
             }
         }
 
+        LineH { padding: 10, margin: Inset{top: 10, right: 2} }
+
+        SubsectionLabel {
+            text: "Or start a new AI room:"
+        }
+
+        ai_room_help_info := MessageHtml {
+            padding: 7
+            width: Fill, height: Fit
+            font_size: 10.
+            font_color: #3
+            body: "<p>An AI room is an ordinary room backed by a Robrix AI agent session: \
+                messages you (or anyone you invite) send drive the agent, and its replies \
+                are posted back into the room.</p>"
+        }
+
+        ai_room_view := View {
+            width: Fill,
+            height: Fit,
+            margin: Inset{ top: 3, bottom: 4 }
+            align: Align{y: 0.5}
+            spacing: 5
+            flow: Right
+
+            ai_room_name_input := RobrixTextInput {
+                align: Align{y: 0.5}
+                margin: Inset{top: 0, left: 5, right: 5, bottom: 0},
+                padding: Inset{left: 12, right: 12, top: 11, bottom: 0}
+                width: Fill { max: 400 }
+                height: 40
+                empty_text: "Name this AI room..."
+                autocapitalize: None,
+                autocorrect: Disabled,
+            }
+
+            create_ai_room_button := RobrixIconButton {
+                padding: Inset{top: 10, bottom: 10, left: 12, right: 14}
+                height: 40
+                draw_icon.svg: (ICON_ADD)
+                icon_walk: Walk{width: 16, height: 16}
+                text: "Create"
+            }
+        }
+
         loading_room_view := View {
             visible: false
             spacing: 5,
@@ -358,6 +402,36 @@ impl Widget for AddRoomScreen {
             // Enable or disable the button based on if the text input is empty.
             if let Some(text) = room_alias_id_input.changed(actions) {
                 search_for_room_button.set_enabled(cx, !text.trim().is_empty());
+            }
+
+            // If the create-AI-room button was clicked (or Enter was pressed),
+            // fire off a room creation request; `app.rs` navigates to it once
+            // `AiRoomAction::Created` comes back.
+            let ai_room_name_input = self.view.text_input(cx, ids!(ai_room_name_input));
+            let create_ai_room_button = self.view.button(cx, ids!(create_ai_room_button));
+            let new_ai_room_name = create_ai_room_button.clicked(actions)
+                .then(|| ai_room_name_input.text())
+                .or_else(|| ai_room_name_input.returned(actions).map(|(t, _)| t));
+            if let Some(name) = new_ai_room_name {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    enqueue_popup_notification("Enter a name for the new AI room.", PopupKind::Error, Some(4.0));
+                } else {
+                    #[cfg(all(feature = "a2app", unix))]
+                    {
+                        submit_async_request(MatrixRequest::AiRoom(crate::a2app::ai::rooms::AiRoomRequest::Create { name }));
+                        enqueue_popup_notification(
+                            "Creating AI room...\n\nThe room will be shown once it has been created by the homeserver.",
+                            PopupKind::Info, Some(6.0),
+                        );
+                        ai_room_name_input.set_text(cx, "");
+                    }
+                    #[cfg(not(all(feature = "a2app", unix)))]
+                    enqueue_popup_notification(
+                        "AI rooms aren't available in this build of Robrix.",
+                        PopupKind::Error, Some(5.0),
+                    );
+                }
             }
 
             // If the cancel button was clicked, hide the room preview and return to default state.

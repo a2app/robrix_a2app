@@ -662,6 +662,26 @@ impl MatchEvent for App {
                 }
                 _ => {}
             }
+
+            // Handle AI room creation: navigate to a newly-created AI room,
+            // or report why creation failed. (Attaching its session, and
+            // everything else about AI rooms, is handled in `a2app::runtime`.)
+            #[cfg(all(feature = "a2app", unix))]
+            match action.downcast_ref() {
+                Some(crate::a2app::ai::rooms::AiRoomAction::Created { room_name_id }) => {
+                    log!("AI Rooms: AI room created: {room_name_id:?}; navigating to it.");
+                    self.navigate_to_room(cx, None, &BasicRoomDetails::RoomId(room_name_id.clone()));
+                }
+                Some(crate::a2app::ai::rooms::AiRoomAction::CreateFailed { error }) => {
+                    log!("AI Rooms: AI room creation FAILED: {error}");
+                    enqueue_popup_notification(
+                        format!("Failed to create the AI room.\n\nError: {error}"),
+                        PopupKind::Error,
+                        None,
+                    );
+                }
+                _ => {}
+            }
         }
     }
 }

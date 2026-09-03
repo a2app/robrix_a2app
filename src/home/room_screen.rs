@@ -681,6 +681,8 @@ script_mod! {
             ReadMarker := mod.widgets.ReadMarker {}
             // A mini-app shared into the room (an invisible stub without `a2app`).
             MiniAppTimelineCard := mod.widgets.MiniAppTimelineCard {}
+            // An AI room's agent turn (an invisible stub without `a2app`).
+            AiReplyTimelineCard := mod.widgets.AiReplyTimelineCard {}
         }
 
         // A jump to bottom button (with an unread message badge) that is shown
@@ -886,6 +888,103 @@ pub(crate) fn index_of_event(
             .is_some_and(|ev_id| ev_id == event_id)
         )
         .map(|position| max_idx.saturating_sub(position).saturating_sub(1))
+}
+
+/// Scans an AI room's currently-loaded timeline for member text messages
+/// after its forwarding cursor, and forwards any new ones to its agent
+/// session (see [`crate::a2app::runtime::forward_ai_room_texts`]).
+#[cfg(all(feature = "a2app", unix))]
+fn scan_ai_room_messages(room_id: &OwnedRoomId, items: &Vector<Arc<TimelineItem>>) {
+    let Some(scan_state) = crate::a2app::runtime::ai_room_scan_state(room_id) else { return };
+    let start_idx = match &scan_state.cursor {
+        Some(cursor_id) => {
+            let found = items.iter().position(|it| {
+                it.as_event()
+                    .and_then(|e| e.event_id())
+                    .map(ToOwned::to_owned)
+                    .as_ref() == Some(cursor_id)
+            });
+            let Some(pos) = found else {
+                // The cursor event isn't in the currently-loaded window;
+                // wait for it to reappear rather than risk re-forwarding
+                // history that was already answered.
+                log!("AI Rooms: cursor event {cursor_id} for room {room_id} isn't in the loaded timeline window; skipping this scan.");
+                return;
+            };
+            pos + 1
+        }
+        None => 0,
+    };
+    let mut new_texts = Vec::new();
+    for item in items.iter().skip(start_idx) {
+        let Some(ev) = item.as_event() else { continue };
+        let Some(event_id) = ev.event_id() else { continue };
+        let TimelineItemContent::MsgLike(msg_like) = ev.content() else { continue };
+        if msg_like.thread_root.is_some() {
+            continue;
+        }
+        let MsgLikeKind::Message(msg) = &msg_like.kind else { continue };
+        let MessageType::Text(text_content) = msg.msgtype() else { continue };
+        new_texts.push((event_id.to_owned(), text_content.body.clone()));
+    }
+    if new_texts.is_empty() {
+        return;
+    }
+    let preamble = scan_state.needs_priming
+        .then(|| build_ai_transcript_preamble(items.iter().take(start_idx)));
+    crate::a2app::runtime::forward_ai_room_texts(room_id, new_texts, preamble);
+}
+
+/// Builds a plaintext transcript of a room's earlier conversation (member
+/// text messages and prior `ai_reply` turns, in order) to prime a
+/// freshly-(re)started session with the context a persistent one would
+/// already have (see `AiRoomInfo::needs_priming`).
+#[cfg(all(feature = "a2app", unix))]
+fn build_ai_transcript_preamble<'a>(items: impl Iterator<Item = &'a Arc<TimelineItem>>) -> String {
+    const MAX_LINES: usize = 40;
+    let mut lines: Vec<String> = Vec::new();
+    for item in items {
+        let Some(ev) = item.as_event() else { continue };
+        match ev.content() {
+            TimelineItemContent::MsgLike(msg_like) if msg_like.thread_root.is_none() => {
+                if let MsgLikeKind::Message(msg) = &msg_like.kind {
+                    if let MessageType::Text(text) = msg.msgtype() {
+                        lines.push(format!("User: {}", text.body));
+                    }
+                }
+            }
+            TimelineItemContent::OtherState(other) => {
+                let is_ai_reply = matches!(
+                    other.content(),
+                    timeline::AnyOtherStateEventContentChange::_Custom { event_type }
+                        if event_type == crate::a2app::ai_room_events::AI_REPLY_EVENT_TYPE
+                );
+                if is_ai_reply {
+                    let text = ev.latest_json()
+                        .and_then(|raw| raw.deserialize_as::<serde_json::Value>().ok())
+                        .and_then(|v| v.get("content")
+                            .and_then(|c| c.get("text"))
+                            .and_then(|t| t.as_str())
+                            .map(str::to_owned));
+                    if let Some(text) = text {
+                        lines.push(format!("Assistant: {text}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if lines.len() > MAX_LINES {
+        let excess = lines.len() - MAX_LINES;
+        lines.drain(0..excess);
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "[This room's earlier conversation, for context:]\n{}\n[/earlier conversation]",
+        lines.join("\n"),
+    )
 }
 
 /// The main widget that displays a single Matrix room.
@@ -1598,20 +1697,25 @@ impl Widget for RoomScreen {
                             TimelineItemContent::OtherState(other) => {
                                 // Don't shown noisy updates like policy rules, server ACLs, space links, custom state events, etc.
                                 // We could always make this configurable, e.g., some kind of dev mode.
-                                let should_hide = matches!(
-                                    other.content(),
+                                // An AI room's `ai_reply` turns are the one custom state event
+                                // that *is* shown, as a timeline card (see `populate_other_state_event`).
+                                let should_hide = match other.content() {
                                     timeline::AnyOtherStateEventContentChange::PolicyRuleRoom(_)
                                     | timeline::AnyOtherStateEventContentChange::PolicyRuleServer(_)
                                     | timeline::AnyOtherStateEventContentChange::PolicyRuleUser(_)
                                     | timeline::AnyOtherStateEventContentChange::RoomServerAcl(_)
                                     | timeline::AnyOtherStateEventContentChange::SpaceChild(_)
-                                    | timeline::AnyOtherStateEventContentChange::SpaceParent(_)
-                                    | timeline::AnyOtherStateEventContentChange::_Custom { .. }
-                                );
+                                    | timeline::AnyOtherStateEventContentChange::SpaceParent(_) => true,
+                                    #[cfg(feature = "a2app")]
+                                    timeline::AnyOtherStateEventContentChange::_Custom { event_type }
+                                        if event_type == crate::a2app::ai_room_events::AI_REPLY_EVENT_TYPE => false,
+                                    timeline::AnyOtherStateEventContentChange::_Custom { .. } => true,
+                                    _ => false,
+                                };
                                 if should_hide {
                                     (list.item(cx, item_id, id!(Empty)), ItemDrawnStatus::both_drawn())
                                 } else {
-                                    populate_small_state_event(
+                                    populate_other_state_event(
                                         cx,
                                         list,
                                         item_id,
@@ -2241,6 +2345,16 @@ impl RoomScreen {
                     tl.pending_downloads.retain(|p| p.mxc != mxc);
                     portal_list.redraw(cx);
                 }
+            }
+        }
+
+        // Forward any new member text messages in an AI room to its agent
+        // session. Cheap to call on every update pass: rooms that aren't
+        // (known to be) AI rooms are a single synchronous map lookup away.
+        #[cfg(all(feature = "a2app", unix))]
+        if num_updates > 0 {
+            if let TimelineKind::MainRoom { room_id } = &tl.kind {
+                scan_ai_room_messages(room_id, &tl.items);
             }
         }
 
@@ -3190,6 +3304,10 @@ impl RoomScreen {
                         mark_as_unread: false,
                     });
                 }
+                // Check (once) whether this room is an AI room, so its
+                // session can be attached.
+                #[cfg(all(feature = "a2app", unix))]
+                crate::a2app::runtime::on_room_shown(&room_id);
             }
         }
 
@@ -5897,6 +6015,45 @@ fn populate_other_message_like(
                 event_tl_item.sender().as_str(),
                 Some(timeline_kind.room_id().clone()),
             );
+        }
+        return (item, ItemDrawnStatus::both_drawn());
+    }
+    populate_small_state_event(
+        cx,
+        list,
+        item_id,
+        timeline_kind,
+        event_tl_item,
+        other,
+        item_drawn_status,
+    )
+}
+
+/// Routes a custom state event: an AI room's `ai_reply` turns get their own
+/// timeline card; everything else stays a small state event.
+fn populate_other_state_event(
+    cx: &mut Cx,
+    list: &mut PortalList,
+    item_id: usize,
+    timeline_kind: &TimelineKind,
+    event_tl_item: &EventTimelineItem,
+    other: &timeline::OtherState,
+    item_drawn_status: ItemDrawnStatus,
+) -> (WidgetRef, ItemDrawnStatus) {
+    #[cfg(feature = "a2app")]
+    if matches!(
+        other.content(),
+        timeline::AnyOtherStateEventContentChange::_Custom { event_type }
+            if event_type == crate::a2app::ai_room_events::AI_REPLY_EVENT_TYPE
+    ) {
+        use crate::a2app::ai_room_events::{AiReplyContent, AiReplyTimelineCardWidgetRefExt};
+        let (item, existed) = list.item_with_existed(cx, item_id, id!(AiReplyTimelineCard));
+        if !(existed && item_drawn_status.content_drawn) {
+            let content = event_tl_item.latest_json()
+                .and_then(|raw| raw.deserialize_as::<serde_json::Value>().ok())
+                .and_then(|v| v.get("content").cloned())
+                .and_then(|c| serde_json::from_value::<AiReplyContent>(c).ok());
+            item.as_ai_reply_timeline_card().populate(cx, content.as_ref());
         }
         return (item, ItemDrawnStatus::both_drawn());
     }

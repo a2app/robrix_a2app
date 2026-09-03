@@ -158,6 +158,16 @@ log_timeline_diffs = []
 ## Logs all diffs received by the Matrix SpaceService.
 log_space_service_diffs = []
 
+[dev-dependencies]
+## Regression harness for the AI-room MCP tool bridge (tests/mcp_rmcp.rs):
+## drives the real `robrix --mcp-bridge` relay with the SAME rmcp-based MCP
+## client octos uses (octos-agent/src/mcp.rs). The hand-written client in
+## tests/mcp_transport.rs exercises the same wire protocol but cannot
+## reproduce client-stack failures — which is how the relay dying under rmcp
+## slipped past it (macOS-only: `accept()` there inherits the listener's
+## O_NONBLOCK; see the test's module docs).
+rmcp = { version = "1.8", default-features = false, features = ["client", "transport-child-process"] }
+
 [workspace]
 members = ["a2app/core", "a2app/agent"]
 

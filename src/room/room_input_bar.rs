@@ -544,14 +544,6 @@ impl RoomInputBar {
             }
             #[cfg(not(feature = "a2app"))]
             SlashCommandAction::MiniApp(_) => {}
-            // The AI agent session lives behind a Unix-socket tool server,
-            // so it exists only where that can bind.
-            #[cfg(all(feature = "a2app", unix))]
-            SlashCommandAction::Ai(arg) => {
-                crate::a2app::runtime::run_ai_command(cx, &arg, room_id);
-            }
-            #[cfg(not(all(feature = "a2app", unix)))]
-            SlashCommandAction::Ai(_) => {}
         }
     }
 

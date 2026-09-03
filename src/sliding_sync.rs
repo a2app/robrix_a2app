@@ -802,6 +802,11 @@ pub enum MatrixRequest {
     /// A matrix operation requested by a Splash mini-app (or an app share).
     #[cfg(feature = "a2app")]
     A2App(crate::a2app::matrix::A2AppMatrixRequest),
+    /// A matrix operation for AI Rooms (create/mark a room, forwarding
+    /// cursor, `ai_reply` writes). Unix-only: AI rooms attach a per-room
+    /// [`crate::a2app::ai::session::AiSession`], which is unix-only itself.
+    #[cfg(all(feature = "a2app", unix))]
+    AiRoom(crate::a2app::ai::rooms::AiRoomRequest),
 }
 
 /// Submits a request to the worker thread to be executed asynchronously.
@@ -2499,6 +2504,13 @@ async fn matrix_worker_task(
             MatrixRequest::A2App(request) => {
                 let _a2app_task = Handle::current().spawn(
                     crate::a2app::matrix::handle_matrix_request(request)
+                );
+            }
+
+            #[cfg(all(feature = "a2app", unix))]
+            MatrixRequest::AiRoom(request) => {
+                let _ai_room_task = Handle::current().spawn(
+                    crate::a2app::ai::rooms::handle_ai_room_request(request)
                 );
             }
 

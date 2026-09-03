@@ -95,6 +95,10 @@ pub fn maybe_run() -> Option<i32> {
 
 /// Relays frames between this process's stdio and the session socket until
 /// either direction closes.
+///
+/// Each pump reports how it ended on stderr (which the spawning agent
+/// inherits), so a relay that dies mid-session says WHICH direction closed
+/// and why instead of exiting 0 without a word.
 fn run(socket: &std::path::Path) -> Result<(), String> {
     let stream = UnixStream::connect(socket)
         .map_err(|e| format!("couldn't connect to session socket {}: {e}", socket.display()))?;
