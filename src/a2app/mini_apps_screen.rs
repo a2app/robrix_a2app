@@ -20,6 +20,8 @@ use a2app_core::versions::AppVersion;
 
 use crate::a2app::runtime::{room_display_name, with_a2app, A2AppOp, A2AppRuntimeAction};
 use crate::home::rooms_list::RoomsListRef;
+use crate::app::ConfirmDeleteAction;
+use crate::shared::confirmation_modal::ConfirmationModalContent;
 use crate::shared::popup_list::{enqueue_popup_notification, PopupKind};
 use crate::shared::room_picker_modal::{RoomPickerContent, RoomPickerModalAction};
 
@@ -1387,6 +1389,12 @@ impl Widget for MiniAppsScreen {
             {
                 self.set_pane(cx, Pane::List);
             }
+            if let Some(A2AppRuntimeAction::Uninstalled(app_id)) = action.downcast_ref() {
+                if self.info_app.as_deref() == Some(app_id.as_str()) {
+                    self.set_pane(cx, Pane::List);
+                }
+                continue;
+            }
             if let Some(A2AppRuntimeAction::VersionsChanged(app_id)) = action.downcast_ref()
                 && self.info_app.as_ref() == Some(app_id)
             {
@@ -1446,11 +1454,21 @@ impl Widget for MiniAppsScreen {
                     continue;
                 }
                 Some(MiniAppsScreenAction::ProviderForget(id)) => {
-                    match a2app_agent::providers::forget(id) {
-                        Ok(()) => enqueue_popup_notification("Forgot that provider's key.", PopupKind::Success, Some(3.0)),
-                        Err(e) => enqueue_popup_notification(e, PopupKind::Error, Some(5.0)),
-                    }
-                    self.view.redraw(cx);
+                    let label = a2app_agent::providers::label_for(id);
+                    let id = id.clone();
+                    self.confirm_delete(
+                        cx,
+                        format!("Forget the {label} key?"),
+                        format!("The key Robrix saved for {label} is deleted. A key from your environment or from octos's own sign-in is never touched."),
+                        "Forget key",
+                        move |cx| {
+                            match a2app_agent::providers::forget(&id) {
+                                Ok(()) => enqueue_popup_notification(format!("Forgot the {label} key."), PopupKind::Success, Some(3.0)),
+                                Err(e) => enqueue_popup_notification(e, PopupKind::Error, Some(5.0)),
+                            }
+                            cx.redraw_all();
+                        },
+                    );
                     continue;
                 }
                 Some(MiniAppsScreenAction::None) | None => {}
@@ -1554,11 +1572,26 @@ impl Widget for MiniAppsScreen {
                 cx.action(A2AppOp::ForceStop(app_id.clone()));
             }
             if self.view.button(cx, ids!(info_clear_data_button)).clicked(actions) {
-                cx.action(A2AppOp::ClearData(app_id.clone()));
+                let name = self.info_name();
+                let app = app_id.clone();
+                self.confirm_delete(
+                    cx,
+                    format!("Clear {name}'s data?"),
+                    String::from("Everything the app saved in its private storage is deleted. The app itself stays installed."),
+                    "Clear data",
+                    move |cx| cx.action(A2AppOp::ClearData(app)),
+                );
             }
             if self.view.button(cx, ids!(info_uninstall_button)).clicked(actions) {
-                cx.action(A2AppOp::Uninstall(app_id.clone()));
-                self.set_pane(cx, Pane::List);
+                let name = self.info_name();
+                let app = app_id.clone();
+                self.confirm_delete(
+                    cx,
+                    format!("Uninstall {name}?"),
+                    String::from("Its saved data and permissions are removed. The app's bundle is archived, so it can be brought back."),
+                    "Uninstall",
+                    move |cx| cx.action(A2AppOp::Uninstall(app)),
+                );
             }
             if self.view.button(cx, ids!(unrestrict_button)).clicked(actions) {
                 cx.action(A2AppOp::Unrestrict(app_id.clone()));
@@ -1713,6 +1746,17 @@ impl MiniAppsScreen {
     }
 
     /// Opens the room picker; `on_picked` gets the chosen room's id.
+    /// Asks before anything is deleted; `then` runs only on confirmation.
+    fn confirm_delete(&self, cx: &mut Cx, title: String, body: String, verb: &'static str, then: impl FnOnce(&mut Cx) + 'static) {
+        cx.action(ConfirmDeleteAction::Show(RefCell::new(Some(ConfirmationModalContent {
+            title_text: Cow::Owned(title),
+            body_text: Cow::Owned(body),
+            accept_button_text: Some(Cow::Borrowed(verb)),
+            on_accept_clicked: Some(Box::new(then)),
+            ..Default::default()
+        }))));
+    }
+
     fn pick_room(&self, cx: &mut Cx, title: String, on_picked: impl FnOnce(&mut Cx, OwnedRoomId) + 'static) {
         cx.action(RoomPickerModalAction::Show(RefCell::new(Some(RoomPickerContent {
             title: Cow::Owned(title),

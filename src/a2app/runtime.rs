@@ -255,6 +255,7 @@ pub enum RoomAction {
 #[derive(Clone, Debug, Default)]
 pub enum A2AppRuntimeAction {
     VersionsChanged(MiniAppId),
+    Uninstalled(MiniAppId),
     #[default]
     None,
 }
@@ -774,6 +775,7 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             persistence::remove_user_app(&app_id);
             persistence::clear_app_data(&app_id);
             publish_grants(cx);
+            cx.action(A2AppRuntimeAction::Uninstalled(app_id.clone()));
             enqueue_popup_notification(
                 format!("Uninstalled \"{}\". Its bundle was archived.", manifest.name),
                 PopupKind::Success, Some(4.0),
