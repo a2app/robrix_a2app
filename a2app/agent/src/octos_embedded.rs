@@ -32,6 +32,7 @@ use makepad_widgets::SignalToUI;
 use octos_cli::commands::acp::AcpCommand;
 
 use crate::acp_client::AcpEvent;
+use crate::mcp::McpServerConfig as RobrixMcpServerConfig;
 use crate::prefs::AgentPrefs;
 use crate::AgentTransport;
 
@@ -93,7 +94,16 @@ pub struct EmbeddedOctos {
 }
 
 impl EmbeddedOctos {
-    pub fn start(workspace: &Path, prefs: &AgentPrefs) -> Result<Self, String> {
+    /// `mcp_servers` are the stdio tool servers this session advertises to the
+    /// agent — the same `McpServerConfig`s `AcpClient::spawn` puts in
+    /// `session/new`. The embedded backend hands them to octos's ACP factory
+    /// (`build_with_mcp`) instead, which connects them per session; on iOS the
+    /// caller passes none (the agent cannot exec the relay child there).
+    pub fn start(
+        workspace: &Path,
+        prefs: &AgentPrefs,
+        mcp_servers: &[RobrixMcpServerConfig],
+    ) -> Result<Self, String> {
         std::fs::create_dir_all(workspace).ok();
         let (evt_tx, events) = std::sync::mpsc::channel();
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
@@ -101,7 +111,8 @@ impl EmbeddedOctos {
         let ws = workspace.to_path_buf();
         let prefs = prefs.clone();
         let sd = shutdown.clone();
-        std::thread::spawn(move || agent_thread(ws, prefs, cmd_rx, evt_tx, sd));
+        let servers = mcp_servers.to_vec();
+        std::thread::spawn(move || agent_thread(ws, prefs, servers, cmd_rx, evt_tx, sd));
         Ok(Self { events, cmd_tx, shutdown })
     }
 }
@@ -154,6 +165,7 @@ fn send(evt_tx: &Sender<AcpEvent>, event: AcpEvent) {
 fn agent_thread(
     workspace: PathBuf,
     prefs: AgentPrefs,
+    mcp_servers: Vec<RobrixMcpServerConfig>,
     cmd_rx: Receiver<Cmd>,
     evt_tx: Sender<AcpEvent>,
     shutdown: Arc<Shutdown>,
@@ -172,7 +184,7 @@ fn agent_thread(
         }
     };
 
-    let agent = match rt.block_on(build_agent(&workspace, &prefs, &shutdown)) {
+    let agent = match rt.block_on(build_agent(&workspace, &prefs, &shutdown, &mcp_servers)) {
         Ok(agent) => agent,
         Err(e) => {
             send(&evt_tx, AcpEvent::ProcessGone(e));
@@ -220,6 +232,7 @@ async fn build_agent(
     workspace: &Path,
     prefs: &AgentPrefs,
     shutdown: &Arc<Shutdown>,
+    mcp_servers: &[RobrixMcpServerConfig],
 ) -> Result<Arc<octos_agent::Agent>, String> {
     let cwd = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     let command = AcpCommand {
@@ -247,7 +260,29 @@ async fn build_agent(
     // crash — safe only while that dir was our own private scratch. It is the
     // user's own ~/.octos now, and their episode history is not ours to delete.
     //
-    let built = factory.build(cwd).await.map_err(|e| e.to_string())?;
+    // The Robrix tool servers this session advertised are translated into
+    // octos config and handed to `build_with_mcp`, exactly the per-session
+    // `mcpServers` path the `octos acp` child process serves.
+    let octos_servers: Vec<octos_agent::McpServerConfig> = mcp_servers
+        .iter()
+        .map(|server| octos_agent::McpServerConfig {
+            command: Some(server.command.clone()),
+            args: server.args.clone(),
+            env: std::collections::HashMap::new(),
+            url: None,
+            headers: std::collections::HashMap::new(),
+            oauth: false,
+            scopes: Vec::new(),
+            concurrency_class: None,
+            // The relay's tools (app generation) run minutes-long by design;
+            // octos's 60s operator default would cancel them mid-build.
+            tool_call_timeout_secs: Some(600),
+        })
+        .collect();
+    let built = factory
+        .build_with_mcp(cwd, &octos_servers)
+        .await
+        .map_err(|e| e.to_string())?;
     finish_agent(built, shutdown)
 }
 

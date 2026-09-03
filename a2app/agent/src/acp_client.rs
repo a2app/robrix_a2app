@@ -366,6 +366,12 @@ fn session_new_params(workspace: &str, mcp_servers: &[McpServerConfig]) -> Value
             "name": server.name,
             "command": server.command,
             "args": server.args,
+            // The ACP schema REQUIRES `env` on a stdio server; without it the
+            // agent's own deserializer (VecSkipError) silently drops the
+            // server before its handler ever sees it. Robrix forwards no
+            // extra environment: the relay child inherits the agent's own
+            // (sanitized) environment.
+            "env": [],
         })).collect::<Vec<_>>(),
     })
 }
@@ -399,6 +405,12 @@ mod params_tests {
             advertised[0]["args"],
             json!(["--mcp-bridge", "--socket", "/tmp/s/tools.sock"])
         );
+        assert_eq!(
+            advertised[0]["env"],
+            json!([]),
+            "the ACP schema requires `env` on a stdio server; without it the \
+             server is silently dropped by the agent's VecSkipError deserializer"
+        );
     }
 
     /// The whole point: the config a session host passes to `spawn` must
@@ -409,10 +421,15 @@ mod params_tests {
     #[test]
     fn spawned_agent_sees_the_tool_servers_in_session_new() {
         use std::os::unix::fs::PermissionsExt;
+        // Fresh run each time: the recording file outlives the test (this dir
+        // is shared, not a per-run tempdir), and a stale capture would silently
+        // pass assertions against an old wire format.
         let dir = std::env::temp_dir().join("acp_mcpservers_wire_test");
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("record.sh");
         let out = dir.join("session_new.json");
+        let _ = std::fs::remove_file(&out);
         // Reads stdin; answers `initialize` (its id is always 1, the first
         // request this client sends) so the reader thread proceeds to
         // session/new, and copies that request to `$out` before replying.
@@ -460,6 +477,9 @@ done
         assert_eq!(advertised[0]["command"], "/usr/bin/robrix");
         assert_eq!(advertised[0]["args"][0], "--mcp-bridge");
         assert_eq!(advertised[0]["args"][2], "/tmp/s/tools.sock");
+        // The env field must ride the wire too (schema-required) or the server
+        // is dropped before the agent's handler sees it.
+        assert_eq!(advertised[0]["env"], json!([]));
     }
 }
 

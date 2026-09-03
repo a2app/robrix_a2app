@@ -518,13 +518,13 @@ pub fn start_backend(
 /// pipeline calls [`start_backend`], which advertises none.
 ///
 /// Which agents honor the advertisement: claude-code-acp (the bridged
-/// backend) and any `ROBRIX_AGENT_CMD` override read `mcpServers` from
-/// `session/new`, so the tools reach their models. octos does NOT — it only
-/// registers MCP servers named in its own config file — so a session whose
-/// backend is octos runs without host tools until that path grows per-session
-/// config injection (`OCTOS_CONFIG_DIR` + an `mcp_servers` entry). An
-/// in-process embedded agent can't exec the Robrix relay child at all, so the
-/// config is silently ignored there too.
+/// backend), any `ROBRIX_AGENT_CMD` override, and octos — whose ACP handler
+/// connects per-session `mcpServers` and registers their tools (the coding
+/// profile is bypassed for client-advertised servers) — all read
+/// `mcpServers` from `session/new`, so the tools reach their models. An
+/// in-process embedded agent on iOS cannot exec the Robrix relay child at
+/// all, so the config is dropped there; on desktop the embedded agent honors
+/// it exactly like the child process does.
 pub fn start_backend_with_mcp(
     workspace: &std::path::Path,
     prefs: &prefs::AgentPrefs,
@@ -557,10 +557,17 @@ pub fn start_backend_with_mcp(
     }
     #[cfg(feature = "embedded")]
     {
-        // An in-process agent cannot exec the Robrix relay child, so the
-        // tool config above can never be honored; drop it silently.
-        let _ = mcp_servers;
-        return Ok(Box::new(octos_embedded::EmbeddedOctos::start(workspace, prefs)?));
+        // An in-process agent on iOS cannot exec the Robrix relay child its
+        // own MCP server would be (exec() is prohibited), so nothing it could
+        // be told about is reachable — drop the config there. Everywhere else
+        // the embedded agent honors it exactly like the child process.
+        let mcp_servers: &[crate::mcp::McpServerConfig] =
+            if cfg!(target_os = "ios") { &[] } else { mcp_servers };
+        return Ok(Box::new(octos_embedded::EmbeddedOctos::start(
+            workspace,
+            prefs,
+            mcp_servers,
+        )?));
     }
     #[cfg(not(feature = "embedded"))]
     {
