@@ -81,6 +81,8 @@ impl AppVersion {
     /// identity, declarations, and `source`. Id, builtin, and scope stay base's.
     pub fn apply_to(&self, base: &MiniAppManifest, source: String) -> MiniAppManifest {
         let mut manifest = MiniAppManifest {
+            description: crate::header::parse_app_header(&source).description
+                .unwrap_or_else(|| base.description.clone()),
             source,
             name: self.name.clone(),
             icon: self.icon.clone(),

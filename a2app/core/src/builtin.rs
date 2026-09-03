@@ -20,11 +20,13 @@ macro_rules! app_source {
 }
 
 fn app(id: &str, name: &str, icon: &str, tint: u32, source: String) -> MiniAppManifest {
+    let description = crate::header::parse_app_header(&source).description.unwrap_or_default();
     let mut manifest = MiniAppManifest {
         id: id.to_string(),
         name: name.to_string(),
         icon: icon.to_string(),
         tint,
+        description,
         source,
         allow_net: false,
         permissions: permissions_for(id),
@@ -213,6 +215,7 @@ mod tests {
             let h = crate::header::parse_app_header(&m.source);
             assert_eq!(h.name.as_deref(), Some(m.name.as_str()), "{}", m.id);
             assert_eq!(h.tint, Some(m.tint), "{}", m.id);
+            assert!(!m.description.is_empty(), "{} has no description", m.id);
             assert_eq!(h.permissions, m.permissions, "{}", m.id);
             assert_eq!(h.permission_reasons, m.permission_reasons, "{}", m.id);
         }

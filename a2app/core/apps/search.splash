@@ -1,6 +1,7 @@
 // name: Search
 // icon: 🔍
 // tint: #0F88FE
+// description: Finds messages in this room or across all of them.
 // permissions: matrix-room-read, matrix-rooms-list, matrix-rooms-read, robrix-navigation
 // why-matrix-room-read: Searches the messages in this room.
 // why-matrix-rooms-list: Lists your rooms so you can pick which to search.

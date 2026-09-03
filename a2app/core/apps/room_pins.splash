@@ -1,6 +1,7 @@
 // name: Pinned Events
 // icon: 📌
 // tint: #C0533E
+// description: The messages pinned in this room.
 // permissions: matrix-room-read, robrix-navigation, matrix-room-info
 // why-matrix-room-read: Shows this room's pinned messages.
 // why-robrix-navigation: Jumps to a pinned message you tap.

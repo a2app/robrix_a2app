@@ -1,6 +1,7 @@
 // name: Room Threads
 // icon: 🧵
 // tint: #8A5CA8
+// description: The threads in this room, readable in place.
 // permissions: matrix-room-read, robrix-navigation, matrix-room-watch
 // why-matrix-room-read: Lists the discussion threads in this room and shows the one you open.
 // why-robrix-navigation: Opens the thread you're reading in Robrix.

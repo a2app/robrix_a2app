@@ -1,6 +1,7 @@
 // name: Room Peek
 // icon: 👀
 // tint: #4A90D9
+// description: Room details, the latest messages and a quick way to send one.
 // permissions: matrix-room-info, matrix-room-read, matrix-room-send, robrix-navigation, matrix-room-watch
 // why-matrix-room-info: Shows this room's name and member count.
 // why-matrix-room-read: Lists the latest messages in this room and their reactions.

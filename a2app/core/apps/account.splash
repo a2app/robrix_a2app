@@ -1,6 +1,7 @@
 // name: Account
 // icon: 🪪
 // tint: #386FA4
+// description: You, this device, your homeserver, and a user lookup.
 // permissions: matrix-profile, matrix-account-read, matrix-users, open-url, robrix-navigation
 // why-matrix-profile: Shows your display name and user id.
 // why-matrix-account-read: Shows this device, your homeserver, and who you ignore.

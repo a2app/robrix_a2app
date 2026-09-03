@@ -277,12 +277,14 @@ undeclared capability is refused without even asking the user:
 // name: Sunrise
 // icon: 🌅
 // tint: #E8A24A
+// description: Today's sunrise time for your city.
 // permissions: network, location
 // why-network: Fetches today's sunrise time.
 // why-location: Uses your city instead of a default one.
 ```
 
-`why-<perm>` is your reason in your own words; the user sees it on the
+`description` is one plain line on what the app does; it is shown under the
+app's name in the list. `why-<perm>` is your reason in your own words; the user sees it on the
 permission prompt, attributed to your app. Ask for the least you need — every
 declaration is listed in App Info, where the user can block any of it.
 

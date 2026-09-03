@@ -1,6 +1,7 @@
 // name: Room Members
 // icon: 👥
 // tint: #6C8E3A
+// description: Who is in this room, with their power levels.
 // permissions: matrix-room-read, robrix-navigation, matrix-room-watch
 // why-matrix-room-read: Lists who is in this room.
 // why-robrix-navigation: Opens the profile of a member you tap.

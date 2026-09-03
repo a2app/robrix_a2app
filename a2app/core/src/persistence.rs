@@ -125,6 +125,8 @@ struct AppManifestFile {
     name: String,
     icon: String,
     tint: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    description: String,
     #[serde(default)]
     allow_net: bool,
     /// Declared permission ids. Declarations only — the user's grants live in
@@ -173,6 +175,7 @@ pub fn save_user_app(manifest: &MiniAppManifest) -> Result<()> {
         name: manifest.name.clone(),
         icon: manifest.icon.clone(),
         tint: manifest.tint,
+        description: manifest.description.clone(),
         allow_net: manifest.allow_net,
         permissions: manifest.permissions.clone(),
         permission_reasons: manifest.permission_reasons.clone(),
@@ -398,6 +401,12 @@ fn load_user_app(id: &str) -> Option<MiniAppManifest> {
         name: file.name,
         icon: file.icon,
         tint: file.tint,
+        // Copies saved before descriptions existed still have the header line.
+        description: if file.description.is_empty() {
+            crate::header::parse_app_header(&source).description.unwrap_or_default()
+        } else {
+            file.description
+        },
         source,
         allow_net: file.allow_net,
         permissions: file.permissions,
@@ -503,6 +512,7 @@ mod tests {
             name: "Round Trip".into(),
             icon: "🧪".into(),
             tint: 0x123456,
+            description: String::new(),
             source: "View{}".into(),
             allow_net: false,
             permissions: vec![],
@@ -544,6 +554,7 @@ mod tests {
             name: "Hist".into(),
             icon: "h".into(),
             tint: 1,
+            description: String::new(),
             source: "View{ v1 }".into(),
             allow_net: false,
             permissions: vec!["location".into()],
@@ -678,6 +689,7 @@ mod tests {
             name: "X".into(),
             icon: "x".into(),
             tint: 0,
+            description: String::new(),
             source: "View{}".into(),
             allow_net: false,
             permissions: vec![],

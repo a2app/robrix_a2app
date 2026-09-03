@@ -1,6 +1,7 @@
 // name: Inbox
 // icon: 📥
 // tint: #E0862B
+// description: Your invites and the rooms with unread messages, live.
 // permissions: matrix-rooms-list, robrix-navigation, matrix-membership
 // why-matrix-rooms-list: Lists your invites and the rooms with unread messages.
 // why-robrix-navigation: Opens a room you tap.

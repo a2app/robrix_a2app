@@ -1,6 +1,7 @@
 // name: Watcher
 // icon: 👁
 // tint: #D9822B
+// description: Keyword rules that notify you, and can auto-reply.
 // permissions: matrix-room-watch, notifications, matrix-room-send
 // why-matrix-room-watch: Sees new messages so it can match your rules.
 // why-notifications: Tells you when a message matches a rule.

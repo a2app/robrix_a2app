@@ -1,6 +1,7 @@
 // name: Inspector
 // icon: 🛠
 // tint: #546E7A
+// description: What Robrix tells a mini-app about its pane, settings and device.
 // permissions: robrix-ui, robrix-preferences, robrix-observe, device-info
 // why-robrix-ui: Moves, minimizes, breaks out or closes its own pane when you tap.
 // why-robrix-preferences: Shows Robrix's display settings and follows changes to them.

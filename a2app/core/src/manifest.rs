@@ -17,6 +17,9 @@ pub struct MiniAppManifest {
     pub icon: String,
     /// Tint color of the icon tile, as 0xRRGGBB.
     pub tint: u32,
+    /// One line on what the app does, from its `// description:` header.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
     /// The Splash source code of the app itself.
     pub source: String,
     /// Legacy pre-permissions field; normalized into `permissions` at every
@@ -54,7 +57,47 @@ pub struct MiniAppManifest {
     pub current_version: Option<String>,
 }
 
+/// Where an app does its work, read off the scopes of what it declares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunsIn {
+    /// Needs one room: it reads or writes the room it is opened from.
+    Room,
+    /// Works over many rooms at once.
+    Rooms,
+    /// Works over your spaces.
+    Spaces,
+    /// Nothing room-shaped: your account, this device, or itself.
+    Account,
+}
+
 impl MiniAppManifest {
+    pub fn runs_in(&self) -> RunsIn {
+        let mut rooms = false;
+        let mut spaces = false;
+        // What the app reads or writes decides where it runs; a hook it
+        // listens to or a place it can send the user does not.
+        let scopes = self.permissions.iter()
+            .filter_map(|p| crate::permissions::Permission::from_str(p))
+            .flat_map(crate::capabilities::in_group)
+            .filter(|c| c.is_available()
+                && c.direction == crate::capabilities::Direction::Outgoing
+                && c.access != crate::capabilities::Access::Act)
+            .map(|c| c.scope);
+        for scope in scopes {
+            match scope {
+                crate::capabilities::Scope::Room => return RunsIn::Room,
+                crate::capabilities::Scope::MultiRoom => rooms = true,
+                crate::capabilities::Scope::Space => spaces = true,
+                _ => {}
+            }
+        }
+        match (rooms, spaces) {
+            (true, _) => RunsIn::Rooms,
+            (false, true) => RunsIn::Spaces,
+            (false, false) => RunsIn::Account,
+        }
+    }
+
     /// Reconciles the legacy `allow_net` flag with the `permissions` list, in
     /// both directions: an old export's `allow_net: true` becomes a declared
     /// `network`, and `allow_net` mirrors the declaration so downgrades and
@@ -148,6 +191,7 @@ pub fn rewritten(base: &MiniAppManifest, source: String) -> MiniAppManifest {
         name: header.name.unwrap_or_else(|| base.name.clone()),
         icon: header.icon.unwrap_or_else(|| base.icon.clone()),
         tint: header.tint.unwrap_or(base.tint),
+        description: header.description.unwrap_or_else(|| base.description.clone()),
         source,
         allow_net: base.allow_net,
         permissions: union_permissions(&base.permissions, &header.permissions),
@@ -303,6 +347,7 @@ mod tests {
             name: "Sunrise".into(),
             icon: "🌅".into(),
             tint: 0x112233,
+            description: String::new(),
             source: "View{}".into(),
             allow_net: true,
             permissions: vec!["network".into(), "location".into()],

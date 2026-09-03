@@ -1,6 +1,7 @@
 // name: Room Info
 // icon: 🏷
 // tint: #2E86AB
+// description: Name, topic, member count and settings of this room.
 // permissions: matrix-room-info
 // why-matrix-room-info: Shows this room's name, topic, and settings.
 

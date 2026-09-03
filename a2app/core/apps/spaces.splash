@@ -1,6 +1,7 @@
 // name: Spaces
 // icon: 🪐
 // tint: #5B3FD9
+// description: Explore your spaces and join the rooms inside them.
 // permissions: matrix-spaces, matrix-rooms-list, robrix-navigation, matrix-membership
 // why-matrix-spaces: Lists your spaces and the rooms inside them.
 // why-matrix-rooms-list: Previews a room you have not joined yet.

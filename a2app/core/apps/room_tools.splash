@@ -1,6 +1,7 @@
 // name: Room Tools
 // icon: 🧰
 // tint: #8D6E63
+// description: Favorite, low priority, unread, pins and links for this room.
 // permissions: matrix-room-read, matrix-room-info, matrix-room-manage, clipboard-write, robrix-navigation
 // why-matrix-room-read: Lists recent messages and which of them are pinned.
 // why-matrix-room-info: Reads the unread flag, room links and where an upgraded room went.

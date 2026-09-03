@@ -1,6 +1,7 @@
 // name: Room Stats
 // icon: 📊
 // tint: #2A9D8F
+// description: Who posts here, when, and what you may do in this room.
 // permissions: matrix-room-read, matrix-room-info, robrix-navigation
 // why-matrix-room-read: Reads this room's messages to count who posts and when.
 // why-matrix-room-info: Shows your power level and what it lets you do here.

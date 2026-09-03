@@ -128,6 +128,7 @@ fn parse_bundle(text: &str) -> Result<MiniAppManifest, String> {
         name: clamp_name(&file.name),
         icon: clamp_icon(&file.icon),
         tint: file.tint,
+        description: crate::header::parse_app_header(&file.source).description.unwrap_or_default(),
         source: file.source,
         allow_net: file.allow_net,
         permissions: sanitize_permissions(&file.permissions),
@@ -174,6 +175,7 @@ fn parse_bare_source(source: &str) -> Result<MiniAppManifest, String> {
         name: clamp_name(&name),
         icon: clamp_icon(&header.icon.unwrap_or_else(|| "📦".to_string())),
         tint: header.tint.unwrap_or(0x7c6cf0),
+        description: header.description.unwrap_or_default(),
         source: source.to_string(),
         allow_net: false,
         // A hand-written script declares in its header exactly like a
@@ -345,6 +347,7 @@ mod tests {
             name: "Pomodoro".to_string(),
             icon: "🍅".to_string(),
             tint: 0xE84D3D,
+            description: String::new(),
             source: "// name: Pomodoro\nView{}".to_string(),
             allow_net: false,
             permissions: vec!["network".to_string(), "open-url".to_string()],

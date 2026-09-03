@@ -11,6 +11,8 @@ pub struct Header {
     pub name: Option<String>,
     pub icon: Option<String>,
     pub tint: Option<u32>,
+    /// One line on what the app does (`// description: ...`), for the app list.
+    pub description: Option<String>,
     /// Capabilities the app says it needs (`// permissions: network, location`).
     /// Declaring is not granting: runtime tiers still prompt, and every one of
     /// these shows up where the user can block it.
@@ -49,6 +51,11 @@ pub fn parse_app_header(source: &str) -> Header {
             }
         } else if let Some(v) = rest.strip_prefix("tint:") {
             header.tint = parse_hex_color(v.trim());
+        } else if let Some(v) = rest.strip_prefix("description:") {
+            let v = v.trim().chars().take(140).collect::<String>().trim().to_string();
+            if !v.is_empty() {
+                header.description = Some(v);
+            }
         } else if let Some(v) = rest.strip_prefix("permissions:") {
             // Unknown ids are dropped rather than carried: an id this build
             // can't grant would sit in the app's info promising something fake.
@@ -130,9 +137,10 @@ mod tests {
 
     #[test]
     fn parses_name_icon_and_tint() {
-        let h = parse_app_header("// name: Tip Calc\n// icon: 💰\n// tint: #4A90D9\nView{}");
+        let h = parse_app_header("// name: Tip Calc\n// icon: 💰\n// tint: #4A90D9\n// description: Splits a bill.\nView{}");
         assert_eq!(h.name.as_deref(), Some("Tip Calc"));
         assert_eq!(h.icon.as_deref(), Some("💰"));
+        assert_eq!(h.description.as_deref(), Some("Splits a bill."));
         assert_eq!(h.tint, Some(0x4A90D9));
     }
 

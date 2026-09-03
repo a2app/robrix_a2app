@@ -487,6 +487,7 @@ impl Generation {
                     name,
                     icon: header.icon.unwrap_or_else(|| "✨".to_string()),
                     tint: header.tint.unwrap_or(0x7c6cf0),
+                    description: header.description.clone().unwrap_or_default(),
                     source,
                     allow_net: false,
                     // Generated apps start fully sandboxed; the user (or a

@@ -1,6 +1,7 @@
 // name: Roll Call
 // icon: 🎲
 // tint: #7C6CF0
+// description: Rolls dice and can post the result to the room.
 // permissions: matrix-profile, matrix-room-send
 // why-matrix-profile: Shows who is rolling.
 // why-matrix-room-send: Posts your roll into this room.
