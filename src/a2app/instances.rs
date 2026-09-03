@@ -231,7 +231,9 @@ pub fn release_owner_no_cx(surface_uid: WidgetUid) {
 /// delivered by `flush_pending` with the state at that time.
 pub fn note_hook(key: &InstanceKey, hook: LiveId) {
     with_registry(|r| {
-        if !r.instances.contains_key(key) {
+        // An instance that has not drawn yet gets both hooks with its first size.
+        let Some(inst) = r.instances.get(key) else { return };
+        if inst.last_size == Vec2d::default() {
             return;
         }
         let owed = (key.clone(), hook);
