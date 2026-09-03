@@ -161,7 +161,7 @@ script_mod! {
                     spacing: 0
                     align: Align{x: 0.5, y: 0.5}
                     icon_walk: Walk{width: 13, height: 13, margin: 0}
-                    draw_icon.svg: (ICON_PANEL_BOTTOM)
+                    draw_icon.svg: (ICON_CARET_DOWN)
                     draw_icon.color: #666
                     draw_bg +: {
                         border_size: 0
@@ -702,16 +702,16 @@ impl MiniAppDock {
         let mut button = inst.pane.button(cx, ids!(pane_edge_button));
         match inst.layout.side.next(effective_is_desktop(cx)) {
             PaneSide::Top => {
-                script_apply_eval!(cx, button, { draw_icon +: { svg: (mod.widgets.ICON_PANEL_TOP) } });
+                script_apply_eval!(cx, button, { draw_icon +: { svg: (mod.widgets.ICON_CARET_UP) } });
             }
             PaneSide::Bottom => {
-                script_apply_eval!(cx, button, { draw_icon +: { svg: (mod.widgets.ICON_PANEL_BOTTOM) } });
+                script_apply_eval!(cx, button, { draw_icon +: { svg: (mod.widgets.ICON_CARET_DOWN) } });
             }
             PaneSide::Left => {
-                script_apply_eval!(cx, button, { draw_icon +: { svg: (mod.widgets.ICON_PANEL_LEFT) } });
+                script_apply_eval!(cx, button, { draw_icon +: { svg: (mod.widgets.ICON_CARET_LEFT) } });
             }
             PaneSide::Right => {
-                script_apply_eval!(cx, button, { draw_icon +: { svg: (mod.widgets.ICON_PANEL_RIGHT) } });
+                script_apply_eval!(cx, button, { draw_icon +: { svg: (mod.widgets.ICON_CARET_RIGHT) } });
             }
         }
     }
