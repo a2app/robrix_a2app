@@ -13,12 +13,13 @@ use makepad_code_editor::code_view::CodeViewWidgetExt;
 use matrix_sdk::ruma::OwnedRoomId;
 
 use a2app_core::diff::{line_diff, DiffLine};
-use a2app_core::manifest::{A2AppScope, MiniAppId};
+use a2app_core::manifest::{A2AppScope, MiniAppId, RunsIn};
 use a2app_core::permissions::{Effective, GrantState, Permission};
 use a2app_core::persistence;
 use a2app_core::versions::AppVersion;
 
-use crate::a2app::runtime::{with_a2app, A2AppOp, A2AppRuntimeAction};
+use crate::a2app::runtime::{room_display_name, with_a2app, A2AppOp, A2AppRuntimeAction};
+use crate::home::rooms_list::RoomsListRef;
 use crate::shared::popup_list::{enqueue_popup_notification, PopupKind};
 use crate::shared::room_picker_modal::{RoomPickerContent, RoomPickerModalAction};
 
@@ -82,14 +83,24 @@ script_mod! {
                     color: (MESSAGE_TEXT_COLOR)
                 }
             }
+            row_summary := Label {
+                visible: false,
+                width: Fill, height: Fit
+                flow: Flow.Right{wrap: true}
+                padding: 0, margin: 0
+                draw_text +: {
+                    text_style: REGULAR_TEXT {font_size: 10},
+                    color: (COLOR_TEXT)
+                }
+            }
         }
         row_open_button := RobrixIconButton {
             padding: Inset{top: 7, bottom: 7, left: 14, right: 14},
             icon_walk: Walk{width: 0, height: 0, margin: 0}
             text: "Open"
         }
-        row_info_button := mod.widgets.MiniAppGhostButton {
-            draw_icon +: { svg: (ICON_INFO) }
+        row_settings_button := mod.widgets.MiniAppGhostButton {
+            draw_icon +: { svg: (ICON_SETTINGS) }
         }
     }
 
@@ -255,14 +266,46 @@ script_mod! {
         }
     }
 
-    // The word at the start of a manage-card row.
+    // The word at the start of a manage-card row, centered on its buttons.
     mod.widgets.MiniAppGroupLabel = Label {
-        width: 56, height: Fit
-        padding: 0, margin: 0
+        width: 56, height: 30
+        padding: Inset{top: 8, bottom: 0, left: 0, right: 0}, margin: 0
         draw_text +: {
             text_style: theme.font_bold {font_size: 10},
             color: (MESSAGE_TEXT_COLOR)
         }
+    }
+
+    mod.widgets.MiniAppRadio = RadioButton {
+        width: 22, height: 22
+        padding: 0, margin: 0
+        align: Align{x: 0.5, y: 0.5}
+        text: ""
+        draw_bg +: {
+            size: 18.0
+            color: (COLOR_PRIMARY)
+            color_hover: (COLOR_PRIMARY)
+            color_active: (COLOR_PRIMARY)
+            color_focus: (COLOR_PRIMARY)
+            color_down: (COLOR_PRIMARY)
+            border_color: (COLOR_SECONDARY_DARKER)
+            border_color_hover: (COLOR_ACTIVE_PRIMARY)
+            border_color_active: (COLOR_ACTIVE_PRIMARY_DARKER)
+            border_color_focus: (COLOR_ACTIVE_PRIMARY_DARKER)
+            border_color_down: (COLOR_ACTIVE_PRIMARY_DARKER)
+            mark_color: vec4(0.0, 0.0, 0.0, 0.0)
+            mark_color_active: (COLOR_ACTIVE_PRIMARY_DARKER)
+        }
+    }
+
+    // A bulleted note, the way the settings screen explains a control.
+    mod.widgets.MiniAppNote = Html {
+        width: Fill, height: Fit
+        flow: Flow.Right{wrap: true}
+        padding: 0
+        font_size: 10
+        font_color: #666
+        text_style_normal: MESSAGE_TEXT_STYLE { font_size: 10 }
     }
 
     // One AI provider in the providers pane.
@@ -275,35 +318,51 @@ script_mod! {
         align: Align{y: 0.5}
         padding: Inset{top: 6, bottom: 6, left: 10, right: 10}
 
-        provider_name := Label {
-            width: 150, height: Fit
-            padding: 0, margin: 0
-            draw_text +: {
-                text_style: theme.font_bold {font_size: 11},
-                color: (COLOR_TEXT)
+        // The gutter holds the row's one verb: pick a set-up provider, or add a key.
+        View {
+            width: 32, height: 32
+            flow: Overlay
+            align: Align{x: 0.5, y: 0.5}
+            provider_pick := mod.widgets.MiniAppRadio {}
+            provider_add := mod.widgets.MiniAppGhostButton {
+                visible: false,
+                draw_icon +: { svg: (ICON_ADD), color: (COLOR_ACTIVE_PRIMARY) }
             }
         }
-        provider_state := Label {
+        View {
             width: Fill, height: Fit
-            padding: 0, margin: 0
-            draw_text +: {
-                text_style: REGULAR_TEXT {font_size: 10},
-                color: (MESSAGE_TEXT_COLOR)
+            flow: Down
+            spacing: 1
+            provider_name := Label {
+                width: Fill, height: Fit
+                padding: 0, margin: 0
+                draw_text +: {
+                    text_style: theme.font_bold {font_size: 11},
+                    color: (COLOR_TEXT)
+                }
+            }
+            provider_detail := Label {
+                width: Fill, height: Fit
+                flow: Flow.Right{wrap: true}
+                padding: 0, margin: 0
+                draw_text +: {
+                    text_style: REGULAR_TEXT {font_size: 10},
+                    color: (MESSAGE_TEXT_COLOR)
+                }
             }
         }
-        provider_action_button := RobrixIconButton {
-            padding: 8,
-            icon_walk: Walk{width: 0, height: 0, margin: 0}
-            text: "Add"
-        }
-        provider_forget_button := RobrixNegativeIconButton {
+        provider_replace_button := RobrixNeutralIconButton {
             visible: false,
             padding: 8,
-            draw_icon +: { svg: (ICON_TRASH) }
-            icon_walk: Walk{width: 14, height: 14, margin: 0}
-            text: ""
+            icon_walk: Walk{width: 0, height: 0, margin: 0}
+            text: "Replace key"
+        }
+        provider_forget_button := mod.widgets.MiniAppGhostButton {
+            visible: false,
+            draw_icon +: { svg: (ICON_TRASH), color: (COLOR_FG_DANGER_RED) }
         }
     }
+
 
     mod.widgets.MiniAppsScreen = #(MiniAppsScreen::register_widget(vm)) {
         width: Fill, height: Fill
@@ -334,18 +393,12 @@ script_mod! {
                     padding: Inset{left: 15}
                     active: false
                     draw_bg +: { size: 21 }
-                    text: "Mini-apps may write to rooms"
+                    text: "Mini-apps can write to rooms"
                     draw_text +: { text_style: theme.font_bold {font_size: 11} }
                 }
-                Label {
-                    width: Fill, height: Fit
-                    flow: Flow.Right{wrap: true}
+                mod.widgets.MiniAppNote {
                     margin: Inset{left: 42}
-                    draw_text +: {
-                        text_style: REGULAR_TEXT {font_size: 9.5},
-                        color: (MESSAGE_TEXT_COLOR)
-                    }
-                    text: "Off: nothing gets sent to your rooms. On: an app still asks you first, and sends as you."
+                    body: "<ul><li>Off: a killswitch, no mini-apps can write to any room.</li><li>On: mini-apps still ask permission normally.</li></ul>"
                 }
             }
 
@@ -369,13 +422,13 @@ script_mod! {
                         icon_walk: Walk{width: 16, height: 16, margin: 0}
                         draw_icon +: { svg: (ICON_SPARKLE), color: (COLOR_ROBRIX_PURPLE) }
                     }
-                    SubsectionLabel { text: "Create with AI", margin: 0 }
+                    SubsectionLabel { text: "Create or modify a mini-app", margin: 0 }
                 }
 
                 prompt_input := RobrixTextInput {
                     width: Fill, height: Fit
                     padding: 12
-                    empty_text: "Describe an app, or a change to one you have"
+                    empty_text: "Describe a new mini-app or changes to one…"
                     draw_text +: { text_style: REGULAR_TEXT {font_size: 11.5} }
                 }
 
@@ -394,16 +447,7 @@ script_mod! {
                     providers_button := RobrixNeutralIconButton {
                         padding: Inset{top: 9, bottom: 9, left: 12, right: 12},
                         icon_walk: Walk{width: 0, height: 0, margin: 0}
-                        text: "AI Providers…"
-                    }
-                    scope_label := Label {
-                        width: Fit, height: Fit
-                        padding: 0, margin: 0
-                        draw_text +: {
-                            text_style: REGULAR_TEXT {font_size: 9.5},
-                            color: (MESSAGE_TEXT_COLOR)
-                        }
-                        text: "New apps are available account-wide."
+                        text: "Setup AI Providers"
                     }
                 }
 
@@ -524,6 +568,7 @@ script_mod! {
                     text: "Install"
                 }
             }
+            View { width: Fill, height: 20 }
         }
 
         info_pane := ScrollYView {
@@ -693,7 +738,15 @@ script_mod! {
                     flow: Flow.Right{wrap: true}
                     spacing: 8
                     align: Align{y: 0.5}
-                    mod.widgets.MiniAppGroupLabel { text: "Data" }
+                    mod.widgets.MiniAppGroupLabel { text: "Storage" }
+                    info_storage_label := Label {
+                        width: Fit, height: 30
+                        padding: Inset{top: 8, bottom: 0, left: 0, right: 0}, margin: Inset{right: 4}
+                        draw_text +: {
+                            text_style: REGULAR_TEXT {font_size: 10},
+                            color: (MESSAGE_TEXT_COLOR)
+                        }
+                    }
                     info_clear_data_button := RobrixNegativeIconButton {
                         padding: 8,
                         icon_walk: Walk{width: 0, height: 0, margin: 0}
@@ -712,15 +765,6 @@ script_mod! {
                         icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
                         text: "Uninstall"
                     }
-                }
-            }
-
-            info_storage_label := Label {
-                width: Fill, height: Fit
-                padding: 0, margin: Inset{left: 6}
-                draw_text +: {
-                    text_style: REGULAR_TEXT {font_size: 10},
-                    color: (MESSAGE_TEXT_COLOR)
                 }
             }
 
@@ -792,7 +836,7 @@ script_mod! {
                     icon_walk: Walk{width: 14, height: 14, margin: 0}
                     text: "Back"
                 }
-                TitleLabel { text: "AI Providers" }
+                TitleLabel { text: "Setup AI Providers" }
             }
 
             providers_blocker := Label {
@@ -873,6 +917,7 @@ script_mod! {
                 align: Align{y: 0.5}
                 source_title := TitleLabel { margin: 0 }
                 source_close_button := RobrixNeutralIconButton {
+                spacing: 0,
                     padding: 8,
                     draw_icon +: { svg: (ICON_CLOSE) }
                     icon_walk: Walk{width: 14, height: 14, margin: 0}
@@ -903,6 +948,7 @@ script_mod! {
                 align: Align{y: 0.5}
                 diff_title := TitleLabel { margin: 0 }
                 diff_close_button := RobrixNeutralIconButton {
+                spacing: 0,
                     padding: 8,
                     draw_icon +: { svg: (ICON_CLOSE) }
                     icon_walk: Walk{width: 14, height: 14, margin: 0}
@@ -986,6 +1032,7 @@ script_mod! {
                     text: "Save as new version"
                 }
                 edit_cancel_button := RobrixNeutralIconButton {
+                spacing: 0,
                     padding: 8,
                     draw_icon +: { svg: (ICON_CLOSE) }
                     icon_walk: Walk{width: 14, height: 14, margin: 0}
@@ -1020,7 +1067,8 @@ pub enum MiniAppsScreenAction {
     UseVersion { app_id: MiniAppId, stamp: String },
     DiffVersion(String),
     ViewVersion(String),
-    ProviderAction(String),
+    ProviderUse(String),
+    ProviderEnterKey(String),
     ProviderForget(String),
     #[default]
     None,
@@ -1042,7 +1090,7 @@ impl Widget for MiniAppRow {
         if let Event::Actions(actions) = event {
             if self.view.button(cx, ids!(row_open_button)).clicked(actions) {
                 cx.action(MiniAppsScreenAction::OpenApp(self.app_id.clone()));
-            } else if self.view.button(cx, ids!(row_info_button)).clicked(actions) {
+            } else if self.view.button(cx, ids!(row_settings_button)).clicked(actions) {
                 cx.action(MiniAppsScreenAction::ShowInfo(self.app_id.clone()));
             }
         }
@@ -1052,13 +1100,29 @@ impl Widget for MiniAppRow {
     }
 }
 
+/// One list row's texts, gathered per draw without cloning any app's source.
+struct MiniAppRowData {
+    id: MiniAppId,
+    icon: String,
+    name: String,
+    /// Where it runs, plus running / stopped.
+    detail: String,
+    summary: String,
+    tint: u32,
+    open_label: &'static str,
+}
+
 impl MiniAppRow {
-    fn populate(&mut self, cx: &mut Cx, app_id: &str, icon: &str, name: &str, detail: &str, tint: u32) {
-        self.app_id = app_id.to_string();
-        self.view.label(cx, ids!(row_glyph)).set_text(cx, icon);
-        self.view.label(cx, ids!(row_name)).set_text(cx, name);
-        self.view.label(cx, ids!(row_detail)).set_text(cx, detail);
+    fn populate(&mut self, cx: &mut Cx, row: &MiniAppRowData) {
+        self.app_id = row.id.clone();
+        self.view.label(cx, ids!(row_glyph)).set_text(cx, &row.icon);
+        self.view.label(cx, ids!(row_name)).set_text(cx, &row.name);
+        self.view.label(cx, ids!(row_detail)).set_text(cx, &row.detail);
+        self.view.label(cx, ids!(row_summary)).set_text(cx, &row.summary);
+        self.view.widget(cx, ids!(row_summary)).set_visible(cx, !row.summary.is_empty());
+        self.view.button(cx, ids!(row_open_button)).set_text(cx, row.open_label);
         // The tile is the app's tint at a pastel strength.
+        let tint = row.tint;
         let channel = |shift: u32| ((tint >> shift) & 0xff) as f32 / 255.0;
         let tile = vec4(channel(16), channel(8), channel(0), 0.16);
         let mut row_tile = self.view.view(cx, ids!(row_tile));
@@ -1101,7 +1165,7 @@ impl MiniAppPermissionRow {
         let (state_text, color) = match effective {
             Effective::Granted => ("Allowed", crate::shared::styles::COLOR_FG_ACCEPT_GREEN),
             Effective::NeedsPrompt => ("Asks", crate::shared::styles::COLOR_ACTIVE_PRIMARY),
-            Effective::Denied => ("Blocked", crate::shared::styles::COLOR_FG_DANGER_RED),
+            Effective::Denied => ("Denied", crate::shared::styles::COLOR_FG_DANGER_RED),
             Effective::Undeclared => ("Undeclared", crate::shared::styles::COLOR_FG_DISABLED),
         };
         let mut state_label = self.view.label(cx, ids!(perm_state));
@@ -1152,10 +1216,10 @@ impl MiniAppCapabilityRow {
         // An explicit answer reads as such; otherwise it follows the group.
         let (state_text, color) = match (own, effective) {
             (GrantState::Granted, _) => (String::from("Allowed"), crate::shared::styles::COLOR_FG_ACCEPT_GREEN),
-            (GrantState::Denied, _) => (String::from("Blocked"), crate::shared::styles::COLOR_FG_DANGER_RED),
+            (GrantState::Denied, _) => (String::from("Denied"), crate::shared::styles::COLOR_FG_DANGER_RED),
             (GrantState::Ask, Effective::Granted) => (String::from("Allowed · group"), crate::shared::styles::COLOR_FG_DISABLED),
             (GrantState::Ask, Effective::NeedsPrompt) => (String::from("Asks · group"), crate::shared::styles::COLOR_FG_DISABLED),
-            (GrantState::Ask, _) => (String::from("Blocked · group"), crate::shared::styles::COLOR_FG_DISABLED),
+            (GrantState::Ask, _) => (String::from("Denied · group"), crate::shared::styles::COLOR_FG_DISABLED),
         };
         let mut state_label = self.view.label(cx, ids!(cap_state));
         script_apply_eval!(cx, state_label, {
@@ -1224,8 +1288,12 @@ impl Widget for MiniAppProviderRow {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
         if let Event::Actions(actions) = event {
-            if self.view.button(cx, ids!(provider_action_button)).clicked(actions) {
-                cx.action(MiniAppsScreenAction::ProviderAction(self.provider_id.clone()));
+            if self.view.radio_button(cx, ids!(provider_pick)).clicked(actions) {
+                cx.action(MiniAppsScreenAction::ProviderUse(self.provider_id.clone()));
+            } else if self.view.button(cx, ids!(provider_add)).clicked(actions)
+                || self.view.button(cx, ids!(provider_replace_button)).clicked(actions)
+            {
+                cx.action(MiniAppsScreenAction::ProviderEnterKey(self.provider_id.clone()));
             } else if self.view.button(cx, ids!(provider_forget_button)).clicked(actions) {
                 cx.action(MiniAppsScreenAction::ProviderForget(self.provider_id.clone()));
             }
@@ -1237,13 +1305,23 @@ impl Widget for MiniAppProviderRow {
 }
 
 impl MiniAppProviderRow {
-    fn populate(&mut self, cx: &mut Cx, id: &str, label: &str, state: &str, action: &str, forgettable: bool) {
+    fn populate(&mut self, cx: &mut Cx, id: &str, label: &str, detail: &str, has_key: bool, active: bool, editable: bool) {
         self.provider_id = id.to_string();
         self.view.label(cx, ids!(provider_name)).set_text(cx, label);
-        self.view.label(cx, ids!(provider_state)).set_text(cx, state);
-        self.view.button(cx, ids!(provider_action_button)).set_text(cx, action);
-        self.view.button(cx, ids!(provider_forget_button)).set_visible(cx, forgettable);
+        self.view.label(cx, ids!(provider_detail)).set_text(cx, detail);
+        self.view.widget(cx, ids!(provider_pick)).set_visible(cx, has_key);
+        self.view.radio_button(cx, ids!(provider_pick)).set_active(cx, active, Animate::No);
+        self.view.widget(cx, ids!(provider_add)).set_visible(cx, !has_key);
+        self.view.widget(cx, ids!(provider_replace_button)).set_visible(cx, active && editable);
+        self.view.widget(cx, ids!(provider_forget_button)).set_visible(cx, editable);
     }
+}
+
+fn room_label(cx: &mut Cx, room_id: &str) -> String {
+    cx.has_global::<RoomsListRef>()
+        .then(|| room_display_name(cx.get_global::<RoomsListRef>(), room_id))
+        .flatten()
+        .unwrap_or_else(|| room_id.to_string())
 }
 
 // -----------------------------------------------------------------------
@@ -1317,7 +1395,7 @@ impl Widget for MiniAppsScreen {
             }
             match action.downcast_ref::<MiniAppsScreenAction>() {
                 Some(MiniAppsScreenAction::OpenApp(app_id)) => {
-                    cx.action(A2AppOp::OpenApp { app_id: app_id.clone(), room_id: None, in_room_pane: false });
+                    self.open_app(cx, app_id.clone());
                     continue;
                 }
                 Some(MiniAppsScreenAction::ShowInfo(app_id)) => {
@@ -1329,7 +1407,7 @@ impl Widget for MiniAppsScreen {
                     continue;
                 }
                 Some(MiniAppsScreenAction::CycleCapability { app_id, cap_id }) => {
-                    // Follows group -> Blocked -> Allowed -> follows group.
+                    // Follows group -> Denied -> Allowed -> follows group.
                     let current = with_a2app(|state| state.permissions.capability_state(app_id, cap_id))
                         .unwrap_or_default();
                     let next = match current {
@@ -1359,8 +1437,12 @@ impl Widget for MiniAppsScreen {
                     self.show_version_source(cx, stamp);
                     continue;
                 }
-                Some(MiniAppsScreenAction::ProviderAction(id)) => {
-                    self.provider_action(cx, id.clone());
+                Some(MiniAppsScreenAction::ProviderUse(id)) => {
+                    self.use_provider(cx, id.clone());
+                    continue;
+                }
+                Some(MiniAppsScreenAction::ProviderEnterKey(id)) => {
+                    self.enter_key(cx, id.clone());
                     continue;
                 }
                 Some(MiniAppsScreenAction::ProviderForget(id)) => {
@@ -1694,7 +1776,7 @@ impl MiniAppsScreen {
         self.set_pane(cx, Pane::Edit);
     }
 
-    /// Cycles a grant Allowed -> Asks -> Blocked -> Allowed. Normal-tier
+    /// Cycles a grant Allowed -> Asks -> Denied -> Allowed. Normal-tier
     /// permissions have no meaningful Ask state, so they skip it.
     fn cycle_permission(&mut self, cx: &mut Cx, app_id: &str, perm: Permission) {
         let current = with_a2app(|state| {
@@ -1720,31 +1802,61 @@ impl MiniAppsScreen {
         });
     }
 
-    fn provider_action(&mut self, cx: &mut Cx, provider_id: String) {
-        // An inactive configured provider is switched to; anything else
-        // ("Add" on a fresh one, "Replace key" on the active one) opens
-        // the key-entry field.
+    /// Opens the app where it belongs: a room-bound app in its room, a
+    /// room app in a room the user picks, anything else in the host.
+    fn open_app(&mut self, cx: &mut Cx, app_id: MiniAppId) {
+        let target = with_a2app(|state| {
+            state.registry.get(&app_id).map(|m| (m.name.clone(), m.scope.clone(), m.runs_in()))
+        }).flatten();
+        match target {
+            Some((_, A2AppScope::Room { room_id }, _)) => {
+                if let Ok(room_id) = OwnedRoomId::try_from(room_id.as_str()) {
+                    cx.action(A2AppOp::OpenInRoom { app_id, room_id });
+                }
+            }
+            Some((name, _, RunsIn::Room)) => {
+                self.pick_room(cx, format!("Run \"{name}\" in…"), move |cx, room_id| {
+                    cx.action(A2AppOp::OpenInRoom { app_id, room_id });
+                });
+            }
+            _ => cx.action(A2AppOp::OpenApp { app_id, room_id: None, in_room_pane: false }),
+        }
+    }
+
+    fn use_provider(&mut self, cx: &mut Cx, provider_id: String) {
         let known = a2app_agent::providers::list()
             .into_iter()
             .find(|p| p.id == provider_id);
-        match known {
-            Some(p) if !p.active => {
-                match a2app_agent::providers::set_active(&provider_id) {
-                    Ok(()) => enqueue_popup_notification(
-                        format!("Now using {provider_id}."), PopupKind::Success, Some(3.0)),
-                    Err(e) => enqueue_popup_notification(e, PopupKind::Error, Some(5.0)),
+        let Some(p) = known else { return };
+        if p.external() {
+            enqueue_popup_notification(
+                "That one is chosen by how Robrix was started (ROBRIX_AGENT_CMD).",
+                PopupKind::Info, Some(4.0),
+            );
+        } else if !p.active {
+            match a2app_agent::providers::set_active(&provider_id) {
+                Ok(()) => {
+                    let in_use = a2app_agent::providers::in_use_id().as_deref() == Some(provider_id.as_str());
+                    let note = if in_use {
+                        format!("Now using {}.", p.label)
+                    } else {
+                        format!("{} is the saved default; this session still uses the agent chosen at launch.", p.label)
+                    };
+                    enqueue_popup_notification(note, PopupKind::Success, Some(4.0));
                 }
-                self.view.redraw(cx);
-            }
-            _ => {
-                self.key_entry = Some(provider_id.clone());
-                self.view.label(cx, ids!(key_entry_label))
-                    .set_text(cx, &format!("API key for {provider_id}"));
-                self.view.widget(cx, ids!(key_entry_section)).set_visible(cx, true);
-                self.view.text_input(cx, ids!(key_input)).set_text(cx, "");
-                self.view.redraw(cx);
+                Err(e) => enqueue_popup_notification(e, PopupKind::Error, Some(5.0)),
             }
         }
+        self.view.redraw(cx);
+    }
+
+    fn enter_key(&mut self, cx: &mut Cx, provider_id: String) {
+        self.view.label(cx, ids!(key_entry_label))
+            .set_text(cx, &format!("API key for {}", a2app_agent::providers::label_for(&provider_id)));
+        self.key_entry = Some(provider_id);
+        self.view.widget(cx, ids!(key_entry_section)).set_visible(cx, true);
+        self.view.text_input(cx, ids!(key_input)).set_text(cx, "");
+        self.view.redraw(cx);
     }
 
     fn close_key_entry(&mut self, cx: &mut Cx) {
@@ -1785,17 +1897,22 @@ impl MiniAppsScreen {
                         m.name.clone(),
                         m.builtin,
                         m.scope.clone(),
+                        m.runs_in(),
                         state.permissions.is_restricted(&app_id),
                     ))
                 }).flatten();
-                let Some((icon, name, builtin, scope, restricted)) = info else { return };
+                let Some((icon, name, builtin, scope, runs_in, restricted)) = info else { return };
                 self.view.label(cx, ids!(info_glyph)).set_text(cx, &icon);
                 self.view.label(cx, ids!(info_name)).set_text(cx, &name);
-                let kind = match (builtin, &scope) {
-                    (true, _) => String::from("Built-in mini-app · available account-wide"),
-                    (false, A2AppScope::Account) => String::from("Your mini-app · available account-wide"),
-                    (false, A2AppScope::Room { room_id }) => format!("Your mini-app · scoped to room {room_id}"),
+                let origin = if builtin { "Built-in mini-app" } else { "Your mini-app" };
+                let place = match (&scope, runs_in) {
+                    (A2AppScope::Room { room_id }, _) => format!("runs in {}", room_label(cx, room_id)),
+                    (_, RunsIn::Room) => String::from("runs in a room"),
+                    (_, RunsIn::Rooms) => String::from("works across your rooms"),
+                    (_, RunsIn::Spaces) => String::from("works across your spaces"),
+                    (_, RunsIn::Account) => String::from("account-wide"),
                 };
+                let kind = format!("{origin} · {place}");
                 self.view.label(cx, ids!(info_kind)).set_text(cx, &kind);
                 self.view.widget(cx, ids!(restricted_banner)).set_visible(cx, restricted);
                 let running = crate::a2app::runtime::with_a2app(|state| {
@@ -1805,8 +1922,14 @@ impl MiniAppsScreen {
                 self.view.widget(cx, ids!(perm_hint)).set_visible(cx, running);
                 self.view.widget(cx, ids!(info_uninstall_button)).set_visible(cx, !builtin);
                 let bytes = persistence::app_data_bytes(&app_id);
-                self.view.label(cx, ids!(info_storage_label))
-                    .set_text(cx, &format!("Saved data: {} bytes in this app's private storage.", bytes));
+                let used = if bytes < 1024 {
+                    format!("{bytes} bytes")
+                } else if bytes < 1024 * 1024 {
+                    format!("{:.1} KB", bytes as f64 / 1024.0)
+                } else {
+                    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+                };
+                self.view.label(cx, ids!(info_storage_label)).set_text(cx, &used);
                 let declares_any = with_a2app(|state| {
                     state.registry.get(&app_id).is_some_and(|m| !m.permissions.is_empty())
                 }).unwrap_or(false);
@@ -1830,29 +1953,39 @@ impl MiniAppsScreen {
         // don't draw, so only one of these runs per draw pass.
         match self.pane {
             Pane::List => {
-                // (id, icon, name, detail) only; cloning whole manifests here
-                // would copy every app's source per draw.
-                let rows: Vec<(MiniAppId, String, String, String, u32)> = with_a2app(|state| {
+                // Texts only; cloning whole manifests here would copy every
+                // app's source per draw.
+                let rows: Vec<MiniAppRowData> = with_a2app(|state| {
                     state.registry.iter().map(|m| {
                         let running = state.is_running(&m.id);
-                        let mut detail = match (&m.scope, m.builtin) {
-                            (_, true) => String::from("Built-in"),
-                            (A2AppScope::Account, false) => String::from("Account-wide"),
-                            (A2AppScope::Room { room_id }, false) => format!("Room: {room_id}"),
+                        let (mut detail, open_label) = match (&m.scope, m.runs_in()) {
+                            (A2AppScope::Room { room_id }, _) => (format!("Runs in {}", room_label(cx, room_id)), "Run in room"),
+                            (_, RunsIn::Room) => (String::from("Runs in a room"), "Run in room…"),
+                            (_, RunsIn::Rooms) => (String::from("Works across your rooms"), "Open"),
+                            (_, RunsIn::Spaces) => (String::from("Works across your spaces"), "Open"),
+                            (_, RunsIn::Account) => (String::from("Account-wide"), "Open"),
                         };
                         if state.permissions.is_restricted(&m.id) {
                             detail.push_str(" · stopped for abuse");
                         } else if running {
                             detail.push_str(" · running");
                         }
-                        (m.id.clone(), m.icon.clone(), m.name.clone(), detail, m.tint)
+                        MiniAppRowData {
+                            id: m.id.clone(),
+                            icon: m.icon.clone(),
+                            name: m.name.clone(),
+                            detail,
+                            summary: m.description.clone(),
+                            tint: m.tint,
+                            open_label,
+                        }
                     }).collect()
                 }).unwrap_or_default();
-                for (app_id, icon, name, detail, tint) in &rows {
-                    let item_live_id = LiveId::from_str(app_id);
+                for row_data in &rows {
+                    let item_live_id = LiveId::from_str(&row_data.id);
                     let Some(item) = list.item(cx, item_live_id, id!(mini_app_row)) else { continue };
                     if let Some(mut row) = item.borrow_mut::<MiniAppRow>() {
-                        row.populate(cx, app_id, icon, name, detail, *tint);
+                        row.populate(cx, row_data);
                     }
                     item.draw_all(cx, &mut Scope::empty());
                 }
@@ -1917,30 +2050,25 @@ impl MiniAppsScreen {
             Pane::Providers => {
                 let configured = a2app_agent::providers::list();
                 let draw_row = |cx: &mut Cx2d, list: &mut FlatList, id: &str, label: &str,
-                                    state: &str, action: &str, forgettable: bool| {
+                                    detail: &str, has_key: bool, active: bool, editable: bool| {
                     let item_live_id = LiveId::from_str(id);
                     let Some(item) = list.item(cx, item_live_id, id!(provider_row)) else { return };
                     if let Some(mut row) = item.borrow_mut::<MiniAppProviderRow>() {
-                        row.populate(cx, id, label, state, action, forgettable);
+                        row.populate(cx, id, label, detail, has_key, active, editable);
                     }
                     item.draw_all(cx, &mut Scope::empty());
                 };
                 // The full catalog first, each row showing its own state...
                 for spec in a2app_agent::providers::CATALOG {
-                    let known = configured.iter().find(|p| p.id == spec.id);
-                    let (state, action, forgettable) = match known {
-                        Some(p) if p.active && p.editable() => (p.detail(), "Replace key", true),
-                        Some(p) if p.active => (p.detail(), "", false),
-                        Some(p) => (p.detail(), "Use", p.editable()),
-                        None => (String::from("Not set up"), "Add", false),
-                    };
-                    draw_row(cx, list, spec.id, spec.label, &state, action, forgettable);
+                    match configured.iter().find(|p| p.id == spec.id) {
+                        Some(p) => draw_row(cx, list, spec.id, spec.label, &p.detail(), true, p.active, p.editable()),
+                        None => draw_row(cx, list, spec.id, spec.label, "Not set up", false, false, false),
+                    }
                 }
                 // ...then anything configured outside the catalog (a local
                 // Ollama, or a ROBRIX_AGENT_CMD override).
                 for p in configured.iter().filter(|p| !a2app_agent::providers::CATALOG.iter().any(|s| s.id == p.id)) {
-                    let action = if !p.active && !p.external() { "Use" } else { "" };
-                    draw_row(cx, list, &p.id, &p.label, &p.detail(), action, false);
+                    draw_row(cx, list, &p.id, &p.label, &p.detail(), true, p.active, p.editable());
                 }
             }
             Pane::Source | Pane::Diff | Pane::Edit => {}
