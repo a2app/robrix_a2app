@@ -442,7 +442,9 @@ impl MainDesktopUI {
                 }
             };
 
-        let SavedDockState { dock_items, open_rooms, room_order, selected_room } = to_restore;
+        let SavedDockState { mut dock_items, open_rooms, room_order, selected_room } = to_restore;
+        #[cfg(feature = "a2app")]
+        strip_mini_app_tabs(&mut dock_items);
 
         self.room_order = room_order;
         self.open_rooms = open_rooms;
@@ -516,6 +518,14 @@ impl MainDesktopUI {
         LiveId::from_str(&format!("miniapp:{app_id}:{room_id}"))
     }
 
+    /// A mini-app tab is showing, so no room is focused; a later
+    /// NavigateToRoom then selects the room's tab instead of assuming it's up.
+    #[cfg(feature = "a2app")]
+    fn focus_mini_app_tab(&mut self, cx: &mut Cx) {
+        self.most_recently_selected_room = None;
+        cx.action(AppStateAction::FocusNone);
+    }
+
     /// Creates (or focuses) the dock tab hosting one mini-app instance.
     #[cfg(feature = "a2app")]
     fn open_mini_app_tab(
@@ -530,6 +540,7 @@ impl MainDesktopUI {
         let dock = self.view.dock(cx, ids!(dock));
         if self.open_mini_app_tabs.contains_key(&tab_id) {
             dock.select_tab(cx, tab_id);
+            self.focus_mini_app_tab(cx);
             return;
         }
         let label = crate::a2app::runtime::with_a2app(|state| {
@@ -551,6 +562,7 @@ impl MainDesktopUI {
         if let Some(new_widget) = new_tab_widget {
             new_widget.as_mini_app_tab_screen().open(cx, app_id.clone(), room_id.clone(), &room_name);
             self.open_mini_app_tabs.insert(tab_id, (app_id, room_id));
+            self.focus_mini_app_tab(cx);
         } else {
             error!("BUG: failed to create a mini-app tab for {app_id}");
         }
@@ -581,30 +593,32 @@ impl MainDesktopUI {
     /// without going through explicit tab selection (e.g., closing a tab causes
     /// the dock to auto-select an adjacent tab).
     fn init_all_visible_tabs(&self, cx: &mut Cx) {
-        // A mini-app tab restored from saved dock state has no instance
-        // behind it (isolates never persist); close such zombies.
-        #[cfg(feature = "a2app")]
-        {
-            use crate::a2app::tab_screen::MiniAppTabScreenWidgetRefExt;
-            let dock_ref = self.view.dock(cx, ids!(dock));
-            let zombies: Vec<LiveId> = {
-                let Some(mut dock) = dock_ref.borrow_mut() else { return };
-                dock.visible_items()
-                    .filter(|(tab_id, widget)| {
-                        widget.as_mini_app_tab_screen().borrow().is_some()
-                            && !self.open_mini_app_tabs.contains_key(tab_id)
-                    })
-                    .map(|(tab_id, _)| tab_id)
-                    .collect()
-            };
-            for tab_id in zombies {
-                dock_ref.close_tab(cx, tab_id);
-            }
-        }
         let dock = self.view.dock(cx, ids!(dock));
         let Some(mut dock) = dock.borrow_mut() else { return };
         for (tab_id, widget) in dock.visible_items() {
             Self::init_tab_widget(cx, &self.open_rooms, &tab_id, &widget);
+        }
+    }
+}
+
+/// Mini-app tabs can't outlive a restart (their isolates never persist), so
+/// a saved layout drops them before it's loaded.
+#[cfg(feature = "a2app")]
+fn strip_mini_app_tabs(dock_items: &mut HashMap<LiveId, DockItem>) {
+    let zombies: Vec<LiveId> = dock_items.iter()
+        .filter(|(_, item)| matches!(item, DockItem::Tab { kind, .. } if *kind == id!(mini_app_tab)))
+        .map(|(id, _)| *id)
+        .collect();
+    if zombies.is_empty() {
+        return;
+    }
+    for id in &zombies {
+        dock_items.remove(id);
+    }
+    for item in dock_items.values_mut() {
+        if let DockItem::Tabs { tabs, selected, .. } = item {
+            tabs.retain(|tab| !zombies.contains(tab));
+            *selected = (*selected).min(tabs.len().saturating_sub(1));
         }
     }
 }
@@ -710,6 +724,10 @@ impl WidgetMatchEvent for MainDesktopUI {
                     }
                     else if let Some(selected_room) = self.open_rooms.get(&tab_id).cloned() {
                         self.select_room(cx, Some(selected_room));
+                    }
+                    #[cfg(feature = "a2app")]
+                    if self.open_mini_app_tabs.contains_key(&tab_id) {
+                        self.focus_mini_app_tab(cx);
                     }
                     // Lazily initialize this tab's widget if it was deferred during dock restoration.
                     self.init_tab_if_needed(cx, tab_id);
