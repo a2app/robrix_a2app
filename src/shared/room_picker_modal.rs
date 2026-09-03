@@ -135,7 +135,7 @@ impl Widget for RoomPickerModal {
                         let subtitle = if entry.is_direct {
                             "Direct message"
                         } else {
-                            entry.room_name_id.room_id().as_str()
+                            ""
                         };
                         row.label(cx, ids!(info.subtitle)).set_text(cx, subtitle);
                         let avatar = row.avatar(cx, ids!(avatar));

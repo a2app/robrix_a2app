@@ -258,6 +258,8 @@ pub const MATRIX_WRITE_OFF_MSG: &str =
     "Mini-apps may not write to rooms: turn on \"Mini-apps may write to rooms\" in the Mini Apps screen";
 
 pub struct Broker {
+    /// A room's display name, for `env`.
+    pub room_name: &'a dyn Fn(&str) -> Option<String>,
     tx: Sender<Completion>,
     rx: Receiver<Completion>,
     /// Kept alive so CoreLocation's delegate keeps reporting; created lazily
@@ -562,6 +564,7 @@ impl Broker {
                     .collect();
                 respond(cx, reply, Ok(&serde_json::json!({ "apps": apps }).to_string()));
             }
+                    "room_name": instance_room.as_deref().and_then(|r| (ctx.room_name)(r)),
             "storage.quota" => {
                 // Walks the jail off-thread; there is no byte cap today.
                 let dir = crate::app_sandbox_dir(&manifest.id);

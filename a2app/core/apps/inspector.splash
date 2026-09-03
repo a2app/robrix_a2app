@@ -54,7 +54,10 @@ fn read_env(){
     host.request("env", nil, fn(r){
         if !r.is_ok { return nil }
         let room = "no room attached"
-        if r.data.room_attached { room = r.data.room_id }
+        if r.data.room_attached {
+            room = r.data.room_name
+            if room.is_nil() { room = "a room" }
+        }
         ui.env_line.set_text(r.data.platform + " · " + r.data.view_mode + " layout · " + room)
     })
 }

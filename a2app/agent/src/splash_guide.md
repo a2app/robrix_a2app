@@ -726,8 +726,8 @@ fn open_member(i){
 
 Every app can read where it is and quit itself; nothing to declare:
 
-- `"env"` -> `{app_id, room_attached, room_id, instance_tag, surface,
-  platform, view_mode}`. `surface` is `"dock"` (a pane on a room), `"tab"`
+- `"env"` -> `{app_id, room_attached, room_id, room_name, instance_tag,
+  surface, platform, view_mode}`. Show `room_name` to people, never the id. `surface` is `"dock"` (a pane on a room), `"tab"`
   (its own desktop tab), `"modal"` (the full-screen host) or `"parked"`;
   `platform` is `macos | ios | android | windows | linux | other`;
   `view_mode` is `"desktop"` or `"mobile"`.

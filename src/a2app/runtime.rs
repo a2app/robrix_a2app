@@ -1180,6 +1180,8 @@ fn process_broker(cx: &mut Cx, ui: &WidgetRef) {
             pane_state: &instances::pane_state,
             desktop_view,
         })
+        let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
+        let room_name = |id: &str| room_display_name(rooms.as_ref()?, id);
     }).unwrap_or_default();
 
     let had_asks = !asks.is_empty();
@@ -1187,6 +1189,7 @@ fn process_broker(cx: &mut Cx, ui: &WidgetRef) {
         apply_broker_ask(cx, ui, ask);
     }
     if had_asks {
+            room_name: &room_name,
         ui.redraw(cx);
     }
 }
@@ -1310,6 +1313,13 @@ fn joined_room_name(cx: &mut Cx, room_id: &OwnedRoomId) -> Result<RoomNameId, St
     }
     Ok(rooms.get_room_name(room_id).unwrap_or_else(|| RoomNameId::empty(room_id.clone())))
 }
+/// A room's display name, once the rooms list exists (it does not before
+/// the home screen is up).
+pub fn room_display_name(rooms: &RoomsListRef, room_id: &str) -> Option<String> {
+    let room_id = OwnedRoomId::try_from(room_id).ok()?;
+    rooms.get_room_name(&room_id).map(|name| name.display_name().to_string())
+}
+
 
 /// Parks `action` for `room_id`'s RoomScreen and navigates there. The
 /// caller may be on the Mini Apps tab; the room lives on Home.
@@ -1663,6 +1673,8 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
                     pane_state: &instances::pane_state,
                     desktop_view,
                 }, request)
+                let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
+                let room_name = |id: &str| room_display_name(rooms.as_ref()?, id);
             }).unwrap_or_default();
             for ask in asks {
                 apply_broker_ask(cx, ui, ask);
@@ -1670,6 +1682,7 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
         } else {
             Broker::respond_denied(cx, &request);
         }
+                    room_name: &room_name,
     }
 
     apply_permission_to_running(cx, ui, &prompt.app_id, prompt.perm);
