@@ -429,7 +429,7 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
 
     // An action the user took that was refused or failed gets a popup that
     // says why, on top of the script's own error handling.
-    for (app_id, error) in with_a2app(|state| state.broker.failed_acts()).unwrap_or_default() {
+    for (app_id, error) in with_a2app(|state| state.broker.failures()).unwrap_or_default() {
         let name = with_a2app(|state| state.registry.get(&app_id).map(|a| a.name.clone()))
             .flatten()
             .unwrap_or(app_id);
@@ -1242,11 +1242,14 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
             let body = format!("{{\"delivered\":{delivered}}}");
             services::respond(cx, reply, Ok(&body));
         }
-        BrokerAsk::Matrix { reply, app_id: _, room, call } => {
+        BrokerAsk::Matrix { reply, app_id, room, call } => {
             let room = room.and_then(|r| OwnedRoomId::try_from(r.as_str()).ok());
             match matrix::request_for(call, room, reply) {
                 Ok(request) => submit_async_request(MatrixRequest::A2App(request)),
-                Err(e) => services::respond(cx, reply, Err(e)),
+                Err(e) => {
+                    with_a2app(|state| state.broker.note(reply, &app_id));
+                    services::respond(cx, reply, Err(e));
+                }
             }
         }
         BrokerAsk::Subscribe { reply, app_id, heap_key, room, hook } => {
@@ -1571,6 +1574,7 @@ fn queue_permission_prompt(
         // script can't nag its way to an accidental Allow.
         if state.dismissed_prompts.contains(&(app_id.clone(), perm)) {
             if let Some(request) = request {
+                state.broker.declined(&request);
                 Broker::respond_denied(cx, &request);
             }
             return;
@@ -1692,6 +1696,7 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
                 apply_broker_ask(cx, ui, ask);
             }
         } else {
+            with_a2app(|state| state.broker.declined(&request));
             Broker::respond_denied(cx, &request);
         }
     }

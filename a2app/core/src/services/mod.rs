@@ -283,9 +283,11 @@ pub struct Broker {
     /// Which app owns each on-screen OS dialog, so the one-at-a-time guard
     /// can be released when the completion comes home from another thread.
     dialog_owner: HashMap<(usize, u64), MiniAppId>,
-    /// Requests that act on the user's behalf (a send, a join, a navigation),
-    /// whose refusal or failure the user must see, not just the script.
-    acts: HashMap<(usize, u64), MiniAppId>,
+    /// Requests whose error answer the user must see, not just the script:
+    /// every act on their behalf, and every refusal of a request.
+    notable: HashMap<(usize, u64), MiniAppId>,
+    /// When each (app, message) was last shown, so a retry loop is one popup.
+    shown: HashMap<(MiniAppId, String), std::time::Instant>,
 }
 
 impl Default for Broker {
@@ -305,21 +307,31 @@ impl Broker {
             pending_geo: HashMap::new(),
             limits: limits::AbuseLimiter::default(),
             dialog_owner: HashMap::new(),
-            acts: HashMap::new(),
+            notable: HashMap::new(),
+            shown: HashMap::new(),
         }
     }
 
-    /// The actions answered with an error since the last call, as
-    /// `(app, message)`, for the host to put in front of the user.
-    pub fn failed_acts(&mut self) -> Vec<(MiniAppId, String)> {
+    /// Marks a request whose error answer the user must see.
+    pub fn note(&mut self, reply: Reply, app_id: &str) {
+        self.notable.insert((reply.heap_key, reply.req_id), app_id.to_string());
+    }
+
+    /// The refusals and failed actions answered since the last call, as
+    /// `(app, message)`, for the host to put in front of the user. The same
+    /// message from the same app repeats at most every 30 seconds.
+    pub fn failures(&mut self) -> Vec<(MiniAppId, String)> {
         let answers = ANSWERS.with(|a| std::mem::take(&mut *a.borrow_mut()));
+        let now = std::time::Instant::now();
         let mut failed: Vec<(MiniAppId, String)> = Vec::new();
         for (reply, error) in answers {
-            let app = self.acts.remove(&(reply.heap_key, reply.req_id));
-            if let (Some(app), Some(error)) = (app, error)
-                && !failed.iter().any(|(a, e)| *a == app && *e == error)
-            {
-                failed.push((app, error));
+            let app = self.notable.remove(&(reply.heap_key, reply.req_id));
+            let (Some(app), Some(error)) = (app, error) else { continue };
+            let key = (app, error);
+            let fresh = self.shown.get(&key).is_none_or(|at| now.duration_since(*at).as_secs() >= 30);
+            if fresh {
+                self.shown.insert(key.clone(), now);
+                failed.push(key);
             }
         }
         failed
@@ -332,7 +344,8 @@ impl Broker {
     pub fn forget_app(&mut self, app_id: &str) {
         self.limits.forget(app_id);
         self.dialog_owner.retain(|_, owner| owner != app_id);
-        self.acts.retain(|_, owner| owner != app_id);
+        self.notable.retain(|_, owner| owner != app_id);
+        self.shown.retain(|(owner, _), _| owner != app_id);
     }
 
     /// How many of this app's requests have been refused this run, for the
@@ -389,6 +402,12 @@ impl Broker {
         let mut asks = Vec::new();
         self.dispatch(cx, ctx, req, &mut asks, Charge::No);
         asks
+    }
+
+    /// The user just said no to this request's prompt, or dismissed it for
+    /// the session: they know, so its refusal gets no popup.
+    pub fn declined(&mut self, req: &SplashHostRequest) {
+        self.notable.remove(&(req.heap_key, req.req_id));
     }
 
     /// Answers a parked request after the user denied its permission.
@@ -498,17 +517,14 @@ impl Broker {
             if to.is_empty() || to == "self" { manifest.id.clone() } else { to }
         });
         let Some(capability) = crate::capabilities::for_service(&req.service) else {
+            self.note(reply, &manifest.id);
             return respond(cx, reply, Err(&format!("unknown service '{}'", req.service)));
         };
-        // Writes and acts are what buttons do; a refusal from here on is
-        // shown to the user as well as answered to the script.
-        let acts = capability.direction == crate::capabilities::Direction::Outgoing
-            && (matches!(capability.access, crate::capabilities::Access::Write | crate::capabilities::Access::Act)
-                || capability.status == crate::capabilities::Status::RefusedBySwitch)
+        // Any refusal from here on is the host's to show; an act (what a
+        // button does) stays notable until its answer, so a failure shows too.
+        self.note(reply, &manifest.id);
+        let acts = matches!(capability.access, crate::capabilities::Access::Write | crate::capabilities::Access::Act)
             && !matches!(req.service.as_str(), "events.subscribe" | "events.unsubscribe" | "permissions.request" | "notify.clear");
-        if acts {
-            self.acts.insert((reply.heap_key, reply.req_id), manifest.id.clone());
-        }
         if !capability.is_available() {
             return respond(cx, reply, Err(&format!("'{}' is not available in this Robrix", req.service)));
         }
@@ -555,6 +571,10 @@ impl Broker {
                     return;
                 }
             }
+        }
+
+        if !acts {
+            self.notable.remove(&(reply.heap_key, reply.req_id));
         }
 
         match req.service.as_str() {

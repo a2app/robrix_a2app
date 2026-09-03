@@ -40,6 +40,10 @@ cargo run --features a2app
 - **Host and pane services**: an app can read where it runs (surface, dock
   side, size, platform, view mode), move, minimize, break out or close its
   own pane, and read Robrix's display settings and device facts.
+- **Refusals are Robrix's to show**: a mini-app that tries something it may
+  not do, or whose action fails, gets a Robrix warning naming the app and the
+  reason; it never depends on the app surfacing its own error. Deleting a
+  provider key, an app's data, or an app asks first.
 - **Writes are off by default**: the "Mini-apps can write to rooms" switch on
   the Mini Apps screen gates every send, on top of per-app permissions.
 - **Version history**: every AI change, hand edit (there is a source editor),
