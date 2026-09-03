@@ -39,7 +39,8 @@ script_mod! {
 
         ModalButtonsRow {
             align: Align{x: 0.5, y: 0.5}
-            spacing: 10
+            spacing: 16
+            margin: Inset{top: 6}
 
             not_now_button := RobrixNeutralIconButton {
                 padding: 12,
