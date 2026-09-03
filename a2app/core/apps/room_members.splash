@@ -27,7 +27,13 @@ fn on_room_members_changed(json){
 }
 
 fn watch(){
-    host.request("events.subscribe", {event: "on_room_members_changed"}, nil)
+    host.request("events.subscribe", {event: "on_room_members_changed"}, fn(r){
+        if r.is_ok {
+            ui.note.set_text("")
+        } else {
+            ui.note.set_text("Live updates off: " + r.error)
+        }
+    })
 }
 
 fn on_permissions_changed(caps){
@@ -102,6 +108,11 @@ View{
                 text: "Refresh" on_click: || load()
                 draw_text +: { color: #x1C274C }
             }
+        }
+        note := Label{
+            text: "" padding: 0 margin: 0
+            width: Fill
+            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 11} }
         }
     }
 }

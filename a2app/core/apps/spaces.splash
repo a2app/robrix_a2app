@@ -158,7 +158,10 @@ fn tap_item(i){
 }
 
 fn join_room(){
-    if preview_id == "" { return nil }
+    if preview_id == "" {
+        ui.join_note.set_text("Tap a room you haven't joined first.")
+        return nil
+    }
     ui.join_note.set_text("Joining…")
     host.request("matrix.join", {room: preview_id}, fn(r){
         if !r.is_ok {

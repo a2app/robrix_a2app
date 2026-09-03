@@ -24,6 +24,7 @@ fn roll(){
 fn post(){
     let total = die_a + die_b
     let msg = "🎲 " + roller + " rolled " + die_a + " + " + die_b + " = " + total
+    ui.note.set_text("Posting…")
     host.request("matrix.send_message", {body: msg}, fn(r){
         if r.is_ok {
             ui.note.set_text("Posted to the room!")

@@ -63,7 +63,10 @@ fn on_permissions_changed(caps){ subscribe() }
 
 fn add_rule(){
     let keyword = ui.keyword_input.text().trim()
-    if keyword == "" { return nil }
+    if keyword == "" {
+        ui.status.set_text("Type a keyword to watch for first.")
+        return nil
+    }
     rules.push({
         keyword: keyword
         pattern: keyword_pattern(keyword)
@@ -74,6 +77,7 @@ fn add_rule(){
     ui.keyword_input.set_text("")
     ui.reply_input.set_text("")
     ui.rule_list.render()
+    show_status()
 }
 
 fn remove_rule(i){
@@ -99,7 +103,9 @@ fn check(m){
         if regex(rule.pattern, "i").test(m.body) {
             hits.push(line)
             if rule.notify {
-                host.request("notify.post", {title: "Watcher: " + rule.keyword, body: line}, nil)
+                host.request("notify.post", {title: "Watcher: " + rule.keyword, body: line}, fn(r){
+                    if !r.is_ok { ui.status.set_text("Notification failed: " + r.error) }
+                })
             }
             if rule.reply.len() > 0 {
                 if host.has("matrix.room.message.send") {

@@ -52,7 +52,10 @@ fn read_pane(){
 
 fn read_env(){
     host.request("env", nil, fn(r){
-        if !r.is_ok { return nil }
+        if !r.is_ok {
+            ui.env_line.set_text(r.error)
+            return nil
+        }
         let room = "no room attached"
         if r.data.room_attached {
             room = r.data.room_name
@@ -93,7 +96,10 @@ fn read_device(){
 
 fn pane_call(service, args){
     host.request(service, args, fn(r){
-        if !r.is_ok { log(service + ": " + r.error) }
+        if r.is_ok { return nil }
+        let line = service + ": " + r.error
+        log(line)
+        ui.pane_state.set_text(line)
     })
 }
 

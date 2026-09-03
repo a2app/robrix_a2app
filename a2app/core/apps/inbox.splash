@@ -73,6 +73,7 @@ fn answer_invite(accept){
             ui.pick_note.set_text(r.error)
             return nil
         }
+        ui.pick_note.set_text("")
         ui.status.set_text(pick_verb + " the invite to " + pick_name)
         load_invites()
     })
@@ -151,10 +152,17 @@ fn on_unread_totals_changed(json){
     ui.totals.set_text(totals_text(t.unread, t.mentions))
 }
 
+fn subscribe(name){
+    host.request("events.subscribe", {event: name}, fn(r){
+        if !r.is_ok { ui.status.set_text("Live updates are off: " + r.error) }
+    })
+}
+
 fn watch(){
-    host.request("events.subscribe", {event: "on_invite_received"}, nil)
-    host.request("events.subscribe", {event: "on_rooms_changed"}, nil)
-    host.request("events.subscribe", {event: "on_unread_totals_changed"}, nil)
+    ui.status.set_text("")
+    subscribe("on_invite_received")
+    subscribe("on_rooms_changed")
+    subscribe("on_unread_totals_changed")
 }
 
 fn on_permissions_changed(caps){

@@ -8,16 +8,21 @@
 // why-matrix-room-info: Refreshes when the pins change.
 
 let items = []
+let status = "Loading…"
+let live_note = ""
+
+fn show_header(){ ui.header.set_text(status + live_note) }
 
 fn load(){
     host.request("matrix.pinned_events", nil, fn(r){
         if r.is_ok {
             items = r.data.pinned
-            ui.header.set_text("" + items.len() + " pinned · tap one to jump to it")
+            status = "" + items.len() + " pinned · tap one to jump to it"
         } else {
             items = []
-            ui.header.set_text(r.error)
+            status = r.error
         }
+        show_header()
         ui.item_list.render()
     })
 }
@@ -27,7 +32,10 @@ fn on_room_pins_changed(json){
 }
 
 fn watch(){
-    host.request("events.subscribe", {event: "on_room_pins_changed"}, nil)
+    host.request("events.subscribe", {event: "on_room_pins_changed"}, fn(r){
+        if r.is_ok { live_note = "" } else { live_note = " · live updates off: " + r.error }
+        show_header()
+    })
 }
 
 fn on_permissions_changed(caps){
@@ -93,7 +101,7 @@ View{
         View{
             width: Fill height: Fit flow: Right align: Align{x: 0.5}
             Button{
-                text: "Refresh" on_click: || load()
+                text: "Refresh" on_click: || { status = "Loading…" show_header() load() }
                 draw_text +: { color: #x1C274C }
             }
         }

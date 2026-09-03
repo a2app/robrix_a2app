@@ -5,9 +5,12 @@
 // permissions: matrix-room-info
 // why-matrix-room-info: Shows this room's name, topic, and settings.
 
+let loaded = false
+
 fn load(){
     host.request("matrix.room_info", nil, fn(r){
         if r.is_ok {
+            loaded = true
             ui.room_name.set_text(r.data.room_name)
             let topic = r.data.topic
             if topic == "" { topic = "(no topic set)" }
@@ -22,6 +25,7 @@ fn load(){
             ui.note.set_text("")
             return nil
         }
+        if !loaded { ui.room_name.set_text("Not available") }
         ui.note.set_text(r.error)
     })
 }

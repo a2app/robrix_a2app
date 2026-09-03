@@ -56,7 +56,6 @@ fn fetch_next(){
                 bodies.push({event_id: id, body: text})
                 pending = ""
                 refresh()
-                if !r.is_ok { return nil }
                 fetch_next()
             })
             return nil
@@ -123,9 +122,12 @@ fn on_room_receipt(json){
 }
 
 fn watch(){
-    host.request("events.subscribe", {event: "on_room_typing"}, nil)
-    host.request("events.subscribe", {event: "on_room_receipt"}, nil)
+    ui.typing.set_text("Nobody is typing")
+    host.request("events.subscribe", {event: "on_room_typing"}, on_watch)
+    host.request("events.subscribe", {event: "on_room_receipt"}, on_watch)
 }
+
+fn on_watch(r){ if !r.is_ok { ui.typing.set_text("Live updates are off: " + r.error) } }
 
 fn on_permissions_changed(caps){
     load()

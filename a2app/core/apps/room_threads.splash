@@ -10,16 +10,21 @@
 let items = []
 let open_id = ""
 let replies = []
+let status = "Loading…"
+let live_note = ""
+
+fn show_header(){ ui.header.set_text(status + live_note) }
 
 fn load(){
     host.request("matrix.room_threads", {limit: 20}, fn(r){
         if r.is_ok {
             items = r.data.threads
-            ui.header.set_text("" + items.len() + " threads · tap one to read it")
+            status = "" + items.len() + " threads · tap one to read it"
         } else {
             items = []
-            ui.header.set_text(r.error)
+            status = r.error
         }
+        show_header()
         ui.item_list.render()
     })
 }
@@ -32,7 +37,7 @@ fn load_thread(){
             for m in r.data.replies { replies.push(m) }
             let word = " replies"
             if r.data.replies.len() == 1 { word = " reply" }
-            ui.thread_header.set_text("" + r.data.replies.len() + word)
+            ui.thread_header.set_text("" + r.data.replies.len() + word + live_note)
         } else {
             ui.thread_header.set_text(r.error)
         }
@@ -87,7 +92,10 @@ fn on_room_message(json){
 }
 
 fn watch(){
-    host.request("events.subscribe", {event: "on_room_message"}, nil)
+    host.request("events.subscribe", {event: "on_room_message"}, fn(r){
+        if r.is_ok { live_note = "" } else { live_note = " · live updates off: " + r.error }
+        show_header()
+    })
 }
 
 fn on_permissions_changed(caps){
@@ -148,7 +156,7 @@ View{
             View{
                 width: Fill height: Fit flow: Right align: Align{x: 0.5}
                 Button{
-                    text: "Refresh" on_click: || load()
+                    text: "Refresh" on_click: || { status = "Loading…" show_header() load() }
                     draw_text +: { color: #x1C274C }
                 }
             }

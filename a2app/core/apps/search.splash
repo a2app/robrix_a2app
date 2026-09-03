@@ -12,6 +12,7 @@ let mode = "room"
 let attached = false
 let server = false
 let rooms = []
+let rooms_line = "Loading rooms…"
 let picked = []
 let results = []
 
@@ -35,15 +36,17 @@ fn set_mode(m){
 }
 
 fn load_rooms(){
+    rooms_line = "Loading rooms…"
+    ui.room_list.render()
     host.request("matrix.rooms_list", nil, fn(r){
+        rooms = []
         if r.is_ok {
-            rooms = []
             for it in r.data.rooms {
                 if !it.is_space { rooms.push(it) }
             }
+            if rooms.len() == 0 { rooms_line = "No rooms to pick from." }
         } else {
-            rooms = []
-            ui.status.set_text(r.error)
+            rooms_line = r.error
         }
         ui.room_list.render()
     })
@@ -175,7 +178,7 @@ View{
                 on_item_tap: |i| toggle_pick(i)
                 on_render: || {
                     if rooms.len() == 0 {
-                        Label{ text: "Loading rooms…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 } }
+                        Label{ text: rooms_line width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 } }
                     } else {
                         for it in rooms {
                             RoundedView{

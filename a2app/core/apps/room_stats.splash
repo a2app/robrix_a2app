@@ -9,6 +9,7 @@
 
 let depth = 300
 let loading = false
+let load_error = ""
 // The newest batch comes without timestamps, so it's kept apart from the older pages.
 let latest = []
 let older = []
@@ -101,6 +102,7 @@ fn count_sender(m){
 fn show(){
     let line = msgs(total())
     if senders.len() > 0 { line = line + " from " + senders.len() + " " + plural(senders.len(), "sender") }
+    if load_error != "" { line = load_error + " · " + line }
     ui.status.set_text(line)
     let h = peak(hours)
     let d = peak(days)
@@ -164,7 +166,7 @@ fn page(){
     if older.len() > 0 { before = older[0].event_id }
     host.request("matrix.older_messages", {before: before, limit: min(50, depth - total())}, fn(r){
         if !r.is_ok {
-            ui.status.set_text(r.error)
+            load_error = r.error
             finish()
             return nil
         }
@@ -182,9 +184,13 @@ fn page(){
 }
 
 fn load(){
-    if loading { return nil }
+    if loading {
+        ui.status.set_text("Still loading, hang on…")
+        return nil
+    }
     ui.status.set_text("Loading…")
     loading = true
+    load_error = ""
     latest = []
     older = []
     host.request("matrix.read_messages", {limit: 30}, fn(r){
@@ -193,7 +199,7 @@ fn load(){
             page()
             return nil
         }
-        ui.status.set_text(r.error)
+        load_error = r.error
         finish()
     })
     host.request("matrix.power_levels", nil, fn(r){

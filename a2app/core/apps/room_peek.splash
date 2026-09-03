@@ -11,13 +11,17 @@
 
 let room_name = "Room Peek"
 let room_line = "Open me from a room to see its info."
+let live_note = ""
+let empty_line = "No messages to show. This app needs to be opened from a room, and needs your permission to read it."
 let messages = []
 let rx_queue = []
 let rx_busy = false
 
 fn show_room(){
     ui.room_title.set_text(room_name)
-    ui.room_line.set_text(room_line)
+    let line = room_line
+    if live_note != "" { line = line + " · " + live_note }
+    ui.room_line.set_text(line)
 }
 
 fn load_room(){
@@ -63,6 +67,7 @@ fn load_messages(){
         messages = []
         rx_queue = []
         if r.is_ok {
+            empty_line = "No messages yet."
             for m in r.data.messages {
                 let i = index_of(old, m.event_id)
                 if i >= 0 {
@@ -73,6 +78,8 @@ fn load_messages(){
                 }
                 messages.push(m)
             }
+        } else {
+            empty_line = r.error
         }
         for id in pending {
             if index_of(messages, id) >= 0 { rx_queue.push(id) }
@@ -103,7 +110,11 @@ fn jump_to_message(i){
 
 fn send_msg(){
     let body = ui.msg_input.text().trim()
-    if body == "" { return nil }
+    if body == "" {
+        ui.send_note.set_text("Type a message first.")
+        return nil
+    }
+    ui.send_note.set_text("Sending…")
     host.request("matrix.send_message", {body: body}, fn(r){
         if r.is_ok {
             ui.send_note.set_text("Sent!")
@@ -170,12 +181,22 @@ fn on_room_members_changed(json){
     load_room()
 }
 
+fn subscribe(name){
+    host.request("events.subscribe", {event: name}, fn(r){
+        if r.is_ok || live_note != "" { return nil }
+        live_note = "live updates off: " + r.error
+        show_room()
+    })
+}
+
 fn watch(){
-    host.request("events.subscribe", {event: "on_room_message"}, nil)
-    host.request("events.subscribe", {event: "on_room_members_changed"}, nil)
-    host.request("events.subscribe", {event: "on_room_typing"}, nil)
-    host.request("events.subscribe", {event: "on_room_reaction"}, nil)
-    host.request("events.subscribe", {event: "on_room_message_changed"}, nil)
+    live_note = ""
+    show_room()
+    subscribe("on_room_message")
+    subscribe("on_room_members_changed")
+    subscribe("on_room_typing")
+    subscribe("on_room_reaction")
+    subscribe("on_room_message_changed")
 }
 
 fn on_permissions_changed(caps){
@@ -208,7 +229,7 @@ View{
             on_render: || {
                 if messages.len() == 0 {
                     Label{
-                        text: "No messages to show. This app needs to be opened from a room, and needs your permission to read it."
+                        text: empty_line
                         width: Fill padding: 0 margin: 0
                         draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
                     }
