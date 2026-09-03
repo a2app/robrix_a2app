@@ -49,7 +49,7 @@ pub enum Permission {
     MatrixUsers,
     /// Be told as messages, edits, reactions, typing, receipts, joins and mentions happen in this
     MatrixRoomWatch,
-    /// React, show typing, and mark this room read as you. Off unless 'Mini-apps can write to rooms' i
+    /// React, show typing, and mark this room read as you. Off unless "Mini-apps can write to rooms" is on.
     MatrixRoomInteract,
     /// Store and read this app's own data as events in this room so everyone using it sees the sa
     MatrixRoomAppData,
@@ -63,7 +63,7 @@ pub enum Permission {
     MatrixRoomsList,
     /// Read rooms you pick beyond the one this app is attached to.
     MatrixRoomsRead,
-    /// Post to rooms you pick, as you. Asks every time and is off unless 'Mini-apps can write to rooms
+    /// Post to rooms you pick, as you. Asks every time and is off unless "Mini-apps can write to rooms" is on.
     MatrixRoomsSend,
     /// Join rooms, answer invites, open direct messages, or leave this room as you. Asks every ti
     MatrixMembership,
@@ -312,7 +312,7 @@ impl Permission {
             Permission::ClipboardRead => "Read whatever is on your clipboard.",
             Permission::Ipc => "Send messages to your other mini-apps.",
             Permission::MatrixRoomRead => "Read this room's messages, members, pins, and threads.",
-            Permission::MatrixRoomSend => "Send messages to this room as you. Asks the first time, and only while 'Mini-apps can write to rooms' is on.",
+            Permission::MatrixRoomSend => "Send messages to this room as you. Asks the first time, and only while \"Mini-apps can write to rooms\" is on.",
             Permission::ClipboardWrite => "Put text on your clipboard.",
             Permission::OpenUrl => "Open web links in your browser.",
             Permission::Files => "Open and save files you pick in the system dialog.",
@@ -327,14 +327,14 @@ impl Permission {
             Permission::MatrixAccountWrite => "Change your display name or avatar, block people, or store app settings on your account. Asks every time and is off unless 'Apps may change your account' is on.",
             Permission::MatrixUsers => "Fetch other Matrix users' public profiles and find existing chats with them.",
             Permission::MatrixRoomWatch => "Be told as messages, edits, reactions, typing, receipts, joins and mentions happen in this room.",
-            Permission::MatrixRoomInteract => "React, show typing, and mark this room read as you. Off unless 'Mini-apps can write to rooms' is on.",
-            Permission::MatrixRoomAppData => "Store and read this app's own data as events in this room so everyone using it sees the same state. Saving is off unless 'Mini-apps can write to rooms' is on.",
-            Permission::MatrixRoomManage => "Pin messages, favorite this room, flag it unread, or change its settings. Writes are off unless 'Mini-apps can write to rooms' is on.",
+            Permission::MatrixRoomInteract => "React, show typing, and mark this room read as you. Off unless \"Mini-apps can write to rooms\" is on.",
+            Permission::MatrixRoomAppData => "Store and read this app's own data as events in this room so everyone using it sees the same state. Saving is off unless \"Mini-apps can write to rooms\" is on.",
+            Permission::MatrixRoomManage => "Pin messages, favorite this room, flag it unread, or change its settings. Writes are off unless \"Mini-apps can write to rooms\" is on.",
             Permission::MatrixRoomInvite => "Invite people to this room as you. Asks every time and is off unless 'Apps may change room membership' is on.",
             Permission::MatrixMedia => "Fetch images and files from this room, get link previews, and upload files to your homeserver.",
             Permission::MatrixRoomsList => "See which rooms, DMs and invites you have with unread counts, and be told when that changes.",
             Permission::MatrixRoomsRead => "Read rooms you pick beyond the one this app is attached to.",
-            Permission::MatrixRoomsSend => "Post to rooms you pick, as you. Asks every time and is off unless 'Mini-apps can write to rooms' is on.",
+            Permission::MatrixRoomsSend => "Post to rooms you pick, as you. Asks every time and is off unless \"Mini-apps can write to rooms\" is on.",
             Permission::MatrixMembership => "Join rooms, answer invites, open direct messages, or leave this room as you. Asks every time and is off unless 'Apps may change room membership' is on.",
             Permission::MatrixSpaces => "See your spaces and the rooms inside them.",
             Permission::RobrixNavigation => "Take you to a room, message, thread, person, space, screen or another mini-app.",

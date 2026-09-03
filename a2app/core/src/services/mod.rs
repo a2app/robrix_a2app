@@ -265,7 +265,7 @@ pub struct BrokerCtx<'a> {
 
 /// The refusal every switch-gated write gets while the user keeps writes off.
 pub const MATRIX_WRITE_OFF_MSG: &str =
-    "writing to rooms is switched off for all mini-apps; turn on \"Mini-apps can write to rooms\" in the Mini Apps screen";
+    "writing to rooms is switched off for all mini-apps. Turn on \"Mini-apps can write to rooms\" in the Mini Apps screen";
 
 pub struct Broker {
     tx: Sender<Completion>,
@@ -420,7 +420,7 @@ impl Broker {
         // Name the exact capability, so an author learns which single
         // ability is blocked rather than just its group.
         let msg = match crate::capabilities::for_service(&req.service) {
-            Some(cap) => format!("permission denied: {} (allow it in the app's settings)", cap.id),
+            Some(cap) => format!("\"{}\" is denied for this app. Allow it in App Info", cap.title),
             None => "permission denied".to_string(),
         };
         respond(cx, Reply::of(req), Err(&msg));
@@ -852,13 +852,13 @@ impl Broker {
                             hook: hook.wire[0],
                         });
                     }
-                    Effective::Denied => respond(cx, reply, Err(&format!("permission denied: {}", hook.id))),
+                    Effective::Denied => respond(cx, reply, Err(&format!("\"{}\" is denied for this app. Allow it in App Info", hook.title))),
                     Effective::Undeclared => {
                         let group = hook.group.map_or("", |g| g.as_str());
                         respond(cx, reply, Err(&format!("permission not declared: {group}")));
                     }
                     Effective::NeedsPrompt if !req.may_prompt => {
-                        respond(cx, reply, Err(&format!("permission denied: {}", hook.id)));
+                        respond(cx, reply, Err(&format!("\"{}\" is denied for this app. Allow it in App Info", hook.title)));
                     }
                     Effective::NeedsPrompt => {
                         let Some(perm) = hook.group else { return };

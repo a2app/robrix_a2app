@@ -433,7 +433,16 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
         let name = with_a2app(|state| state.registry.get(&app_id).map(|a| a.name.clone()))
             .flatten()
             .unwrap_or(app_id);
-        enqueue_popup_notification(format!("{name}: {error}"), PopupKind::Warning, Some(7.0));
+        let mut text = format!("{name}: ");
+        let mut chars = error.chars();
+        if let Some(first) = chars.next() {
+            text.extend(first.to_uppercase());
+            text.push_str(chars.as_str());
+        }
+        if !text.ends_with(['.', '!', '?']) {
+            text.push('.');
+        }
+        enqueue_popup_notification(text, PopupKind::Warning, Some(15.0));
     }
     expire_timed_grants(cx, ui);
     persist_if_dirty();
@@ -954,7 +963,7 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 apply_permission_to_running(cx, ui, &app_id, Permission::MatrixRoomSend);
             }
             enqueue_popup_notification(
-                if on { "Mini-apps may now write to rooms; each one still asks you first." }
+                if on { "Mini-apps may now write to rooms. Each one still asks you first." }
                 else { "Mini-apps can no longer write to rooms." },
                 PopupKind::Info, Some(4.0),
             );
@@ -963,7 +972,7 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
         A2AppOp::ShareToRoom { app_id, room_id } => {
             if !with_a2app(|state| state.permissions.matrix_write()).unwrap_or(false) {
                 enqueue_popup_notification(
-                    format!("{MATRIX_WRITE_OFF_MSG}, so sharing an app into a room is blocked too."),
+                    format!("Sharing an app into a room is blocked: {MATRIX_WRITE_OFF_MSG}."),
                     PopupKind::Warning, Some(5.0),
                 );
                 return;
