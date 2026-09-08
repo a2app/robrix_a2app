@@ -409,6 +409,8 @@ pub const CATALOG: &[Capability] = &[
     cap!("on_active_room_changed", "Know which room you switch to", "Which room, thread, or nothing Robrix now shows; latest-only per pass. Reveals browsing, so it prompts.", Read, Incoming, MultiRoom, Some(P::RobrixObserve), Available, High, ["on_active_room_changed"]),
     cap!("on_navigation_changed", "Know which screen you switch to", "Home, a space, settings, mini apps; latest-only per pass.", Read, Incoming, Client, Some(P::RobrixObserve), Available, Medium, ["on_navigation_changed"]),
     cap!("on_launch", "Launch context hook", "Be told how the instance was opened: slash command, timeline card, list, or tab.", Read, Incoming, Instance, None, PlannedMachinery, Low, []),
+    // ----- app-generation -----
+    cap!("apps.generate", "Build and run a mini-app", "Run the AI generation pipeline: spend your provider's usage to write, validate and install a new sandboxed app into this room, then run it. Reached only by an AI room's own session — no installed app can invoke the generator.", Act, Outgoing, Room, Some(P::AppGeneration), Available, Medium, []),
     // ----- never -----
     cap!("apps.manage", "Manage installed apps", "Never: install, uninstall, archive, restore, export or import apps stays a user-only surface.", Write, Outgoing, Apps, None, Never, Critical, []),
     cap!("matrix.space.leave", "Leave a space", "Never: leaving a space and its children is irreversible and user-only.", Write, Outgoing, Space, None, Never, Critical, []),

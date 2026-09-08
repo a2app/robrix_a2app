@@ -14,6 +14,11 @@ pub mod ai;
 /// (cross-platform; the session/forwarding logic that acts on them is in
 /// `ai::rooms`, which is unix-only).
 pub mod ai_room_events;
+/// The "AI in this room" management panel (permission rows, session power,
+/// access log, restriction clear). Unix-only actions; the widget itself is a
+/// thin stub on other platforms via `a2app_dummy`.
+#[cfg(unix)]
+pub mod ai_room_panel;
 
 /// The modal pane that hosts running mini-apps.
 pub mod host_pane;
@@ -43,6 +48,8 @@ pub fn script_mod(vm: &mut ScriptVm) {
     host_set::script_mod(vm);
     permission_prompt::script_mod(vm);
     ai_room_events::script_mod(vm);
+    #[cfg(unix)]
+    ai_room_panel::script_mod(vm);
     host_pane::script_mod(vm);
     dock::script_mod(vm);
     tab_screen::script_mod(vm);

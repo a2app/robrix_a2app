@@ -153,6 +153,13 @@ script_mod! {
                             content := MiniAppPermissionPrompt {}
                         }
 
+                        // The "AI in this room" management panel (an invisible
+                        // stub in builds without `a2app` / on non-unix).
+                        ai_room_panel_modal := Modal {
+                            can_dismiss: true,
+                            content := AiRoomPanel {}
+                        }
+
                         PopupList {}
 
                         // Tooltips must be shown in front of all other UI elements,

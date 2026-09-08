@@ -544,6 +544,12 @@ impl RoomInputBar {
             }
             #[cfg(not(feature = "a2app"))]
             SlashCommandAction::MiniApp(_) => {}
+            SlashCommandAction::AiRoomSettings(arg) => {
+                #[cfg(all(feature = "a2app", unix))]
+                crate::a2app::runtime::ai_panel_command(cx, &arg, room_id);
+                #[cfg(not(all(feature = "a2app", unix)))]
+                {}
+            }
         }
     }
 

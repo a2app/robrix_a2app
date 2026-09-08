@@ -12,6 +12,7 @@ script_mod! {
     mod.widgets.MiniAppsScreen = View { visible: false }
     mod.widgets.MiniAppHostPane = View { visible: false }
     mod.widgets.MiniAppPermissionPrompt = View { visible: false }
+    mod.widgets.AiRoomPanel = View { visible: false }
     mod.widgets.MiniAppTimelineCard = View { visible: false }
     mod.widgets.AiReplyTimelineCard = View { visible: false }
     mod.widgets.MiniAppTabScreen = View { visible: false }

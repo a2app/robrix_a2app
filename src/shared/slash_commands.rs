@@ -134,6 +134,12 @@ pub static SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Open, run, create, or share Splash mini-apps in this room",
         usage: "/miniapp [run <app name> | share <app name> | <describe an app to create>]",
     },
+    SlashCommand {
+        name: "ai",
+        aliases: &[],
+        description: "Manage this room's AI: what it may do, whether it's on, and its recent activity",
+        usage: "/ai",
+    },
 
     // TODO: add more of the commands below, most of which need backend matrix requests:
     //
@@ -193,6 +199,10 @@ pub enum SlashCommandAction {
     /// and anything else starts a room-scoped generation.
     /// Only produced in builds with the `a2app` feature.
     MiniApp(String),
+    /// Open the "AI in this room" management panel, or manage its read
+    /// allowlist (`allow <room>` / `remove <room>`). Only produced in a2app
+    /// builds on desktop (AI rooms are unix-only).
+    AiRoomSettings(String),
 }
 
 /// Returns an iterator over all slash commands matching the given query.
@@ -225,16 +235,26 @@ pub fn parse_input(text: &str) -> SlashCommandOutcome {
         ));
     };
 
-    // Only the emoticons, /leave, and /miniapp still make sense with nothing after them.
+    // Only the emoticons, /leave, /miniapp, and /ai still make sense with
+    // nothing after them.
     let arg = arg.trim();
     if command.name == "leave" && !arg.is_empty() {
         return SlashCommandOutcome::Error(format!("Usage: {}", command.usage));
     }
     if arg.is_empty() && !matches!(
         command.name,
-        "shrug" | "tableflip" | "unflip" | "lenny" | "leave" | "miniapp",
+        "shrug" | "tableflip" | "unflip" | "lenny" | "leave" | "miniapp" | "ai",
     ) {
         return SlashCommandOutcome::Error(format!("Usage: {}", command.usage));
+    }
+
+    if command.name == "ai" {
+        #[cfg(all(feature = "a2app", unix))]
+        return SlashCommandOutcome::Action(SlashCommandAction::AiRoomSettings(arg.to_owned()));
+        #[cfg(not(all(feature = "a2app", unix)))]
+        return SlashCommandOutcome::Error(
+            "AI rooms aren't available in this build of Robrix.".to_owned(),
+        );
     }
 
     if command.name == "miniapp" {

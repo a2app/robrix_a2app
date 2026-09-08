@@ -729,6 +729,20 @@ script_mod! {
                     }
                 }
 
+                // An AI room's live status row: visible while the room's
+                // agent is working on a turn or member messages are queued
+                // behind it (populated each draw, hidden by default).
+                ai_room_status := Label {
+                    visible: false
+                    width: Fill, height: Fit
+                    align: Align{x: 0.5, y: 0.5}
+                    padding: Inset{left: 8, right: 8, top: 4, bottom: 2}
+                    draw_text +: {
+                        text_style: REGULAR_TEXT { font_size: 11 },
+                        color: (COLOR_ACTIVE_PRIMARY)
+                    }
+                }
+
                 // Below that, display a typing notice when other users in the room are typing.
                 typing_notice := TypingNotice { }
 
@@ -930,61 +944,7 @@ fn scan_ai_room_messages(room_id: &OwnedRoomId, items: &Vector<Arc<TimelineItem>
     if new_texts.is_empty() {
         return;
     }
-    let preamble = scan_state.needs_priming
-        .then(|| build_ai_transcript_preamble(items.iter().take(start_idx)));
-    crate::a2app::runtime::forward_ai_room_texts(room_id, new_texts, preamble);
-}
-
-/// Builds a plaintext transcript of a room's earlier conversation (member
-/// text messages and prior `ai_reply` turns, in order) to prime a
-/// freshly-(re)started session with the context a persistent one would
-/// already have (see `AiRoomInfo::needs_priming`).
-#[cfg(all(feature = "a2app", unix))]
-fn build_ai_transcript_preamble<'a>(items: impl Iterator<Item = &'a Arc<TimelineItem>>) -> String {
-    const MAX_LINES: usize = 40;
-    let mut lines: Vec<String> = Vec::new();
-    for item in items {
-        let Some(ev) = item.as_event() else { continue };
-        match ev.content() {
-            TimelineItemContent::MsgLike(msg_like) if msg_like.thread_root.is_none() => {
-                if let MsgLikeKind::Message(msg) = &msg_like.kind {
-                    if let MessageType::Text(text) = msg.msgtype() {
-                        lines.push(format!("User: {}", text.body));
-                    }
-                }
-            }
-            TimelineItemContent::OtherState(other) => {
-                let is_ai_reply = matches!(
-                    other.content(),
-                    timeline::AnyOtherStateEventContentChange::_Custom { event_type }
-                        if event_type == crate::a2app::ai_room_events::AI_REPLY_EVENT_TYPE
-                );
-                if is_ai_reply {
-                    let text = ev.latest_json()
-                        .and_then(|raw| raw.deserialize_as::<serde_json::Value>().ok())
-                        .and_then(|v| v.get("content")
-                            .and_then(|c| c.get("text"))
-                            .and_then(|t| t.as_str())
-                            .map(str::to_owned));
-                    if let Some(text) = text {
-                        lines.push(format!("Assistant: {text}"));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    if lines.len() > MAX_LINES {
-        let excess = lines.len() - MAX_LINES;
-        lines.drain(0..excess);
-    }
-    if lines.is_empty() {
-        return String::new();
-    }
-    format!(
-        "[This room's earlier conversation, for context:]\n{}\n[/earlier conversation]",
-        lines.join("\n"),
-    )
+    crate::a2app::runtime::forward_ai_room_texts(room_id, new_texts);
 }
 
 /// The main widget that displays a single Matrix room.
@@ -1550,6 +1510,12 @@ impl Widget for RoomScreen {
             return DrawStep::done();
         }
 
+        // The AI-room status row is populated on every draw: the transitions
+        // that change it (turn end, queue flush, agent finishing startup) are
+        // driven by the runtime's event passes, not by timeline updates.
+        #[cfg(all(feature = "a2app", unix))]
+        self.populate_ai_room_status(cx);
+
 
         let room_screen_widget_uid = self.widget_uid();
         while let Some(subview) = self.view.draw_walk(cx, scope, walk).step() {
@@ -1814,6 +1780,44 @@ impl Widget for RoomScreen {
 }
 
 impl RoomScreen {
+    /// Populates the AI-room status row (busy / queued) from the room's live
+    /// session state. Called every draw; hidden for ordinary rooms, idle
+    /// sessions, and rooms without a live session.
+    #[cfg(all(feature = "a2app", unix))]
+    fn populate_ai_room_status(&mut self, cx: &mut Cx2d) {
+        let status = self.tl_state.as_ref().and_then(|tl| match &tl.kind {
+            TimelineKind::MainRoom { room_id } => crate::a2app::runtime::ai_room_status(room_id),
+            _ => None,
+        });
+        let Some(status) = status else {
+            self.view(cx, ids!(ai_room_status)).set_visible(cx, false);
+            return;
+        };
+        if status.busy {
+            let label = self.view.label(cx, ids!(ai_room_status));
+            if status.queued > 0 {
+                label.set_text(
+                    cx,
+                    &format!("AI agent is working… · {} message(s) queued", status.queued),
+                );
+            } else {
+                label.set_text(cx, "AI agent is working on your message…");
+            }
+            self.view(cx, ids!(ai_room_status)).set_visible(cx, true);
+        } else if status.queued > 0 {
+            // Not busy yet but prompts are waiting: the agent is still
+            // starting up (they flush as soon as it reports ready).
+            let label = self.view.label(cx, ids!(ai_room_status));
+            label.set_text(
+                cx,
+                &format!("AI agent is starting… · {} message(s) queued", status.queued),
+            );
+            self.view(cx, ids!(ai_room_status)).set_visible(cx, true);
+        } else {
+            self.view(cx, ids!(ai_room_status)).set_visible(cx, false);
+        }
+    }
+
     fn room_id(&self) -> Option<&OwnedRoomId> {
         self.room_name_id.as_ref().map(|r| r.room_id())
     }
