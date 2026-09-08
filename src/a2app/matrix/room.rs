@@ -54,7 +54,7 @@ pub(super) async fn thread_replies(room_id: OwnedRoomId, event_id: OwnedEventId,
     }).to_string())
 }
 
-pub(super) async fn older_messages(room_id: OwnedRoomId, before: Option<OwnedEventId>, limit: u32) -> Result<String, String> {
+pub(crate) async fn older_messages(room_id: OwnedRoomId, before: Option<OwnedEventId>, limit: u32) -> Result<String, String> {
     use matrix_sdk::room::MessagesOptions;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
@@ -277,7 +277,7 @@ pub(super) async fn successor(room_id: OwnedRoomId) -> Result<String, String> {
 
 }
 /// `matrix.room_info`, and `matrix.rooms_info` for any joined room.
-pub(super) async fn info(room_id: matrix_sdk::ruma::OwnedRoomId) -> Result<String, String> {
+pub(crate) async fn info(room_id: matrix_sdk::ruma::OwnedRoomId) -> Result<String, String> {
     use matrix_sdk::RoomState;
     use crate::sliding_sync::get_client;
     let client = get_client().ok_or("not logged in")?;
@@ -326,7 +326,7 @@ fn push_message(
 }
 
 /// `matrix.read_messages`, and `matrix.rooms_messages` for any joined room.
-pub(super) async fn read_messages(room_id: matrix_sdk::ruma::OwnedRoomId, limit: u32) -> Result<String, String> {
+pub(crate) async fn read_messages(room_id: matrix_sdk::ruma::OwnedRoomId, limit: u32) -> Result<String, String> {
     use matrix_sdk::RoomState;
     use matrix_sdk::room::MessagesOptions;
     use crate::sliding_sync::get_client;

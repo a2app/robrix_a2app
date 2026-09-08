@@ -79,6 +79,10 @@ pub enum Permission {
     RobrixPreferences,
     /// Be told which room or screen you switch to.
     RobrixObserve,
+    /// Run the AI app-generation pipeline (spends the user's provider tokens
+    /// and installs a new sandboxed mini-app). Reached only by an AI room's
+    /// own session, never by a mini-app manifest.
+    AppGeneration,
 }
 
 /// Runtime permissions prompt the user on first use; normal ones auto-grant
@@ -90,7 +94,7 @@ pub enum Tier {
 }
 
 impl Permission {
-    pub const ALL: [Permission; 36] = [
+    pub const ALL: [Permission; 37] = [
         Permission::Network,
         Permission::Location,
         Permission::Notifications,
@@ -127,6 +131,7 @@ impl Permission {
         Permission::RobrixUi,
         Permission::RobrixPreferences,
         Permission::RobrixObserve,
+        Permission::AppGeneration,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -167,6 +172,7 @@ impl Permission {
             Permission::RobrixUi => "robrix-ui",
             Permission::RobrixPreferences => "robrix-preferences",
             Permission::RobrixObserve => "robrix-observe",
+            Permission::AppGeneration => "app-generation",
         }
     }
 
@@ -206,7 +212,8 @@ impl Permission {
             | Permission::RobrixNavigation
             | Permission::RobrixComposer
             | Permission::RobrixUi
-            | Permission::RobrixObserve => Tier::Runtime,
+            | Permission::RobrixObserve
+            | Permission::AppGeneration => Tier::Runtime,
             Permission::ClipboardWrite
             | Permission::OpenUrl
             | Permission::Files
@@ -258,6 +265,7 @@ impl Permission {
             Permission::RobrixUi => "Its own pane",
             Permission::RobrixPreferences => "Robrix settings",
             Permission::RobrixObserve => "Watch what you're doing",
+            Permission::AppGeneration => "Build and run mini-apps",
         }
     }
 
@@ -299,6 +307,7 @@ impl Permission {
             Permission::RobrixUi => "🪟",
             Permission::RobrixPreferences => "⚙️",
             Permission::RobrixObserve => "📡",
+            Permission::AppGeneration => "⚡",
         }
     }
 
@@ -342,6 +351,7 @@ impl Permission {
             Permission::RobrixUi => "Resize, move, minimize or break out its pane, badge its tab, and ask for keyboard focus.",
             Permission::RobrixPreferences => "Know display settings like view mode, zoom and theme so the app can match Robrix.",
             Permission::RobrixObserve => "Be told which room or screen you switch to.",
+            Permission::AppGeneration => "Run the AI app-builder here. It spends your provider's usage and installs a new sandboxed app into this room.",
         }
     }
 }
@@ -440,6 +450,37 @@ pub struct Restriction {
     /// the run's counters — and this is the number that explains the stop.
     #[serde(default)]
     pub refusals: u64,
+}
+
+/// The reserved prefix for permission subjects that are not installed
+/// mini-apps. Today that is exactly one kind: the AI-room agent session that
+/// backs a room carrying the `ai_room` marker. Its grants live in the SAME
+/// [`PermissionStore`] (the maps are string-keyed), namespaced under this
+/// prefix so a room can never collide with — or be mistaken for — an
+/// installed app id (app ids are slug-safe and contain neither ':' nor '!',
+/// which room ids always do).
+pub const AGENT_SUBJECT_PREFIX: &str = "ai-room:";
+
+/// The permission-store key for an AI room's agent session: one durable
+/// subject per room, keyed by the room's matrix id. The room's `ai_room`
+/// marker persists and the session is re-attached to it after restarts, so
+/// grants keyed here are as durable as an app's — and as revocable.
+pub fn agent_subject(room_id: &str) -> String {
+    format!("{AGENT_SUBJECT_PREFIX}{room_id}")
+}
+
+/// Whether a store key names an agent session rather than a mini-app.
+/// Callers that must behave differently for agents (the room-scoped AI
+/// panel, session teardown) branch on this.
+pub fn is_agent_subject(subject: &str) -> bool {
+    subject.starts_with(AGENT_SUBJECT_PREFIX)
+}
+
+/// The room id a subject key names, when it is an agent subject. The store
+/// deliberately has no notion of rooms; the runtime that owns the sessions
+/// maps the key back to its room when it needs to.
+pub fn agent_room_of(subject: &str) -> Option<&str> {
+    subject.strip_prefix(AGENT_SUBJECT_PREFIX)
 }
 
 impl PermissionStore {
@@ -647,28 +688,45 @@ impl PermissionStore {
     }
 
     pub fn effective(&self, manifest: &MiniAppManifest, perm: Permission) -> Effective {
-        if !manifest.declares(perm) {
+        self.effective_for(&manifest.id, |p| manifest.declares(p), perm)
+    }
+
+    /// The subject-general form of [`Self::effective`]: the same decision for
+    /// ANY permission subject — an installed app, or an AI room's agent
+    /// session keyed by [`agent_subject`] — whose declarations are supplied
+    /// rather than read from a manifest. `declares` answers "does this subject
+    /// declare permission `perm`?" (an app's manifest, an agent session's
+    /// tool profile). Grants, once/timed answers, capability overrides,
+    /// restrictions and the global switches all live in the store and are
+    /// looked up by `subject`, so the two subject kinds share one decision.
+    pub fn effective_for(
+        &self,
+        subject: &str,
+        declares: impl Fn(Permission) -> bool,
+        perm: Permission,
+    ) -> Effective {
+        if !declares(perm) {
             return Effective::Undeclared;
         }
-        // A restricted app holds nothing, whatever it was granted before. It
-        // should not be running at all, but this is the choke point every
+        // A restricted subject holds nothing, whatever it was granted before.
+        // It should not be running at all, but this is the choke point every
         // capability check goes through, so it is where the guarantee belongs
         // rather than in whichever caller remembers to ask.
-        if self.is_restricted(&manifest.id) {
+        if self.is_restricted(subject) {
             return Effective::Denied;
         }
-        let stored = self.state(&manifest.id, perm);
+        let stored = self.state(subject, perm);
         // Session and timed grants outrank Ask but never a stored Denied:
         // "just this once" must not resurrect something you turned off.
         if stored != GrantState::Denied {
-            if self.has_once(&manifest.id, perm) {
+            if self.has_once(subject, perm) {
                 return Effective::Granted;
             }
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            if self.timed_until(&manifest.id, perm, now).is_some() {
+            if self.timed_until(subject, perm, now).is_some() {
                 return Effective::Granted;
             }
         }
@@ -682,9 +740,20 @@ impl PermissionStore {
         }
     }
 
-    /// Whether the capability is usable right now (prompt-pending counts as no).
+    /// Whether the permission is usable right now (prompt-pending counts as
+    /// no) — the app-keyed wrapper over [`Self::is_granted_for`].
     pub fn is_granted(&self, manifest: &MiniAppManifest, perm: Permission) -> bool {
-        self.effective(manifest, perm) == Effective::Granted
+        self.is_granted_for(&manifest.id, |p| manifest.declares(p), perm)
+    }
+
+    /// Subject-general form of [`Self::is_granted`].
+    pub fn is_granted_for(
+        &self,
+        subject: &str,
+        declares: impl Fn(Permission) -> bool,
+        perm: Permission,
+    ) -> bool {
+        self.effective_for(subject, declares, perm) == Effective::Granted
     }
 
     /// The user's stored answer for one (app, capability); `Ask` = follows
@@ -706,28 +775,51 @@ impl PermissionStore {
         }
     }
 
-    /// What one capability nets out to: its own override first, then its
-    /// group's answer; a group `Denied` (or a restriction) beats everything.
     pub fn effective_capability(
         &self,
         manifest: &MiniAppManifest,
         cap: &crate::capabilities::Capability,
     ) -> Effective {
+        self.effective_capability_for(
+            &manifest.id,
+            |p| manifest.declares(p),
+            |c| manifest.declares_capability(c),
+            cap,
+        )
+    }
+
+    /// The subject-general form of [`Self::effective_capability`]: the same
+    /// capability decision for ANY subject — an installed app, or an AI
+    /// room's agent session — with its declarations supplied.
+    ///
+    /// `declares_perm` answers "does this subject declare permission
+    /// `perm`?" and `declares_cap` "does it declare capability `cap`?" (for a
+    /// manifest those are `declares`/`declares_capability`; for an agent
+    /// session, its tool profile). Callers keep the manifest invariant — a
+    /// declared capability implies its group — so the group answer below
+    /// always resolves the way an app's does.
+    pub fn effective_capability_for(
+        &self,
+        subject: &str,
+        declares_perm: impl Fn(Permission) -> bool,
+        declares_cap: impl Fn(&crate::capabilities::Capability) -> bool,
+        cap: &crate::capabilities::Capability,
+    ) -> Effective {
         if !cap.is_available() {
             return Effective::Undeclared;
         }
-        if !manifest.declares_capability(cap) {
+        if !declares_cap(cap) {
             return Effective::Undeclared;
         }
-        if self.is_restricted(&manifest.id) {
+        if self.is_restricted(subject) {
             return Effective::Denied;
         }
         if cap.status == crate::capabilities::Status::RefusedBySwitch && !self.matrix_write {
             return Effective::Denied;
         }
         let Some(group) = cap.group else { return Effective::Granted };
-        let group_effective = self.effective(manifest, group);
-        match self.capability_state(&manifest.id, cap.id) {
+        let group_effective = self.effective_for(subject, &declares_perm, group);
+        match self.capability_state(subject, cap.id) {
             GrantState::Denied => Effective::Denied,
             GrantState::Granted => match group_effective {
                 Effective::Denied | Effective::Undeclared => group_effective,
@@ -742,16 +834,33 @@ impl PermissionStore {
     /// inside the app's isolate, so `host.has("network")` and
     /// `host.has("matrix.room.members.read")` both work.
     pub fn granted_caps(&self, manifest: &MiniAppManifest) -> Vec<String> {
+        self.granted_caps_for(&manifest.id, |p| manifest.declares(p), |c| manifest.declares_capability(c))
+    }
+
+    /// The names currently usable by `subject` — every granted permission
+    /// group id plus every granted capability id — the subject-general form
+    /// of [`Self::granted_caps`]. What a running isolate's `host.has(...)`
+    /// answers from (via the snapshot); an agent session's runtime will ask
+    /// this directly for its room's key.
+    pub fn granted_caps_for(
+        &self,
+        subject: &str,
+        declares_perm: impl Fn(Permission) -> bool,
+        declares_cap: impl Fn(&crate::capabilities::Capability) -> bool,
+    ) -> Vec<String> {
         let mut out: Vec<String> = Permission::ALL
             .into_iter()
-            .filter(|p| self.is_granted(manifest, *p))
+            .filter(|p| self.is_granted_for(subject, &declares_perm, *p))
             .map(|p| p.as_str().to_string())
             .collect();
         out.extend(
             crate::capabilities::CATALOG
                 .iter()
                 .filter(|c| c.group.is_some())
-                .filter(|c| self.effective_capability(manifest, c) == Effective::Granted)
+                .filter(|c| {
+                    self.effective_capability_for(subject, &declares_perm, &declares_cap, c)
+                        == Effective::Granted
+                })
                 .map(|c| c.id.to_string()),
         );
         out
@@ -1113,5 +1222,172 @@ mod tests {
         n.capabilities = vec!["device.clipboard.write".to_string()];
         n.normalize_permissions();
         assert!(n.declares(Permission::ClipboardWrite));
+    }
+
+    /// The subject-general functions are the SAME decision as the manifest
+    /// ones, for any subject — proven by running both over the whole catalog
+    /// for one app in a mixed grant/deny/override state. The app-keyed
+    /// methods are thin wrappers, so the two can never drift.
+    #[test]
+    fn subject_general_functions_match_the_manifest_path() {
+        use crate::capabilities::CATALOG;
+        let mut m = manifest(&["matrix-room-read", "network", "clipboard-read"]);
+        m.capabilities = vec!["matrix.room.members.read".to_string()];
+        m.normalize_permissions();
+        let mut store = PermissionStore::default();
+        store.set("t", Permission::MatrixRoomRead, GrantState::Granted);
+        store.set_capability("t", "matrix.room.members.read", GrantState::Denied);
+        store.set("t", Permission::Network, GrantState::Denied);
+
+        for cap in CATALOG {
+            let app = store.effective_capability(&m, cap);
+            let generic = store.effective_capability_for(
+                &m.id,
+                |p| m.declares(p),
+                |c| m.declares_capability(c),
+                cap,
+            );
+            assert_eq!(app, generic, "capability {} differs under a subject key", cap.id);
+        }
+        for perm in Permission::ALL {
+            assert_eq!(
+                store.effective(&m, perm),
+                store.effective_for(&m.id, |p| m.declares(p), perm),
+                "permission {} differs under a subject key",
+                perm.as_str()
+            );
+        }
+        assert_eq!(
+            store.granted_caps(&m),
+            store.granted_caps_for(&m.id, |p| m.declares(p), |c| m.declares_capability(c)),
+        );
+    }
+
+    /// An AI room's agent session is a first-class permission subject: grants
+    /// live under its room's namespaced key, the same tiers prompt, per-group
+    /// answers and per-capability overrides layer identically, the write
+    /// switch and restrictions gate it, and the session can ask what it may
+    /// do right now — the store has no app-only assumptions left.
+    #[test]
+    fn an_ai_room_subject_behaves_like_an_app() {
+        use crate::capabilities::by_id;
+        let room = "!design:matrix.org";
+        let subject = agent_subject(room);
+        assert!(is_agent_subject(&subject));
+        assert_eq!(agent_room_of(&subject), Some(room));
+        // App ids are slug-safe; the namespaced key can never be one.
+        assert!(!is_agent_subject("roll-call"));
+        assert!(agent_room_of("roll-call").is_none());
+
+        // The session's tool profile: the attached-room reads it offers.
+        let profile = [
+            "matrix.room.messages.read",
+            "matrix.room.members.read",
+            "matrix.room.info.read",
+        ];
+        let declares_perm = |p: Permission| {
+            profile.iter().any(|id| by_id(id).and_then(|c| c.group).is_some_and(|g| g == p))
+        };
+        let declares_cap = |c: &crate::capabilities::Capability| profile.contains(&c.id);
+
+        let mut store = PermissionStore::default();
+        let messages = by_id("matrix.room.messages.read").unwrap();
+        let members = by_id("matrix.room.members.read").unwrap();
+        let info = by_id("matrix.room.info.read").unwrap();
+
+        // First use of a runtime-tier group prompts, exactly like an app's.
+        assert_eq!(
+            store.effective_capability_for(&subject, declares_perm, declares_cap, messages),
+            Effective::NeedsPrompt
+        );
+        assert_eq!(
+            store.effective_capability_for(&subject, declares_perm, declares_cap, members),
+            Effective::NeedsPrompt
+        );
+        // A normal-tier group auto-grants on declaration, like an app's.
+        assert_eq!(
+            store.effective_capability_for(&subject, declares_perm, declares_cap, info),
+            Effective::Granted
+        );
+        let caps = store.granted_caps_for(&subject, declares_perm, declares_cap);
+        assert!(caps.iter().any(|c| c == "matrix-room-info"));
+        assert!(caps.iter().any(|c| c == "matrix.room.info.read"));
+        // Nothing runtime-tier is granted before the user answers.
+        assert!(!caps.iter().any(|c| c == "matrix.room.messages.read"));
+        assert!(!caps.iter().any(|c| c == "matrix.room.members.read"));
+
+        // Granting the runtime group unlocks every declared capability in it.
+        store.set(&subject, Permission::MatrixRoomRead, GrantState::Granted);
+        assert_eq!(
+            store.effective_capability_for(&subject, declares_perm, declares_cap, members),
+            Effective::Granted
+        );
+        let caps = store.granted_caps_for(&subject, declares_perm, declares_cap);
+        assert!(caps.iter().any(|c| c == "matrix-room-read"));
+        assert!(caps.iter().any(|c| c == "matrix.room.messages.read"));
+        assert!(caps.iter().any(|c| c == "matrix.room.info.read"));
+        // A capability outside the profile is never granted (undeclared).
+        assert!(!caps.iter().any(|c| c == "matrix.room.pins.read"));
+        assert_eq!(
+            store.effective_capability_for(
+                &subject,
+                declares_perm,
+                declares_cap,
+                by_id("matrix.room.pins.read").unwrap()
+            ),
+            Effective::Undeclared
+        );
+
+        // One capability can be blocked under its granted group.
+        store.set_capability(&subject, members.id, GrantState::Denied);
+        assert_eq!(
+            store.effective_capability_for(&subject, declares_perm, declares_cap, members),
+            Effective::Denied
+        );
+        assert_eq!(
+            store.effective_capability_for(&subject, declares_perm, declares_cap, info),
+            Effective::Granted
+        );
+
+        // The write switch gates a switch-gated capability for a room subject
+        // just as it does for an app.
+        let send_profile = ["matrix.room.message.send"];
+        let send_declares_perm = |p: Permission| {
+            send_profile
+                .iter()
+                .any(|id| by_id(id).and_then(|c| c.group).is_some_and(|g| g == p))
+        };
+        let send_declares_cap = |c: &crate::capabilities::Capability| send_profile.contains(&c.id);
+        let send = by_id("matrix.room.message.send").unwrap();
+        store.set(&subject, Permission::MatrixRoomSend, GrantState::Granted);
+        assert_eq!(
+            store.effective_capability_for(&subject, send_declares_perm, send_declares_cap, send),
+            Effective::Denied,
+            "matrix_write is off by default; a granted group is not enough"
+        );
+        store.set_matrix_write(true);
+        assert_eq!(
+            store.effective_capability_for(&subject, send_declares_perm, send_declares_cap, send),
+            Effective::Granted
+        );
+
+        // A restricted session holds nothing, whatever it was granted.
+        store.restrict(&subject, "made far too many tool calls", 1000, 42);
+        assert_eq!(
+            store.effective_capability_for(&subject, declares_perm, declares_cap, info),
+            Effective::Denied
+        );
+        store.unrestrict(&subject);
+        assert_eq!(
+            store.effective_capability_for(&subject, declares_perm, declares_cap, info),
+            Effective::Granted
+        );
+
+        // Persisted whole-file like everything else, keyed by the room.
+        let json = serde_json::to_string(&store).unwrap();
+        let reloaded: PermissionStore = serde_json::from_str(&json).unwrap();
+        assert_eq!(reloaded.state(&subject, Permission::MatrixRoomRead), GrantState::Granted);
+        assert_eq!(reloaded.capability_state(&subject, members.id), GrantState::Denied);
+        assert!(reloaded.matrix_write());
     }
 }

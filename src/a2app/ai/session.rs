@@ -40,7 +40,7 @@ use a2app_agent::mcp::{McpServer, McpServerConfig};
 use matrix_sdk::ruma::OwnedRoomId;
 
 use super::server::ToolServer;
-use super::tools::{AiHost, register_session_tools};
+use super::tools::{AiHost, ReadToolKind, register_session_tools};
 
 /// A tool call that arrived on a session's MCP serve thread, waiting for the
 /// UI thread to execute it. Each variant carries the channel the answer goes
@@ -53,6 +53,12 @@ pub enum SessionJob {
     LaunchSplashApp { description: String, answer: Sender<Result<String, String>> },
     /// `send_message`: post plain text into the session's room.
     SendRoomMessage { text: String, answer: Sender<Result<String, String>> },
+    /// A capability-gated attached-room read (`read_room_messages`,
+    /// `read_older_messages`, `room_info`). The runtime decides against the
+    /// room's permission subject whether this tool may run — refusing or
+    /// parking it behind a permission prompt on first use — then fetches the
+    /// data on the async worker and answers here when the result lands.
+    ReadTool { kind: ReadToolKind, answer: Sender<Result<String, String>> },
 }
 
 /// The real [`AiHost`]: hands each tool call to the UI thread and blocks on
@@ -92,6 +98,16 @@ impl AiHost for SessionHost {
         answer_rx
             .recv()
             .map_err(|_| "this session ended before the message was posted".to_string())?
+    }
+
+    fn read_tool(&self, kind: ReadToolKind) -> Result<String, String> {
+        let (answer_tx, answer_rx) = channel();
+        self.jobs
+            .send(SessionJob::ReadTool { kind, answer: answer_tx })
+            .map_err(|_| "this session's UI thread is gone".to_string())?;
+        answer_rx
+            .recv()
+            .map_err(|_| "this session ended before the read completed".to_string())?
     }
 }
 
@@ -229,6 +245,11 @@ impl AiSession {
     /// Whether a turn is currently in flight.
     pub fn is_busy(&self) -> bool {
         self.busy
+    }
+
+    /// Member messages waiting for the agent to be free, oldest first.
+    pub fn queued_len(&self) -> usize {
+        self.queued.len()
     }
 
     /// The tool calls waiting on the UI thread, drained by the runtime.

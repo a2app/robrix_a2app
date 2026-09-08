@@ -25,6 +25,7 @@ use matrix_sdk::ruma::{
     serde::Raw,
 };
 
+use crate::a2app::ai::tools::ReadToolKind;
 use crate::a2app::ai_room_events::{
     AI_REPLY_EVENT_TYPE, AI_ROOM_EVENT_TYPE, AI_SESSION_DATA_EVENT_TYPE,
     AiReplyContent, AiRoomMarkerContent, AiSessionCursorContent,
@@ -48,6 +49,12 @@ pub enum AiRoomRequest {
     /// Writes one agent turn (a completed reply, or a `send_message` tool
     /// call) as an `ai_reply` state event.
     PostReply { room_id: OwnedRoomId, content: AiReplyContent },
+    /// A capability-gated attached-room read the session's agent asked for
+    /// (already decided Granted by the runtime against the room's permission
+    /// subject). Fetches the data and posts the result back as
+    /// [`AiRoomAction::ToolReadResult`] under `id`, which the runtime uses to
+    /// answer the parked tool call.
+    ToolRead { id: u64, room_id: OwnedRoomId, tool: ReadToolKind },
 }
 
 /// What [`handle_ai_room_request`] reports back to the UI thread.
@@ -63,6 +70,9 @@ pub enum AiRoomAction {
     /// An `ai_reply` failed to post; the turn's text is otherwise lost, same
     /// as any other failed send.
     PostReplyFailed { error: String },
+    /// A granted [`AiRoomRequest::ToolRead`] finished; `result` is the JSON
+    /// text (or the error) the waiting tool call must be answered with.
+    ToolReadResult { id: u64, result: Result<String, String> },
 }
 
 /// Runs one AI-room Matrix operation on the async worker.
@@ -99,6 +109,36 @@ pub async fn handle_ai_room_request(request: AiRoomRequest) {
                 log!("AI Rooms worker: FAILED to post ai_reply to {room_id}: {e}");
                 Cx::post_action(AiRoomAction::PostReplyFailed { error: e });
             }
+        }
+        AiRoomRequest::ToolRead { id, room_id, tool } => {
+            let result = read_tool(&room_id, tool).await;
+            Cx::post_action(AiRoomAction::ToolReadResult { id, result });
+        }
+    }
+}
+
+/// Runs one granted attached-room read against the same matrix machinery the
+/// mini-app services use (`matrix::room::*`), returning the same JSON text
+/// shapes a mini-app's `host.request` would get.
+async fn read_tool(room_id: &OwnedRoomId, tool: ReadToolKind) -> Result<String, String> {
+    use crate::a2app::matrix::room as matrix_room;
+    match tool {
+        ReadToolKind::Messages { limit } => matrix_room::read_messages(room_id.clone(), limit).await,
+        ReadToolKind::Older { before, limit } => {
+            let before = before
+                .as_deref()
+                .map(OwnedEventId::try_from)
+                .transpose()
+                .map_err(|_| "not a valid event id")?;
+            matrix_room::older_messages(room_id.clone(), before, limit).await
+        }
+        ReadToolKind::Info => matrix_room::info(room_id.clone()).await,
+        // The target room was already allowlisted and granted on the UI
+        // thread; fetch from it directly (it must be a joined room or the
+        // read answers "not found"/"room not joined").
+        ReadToolKind::OtherRoom { room, limit } => {
+            let target = OwnedRoomId::try_from(room.as_str()).map_err(|_| "not a valid room id")?;
+            matrix_room::read_messages(target, limit).await
         }
     }
 }

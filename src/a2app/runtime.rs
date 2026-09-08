@@ -18,7 +18,9 @@ use matrix_sdk::ruma::{matrix_uri::MatrixId, MatrixToUri, MatrixUri, OwnedEventI
 use a2app_core::builtin;
 use a2app_core::bundle;
 use a2app_core::manifest::{A2AppScope, AppRegistry, MiniAppId, MiniAppManifest};
-use a2app_core::permissions::{Effective, GrantState, Permission, PermissionStore};
+use a2app_core::permissions::{
+    Effective, GrantState, Permission, PermissionStore, agent_room_of, agent_subject, is_agent_subject,
+};
 use a2app_core::persistence::{self, A2AppPersistedState};
 use a2app_core::services::{self, Broker, BrokerAsk, BrokerCtx, HostAction, HostQuery, Reply, MATRIX_WRITE_OFF_MSG};
 use a2app_core::versions::{self, VersionOrigin};
@@ -51,7 +53,17 @@ use crate::a2app::ai::session::{AiSession, PromptOutcome, SessionJob, SessionUpd
 #[cfg(unix)]
 use crate::a2app::ai::rooms::{AiRoomAction, AiRoomRequest};
 #[cfg(unix)]
-use crate::a2app::ai_room_events::AiReplyContent;
+use crate::a2app::ai::tools::{AI_ROOM_SESSION_CAP_IDS, ReadToolKind, read_tool_name};
+#[cfg(unix)]
+use crate::a2app::ai_room_panel::{
+    AiRoomPanelAction, AiRoomPanelCommand, AiRoomPanelInfo, AiRoomPanelWidgetRefExt,
+};
+#[cfg(unix)]
+use crate::a2app::ai_room_events::{AiReplyContent, AiReplyToolCall};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
+use std::sync::mpsc::Sender;
 
 /// How long between saves of dirty permission/registry state.
 const PERSIST_THROTTLE: Duration = Duration::from_secs(2);
@@ -61,23 +73,70 @@ const TIMED_GRANT_CHECK: Duration = Duration::from_secs(5);
 const CONSOLE_REPAINT: Duration = Duration::from_millis(120);
 /// How long a room-scoped host action waits for its RoomScreen to appear.
 const ROOM_ACTION_TTL: Duration = Duration::from_secs(10);
+/// Read tool calls a session may make per rolling window before it is refused
+/// until the window rolls: an agent legitimately batches a few reads a turn;
+/// far more than that is a loop, and each refused call also tells the model to
+/// stop.
+const AI_READ_BUDGET: u32 = 24;
+const AI_READ_WINDOW: Duration = Duration::from_secs(10);
+/// The next id for a granted AI-room read request, so the async worker's
+/// result can find the exact tool call it answers.
+#[cfg(unix)]
+static NEXT_AI_TOOL_ID: AtomicU64 = AtomicU64::new(1);
+
+/// One granted read in flight: its room, the tool kind (so the receipt chip
+/// can name it when the result lands) and the channel answering the tool call.
+#[cfg(unix)]
+type AiReadPending = (OwnedRoomId, ReadToolKind, Sender<Result<String, String>>);
 
 thread_local! {
     static A2APP: RefCell<Option<A2AppState>> = const { RefCell::new(None) };
 }
 
 /// Runs `f` against the global a2app state, if it has been initialized.
+///
+/// The state is a `RefCell`, so calling this while an outer [`with_a2app`]
+/// borrow is still live panics. That nesting is a bug no matter where it
+/// happens, but the bare "RefCell already borrowed" message names neither
+/// side of it — so on re-entry the panic carries a backtrace of the SECOND
+/// borrow, whose stack still contains the first (still-unwound) [`with_a2app`]
+/// frame. Works without `RUST_BACKTRACE=1`.
 pub fn with_a2app<R>(f: impl FnOnce(&mut A2AppState) -> R) -> Option<R> {
-    A2APP.with(|state| state.borrow_mut().as_mut().map(f))
+    A2APP.with(|state| {
+        let mut guard = state.try_borrow_mut().unwrap_or_else(|_| {
+            panic!(
+                "a2app state re-entered while already borrowed (the outer \
+                 with_a2app frame is still on this stack):\n{}",
+                std::backtrace::Backtrace::force_capture()
+            )
+        });
+        guard.as_mut().map(f)
+    })
+}
+
+/// What can be parked behind one permission prompt: a mini-app bridge request
+/// (replayed through the broker once the user answers) or an AI-room agent
+/// tool call (re-decided and executed / refused once the user answers).
+pub enum ParkedRequest {
+    /// A mini-app request waiting on its group's answer (`None` when the
+    /// prompt was raised for a group without a specific request behind it).
+    Bridge(Option<SplashHostRequest>),
+    /// An AI session tool call waiting on its room subject's answer.
+    #[cfg(unix)]
+    AiTool { room_id: OwnedRoomId, job: SessionJob },
 }
 
 /// A runtime permission prompt waiting for (or showing to) the user.
 pub struct PermissionPrompt {
-    pub app_id: MiniAppId,
+    /// The permission-store subject the answer is recorded for: an installed
+    /// app's id, or an AI room's agent key (see [`agent_subject`]). One
+    /// decision, one subject — a mini-app and a room's AI can never answer
+    /// for each other.
+    pub subject: String,
     pub perm: Permission,
-    /// Bridge requests parked behind this prompt; replayed or refused
-    /// once the user answers.
-    pub parked: Vec<SplashHostRequest>,
+    /// Requests parked behind this prompt; replayed or refused once the user
+    /// answers.
+    pub parked: Vec<ParkedRequest>,
 }
 
 /// The state of the AI generation console shown in the Mini Apps screen.
@@ -97,16 +156,35 @@ pub struct AiRoomInfo {
     /// session, also persisted as its `ai_session_data` account-data
     /// cursor. Only events after this one are forwarded.
     pub cursor: Option<OwnedEventId>,
-    /// True until the next forwarded prompt has carried a replayed-transcript
-    /// preamble. Set back to `true` whenever the session is (re)started,
-    /// since the in-memory agent has no memory of a prior process's turns.
-    pub needs_priming: bool,
     /// Whether a `send_message` tool call posted to the room during the
     /// session's current turn. When that turn's final text arrives it is
     /// redundant (the tool already said it), so the runtime drops it — a
     /// tool turn must leave exactly one `ai_reply`. Cleared when the turn
     /// ends (its reply is consumed, or the turn errors out).
     posted_by_tool_this_turn: bool,
+    /// Read-tool flood guard: calls made within the current rolling window
+    /// (see `AI_READ_BUDGET` / `AI_READ_WINDOW`). A session that reads far
+    /// faster than any conversation could is a loop; it is refused until the
+    /// window rolls over.
+    read_burst: u32,
+    read_window_started: Option<Instant>,
+    /// Whether this room's AI is turned on at all (the panel's power switch).
+    /// Off stops the session and forwarding; the permission grants are kept.
+    session_on: bool,
+    /// Tool calls this turn actually executed (or were refused), waiting to
+    /// ride on the turn's one `ai_reply` card as a receipt. Cleared when the
+    /// card is posted or the turn errors out.
+    pending_tool_calls: Vec<AiReplyToolCall>,
+    /// What the room's busy/queued status row last showed. Compared against
+    /// the live session each event pass, so the row redraws only when its
+    /// state actually changes (and hides once the agent goes idle).
+    status_busy: bool,
+    status_queued: usize,
+    /// Rooms (matrix ids) this room's AI may read beyond this one, added by
+    /// the user with `/ai allow <room>` (and removed with `/ai remove
+    /// <room>`). Per-device, like the session itself; the gate for
+    /// `matrix.rooms.messages.read` checks this on top of the group grant.
+    read_rooms: HashSet<String>,
 }
 
 /// All a2app state, owned by the UI thread.
@@ -118,7 +196,8 @@ pub struct A2AppState {
     pub prompts: VecDeque<PermissionPrompt>,
     pub active_prompt: Option<PermissionPrompt>,
     /// (app, permission) pairs the user said "Not Now" to this session.
-    pub dismissed_prompts: HashSet<(MiniAppId, Permission)>,
+    /// The key is the subject: an app id or an AI room's agent key.
+    pub dismissed_prompts: HashSet<(String, Permission)>,
     pub generation: Option<Generation>,
     pub console: GenConsole,
     /// The request text of a failed generation, offered for Retry.
@@ -158,6 +237,12 @@ pub struct A2AppState {
     /// finished app in the right room.
     #[cfg(unix)]
     pub ai_generation_room: Option<OwnedRoomId>,
+    /// Granted attached-room reads in flight, keyed by request id: the room
+    /// and tool they belong to, plus the channel that must answer the waiting
+    /// tool call when the async worker's [`AiRoomAction::ToolReadResult`]
+    /// lands (the tool is kept so the receipt chip can name it).
+    #[cfg(unix)]
+    pub ai_reads: HashMap<u64, AiReadPending>,
     perms_dirty: bool,
     registry_dirty: bool,
     last_persist: Instant,
@@ -229,6 +314,8 @@ pub fn init() {
             known_non_ai_rooms: HashSet::new(),
             #[cfg(unix)]
             ai_generation_room: None,
+            #[cfg(unix)]
+            ai_reads: HashMap::new(),
             perms_dirty: false,
             registry_dirty: false,
             last_persist: Instant::now(),
@@ -281,6 +368,9 @@ pub enum A2AppOp {
     ShareToRoom { app_id: MiniAppId, room_id: OwnedRoomId },
     /// The user's "Mini-apps can write to rooms" switch.
     SetMatrixWrite(bool),
+    /// Opens the "AI in this room" management panel for an AI room.
+    #[cfg(unix)]
+    AiRoomPanel(OwnedRoomId),
 }
 
 
@@ -369,6 +459,8 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     let mut host_events: Vec<(&'static str, serde_json::Value)> = Vec::new();
     #[cfg(unix)]
     let mut ai_room_actions: Vec<AiRoomAction> = Vec::new();
+    #[cfg(unix)]
+    let mut ai_panel_actions: Vec<AiRoomPanelAction> = Vec::new();
     if let Event::Actions(actions) = event {
         for action in actions {
             if let Some(watch_event) = action.downcast_ref::<A2AppRoomWatchEvent>() {
@@ -438,6 +530,10 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
             if let Some(ai_room_action) = action.downcast_ref::<AiRoomAction>() {
                 ai_room_actions.push(ai_room_action.clone());
             }
+            #[cfg(unix)]
+            if let Some(panel_action) = action.downcast_ref::<AiRoomPanelAction>() {
+                ai_panel_actions.push(panel_action.clone());
+            }
         }
     }
 
@@ -487,6 +583,12 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     #[cfg(unix)]
     for action in ai_room_actions {
         apply_ai_room_action(cx, ui, action);
+    }
+    // The AI room management panel's own answers (applied after the session
+    // job/event plumbing, so a power flip or grant lands on a settled state).
+    #[cfg(unix)]
+    for action in ai_panel_actions {
+        apply_ai_room_panel_action(cx, ui, action);
     }
 
     // Sessions drain their tool calls and agent events every pass; a tool
@@ -1059,6 +1161,10 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 app_name: manifest.name.clone(),
             }));
         }
+        #[cfg(unix)]
+        A2AppOp::AiRoomPanel(room_id) => {
+            open_ai_room_panel(cx, ui, &room_id);
+        }
     }
 }
 
@@ -1308,7 +1414,7 @@ fn process_broker(cx: &mut Cx, ui: &WidgetRef) {
 fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
     match ask {
         BrokerAsk::Prompt { app_id, perm, request } => {
-            queue_permission_prompt(cx, ui, app_id, perm, request);
+            queue_permission_prompt(cx, ui, app_id, perm, ParkedRequest::Bridge(request));
         }
         BrokerAsk::Notify { app_id, summary } => {
             let name = with_a2app(|state| {
@@ -1665,73 +1771,165 @@ fn prefs_json(cx: &mut Cx) -> serde_json::Value {
 fn queue_permission_prompt(
     cx: &mut Cx,
     ui: &WidgetRef,
-    app_id: MiniAppId,
+    subject: String,
     perm: Permission,
-    request: Option<SplashHostRequest>,
+    parked: ParkedRequest,
 ) {
     with_a2app(|state| {
         // "Not Now" this session: refuse without re-asking, so a looping
-        // script can't nag its way to an accidental Allow.
-        if state.dismissed_prompts.contains(&(app_id.clone(), perm)) {
-            if let Some(request) = request {
-                state.broker.declined(&request);
-                Broker::respond_denied(cx, &request);
-            }
+        // caller (a script, or an agent that keeps trying the same tool)
+        // can't nag its way to an accidental Allow.
+        if state.dismissed_prompts.contains(&(subject.clone(), perm)) {
+            refuse_parked_request(cx, perm, parked);
             return;
         }
         // Merge into an already-active or queued prompt for the same pair.
-        let same = |p: &PermissionPrompt| p.app_id == app_id && p.perm == perm;
+        let same = |p: &PermissionPrompt| p.subject == subject && p.perm == perm;
         if let Some(active) = state.active_prompt.as_mut().filter(|p| same(p)) {
-            active.parked.extend(request);
+            active.parked.push(parked);
             return;
         }
         if let Some(queued) = state.prompts.iter_mut().find(|p| same(p)) {
-            queued.parked.extend(request);
+            queued.parked.push(parked);
             return;
         }
         state.prompts.push_back(PermissionPrompt {
-            app_id,
+            subject,
             perm,
-            parked: request.into_iter().collect(),
+            parked: vec![parked],
         });
     });
     show_next_permission_prompt(cx, ui);
 }
 
+/// Refuses one parked request outright (a "Not Now" dismissal): a mini-app
+/// bridge request is declined through the broker exactly as a stored Deny
+/// would be; an AI tool call is answered with an error the model can read and
+/// act on.
+fn refuse_parked_request(cx: &mut Cx, perm: Permission, parked: ParkedRequest) {
+    match parked {
+        ParkedRequest::Bridge(request) => {
+            if let Some(request) = request {
+                with_a2app(|state| state.broker.declined(&request));
+                Broker::respond_denied(cx, &request);
+            }
+        }
+        #[cfg(unix)]
+        ParkedRequest::AiTool { room_id, job } => {
+            // The prompt was dismissed, not answered: the tool call is refused
+            // (with a receipt, so the user sees the AI was stopped from it).
+            if let SessionJob::ReadTool { kind, .. } = &job {
+                note_ai_tool_call(&room_id, read_tool_name(kind), false, &ai_tool_refused_text(perm));
+            }
+            answer_session_job(job, Err(ai_tool_refused_text(perm)));
+        }
+    }
+}
+
 fn show_next_permission_prompt(cx: &mut Cx, ui: &WidgetRef) {
+    let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
     let info = with_a2app(|state| {
         if state.active_prompt.is_some() {
             return None;
         }
         let prompt = state.prompts.pop_front()?;
-        let (app_name, app_icon, reason) = state.registry.get(&prompt.app_id)
-            .map(|m| (m.name.clone(), m.icon.clone(), m.reason_for(prompt.perm).map(str::to_string)))
-            .unwrap_or_else(|| (prompt.app_id.clone(), String::new(), None));
-        // Name the exact ability that asked, not just its group; a parked
-        // subscribe names the hook it is for.
-        let capability = prompt.parked.first().and_then(|r| {
-            let hook_name = (r.service == "events.subscribe")
-                .then(|| serde_json::from_str::<serde_json::Value>(&r.args_json).ok())
+        let info = prompt_info_for(state, rooms.as_ref(), &prompt.subject, prompt.perm, &prompt.parked);
+        state.active_prompt = Some(prompt);
+        Some(info)
+    })
+    .flatten();
+    let Some(info) = info else { return };
+    ui.mini_app_permission_prompt(cx, ids!(a2app_permission_modal.content)).show(cx, &info);
+    ui.modal(cx, ids!(a2app_permission_modal)).open(cx);
+}
+
+/// Builds what the prompt modal shows for one (subject, group, parked) tuple.
+/// An AI room's agent subject is presented as the room's AI with the concrete
+/// read it asked for; a mini-app keeps its registry identity and the app's own
+/// declared reason.
+fn prompt_info_for(
+    state: &A2AppState,
+    rooms: Option<&RoomsListRef>,
+    subject: &str,
+    perm: Permission,
+    parked: &[ParkedRequest],
+) -> PromptInfo {
+    if let Some(room) = agent_room_of(subject) {
+        let room_name = rooms
+            .and_then(|r| room_display_name(r, room))
+            .unwrap_or_else(|| room.to_string());
+        let capability = parked.iter().find_map(ai_parked_capability).map(|c| c.title.to_string());
+        return PromptInfo {
+            app_name: format!("AI in {room_name}"),
+            app_icon: String::from("🤖"),
+            perm,
+            reason: Some(String::from("It needs this to answer messages in this room.")),
+            capability,
+        };
+    }
+    let (app_name, app_icon, reason) = state.registry.get(subject)
+        .map(|m| (m.name.clone(), m.icon.clone(), m.reason_for(perm).map(str::to_string)))
+        .unwrap_or_else(|| (subject.to_string(), String::new(), None));
+    // Name the exact ability that asked, not just its group; a parked
+    // subscribe names the hook it is for.
+    let capability = parked.iter().find_map(|p| match p {
+        ParkedRequest::Bridge(request) => {
+            let Some(request) = request else { return None };
+            let hook_name = (request.service == "events.subscribe")
+                .then(|| serde_json::from_str::<serde_json::Value>(&request.args_json).ok())
                 .flatten()
                 .and_then(|args| args["event"].as_str().map(str::to_string));
             match hook_name {
                 Some(name) => a2app_core::capabilities::for_hook(&name),
-                None => a2app_core::capabilities::for_service(&r.service),
+                None => a2app_core::capabilities::for_service(&request.service),
             }
-        }).map(|c| c.title.to_string());
-        let info = PromptInfo {
-            app_name,
-            app_icon,
-            perm: prompt.perm,
-            reason,
-            capability,
-        };
-        state.active_prompt = Some(prompt);
-        Some(info)
-    }).flatten();
-    let Some(info) = info else { return };
-    ui.mini_app_permission_prompt(cx, ids!(a2app_permission_modal.content)).show(cx, &info);
-    ui.modal(cx, ids!(a2app_permission_modal)).open(cx);
+        }
+        #[cfg(unix)]
+        ParkedRequest::AiTool { .. } => None,
+    })
+    .map(|c| c.title.to_string());
+    PromptInfo { app_name, app_icon, perm, reason, capability }
+}
+
+/// The catalog capability behind one parked AI tool call, if it names one.
+/// Only the read tools carry capabilities today; the native tools
+/// (`send_message`, `launch_splash_app`) are room plumbing and never prompt.
+fn ai_parked_capability(parked: &ParkedRequest) -> Option<&'static a2app_core::capabilities::Capability> {
+    match parked {
+        #[cfg(unix)]
+        ParkedRequest::AiTool { job, .. } => match job {
+            SessionJob::ReadTool { kind, .. } => kind.capability(),
+            SessionJob::LaunchSplashApp { .. } => a2app_core::capabilities::by_id("apps.generate"),
+            SessionJob::SendRoomMessage { .. } => None,
+        },
+        _ => None,
+    }
+}
+
+/// Answers one session tool call with a finished result, whatever variant it
+/// is. A granted read answers when its worker fetch lands; refusals and
+/// session-teardown errors answer here so a serve thread never hangs.
+#[cfg(unix)]
+fn answer_session_job(job: SessionJob, result: Result<String, String>) {
+    match job {
+        SessionJob::LaunchSplashApp { answer, .. }
+        | SessionJob::SendRoomMessage { answer, .. }
+        | SessionJob::ReadTool { answer, .. } => {
+            let _ = answer.send(result);
+        }
+    }
+}
+
+/// What an AI tool call is told when its room subject refused it — an `Err`
+/// the model reads and can act on (tell the user, ask them to allow it),
+/// never a hang and never a crash.
+#[cfg(unix)]
+fn ai_tool_refused_text(perm: Permission) -> String {
+    format!(
+        "The user did not allow the AI in this room to do this (\"{}\"). \
+         Tell them what you wanted to do and why, so they can allow it.",
+        perm.title()
+    )
 }
 
 fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromptAction) {
@@ -1741,26 +1939,27 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
     let granted = match answer {
         PermissionPromptAction::Allow => {
             with_a2app(|state| {
-                state.permissions.set(&prompt.app_id, prompt.perm, GrantState::Granted);
+                state.permissions.set(&prompt.subject, prompt.perm, GrantState::Granted);
                 state.perms_dirty = true;
             });
             true
         }
         PermissionPromptAction::AllowOnce => {
-            // Session-only: never touches disk, dropped on isolate teardown.
-            with_a2app(|state| state.permissions.grant_once(&prompt.app_id, prompt.perm));
+            // Session-only: never touches disk, dropped on isolate/session
+            // teardown.
+            with_a2app(|state| state.permissions.grant_once(&prompt.subject, prompt.perm));
             true
         }
         PermissionPromptAction::Deny => {
             with_a2app(|state| {
-                state.permissions.set(&prompt.app_id, prompt.perm, GrantState::Denied);
+                state.permissions.set(&prompt.subject, prompt.perm, GrantState::Denied);
                 state.perms_dirty = true;
             });
             false
         }
         PermissionPromptAction::NotNow => {
             with_a2app(|state| {
-                state.dismissed_prompts.insert((prompt.app_id.clone(), prompt.perm));
+                state.dismissed_prompts.insert((prompt.subject.clone(), prompt.perm));
             });
             false
         }
@@ -1772,36 +1971,61 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
     };
     publish_grants(cx);
 
+    let subject = prompt.subject.clone();
+    let perm = prompt.perm;
     // Replay or refuse everything parked behind this prompt.
-    for request in prompt.parked {
-        if granted {
-            let asks = with_a2app(|state| {
-                let A2AppState { broker, registry, permissions, foreground_app, .. } = state;
-                let is_docked = |app_id: &str| instances::is_docked(app_id);
-                let desktop_view = effective_is_desktop(cx);
-                let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
-                let room_name = |id: &str| room_display_name(rooms.as_ref()?, id);
-                broker.dispatch_after_grant(cx, BrokerCtx {
-                    registry,
-                    permissions,
-                    foreground_app: foreground_app.as_deref(),
-                    is_docked: &is_docked,
-                    is_running: &instances::is_running,
-                    pane_state: &instances::pane_state,
-                    room_name: &room_name,
-                    desktop_view,
-                }, request)
-            }).unwrap_or_default();
-            for ask in asks {
-                apply_broker_ask(cx, ui, ask);
+    for parked in prompt.parked {
+        match parked {
+            ParkedRequest::Bridge(request) => {
+                if granted {
+                    if let Some(request) = request {
+                        let asks = with_a2app(|state| {
+                            let A2AppState { broker, registry, permissions, foreground_app, .. } = state;
+                            let is_docked = |app_id: &str| instances::is_docked(app_id);
+                            let desktop_view = effective_is_desktop(cx);
+                            let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
+                            let room_name = |id: &str| room_display_name(rooms.as_ref()?, id);
+                            broker.dispatch_after_grant(cx, BrokerCtx {
+                                registry,
+                                permissions,
+                                foreground_app: foreground_app.as_deref(),
+                                is_docked: &is_docked,
+                                is_running: &instances::is_running,
+                                pane_state: &instances::pane_state,
+                                room_name: &room_name,
+                                desktop_view,
+                            }, request)
+                        }).unwrap_or_default();
+                        for ask in asks {
+                            apply_broker_ask(cx, ui, ask);
+                        }
+                    }
+                } else if let Some(request) = request {
+                    with_a2app(|state| state.broker.declined(&request));
+                    Broker::respond_denied(cx, &request);
+                }
             }
-        } else {
-            with_a2app(|state| state.broker.declined(&request));
-            Broker::respond_denied(cx, &request);
+            #[cfg(unix)]
+            ParkedRequest::AiTool { room_id, job } => {
+                if granted {
+                    // The grant is stored above; re-run the session job so its
+                    // own gate now lets it through to the real work.
+                    execute_session_job(cx, ui, &room_id, job);
+                } else {
+                    // Denied: the call is refused with a receipt naming it, so
+                    // the turn's card shows the AI was stopped from doing it.
+                    if let SessionJob::ReadTool { kind, .. } = &job {
+                        note_ai_tool_call(&room_id, read_tool_name(kind), false, &ai_tool_refused_text(perm));
+                    }
+                    answer_session_job(job, Err(ai_tool_refused_text(perm)));
+                }
+            }
         }
     }
 
-    apply_permission_to_running(cx, ui, &prompt.app_id, prompt.perm);
+    if !is_agent_subject(&subject) {
+        apply_permission_to_running(cx, ui, &subject, perm);
+    }
     show_next_permission_prompt(cx, ui);
     ui.redraw(cx);
 }
@@ -2007,7 +2231,7 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
                 state
                     .ai_rooms
                     .entry(room_id)
-                    .or_insert(AiRoomInfo { cursor: None, needs_priming: true, posted_by_tool_this_turn: false });
+                    .or_insert(AiRoomInfo { cursor: None, posted_by_tool_this_turn: false, read_burst: 0, read_window_started: None, session_on: true, pending_tool_calls: Vec::new(), status_busy: false, status_queued: 0, read_rooms: HashSet::new() });
             });
         }
         AiRoomAction::CreateFailed { error } => {
@@ -2021,7 +2245,7 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
         AiRoomAction::Attached { room_id, name, cursor } => {
             log!("AI Rooms: room {room_id} is an AI room (name: {name:?}, saved forwarding cursor: {cursor:?}); attaching session.");
             with_a2app(|state| {
-                state.ai_rooms.insert(room_id.clone(), AiRoomInfo { cursor, needs_priming: true, posted_by_tool_this_turn: false });
+                state.ai_rooms.insert(room_id.clone(), AiRoomInfo { cursor, posted_by_tool_this_turn: false, read_burst: 0, read_window_started: None, session_on: true, pending_tool_calls: Vec::new(), status_busy: false, status_queued: 0, read_rooms: HashSet::new() });
             });
             attach_ai_session(cx, ui, &room_id, name);
         }
@@ -2032,7 +2256,270 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
                 PopupKind::Error, Some(6.0),
             );
         }
+        AiRoomAction::ToolReadResult { id, result } => {
+            // A granted read finished on the worker; answer the tool call that
+            // has been waiting on it and record the outcome on the turn's
+            // receipt. The sender is gone if the session ended meanwhile — a
+            // send failure is the cleanup (and no receipt is left behind).
+            if let Some((room_id, kind, answer)) =
+                with_a2app(|state| state.ai_reads.remove(&id)).flatten()
+            {
+                let (summary, ok) = match &result {
+                    Ok(_) => (String::new(), true),
+                    Err(e) => (e.clone(), false),
+                };
+                note_ai_tool_call(&room_id, read_tool_name(&kind), ok, &summary);
+                let _ = answer.send(result);
+            }
+        }
     }
+}
+
+/// Stops an AI room's session and resets what a restart needs (one-time
+/// grants, in-flight reads). Grants and restrictions — the user's durable
+/// answers — are kept. Mirrors what the death path does, minus the popups;
+/// used by the panel's power switch.
+#[cfg(unix)]
+fn stop_ai_session(room_id: &OwnedRoomId) {
+    with_a2app(|state| {
+        state.ai_sessions.remove(room_id);
+        state.ai_reads.retain(|_, (r, _, _)| r != room_id);
+        let subject = agent_subject(room_id.as_str());
+        state.permissions.clear_once_for(&subject);
+        state.perms_dirty = true;
+    });
+}
+
+/// The panel's power switch: on (re)attaches the agent, off stops it and the
+/// forwarding that would revive it.
+#[cfg(unix)]
+fn set_ai_room_power(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, on: bool) {
+    with_a2app(|state| {
+        if let Some(info) = state.ai_rooms.get_mut(room_id) {
+            info.session_on = on;
+        }
+    });
+    if on {
+        log!("AI Rooms: powering room {room_id}'s AI back on; attaching a session.");
+        attach_ai_session(cx, ui, room_id, None);
+    } else {
+        log!("AI Rooms: powering off room {room_id}'s AI.");
+        stop_ai_session(room_id);
+    }
+    ui.redraw(cx);
+}
+
+/// The `/ai` command: with no argument it opens the "AI in this room" panel;
+/// `allow <room>` / `remove <room>` maintain the rooms this AI may read
+/// beyond this one. a2app + unix only (other builds no-op the action).
+#[cfg(unix)]
+pub fn ai_panel_command(cx: &mut Cx, arg: &str, room_id: &OwnedRoomId) {
+    let known = with_a2app(|state| state.ai_rooms.contains_key(room_id)).unwrap_or(false);
+    if !known {
+        enqueue_popup_notification(
+            "This isn't an AI room — there is no AI here to manage.",
+            PopupKind::Warning,
+            Some(5.0),
+        );
+        return;
+    }
+    let arg = arg.trim();
+    let edit_rooms = |state: &mut A2AppState, add: bool, target: &str| {
+        let Some(info) = state.ai_rooms.get_mut(room_id) else { return false };
+        if add {
+            info.read_rooms.insert(target.to_string())
+        } else {
+            info.read_rooms.remove(target)
+        }
+    };
+    if let Some(target) = arg.strip_prefix("allow ") {
+        let target = target.trim();
+        if OwnedRoomId::try_from(target).is_err() {
+            enqueue_popup_notification(
+                format!("\"{target}\" isn't a valid room id (it should look like !abc:server.org)."),
+                PopupKind::Error,
+                Some(5.0),
+            );
+            return;
+        }
+        if with_a2app(|state| edit_rooms(state, true, target)).unwrap_or(false) {
+            enqueue_popup_notification(
+                format!("This room's AI may now read {target}."),
+                PopupKind::Info,
+                Some(4.0),
+            );
+        }
+        return;
+    }
+    if let Some(target) = arg.strip_prefix("remove ") {
+        let target = target.trim();
+        if with_a2app(|state| edit_rooms(state, false, target)).unwrap_or(false) {
+            enqueue_popup_notification(
+                format!("This room's AI can no longer read {target}."),
+                PopupKind::Info,
+                Some(4.0),
+            );
+        } else {
+            enqueue_popup_notification(
+                format!("{target} wasn't on this AI's read list."),
+                PopupKind::Warning,
+                Some(4.0),
+            );
+        }
+        return;
+    }
+    if !arg.is_empty() {
+        enqueue_popup_notification(
+            "Usage: /ai — or /ai allow <room-id> / /ai remove <room-id>.",
+            PopupKind::Warning,
+            Some(5.0),
+        );
+        return;
+    }
+    cx.action(A2AppOp::AiRoomPanel(room_id.clone()));
+}
+
+/// Opens the room's AI panel (from an op), or refreshes it after an action.
+#[cfg(unix)]
+fn open_ai_room_panel(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
+    if !with_a2app(|state| state.ai_rooms.contains_key(room_id)).unwrap_or(false) {
+        enqueue_popup_notification(
+            "This isn't an AI room — there is no AI here to manage.",
+            PopupKind::Warning,
+            Some(5.0),
+        );
+        return;
+    }
+    refresh_ai_room_panel(cx, ui, room_id);
+}
+
+/// Repopulates and shows the AI room panel for `room_id` with current state.
+#[cfg(unix)]
+fn refresh_ai_room_panel(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
+    let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
+    let room_name = rooms
+        .as_ref()
+        .and_then(|r| room_display_name(r, room_id.as_str()))
+        .unwrap_or_else(|| room_id.to_string());
+    let subject = agent_subject(room_id.as_str());
+    let Some(info) = with_a2app(|state| {
+        let info = state.ai_rooms.get(room_id)?;
+        let perm_word = |perm: Permission| match state
+            .permissions
+            .effective_for(&subject, ai_room_declares_perm, perm)
+        {
+            Effective::Granted => "allowed",
+            Effective::Denied => "don't allow",
+            Effective::NeedsPrompt => "ask each time",
+            Effective::Undeclared => "not offered",
+        };
+        let line = |perm: Permission| {
+            let count = state.permissions.use_count(&subject, perm);
+            let mut s = format!("{} — {}", perm.title(), perm_word(perm));
+            if count > 0 {
+                s.push_str(&format!(" · {count} use{}", if count == 1 { "" } else { "s" }));
+                if let Some(at) = state.permissions.last_access(&subject, perm) {
+                    let now = versions::now_unix();
+                    let ago = now.saturating_sub(at);
+                    s.push_str(" · last ");
+                    s.push_str(&if ago < 90 {
+                        "just now".to_string()
+                    } else if ago < 3600 {
+                        format!("{}m ago", ago / 60)
+                    } else if ago < 86_400 {
+                        format!("{}h ago", ago / 3600)
+                    } else {
+                        format!("{}d ago", ago / 86_400)
+                    });
+                }
+            }
+            s
+        };
+        let managed: Vec<Permission> = [Permission::MatrixRoomRead, Permission::MatrixRoomInfo, Permission::AppGeneration]
+            .into_iter()
+            .filter(|p| ai_room_declares_perm(*p))
+            .collect();
+        let rows: Vec<String> = managed.iter().map(|p| line(*p)).collect();
+        let usage = {
+            let parts: Vec<String> = managed
+                .iter()
+                .filter_map(|p| {
+                    let n = state.permissions.use_count(&subject, *p);
+                    (n > 0).then(|| format!("{} {n}×", p.title().to_lowercase()))
+                })
+                .collect();
+            if parts.is_empty() {
+                String::from("No tool use recorded yet.")
+            } else {
+                format!("Recent use: {}", parts.join(", "))
+            }
+        };
+        let restriction = state
+            .permissions
+            .restriction(&subject)
+            .map(|r| format!("The host stopped this room's AI: {}.", r.reason));
+        Some(AiRoomPanelInfo {
+            room_id: room_id.to_string(),
+            room_name,
+            powered_on: info.session_on,
+            rows,
+            usage,
+            restriction,
+        })
+    })
+    .flatten()
+    else {
+        return;
+    };
+    ui.ai_room_panel(cx, ids!(ai_room_panel_modal.content)).show(cx, &info);
+    ui.modal(cx, ids!(ai_room_panel_modal)).open(cx);
+}
+
+/// Applies one AI-room panel action (a group answer, a power flip, or an
+/// unrestrict) and re-shows the panel with the new state.
+#[cfg(unix)]
+fn apply_ai_room_panel_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomPanelAction) {
+    let Ok(room_id) = OwnedRoomId::try_from(action.room_id.as_str()) else { return };
+    let subject = agent_subject(&action.room_id);
+    match (action.perm, action.command) {
+        (Some(perm), AiRoomPanelCommand::Allow) => {
+            with_a2app(|state| {
+                state.permissions.set(&subject, perm, GrantState::Granted);
+                state.perms_dirty = true;
+            });
+        }
+        (Some(perm), AiRoomPanelCommand::Ask) => {
+            // Back to Ask: the next use prompts again (the prompt modal's
+            // Allow/Deny answers then write over this).
+            with_a2app(|state| {
+                state.permissions.set(&subject, perm, GrantState::Ask);
+                state.perms_dirty = true;
+            });
+        }
+        (Some(perm), AiRoomPanelCommand::Deny) => {
+            with_a2app(|state| {
+                state.permissions.set(&subject, perm, GrantState::Denied);
+                state.perms_dirty = true;
+            });
+        }
+        (None, AiRoomPanelCommand::Unrestrict) => {
+            with_a2app(|state| {
+                state.permissions.unrestrict(&subject);
+                state.perms_dirty = true;
+            });
+            enqueue_popup_notification(
+                "This room's AI can run again. It will ask you before anything new.",
+                PopupKind::Info,
+                Some(4.0),
+            );
+        }
+        (None, AiRoomPanelCommand::PowerOn) => set_ai_room_power(cx, ui, &room_id, true),
+        (None, AiRoomPanelCommand::PowerOff) => set_ai_room_power(cx, ui, &room_id, false),
+        _ => return,
+    }
+    publish_grants(cx);
+    refresh_ai_room_panel(cx, ui, &room_id);
+    ui.redraw(cx);
 }
 
 /// Starts an AI room's session if it isn't already running. Started idle
@@ -2040,6 +2527,14 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
 /// replayed transcript and sends it as one prompt.
 #[cfg(unix)]
 fn attach_ai_session(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, _name: Option<String>) {
+    // Turned off from the panel: don't (re)start the agent.
+    let powered_off = with_a2app(|state| {
+        state.ai_rooms.get(room_id).map(|info| !info.session_on).unwrap_or(false)
+    }).unwrap_or(false);
+    if powered_off {
+        log!("AI Rooms: room {room_id}'s AI is turned off; not attaching a session.");
+        return;
+    }
     let already_running = with_a2app(|state| state.ai_sessions.contains_key(room_id)).unwrap_or(true);
     if already_running {
         log!("AI Rooms: room {room_id}'s agent session is already running; keeping it.");
@@ -2071,26 +2566,47 @@ pub struct AiRoomScanState {
     /// Only items after this event (by timeline position) are new.
     /// `None` means the room has never forwarded anything yet.
     pub cursor: Option<OwnedEventId>,
-    /// Whether the next forwarded prompt still needs the replayed-transcript
-    /// preamble.
-    pub needs_priming: bool,
 }
 
 /// Returns this room's forwarding state, or `None` if it isn't (or isn't yet
-/// known to be) an AI room — the caller's cue to skip scanning entirely.
+/// known to be) an AI room, or its AI is turned off — the caller's cue to
+/// skip scanning entirely.
 #[cfg(unix)]
 pub fn ai_room_scan_state(room_id: &OwnedRoomId) -> Option<AiRoomScanState> {
     with_a2app(|state| {
-        state.ai_rooms.get(room_id).map(|info| AiRoomScanState {
+        state.ai_rooms.get(room_id).filter(|info| info.session_on).map(|info| AiRoomScanState {
             cursor: info.cursor.clone(),
-            needs_priming: info.needs_priming,
         })
     }).flatten()
 }
 
+/// The live activity of a room's agent session, for its in-room status row:
+/// whether a turn is in flight, and how many member prompts are queued
+/// behind it (waiting for the agent to be free, or for it to finish
+/// starting). `None` when the room has no live session — the row is hidden.
+#[cfg(unix)]
+pub struct AiRoomStatus {
+    pub busy: bool,
+    pub queued: usize,
+}
+
+/// Reads a room's session activity; see [`AiRoomStatus`].
+#[cfg(unix)]
+pub fn ai_room_status(room_id: &OwnedRoomId) -> Option<AiRoomStatus> {
+    with_a2app(|state| {
+        let session = state.ai_sessions.get(room_id)?;
+        Some(AiRoomStatus {
+            busy: session.is_busy(),
+            queued: session.queued_len(),
+        })
+    })
+    .flatten()
+}
+
 /// Forwards newly-seen member messages (in timeline order) to an AI room's
-/// session as prompts, attaching the session first if needed. `preamble`,
-/// when given, is folded into the *first* prompt only (see `needs_priming`).
+/// session as prompts, attaching the session first if needed. Nothing is sent
+/// here beyond the member messages themselves: a session starts fresh and
+/// silent, and its first (and only) inputs are real user messages.
 ///
 /// Each successfully-forwarded event becomes the room's new cursor,
 /// persisted as room account data for restart continuity.
@@ -2098,36 +2614,29 @@ pub fn ai_room_scan_state(room_id: &OwnedRoomId) -> Option<AiRoomScanState> {
 pub fn forward_ai_room_texts(
     room_id: &OwnedRoomId,
     new_texts: Vec<(OwnedEventId, String)>,
-    preamble: Option<String>,
 ) {
     if new_texts.is_empty() {
         return;
     }
-    log!("AI Rooms: forwarding {} new message(s) to room {room_id}'s session (priming preamble: {})...", new_texts.len(), preamble.as_ref().map(|p| !p.is_empty()).unwrap_or(false));
+    log!("AI Rooms: forwarding {} new message(s) to room {room_id}'s session...", new_texts.len());
     for (event_id, text) in &new_texts {
         log!("AI Rooms:   -> forwarding {event_id}: {}", text.chars().take(120).collect::<String>());
     }
     let prefs = with_a2app(|state| state.agent_prefs.clone())
         .unwrap_or_else(a2app_agent::prefs::load_agent_prefs);
-    let mut preamble = preamble.filter(|p| !p.is_empty());
     let mut last_cursor = None;
     for (event_id, text) in new_texts {
-        let prompt_text = match preamble.take() {
-            Some(p) => format!("{p}\n\n{text}"),
-            None => text,
-        };
         let outcome: Result<PromptOutcome, String> = with_a2app(|state| {
             if !state.ai_sessions.contains_key(room_id) {
                 AiSession::start(room_id.clone(), prefs.clone())
                     .map(|session| { state.ai_sessions.insert(room_id.clone(), session); })?;
             }
             let outcome = state.ai_sessions.get_mut(room_id)
-                .map(|session| session.prompt(prompt_text))
+                .map(|session| session.prompt(text.clone()))
                 .unwrap_or(PromptOutcome::Dead);
             if outcome != PromptOutcome::Dead {
                 if let Some(info) = state.ai_rooms.get_mut(room_id) {
                     info.cursor = Some(event_id.clone());
-                    info.needs_priming = false;
                 }
             }
             Ok(outcome)
@@ -2225,10 +2734,12 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
                     }
                     SessionUpdate::Error(msg) => {
                         // The turn is over without a reply; clear the tool-post
-                        // flag so the next turn's reply is not wrongly dropped.
+                        // flag (and this turn's receipts) so the next turn's
+                        // reply is not wrongly dropped or attributed.
                         with_a2app(|state| {
                             if let Some(info) = state.ai_rooms.get_mut(&room_id) {
                                 info.posted_by_tool_this_turn = false;
+                                info.pending_tool_calls.clear();
                             }
                         });
                         log!("AI Rooms: room {room_id}'s agent session reported an error: {msg}");
@@ -2256,36 +2767,216 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
         );
         with_a2app(|state| {
             state.ai_sessions.remove(&room_id);
-            // The next attach must re-prime: the in-memory agent (and its
-            // context) is gone with the process, even though the room's
-            // marker and cursor persist.
-            if let Some(info) = state.ai_rooms.get_mut(&room_id) {
-                info.needs_priming = true;
-            }
+            // A dead session is a (re)start boundary for "Allow Once": drop
+            // its one-time grants so the next agent asks again, exactly as an
+            // app's isolate teardown ends its one-time grants. In-flight
+            // granted reads are orphaned too — their tool calls died with the
+            // serve threads, so any late result has nothing to answer.
+            state.ai_reads.retain(|_, (r, _, _)| r != &room_id);
+            let subject = agent_subject(room_id.as_str());
+            state.permissions.clear_once_for(&subject);
+            state.perms_dirty = true;
         });
+        ui.redraw(cx);
+    }
+
+    // 3. Keep each room's busy/queued status row honest between timeline
+    //    updates: a turn ending with no reply, the queue flushing the next
+    //    prompt, or the agent finishing its startup all change it without a
+    //    new timeline event. Redraw rooms whose row would change, once per
+    //    pass (the row's text itself is populated at draw time).
+    let status_changed: Vec<OwnedRoomId> = with_a2app(|state| {
+        let mut changed = Vec::new();
+        for (room_id, session) in state.ai_sessions.iter() {
+            let (busy, queued) = (session.is_busy(), session.queued_len());
+            let Some(info) = state.ai_rooms.get_mut(room_id) else { continue };
+            if info.status_busy != busy || info.status_queued != queued {
+                info.status_busy = busy;
+                info.status_queued = queued;
+                changed.push(room_id.clone());
+            }
+        }
+        changed
+    })
+    .unwrap_or_default();
+    if !status_changed.is_empty() {
         ui.redraw(cx);
     }
 }
 
-/// Runs one tool call the room's agent made, on the UI thread, and sends the
-/// result back to the serve thread that called the tool.
+/// Whether an AI room's profile declares one permission group: it does if any
+/// offered capability sits in it (mirrors `MiniAppManifest::normalize`: a
+/// declared capability implies its group). The profile itself is
+/// [`AI_ROOM_SESSION_CAP_IDS`] in `ai::tools`, the single source for both the
+/// tool list and this gate.
+fn ai_room_declares_perm(perm: Permission) -> bool {
+    AI_ROOM_SESSION_CAP_IDS.iter().any(|id| {
+        a2app_core::capabilities::by_id(id)
+            .and_then(|c| c.group)
+            .is_some_and(|g| g == perm)
+    })
+}
+
+/// Whether an AI room's profile declares one capability.
+fn ai_room_declares_cap(cap: &a2app_core::capabilities::Capability) -> bool {
+    AI_ROOM_SESSION_CAP_IDS.contains(&cap.id)
+}
+
+/// The session's verdict for one catalog capability against its room subject
+/// — the shared gate the mini-app broker mirrors, so a room's AI and an app
+/// can never be decided differently for the same capability.
 #[cfg(unix)]
-fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: SessionJob) {
-    match job {
-        SessionJob::SendRoomMessage { text, answer } => {
-            // Remember this turn already spoke to the room through the tool,
-            // so its eventual trailing text (octos requires a non-empty
-            // end-of-turn response) is dropped as redundant rather than
-            // posted as a second `ai_reply`.
-            with_a2app(|state| {
-                if let Some(info) = state.ai_rooms.get_mut(room_id) {
-                    info.posted_by_tool_this_turn = true;
+fn ai_capability_verdict(
+    state: &A2AppState,
+    room_id: &OwnedRoomId,
+    cap: &a2app_core::capabilities::Capability,
+) -> Effective {
+    let subject = agent_subject(room_id.as_str());
+    state.permissions.effective_capability_for(&subject, ai_room_declares_perm, ai_room_declares_cap, cap)
+}
+
+/// Executes one capability-gated attached-room read for a session. Decides
+/// against the room's permission subject (`agent_subject(room_id)`) exactly as
+/// the broker decides for a mini-app: a granted call records its use and is
+/// fetched on the async worker (the tool call waits, answered when the result
+/// lands); a refused call answers with an error the model can read and act on;
+/// a first use parks the call behind the permission prompt until the user
+/// answers.
+#[cfg(unix)]
+fn run_ai_read_tool(
+    cx: &mut Cx,
+    ui: &WidgetRef,
+    room_id: &OwnedRoomId,
+    kind: ReadToolKind,
+    answer: Sender<Result<String, String>>,
+) {
+    let Some(cap) = kind.capability() else {
+        let _ = answer.send(Err("this tool is no longer offered".to_string()));
+        return;
+    };
+    // Flood guard first: refuse a read loop before it spends worker time. A
+    // fresh window starts once the last one ages out.
+    let over_budget = with_a2app(|state| {
+        state.ai_rooms.get_mut(room_id).map(|info| {
+            let now = Instant::now();
+            if info
+                .read_window_started
+                .map(|w| now.duration_since(w) > AI_READ_WINDOW)
+                .unwrap_or(true)
+            {
+                info.read_window_started = Some(now);
+                info.read_burst = 0;
+            }
+            info.read_burst += 1;
+            info.read_burst > AI_READ_BUDGET
+        }).unwrap_or(false)
+    }).unwrap_or(false);
+    if over_budget {
+        let text = String::from(
+            "This room's AI is making too many read calls at once; stop and wait a few seconds.",
+        );
+        note_ai_tool_call(room_id, read_tool_name(&kind), false, &text);
+        let _ = answer.send(Err(text));
+        return;
+    }
+    let subject = agent_subject(room_id.as_str());
+    let verdict =
+        with_a2app(|state| ai_capability_verdict(state, room_id, cap)).unwrap_or(Effective::Denied);
+    match verdict {
+        Effective::Granted => {
+            // Cross-room reads additionally need the TARGET room on this AI's
+            // allowlist (`/ai allow <room>`); a group grant alone is not
+            // enough — it answers "may it read other rooms at all", not
+            // "which rooms".
+            if let ReadToolKind::OtherRoom { room, .. } = &kind {
+                let allowed = with_a2app(|state| {
+                    state.ai_rooms.get(room_id).map(|i| i.read_rooms.contains(room)).unwrap_or(false)
+                }).unwrap_or(false);
+                if !allowed {
+                    let text = format!(
+                        "Reading {room} is not allowed: the user must add it first with \
+                         `/ai allow {room}` in this room's AI settings."
+                    );
+                    note_ai_tool_call(room_id, read_tool_name(&kind), false, &text);
+                    let _ = answer.send(Err(text));
+                    return;
                 }
+            }
+            // The group answered; record that the session actually used it —
+            // the same "Used" record a mini-app's granted call leaves, so the
+            // room's AI panel can show what it has been doing.
+            if let Some(group) = cap.group {
+                with_a2app(|state| {
+                    state.permissions.record_access(&subject, group, versions::now_unix());
+                    state.perms_dirty = true;
+                });
+            }
+            let id = NEXT_AI_TOOL_ID.fetch_add(1, Ordering::Relaxed);
+            with_a2app(|state| {
+                state.ai_reads.insert(id, (room_id.clone(), kind.clone(), answer));
             });
-            post_ai_reply(room_id, text);
-            let _ = answer.send(Ok(String::from("Posted to the room.")));
+            submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::ToolRead {
+                id,
+                room_id: room_id.clone(),
+                tool: kind,
+            }));
         }
-        SessionJob::LaunchSplashApp { description, answer } => {
+        Effective::Denied | Effective::Undeclared => {
+            let text = match cap.group {
+                Some(group) => ai_tool_refused_text(group),
+                None => String::from("The user has not allowed the AI in this room to do that."),
+            };
+            note_ai_tool_call(room_id, read_tool_name(&kind), false, &text);
+            let _ = answer.send(Err(text));
+        }
+        Effective::NeedsPrompt => {
+            // First use of a runtime-tier group: park the call and ask, exactly
+            // as a mini-app's first use does. The tool call is left unanswered
+            // — its serve thread blocks until the prompt resolves it.
+            let Some(group) = cap.group else { return };
+            queue_permission_prompt(
+                cx,
+                ui,
+                subject,
+                group,
+                ParkedRequest::AiTool {
+                    room_id: room_id.clone(),
+                    job: SessionJob::ReadTool { kind, answer },
+                },
+            );
+        }
+    }
+}
+
+/// Executes the `launch_splash_app` tool for a session: first gated against
+/// the room's subject like any other capability (`apps.generate`), then — if
+/// granted — run through the same generation machinery the Mini Apps screen
+/// uses, with the waiting tool call answered when the build finishes. The
+/// build tool is the one capability with real cost (provider tokens), so a
+/// first use prompts exactly like a read does.
+#[cfg(unix)]
+fn run_ai_generation(
+    cx: &mut Cx,
+    ui: &WidgetRef,
+    room_id: &OwnedRoomId,
+    description: String,
+    answer: Sender<Result<String, String>>,
+) {
+    let Some(cap) = a2app_core::capabilities::by_id("apps.generate") else {
+        let _ = answer.send(Err("app generation is no longer offered".to_string()));
+        return;
+    };
+    let subject = agent_subject(room_id.as_str());
+    let verdict =
+        with_a2app(|state| ai_capability_verdict(state, room_id, cap)).unwrap_or(Effective::Denied);
+    match verdict {
+        Effective::Granted => {
+            if let Some(group) = cap.group {
+                with_a2app(|state| {
+                    state.permissions.record_access(&subject, group, versions::now_unix());
+                    state.perms_dirty = true;
+                });
+            }
             // Refuse up front when the pipeline cannot start, exactly as the
             // Mini Apps screen would; a tool call must not hang on a build
             // that can never begin.
@@ -2301,6 +2992,7 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
                     }).flatten()
                 });
             if let Some(reason) = refused {
+                note_ai_tool_call(room_id, "launch_splash_app", false, &reason);
                 let _ = answer.send(Err(reason));
                 return;
             }
@@ -2336,6 +3028,53 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
                 }
             }
         }
+        Effective::Denied | Effective::Undeclared => {
+            let text = ai_tool_refused_text(cap.group.expect("apps.generate has a group"));
+            note_ai_tool_call(room_id, "launch_splash_app", false, &text);
+            let _ = answer.send(Err(text));
+        }
+        Effective::NeedsPrompt => {
+            // First use: park the call and ask, exactly as a read's first use
+            // does. The tool call waits on its serve thread until answered.
+            let group = cap.group.expect("apps.generate has a group");
+            queue_permission_prompt(
+                cx,
+                ui,
+                subject,
+                group,
+                ParkedRequest::AiTool {
+                    room_id: room_id.clone(),
+                    job: SessionJob::LaunchSplashApp { description, answer },
+                },
+            );
+        }
+    }
+}
+
+/// Runs one tool call the room's agent made, on the UI thread, and sends the
+/// result back to the serve thread that called the tool.
+#[cfg(unix)]
+fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: SessionJob) {
+    match job {
+        SessionJob::SendRoomMessage { text, answer } => {
+            // Remember this turn already spoke to the room through the tool,
+            // so its eventual trailing text (octos requires a non-empty
+            // end-of-turn response) is dropped as redundant rather than
+            // posted as a second `ai_reply`.
+            with_a2app(|state| {
+                if let Some(info) = state.ai_rooms.get_mut(room_id) {
+                    info.posted_by_tool_this_turn = true;
+                }
+            });
+            post_ai_reply(room_id, text);
+            let _ = answer.send(Ok(String::from("Posted to the room.")));
+        }
+        SessionJob::LaunchSplashApp { description, answer } => {
+            run_ai_generation(cx, ui, room_id, description, answer);
+        }
+        SessionJob::ReadTool { kind, answer } => {
+            run_ai_read_tool(cx, ui, room_id, kind, answer);
+        }
     }
 }
 
@@ -2354,34 +3093,62 @@ fn resolve_session_generation(
 ) {
     let room_id = with_a2app(|state| state.ai_generation_room.take()).flatten();
     let Some(room_id) = room_id else { return };
-    let answered = with_a2app(|state| {
+    // Take the parked answer OUT of the borrow first: sending it and
+    // recording the receipt must run after `with_a2app` releases its guard,
+    // because both touch the same state again (`note_ai_tool_call` borrows it
+    // a second time) — nesting them inside this closure panicked with a
+    // re-entrant RefCell borrow.
+    let Some(answer) = with_a2app(|state| {
         state
             .ai_sessions
             .get_mut(&room_id)
             .and_then(|session| session.take_generation_answer())
-            .map(|answer| {
-                let _ = answer.send(outcome.clone());
-            })
-            .is_some()
-    }).unwrap_or(false);
-    if answered {
-        if outcome.is_ok() {
-            if let Some(manifest) = manifest {
-                cx.action(A2AppOp::OpenApp {
-                    app_id: manifest.id.clone(),
-                    room_id: Some(room_id),
-                    in_room_pane: true,
-                });
-            }
+    })
+    .flatten()
+    else {
+        return;
+    };
+    let (summary, ok) = match &outcome {
+        Ok(_) => (String::new(), true),
+        Err(e) => (e.clone(), false),
+    };
+    note_ai_tool_call(&room_id, "launch_splash_app", ok, &summary);
+    let _ = answer.send(outcome.clone());
+    if outcome.is_ok() {
+        if let Some(manifest) = manifest {
+            cx.action(A2AppOp::OpenApp {
+                app_id: manifest.id.clone(),
+                room_id: Some(room_id),
+                in_room_pane: true,
+            });
         }
-        ui.redraw(cx);
     }
+    ui.redraw(cx);
+}
+
+/// Records one tool call outcome on the room's pending receipt list, shown on
+/// the turn's `ai_reply` card. Refusals and failures are exactly what a
+/// receipt exists for, so the summary is kept short; a granted read that
+/// succeeded leaves an empty summary.
+#[cfg(unix)]
+fn note_ai_tool_call(room_id: &OwnedRoomId, name: &str, ok: bool, summary: &str) {
+    let summary: String = summary.chars().take(48).collect();
+    with_a2app(|state| {
+        if let Some(info) = state.ai_rooms.get_mut(room_id) {
+            info.pending_tool_calls.push(AiReplyToolCall {
+                name: name.to_string(),
+                ok,
+                summary,
+            });
+        }
+    });
 }
 
 /// Writes `text` as an `ai_reply` state event — the agent's only output
 /// channel (never `m.room.message`, so it can't loop back into the
 /// forwarder as input). This is how both a completed turn's natural reply
-/// and the `send_message` tool call reach the room.
+/// and the `send_message` tool call reach the room. The turn's pending tool
+/// receipts are consumed onto this one card.
 #[cfg(unix)]
 fn post_ai_reply(room_id: &OwnedRoomId, text: String) {
     // Best-effort traceability, not a precise per-turn link: under queueing,
@@ -2390,6 +3157,14 @@ fn post_ai_reply(room_id: &OwnedRoomId, text: String) {
     let in_reply_to = with_a2app(|state| {
         state.ai_rooms.get(room_id).and_then(|info| info.cursor.as_ref()).map(ToString::to_string)
     }).flatten();
+    let tool_calls = with_a2app(|state| {
+        state
+            .ai_rooms
+            .get_mut(room_id)
+            .map(|info| std::mem::take(&mut info.pending_tool_calls))
+    })
+    .flatten()
+    .unwrap_or_default();
     log!("AI Rooms: posting ai_reply to room {room_id} (in_reply_to: {in_reply_to:?}).");
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2400,7 +3175,7 @@ fn post_ai_reply(room_id: &OwnedRoomId, text: String) {
         content: AiReplyContent {
             v: 1,
             text,
-            tool_calls: Vec::new(),
+            tool_calls,
             model: None,
             created_at,
             in_reply_to,

@@ -33,10 +33,9 @@ pub struct AiRoomMarkerContent {
 }
 
 /// One tool call summary attached to an [`AiReplyContent`], shown as a chip.
-///
-/// Not yet populated (the ACP transport doesn't surface tool-call details to
-/// the session today; see `a2app_agent::acp_client::AcpEvent::ToolCall`) —
-/// present for wire-format forward-compatibility.
+/// A granted call that ran is `ok: true`; a call the permission model refused
+/// (or one whose fetch failed) is `ok: false` with the reason in `summary`,
+/// so the room's transcript doubles as a permission receipt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiReplyToolCall {
     pub name: String,
@@ -153,7 +152,19 @@ impl AiReplyTimelineCardRef {
         inner.view.label(cx, ids!(reply_text)).set_text(cx, text);
         let tools_line = content
             .filter(|c| !c.tool_calls.is_empty())
-            .map(|c| format!("Used: {}", c.tool_calls.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")))
+            .map(|c| {
+                let parts: Vec<String> = c.tool_calls.iter().map(|t| {
+                    let mut name = t.name.clone();
+                    if !t.ok {
+                        name.push_str(" ✗");
+                        if !t.summary.is_empty() {
+                            name.push_str(&format!(" ({})", t.summary));
+                        }
+                    }
+                    name
+                }).collect();
+                format!("Used: {}", parts.join(", "))
+            })
             .unwrap_or_default();
         let reply_tools = inner.view.label(cx, ids!(reply_tools));
         reply_tools.set_visible(cx, !tools_line.is_empty());

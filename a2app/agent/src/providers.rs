@@ -358,13 +358,45 @@ pub fn effective_provider() -> Option<String> {
     session_provider().or_else(default_provider)
 }
 
-/// Makes `id` the saved default. Only the `provider` field moves; the keys and
-/// every other setting stay exactly as they were.
+/// Robrix's intended default model for DeepSeek setups it writes. octos's own
+/// registry default for the `deepseek` provider is `deepseek-chat`; Robrix
+/// writes `deepseek-v4-flash` instead — the fast, low-cost variant. Thinking
+/// stays off because octos only emits thinking parameters for the DeepSeek V4
+/// family when `reasoning_effort` is present (any level enables thinking), and
+/// a config Robrix writes never sets one.
+const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-v4-flash";
+
+/// Shared by [`save_key`] and [`set_active`], which both move `provider` — one
+/// copy so the two verbs can't drift. Rules:
+///
+/// * A model pinned for a DIFFERENT provider must not follow the switch: a
+///   Claude id sent to DeepSeek is a baffling auth failure, not a useful
+///   passthrough.
+/// * A model already present for the SAME provider survives a key re-save or
+///   re-pick — re-entering a key is not a statement about the model.
+/// * A DeepSeek config with no model yet gets [`DEEPSEEK_DEFAULT_MODEL`], so a
+///   fresh setup is flash-with-no-thinking without anyone naming a model.
+fn reconcile_model(
+    config: &mut serde_json::Map<String, serde_json::Value>,
+    id: &str,
+    prior_provider: Option<&str>,
+) {
+    if prior_provider != Some(id) {
+        config.remove("model");
+    }
+    if id == "deepseek" && !config.contains_key("model") {
+        config.insert("model".to_string(), serde_json::json!(DEEPSEEK_DEFAULT_MODEL));
+    }
+}
+
+/// Makes `id` the saved default. Only the `provider` field moves (plus the
+/// model rule in [`reconcile_model`]); the keys and every other setting stay
+/// exactly as they were.
 pub fn set_active(id: &str) -> Result<(), String> {
     write_config(|config| {
+        let prior = config.get("provider").and_then(|p| p.as_str()).map(str::to_owned);
         config.insert("provider".to_string(), serde_json::json!(id));
-        // A model pinned for the previous provider would be sent to this one.
-        config.remove("model");
+        reconcile_model(config, id, prior.as_deref());
     })
 }
 
@@ -398,8 +430,9 @@ pub fn save_key(id: &str, key: &str) -> Result<(), String> {
         if let Some(map) = vars.as_object_mut() {
             map.insert(var, serde_json::json!(key));
         }
+        let prior = config.get("provider").and_then(|p| p.as_str()).map(str::to_owned);
         config.insert("provider".to_string(), serde_json::json!(id));
-        config.remove("model");
+        reconcile_model(config, id, prior.as_deref());
     })
 }
 
@@ -550,6 +583,68 @@ mod tests {
             .unwrap();
             set_active("moonshot-coding").unwrap();
             // A Claude model id sent to Kimi is a baffling failure.
+            assert!(config_json().get("model").is_none());
+        });
+    }
+
+    /// A fresh DeepSeek setup gets Robrix's flash default — octos's own
+    /// registry default for the provider is `deepseek-chat` — and the file
+    /// carries no `reasoning_effort`, which is the only thing that switches
+    /// DeepSeek V4 thinking on. Flash + no thinking, without anyone naming a
+    /// model.
+    #[test]
+    fn a_deepseek_setup_defaults_to_flash_without_thinking() {
+        with_temp_config(|| {
+            save_key("deepseek", "sk-deepseek-key").unwrap();
+            let config = config_json();
+            assert_eq!(config.get("provider").unwrap(), "deepseek");
+            assert_eq!(config.get("model").unwrap(), DEEPSEEK_DEFAULT_MODEL);
+            assert!(config.get("gateway").is_none(), "no gateway block at all");
+        });
+    }
+
+    /// Re-entering a key is not a statement about the model: a pin the user
+    /// (or octos config) made for the same provider survives a re-save.
+    #[test]
+    fn a_key_resave_keeps_the_same_provider_model() {
+        with_temp_config(|| {
+            save_key("deepseek", "sk-one").unwrap();
+            assert_eq!(config_json().get("model").unwrap(), DEEPSEEK_DEFAULT_MODEL);
+            // A later, deliberate choice elsewhere is the user's own.
+            write_config(|c| {
+                c.insert("model".to_string(), serde_json::json!("deepseek-chat"));
+            })
+            .unwrap();
+            save_key("deepseek", "sk-two").unwrap();
+            assert_eq!(config_json().get("model").unwrap(), "deepseek-chat");
+        });
+    }
+
+    /// Landing on DeepSeek with a model pinned for another provider drops the
+    /// stale model (it would be sent to DeepSeek) and seeds the flash default.
+    #[test]
+    fn switching_to_deepseek_drops_the_old_model_and_seeds_flash() {
+        with_temp_config(|| {
+            save_key("anthropic", "sk-ant-one").unwrap();
+            write_config(|c| {
+                c.insert("model".to_string(), serde_json::json!("claude-opus-5"));
+            })
+            .unwrap();
+            save_key("deepseek", "sk-deepseek").unwrap();
+            let config = config_json();
+            assert_eq!(config.get("provider").unwrap(), "deepseek");
+            assert_eq!(config.get("model").unwrap(), DEEPSEEK_DEFAULT_MODEL);
+        });
+    }
+
+    /// The deepseek flash default is deepseek's, not a global one: another
+    /// provider keeps getting no model of ours, exactly as before.
+    #[test]
+    fn the_deepseek_default_does_not_leak_to_other_providers() {
+        with_temp_config(|| {
+            save_key("deepseek", "sk-deepseek").unwrap();
+            assert_eq!(config_json().get("model").unwrap(), DEEPSEEK_DEFAULT_MODEL);
+            save_key("anthropic", "sk-ant-one").unwrap();
             assert!(config_json().get("model").is_none());
         });
     }
