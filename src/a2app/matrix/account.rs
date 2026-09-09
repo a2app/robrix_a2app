@@ -3,10 +3,9 @@
 use matrix_sdk::ruma::OwnedUserId;
 use matrix_sdk::ruma::api::client::discovery::get_authorization_server_metadata::v1::{AccountManagementAction, AccountManagementActionData};
 use matrix_sdk::ruma::api::client::profile::{AvatarUrl, DisplayName};
-use matrix_sdk::ruma::events::ignored_user_list::IgnoredUserListEventContent;
 
 use super::rooms::room_name;
-use crate::sliding_sync::{current_user_id, get_client, is_user_blocked};
+use crate::sliding_sync::{current_user_id, get_blocked_users, get_client, is_user_blocked};
 
 pub(super) async fn user_profile(user_id: OwnedUserId) -> Result<String, String> {
     let client = get_client().ok_or("not logged in")?;
@@ -63,14 +62,11 @@ pub(super) async fn info() -> Result<String, String> {
 }
 
 pub(super) async fn ignored_users() -> Result<String, String> {
-    let client = get_client().ok_or("not logged in")?;
-    let raw = client.account().account_data::<IgnoredUserListEventContent>().await
-        .map_err(|e| format!("couldn't read the ignore list: {e}"))?;
-    let users: Vec<OwnedUserId> = match raw {
-        Some(raw) => raw.deserialize()
-            .map_err(|e| format!("couldn't read the ignore list: {e}"))?
-            .ignored_users.into_keys().collect(),
-        None => Vec::new(),
-    };
-    Ok(serde_json::json!({ "users": users }).to_string())
+    if get_client().is_none() {
+        return Err("not logged in".to_string());
+    }
+    // The SDK doesn't maintain the ignored-user list in its store, so `sliding_sync`
+    // keeps the authoritative set. Reading the raw account data here would let this
+    // service disagree with Settings and with `user_profile()` above.
+    Ok(serde_json::json!({ "users": get_blocked_users() }).to_string())
 }
