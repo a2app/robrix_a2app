@@ -31,7 +31,7 @@ script_mod! {
             text: "AI in this room"
         }
         panel_subtitle := ModalBody {
-            body: "<p>What this room's AI may do, and whether it's running. Changes apply to your device only.</p>"
+            text: "What this room's AI may do, and whether it's running. Changes apply to your device only."
         }
 
         power_row := View {
@@ -88,6 +88,36 @@ script_mod! {
                 gen_allow := ButtonFlat { text: "Allow" }
                 gen_ask := ButtonFlat { text: "Ask each time" }
                 gen_block := ButtonFlatter { text: "Don't allow" }
+            }
+        }
+
+        rooms_read_row := View {
+            width: Fill, height: Fit
+            flow: Down
+            spacing: 4
+            rooms_read_state := ModalBody {}
+            rooms_read_buttons := View {
+                width: Fill, height: Fit
+                flow: Right
+                spacing: 8
+                rooms_read_allow := ButtonFlat { text: "Allow" }
+                rooms_read_ask := ButtonFlat { text: "Ask each time" }
+                rooms_read_block := ButtonFlatter { text: "Don't allow" }
+            }
+        }
+
+        rooms_list_row := View {
+            width: Fill, height: Fit
+            flow: Down
+            spacing: 4
+            rooms_list_state := ModalBody {}
+            rooms_list_buttons := View {
+                width: Fill, height: Fit
+                flow: Right
+                spacing: 8
+                rooms_list_allow := ButtonFlat { text: "Allow" }
+                rooms_list_ask := ButtonFlat { text: "Ask each time" }
+                rooms_list_block := ButtonFlatter { text: "Don't allow" }
             }
         }
 
@@ -174,25 +204,47 @@ impl Widget for AiRoomPanel {
             return;
         }
         // (perm, allow, ask, deny) button triples, one per managed group.
+        // Read this room's content.
         if self.view.button(cx, ids!(read_allow)).clicked(actions) {
             emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomRead), AiRoomPanelCommand::Allow);
         } else if self.view.button(cx, ids!(read_ask)).clicked(actions) {
             emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomRead), AiRoomPanelCommand::Ask);
         } else if self.view.button(cx, ids!(read_block)).clicked(actions) {
             emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomRead), AiRoomPanelCommand::Deny);
-        } else if self.view.button(cx, ids!(info_allow)).clicked(actions) {
+        }
+        // See this room's details.
+        if self.view.button(cx, ids!(info_allow)).clicked(actions) {
             emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomInfo), AiRoomPanelCommand::Allow);
         } else if self.view.button(cx, ids!(info_ask)).clicked(actions) {
             emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomInfo), AiRoomPanelCommand::Ask);
         } else if self.view.button(cx, ids!(info_block)).clicked(actions) {
             emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomInfo), AiRoomPanelCommand::Deny);
-        } else if self.view.button(cx, ids!(gen_allow)).clicked(actions) {
+        }
+        // Build and run mini-apps.
+        if self.view.button(cx, ids!(gen_allow)).clicked(actions) {
             emit_panel_action(cx, &room_id, Some(Permission::AppGeneration), AiRoomPanelCommand::Allow);
         } else if self.view.button(cx, ids!(gen_ask)).clicked(actions) {
             emit_panel_action(cx, &room_id, Some(Permission::AppGeneration), AiRoomPanelCommand::Ask);
         } else if self.view.button(cx, ids!(gen_block)).clicked(actions) {
             emit_panel_action(cx, &room_id, Some(Permission::AppGeneration), AiRoomPanelCommand::Deny);
-        } else if self.view.button(cx, ids!(unrestrict_button)).clicked(actions) {
+        }
+        // Read messages in other rooms.
+        if self.view.button(cx, ids!(rooms_read_allow)).clicked(actions) {
+            emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomsRead), AiRoomPanelCommand::Allow);
+        } else if self.view.button(cx, ids!(rooms_read_ask)).clicked(actions) {
+            emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomsRead), AiRoomPanelCommand::Ask);
+        } else if self.view.button(cx, ids!(rooms_read_block)).clicked(actions) {
+            emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomsRead), AiRoomPanelCommand::Deny);
+        }
+        // See a list of the user's rooms.
+        if self.view.button(cx, ids!(rooms_list_allow)).clicked(actions) {
+            emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomsList), AiRoomPanelCommand::Allow);
+        } else if self.view.button(cx, ids!(rooms_list_ask)).clicked(actions) {
+            emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomsList), AiRoomPanelCommand::Ask);
+        } else if self.view.button(cx, ids!(rooms_list_block)).clicked(actions) {
+            emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomsList), AiRoomPanelCommand::Deny);
+        }
+        if self.view.button(cx, ids!(unrestrict_button)).clicked(actions) {
             emit_panel_action(cx, &room_id, None, AiRoomPanelCommand::Unrestrict);
         }
     }
@@ -216,6 +268,8 @@ impl AiRoomPanelRef {
         v.label(cx, ids!(read_state)).set_text(cx, row(0));
         v.label(cx, ids!(info_state)).set_text(cx, row(1));
         v.label(cx, ids!(gen_state)).set_text(cx, row(2));
+        v.label(cx, ids!(rooms_read_state)).set_text(cx, row(3));
+        v.label(cx, ids!(rooms_list_state)).set_text(cx, row(4));
         v.label(cx, ids!(usage_label)).set_text(cx, &info.usage);
         let restrict_notice = info.restriction.clone().unwrap_or_default();
         let restricted = !restrict_notice.is_empty();

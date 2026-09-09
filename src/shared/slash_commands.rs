@@ -199,9 +199,10 @@ pub enum SlashCommandAction {
     /// and anything else starts a room-scoped generation.
     /// Only produced in builds with the `a2app` feature.
     MiniApp(String),
-    /// Open the "AI in this room" management panel, or manage its read
-    /// allowlist (`allow <room>` / `remove <room>`). Only produced in a2app
-    /// builds on desktop (AI rooms are unix-only).
+    /// Open the "AI in this room" management panel (`/ai`), or mark the
+    /// current room as an AI room (`/ai enable`). Reading other rooms is
+    /// handled by the ordinary permission prompts — there is no allowlist.
+    /// Only produced in a2app builds on desktop (AI rooms are unix-only).
     AiRoomSettings(String),
 }
 

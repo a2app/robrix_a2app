@@ -320,6 +320,21 @@ impl RoomInputBar {
             return;
         };
 
+        // In an AI room, pressing Escape also aborts whatever the room's AI
+        // is currently doing (an in-flight turn, queued member prompts, or
+        // the app build its `launch_splash_app` tool is waiting on). Only
+        // emitted when there is something to stop: an idle room's Escape
+        // stays a plain reply-cancel. The runtime op cancels the generation
+        // and the session turn together, leaving the session ready for the
+        // room's next message.
+        #[cfg(all(feature = "a2app", unix))]
+        if text_input.escaped(actions)
+            && let TimelineKind::MainRoom { room_id } = &timeline_kind
+            && crate::a2app::runtime::ai_room_is_busy(room_id)
+        {
+            cx.action(crate::a2app::runtime::A2AppOp::AbortAiRoom(room_id.clone()));
+        }
+
         let open_popup_menu_button = self.button(cx, ids!(open_popup_menu_button));
         if open_popup_menu_button.clicked(actions) {
             let button_rect = open_popup_menu_button.area().rect(cx);

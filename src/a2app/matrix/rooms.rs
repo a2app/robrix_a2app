@@ -45,6 +45,27 @@ pub(super) async fn search(query: String, limit: u32) -> Result<String, String> 
     Ok(serde_json::json!({ "rooms": out }).to_string())
 }
 
+/// Every joined room the model may offer to read, as JSON rows with the
+/// name and id (plus direct/space/encryption/unread flags). The read tools'
+/// `list_rooms` fetches this; the shape matches `matrix.rooms_list`.
+pub(crate) async fn joined_rooms_list() -> Result<String, String> {
+    let client = get_client().ok_or("not logged in")?;
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for room in client.joined_rooms() {
+        out.push(serde_json::json!({
+            "room_id": room.room_id(),
+            "name": room_name(&room).await,
+            "is_direct": room.is_direct().await.unwrap_or(false),
+            "is_space": room.is_space(),
+            "member_count": room.joined_members_count(),
+            "is_encrypted": room.encryption_state().is_encrypted(),
+            "unread": room.num_unread_messages(),
+            "mentions": room.num_unread_mentions(),
+        }));
+    }
+    Ok(serde_json::json!({ "rooms": out }).to_string())
+}
+
 pub(super) async fn invites() -> Result<String, String> {
     let client = get_client().ok_or("not logged in")?;
     let mut out: Vec<serde_json::Value> = Vec::new();

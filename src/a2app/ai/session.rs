@@ -37,6 +37,7 @@ use a2app_agent::acp_client::AcpEvent;
 use a2app_agent::AgentTransport;
 use a2app_agent::mcp::SERVER_NAME;
 use a2app_agent::mcp::{McpServer, McpServerConfig};
+use makepad_widgets::log;
 use matrix_sdk::ruma::OwnedRoomId;
 
 use super::server::ToolServer;
@@ -143,6 +144,15 @@ pub enum PromptOutcome {
 /// oldest ask, not by buffering without bound.
 const MAX_QUEUED_PROMPTS: usize = 16;
 
+/// Truncates `text` for a log line, with an ellipsis when it was cut.
+fn clip(text: &str, max_chars: usize) -> String {
+    let mut out: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
+}
+
 /// The next unique id for per-session agent workspaces (socket-like paths
 /// stay unique even though a room may host several sessions over time).
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -175,6 +185,13 @@ pub struct AiSession {
     /// Set when the agent process is gone (`ProcessGone`); prompts are then
     /// refused and the runtime drops the session.
     transport_dead: bool,
+    /// Chars of reply text streamed so far this turn (diagnostics only).
+    turn_reply_chars: usize,
+    /// Chars of thinking streamed so far this turn (diagnostics only).
+    turn_thought_chars: usize,
+    /// Whether this turn's first thought chunk was logged (so a long think
+    /// reports once, not per chunk).
+    turn_thought_logged: bool,
 }
 
 impl AiSession {
@@ -197,12 +214,27 @@ impl AiSession {
         // A dedicated workspace per session: the agent's tools are rooted at
         // its cwd, and a chat session lives far longer than a generation, so
         // it must not share the pipeline's scratch dir (files a stale run
-        // left there would leak into unrelated work).
-        let workspace = a2app_core::data_root()
-            .join("ai_sessions")
-            .join(format!("session-{}", NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)));
-        std::fs::create_dir_all(&workspace)
-            .map_err(|e| format!("couldn't create {}: {e}", workspace.display()))?;
+        // left there would leak into unrelated work). The id counter restarts
+        // each process, so a directory a killed run left behind is cleared
+        // before the id is reused.
+        let workspace_root = a2app_core::data_root().join("ai_sessions");
+        std::fs::create_dir_all(&workspace_root)
+            .map_err(|e| format!("couldn't create {}: {e}", workspace_root.display()))?;
+        let workspace =
+            workspace_root.join(format!("session-{}", NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)));
+        if let Err(e) = std::fs::create_dir(&workspace) {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                // Left over from a killed process; a fresh session must not
+                // inherit its files.
+                std::fs::remove_dir_all(&workspace).map_err(|e| {
+                    format!("couldn't clear stale workspace {}: {e}", workspace.display())
+                })?;
+                std::fs::create_dir(&workspace)
+                    .map_err(|e| format!("couldn't create {}: {e}", workspace.display()))?;
+            } else {
+                return Err(format!("couldn't create {}: {e}", workspace.display()));
+            }
+        }
 
         let exe = std::env::current_exe()
             .map_err(|e| format!("couldn't find this process's binary: {e}"))?;
@@ -229,6 +261,9 @@ impl AiSession {
             queued: VecDeque::new(),
             generation_answer: None,
             transport_dead: false,
+            turn_reply_chars: 0,
+            turn_thought_chars: 0,
+            turn_thought_logged: false,
         })
     }
 
@@ -308,14 +343,31 @@ impl AiSession {
                     updates.push(SessionUpdate::Ready);
                     self.flush_queue();
                 }
-                AcpEvent::TurnDone { text, .. } => {
+                AcpEvent::TurnDone { stop_reason, text } => {
+                    log!(
+                        "AI session {}: turn ended ({}) — reply {} chars, thinking {} chars{}",
+                        self.room_id,
+                        stop_reason,
+                        self.turn_reply_chars,
+                        self.turn_thought_chars,
+                        if text.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!("; text: {}", clip(&text, 160))
+                        }
+                    );
                     self.busy = false;
-                    if !text.trim().is_empty() {
+                    // A cancelled turn (the user pressed Escape) has nothing
+                    // to add on its own: the cancellation is why the turn is
+                    // over, and echoing the agent's abort text would read as
+                    // an answer. Everything else posts as usual.
+                    if stop_reason != "cancelled" && !text.trim().is_empty() {
                         updates.push(SessionUpdate::Reply { text });
                     }
                     self.flush_queue();
                 }
                 AcpEvent::Error(msg) => {
+                    log!("AI session {}: agent error after {} chars of thinking: {}", self.room_id, self.turn_thought_chars, clip(&msg, 240));
                     // The agent answered the outstanding request with an
                     // error; it is idle again, and any queued asks continue.
                     self.busy = false;
@@ -323,19 +375,43 @@ impl AiSession {
                     self.flush_queue();
                 }
                 AcpEvent::ProcessGone(msg) => {
+                    log!("AI session {}: agent process gone: {}", self.room_id, clip(&msg, 240));
                     self.busy = false;
                     self.transport_dead = true;
                     updates.push(SessionUpdate::Gone(msg));
                 }
-                // Streamed content a chat does not need to echo: thinking,
-                // tool-call titles, plans and proof-of-life ticks all matter
-                // only to the generation console. A session's output channel
-                // is the room, and only completed turns go there.
-                AcpEvent::Chunk(_)
-                | AcpEvent::Thought(_)
-                | AcpEvent::ToolCall(_)
-                | AcpEvent::Plan(_)
-                | AcpEvent::Tick => {}
+                // Streamed content a chat does not need to echo back to the
+                // room — thinking, tool-call titles, plans, proof-of-life
+                // ticks — but it is exactly what a log wants when a turn
+                // misbehaves, so it is surfaced here instead of dropped
+                // silently.
+                AcpEvent::Chunk(text) => {
+                    self.turn_reply_chars = self.turn_reply_chars.saturating_add(text.len());
+                }
+                AcpEvent::Thought(text) => {
+                    self.turn_thought_chars = self.turn_thought_chars.saturating_add(text.len());
+                    if !self.turn_thought_logged {
+                        self.turn_thought_logged = true;
+                        log!(
+                            "AI session {}: agent is thinking… {}",
+                            self.room_id,
+                            clip(&text, 160)
+                        );
+                    } else if self.turn_thought_chars % 4096 == 0 {
+                        log!(
+                            "AI session {}: agent still thinking ({} chars so far)",
+                            self.room_id,
+                            self.turn_thought_chars
+                        );
+                    }
+                }
+                AcpEvent::ToolCall(title) => {
+                    log!("AI session {}: agent tool call: {}", self.room_id, title);
+                }
+                AcpEvent::Plan(steps) => {
+                    log!("AI session {}: agent plan updated ({} steps)", self.room_id, steps.len());
+                }
+                AcpEvent::Tick => {}
             }
         }
         updates
@@ -346,8 +422,12 @@ impl AiSession {
         if self.dead() {
             return PromptOutcome::Dead;
         }
+        log!("AI session {}: sending prompt ({} chars)", self.room_id, text.len());
         self.transport.send_prompt(&text);
         self.busy = true;
+        self.turn_reply_chars = 0;
+        self.turn_thought_chars = 0;
+        self.turn_thought_logged = false;
         PromptOutcome::Sent
     }
 
@@ -359,6 +439,28 @@ impl AiSession {
         if let Some(text) = self.queued.pop_front() {
             self.send_next_prompt(text);
         }
+    }
+
+    /// Aborts the session's current work: asks the agent to abandon its
+    /// in-flight turn (`session/cancel`) and drops member prompts queued
+    /// behind it, so nothing fires after the abort. Returns whether there was
+    /// any work to stop (a turn in flight, or queued prompts). The cancelled
+    /// turn ends with a `cancelled` stop reason, which [`Self::advance`]
+    /// reports as no reply — the room simply returns to idle. The session
+    /// itself stays alive for the room's next message.
+    pub fn abort(&mut self) -> bool {
+        if self.dead() {
+            return false;
+        }
+        let had_work = self.busy || !self.queued.is_empty();
+        self.queued.clear();
+        if self.busy {
+            // No-op inside the transport if the handshake hasn't finished
+            // (`session/cancel` needs a session id); the queued prompts were
+            // the only thing pending then, and they are gone now.
+            self.transport.cancel();
+        }
+        had_work
     }
 }
 

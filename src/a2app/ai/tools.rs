@@ -47,8 +47,12 @@ pub trait AiHost: Send + Sync {
 
 /// The read the model asked for, parsed and clamped by its [`Tool`] impl into
 /// the shape the executor (and the async matrix worker) needs. One variant per
-/// tool; each maps 1:1 onto a catalog capability, so the runtime can gate the
-/// call before any data moves.
+/// tool; every variant except [`ReadToolKind::Memory`] maps 1:1 onto a catalog
+/// capability, so the runtime can gate the call before any data moves.
+/// `Memory` is different by design: reading the room's `ai_reply` history is
+/// the agent recalling its OWN past turns — room plumbing like `send_message`
+/// — so it is never gated or prompted. It still rides the read path because
+/// fetching state events needs the async matrix worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadToolKind {
     /// `read_room_messages` → `matrix.room.messages.read`.
@@ -60,21 +64,32 @@ pub enum ReadToolKind {
     /// `room_info` → `matrix.room.info.read`.
     Info,
     /// `read_other_room_messages` → `matrix.rooms.messages.read`: recent
-    /// messages of another JOINED room the user has allowlisted for this
-    /// AI in the room's panel (`/ai allow <room>`). `room` is the target
-    /// room's id, as a string for the tool's schema.
+    /// messages of another JOINED room the model names. Gated like any other
+    /// read: the user is asked the first time the AI reads a room outside
+    /// this one.
     OtherRoom { room: String, limit: u32 },
+    /// `list_rooms` → `matrix.rooms.list`: the joined rooms and DMs the
+    /// model may offer to read, with names and ids.
+    ListRooms,
+    /// `read_room_memory` (ungated): this room's recent `ai_reply` turns —
+    /// the agent's OWN past replies and tool calls. Not a catalog capability:
+    /// the runtime treats it as always allowed, like `send_message`.
+    Memory { limit: u32 },
 }
 
 impl ReadToolKind {
     /// The catalog capability this tool exercises — what the user is asked
-    /// about and what the access record names.
+    /// about and what the access record names. [`Self::Memory`] has none (it
+    /// is ungated room plumbing); the runtime special-cases it before ever
+    /// consulting this.
     pub fn capability_id(&self) -> &'static str {
         match self {
             ReadToolKind::Messages { .. } => "matrix.room.messages.read",
             ReadToolKind::Older { .. } => "matrix.room.messages.paginate",
             ReadToolKind::Info => "matrix.room.info.read",
             ReadToolKind::OtherRoom { .. } => "matrix.rooms.messages.read",
+            ReadToolKind::ListRooms => "matrix.rooms.list",
+            ReadToolKind::Memory { .. } => "",
         }
     }
 
@@ -89,11 +104,15 @@ impl ReadToolKind {
 /// [`AI_ROOM_SESSION_CAP_IDS`], which adds the generator). Kept beside the
 /// tool impls so the tool list and the runtime's gate cannot disagree. The
 /// native `send_message` tool is room plumbing, not a catalog capability, so
-/// it is deliberately not listed anywhere here.
+/// it is deliberately not listed anywhere here — and neither is
+/// `read_room_memory`, which is the same kind of ungated plumbing (the agent
+/// recalling its own past turns).
 pub const AI_ROOM_READ_CAP_IDS: &[&str] = &[
     "matrix.room.messages.read",
     "matrix.room.messages.paginate",
     "matrix.room.info.read",
+    "matrix.rooms.messages.read",
+    "matrix.rooms.list",
 ];
 
 /// Everything an AI session may do that sits in the mini-app capability
@@ -105,6 +124,7 @@ pub const AI_ROOM_SESSION_CAP_IDS: &[&str] = &[
     "matrix.room.messages.paginate",
     "matrix.room.info.read",
     "matrix.rooms.messages.read",
+    "matrix.rooms.list",
     "apps.generate",
 ];
 
@@ -116,6 +136,8 @@ pub fn read_tool_name(kind: &ReadToolKind) -> &'static str {
         ReadToolKind::Older { .. } => "read_older_messages",
         ReadToolKind::Info => "room_info",
         ReadToolKind::OtherRoom { .. } => "read_other_room_messages",
+        ReadToolKind::ListRooms => "list_rooms",
+        ReadToolKind::Memory { .. } => "read_room_memory",
     }
 }
 
@@ -150,8 +172,11 @@ impl Tool for ReadRoomMessagesTool {
 
     fn description(&self) -> &str {
         "Returns this room's recent text messages, oldest first, as JSON \
-         rows with the sender and event id. Use it to catch up on \
-         conversation you have not been told about."
+         rows. Each row has the sender, the sender_id, the event_id, the \
+         room_id, the body, and whether the user has already read it \
+         (unread: true means it arrived after the user's last read receipt). \
+         Use it to catch up on conversation you have not been told about — \
+         when asked to summarize, focus on the rows where unread is true."
     }
 
     fn input_schema(&self) -> Value {
@@ -191,7 +216,9 @@ impl Tool for ReadOlderMessagesTool {
     fn description(&self) -> &str {
         "Returns the page of this room's history older than the messages you \
          already saw. Pass `before` — the event id of the earliest message \
-         you have — to get the messages that came before it."
+         you have — to get the messages that came before it. Rows carry the \
+         sender, sender_id, event_id, room_id, body and an unread flag, as \
+         in read_room_messages."
     }
 
     fn input_schema(&self) -> Value {
@@ -249,10 +276,10 @@ impl Tool for RoomInfoTool {
     }
 }
 
-/// `read_other_room_messages` — read a JOINED room the user allowlisted for
-/// this AI. Gated by `matrix.rooms.messages.read` (MatrixRoomsRead) plus the
-/// per-room allowlist, so a prompt for the group is not enough on its own:
-/// the target room has to have been added with `/ai allow <room>`.
+/// `read_other_room_messages` — read a JOINED room the model names. Gated by
+/// `matrix.rooms.messages.read`; the user is asked the first time the AI
+/// reads a room outside this one, and a granted answer lets it read any
+/// joined room it names.
 pub struct ReadOtherRoomMessagesTool {
     host: Arc<dyn AiHost>,
 }
@@ -269,9 +296,12 @@ impl Tool for ReadOtherRoomMessagesTool {
     }
 
     fn description(&self) -> &str {
-        "Returns the recent text messages of another room the user has let \
-         you read, as JSON rows with the sender and event id. The room must \
-         have been added with `/ai allow <room>` in its settings."
+        "Returns the recent text messages of another joined room you name, as \
+         JSON rows with the sender, sender_id, event_id, the row's own \
+         room_id, body, and an unread flag (true when the user hasn't read it \
+         yet). The user is asked to allow the first read of a room outside \
+         this one; once allowed you may read any of their rooms. Use \
+         list_rooms to see which rooms exist."
     }
 
     fn input_schema(&self) -> Value {
@@ -280,7 +310,7 @@ impl Tool for ReadOtherRoomMessagesTool {
             "properties": {
                 "room": {
                     "type": "string",
-                    "description": "The matrix room id to read, e.g. !abc:server.org.",
+                    "description": "The matrix room id to read, e.g. !abc:server.org (see list_rooms).",
                 },
                 "limit": {
                     "type": "integer",
@@ -301,6 +331,91 @@ impl Tool for ReadOtherRoomMessagesTool {
             .ok_or_else(|| "`read_other_room_messages` needs a `room` id".to_string())?
             .to_string();
         self.host.read_tool(ReadToolKind::OtherRoom { room, limit: parse_limit(arguments) })
+    }
+}
+
+/// `list_rooms` — the joined rooms and DMs the model may offer to read.
+/// Gated by `matrix.rooms.list`; the user is asked on first use.
+pub struct ListRoomsTool {
+    host: Arc<dyn AiHost>,
+}
+
+impl ListRoomsTool {
+    pub fn new(host: Arc<dyn AiHost>) -> Self {
+        Self { host }
+    }
+}
+
+impl Tool for ListRoomsTool {
+    fn name(&self) -> &str {
+        "list_rooms"
+    }
+
+    fn description(&self) -> &str {
+        "Lists the user's joined rooms and direct chats: name, room id, \
+         whether it is a direct chat or a space, member count, encryption, \
+         and unread/mentions counts. Call it to find the room id to pass to \
+         read_other_room_messages when the user asks about a room."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object", "additionalProperties": false })
+    }
+
+    fn call(&self, _arguments: &Map<String, Value>) -> Result<String, String> {
+        self.host.read_tool(ReadToolKind::ListRooms)
+    }
+}
+
+/// `read_room_memory` — recall the agent's own past replies in this room.
+///
+/// Ungated room plumbing (like `send_message`): the room's humans see the
+/// agent's turns as "AI" cards carrying this text, so this is how the agent
+/// recalls what it previously said or built — especially after a restart or
+/// when asked to continue earlier work. `read_room_messages` covers what the
+/// humans said; this covers what *it* said. Not a catalog capability, so no
+/// permission prompt ever gates it.
+pub struct ReadRoomMemoryTool {
+    host: Arc<dyn AiHost>,
+}
+
+impl ReadRoomMemoryTool {
+    pub fn new(host: Arc<dyn AiHost>) -> Self {
+        Self { host }
+    }
+}
+
+impl Tool for ReadRoomMemoryTool {
+    fn name(&self) -> &str {
+        "read_room_memory"
+    }
+
+    fn description(&self) -> &str {
+        "Returns your own recent replies and actions in this room, oldest \
+         first, as JSON rows. The room's humans see your turns as AI cards \
+         that carry this text, so this is how you recall what you previously \
+         said or built — after a restart, or when the user asks you to \
+         continue or build on earlier work. Rows carry the reply text, its \
+         timestamp, and any tools you used (building an app, reading another \
+         room, sending a message). Use read_room_messages for what the \
+         humans said."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "How many of your past turns to return (default 15, max 50).",
+                },
+            },
+            "additionalProperties": false,
+        })
+    }
+
+    fn call(&self, arguments: &Map<String, Value>) -> Result<String, String> {
+        self.host.read_tool(ReadToolKind::Memory { limit: parse_limit(arguments) })
     }
 }
 
@@ -381,9 +496,16 @@ impl Tool for SendMessageTool {
     }
 
     fn description(&self) -> &str {
-        "Posts a plain-text message to this room's timeline. Use it to answer \
-         the user's questions and report progress or results in words. For \
-         building an app, use launch_splash_app instead."
+        "Posts a message to this room's timeline. Use it to answer the user's \
+         questions and report progress or results in words. The text supports \
+         Markdown: **bold**, *italic*, lists, and links. Mention a person by \
+         linking their full matrix id — [Their name](https://matrix.to/#/@user:server) \
+         — which the client renders as a clickable avatar pill. Point at a \
+         specific message with its permalink — \
+         [that message](https://matrix.to/#/!room:server/$event) — which the \
+         client renders as a clickable link to that message in that room \
+         (event ids come from the read tools). For building an app, use \
+         launch_splash_app instead."
     }
 
     fn input_schema(&self) -> Value {
@@ -415,12 +537,15 @@ impl Tool for SendMessageTool {
 /// plus one line here, and every agent (octos and Claude Code alike, via the
 /// bridge) sees it on the next `tools/list`.
 pub fn register_session_tools(server: &mut a2app_agent::mcp::McpServer, host: Arc<dyn AiHost>) {
-    // Capability-gated attached-room reads first, then the two native tools.
+    // Capability-gated attached-room reads first, then the native tools.
     server.add_tool(ReadRoomMessagesTool::new(host.clone()));
     server.add_tool(ReadOlderMessagesTool::new(host.clone()));
     server.add_tool(RoomInfoTool::new(host.clone()));
+    server.add_tool(ListRoomsTool::new(host.clone()));
     server.add_tool(ReadOtherRoomMessagesTool::new(host.clone()));
     server.add_tool(LaunchSplashAppTool::new(host.clone()));
+    // Ungated native tools (the agent's own room plumbing).
+    server.add_tool(ReadRoomMemoryTool::new(host.clone()));
     server.add_tool(SendMessageTool::new(host));
 }
 
@@ -436,6 +561,8 @@ mod tests {
             (ReadToolKind::Messages { limit: 10 }, "matrix.room.messages.read"),
             (ReadToolKind::Older { before: None, limit: 10 }, "matrix.room.messages.paginate"),
             (ReadToolKind::Info, "matrix.room.info.read"),
+            (ReadToolKind::OtherRoom { room: "!r:s".to_string(), limit: 10 }, "matrix.rooms.messages.read"),
+            (ReadToolKind::ListRooms, "matrix.rooms.list"),
         ];
         for (kind, id) in cases {
             assert_eq!(kind.capability_id(), id);
@@ -454,6 +581,7 @@ mod tests {
             Older { before: None, limit: 1 },
             Info,
             OtherRoom { room: "!r:s".to_string(), limit: 1 },
+            ListRooms,
         ] {
             let id = kind.capability_id();
             assert!(
@@ -475,5 +603,21 @@ mod tests {
         assert_eq!(parse_limit(&args), MAX_READ_LIMIT);
         args.insert("limit".into(), json!(0));
         assert_eq!(parse_limit(&args), 1);
+    }
+
+    /// `read_room_memory` is the one deliberate exception to "every read kind
+    /// maps 1:1 onto a catalog capability": the agent recalling its own past
+    /// turns is ungated room plumbing, so it must not surface as a capability
+    /// (no permission prompt row, no access record) — yet it still needs a
+    /// stable MCP name for logs and a bounded limit.
+    #[test]
+    fn room_memory_is_ungated_room_plumbing() {
+        let kind = ReadToolKind::Memory { limit: 10 };
+        assert!(kind.capability().is_none(), "memory is not a catalog capability");
+        assert_eq!(read_tool_name(&kind), "read_room_memory");
+        assert_eq!(kind.capability_id(), "", "no capability id to gate on");
+        let mut args = Map::new();
+        args.insert("limit".into(), json!(999));
+        assert_eq!(parse_limit(&args), MAX_READ_LIMIT, "memory reads stay bounded too");
     }
 }

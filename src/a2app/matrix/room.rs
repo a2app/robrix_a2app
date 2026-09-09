@@ -1,6 +1,7 @@
 //! Services on the instance's attached room: info, messages, members, pins, threads.
 
 use matrix_sdk::deserialized_responses::TimelineEvent;
+use matrix_sdk::ruma::events::receipt::{ReceiptThread, ReceiptType};
 use matrix_sdk::ruma::events::room::message::sanitize::remove_plain_reply_fallback;
 use matrix_sdk::ruma::events::room::message::{OriginalSyncRoomMessageEvent, Relation};
 use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent};
@@ -34,6 +35,43 @@ fn message_json(msg: &OriginalSyncRoomMessageEvent) -> serde_json::Value {
     })
 }
 
+/// The timestamp of the user's own newest read receipt (public or private)
+/// in this room, if they have ever read it. Everything at or before that
+/// point counts as read; everything after it, unread.
+async fn my_read_receipt_ts(room: &matrix_sdk::Room) -> Option<u64> {
+    let me = current_user_id()?;
+    let candidates = [
+        room.load_user_receipt(ReceiptType::Read, ReceiptThread::Unthreaded, &me).await.ok().flatten(),
+        room.load_user_receipt(ReceiptType::ReadPrivate, ReceiptThread::Unthreaded, &me).await.ok().flatten(),
+    ];
+    candidates.into_iter().flatten().max_by_key(|(_, r)| r.ts)
+        .and_then(|(_, r)| r.ts)
+        .map(|t| u64::from(t.0))
+}
+
+/// Whether `msg` is still unread by the user: someone else sent it, and it
+/// is newer than the user's own read receipt. The user's own messages are
+/// always read (they wrote them).
+fn is_unread(msg: &OriginalSyncRoomMessageEvent, my_read_ts: Option<u64>, me: &OwnedUserId) -> bool {
+    msg.sender != *me
+        && my_read_ts.is_none_or(|read_ts| u64::from(msg.origin_server_ts.0) > read_ts)
+}
+
+/// Adds the read-model context shared by the room-read rows to one row:
+/// which room the message is in (so a caller can build a permalink to it,
+/// including across rooms) and whether the user has already read it.
+fn add_row_context(
+    mut row: serde_json::Value,
+    msg: &OriginalSyncRoomMessageEvent,
+    room_id: &OwnedRoomId,
+    my_read_ts: Option<u64>,
+    me: &OwnedUserId,
+) -> serde_json::Value {
+    row["room_id"] = room_id.to_string().into();
+    row["unread"] = is_unread(msg, my_read_ts, me).into();
+    row
+}
+
 pub(super) async fn thread_replies(room_id: OwnedRoomId, event_id: OwnedEventId, limit: u32) -> Result<String, String> {
     use matrix_sdk::ruma::events::relation::RelationType;
     let client = get_client().ok_or("not logged in")?;
@@ -59,6 +97,8 @@ pub(crate) async fn older_messages(room_id: OwnedRoomId, before: Option<OwnedEve
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
     let limit = limit as usize;
+    let me = current_user_id().ok_or("not logged in")?;
+    let my_read_ts = my_read_receipt_ts(&room).await;
     // No anchor means "older than the cached window", i.e. where read_messages stops.
     let mut anchor = before;
     if anchor.is_none()
@@ -73,7 +113,9 @@ pub(crate) async fn older_messages(room_id: OwnedRoomId, before: Option<OwnedEve
         // /context splits its budget across both sides of the anchor.
         let context = room.event_with_context(anchor, true, (limit as u32 * 2).into(), None).await
             .map_err(|e| format!("couldn't load older messages: {e}"))?;
-        out.extend(context.events_before.iter().filter_map(as_message).map(|m| message_json(&m)));
+        out.extend(context.events_before.iter().filter_map(as_message).map(|m| {
+            add_row_context(message_json(&m), &m, &room_id, my_read_ts, &me)
+        }));
         from = context.prev_batch_token;
     }
     // Top up from /messages when the page was mostly state events, or had no anchor.
@@ -86,7 +128,9 @@ pub(crate) async fn older_messages(room_id: OwnedRoomId, before: Option<OwnedEve
         options.from = from;
         let messages = room.messages(options).await
             .map_err(|e| format!("couldn't load older messages: {e}"))?;
-        out.extend(messages.chunk.iter().filter_map(as_message).map(|m| message_json(&m)));
+        out.extend(messages.chunk.iter().filter_map(as_message).map(|m| {
+            add_row_context(message_json(&m), &m, &room_id, my_read_ts, &me)
+        }));
         from = messages.end;
         if from.is_none() {
             break;
@@ -311,6 +355,9 @@ fn push_message(
     out: &mut Vec<serde_json::Value>,
     edits: &mut HashMap<OwnedEventId, String>,
     msg: OriginalSyncRoomMessageEvent,
+    room_id: &OwnedRoomId,
+    my_read_ts: Option<u64>,
+    me: &OwnedUserId,
 ) {
     if let Some(Relation::Replacement(edit)) = &msg.content.relates_to {
         edits.entry(edit.event_id.clone())
@@ -322,7 +369,7 @@ fn push_message(
         clip_chars(&mut body, 500);
         row["body"] = body.into();
     }
-    out.push(row);
+    out.push(add_row_context(row, &msg, room_id, my_read_ts, me));
 }
 
 /// `matrix.read_messages`, and `matrix.rooms_messages` for any joined room.
@@ -335,6 +382,11 @@ pub(crate) async fn read_messages(room_id: matrix_sdk::ruma::OwnedRoomId, limit:
     if room.state() != RoomState::Joined {
         return Err("room not joined".into());
     }
+    // The user's own read receipt marks what they have already seen, so each
+    // row can say whether it is unread — and the agent can focus on the
+    // messages the user hasn't read yet when asked to summarize.
+    let me = current_user_id().ok_or("not logged in")?;
+    let my_read_ts = my_read_receipt_ts(&room).await;
     let mut out: Vec<serde_json::Value> = Vec::new();
     let mut edits = HashMap::new();
     // The event cache already holds the recent timeline in
@@ -345,7 +397,7 @@ pub(crate) async fn read_messages(room_id: matrix_sdk::ruma::OwnedRoomId, limit:
                 let Ok(AnySyncTimelineEvent::MessageLike(
                     AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(msg))
                 )) = event.raw().deserialize() else { continue };
-                push_message(&mut out, &mut edits, msg);
+                push_message(&mut out, &mut edits, msg, &room_id, my_read_ts, &me);
                 if out.len() >= limit as usize {
                     break;
                 }
@@ -368,7 +420,7 @@ pub(crate) async fn read_messages(room_id: matrix_sdk::ruma::OwnedRoomId, limit:
                 let Ok(AnySyncTimelineEvent::MessageLike(
                     AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(msg))
                 )) = event.raw().deserialize() else { continue };
-                push_message(&mut out, &mut edits, msg);
+                push_message(&mut out, &mut edits, msg, &room_id, my_read_ts, &me);
                 if out.len() >= limit as usize {
                     break;
                 }
@@ -381,5 +433,5 @@ pub(crate) async fn read_messages(room_id: matrix_sdk::ruma::OwnedRoomId, limit:
     }
     // Backward pagination is newest-first; apps read oldest-first.
     out.reverse();
-    Ok(serde_json::json!({ "messages": out }).to_string())
+    Ok(serde_json::json!({ "messages": out, "unread_count": room.num_unread_messages() }).to_string())
 }

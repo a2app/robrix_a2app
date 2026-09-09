@@ -15,7 +15,7 @@ use matrix_sdk::Room;
 use matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState;
 use matrix_sdk::ruma::{
     OwnedEventId, OwnedRoomId,
-    api::client::room::create_room,
+    api::client::{room::create_room, state::get_state_event_for_key},
     assign,
     events::{
         AnyInitialStateEvent, AnyRoomAccountDataEventContent, InitialStateEvent,
@@ -25,7 +25,7 @@ use matrix_sdk::ruma::{
     serde::Raw,
 };
 
-use crate::a2app::ai::tools::ReadToolKind;
+use crate::a2app::ai::tools::{ReadToolKind, read_tool_name};
 use crate::a2app::ai_room_events::{
     AI_REPLY_EVENT_TYPE, AI_ROOM_EVENT_TYPE, AI_SESSION_DATA_EVENT_TYPE,
     AiReplyContent, AiRoomMarkerContent, AiSessionCursorContent,
@@ -40,6 +40,10 @@ pub enum AiRoomRequest {
     /// request (the marker rides along in `initial_state`), so there's no
     /// window where the room exists but isn't yet an AI room.
     Create { name: String },
+    /// Writes the marker to an existing room (`/ai enable`), so a room that
+    /// was created before markers existed — or by another client — becomes
+    /// an AI room. The room's agent then attaches like any marked room.
+    Mark { room_id: OwnedRoomId },
     /// Reads the marker (and forwarding cursor, if present) for a room that
     /// was just opened, so the runtime can attach its session.
     CheckMarker { room_id: OwnedRoomId },
@@ -63,6 +67,8 @@ pub enum AiRoomAction {
     /// A new AI room was created; navigate to it.
     Created { room_name_id: RoomNameId },
     CreateFailed { error: String },
+    /// A `/ai enable` marker write failed; surface why.
+    MarkFailed { error: String },
     /// The room has the marker: attach (or keep) its session.
     Attached { room_id: OwnedRoomId, name: Option<String>, cursor: Option<OwnedEventId> },
     /// The room has no marker: it's an ordinary room.
@@ -82,6 +88,24 @@ pub async fn handle_ai_room_request(request: AiRoomRequest) {
         AiRoomRequest::Create { name } => {
             log!("AI Rooms worker: creating AI room \"{name}\"...");
             Cx::post_action(create_ai_room(&name).await);
+        }
+        AiRoomRequest::Mark { room_id } => {
+            log!("AI Rooms worker: marking {room_id} as an AI room...");
+            let Some(room) = get_client().and_then(|c| c.get_room(&room_id)) else {
+                log!("AI Rooms worker: can't mark {room_id}: room not found in client.");
+                Cx::post_action(AiRoomAction::MarkFailed { error: "room not found in client".into() });
+                return;
+            };
+            let content = AiRoomMarkerContent { v: 1, name: None };
+            if let Err(e) = write_marker(&room, &content).await {
+                log!("AI Rooms worker: FAILED to mark {room_id} as an AI room: {e}");
+                Cx::post_action(AiRoomAction::MarkFailed { error: e });
+                return;
+            }
+            log!("AI Rooms worker: wrote the ai_room marker for {room_id}.");
+            // Attach exactly like a room whose marker was found on open (the
+            // room was just marked, so there is no saved forwarding cursor yet).
+            Cx::post_action(AiRoomAction::Attached { room_id, name: None, cursor: None });
         }
         AiRoomRequest::CheckMarker { room_id } => {
             log!("AI Rooms worker: checking ai_room marker for {room_id}...");
@@ -111,7 +135,21 @@ pub async fn handle_ai_room_request(request: AiRoomRequest) {
             }
         }
         AiRoomRequest::ToolRead { id, room_id, tool } => {
-            let result = read_tool(&room_id, tool).await;
+            let result = read_tool(&room_id, tool.clone()).await;
+            match &result {
+                Ok(text) => log!(
+                    "AI Rooms worker: {} for {} returned OK ({} chars).",
+                    read_tool_name(&tool),
+                    room_id,
+                    text.chars().count()
+                ),
+                Err(e) => log!(
+                    "AI Rooms worker: {} for {} returned Err: {}",
+                    read_tool_name(&tool),
+                    room_id,
+                    e
+                ),
+            }
             Cx::post_action(AiRoomAction::ToolReadResult { id, result });
         }
     }
@@ -122,6 +160,7 @@ pub async fn handle_ai_room_request(request: AiRoomRequest) {
 /// shapes a mini-app's `host.request` would get.
 async fn read_tool(room_id: &OwnedRoomId, tool: ReadToolKind) -> Result<String, String> {
     use crate::a2app::matrix::room as matrix_room;
+    use crate::a2app::matrix::rooms as matrix_rooms;
     match tool {
         ReadToolKind::Messages { limit } => matrix_room::read_messages(room_id.clone(), limit).await,
         ReadToolKind::Older { before, limit } => {
@@ -133,14 +172,99 @@ async fn read_tool(room_id: &OwnedRoomId, tool: ReadToolKind) -> Result<String, 
             matrix_room::older_messages(room_id.clone(), before, limit).await
         }
         ReadToolKind::Info => matrix_room::info(room_id.clone()).await,
-        // The target room was already allowlisted and granted on the UI
-        // thread; fetch from it directly (it must be a joined room or the
-        // read answers "not found"/"room not joined").
+        // The target room was granted on the UI thread; fetch from it
+        // directly (it must be a joined room or the read answers "not
+        // found"/"room not joined").
         ReadToolKind::OtherRoom { room, limit } => {
             let target = OwnedRoomId::try_from(room.as_str()).map_err(|_| "not a valid room id")?;
             matrix_room::read_messages(target, limit).await
         }
+        ReadToolKind::ListRooms => matrix_rooms::joined_rooms_list().await,
+        // Ungated plumbing (no capability): the agent recalling its own turns.
+        ReadToolKind::Memory { limit } => room_memory(room_id, limit).await,
     }
+}
+
+/// Fetches the room's recent `ai_reply` state events — the agent's own past
+/// turns — oldest first, one JSON row per turn: the reply text, its
+/// timestamp, the model that wrote it, the tool calls its turn made, and
+/// which user message it answered. Same event-cache-then-`/messages` walk
+/// the message reads use; the replies are ordinary state events in the
+/// timeline, so both sources carry them. The text is deliberately NOT
+/// clipped: this is the agent's memory of its own work, and continuing that
+/// work needs it whole.
+async fn room_memory(room_id: &OwnedRoomId, limit: u32) -> Result<String, String> {
+    use matrix_sdk::room::MessagesOptions;
+    use matrix_sdk::deserialized_responses::TimelineEvent;
+
+    /// One past turn as a JSON row; `true` once `limit` rows are collected.
+    fn push_turn(out: &mut Vec<serde_json::Value>, event: &TimelineEvent, limit: usize) -> bool {
+        // Custom state types (the ai_reply event) aren't in the typed event
+        // enum, so read the raw JSON and filter on the type string.
+        let Ok(raw) = event.raw().deserialize_as::<serde_json::Value>() else {
+            return out.len() >= limit;
+        };
+        if raw.get("type").and_then(serde_json::Value::as_str) != Some(AI_REPLY_EVENT_TYPE) {
+            return out.len() >= limit;
+        }
+        let Some(content) = raw.get("content").cloned() else {
+            return out.len() >= limit;
+        };
+        let Ok(content) = serde_json::from_value::<AiReplyContent>(content) else {
+            return out.len() >= limit;
+        };
+        out.push(serde_json::json!({
+            "event_id": raw.get("event_id").and_then(serde_json::Value::as_str),
+            "ts": content.created_at,
+            "text": content.text,
+            "model": content.model,
+            "tool_calls": content.tool_calls,
+            "in_reply_to": content.in_reply_to,
+        }));
+        out.len() >= limit
+    }
+
+    let client = crate::sliding_sync::get_client().ok_or("not logged in")?;
+    let room = client.get_room(room_id).ok_or("room not found")?;
+    let limit = (limit as usize).clamp(1, 50);
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    // The event cache already holds the recent timeline; only hit the
+    // network when it can't fill the request.
+    if let Ok((cache, _guard)) = client.event_cache().room(room_id).await
+        && let Ok(events) = cache.events().await
+    {
+        for event in events.iter().rev() {
+            if push_turn(&mut out, event, limit) {
+                break;
+            }
+        }
+    }
+    if out.len() < limit {
+        // A room's recent tail can be all regular messages, so keep
+        // paginating until we fill `limit`. Start over rather than mixing
+        // the two sources (their newest page may overlap the cache).
+        out.clear();
+        let mut from: Option<String> = None;
+        for _ in 0..4 {
+            let mut options = MessagesOptions::backward();
+            options.limit = 50u32.into();
+            options.from = from;
+            let messages = room.messages(options).await
+                .map_err(|e| format!("couldn't load the room's past turns: {e}"))?;
+            for event in messages.chunk {
+                if push_turn(&mut out, &event, limit) {
+                    break;
+                }
+            }
+            from = messages.end;
+            if out.len() >= limit || from.is_none() {
+                break;
+            }
+        }
+    }
+    // Pagination answers newest-first; the agent reads oldest-first.
+    out.reverse();
+    Ok(serde_json::json!({ "turns": out }).to_string())
 }
 
 async fn create_ai_room(name: &str) -> AiRoomAction {
@@ -171,12 +295,44 @@ async fn create_ai_room(name: &str) -> AiRoomAction {
         initial_state,
     });
     match client.create_room(request).await {
-        Ok(room) => AiRoomAction::Created { room_name_id: RoomNameId::from_room(&room).await },
+        Ok(room) => {
+            // Homeservers (Synapse included) only honor a small allowlist of
+            // *known* event types in create_room's initial_state and silently
+            // drop a custom marker event, so also write the marker through the
+            // ordinary state-event endpoint — the same one ai_reply events
+            // use, which demonstrably round-trips through sync. The room is
+            // recorded as an AI room in-memory at `Created` either way; this
+            // write is what makes it survive an app restart.
+            let content = AiRoomMarkerContent { v: 1, name: Some(name.to_owned()) };
+            if let Err(e) = write_marker(&room, &content).await {
+                log!("AI Rooms worker: WARNING: couldn't persist the ai_room marker on the new room; it will only be an AI room until the app restarts: {e}");
+            }
+            AiRoomAction::Created { room_name_id: RoomNameId::from_room(&room).await }
+        }
         Err(e) => {
             log!("AI Rooms worker: FAILED to create AI room \"{name}\": {e}");
             AiRoomAction::CreateFailed { error: e.to_string() }
         }
     }
+}
+
+/// Writes the ai_room marker state event once the room exists. Retries while
+/// the brand-new room settles in sliding sync: right after `create_room` the
+/// local client can lag a moment (the same lag `check_marker` waits out for
+/// reads), and sending state requires the room to be joined locally.
+async fn write_marker(room: &Room, content: &AiRoomMarkerContent) -> Result<(), String> {
+    let json = serde_json::to_value(content).map_err(|e| e.to_string())?;
+    let mut last_err = String::from("state send never attempted");
+    for _ in 0..10 {
+        match room.send_state_event_raw(AI_ROOM_EVENT_TYPE, "", json.clone()).await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last_err = e.to_string();
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }
+    }
+    Err(last_err)
 }
 
 /// Checks whether a room carries the AI-room marker. Returns `None` (and
@@ -185,11 +341,16 @@ async fn create_ai_room(name: &str) -> AiRoomAction {
 ///
 /// Two separate waits are needed for a brand-new room: the room object
 /// itself can lag sliding sync for a moment after `create_room`, and its
-/// state events (including our `ai_room` marker, written via the create
-/// request's `initial_state`) stream in *after* the room object appears.
-/// Reading state before that would miss the marker and wrongly classify the
-/// room as ordinary, so a marker miss only counts once the room's state has
+/// state events stream in *after* the room object appears. Reading state
+/// before that would miss the marker and wrongly classify the room as
+/// ordinary, so a marker miss only counts once the room's state has
 /// demonstrably synced (its `m.room.create` event is cached locally).
+///
+/// The marker never reaches the local state store through sliding sync at
+/// all: the SDK only requests a fixed set of *known* state types
+/// (`required_state`), and custom types like the ai_room marker are not in
+/// it. A local miss is therefore confirmed against the homeserver (which is
+/// authoritative) before the room is classified as ordinary.
 async fn check_marker(room_id: &OwnedRoomId) -> Option<AiRoomAction> {
     // Wait for the room object itself, then for its synced state.
     let mut room = crate::sliding_sync::get_client().and_then(|c| c.get_room(room_id));
@@ -206,11 +367,7 @@ async fn check_marker(room_id: &OwnedRoomId) -> Option<AiRoomAction> {
     };
     for _ in 0..20 {
         if let Some(marker) = read_marker(&room).await {
-            let cursor = read_cursor(&room).await
-                .and_then(|c| c.cursor)
-                .and_then(|c| <&matrix_sdk::ruma::EventId>::try_from(c.as_str()).ok().map(ToOwned::to_owned));
-            log!("AI Rooms worker: room {room_id} IS an AI room (marker name: {:?}, saved cursor: {:?}).", marker.name, cursor);
-            return Some(AiRoomAction::Attached { room_id: room_id.clone(), name: marker.name, cursor });
+            return Some(attached_action(&room, room_id, marker).await);
         }
         let state_synced = room
             .get_state_event(StateEventType::RoomCreate, "")
@@ -219,13 +376,40 @@ async fn check_marker(room_id: &OwnedRoomId) -> Option<AiRoomAction> {
             .flatten()
             .is_some();
         if state_synced {
-            log!("AI Rooms worker: room {room_id} exists and its state has synced (m.room.create cached), but it carries no ai_room marker event.");
-            return Some(AiRoomAction::NotAiRoom { room_id: room_id.clone() });
+            // The local store has synced and has no marker, but that only
+            // proves sliding sync didn't deliver it (custom types never are).
+            // Ask the homeserver directly; a `NotFound` there is the one
+            // authoritative "not an AI room", and a transient fetch failure
+            // just retries below without classifying the room.
+            match read_marker_from_server(&room).await {
+                Ok(Some(marker)) => return Some(attached_action(&room, room_id, marker).await),
+                Ok(None) => {
+                    log!("AI Rooms worker: room {room_id} exists and its state has synced (m.room.create cached), but the homeserver reports no ai_room marker event.");
+                    return Some(AiRoomAction::NotAiRoom { room_id: room_id.clone() });
+                }
+                Err(e) => {
+                    log!("AI Rooms worker: couldn't confirm the ai_room marker for {room_id} from the homeserver ({e}); retrying.");
+                }
+            }
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
-    log!("AI Rooms worker: room {room_id}'s state never synced within the retry window; deferring the marker check (re-checked when the room is next opened).");
+    log!("AI Rooms worker: room {room_id}'s marker could not be confirmed within the retry window; deferring the marker check (re-checked when the room is next opened).");
     None
+}
+
+/// Builds the `Attached` action for a room whose marker was found, reading
+/// the saved forwarding cursor as it goes.
+async fn attached_action(
+    room: &Room,
+    room_id: &OwnedRoomId,
+    marker: AiRoomMarkerContent,
+) -> AiRoomAction {
+    let cursor = read_cursor(room).await
+        .and_then(|c| c.cursor)
+        .and_then(|c| <&matrix_sdk::ruma::EventId>::try_from(c.as_str()).ok().map(ToOwned::to_owned));
+    log!("AI Rooms worker: room {room_id} IS an AI room (marker name: {:?}, saved cursor: {:?}).", marker.name, cursor);
+    AiRoomAction::Attached { room_id: room_id.clone(), name: marker.name, cursor }
 }
 
 /// Reads the raw JSON of a `Raw<AnySyncStateEvent>`/`Raw<AnyStrippedStateEvent>`,
@@ -244,6 +428,29 @@ async fn read_marker(room: &Room) -> Option<AiRoomMarkerContent> {
     let raw = room.get_state_event(StateEventType::from(AI_ROOM_EVENT_TYPE), "").await.ok()??;
     let json = deserialize_raw_state(&raw).ok()?;
     serde_json::from_value(json.get("content")?.clone()).ok()
+}
+
+/// Reads the marker straight from the homeserver, bypassing the local state
+/// store. Sliding sync never delivers custom state types (they aren't in the
+/// SDK's `required_state`), so the local store can't answer this reliably;
+/// the homeserver is authoritative. `Ok(None)` means the marker is genuinely
+/// absent (a 404), `Err` is a transient fetch failure.
+async fn read_marker_from_server(room: &Room) -> Result<Option<AiRoomMarkerContent>, String> {
+    use matrix_sdk::ruma::api::error::ErrorKind;
+    let request = get_state_event_for_key::v3::Request::new(
+        room.room_id().to_owned(),
+        StateEventType::from(AI_ROOM_EVENT_TYPE),
+        String::new(),
+    );
+    match room.client().send(request).await {
+        Ok(response) => response
+            .into_content()
+            .deserialize_as_unchecked::<AiRoomMarkerContent>()
+            .map(Some)
+            .map_err(|e| e.to_string()),
+        Err(e) if e.client_api_error_kind() == Some(&ErrorKind::NotFound) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Reads this room's forwarding-cursor account data, if any.

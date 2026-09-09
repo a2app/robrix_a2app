@@ -986,6 +986,16 @@ impl App {
 
         self.persist_runtime_state(cx, "shutdown");
 
+        // Abort any in-flight AI work before the process tears down: an
+        // explicit `session/cancel` goes to each live room session's agent and
+        // to the running app-generation agent, with a short grace for them to
+        // relay it to the LLM provider. Without this, a turn (or build) the
+        // AI was working on would be cut off only by the agent child process
+        // being killed — which drops the provider connection but sends no
+        // explicit stop.
+        #[cfg(all(feature = "a2app", unix))]
+        crate::a2app::runtime::shutdown();
+
         if let Err(_e) = crate::sliding_sync::stop_sync_service_for_shutdown(Duration::from_secs(3)) {
             error!("Failed to stop Matrix sync service before shutdown. Error: Timed out.");
         }

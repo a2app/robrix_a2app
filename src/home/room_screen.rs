@@ -76,6 +76,16 @@ const JUMP_SEARCH_NOT_FOUND_DELAY: f64 = 2.0;
 /// requesting more back pagination.
 const MAX_BACKWARDS_PAGINATIONS_WITHOUT_PROGRESS: usize = 5;
 
+/// How far below the timeline's bottom edge the newest message may be for the
+/// AI-room status pill's appearance to still pull the timeline flush to it.
+/// The pill's own height is ~30px, so the extra slack covers the smooth
+/// scroll-to-end that a send kicks off racing the pill's viewport shrink
+/// (which is what leaves the portal a few pixels short of the end). Anything
+/// farther down means the user has scrolled up to read history, and the pill
+/// must not yank them back to the bottom.
+#[cfg(all(feature = "a2app", unix))]
+const AI_STATUS_PILL_RETAIL_LEEWAY: f64 = 120.0;
+
 
 static UNNAMED_ROOM: &str = "Unnamed Room";
 
@@ -729,17 +739,29 @@ script_mod! {
                     }
                 }
 
-                // An AI room's live status row: visible while the room's
-                // agent is working on a turn or member messages are queued
-                // behind it (populated each draw, hidden by default).
-                ai_room_status := Label {
+                // An AI room's live status pill, just above the input bar:
+                // visible while the room's agent is starting up, working on a
+                // turn, or has member messages queued behind it. It answers
+                // "was my message queued, or is the AI processing it?" before
+                // the reply card lands (populated each draw, hidden by default).
+                ai_room_status_row := RoundedView {
                     visible: false
                     width: Fill, height: Fit
-                    align: Align{x: 0.5, y: 0.5}
-                    padding: Inset{left: 8, right: 8, top: 4, bottom: 2}
-                    draw_text +: {
-                        text_style: REGULAR_TEXT { font_size: 11 },
-                        color: (COLOR_ACTIVE_PRIMARY)
+                    margin: Inset{left: 8, right: 8, top: 4, bottom: 2}
+                    padding: Inset{left: 10, right: 10, top: 3, bottom: 3}
+                    show_bg: true
+                    draw_bg +: {
+                        color: (COLOR_LIST_ITEM_BG_HOVER)
+                        border_radius: 5.0
+                    }
+                    ai_room_status := Label {
+                        width: Fill, height: Fit
+                        flow: Flow.Right{wrap: true}
+                        align: Align{x: 0.5, y: 0.5}
+                        draw_text +: {
+                            text_style: REGULAR_TEXT { font_size: 11 },
+                            color: (COLOR_ACTIVE_PRIMARY)
+                        }
                     }
                 }
 
@@ -978,6 +1000,18 @@ pub struct RoomScreen {
     #[rust] pending_read_receipt_jump: Option<OwnedUserId>,
     /// Fires when a background search for a jumped-to event has gone quiet.
     #[rust] jump_search_timer: Timer,
+
+    /// Whether the AI-room status pill ("AI agent is working on your message…")
+    /// first became visible on the current draw. See
+    /// [`RoomScreen::populate_ai_room_status`] and the portal-draw pass in
+    /// [`RoomScreen::draw_walk`]: the pill sits just below the timeline, so its
+    /// first frame shrinks the timeline viewport by the pill's own height — and
+    /// if the newest message was on screen then, that shrink would cut it off
+    /// below the fold. The flag tells the portal draw that follows to re-tail
+    /// the timeline so the pill shows *below* the last message instead of
+    /// hiding it.
+    #[cfg(all(feature = "a2app", unix))]
+    #[rust] ai_status_just_shown: bool,
 }
 
 /// Cached references to RoomScreen child widgets used in every event handler.
@@ -1406,7 +1440,7 @@ impl Widget for RoomScreen {
         // Here, we handle and remove any general actions that are relevant to only this RoomScreen.
         // Removing the handled actions ensures they are not mistakenly handled by other RoomScreen widget instances.
         actions_generated_within_this_room_screen.retain(|action| {
-            if self.handle_link_clicked(cx, action, &user_profile_sliding_pane) {
+            if self.handle_link_clicked(cx, action, &user_profile_sliding_pane, &portal_list, &loading_pane) {
                 return false;
             }
 
@@ -1521,6 +1555,12 @@ impl Widget for RoomScreen {
         while let Some(subview) = self.view.draw_walk(cx, scope, walk).step() {
             // Here, we only need to handle drawing the portal list.
             let portal_list_ref = subview.as_portal_list();
+            // The portal's current viewport height, read before borrowing its
+            // contents below. This frame's layout already includes the
+            // AI-status pill's visibility (populate_ai_room_status ran above),
+            // so a pill that just appeared has already shrunk this height.
+            #[cfg(all(feature = "a2app", unix))]
+            let portal_height = portal_list_ref.area().rect(cx).size.y;
             let Some(mut list_ref) = portal_list_ref.borrow_mut() else {
                 error!("!!! RoomScreen::draw_walk(): BUG: expected a PortalList widget, but got something else");
                 continue;
@@ -1535,6 +1575,27 @@ impl Widget for RoomScreen {
 
             let list = list_ref.deref_mut();
             list.set_item_range(cx, 0, last_item_id);
+
+            // The AI-room status pill (see populate_ai_room_status above) sits
+            // just below the timeline, so the first frame it appears it shrinks
+            // the timeline viewport by the pill's own height. If the newest
+            // message — the one that started this very turn — was on screen at
+            // that moment, the shrink cuts it off below the fold (and it can
+            // race the smooth scroll-to-end a send kicks off, leaving the
+            // portal pinned a few pixels short of the end). Re-arm the portal's
+            // tail so it settles flush and the pill reads as sitting *below*
+            // the last message rather than hiding it. A user who has scrolled
+            // up to read (newest message far off-screen) keeps their place.
+            #[cfg(all(feature = "a2app", unix))]
+            if std::mem::take(&mut self.ai_status_just_shown) {
+                let newest_on_screen = last_item_id.checked_sub(1).is_some_and(|last_id| {
+                    list.position_of_item(cx, last_id)
+                        .is_some_and(|pos| pos < portal_height + AI_STATUS_PILL_RETAIL_LEEWAY)
+                });
+                if newest_on_screen {
+                    list.set_tail_range(true);
+                }
+            }
 
             while let Some(item_id) = list.next_visible_item(cx) {
                 let item = {
@@ -1780,41 +1841,61 @@ impl Widget for RoomScreen {
 }
 
 impl RoomScreen {
-    /// Populates the AI-room status row (busy / queued) from the room's live
-    /// session state. Called every draw; hidden for ordinary rooms, idle
-    /// sessions, and rooms without a live session.
+    /// Populates the AI-room status pill (starting / working / queued) from
+    /// the room's live session state. Called every draw; hidden for ordinary
+    /// rooms, idle sessions, and rooms without a live session.
     #[cfg(all(feature = "a2app", unix))]
     fn populate_ai_room_status(&mut self, cx: &mut Cx2d) {
         let status = self.tl_state.as_ref().and_then(|tl| match &tl.kind {
             TimelineKind::MainRoom { room_id } => crate::a2app::runtime::ai_room_status(room_id),
             _ => None,
         });
+        let row = self.view(cx, ids!(ai_room_status_row));
+        let was_visible = row.visible();
         let Some(status) = status else {
-            self.view(cx, ids!(ai_room_status)).set_visible(cx, false);
+            row.set_visible(cx, false);
             return;
         };
-        if status.busy {
-            let label = self.view.label(cx, ids!(ai_room_status));
-            if status.queued > 0 {
-                label.set_text(
-                    cx,
-                    &format!("AI agent is working… · {} message(s) queued", status.queued),
-                );
-            } else {
-                label.set_text(cx, "AI agent is working on your message…");
-            }
-            self.view(cx, ids!(ai_room_status)).set_visible(cx, true);
+        let (visible, text) = if status.busy {
+            // The agent accepted the prompt and is working on the turn.
+            (
+                true,
+                if status.queued > 0 {
+                    format!(
+                        "AI agent is working on your message… · {} more queued",
+                        status.queued
+                    )
+                } else {
+                    "AI agent is working on your message…".to_string()
+                },
+            )
         } else if status.queued > 0 {
             // Not busy yet but prompts are waiting: the agent is still
             // starting up (they flush as soon as it reports ready).
-            let label = self.view.label(cx, ids!(ai_room_status));
-            label.set_text(
-                cx,
-                &format!("AI agent is starting… · {} message(s) queued", status.queued),
-            );
-            self.view(cx, ids!(ai_room_status)).set_visible(cx, true);
+            (
+                true,
+                format!(
+                    "Message queued — AI agent is starting up… · {} queued",
+                    status.queued
+                ),
+            )
         } else {
-            self.view(cx, ids!(ai_room_status)).set_visible(cx, false);
+            (false, String::new())
+        };
+        // The pill sits just below the timeline, so the first frame it appears
+        // it shrinks the timeline viewport by its own height. If the newest
+        // message (the one that started this turn) was on screen at that
+        // moment, the shrink cuts it off below the fold — the user had to
+        // scroll down to see the message they'd just sent. The portal-draw
+        // pass in `draw_walk` sees this flag and re-tails the timeline, so the
+        // pill ends up *below* the last message instead of hiding it.
+        if visible && !was_visible {
+            self.ai_status_just_shown = true;
+        }
+        row.set_visible(cx, visible);
+        if visible {
+            let label = self.view.label(cx, ids!(ai_room_status));
+            label.set_text(cx, &text);
         }
     }
 
@@ -2402,6 +2483,8 @@ impl RoomScreen {
         cx: &mut Cx,
         action: &Action,
         pane: &UserProfileSlidingPaneRef,
+        portal_list: &PortalListRef,
+        loading_pane: &LoadingPaneRef,
     ) -> bool {
         // A closure that handles both MatrixToUri and MatrixUri links,
         // and returns whether the link was handled.
@@ -2464,11 +2547,33 @@ impl RoomScreen {
                     //       a room preview for that room.
                     false
                 }
-                MatrixId::Event(room_id, event_id) => {
-                    log!("TODO: open event {} in room {}", event_id, room_id);
-                    // TODO: this requires the same first step as the `MatrixId::Room` case above,
-                    //       but then we need to call Room::event_with_context() to get the event
-                    //       and its context (surrounding events ?).
+                MatrixId::Event(room, event_id) => {
+                    // A link to a specific message: jump to it in-app. A
+                    // same-room link (an AI reply quoting this room's own
+                    // content, or any chat permalink) scrolls the current
+                    // timeline to that message and highlights it; a link to
+                    // another room's message — as an AI reply's cross-room
+                    // reference is — brings that room forward at the message
+                    // (a2app builds, where the jump machinery lives).
+                    if self.timeline_kind.as_ref().is_some_and(|k| k.room_id().as_str() == room.as_str()) {
+                        self.jump_to_event(
+                            cx,
+                            event_id,
+                            None,
+                            String::from("the message that link points to"),
+                            portal_list,
+                            loading_pane,
+                        );
+                        return true;
+                    }
+                    // An alias can't name a room we can open; only concrete ids.
+                    #[cfg(feature = "a2app")]
+                    if let Ok(room_id) = OwnedRoomId::try_from(room.as_str())
+                        && crate::a2app::runtime::open_event_in_room(cx, room_id, event_id.clone()).is_ok()
+                    {
+                        return true;
+                    }
+                    log!("Couldn't open event {} in room {} in-app; falling back to the external link.", event_id, room);
                     false
                 }
                 _ => false,
