@@ -515,6 +515,11 @@ pub fn blocker() -> Option<Blocker> {
 /// writing one Splash file, and for octos any reasoning params would map to
 /// thinking for the very providers Robrix runs it on. Chat sessions use
 /// [`start_backend_with_mcp`] directly and keep the user's full picks.
+///
+/// The generation agent keeps its backend's own toolset
+/// (`host_managed = false`): it writes the app from its own reply, and under
+/// the persistent-guide build may use web lookups to check real Makepad
+/// API details. Only the room's long-lived session agent runs host-managed.
 pub fn start_backend(
     workspace: &std::path::Path,
     prefs: &prefs::AgentPrefs,
@@ -524,7 +529,7 @@ pub fn start_backend(
         "app-generation agent: extended thinking forced OFF for this run \
          (model pick kept, effort cleared, thinking=off)"
     );
-    start_backend_with_mcp(workspace, &prefs, &[])
+    start_backend_with_mcp(workspace, &prefs, &[], false)
 }
 
 /// [`start_backend`] plus the stdio MCP servers the spawned agent is told
@@ -540,10 +545,22 @@ pub fn start_backend(
 /// in-process embedded agent on iOS cannot exec the Robrix relay child at
 /// all, so the config is dropped there; on desktop the embedded agent honors
 /// it exactly like the child process does.
+///
+/// `host_managed` scopes the agent's own toolset. When `true`, the agent
+/// runs as a *host-managed* session: octos backends apply the built-in
+/// `hosted` profile, which empties octos's registry of native tools
+/// (shell/bash, file tools, search, memory, spawn, …), so the only tools
+/// the model can call are the ones Robrix advertises through `mcp_servers`
+/// — every call is mediated by Robrix and maps to a mini-app capability.
+/// When `false` the backend keeps its own default toolset. Honored by the
+/// octos backends (embedded and `octos acp` child); a `ROBRIX_AGENT_CMD`
+/// override or the claude-code bridge brings its own tools and is left
+/// unchanged.
 pub fn start_backend_with_mcp(
     workspace: &std::path::Path,
     prefs: &prefs::AgentPrefs,
     mcp_servers: &[crate::mcp::McpServerConfig],
+    host_managed: bool,
 ) -> Result<Box<dyn AgentTransport>, String> {
     // Refuse before spawning rather than translating an errno afterwards: the
     // check knows WHICH program is missing, so it can name it and the install.
@@ -611,6 +628,7 @@ pub fn start_backend_with_mcp(
             workspace,
             prefs,
             mcp_servers,
+            host_managed,
         )?));
     }
     #[cfg(not(feature = "embedded"))]
@@ -622,7 +640,15 @@ pub fn start_backend_with_mcp(
             // another provider's endpoint.
             return Ok(Box::new(AcpClient::spawn(&cmd, workspace, &bridge_env, &[], mcp_servers)?));
         }
-        Ok(Box::new(AcpClient::spawn(&octos_acp_command(prefs), workspace, &env, &extra, mcp_servers)?))
+        // A host-managed session strips octos's native tools by running the
+        // built-in `hosted` profile (see octos-agent's profile system). The
+        // one-shot generation agent (host_managed = false) keeps the default
+        // `coding` surface.
+        let mut cmd = octos_acp_command(prefs);
+        if host_managed {
+            cmd.push_str(" --profile hosted");
+        }
+        Ok(Box::new(AcpClient::spawn(&cmd, workspace, &env, &extra, mcp_servers)?))
     }
 }
 

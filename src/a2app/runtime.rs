@@ -51,7 +51,7 @@ use crate::utils::RoomNameId;
 #[cfg(unix)]
 use crate::a2app::ai::session::{AiSession, PromptOutcome, SessionJob, SessionUpdate};
 #[cfg(unix)]
-use crate::a2app::ai::rooms::{AiRoomAction, AiRoomRequest};
+use crate::a2app::ai::rooms::{next_ai_state_key, AiRoomAction, AiRoomRequest};
 #[cfg(unix)]
 use crate::a2app::ai::tools::{AI_ROOM_SESSION_CAP_IDS, ReadToolKind, read_tool_name};
 #[cfg(unix)]
@@ -59,7 +59,10 @@ use crate::a2app::ai_room_panel::{
     AiRoomPanelAction, AiRoomPanelCommand, AiRoomPanelInfo, AiRoomPanelWidgetRefExt,
 };
 #[cfg(unix)]
-use crate::a2app::ai_room_events::{AiReplyContent, AiReplyToolCall};
+use crate::a2app::ai_room_events::{
+    AI_ACTIVITY_EVENT_TYPE, AI_TOOL_CALL_EVENT_TYPE, AiActivityContent, AiActivityKind,
+    AiReplyContent, AiReplyToolCall, AiToolCallContent, AiToolCallStatus,
+};
 #[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
@@ -153,6 +156,18 @@ pub struct GenConsole {
     pub last_render: Option<Instant>,
 }
 
+/// One agent tool call whose `Started` `ai_tool_call` state row is still
+/// waiting for its outcome, so the row can be rewritten `Done` (see
+/// [`AiRoomInfo::active_tool_calls`]).
+#[cfg(unix)]
+struct ActiveToolCall {
+    /// The tool name the agent called; an outcome matches by it.
+    name: String,
+    /// The state key of the posted `Started` row — the `Done` update rewrites
+    /// that same row instead of appending a new one.
+    key: String,
+}
+
 /// An AI room's marker/forwarding state, tracked once the room is opened.
 #[cfg(unix)]
 pub struct AiRoomInfo {
@@ -179,6 +194,13 @@ pub struct AiRoomInfo {
     /// ride on the turn's one `ai_reply` card as a receipt. Cleared when the
     /// card is posted or the turn errors out.
     pending_tool_calls: Vec<AiReplyToolCall>,
+    /// Tool calls the agent started whose `ai_tool_call` state rows are
+    /// still `Started`, oldest first, waiting for their outcome so the row
+    /// can be rewritten `Done`. An outcome matches the oldest still-running
+    /// row with the same tool name; rows left running at the turn's end are
+    /// dropped with the receipt list (their `Started` row stays in the
+    /// timeline as history).
+    active_tool_calls: Vec<ActiveToolCall>,
     /// What the room's busy/queued status row last showed. Compared against
     /// the live session each event pass, so the row redraws only when its
     /// state actually changes (and hides once the agent goes idle).
@@ -1854,6 +1876,16 @@ fn queue_permission_prompt(
     show_next_permission_prompt(cx, ui);
 }
 
+/// The tool name an AI session job maps to (the name the model called).
+#[cfg(unix)]
+fn ai_job_tool_name(job: &SessionJob) -> &'static str {
+    match job {
+        SessionJob::ReadTool { kind, .. } => read_tool_name(kind),
+        SessionJob::LaunchSplashApp { .. } => "launch_splash_app",
+        SessionJob::SendRoomMessage { .. } => "send_message",
+    }
+}
+
 /// Refuses one parked request outright (a "Not Now" dismissal): a mini-app
 /// bridge request is declined through the broker exactly as a stored Deny
 /// would be; an AI tool call is answered with an error the model can read and
@@ -1869,11 +1901,11 @@ fn refuse_parked_request(cx: &mut Cx, perm: Permission, parked: ParkedRequest) {
         #[cfg(unix)]
         ParkedRequest::AiTool { room_id, job } => {
             // The prompt was dismissed, not answered: the tool call is refused
-            // (with a receipt, so the user sees the AI was stopped from it).
-            if let SessionJob::ReadTool { kind, .. } = &job {
-                note_ai_tool_call(&room_id, read_tool_name(kind), false, &ai_tool_refused_text(perm));
-            }
-            answer_session_job(job, Err(ai_tool_refused_text(perm)));
+            // (with a receipt, so the user sees the AI was stopped from it —
+            // and its live tool row rewritten Done).
+            let reason = ai_tool_refused_text(perm);
+            note_ai_tool_call(&room_id, ai_job_tool_name(&job), false, &reason);
+            answer_session_job(job, Err(reason));
         }
     }
 }
@@ -2133,11 +2165,11 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
                     execute_session_job(cx, ui, &room_id, job);
                 } else {
                     // Denied: the call is refused with a receipt naming it, so
-                    // the turn's card shows the AI was stopped from doing it.
-                    if let SessionJob::ReadTool { kind, .. } = &job {
-                        note_ai_tool_call(&room_id, read_tool_name(kind), false, &ai_tool_refused_text(perm));
-                    }
-                    answer_session_job(job, Err(ai_tool_refused_text(perm)));
+                    // the turn's card shows the AI was stopped from doing it
+                    // (and its live tool row is rewritten Done).
+                    let reason = ai_tool_refused_text(perm);
+                    note_ai_tool_call(&room_id, ai_job_tool_name(&job), false, &reason);
+                    answer_session_job(job, Err(reason));
                 }
             }
         }
@@ -2414,7 +2446,7 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
                 state
                     .ai_rooms
                     .entry(room_id)
-                    .or_insert(AiRoomInfo { cursor: None, posted_by_tool_this_turn: false, read_burst: 0, read_window_started: None, session_on: true, pending_tool_calls: Vec::new(), status_busy: false, status_queued: 0 });
+                    .or_insert(AiRoomInfo { cursor: None, posted_by_tool_this_turn: false, read_burst: 0, read_window_started: None, session_on: true, pending_tool_calls: Vec::new(), active_tool_calls: Vec::new(), status_busy: false, status_queued: 0 });
             });
         }
         AiRoomAction::CreateFailed { error } => {
@@ -2435,7 +2467,7 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
         AiRoomAction::Attached { room_id, name, cursor } => {
             log!("AI Rooms: room {room_id} is an AI room (name: {name:?}, saved forwarding cursor: {cursor:?}); attaching session.");
             with_a2app(|state| {
-                state.ai_rooms.insert(room_id.clone(), AiRoomInfo { cursor, posted_by_tool_this_turn: false, read_burst: 0, read_window_started: None, session_on: true, pending_tool_calls: Vec::new(), status_busy: false, status_queued: 0 });
+                state.ai_rooms.insert(room_id.clone(), AiRoomInfo { cursor, posted_by_tool_this_turn: false, read_burst: 0, read_window_started: None, session_on: true, pending_tool_calls: Vec::new(), active_tool_calls: Vec::new(), status_busy: false, status_queued: 0 });
             });
             attach_ai_session(cx, ui, &room_id, name);
         }
@@ -2475,6 +2507,12 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
                         e
                     ),
                 }
+                // Every outcome rewrites the call's live `ai_tool_call` row
+                // to `Done`; a granted read's outcome also rides on the
+                // turn's receipt chip. Ungated memory reads (recalling its
+                // own past turns) are room plumbing, not something the user
+                // watches for, so they leave no chip — only their row.
+                finish_ai_tool_call(&room_id, read_tool_name(&kind), ok, &summary);
                 if !matches!(kind, ReadToolKind::Memory { .. }) {
                     note_ai_tool_call(&room_id, read_tool_name(&kind), ok, &summary);
                 }
@@ -2960,6 +2998,20 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
             for update in updates {
                 match update {
                     SessionUpdate::Ready => log!("AI Rooms: room {room_id}'s agent session is ready."),
+                    SessionUpdate::Thinking => {
+                        // First reasoning chunk of a turn: the chat gets a
+                        // "thinking…" row so a long quiet stretch reads as
+                        // the model working, not silence.
+                        log!("AI Rooms: room {room_id}'s agent started thinking.");
+                        post_ai_activity(&room_id, AiActivityKind::Thinking, None);
+                    }
+                    SessionUpdate::ToolCallStarted { name } => {
+                        // Every tool call becomes its own `ai_tool_call`
+                        // state row immediately, so the room sees the agent
+                        // pick the tool while it is still running it.
+                        log!("AI Rooms: room {room_id}'s agent started tool {name}.");
+                        on_ai_tool_call_started(&room_id, &name);
+                    }
                     SessionUpdate::Reply { text } => {
                         log!("AI Rooms: room {room_id}'s agent finished a turn ({} chars).", text.len());
                         // A turn whose `send_message` tool already posted to
@@ -2979,22 +3031,35 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
                         } else {
                             to_post.push((room_id.clone(), text))
                         }
+                        // Turn over: tool rows that never resolved (their
+                        // outcome never landed) stay as `Started` history —
+                        // the reply's receipt chips still tell the outcome.
+                        with_a2app(|state| {
+                            if let Some(info) = state.ai_rooms.get_mut(&room_id) {
+                                info.active_tool_calls.clear();
+                            }
+                        });
                     }
                     SessionUpdate::Error(msg) => {
                         // The turn is over without a reply; clear the tool-post
-                        // flag (and this turn's receipts) so the next turn's
-                        // reply is not wrongly dropped or attributed.
+                        // flag (and this turn's receipts + running tool rows)
+                        // so the next turn's reply is not wrongly dropped or
+                        // attributed, and post an error row into the chat so
+                        // the failure is part of the room's transcript.
                         with_a2app(|state| {
                             if let Some(info) = state.ai_rooms.get_mut(&room_id) {
                                 info.posted_by_tool_this_turn = false;
                                 info.pending_tool_calls.clear();
+                                info.active_tool_calls.clear();
                             }
                         });
                         log!("AI Rooms: room {room_id}'s agent session reported an error: {msg}");
+                        post_ai_activity(&room_id, AiActivityKind::Error, Some(&msg));
                         errors.push(msg)
                     }
                     SessionUpdate::Gone(msg) => {
                         log!("AI Rooms: room {room_id}'s agent session is GONE: {msg}");
+                        post_ai_activity(&room_id, AiActivityKind::Stopped, Some(&msg));
                         deaths.push((room_id.clone(), msg))
                     }
                 }
@@ -3324,6 +3389,9 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
                     info.posted_by_tool_this_turn = true;
                 }
             });
+            // The call's state row finishes when its message is posted; the
+            // receipt chip rides the same `ai_reply` card below.
+            note_ai_tool_call(room_id, "send_message", true, "");
             post_ai_reply(room_id, text);
             let _ = answer.send(Ok(String::from("Posted to the room.")));
         }
@@ -3384,13 +3452,28 @@ fn resolve_session_generation(
     ui.redraw(cx);
 }
 
+/// Milliseconds since the UNIX epoch, for the `createdAt` fields of the
+/// AI-session state rows.
+#[cfg(unix)]
+fn ai_now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Records one tool call outcome on the room's pending receipt list, shown on
 /// the turn's `ai_reply` card. Refusals and failures are exactly what a
 /// receipt exists for, so the summary is kept short; a granted read that
 /// succeeded leaves an empty summary.
+///
+/// The outcome also rewrites the call's `ai_tool_call` state row from
+/// `Started` to `Done` (matching the oldest still-running row with this tool
+/// name), so the room's live tool log shows each call finishing.
 #[cfg(unix)]
 fn note_ai_tool_call(room_id: &OwnedRoomId, name: &str, ok: bool, summary: &str) {
     let summary: String = summary.chars().take(48).collect();
+    finish_ai_tool_call(room_id, name, ok, &summary);
     with_a2app(|state| {
         if let Some(info) = state.ai_rooms.get_mut(room_id) {
             info.pending_tool_calls.push(AiReplyToolCall {
@@ -3400,6 +3483,111 @@ fn note_ai_tool_call(room_id: &OwnedRoomId, name: &str, ok: bool, summary: &str)
             });
         }
     });
+}
+
+/// Rewrites the tool's `ai_tool_call` state row from `Started` to `Done`
+/// with its outcome — the live half of [`note_ai_tool_call`], separated so a
+/// call that should leave no receipt chip (ungated `read_room_memory`) can
+/// still finish its row. Matches the oldest still-running row with this tool
+/// name; rows with no match (their `Started` event hasn't drained yet, or
+/// never will) are left as `Started` history.
+#[cfg(unix)]
+fn finish_ai_tool_call(room_id: &OwnedRoomId, name: &str, ok: bool, summary: &str) {
+    // Take the matching row's key OUT of the borrow: the state-event post
+    // below must run after `with_a2app` releases its guard.
+    let finished_key = with_a2app(|state| {
+        state.ai_rooms.get_mut(room_id).and_then(|info| {
+            let pos = info.active_tool_calls.iter().position(|c| c.name == name);
+            pos.map(|p| info.active_tool_calls.remove(p).key)
+        })
+    })
+    .flatten();
+    if let Some(key) = finished_key {
+        post_ai_tool_call_done(room_id, name, &key, ok, summary);
+    }
+}
+
+/// Posts one `ai_activity` state row with a fresh key — an append-only
+/// marker in the room's transcript that the agent is doing something visible
+/// (thinking started, a turn error, the session stopping).
+#[cfg(unix)]
+fn post_ai_activity(room_id: &OwnedRoomId, kind: AiActivityKind, label: Option<&str>) {
+    let content = AiActivityContent {
+        v: 1,
+        kind,
+        label: label.map(str::to_string),
+        created_at: ai_now_millis(),
+    };
+    post_ai_state_event(room_id, AI_ACTIVITY_EVENT_TYPE, &next_ai_state_key("activity"), &content);
+}
+
+/// Posts one `ai_tool_call` row in its `Started` state (fresh key) and
+/// records the row so its outcome can rewrite it `Done`.
+#[cfg(unix)]
+fn on_ai_tool_call_started(room_id: &OwnedRoomId, name: &str) {
+    let key = next_ai_state_key("tool");
+    with_a2app(|state| {
+        if let Some(info) = state.ai_rooms.get_mut(room_id) {
+            info.active_tool_calls.push(ActiveToolCall {
+                name: name.to_string(),
+                key: key.clone(),
+            });
+        }
+    });
+    let content = AiToolCallContent {
+        v: 1,
+        name: name.to_string(),
+        status: AiToolCallStatus::Started,
+        ok: false,
+        summary: String::new(),
+        created_at: ai_now_millis(),
+    };
+    post_ai_state_event(room_id, AI_TOOL_CALL_EVENT_TYPE, &key, &content);
+}
+
+/// Rewrites one `ai_tool_call` row (its `Started` key) as `Done`, carrying
+/// the call's outcome for the chat to render.
+#[cfg(unix)]
+fn post_ai_tool_call_done(
+    room_id: &OwnedRoomId,
+    name: &str,
+    key: &str,
+    ok: bool,
+    summary: &str,
+) {
+    let content = AiToolCallContent {
+        v: 1,
+        name: name.to_string(),
+        status: AiToolCallStatus::Done,
+        ok,
+        summary: summary.to_string(),
+        created_at: ai_now_millis(),
+    };
+    post_ai_state_event(room_id, AI_TOOL_CALL_EVENT_TYPE, key, &content);
+}
+
+/// Serializes one AI-session activity/tool-call row and hands it to the
+/// async worker as a [`AiRoomRequest::PostAiStateEvent`]. Best-effort: the
+/// worker logs failures and the turn continues (the reply's receipts are the
+/// durable record).
+#[cfg(unix)]
+fn post_ai_state_event(
+    room_id: &OwnedRoomId,
+    event_type: &str,
+    state_key: &str,
+    content: &impl serde::Serialize,
+) {
+    match serde_json::to_value(content) {
+        Ok(json) => {
+            submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::PostAiStateEvent {
+                room_id: room_id.clone(),
+                event_type: event_type.to_string(),
+                state_key: state_key.to_string(),
+                content: json,
+            }));
+        }
+        Err(e) => log!("AI Rooms: couldn't serialize an {event_type} state row: {e}"),
+    }
 }
 
 /// Writes `text` as an `ai_reply` state event — the agent's only output
