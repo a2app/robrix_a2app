@@ -7,7 +7,7 @@
 //! state in `<data_root>/permissions.json`, deliberately outside every app's
 //! own storage jail.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -429,6 +429,17 @@ pub struct PermissionStore {
     /// switch-gated write is refused without a prompt until the user turns it on.
     #[serde(default)]
     matrix_write: bool,
+    /// Per-subject allowlists of rooms the subject may post messages into as
+    /// the user (the AI-room agent's per-room grants for
+    /// `matrix.rooms.message.send`). Keyed by subject (an app id or an agent
+    /// key, see [`agent_subject`]) then room id. A room grant is specific to
+    /// that room: it is what lets one target room be allowed without
+    /// unlocking every room, the way a group grant would. The group grant
+    /// still answers first — a group `Denied` kills the capability entirely
+    /// — but a group `Granted` alone does NOT allow a room; the room must be
+    /// listed here too.
+    #[serde(default)]
+    send_rooms: BTreeMap<String, BTreeSet<String>>,
     /// Apps the host stopped for abusing the bridge, and why. Persisted
     /// deliberately: an app that hammered its way to a stop must not get a
     /// clean slate by being restarted, or the escalation means nothing.
@@ -515,6 +526,39 @@ impl PermissionStore {
 
     pub fn set_matrix_write(&mut self, on: bool) {
         self.matrix_write = on;
+    }
+
+    /// Whether `subject` may post messages into `room` as the user — one
+    /// room at a time (see `send_rooms`). A room is allowed only when the
+    /// user explicitly allowed THAT room; group grants do not unlock rooms.
+    pub fn is_room_send_allowed(&self, subject: &str, room: &str) -> bool {
+        self.send_rooms
+            .get(subject)
+            .is_some_and(|rooms| rooms.contains(room))
+    }
+
+    /// Records that `subject` may post messages into `room` (durable, like
+    /// the group grants). A no-op when already allowed.
+    pub fn allow_room_send(&mut self, subject: &str, room: &str) {
+        self.send_rooms
+            .entry(subject.to_string())
+            .or_default()
+            .insert(room.to_string());
+    }
+
+    /// Removes `subject`'s per-room grant for `room`, if any.
+    pub fn disallow_room_send(&mut self, subject: &str, room: &str) {
+        if let Some(rooms) = self.send_rooms.get_mut(subject) {
+            rooms.remove(room);
+        }
+    }
+
+    /// All rooms `subject` may post into (for a per-room management UI).
+    pub fn room_send_grants(&self, subject: &str) -> Vec<String> {
+        self.send_rooms
+            .get(subject)
+            .map(|rooms| rooms.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Grants a capability until `until_unix` (the sheet's "Allow for 1 hour").
@@ -1008,6 +1052,32 @@ mod tests {
         let caps = store.granted_caps(&m);
         assert!(caps.iter().any(|c| c == "network"));
         assert!(!caps.iter().any(|c| c == "open-url" || c == "device.url.open"));
+    }
+
+    #[test]
+    fn room_send_grants_are_per_room_and_independent_of_group_grants() {
+        let mut store = PermissionStore::default();
+        let subject = "ai-room:!a:example.org";
+        // Nothing allowed until a room is explicitly granted.
+        assert!(!store.is_room_send_allowed(subject, "!x:example.org"));
+        assert!(store.room_send_grants(subject).is_empty());
+        // A group grant alone must NOT unlock any room (per-room semantics).
+        store.set(subject, Permission::MatrixRoomsSend, GrantState::Granted);
+        assert!(!store.is_room_send_allowed(subject, "!x:example.org"));
+        // Granting one room covers exactly that room.
+        store.allow_room_send(subject, "!x:example.org");
+        assert!(store.is_room_send_allowed(subject, "!x:example.org"));
+        assert!(!store.is_room_send_allowed(subject, "!y:example.org"));
+        assert_eq!(store.room_send_grants(subject), vec!["!x:example.org".to_string()]);
+        // Subjects are namespaced: another agent's grants don't leak.
+        let other = "ai-room:!b:example.org";
+        assert!(!store.is_room_send_allowed(other, "!x:example.org"));
+        store.allow_room_send(other, "!y:example.org");
+        assert!(store.is_room_send_allowed(other, "!y:example.org"));
+        assert!(!store.is_room_send_allowed(subject, "!y:example.org"));
+        // Revoke.
+        store.disallow_room_send(subject, "!x:example.org");
+        assert!(!store.is_room_send_allowed(subject, "!x:example.org"));
     }
 
     #[test]

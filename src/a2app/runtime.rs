@@ -95,6 +95,11 @@ static NEXT_AI_TOOL_ID: AtomicU64 = AtomicU64::new(1);
 /// can name it when the result lands) and the channel answering the tool call.
 #[cfg(unix)]
 type AiReadPending = (OwnedRoomId, ReadToolKind, Sender<Result<String, String>>);
+/// What one in-flight cross-room post is waiting on (see `AiRoomInfo`'s
+/// sibling `ai_posts` map): the session room (for the receipt) and the
+/// channel that must answer the parked tool call when the async worker's
+/// [`AiRoomAction::PostToRoomResult`] lands.
+type AiPostPending = (OwnedRoomId, Sender<Result<String, String>>);
 
 thread_local! {
     static A2APP: RefCell<Option<A2AppState>> = const { RefCell::new(None) };
@@ -264,6 +269,12 @@ pub struct A2AppState {
     /// lands (the tool is kept so the receipt chip can name it).
     #[cfg(unix)]
     pub ai_reads: HashMap<u64, AiReadPending>,
+    /// Cross-room `post_room_message` posts in flight, keyed by request id:
+    /// the session room they belong to (for the receipt) plus the channel
+    /// that must answer the waiting tool call when the async worker's
+    /// [`AiRoomAction::PostToRoomResult`] lands.
+    #[cfg(unix)]
+    pub ai_posts: HashMap<u64, AiPostPending>,
     perms_dirty: bool,
     registry_dirty: bool,
     last_persist: Instant,
@@ -342,6 +353,8 @@ pub fn init() {
             ai_generation_room: None,
             #[cfg(unix)]
             ai_reads: HashMap::new(),
+            #[cfg(unix)]
+            ai_posts: HashMap::new(),
             perms_dirty: false,
             registry_dirty: false,
             last_persist: Instant::now(),
@@ -1883,6 +1896,7 @@ fn ai_job_tool_name(job: &SessionJob) -> &'static str {
         SessionJob::ReadTool { kind, .. } => read_tool_name(kind),
         SessionJob::LaunchSplashApp { .. } => "launch_splash_app",
         SessionJob::SendRoomMessage { .. } => "send_message",
+        SessionJob::PostRoomMessage { .. } => "post_room_message",
     }
 }
 
@@ -1956,6 +1970,12 @@ fn ai_prompt_action(
                     ReadToolKind::Memory { .. } => String::from("recall its own past replies"),
                 },
                 SessionJob::LaunchSplashApp { .. } => String::from("build and run a mini-app"),
+                SessionJob::PostRoomMessage { room_id: room, .. } => {
+                    let name = rooms
+                        .and_then(|r| room_display_name(r, room.as_str()))
+                        .unwrap_or_else(|| room.clone());
+                    format!("post a message into “{name}”")
+                }
                 SessionJob::SendRoomMessage { .. } => continue,
             };
         }
@@ -1996,6 +2016,12 @@ fn ai_prompt_reason(
                     ReadToolKind::Memory { .. } => String::from("It is recalling what it previously said in this room."),
                 },
                 SessionJob::LaunchSplashApp { .. } => String::from("It is building an app you asked for."),
+                SessionJob::PostRoomMessage { room_id: room, .. } => {
+                    let name = rooms
+                        .and_then(|r| room_display_name(r, room.as_str()))
+                        .unwrap_or_else(|| room.clone());
+                    format!("It wants to post a message into “{name}”, outside this room. It can only post there if you allow this room.")
+                }
                 SessionJob::SendRoomMessage { .. } => continue,
             };
         }
@@ -2066,7 +2092,8 @@ fn answer_session_job(job: SessionJob, result: Result<String, String>) {
     match job {
         SessionJob::LaunchSplashApp { answer, .. }
         | SessionJob::SendRoomMessage { answer, .. }
-        | SessionJob::ReadTool { answer, .. } => {
+        | SessionJob::ReadTool { answer, .. }
+        | SessionJob::PostRoomMessage { answer, .. } => {
             let _ = answer.send(result);
         }
     }
@@ -2160,13 +2187,31 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
             #[cfg(unix)]
             ParkedRequest::AiTool { room_id, job } => {
                 if granted {
+                    // Per-room grants for cross-room posts: an Allow unlocks
+                    // exactly the target room, so record it before re-running
+                    // the job (its gate now lets it through).
+                    if let SessionJob::PostRoomMessage { room_id: target, .. } = &job {
+                        with_a2app(|state| {
+                            state.permissions.allow_room_send(&subject, target);
+                            state.perms_dirty = true;
+                        });
+                    }
                     // The grant is stored above; re-run the session job so its
                     // own gate now lets it through to the real work.
                     execute_session_job(cx, ui, &room_id, job);
                 } else {
                     // Denied: the call is refused with a receipt naming it, so
                     // the turn's card shows the AI was stopped from doing it
-                    // (and its live tool row is rewritten Done).
+                    // (and its live tool row is rewritten Done). A cross-room
+                    // post is denied PER ROOM: reset the group to Ask so one
+                    // room's refusal does not silently block every other room
+                    // the agent might name later.
+                    if matches!(job, SessionJob::PostRoomMessage { .. }) {
+                        with_a2app(|state| {
+                            state.permissions.set(&subject, perm, GrantState::Ask);
+                            state.perms_dirty = true;
+                        });
+                    }
                     let reason = ai_tool_refused_text(perm);
                     note_ai_tool_call(&room_id, ai_job_tool_name(&job), false, &reason);
                     answer_session_job(job, Err(reason));
@@ -2477,6 +2522,22 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
                 format!("Couldn't post the AI agent's reply: {error}"),
                 PopupKind::Error, Some(6.0),
             );
+        }
+        AiRoomAction::PostToRoomResult { id, result } => {
+            // A cross-room post finished on the worker; answer the tool call
+            // that has been waiting on it and record the receipt (and the
+            // call's live state row) with its outcome. The sender is gone if
+            // the session ended meanwhile — a send failure is the cleanup.
+            if let Some((session_room, answer)) =
+                with_a2app(|state| state.ai_posts.remove(&id)).flatten()
+            {
+                let (summary, ok) = match &result {
+                    Ok(msg) => (msg.clone(), true),
+                    Err(e) => (e.clone(), false),
+                };
+                note_ai_tool_call(&session_room, "post_room_message", ok, &summary);
+                let _ = answer.send(result);
+            }
         }
         AiRoomAction::ToolReadResult { id, result } => {
             // A read finished on the worker; answer the tool call that has
@@ -3271,6 +3332,124 @@ fn run_ai_read_tool(
     }
 }
 
+/// Executes the `post_room_message` tool for a session: posts the agent's
+/// text into ANOTHER joined room as an `ai_reply` state-event card, gated PER
+/// ROOM. Unlike a group-granted read, an allowance covers exactly the target
+/// room: the user is asked the first time this agent posts into each room it
+/// names, and the room joins the subject's send allowlist on Allow. A group
+/// `Denied` on `matrix.rooms.message.send` is the kill switch; a group
+/// `Granted` alone never unlocks a room.
+#[cfg(unix)]
+fn run_ai_room_post(
+    cx: &mut Cx,
+    ui: &WidgetRef,
+    session_room: &OwnedRoomId,
+    target: String,
+    text: String,
+    answer: Sender<Result<String, String>>,
+) {
+    // The tool validated text already; refuse a room that cannot be posted
+    // into as a malformed call.
+    let Ok(target_room) = OwnedRoomId::try_from(target.as_str()) else {
+        let err = format!("`{target}` is not a valid matrix room id");
+        note_ai_tool_call(session_room, "post_room_message", false, &err);
+        let _ = answer.send(Err(err));
+        return;
+    };
+    let Some(cap) = a2app_core::capabilities::by_id("matrix.rooms.message.send") else {
+        let _ = answer.send(Err("posting into other rooms is no longer offered".to_string()));
+        return;
+    };
+    let Some(group) = cap.group else {
+        let _ = answer.send(Err("posting into other rooms is no longer offered".to_string()));
+        return;
+    };
+    let subject = agent_subject(session_room.as_str());
+    // The per-room decision lives in the store: a durable group Denied is the
+    // kill switch; otherwise the allowlist decides room by room.
+    let verdict = with_a2app(|state| {
+        let store = &state.permissions;
+        if store.state(&subject, group) == GrantState::Denied {
+            Some(false)
+        } else if store.is_room_send_allowed(&subject, &target) {
+            Some(true)
+        } else {
+            None
+        }
+    })
+    .flatten();
+    let job = SessionJob::PostRoomMessage {
+        room_id: target,
+        text,
+        answer,
+    };
+    match verdict {
+        Some(true) => {
+            // Allowed for this room: record the group use and post on the
+            // async worker (the tool call waits, answered when the write
+            // lands).
+            with_a2app(|state| {
+                state.permissions.record_access(&subject, group, versions::now_unix());
+                state.perms_dirty = true;
+            });
+            post_ai_room_message(session_room, &target_room, job);
+        }
+        Some(false) => {
+            let text = ai_tool_refused_text(group);
+            note_ai_tool_call(session_room, "post_room_message", false, &text);
+            answer_session_job(job, Err(text));
+        }
+        None => {
+            // First time into this room: park the call behind the prompt.
+            // The room's name shows on the prompt (see `ai_prompt_action` /
+            // `ai_prompt_reason`); an Allow grants exactly this room.
+            queue_permission_prompt(
+                cx,
+                ui,
+                subject,
+                group,
+                ParkedRequest::AiTool {
+                    room_id: session_room.clone(),
+                    job,
+                },
+            );
+        }
+    }
+}
+
+/// Parks a granted cross-room post on the worker and remembers the call so
+/// [`AiRoomAction::PostToRoomResult`] can answer it (mirrors the granted read
+/// path).
+#[cfg(unix)]
+fn post_ai_room_message(
+    session_room: &OwnedRoomId,
+    target: &OwnedRoomId,
+    job: SessionJob,
+) {
+    let SessionJob::PostRoomMessage { room_id, text, answer } = job else { return };
+    let id = NEXT_AI_TOOL_ID.fetch_add(1, Ordering::Relaxed);
+    with_a2app(|state| {
+        state.ai_posts.insert(id, (session_room.clone(), answer));
+    });
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::PostToRoom {
+        id,
+        target: OwnedRoomId::try_from(room_id).unwrap_or_else(|_| target.clone()),
+        content: AiReplyContent {
+            v: 1,
+            text: text.clone(),
+            formatted: crate::a2app::ai_room_events::agent_reply_formatted_html(&text),
+            tool_calls: Vec::new(),
+            model: None,
+            created_at,
+            in_reply_to: None,
+        },
+    }));
+}
+
 /// Executes the `launch_splash_app` tool for a session: first gated against
 /// the room's subject like any other capability (`apps.generate`), then — if
 /// granted — run through the same generation machinery the Mini Apps screen
@@ -3394,6 +3573,9 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
             note_ai_tool_call(room_id, "send_message", true, "");
             post_ai_reply(room_id, text);
             let _ = answer.send(Ok(String::from("Posted to the room.")));
+        }
+        SessionJob::PostRoomMessage { room_id: target, text, answer } => {
+            run_ai_room_post(cx, ui, room_id, target, text, answer);
         }
         SessionJob::LaunchSplashApp { description, answer } => {
             run_ai_generation(cx, ui, room_id, description, answer);

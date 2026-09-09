@@ -73,6 +73,14 @@ pub enum AiRoomRequest {
     /// Writes one agent turn (a completed reply, or a `send_message` tool
     /// call) as an `ai_reply` state event.
     PostReply { room_id: OwnedRoomId, content: AiReplyContent },
+    /// Writes one agent turn as an `ai_reply` state event into ANOTHER
+    /// joined room (the `post_room_message` tool). Answers the parked tool
+    /// call through [`AiRoomAction::PostToRoomResult`] once the write lands.
+    PostToRoom {
+        id: u64,
+        target: OwnedRoomId,
+        content: AiReplyContent,
+    },
     /// Writes one raw AI-session activity state event (an `ai_activity`
     /// marker or an `ai_tool_call` row). The caller supplies the state key:
     /// a fresh key (see [`next_ai_state_key`]) appends a new row to the
@@ -108,6 +116,9 @@ pub enum AiRoomAction {
     /// An `ai_reply` failed to post; the turn's text is otherwise lost, same
     /// as any other failed send.
     PostReplyFailed { error: String },
+    /// A granted [`AiRoomRequest::PostToRoom`] finished; `result` is the text
+    /// (or the error) the waiting tool call must be answered with.
+    PostToRoomResult { id: u64, result: Result<String, String> },
     /// A granted [`AiRoomRequest::ToolRead`] finished; `result` is the JSON
     /// text (or the error) the waiting tool call must be answered with.
     ToolReadResult { id: u64, result: Result<String, String> },
@@ -164,6 +175,26 @@ pub async fn handle_ai_room_request(request: AiRoomRequest) {
             if let Err(e) = post_reply(&room, &content).await {
                 log!("AI Rooms worker: FAILED to post ai_reply to {room_id}: {e}");
                 Cx::post_action(AiRoomAction::PostReplyFailed { error: e });
+            }
+        }
+        AiRoomRequest::PostToRoom { id, target, content } => {
+            let Some(room) = get_client().and_then(|c| c.get_room(&target)) else {
+                let msg = format!("room {target} not found in client (are you still joined?)");
+                log!("AI Rooms worker: can't post ai_reply to {target}: {msg}");
+                Cx::post_action(AiRoomAction::PostToRoomResult { id, result: Err(msg) });
+                return;
+            };
+            match post_reply(&room, &content).await {
+                Ok(_) => {
+                    Cx::post_action(AiRoomAction::PostToRoomResult {
+                        id,
+                        result: Ok(String::from("Posted to the room as an AI card.")),
+                    });
+                }
+                Err(e) => {
+                    log!("AI Rooms worker: FAILED to post ai_reply to {target}: {e}");
+                    Cx::post_action(AiRoomAction::PostToRoomResult { id, result: Err(e) });
+                }
             }
         }
         AiRoomRequest::PostAiStateEvent { room_id, event_type, state_key, content } => {
