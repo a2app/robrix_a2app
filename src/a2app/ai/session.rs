@@ -54,6 +54,16 @@ pub enum SessionJob {
     LaunchSplashApp { description: String, answer: Sender<Result<String, String>> },
     /// `send_message`: post plain text into the session's room.
     SendRoomMessage { text: String, answer: Sender<Result<String, String>> },
+    /// `post_room_message`: post text into ANOTHER joined room as an AI
+    /// state-event card. The runtime decides against the room's per-room
+    /// send allowlist whether this may run — prompting the user the first
+    /// time this agent posts into each target room — then posts on the
+    /// async worker and answers here when the write lands.
+    PostRoomMessage {
+        room_id: String,
+        text: String,
+        answer: Sender<Result<String, String>>,
+    },
     /// A capability-gated attached-room read (`read_room_messages`,
     /// `read_older_messages`, `room_info`). The runtime decides against the
     /// room's permission subject whether this tool may run — refusing or
@@ -92,6 +102,20 @@ impl AiHost for SessionHost {
         let (answer_tx, answer_rx) = channel();
         self.jobs
             .send(SessionJob::SendRoomMessage {
+                text: text.to_string(),
+                answer: answer_tx,
+            })
+            .map_err(|_| "this session's UI thread is gone".to_string())?;
+        answer_rx
+            .recv()
+            .map_err(|_| "this session ended before the message was posted".to_string())?
+    }
+
+    fn post_room_message(&self, room: &str, text: &str) -> Result<String, String> {
+        let (answer_tx, answer_rx) = channel();
+        self.jobs
+            .send(SessionJob::PostRoomMessage {
+                room_id: room.to_string(),
                 text: text.to_string(),
                 answer: answer_tx,
             })

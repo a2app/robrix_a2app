@@ -38,6 +38,11 @@ pub trait AiHost: Send + Sync {
     /// Posts `text` into the room associated with this session.
     fn send_room_message(&self, text: &str) -> Result<String, String>;
 
+    /// Posts `text` into ANOTHER joined room as an agent state-event card,
+    /// gated per room (the user is asked the first time this agent posts
+    /// into each room).
+    fn post_room_message(&self, room: &str, text: &str) -> Result<String, String>;
+
     /// One capability-gated attached-room read. The host hands it to the UI
     /// thread, where the runtime decides whether this session's room subject
     /// may exercise the mapped capability (prompting the user on first use)
@@ -116,9 +121,11 @@ pub const AI_ROOM_READ_CAP_IDS: &[&str] = &[
 ];
 
 /// Everything an AI session may do that sits in the mini-app capability
-/// catalog: the read tools above plus the generator (`launch_splash_app`).
-/// What the runtime's gate checks against, so every offered capability is
-/// declared — a profile list can only grow by editing this array.
+/// catalog: the read tools above, the generator (`launch_splash_app`), and
+/// posting into the user's other rooms (`post_room_message` — gated per
+/// room, see the runtime). What the runtime's gate checks against, so every
+/// offered capability is declared — a profile list can only grow by editing
+/// this array.
 pub const AI_ROOM_SESSION_CAP_IDS: &[&str] = &[
     "matrix.room.messages.read",
     "matrix.room.messages.paginate",
@@ -126,6 +133,7 @@ pub const AI_ROOM_SESSION_CAP_IDS: &[&str] = &[
     "matrix.rooms.messages.read",
     "matrix.rooms.list",
     "apps.generate",
+    "matrix.rooms.message.send",
 ];
 
 /// The MCP tool name for a read kind — what shows on the room's `ai_reply`
@@ -536,6 +544,81 @@ impl Tool for SendMessageTool {
     }
 }
 
+/// `post_room_message` — post an agent-authored message into another joined
+/// room as an AI state-event card.
+///
+/// The card is the same `ai_reply` state event the agent's own room shows
+/// (never `m.room.message`, so it can't loop back anywhere). Permission is
+/// granted PER ROOM: the user is asked the first time the agent posts into
+/// each room it names, and an allowance covers exactly that room.
+pub struct PostRoomMessageTool {
+    host: Arc<dyn AiHost>,
+}
+
+impl PostRoomMessageTool {
+    pub fn new(host: Arc<dyn AiHost>) -> Self {
+        Self { host }
+    }
+}
+
+impl Tool for PostRoomMessageTool {
+    fn name(&self) -> &str {
+        "post_room_message"
+    }
+
+    fn description(&self) -> &str {
+        "Posts a message to another of the user's joined rooms as an AI \
+         card, using the same formatting and linking as send_message \
+         (Markdown: **bold**, *italic*, lists; link a person with their \
+         full matrix id [Name](https://matrix.to/#/@user:server); link a \
+         specific message with its permalink \
+         [that message](https://matrix.to/#/!room:server/$event)). ALWAYS \
+         format your posts the same way you format replies here. Permission \
+         is per room — the first time you post into a room the user is \
+         asked, and the choice covers exactly that room. Use list_rooms to \
+         find the room id, read_other_room_messages to see what is being \
+         said there first, and post_room_message to answer or contribute. \
+         Do NOT use this for this room's chat — send_message is for here."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "room": {
+                    "type": "string",
+                    "description": "The matrix room id to post into, e.g. !abc:server.org (see list_rooms).",
+                },
+                "text": {
+                    "type": "string",
+                    "description": "The message text to post.",
+                },
+            },
+            "required": ["room", "text"],
+            "additionalProperties": false,
+        })
+    }
+
+    fn call(&self, arguments: &Map<String, Value>) -> Result<String, String> {
+        let room = arguments
+            .get("room")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .ok_or_else(|| "`post_room_message` needs a `room` id".to_string())?
+            .to_string();
+        let text = arguments
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "`post_room_message` needs a string `text`".to_string())?
+            .trim();
+        if text.is_empty() {
+            return Err("`text` must not be empty".to_string());
+        }
+        self.host.post_room_message(&room, text)
+    }
+}
+
 /// Builds a session's full tool set and registers it on `server`.
 ///
 /// This is the "add a tool" seam in one place: a new tool is a `Tool` impl
@@ -551,7 +634,8 @@ pub fn register_session_tools(server: &mut a2app_agent::mcp::McpServer, host: Ar
     server.add_tool(LaunchSplashAppTool::new(host.clone()));
     // Ungated native tools (the agent's own room plumbing).
     server.add_tool(ReadRoomMemoryTool::new(host.clone()));
-    server.add_tool(SendMessageTool::new(host));
+    server.add_tool(SendMessageTool::new(host.clone()));
+    server.add_tool(PostRoomMessageTool::new(host));
 }
 
 #[cfg(test)]
