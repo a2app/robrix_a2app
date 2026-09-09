@@ -6,38 +6,38 @@ use eyeball::Subscriber;
 use eyeball_im::VectorDiff;
 use futures_util::{future::{Abortable, join_all}, pin_mut, stream, StreamExt};
 use imbl::Vector;
-use makepad_widgets::{error, log, warning, Cx, SignalToUI, WidgetUid};
+use makepad_widgets::{error, image_cache::image_size_by_data, log, warning, Cx, SignalToUI, WidgetUid};
 use matrix_sdk_base::crypto::{DecryptionSettings, TrustRequirement};
 use matrix_sdk::{
     authentication::oauth::error::OAuthDiscoveryError, config::RequestConfig, encryption::{identities::Device, EncryptionSettings}, event_handler::EventHandlerDropGuard, media::MediaRequestParameters, room::{edit::EditedContent, reply::Reply, IncludeRelations, Receipts, RelationsOptions}, ruma::{
-        api::{Direction, client::{authenticated_media::get_media_preview, discovery::get_authorization_server_metadata::v1::{AccountManagementAction, AccountManagementActionData}, profile::{AvatarUrl, DisplayName}, receipt::create_receipt::v3::ReceiptType}}, events::{
+        api::{Direction, client::{authenticated_media::get_media_preview, discovery::get_authorization_server_metadata::v1::{AccountManagementAction, AccountManagementActionData}, profile::{AvatarUrl, DisplayName}, receipt::create_receipt::v3::ReceiptType}, error::{ErrorKind, RetryAfter}}, events::{
             receipt::{ReceiptThread, ReceiptType as ReceiptEventType},
             relation::RelationType,
             room::{
-                encrypted::Relation as EncryptedRelation, message::{RoomMessageEventContent, TextMessageEventContent}, power_levels::RoomPowerLevels, redaction::SyncRoomRedactionEvent, MediaSource
-            }, AnySyncMessageLikeEvent, AnySyncTimelineEvent, MessageLikeEventType, StateEventType
-        }, EventId, MatrixToUri, MatrixUri, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId, RoomOrAliasId, UserId, uint
-    }, sliding_sync::VersionBuilder, Client, ClientBuildError, OwnedServerName, Room, RoomDisplayName, RoomMemberships, RoomState, SessionChange, SuccessorRoom
+                encrypted::Relation as EncryptedRelation, message::{MessageType, Relation, RoomMessageEventContent, TextMessageEventContent}, power_levels::RoomPowerLevels, redaction::SyncRoomRedactionEvent, MediaSource
+            }, AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncTimelineEvent, MessageLikeEventType, StateEventType
+        }, EventId, MatrixToUri, MatrixUri, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomOrAliasId, TransactionId, UserId, uint
+    }, send_queue::{LocalEchoContent, RoomSendQueueUpdate, SendQueueUpdate}, sliding_sync::VersionBuilder, Client, ClientBuildError, OwnedServerName, Room, RoomDisplayName, RoomMemberships, RoomState, SessionChange, SuccessorRoom
 };
 #[cfg(not(target_os = "ios"))]
 use matrix_sdk::Error;
 use matrix_sdk_ui::{
-    RoomListService, Timeline, encryption_sync_service, room_list_service::{RoomListItem, RoomListLoadingState, SyncIndicator, filters}, sync_service::{self, SyncService}, timeline::{LatestEventValue, RoomExt, TimelineEventItemId, TimelineFocus, TimelineItem, TimelineReadReceiptTracking, TimelineDetails}
+    RoomListService, Timeline, encryption_sync_service, room_list_service::{RoomListItem, RoomListLoadingState, SyncIndicator, filters}, sync_service::{self, SyncService}, timeline::{AttachmentSource, EventSendState, LatestEventValue, RedactError, RoomExt, TimelineEventItemId, TimelineFocus, TimelineItem, TimelineReadReceiptTracking, TimelineDetails}
 };
 #[cfg(not(target_os = "ios"))]
 use robius_open::Uri;
 use ruma::{OwnedRoomAliasId, OwnedRoomOrAliasId, RoomId, events::tag::Tags};
 use tokio::{
     runtime::Handle,
-    sync::{broadcast, mpsc::{Sender, UnboundedReceiver, UnboundedSender}, watch, Notify, Semaphore}, task::JoinHandle, time::error::Elapsed,
+    sync::{broadcast, mpsc::{Sender, UnboundedReceiver, UnboundedSender}, watch, Notify, Semaphore}, task::JoinHandle, time::{Instant, error::Elapsed},
 };
 use url::Url;
-use std::{borrow::Cow, cmp::{max, min}, future::Future, hash::{BuildHasherDefault, DefaultHasher}, iter::Peekable, ops::{Deref, DerefMut, Not}, path::{Path, PathBuf}, sync::{Arc, LazyLock, Mutex, atomic::{AtomicBool, Ordering}}, time::Duration};
+use std::{borrow::Cow, cmp::{max, min}, future::Future, hash::{BuildHasherDefault, DefaultHasher}, iter::Peekable, ops::{Deref, DerefMut, Not}, path::{Path, PathBuf}, sync::{Arc, LazyLock, Mutex, atomic::{AtomicBool, Ordering}}, time::{Duration, SystemTime}};
 use std::io;
 use hashbrown::{HashMap, HashSet};
 use crate::{
     app::AppStateAction, app_data_dir, cache_dir, avatar_cache::AvatarUpdate, event_preview::{BeforeText, TextPreview, text_preview_of_raw_timeline_event, text_preview_of_timeline_item}, home::{
-        add_room::KnockResultAction, invite_screen::{JoinRoomResultAction, LeaveRoomResultAction}, link_preview::LinkPreviewData, room_screen::{InviteResultAction, TimelineUpdate, index_of_event}, rooms_list::{self, InvitedRoomInfo, InviterInfo, JoinedRoomInfo, RoomsListUpdate, enqueue_rooms_list_update}, rooms_list_header::RoomsListHeaderAction, tombstone_footer::SuccessorRoomDetails
+        add_room::KnockResultAction, invite_screen::{JoinRoomResultAction, LeaveRoomResultAction}, link_preview::LinkPreviewData, room_screen::{InviteResultAction, TimelineUpdate, index_of_event}, rooms_list::{self, InvitedRoomInfo, InviterInfo, JoinedRoomInfo, LatestEventPreview, RoomsListUpdate, enqueue_rooms_list_update}, rooms_list_header::RoomsListHeaderAction, send_status_indicator::stringify_send_error, tombstone_footer::SuccessorRoomDetails
     }, login::login_screen::LoginAction, logout::{logout_confirm_modal::LogoutAction, logout_state_machine::{LogoutConfig, is_logout_in_progress, logout_with_state_machine}}, media_cache::{MediaCacheEntry, MediaCacheEntryRef}, persistence::{self, ClientSessionPersisted, load_app_state}, profile::{
         user_profile::UserProfile,
         user_profile_cache::{UserProfileUpdate, enqueue_user_profile_update},
@@ -360,6 +360,12 @@ pub enum AccountDataAction {
     AccountManagementUrlFetched(AccountManagementUrl),
 }
 
+/// An action broadcast when the account's list of blocked users changes.
+///
+/// Contains the new list, sorted by user ID.
+#[derive(Clone, Debug)]
+pub struct BlockedUsersUpdated(pub Vec<OwnedUserId>);
+
 /// Actions emitted in response to a [`MatrixRequest::OpenOrCreateDirectMessage`].
 #[derive(Debug)]
 pub enum DirectMessageRoomAction {
@@ -612,13 +618,12 @@ pub enum MatrixRequest {
         /// * If `true` (default is false), the link will include an action hint to join the room.
         join_on_click: bool,
     },
-    /// Request to ignore/block or unignore/unblock a user.
-    IgnoreUser {
+    /// Request to block or unblock a user.
+    #[doc(alias("ignore", "unignore"))]
+    BlockUser {
         user_id: OwnedUserId,
-        /// Whether to ignore (`true`) or unignore (`false`) the user.
-        ignore: bool,
-        /// The room that the user was (un)ignored in, so we can re-paginate it.
-        room_id: OwnedRoomId,
+        /// Whether to block (`true`) or unblock (`false`) the user.
+        block: bool,
     },
     /// Request to set or remove the avatar of the current user's account.
     SetAvatar {
@@ -763,6 +768,12 @@ pub enum MatrixRequest {
         timeline_kind: TimelineKind,
         timeline_event_id: TimelineEventItemId,
         reason: Option<String>,
+    },
+    /// Retries sending the given local echo of a message,
+    /// typically one that previously failed to send.
+    RetrySend {
+        timeline_kind: TimelineKind,
+        timeline_event_id: TimelineEventItemId,
     },
     /// Pin or unpin the given event in the given room.
     #[doc(alias("unpin"))]
@@ -950,7 +961,14 @@ async fn matrix_worker_task(
                     log!("Sending request to edit message {timeline_event_item_id:?} in {timeline_kind}...");
                     let result = timeline.edit(&timeline_event_item_id, edited_content).await;
                     match result {
-                        Ok(_) => log!("Successfully edited message {timeline_event_item_id:?} in {timeline_kind}."),
+                        Ok(_) => {
+                            log!("Successfully edited message {timeline_event_item_id:?} in {timeline_kind}.");
+                            // Re-enable the send queue after editing a message, since a prior failure
+                            // may have disabled the room's send queue.
+                            if matches!(timeline_event_item_id, TimelineEventItemId::TransactionId(_)) {
+                                timeline.room().send_queue().set_enabled(true);
+                            }
+                        }
                         Err(ref e) => error!("Error editing message {timeline_event_item_id:?} in {timeline_kind}: {e:?}"),
                     }
                     if sender.send(TimelineUpdate::MessageEdited {
@@ -1860,61 +1878,34 @@ async fn matrix_worker_task(
                 });
             }
 
-            MatrixRequest::IgnoreUser { ignore, user_id, room_id } => {
+            MatrixRequest::BlockUser { block, user_id } => {
                 let Some(client) = get_client() else { continue };
-                let _ignore_task = Handle::current().spawn(async move {
-                    log!("Sending request to {}ignore user: {user_id}...", if ignore { "" } else { "un" });
-                    let ignore_result = if ignore {
+                let _block_task = Handle::current().spawn(async move {
+                    log!("Sending request to {}block user: {user_id}...", if block { "" } else { "un" });
+                    let block_result = if block {
                         client.account().ignore_user(&user_id).await
                     } else {
                         client.account().unignore_user(&user_id).await
                     };
 
-                    if let Err(e) = ignore_result {
-                        error!("Failed to {}ignore user {user_id}: {e:?}", if ignore { "" } else { "un" });
+                    if let Err(e) = block_result {
+                        error!("Failed to {}block user {user_id}: {e:?}", if block { "" } else { "un" });
                         enqueue_popup_notification(
-                            format!("Couldn't {}ignore {user_id}. Error: {e}", if ignore { "" } else { "un" }),
+                            format!("Couldn't {}block {user_id}. Error: {e}", if block { "" } else { "un" }),
                             PopupKind::Error,
                             None,
                         );
                         return;
                     }
-                    log!("Successfully {}ignored user {user_id}.", if ignore { "" } else { "un" });
+                    log!("Successfully {}blocked user {user_id}.", if block { "" } else { "un" });
                     enqueue_popup_notification(
-                        format!("{} ignoring {user_id}.", if ignore { "Now" } else { "No longer" }),
+                        format!("{} blocking {user_id}.", if block { "Now" } else { "No longer" }),
                         PopupKind::Success,
                         Some(4.0),
                     );
-
-                    // We need to re-acquire the `RoomMember` object now that its state
-                    // has changed, i.e., the user has been (un)ignored.
-                    // We then need to send an update to replace the cached `RoomMember`
-                    // with the now-stale ignored state.
-                    if let Some(room) = client.get_room(&room_id) {
-                        if let Ok(Some(new_room_member)) = room.get_member(&user_id).await {
-                            log!("Enqueueing user profile update for user {user_id}, who is now {}ignored.",
-                                if new_room_member.is_ignored() { "" } else { "un" },
-                            );
-                            enqueue_user_profile_update(UserProfileUpdate::RoomMemberOnly {
-                                room_id: room_id.clone(),
-                                room_member: new_room_member,
-                            });
-                        }
-                    }
-
-                    // After successfully (un)ignoring a user, all timelines are fully cleared by the Matrix SDK.
-                    // Therefore, we need to re-fetch all timelines for all rooms,
-                    // and currently the only way to actually accomplish this is via pagination.
-                    // See: <https://github.com/matrix-org/matrix-rust-sdk/issues/1703#issuecomment-2250297923>
-                    //
-                    // Note that here we only proactively re-paginate the *current* room
-                    // (the one being viewed by the user when this ignore request was issued),
-                    // and all other rooms will be re-paginated in `handle_ignore_user_list_subscriber()`.`
-                    submit_async_request(MatrixRequest::PaginateTimeline {
-                        timeline_kind: TimelineKind::MainRoom { room_id },
-                        num_events: 50,
-                        direction: PaginationDirection::Backwards,
-                    });
+                    // Upon the next sync, the blocked user list will be updated, which will cause
+                    // the matrix SDK to clear each timeline, at which point the visible timelines
+                    // will re-paginate themselves.
                 });
             }
 
@@ -2093,8 +2084,7 @@ async fn matrix_worker_task(
                 #[cfg(feature = "tsp")]
                 sign_with_tsp,
             } => {
-                // TODO: use this timeline `_sender` once we support sending-message status/operations in the UI.
-                let Some((timeline, _sender)) = get_timeline_and_sender(&timeline_kind) else {
+                let Some((timeline, sender)) = get_timeline_and_sender(&timeline_kind) else {
                     log!("BUG: {timeline_kind} not found for send message request");
                     continue;
                 };
@@ -2127,6 +2117,8 @@ async fn matrix_worker_task(
                                                     PopupKind::Error,
                                                     None,
                                                 );
+                                                let _ = sender.send(TimelineUpdate::SendFailedBeforeBeingQueued { message, replied_to });
+                                                SignalToUI::set_ui_signal();
                                                 return;
                                             }
                                         }
@@ -2138,6 +2130,8 @@ async fn matrix_worker_task(
                                             PopupKind::Error,
                                             None,
                                         );
+                                        let _ = sender.send(TimelineUpdate::SendFailedBeforeBeingQueued { message, replied_to });
+                                        SignalToUI::set_ui_signal();
                                         return;
                                     }
                                 }
@@ -2146,37 +2140,32 @@ async fn matrix_worker_task(
                         }
                     };
 
-                    if let Some(replied_to_info) = replied_to {
-                        let reply_content = match timeline
-                            .room()
-                            .make_reply_event(message.into(), replied_to_info)
-                            .await
-                        {
-                            Ok(content) => content,
+                    let r_or_m = if replied_to.is_some() { "reply" } else { "message" };
+                    let content: AnyMessageLikeEventContent = if let Some(reply) = &replied_to {
+                        let reply = Reply {
+                            event_id: reply.event_id.clone(),
+                            enforce_thread: reply.enforce_thread,
+                            add_mentions: reply.add_mentions,
+                        };
+                        match timeline.room().make_reply_event(message.clone().into(), reply).await {
+                            Ok(content) => content.into(),
                             Err(_e) => {
                                 error!("Failed to build reply content to send to {timeline_kind}: {_e:?}");
-                                enqueue_popup_notification(
-                                    format!("Failed to send reply: {_e}"),
-                                    PopupKind::Error,
-                                    None,
-                                );
-                                return;
-                            }
-                        };
-                        match timeline.send(reply_content.into()).await {
-                            Ok(_send_handle) => log!("Sent reply message to {timeline_kind}."),
-                            Err(_e) => {
-                                error!("Failed to send reply message to {timeline_kind}: {_e:?}");
                                 enqueue_popup_notification(format!("Failed to send reply: {_e}"), PopupKind::Error, None);
+                                let _ = sender.send(TimelineUpdate::SendFailedBeforeBeingQueued { message, replied_to });
+                                SignalToUI::set_ui_signal();
+                                return;
                             }
                         }
                     } else {
-                        match timeline.send(message.into()).await {
-                            Ok(_send_handle) => log!("Sent message to {timeline_kind}."),
-                            Err(_e) => {
-                                error!("Failed to send message to {timeline_kind}: {_e:?}");
-                                enqueue_popup_notification(format!("Failed to send message: {_e}"), PopupKind::Error, None);
-                            }
+                        message.clone().into()
+                    };
+                    match timeline.send(content).await {
+                        Ok(_send_handle) => log!("Sent {r_or_m} to {timeline_kind}."),
+                        Err(_e) => {
+                            error!("Failed to send {r_or_m} to {timeline_kind}: {_e:?}");
+                            enqueue_popup_notification(format!("Failed to send {r_or_m}: {_e}"), PopupKind::Error, None);
+                            let _ = sender.send(TimelineUpdate::SendFailedBeforeBeingQueued { message, replied_to });
                         }
                     }
                     SignalToUI::set_ui_signal();
@@ -2204,16 +2193,13 @@ async fn matrix_worker_task(
                     let _ = sender.send(TimelineUpdate::FileUploadError {
                         upload_id,
                         error: "TSP-signed attachment uploads are not supported yet.".to_string(),
-                        upload,
-                        retryable: false,
+                        retryable_upload: None,
                     });
                     SignalToUI::set_ui_signal();
                     continue;
                 }
 
                 let sender_clone = sender.clone();
-                let progress_sender = sender.clone();
-                let monitor_timeline_kind = timeline_kind.clone();
                 let (abort_handle, abort_registration) = futures_util::future::AbortHandle::new_pair();
                 // Spawn a new async task to send the attachment.
                 let _send_attachment_task = Handle::current().spawn(async move {
@@ -2223,7 +2209,14 @@ async fn matrix_worker_task(
                     };
                     use matrix_sdk_ui::timeline::AttachmentConfig as TimelineAttachmentConfig;
 
-                    let upload_future = async move {
+                    // Create a new transaction ID for this so we can track it through the send queue.
+                    let txn_id = TransactionId::new();
+                    let queue_updates = timeline.room().send_queue().subscribe().await
+                        .map(|(_local_echoes, receiver)| receiver);
+
+                    // WE allow the upload to be cancelled up until the point where
+                    // the messages has reached the send queue.
+                    let queue_future = async {
                         let _ = sender_clone.send(TimelineUpdate::FileUploadStarted {
                             upload_id,
                             file_name: upload.file_data.file_name(),
@@ -2241,20 +2234,27 @@ async fn matrix_worker_task(
                             let _ = sender_clone.send(TimelineUpdate::FileUploadError {
                                 upload_id,
                                 error,
-                                upload,
-                                retryable: false,
+                                retryable_upload: None,
                             });
                             SignalToUI::set_ui_signal();
-                            return;
+                            return false;
                         }
 
-                        let upload_for_error = upload.clone();
-                        let AttachmentUpload {
-                            file_data,
-                            in_reply_to,
-                            ..
-                        } = upload;
+                        let bytes = match tokio::fs::read(upload.file_data.path()).await {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                error!("Failed to read attachment {:?} for {timeline_kind}: {e:?}", upload.file_data.path());
+                                let _ = sender_clone.send(TimelineUpdate::FileUploadError {
+                                    upload_id,
+                                    error: format!("couldn't read the file: {e}"),
+                                    retryable_upload: Some(upload.clone()),
+                                });
+                                SignalToUI::set_ui_signal();
+                                return false;
+                            }
+                        };
 
+                        let file_data = &upload.file_data;
                         log!(
                             "Sending attachment to {timeline_kind}: {} ({} bytes)...",
                             file_data.file_name(),
@@ -2266,7 +2266,7 @@ async fn matrix_worker_task(
                             .unwrap_or(mime::APPLICATION_OCTET_STREAM);
 
                         let image_dimensions: Option<(u32, u32)> = if content_type.type_() == mime::IMAGE {
-                            crate::image_utils::read_image_dimensions(file_data.path())
+                            image_size_by_data(&bytes, file_data.path()).ok()
                                 .map(|(w, h)| (w as u32, h as u32))
                         } else {
                             None
@@ -2301,65 +2301,100 @@ async fn matrix_worker_task(
                             }),
                         };
 
-                        let send_request = timeline.send_attachment(
-                            file_data.path().to_path_buf(),
+                        if let Err(e) = timeline.send_attachment(
+                            AttachmentSource::Data { bytes, filename: file_data.file_name() },
                             content_type,
                             TimelineAttachmentConfig {
+                                txn_id: Some(txn_id.clone()),
                                 info: Some(info),
                                 caption: file_data.caption.as_ref().map(TextMessageEventContent::plain),
-                                in_reply_to,
+                                in_reply_to: upload.in_reply_to.clone(),
                                 ..Default::default()
                             },
-                        );
-                        let progress_subscriber = send_request.subscribe_to_send_progress();
-                        // Spawn a task to handle progress updates
-                        Handle::current().spawn(async move {
-                            let mut subscriber = progress_subscriber;
-                            loop {
-                                let progress = subscriber.get();
-                                let current: u64 = progress.current as u64;
-                                let total: u64 = progress.total as u64;
-                                if progress_sender.send(TimelineUpdate::FileUploadUpdate {
-                                    upload_id,
-                                    current,
-                                    total,
-                                }).is_err() {
-                                    break;
-                                }
-                                SignalToUI::set_ui_signal();
-                                // Wait for next update
-                                if subscriber.next().await.is_none() {
-                                    break;
-                                }
-                            }
-                        });
-
-                        match send_request.await {
-                            Ok(()) => {
-                                log!("Successfully sent attachment to {timeline_kind}.");
-                                let _ = sender_clone.send(TimelineUpdate::FileUploadComplete {
-                                    upload_id,
-                                });
-                            }
-                            Err(e) => {
-                                error!("Failed to send attachment to {timeline_kind}: {e:?}");
-                                let _ = sender_clone.send(TimelineUpdate::FileUploadError {
-                                    upload_id,
-                                    error: format!("{e}"),
-                                    upload: upload_for_error,
-                                    retryable: true,
-                                });
-                            }
+                        ).use_send_queue().await {
+                            error!("Failed to send attachment to {timeline_kind}: {e:?}");
+                            let _ = sender_clone.send(TimelineUpdate::FileUploadError {
+                                upload_id,
+                                error: format!("{e}"),
+                                retryable_upload: Some(upload.clone()),
+                            });
+                            SignalToUI::set_ui_signal();
+                            return false;
                         }
-
-                        SignalToUI::set_ui_signal();
+                        true
                     };
-
-                    match Abortable::new(upload_future, abort_registration).await {
-                        Ok(()) => {}
+                    match Abortable::new(queue_future, abort_registration).await {
+                        // Note: a cancel that lands in the brief window after this future has
+                        // queued the message can't stop it, so the message still gets sent.
+                        Ok(true) => { }
+                        Ok(false) => return,
                         Err(_) => {
-                            log!("Attachment upload task {upload_id:?} for {monitor_timeline_kind} was aborted.");
+                            log!("Attachment upload task {upload_id:?} for {timeline_kind} was aborted.");
+                            return;
                         }
+                    }
+                    log!("Successfully queued attachment to send to {timeline_kind}.");
+                    // If the user cancels at this point, we have to discard the message via the send queue.
+                    let _ = sender_clone.send(TimelineUpdate::FileUploadQueuing {
+                        upload_id,
+                        transaction_id: txn_id.clone(),
+                    });
+                    SignalToUI::set_ui_signal();
+
+                    // If we're offline we ought to notify the upload modal so the user knows that
+                    // nothing will happen until we're back online.
+                    if is_offline() {
+                        let _ = sender_clone.send(TimelineUpdate::FileUploadComplete { upload_id });
+                        SignalToUI::set_ui_signal();
+                        return;
+                    }
+
+                    let mut queue_updates = match queue_updates {
+                        Ok(receiver) => receiver,
+                        Err(_e) => {
+                            error!("Couldn't watch the send queue for {timeline_kind}: {_e:?}");
+                            let _ = sender_clone.send(TimelineUpdate::FileUploadComplete { upload_id });
+                            SignalToUI::set_ui_signal();
+                            return;
+                        }
+                    };
+                    // Track the progress of this upload until it's sent, cancelled, or gives up,
+                    // since we want to show its progress in the room input bar with as much detail as possible.
+                    let mut last_percent = None;
+                    loop {
+                        let update = match queue_updates.recv().await {
+                            Ok(update) => update,
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        };
+                        match update {
+                            RoomSendQueueUpdate::MediaUpload { related_to, progress, .. }
+                                if related_to == txn_id =>
+                            {
+                                let percent = (progress.total > 0)
+                                    .then(|| progress.current * 100 / progress.total);
+                                if last_percent == percent { continue }
+                                last_percent = percent;
+                                let _ = sender_clone.send(TimelineUpdate::FileUploadProgress {
+                                    upload_id,
+                                    current_bytes: progress.current,
+                                    total_bytes: progress.total,
+                                });
+                            }
+                            // From here on, the upload modal won't be shown,
+                            // only the send status indicator by the message can show its status.
+                            RoomSendQueueUpdate::SentEvent { transaction_id, .. }
+                            | RoomSendQueueUpdate::CancelledLocalEvent { transaction_id }
+                            | RoomSendQueueUpdate::SendError { transaction_id, .. }
+                                if transaction_id == txn_id =>
+                            {
+                                let _ = sender_clone.send(TimelineUpdate::FileUploadComplete { upload_id });
+                                SignalToUI::set_ui_signal();
+                                break;
+                            }
+                            _ => continue,
+                        }
+                        SignalToUI::set_ui_signal();
                     }
                 });
             }
@@ -2485,13 +2520,55 @@ async fn matrix_worker_task(
                         Ok(()) => log!("Successfully redacted message in {timeline_kind}."),
                         Err(e) => {
                             error!("Failed to redact message in {timeline_kind}; error: {e:?}");
-                            enqueue_popup_notification(
-                                format!("Failed to redact message. Error: {e}"),
-                                PopupKind::Error,
-                                None,
-                            );
+                            let msg = match (&timeline_event_id, &e) {
+                                (TimelineEventItemId::TransactionId(_), matrix_sdk_ui::timeline::Error::RedactError(RedactError::InvalidLocalEchoState)) =>
+                                    "This message was already sent, so it can't be cancelled. You can delete it instead.".to_string(),
+                                (TimelineEventItemId::TransactionId(_), e) => format!("Couldn't cancel sending this message: {e}"),
+                                (_, e) => format!("Failed to redact message. Error: {e}"),
+                            };
+                            enqueue_popup_notification(msg, PopupKind::Error, Some(8.0));
                         }
                     }
+                });
+            },
+
+            MatrixRequest::RetrySend { timeline_kind, timeline_event_id } => {
+                let Some(timeline) = get_timeline(&timeline_kind) else {
+                    log!("BUG: {timeline_kind} not found for retry send request");
+                    continue;
+                };
+
+                let _retry_task = Handle::current().spawn(async move {
+                    let items = timeline.items().await;
+                    let event_tl_item = items.iter().rev()
+                        .find_map(|item| item.as_event().filter(|ev| ev.identifier() == timeline_event_id));
+                    let send_handle = match event_tl_item.map(|ev| (ev, ev.send_state())) {
+                        Some((ev, Some(EventSendState::SendingFailed { .. }))) => ev.local_echo_send_handle(),
+                        Some((_, Some(EventSendState::NotSentYet { .. }))) => {
+                            enqueue_popup_notification("This message is already being sent.", PopupKind::Info, Some(5.0));
+                            return;
+                        }
+                        _ => None,
+                    };
+                    let Some(send_handle) = send_handle else {
+                        enqueue_popup_notification("This message was already sent.", PopupKind::Info, Some(5.0));
+                        return;
+                    };
+                    if let Err(e) = send_handle.unwedge().await {
+                        error!("Failed to retry sending{timeline_event_id:?} in {timeline_kind}: {e:?}");
+                        enqueue_popup_notification(format!("Couldn't retry sending: {e}"), PopupKind::Error, Some(8.0));
+                        return;
+                    }
+                    // We still need to re-enable the send queue, since `unwedge()` doesn't do that itself
+                    timeline.room().send_queue().set_enabled(true);
+                    if is_offline() {
+                        enqueue_popup_notification(
+                            "You're offline. This message will be re-sent automatically when you're back online.",
+                            PopupKind::Warning,
+                            Some(7.0),
+                        );
+                    }
+                    SignalToUI::set_ui_signal();
                 });
             },
 
@@ -2909,6 +2986,14 @@ static SYNC_SERVICE_LIFECYCLE_LOCK: LazyLock<tokio::sync::Mutex<()>> =
 /// Set to `true` when the access token has been rejected by the homeserver,
 /// signaling the main task to tear down the current session and wait for re-login.
 static TOKEN_EXPIRED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the sync service currently reports the homeserver as unreachable.
+static IS_OFFLINE: AtomicBool = AtomicBool::new(false);
+
+pub fn is_offline() -> bool {
+    IS_OFFLINE.load(Ordering::Acquire)
+}
+
 /// Notifies the main monitoring loop to wake up and check `TOKEN_EXPIRED`.
 static TOKEN_EXPIRED_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 
@@ -2979,19 +3064,23 @@ pub fn stop_sync_service_for_shutdown(timeout: Duration) -> Result<(), Elapsed> 
     result
 }
 
-/// The list of users that the current user has chosen to ignore.
+/// The list of users that the current user has chosen to block.
 /// Ideally we shouldn't have to maintain this list ourselves,
-/// but the Matrix SDK doesn't currently properly maintain the list of ignored users.
-static IGNORED_USERS: Mutex<HashSet<OwnedUserId, ConstHasher>> = Mutex::new(HashSet::with_hasher(BuildHasherDefault::new()));
+/// but the Matrix SDK doesn't currently properly maintain the list of blocked users.
+static BLOCKED_USERS: Mutex<HashSet<OwnedUserId, ConstHasher>> = Mutex::new(HashSet::with_hasher(BuildHasherDefault::new()));
 
-/// Returns a deep clone of the current list of ignored users.
-pub fn get_ignored_users() -> HashSet<OwnedUserId, ConstHasher> {
-    IGNORED_USERS.lock().unwrap().clone()
+/// Returns a sorted list of the currently blocked users.
+#[doc(alias("ignored"))]
+pub fn get_blocked_users() -> Vec<OwnedUserId> {
+    let mut users: Vec<_> = BLOCKED_USERS.lock().unwrap().iter().cloned().collect();
+    users.sort_unstable();
+    users
 }
 
-/// Returns whether the given user ID is currently being ignored.
-pub fn is_user_ignored(user_id: &UserId) -> bool {
-    IGNORED_USERS.lock().unwrap().contains(user_id)
+/// Returns whether the given user ID is currently blocked.
+#[doc(alias("ignored"))]
+pub fn is_user_blocked(user_id: &UserId) -> bool {
+    BLOCKED_USERS.lock().unwrap().contains(user_id)
 }
 
 
@@ -3318,8 +3407,8 @@ async fn start_matrix_client_login_and_sync(rt: Handle) {
         // Listen for changes to our verification status and incoming verification requests.
         subscriber_task_handles.push(add_verification_event_handlers_and_sync_client(client.clone()));
 
-        // Listen for updates to the ignored user list.
-        subscriber_task_handles.push(handle_ignore_user_list_subscriber(client.clone()));
+        // Listen for updates to the blocked user list.
+        subscriber_task_handles.push(handle_blocked_user_list_subscriber(client.clone()));
 
         // Listen for session changes, e.g., when the access token becomes invalid.
         subscriber_task_handles.push(handle_session_changes(client.clone()));
@@ -3373,9 +3462,15 @@ async fn start_matrix_client_login_and_sync(rt: Handle) {
         }
         apply_sync_service_desired_state("initial Matrix sync startup").await;
 
+        // Subscribe before enabling the send queue so we get ALL the updates possible,
+        // especially for pending messages that were not yet sent.
+        subscriber_task_handles.push(handle_send_queue_subscriber(client.clone()));
+        client.send_queue().enable_upload_progress(true);
+        client.send_queue().set_enabled(true).await;
+
         let mut room_list_service_task = rt.spawn(room_list_service_loop(room_list_service));
         let mut space_service_task = rt.spawn(space_service_loop(client));
-        // If the space service fails, we shouldn't kill everything, room sync can sill go on.
+        // If the space service fails, we shouldn't kill everything, room sync can still happen.
         let mut is_space_service_alive = true;
 
         // Now, this task becomes an infinite loop that monitors the state of the
@@ -4174,10 +4269,10 @@ async fn add_new_room(
     Ok(())
 }
 
-#[allow(unused)]
-async fn current_ignore_user_list(client: &Client) -> Option<HashSet<OwnedUserId>> {
+/// Reads the account-wide list of blocked users from the account data in the local store.
+async fn current_blocked_user_list(client: &Client) -> Option<HashSet<OwnedUserId, ConstHasher>> {
     use matrix_sdk::ruma::events::ignored_user_list::IgnoredUserListEventContent;
-    let ignored_users = client.account()
+    let blocked_users = client.account()
         .account_data::<IgnoredUserListEventContent>()
         .await
         .ok()??
@@ -4187,45 +4282,39 @@ async fn current_ignore_user_list(client: &Client) -> Option<HashSet<OwnedUserId
         .into_keys()
         .collect();
 
-    Some(ignored_users)
+    Some(blocked_users)
 }
 
+/// Replaces the list of blocked users, emitting a [`BlockedUsersUpdated`] action if it changed.
+fn set_blocked_users(new_list: HashSet<OwnedUserId, ConstHasher>) {
+    let mut blocked_users = BLOCKED_USERS.lock().unwrap();
+    if *blocked_users == new_list {
+        return;
+    }
+    *blocked_users = new_list;
+    drop(blocked_users);
+    Cx::post_action(BlockedUsersUpdated(get_blocked_users()));
+}
+
+/// Listens for changes to the list of blocked users.
+///
 /// This function spawns a task that captures a strong `Client` ref,
 /// so the caller should abort+await it upon logout to ensure the Client gets dropped.
-fn handle_ignore_user_list_subscriber(client: Client) -> JoinHandle<()> {
+fn handle_blocked_user_list_subscriber(client: Client) -> JoinHandle<()> {
     let mut subscriber = client.subscribe_to_ignore_user_list_changes();
-    log!("Initial ignored-user list is: {:?}", subscriber.get());
     Handle::current().spawn(async move {
-        let mut first_update = true;
-        while let Some(ignore_list) = subscriber.next().await {
-            log!("Received an updated ignored-user list: {ignore_list:?}");
-            let ignored_users_new = ignore_list
+        if let Some(initial_list) = current_blocked_user_list(&client).await {
+            log!("Initial blocked-user list is: {initial_list:?}");
+            set_blocked_users(initial_list);
+        }
+
+        while let Some(blocked_list) = subscriber.next().await {
+            log!("Received an updated blocked-user list: {blocked_list:?}");
+            let blocked_users_new = blocked_list
                 .into_iter()
                 .filter_map(|u| OwnedUserId::try_from(u).ok())
                 .collect::<HashSet<_, ConstHasher>>();
-
-            // TODO: when we support persistent state, don't forget to update `IGNORED_USERS` upon app boot.
-            let mut ignored_users_old = IGNORED_USERS.lock().unwrap();
-            let has_changed = *ignored_users_old != ignored_users_new;
-            *ignored_users_old = ignored_users_new;
-
-            if has_changed && !first_update {
-                // After successfully (un)ignoring a user, all timelines are fully cleared by the Matrix SDK.
-                // Therefore, we need to re-fetch all timelines for all rooms,
-                // and currently the only way to actually accomplish this is via pagination.
-                // See: <https://github.com/matrix-org/matrix-rust-sdk/issues/1703#issuecomment-2250297923>
-                for joined_room in client.joined_rooms() {
-                    submit_async_request(MatrixRequest::PaginateTimeline {
-                        timeline_kind: TimelineKind::MainRoom {
-                            room_id: joined_room.room_id().to_owned(),
-                        },
-                        num_events: 50,
-                        direction: PaginationDirection::Backwards,
-                    });
-                }
-            }
-
-            first_update = false;
+            set_blocked_users(blocked_users_new);
         }
     })
 }
@@ -4312,6 +4401,132 @@ fn handle_session_changes(client: Client) -> JoinHandle<()> {
     })
 }
 
+const SEND_QUEUE_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// What a queued send request was for.
+enum LocalSendKind {
+    Message,
+    Attachment,
+    Edit,
+    Reaction { key: String },
+    Redaction,
+}
+
+/// Watches the send queue for any failures and handles them appropriately.
+///
+/// Recoverable errors will re-enable the send queue after a delay so messages
+/// can be auto-retried, while unrecoverable errors show a popup notification
+/// and wake up the room so future messages can still be sent.
+fn handle_send_queue_subscriber(client: Client) -> JoinHandle<()> {
+    let mut updates = client.send_queue().subscribe();
+    Handle::current().spawn(async move {
+        let mut kinds: HashMap<OwnedTransactionId, LocalSendKind> = HashMap::new();
+        // The time when a room's queue should be woken up after a recoverable failure.
+        let mut reenable_at: HashMap<OwnedRoomId, Instant> = HashMap::new();
+        // If we missed updates and don't know which rooms they're for, we set this
+        // to ensure that all rooms' queues get re-enabled.
+        let mut reenable_all_at: Option<Instant> = None;
+
+        loop {
+            let next_wakeup = reenable_at.values().copied().min().into_iter().chain(reenable_all_at).min();
+            tokio::select! {
+                res = updates.recv() => match res {
+                    Ok(SendQueueUpdate { room_id, update }) => match update {
+                        RoomSendQueueUpdate::NewLocalEvent(echo) => {
+                            let kind = match echo.content {
+                                LocalEchoContent::Event { serialized_event, .. } => match serialized_event.deserialize() {
+                                    Ok(AnyMessageLikeEventContent::RoomMessage(msg)) => match msg.msgtype {
+                                        _ if matches!(msg.relates_to, Some(Relation::Replacement(_))) => LocalSendKind::Edit,
+                                        MessageType::Image(_) | MessageType::Video(_)
+                                        | MessageType::File(_) | MessageType::Audio(_) => LocalSendKind::Attachment,
+                                        _ => LocalSendKind::Message,
+                                    },
+                                    _ => LocalSendKind::Message,
+                                },
+                                LocalEchoContent::React { key, .. } => LocalSendKind::Reaction { key },
+                                LocalEchoContent::Redaction { .. } => LocalSendKind::Redaction,
+                            };
+                            kinds.insert(echo.transaction_id, kind);
+                        }
+                        RoomSendQueueUpdate::SentEvent { transaction_id, .. }
+                        | RoomSendQueueUpdate::CancelledLocalEvent { transaction_id } => {
+                            kinds.remove(&transaction_id);
+                        }
+                        RoomSendQueueUpdate::SendError { transaction_id, error, is_recoverable } => {
+                            if is_recoverable {
+                                // If we're offline, the sync state subscriber will re-enable the send queue upon reconnect.
+                                if !is_offline() && sync_service_desired_running() {
+                                    let delay = match error.client_api_error_kind() {
+                                        Some(ErrorKind::LimitExceeded(data)) => match data.retry_after {
+                                            Some(RetryAfter::Delay(delay)) => delay,
+                                            Some(RetryAfter::DateTime(time)) => time.duration_since(SystemTime::now()).unwrap_or(SEND_QUEUE_RETRY_DELAY),
+                                            None => SEND_QUEUE_RETRY_DELAY,
+                                        },
+                                        _ => SEND_QUEUE_RETRY_DELAY,
+                                    };
+                                    warning!("Recoverable send error in room {room_id}, retrying in {delay:?}: {error}");
+                                    reenable_at.insert(room_id, Instant::now() + delay);
+                                }
+                                continue;
+                            }
+
+                            error!("Unrecoverable send error in room {room_id}: {error:?}");
+                            // The SDK disabled the whole room's queue, so we have to re-enable it.
+                            let room = client.get_room(&room_id);
+                            if let Some(room) = &room {
+                                room.send_queue().set_enabled(true);
+                            }
+                            let room_name = match &room {
+                                Some(room) => RoomNameId::from_room(room).await,
+                                None => RoomNameId::empty(room_id.clone()),
+                            };
+                            let desc = stringify_send_error(&error);
+                            let msg = match kinds.get(&transaction_id) {
+                                Some(LocalSendKind::Message) => format!("Couldn't send a message in {room_name}: {desc}\n\nOpen the message's menu to edit, retry, or cancel it."),
+                                Some(LocalSendKind::Attachment) => format!("Couldn't send an attachment in {room_name}: {desc}\n\nOpen the message's menu to retry or cancel it."),
+                                Some(LocalSendKind::Edit) => format!("Couldn't send your edit in {room_name}: {desc}"),
+                                Some(LocalSendKind::Reaction { key }) => format!("Couldn't send your {key} reaction in {room_name}: {desc}"),
+                                Some(LocalSendKind::Redaction) => format!("Couldn't delete a message in {room_name}: {desc}"),
+                                None => format!("Couldn't send to {room_name}: {desc}"),
+                            };
+                            enqueue_popup_notification(msg, PopupKind::Error, Some(8.0));
+                        }
+                        _ => {}
+                    },
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warning!("Send queue update receiver lagged and we missed {n} messages.");
+                        if !is_offline() && sync_service_desired_running() {
+                            reenable_all_at = Some(Instant::now() + SEND_QUEUE_RETRY_DELAY);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                _ = async { tokio::time::sleep_until(next_wakeup.unwrap()).await},
+                    if next_wakeup.is_some() =>
+                {
+                    let now = Instant::now();
+                    if reenable_all_at.is_some_and(|at| at <= now) {
+                        reenable_all_at = None;
+                        reenable_at.clear();
+                        client.send_queue().set_enabled(true).await;
+                        continue;
+                    }
+                    let due: Vec<OwnedRoomId> = reenable_at.iter()
+                        .filter(|(_, at)| **at <= now)
+                        .map(|(room_id, _)| room_id.clone())
+                        .collect();
+                    for room_id in due {
+                        reenable_at.remove(&room_id);
+                        if let Some(room) = client.get_room(&room_id) {
+                            room.send_queue().set_enabled(true);
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
 fn handle_sync_service_state_subscriber(mut subscriber: Subscriber<sync_service::State>) -> JoinHandle<()> {
     log!("Initial sync service state is {:?}", subscriber.get());
     Handle::current().spawn(async move {
@@ -4357,7 +4572,14 @@ fn handle_sync_service_state_subscriber(mut subscriber: Subscriber<sync_service:
                     log!("Ignoring sync service state update after token expiration.");
                     break;
                 }
-                other => Cx::post_action(RoomsListHeaderAction::StateUpdate(other)),
+                other => {
+                    IS_OFFLINE.store(matches!(other, sync_service::State::Offline), Ordering::Release);
+                    let is_now_running = matches!(other, sync_service::State::Running);
+                    Cx::post_action(RoomsListHeaderAction::StateUpdate(other));
+                    if is_now_running && let Some(client) = get_client() {
+                        client.send_queue().set_enabled(true).await;
+                    }
+                }
             }
         }
     })
@@ -4648,7 +4870,7 @@ async fn text_preview_of_latest_thread_reply(
 async fn get_latest_event_details(
     latest_event_value: &LatestEventValue,
     client: &Client,
-) -> Option<(MilliSecondsSinceUnixEpoch, String)> {
+) -> Option<LatestEventPreview> {
     macro_rules! get_sender_username {
         ($profile:expr, $sender:expr, $is_own:expr) => {{
             match $profile {
@@ -4667,13 +4889,19 @@ async fn get_latest_event_details(
     match latest_event_value {
         LatestEventValue::None => None,
         LatestEventValue::Remote { timestamp, sender, is_own, profile, content } => {
+            // Don't show previews for a message sent by a blocked user.
+            // The SDK usually won't give us these, but a cached latest event instance
+            // could still be in use by the UI, so this is just an extra precaution.
+            if is_user_blocked(sender) {
+                return None;
+            }
             let sender_username = get_sender_username!(profile, sender, *is_own);
-            let latest_message_text = text_preview_of_timeline_item(
+            let text = text_preview_of_timeline_item(
                 content,
                 sender,
                 &sender_username,
             ).format_with(&sender_username, true);
-            Some((*timestamp, latest_message_text))
+            Some(LatestEventPreview { timestamp: *timestamp, text, sender: Some(sender.clone()) })
         }
         LatestEventValue::Local { timestamp, sender, profile, content, state: _ } => {
             // TODO: use the `state` enum to augment the preview text with more details.
@@ -4681,15 +4909,19 @@ async fn get_latest_event_details(
             //                "<span color="red">Failed to send {msg}</span>"
             let is_own = current_user_id().is_some_and(|id| &id == sender);
             let sender_username = get_sender_username!(profile, sender, is_own);
-            let latest_message_text = text_preview_of_timeline_item(
+            let text = text_preview_of_timeline_item(
                 content,
                 sender,
                 &sender_username,
             ).format_with(&sender_username, true);
-            Some((*timestamp, latest_message_text))
+            Some(LatestEventPreview { timestamp: *timestamp, text, sender: Some(sender.clone()) })
         }
         LatestEventValue::RemoteInvite { timestamp, .. } => {
-            Some((*timestamp, String::from("You were invited to this room.")))
+            Some(LatestEventPreview {
+                timestamp: *timestamp,
+                text: String::from("You were invited to this room."),
+                sender: None,
+            })
         }
     }    
 }
@@ -4699,14 +4931,13 @@ async fn get_latest_event_details(
 /// This function sends a `RoomsListUpdate::UpdateLatestEvent`
 /// to update the latest event in the RoomsListEntry for the given room.
 async fn update_latest_event(room: &Room) {
-    if let Some((timestamp, latest_message_text)) = get_latest_event_details(
+    if let Some(latest) = get_latest_event_details(
         &room.latest_event().await,
         &room.client(),
     ).await {
         enqueue_rooms_list_update(RoomsListUpdate::UpdateLatestEvent {
             room_id: room.room_id().to_owned(),
-            timestamp,
-            latest_message_text,
+            latest,
         });
     }
 }
@@ -4893,6 +5124,8 @@ async fn timeline_subscriber_handler(
     // Whether any update changes have arrived since this timeline was last closed,
     // meaning that we need to send an cumulative update when the timeline gets re-opened.
     let mut has_unsent_changes = false;
+    // The latest upload progress that was sent to the UI: `(item index, percent)`.
+    let mut latest_progress_update: Option<(usize, usize)> = None;
 
     loop { tokio::select! {
         // we should check for new requests before handling new timeline updates,
@@ -4999,6 +5232,10 @@ async fn timeline_subscriber_handler(
             let mut clear_cache = false;
             // whether the changes include items being appended to the end of the timeline
             let mut is_append = false;
+            // the (index, percent) of the last upload progress tick in this batch
+            let mut latest_progress_updates = None;
+            let mut num_progress_updates = 0;
+
             for diff in batch {
                 num_updates += 1;
                 match diff {
@@ -5073,6 +5310,21 @@ async fn timeline_subscriber_handler(
                         if LOG_TIMELINE_DIFFS { log!("timeline_subscriber: room {room_id}, thread {thread_root_event_id:?} diff Insert at {index}. Changes: {index_of_first_change}..{index_of_last_change}"); }
                     }
                     VectorDiff::Set { index, value } => {
+                        // The way that the sdk provides progress updates for an upload/message being sent
+                        // is by delivering a `Set` diff here, which replaces the local echo with an updated
+                        // version of itself. When that happens, we only need to update the progress value in the UI.
+                        if let Some(old_txn_id) = timeline_items.get(index).and_then(|old| old.as_event()?.transaction_id())
+                            && let Some(new_event) = value.as_event()
+                            && new_event.transaction_id() == Some(old_txn_id)
+                            && let Some(EventSendState::NotSentYet { progress: Some(p) }) = new_event.send_state()
+                        {
+                            let percent = (p.progress.current * 100)
+                                .checked_div(p.progress.total)
+                                .unwrap_or(0);
+                            latest_progress_updates = Some((index, percent));
+                            num_progress_updates += 1;
+                        }
+
                         index_of_first_change = min(index_of_first_change, index);
                         index_of_last_change  = max(index_of_last_change, index.saturating_add(1));
                         timeline_items.set(index, value);
@@ -5116,7 +5368,7 @@ async fn timeline_subscriber_handler(
                     }
                 }
             }
-
+            let is_progress_only = num_progress_updates == num_updates;
 
             if num_updates > 0 {
                 // Handle the case where back pagination inserts items at the beginning of the timeline
@@ -5136,35 +5388,44 @@ async fn timeline_subscriber_handler(
                 // Only send updates to the UI while this timeline is open.
                 // While it's closed, we process the updates locally until it is re-opened again.
                 if is_timeline_open {
-                    if timeline_update_sender.send(TimelineUpdate::NewItems {
-                        new_items: timeline_items.clone(),
-                        changed_indices,
-                        clear_cache,
-                        is_append,
-                    }).is_err() {
-                        log!("Timeline for room {room_id}, thread {thread_root_event_id:?} was closed \
-                            or recreated; ending this subscriber task.");
-                        return;
-                    }
-
-                    // We must send this update *after* the actual NewItems update,
-                    // otherwise the UI thread (RoomScreen) won't be able to correctly locate the target event.
-                    if let Some((index, found_event_id)) = found_target_event_id.take() {
-                        target_event_id = None;
-                        if timeline_update_sender.send(
-                            TimelineUpdate::TargetEventFound {
-                                target_event_id: found_event_id.clone(),
-                                index,
+                    // Only send a progress-change update if it's actually different than before.
+                    let ui_needs_update = !is_progress_only
+                        || latest_progress_updates != latest_progress_update;
+                    if ui_needs_update {
+                        let update = if is_progress_only {
+                            latest_progress_update = latest_progress_updates;
+                            TimelineUpdate::LocalEchoProgress { new_items: timeline_items.clone() }
+                        } else {
+                            TimelineUpdate::NewItems {
+                                new_items: timeline_items.clone(),
+                                changed_indices,
+                                clear_cache,
+                                is_append,
                             }
-                        ).is_err() {
+                        };
+                        if timeline_update_sender.send(update).is_err() {
                             log!("Timeline for room {room_id}, thread {thread_root_event_id:?} was closed \
                                 or recreated; ending this subscriber task.");
                             return;
                         }
-                    }
 
-                    // Send a Makepad-level signal to update this room's timeline UI view.
-                    SignalToUI::set_ui_signal();
+                        // We must send this update *after* the actual NewItems update,
+                        // otherwise the RoomScreen UI won't be able to correctly locate the target event.
+                        if let Some((index, found_event_id)) = found_target_event_id.take() {
+                            target_event_id = None;
+                            if timeline_update_sender.send(
+                                TimelineUpdate::TargetEventFound {
+                                    target_event_id: found_event_id.clone(),
+                                    index,
+                                }
+                            ).is_err() {
+                                log!("Timeline for room {room_id}, thread {thread_root_event_id:?} was closed \
+                                    or recreated; ending this subscriber task.");
+                                return;
+                            }
+                        }
+                        SignalToUI::set_ui_signal();
+                    }
                 } else {
                     // Closed: our local items are updated above; remember to catch the UI up on reopen.
                     has_unsent_changes = true;
@@ -5642,7 +5903,7 @@ pub async fn clear_app_state(config: &LogoutConfig) -> Result<()> {
     CLIENT.lock().unwrap().take();
     SYNC_SERVICE.lock().unwrap().take();
     SYNC_SERVICE_ASSUMED_RUNNING.store(false, Ordering::Release);
-    IGNORED_USERS.lock().unwrap().clear();
+    set_blocked_users(HashSet::default());
     ALL_JOINED_ROOMS.lock().unwrap().clear();
     OWN_DISPLAY_NAME.lock().unwrap().take();
     LOGOUT_NOTIFY.notify_one();

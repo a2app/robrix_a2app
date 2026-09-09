@@ -6,7 +6,7 @@ use matrix_sdk::ruma::api::client::profile::{AvatarUrl, DisplayName};
 use matrix_sdk::ruma::events::ignored_user_list::IgnoredUserListEventContent;
 
 use super::rooms::room_name;
-use crate::sliding_sync::{current_user_id, get_client, is_user_ignored};
+use crate::sliding_sync::{current_user_id, get_client, is_user_blocked};
 
 pub(super) async fn user_profile(user_id: OwnedUserId) -> Result<String, String> {
     let client = get_client().ok_or("not logged in")?;
@@ -18,7 +18,7 @@ pub(super) async fn user_profile(user_id: OwnedUserId) -> Result<String, String>
         "user_id": user_id,
         "display_name": display_name,
         "has_avatar": profile.get_static::<AvatarUrl>().ok().flatten().is_some(),
-        "ignored": is_user_ignored(&user_id),
+        "ignored": is_user_blocked(&user_id),
     }).to_string())
 }
 
