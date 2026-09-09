@@ -559,6 +559,27 @@ fn next_reply_state_key() -> String {
 
 /// Writes one agent turn as an `ai_reply` state event with a fresh state key
 /// (so it never overwrites a previous turn's reply).
+/// Turns a failed `ai_reply` state write into a message the caller — and the
+/// model, for cross-room posts — can act on. A 403/M_FORBIDDEN here is almost
+/// always a power-level shortfall: posting a custom state event requires the
+/// account's power in that room to be at least the room's `state_default`
+/// (50 = Moderator by default). Name that instead of echoing the raw server
+/// error, which reads as a mystery to the agent (and to the room's owner).
+fn friendly_state_post_error(e: &matrix_sdk::Error) -> String {
+    use matrix_sdk::ruma::api::error::ErrorKind;
+    if matches!(e.client_api_error_kind(), Some(ErrorKind::Forbidden)) {
+        return String::from(
+            "the homeserver refused the state event: this account is not powerful enough in the \
+             target room. Posting as an AI card is a custom state event, which needs at least the \
+             room's state_default power level (normally 50 = Moderator). Promote this account to \
+             Moderator in that room, or lower the room's state default, then ask me to post again.",
+        );
+    }
+    e.to_string()
+}
+
+/// Writes one agent turn as an `ai_reply` state event with a fresh state key
+/// (so it never overwrites a previous turn's reply).
 async fn post_reply(room: &Room, content: &AiReplyContent) -> Result<(), String> {
     let json = serde_json::to_value(content).map_err(|e| e.to_string())?;
     let key = next_reply_state_key();
@@ -568,8 +589,9 @@ async fn post_reply(room: &Room, content: &AiReplyContent) -> Result<(), String>
             Ok(())
         }
         Err(e) => {
-            log!("AI Rooms worker: ai_reply write to room {} failed: {e}", room.room_id());
-            Err(e.to_string())
+            let friendly = friendly_state_post_error(&e);
+            log!("AI Rooms worker: ai_reply write to room {} failed: {friendly}", room.room_id());
+            Err(friendly)
         }
     }
 }
