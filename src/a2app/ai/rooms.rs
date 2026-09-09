@@ -1,8 +1,9 @@
 //! AI Rooms: the Matrix operations that back the marker/forwarding/reply
 //! machinery (create a room, read/write its marker, read/write its
-//! forwarding cursor, write an `ai_reply`). Run on the async worker via
-//! `MatrixRequest::AiRoom`; results come back to the UI thread as
-//! [`AiRoomAction`]s, applied in `a2app::runtime`.
+//! forwarding cursor, write an `ai_reply`, post live `ai_activity` /
+//! `ai_tool_call` rows). Run on the async worker via `MatrixRequest::AiRoom`;
+//! results come back to the UI thread as [`AiRoomAction`]s, applied in
+//! `a2app::runtime`.
 //!
 //! See [`crate::a2app::ai_room_events`] for the wire types shared with the
 //! (cross-platform) rendering side.
@@ -32,6 +33,25 @@ use crate::a2app::ai_room_events::{
 };
 use crate::utils::RoomNameId;
 
+/// Counter backing [`next_ai_state_key`], so two rows minted in the same
+/// nanosecond never collide.
+static NEXT_AI_EVENT_KEY: AtomicU64 = AtomicU64::new(1);
+
+/// Mints a fresh, unique state key for one `ai_activity` / `ai_tool_call`
+/// row. The prefix names the kind of row the key belongs to; the key is
+/// unique per row, and reusing one (a tool call's `Started` → `Done` update)
+/// rewrites that row in the room's current state instead of appending.
+///
+/// UI-thread safe: only the atomic counter is shared.
+pub fn next_ai_state_key(prefix: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let n = NEXT_AI_EVENT_KEY.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{nanos:x}-{n:x}")
+}
+
 /// Matrix operations for AI rooms, dispatched via `MatrixRequest::AiRoom`
 /// and run on the async worker's tokio runtime.
 #[derive(Debug)]
@@ -53,6 +73,18 @@ pub enum AiRoomRequest {
     /// Writes one agent turn (a completed reply, or a `send_message` tool
     /// call) as an `ai_reply` state event.
     PostReply { room_id: OwnedRoomId, content: AiReplyContent },
+    /// Writes one raw AI-session activity state event (an `ai_activity`
+    /// marker or an `ai_tool_call` row). The caller supplies the state key:
+    /// a fresh key (see [`next_ai_state_key`]) appends a new row to the
+    /// room's live log; reusing a key — a tool call's `Started` → `Done`
+    /// update — rewrites that one row. Best-effort: a failure is logged and
+    /// the turn continues (the final `ai_reply` still carries the receipts).
+    PostAiStateEvent {
+        room_id: OwnedRoomId,
+        event_type: String,
+        state_key: String,
+        content: serde_json::Value,
+    },
     /// A capability-gated attached-room read the session's agent asked for
     /// (already decided Granted by the runtime against the room's permission
     /// subject). Fetches the data and posts the result back as
@@ -132,6 +164,17 @@ pub async fn handle_ai_room_request(request: AiRoomRequest) {
             if let Err(e) = post_reply(&room, &content).await {
                 log!("AI Rooms worker: FAILED to post ai_reply to {room_id}: {e}");
                 Cx::post_action(AiRoomAction::PostReplyFailed { error: e });
+            }
+        }
+        AiRoomRequest::PostAiStateEvent { room_id, event_type, state_key, content } => {
+            let Some(room) = get_client().and_then(|c| c.get_room(&room_id)) else {
+                log!("AI Rooms worker: can't post {event_type} to {room_id}: room not found in client.");
+                return;
+            };
+            if let Err(e) = room.send_state_event_raw(&event_type, &state_key, content).await {
+                // Best-effort rows: a failure must not derail the turn (the
+                // final `ai_reply` still carries the receipts), so log only.
+                log!("AI Rooms worker: FAILED to post {event_type} (key {state_key}) to {room_id}: {e}");
             }
         }
         AiRoomRequest::ToolRead { id, room_id, tool } => {

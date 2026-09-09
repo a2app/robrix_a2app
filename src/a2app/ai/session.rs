@@ -120,6 +120,14 @@ pub enum SessionUpdate {
     /// A turn completed with the agent's final text (empty replies are
     /// filtered out — a refusal or cancel posts nothing).
     Reply { text: String },
+    /// The agent's reasoning stream started on the in-flight turn (emitted
+    /// once per turn), so the chat can show a "thinking…" row while the
+    /// model is still quiet.
+    Thinking,
+    /// The agent started one tool call; `name` is the tool's name. Robrix
+    /// turns this into the tool call's `Started` state event and matches its
+    /// eventual outcome back to the same row.
+    ToolCallStarted { name: String },
     /// The agent reported an error on the in-flight turn.
     Error(String),
     /// The agent process is gone (died, was killed, or never started). The
@@ -201,6 +209,13 @@ impl AiSession {
     /// Robrix binary — this very process — as an MCP server whose socket is
     /// the freshly bound one. `Err` names why a session can't start (no
     /// provider, agent missing, socket bind failure).
+    ///
+    /// The session agent is *host-managed* (`host_managed = true`): an octos
+    /// backend runs its built-in `hosted` profile, so octos's native tools
+    /// (shell/bash, file tools, memory, …) are absent. The only tools the
+    /// model can call are the ones registered on `server` below — all of
+    /// which Robrix executes and gates — so every piece of tool access is
+    /// mediated by Robrix and maps to capabilities shared with mini-apps.
     pub fn start(room_id: OwnedRoomId, prefs: AgentPrefs) -> Result<Self, String> {
         // The rendezvous: serve threads send jobs here, the UI thread drains.
         let (jobs_tx, jobs_rx) = channel::<SessionJob>();
@@ -249,7 +264,7 @@ impl AiSession {
         );
 
         let transport =
-            a2app_agent::start_backend_with_mcp(&workspace, &prefs, &[tool_server])?;
+            a2app_agent::start_backend_with_mcp(&workspace, &prefs, &[tool_server], true)?;
 
         Ok(Self {
             room_id,
@@ -391,7 +406,11 @@ impl AiSession {
                 AcpEvent::Thought(text) => {
                     self.turn_thought_chars = self.turn_thought_chars.saturating_add(text.len());
                     if !self.turn_thought_logged {
+                        // First thought of the turn: surface it once so the
+                        // room can show a "thinking…" row; a long think keeps
+                        // the flag set (only periodic diagnostics below).
                         self.turn_thought_logged = true;
+                        updates.push(SessionUpdate::Thinking);
                         log!(
                             "AI session {}: agent is thinking… {}",
                             self.room_id,
@@ -407,6 +426,7 @@ impl AiSession {
                 }
                 AcpEvent::ToolCall(title) => {
                     log!("AI session {}: agent tool call: {}", self.room_id, title);
+                    updates.push(SessionUpdate::ToolCallStarted { name: title });
                 }
                 AcpEvent::Plan(steps) => {
                     log!("AI session {}: agent plan updated ({} steps)", self.room_id, steps.len());

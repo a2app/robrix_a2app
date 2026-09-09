@@ -15,6 +15,7 @@ script_mod! {
     mod.widgets.AiRoomPanel = View { visible: false }
     mod.widgets.MiniAppTimelineCard = View { visible: false }
     mod.widgets.AiReplyTimelineCard = View { visible: false }
+    mod.widgets.AiEventTimelineCard = View { visible: false }
     mod.widgets.MiniAppTabScreen = View { visible: false }
     mod.widgets.MiniAppDock = View {
         width: Fill, height: Fill

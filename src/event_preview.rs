@@ -540,6 +540,18 @@ pub fn text_preview_of_other_state(
         {
             String::from("replied.")
         }
+        #[cfg(feature = "a2app")]
+        AnyOtherStateEventContentChange::_Custom { event_type }
+            if event_type == crate::a2app::ai_room_events::AI_ACTIVITY_EVENT_TYPE =>
+        {
+            String::from("is thinking…")
+        }
+        #[cfg(feature = "a2app")]
+        AnyOtherStateEventContentChange::_Custom { event_type }
+            if event_type == crate::a2app::ai_room_events::AI_TOOL_CALL_EVENT_TYPE =>
+        {
+            String::from("used a tool.")
+        }
         other => {
             let event_type = other.event_type().to_string();
             format!("changed this room's {} state.",

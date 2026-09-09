@@ -693,6 +693,9 @@ script_mod! {
             MiniAppTimelineCard := mod.widgets.MiniAppTimelineCard {}
             // An AI room's agent turn (an invisible stub without `a2app`).
             AiReplyTimelineCard := mod.widgets.AiReplyTimelineCard {}
+            // An AI room's live activity rows (thinking/error markers, tool
+            // calls) — invisible stubs without `a2app`.
+            AiEventTimelineCard := mod.widgets.AiEventTimelineCard {}
         }
 
         // A jump to bottom button (with an unread message badge) that is shown
@@ -1735,7 +1738,9 @@ impl Widget for RoomScreen {
                                     | timeline::AnyOtherStateEventContentChange::SpaceParent(_) => true,
                                     #[cfg(feature = "a2app")]
                                     timeline::AnyOtherStateEventContentChange::_Custom { event_type }
-                                        if event_type == crate::a2app::ai_room_events::AI_REPLY_EVENT_TYPE => false,
+                                        if event_type == crate::a2app::ai_room_events::AI_REPLY_EVENT_TYPE
+                                            || event_type == crate::a2app::ai_room_events::AI_ACTIVITY_EVENT_TYPE
+                                            || event_type == crate::a2app::ai_room_events::AI_TOOL_CALL_EVENT_TYPE => false,
                                     timeline::AnyOtherStateEventContentChange::_Custom { .. } => true,
                                     _ => false,
                                 };
@@ -6139,7 +6144,9 @@ fn populate_other_message_like(
 }
 
 /// Routes a custom state event: an AI room's `ai_reply` turns get their own
-/// timeline card; everything else stays a small state event.
+/// timeline card, its live `ai_activity` markers ("thinking…" / errors /
+/// stopped) and `ai_tool_call` rows get the small live-activity card, and
+/// everything else stays a small state event.
 fn populate_other_state_event(
     cx: &mut Cx,
     list: &mut PortalList,
@@ -6150,19 +6157,41 @@ fn populate_other_state_event(
     item_drawn_status: ItemDrawnStatus,
 ) -> (WidgetRef, ItemDrawnStatus) {
     #[cfg(feature = "a2app")]
-    if matches!(
-        other.content(),
-        timeline::AnyOtherStateEventContentChange::_Custom { event_type }
-            if event_type == crate::a2app::ai_room_events::AI_REPLY_EVENT_TYPE
-    ) {
-        use crate::a2app::ai_room_events::{AiReplyContent, AiReplyTimelineCardWidgetRefExt};
-        let (item, existed) = list.item_with_existed(cx, item_id, id!(AiReplyTimelineCard));
-        if !(existed && item_drawn_status.content_drawn) {
-            let content = event_tl_item.latest_json()
+    if let timeline::AnyOtherStateEventContentChange::_Custom { event_type } = other.content() {
+        use crate::a2app::ai_room_events::{
+            AI_ACTIVITY_EVENT_TYPE, AI_REPLY_EVENT_TYPE, AI_TOOL_CALL_EVENT_TYPE,
+            AiActivityContent, AiReplyContent, AiReplyTimelineCardWidgetRefExt,
+            AiEventTimelineCardWidgetRefExt, AiToolCallContent,
+        };
+        let raw_content = || {
+            event_tl_item
+                .latest_json()
                 .and_then(|raw| raw.deserialize_as::<serde_json::Value>().ok())
                 .and_then(|v| v.get("content").cloned())
-                .and_then(|c| serde_json::from_value::<AiReplyContent>(c).ok());
-            item.as_ai_reply_timeline_card().populate(cx, content.as_ref());
+        };
+        if event_type == AI_REPLY_EVENT_TYPE {
+            let (item, existed) = list.item_with_existed(cx, item_id, id!(AiReplyTimelineCard));
+            if !(existed && item_drawn_status.content_drawn) {
+                let content =
+                    raw_content().and_then(|c| serde_json::from_value::<AiReplyContent>(c).ok());
+                item.as_ai_reply_timeline_card().populate(cx, content.as_ref());
+            }
+            return (item, ItemDrawnStatus::both_drawn());
+        }
+        let (item, existed) = list.item_with_existed(cx, item_id, id!(AiEventTimelineCard));
+        if !(existed && item_drawn_status.content_drawn) {
+            if event_type == AI_ACTIVITY_EVENT_TYPE {
+                let content =
+                    raw_content().and_then(|c| serde_json::from_value::<AiActivityContent>(c).ok());
+                item.as_ai_event_timeline_card().populate_activity(cx, content.as_ref());
+            } else if event_type == AI_TOOL_CALL_EVENT_TYPE {
+                let content =
+                    raw_content().and_then(|c| serde_json::from_value::<AiToolCallContent>(c).ok());
+                item.as_ai_event_timeline_card().populate_tool_call(cx, content.as_ref());
+            } else {
+                // A custom event type this build doesn't render: hide the row.
+                item.as_ai_event_timeline_card().populate_activity(cx, None);
+            }
         }
         return (item, ItemDrawnStatus::both_drawn());
     }

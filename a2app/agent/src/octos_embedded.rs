@@ -99,10 +99,17 @@ impl EmbeddedOctos {
     /// `session/new`. The embedded backend hands them to octos's ACP factory
     /// (`build_with_mcp`) instead, which connects them per session; on iOS the
     /// caller passes none (the agent cannot exec the relay child there).
+    ///
+    /// `host_managed` scopes octos's own toolset: `true` applies the built-in
+    /// `hosted` profile (zero octos-native tools), so the only tools the model
+    /// can call are the ones this session advertises through `mcp_servers`.
+    /// The one-shot app-generation agent passes `false` and keeps octos's
+    /// default `coding` surface.
     pub fn start(
         workspace: &Path,
         prefs: &AgentPrefs,
         mcp_servers: &[RobrixMcpServerConfig],
+        host_managed: bool,
     ) -> Result<Self, String> {
         std::fs::create_dir_all(workspace).ok();
         let (evt_tx, events) = std::sync::mpsc::channel();
@@ -112,7 +119,9 @@ impl EmbeddedOctos {
         let prefs = prefs.clone();
         let sd = shutdown.clone();
         let servers = mcp_servers.to_vec();
-        std::thread::spawn(move || agent_thread(ws, prefs, servers, cmd_rx, evt_tx, sd));
+        std::thread::spawn(move || {
+            agent_thread(ws, prefs, servers, host_managed, cmd_rx, evt_tx, sd)
+        });
         Ok(Self { events, cmd_tx, shutdown })
     }
 }
@@ -166,6 +175,7 @@ fn agent_thread(
     workspace: PathBuf,
     prefs: AgentPrefs,
     mcp_servers: Vec<RobrixMcpServerConfig>,
+    host_managed: bool,
     cmd_rx: Receiver<Cmd>,
     evt_tx: Sender<AcpEvent>,
     shutdown: Arc<Shutdown>,
@@ -202,7 +212,13 @@ fn agent_thread(
         }
     };
 
-    let agent = match rt.block_on(build_agent(&workspace, &prefs, &shutdown, &mcp_servers)) {
+    let agent = match rt.block_on(build_agent(
+        &workspace,
+        &prefs,
+        &shutdown,
+        &mcp_servers,
+        host_managed,
+    )) {
         Ok(agent) => agent,
         Err(e) => {
             send(&evt_tx, AcpEvent::ProcessGone(e));
@@ -251,6 +267,7 @@ async fn build_agent(
     prefs: &AgentPrefs,
     shutdown: &Arc<Shutdown>,
     mcp_servers: &[RobrixMcpServerConfig],
+    host_managed: bool,
 ) -> Result<Arc<octos_agent::Agent>, String> {
     let cwd = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     let command = AcpCommand {
@@ -268,6 +285,13 @@ async fn build_agent(
         // for this model" against the Kimi coding plan.
         provider: crate::providers::session_provider(),
         model: crate::prefs::Backend::detect().model_override(prefs),
+        // Host-managed sessions (the room's long-lived agent) run octos's
+        // built-in `hosted` profile: octos's registry is emptied of native
+        // tools, so the model can only call the tools Robrix advertised in
+        // `mcp_servers` — every call is mediated by Robrix. The one-shot
+        // app-generation agent (host_managed = false) keeps the default
+        // `coding` surface.
+        profile: host_managed.then(|| "hosted".to_string()),
         ..Default::default()
     };
 

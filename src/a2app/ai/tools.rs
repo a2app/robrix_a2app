@@ -496,16 +496,21 @@ impl Tool for SendMessageTool {
     }
 
     fn description(&self) -> &str {
-        "Posts a message to this room's timeline. Use it to answer the user's \
-         questions and report progress or results in words. The text supports \
-         Markdown: **bold**, *italic*, lists, and links. Mention a person by \
-         linking their full matrix id — [Their name](https://matrix.to/#/@user:server) \
-         — which the client renders as a clickable avatar pill. Point at a \
+        "Posts a message to this room's timeline — the way you reply to the \
+         user in words, so use it for every answer, report, and progress \
+         update. ALWAYS format your messages — never send a plain, \
+         unformatted wall of text. The text supports Markdown: **bold** for \
+         key terms, *italic* where it helps, and bullet or numbered lists to \
+         structure several points or steps. Mention a person by linking their \
+         full matrix id — [Their name](https://matrix.to/#/@user:server) — \
+         which the client renders as a clickable avatar pill. Point at a \
          specific message with its permalink — \
          [that message](https://matrix.to/#/!room:server/$event) — which the \
          client renders as a clickable link to that message in that room \
-         (event ids come from the read tools). For building an app, use \
-         launch_splash_app instead."
+         (event ids come from the read tools). Make a habit of it: every \
+         reply should use the formatting and linking that fits, without the \
+         user having to ask. For building an app, use launch_splash_app \
+         instead."
     }
 
     fn input_schema(&self) -> Value {
