@@ -25,6 +25,15 @@ const MAX_REPAIRS: u32 = 2;
 /// the wild when models reach for ✕-style icons.
 const TOFU_GLYPHS: &[char] = &['✕', '✗', '✘', '⤡', '⤢', '➜', '↻', '⟳'];
 
+/// Truncates streamed agent text for a log line, with an ellipsis when cut.
+fn clip_for_log(text: &str, max_chars: usize) -> String {
+    let mut out: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
+}
+
 /// A generation with NO agent events for this long is declared stalled. LLM
 /// turns legitimately take a while, so this is generous — it only catches an
 /// agent that is alive but silent (hung provider, dead network) which would
@@ -311,6 +320,9 @@ impl Generation {
                     self.transcript_kind = None;
                 }
                 AcpEvent::Chunk(text) => {
+                    if self.stream.is_empty() {
+                        makepad_widgets::log!("app generation: agent writing…");
+                    }
                     self.stream.push_str(&text);
                     self.transcribe(StreamKind::Writing, &text);
                     // Streaming progress. Length is a decent proxy for life.
@@ -323,6 +335,7 @@ impl Generation {
                     }
                 }
                 AcpEvent::ToolCall(title) => {
+                    makepad_widgets::log!("app generation: agent tool call: {title}");
                     self.status = format!("Agent: {title}…");
                     self.log(format!("🔧 {title}"));
                 }
@@ -332,6 +345,10 @@ impl Generation {
                     // to the live tail, where it's replaced by the code as soon
                     // as the agent starts writing.
                     if self.thought.is_empty() {
+                        makepad_widgets::log!(
+                            "app generation: agent thinking… (head: {})",
+                            clip_for_log(&text, 160)
+                        );
                         self.log("💭 Thinking…");
                     }
                     self.thought.push_str(&text);
@@ -370,6 +387,17 @@ impl Generation {
                 // No content, but it moved the stall clock (see `advance`).
                 AcpEvent::Tick => {}
                 AcpEvent::TurnDone { stop_reason, text } => {
+                    makepad_widgets::log!(
+                        "app generation: turn done ({stop_reason}) — {} chars written, \
+                         {} chars thinking{}",
+                        self.stream.len(),
+                        self.thought.len(),
+                        if text.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!("; text head: {}", clip_for_log(&text, 160))
+                        }
+                    );
                     if stop_reason == "cancelled" {
                         return GenOutcome::Failed("Cancelled".to_string());
                     }
@@ -378,6 +406,11 @@ impl Generation {
                     }
                     match self.finish_turn(cx, &text) {
                         TurnVerdict::Installed(manifest) => {
+                            makepad_widgets::log!(
+                                "app generation: validated clean — \"{}\" ready (attempt {})",
+                                manifest.name,
+                                self.repairs
+                            );
                             self.phase = GenPhase::Done;
                             let refine_of = match &self.mode {
                                 GenMode::Create => None,
@@ -392,6 +425,13 @@ impl Generation {
                                     "The generated app kept failing to compile".to_string(),
                                 );
                             }
+                            makepad_widgets::log!(
+                                "app generation: compile failed with {} error(s) — repair {} \
+                                 (of max {})",
+                                errors.len(),
+                                self.repairs,
+                                MAX_REPAIRS
+                            );
                             for e in errors.iter().take(3) {
                                 self.log(format!("⚠ {e}"));
                             }
@@ -414,6 +454,10 @@ impl Generation {
                             if self.repairs > MAX_REPAIRS {
                                 return GenOutcome::Failed(reason);
                             }
+                            makepad_widgets::log!(
+                                "app generation: reply had no fenced block — nudging (attempt {})",
+                                self.repairs
+                            );
                             let attempt = self.repairs;
                             self.log("Reply had no code block — asking again");
                             self.client.send_prompt(&build_nudge_prompt());
@@ -618,10 +662,23 @@ const PERMISSION_POLICY: &str = "The app is SANDBOXED. Anything beyond its own U
      the `nav.*` services (see the guide's Acting inside Robrix section), only ever \
      in response to a tap.";
 
+/// The pace policy for the app generator. The pipeline wants ONE valid Splash
+/// file, fast: a reasoning model may still stream its own thinking (nothing
+/// Robrix sends can switch a model's default-on reasoning off), so the prompt
+/// says outright what the pipeline needs — don't overthink, don't plan aloud,
+/// write the first complete app that satisfies the request, in one reply.
+pub(crate) const PACE_POLICY: &str = "Do NOT overthink this. Do not reason at \
+     length and do not plan aloud — read the request once, then write the \
+     complete, valid Splash app that meets it as a single fenced block, as \
+     quickly as you can. A working app delivered now is better than a perfect \
+     one; it can be refined later if the user asks.";
+
 fn build_initial_prompt(request: &str, slim: bool) -> String {
     format!(
         "You are the app generator for a phone launcher. Build a small, polished, \
          self-contained mini-app in the Makepad Splash dialect described below. \
+         {PACE_POLICY}\n\
+         \n\
          {RESPONSIVE_POLICY}\n\
          \n\
          {PERMISSION_POLICY}\n\
@@ -639,8 +696,10 @@ fn build_initial_prompt(request: &str, slim: bool) -> String {
 fn build_refine_prompt(request: &str, base: &MiniAppManifest, slim: bool) -> String {
     format!(
         "You are the app generator for a phone launcher. MODIFY an existing \
-         mini-app written in the Makepad Splash dialect described below. Keep \
-         everything the user didn't ask to change — including its responsive \
+         mini-app written in the Makepad Splash dialect described below. \
+         {PACE_POLICY}\n\
+         \n\
+         Keep everything the user didn't ask to change — including its responsive \
          layout: {RESPONSIVE_POLICY}\n\
          \n\
          {PERMISSION_POLICY}\n\
@@ -671,7 +730,8 @@ fn build_repair_prompt(errors: &[String]) -> String {
         "Your script failed to compile. Errors:\n{list}\n\n\
          Re-read the guide's rules and reply again with the corrected COMPLETE \
          script as EXACTLY ONE ```splash fenced block (same // name/icon/tint \
-         header), nothing else."
+         header), nothing else. Fix it directly — do not overthink or re-plan; \
+         correct what the errors point at and resend the whole script."
     )
 }
 

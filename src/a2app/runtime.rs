@@ -71,6 +71,10 @@ const PERSIST_THROTTLE: Duration = Duration::from_secs(2);
 const TIMED_GRANT_CHECK: Duration = Duration::from_secs(5);
 /// How often the generation console re-renders while output streams in.
 const CONSOLE_REPAINT: Duration = Duration::from_millis(120);
+/// The heartbeat interval kept alive while a generation runs, so its stall
+/// watchdog can fire without the agent's own (now-silent) events. Cheap: a
+/// timer tick just drains an empty event queue when all is well.
+const STALL_HEARTBEAT_SECS: f64 = 5.0;
 /// How long a room-scoped host action waits for its RoomScreen to appear.
 const ROOM_ACTION_TTL: Duration = Duration::from_secs(10);
 /// Read tool calls a session may make per rolling window before it is refused
@@ -180,11 +184,6 @@ pub struct AiRoomInfo {
     /// state actually changes (and hides once the agent goes idle).
     status_busy: bool,
     status_queued: usize,
-    /// Rooms (matrix ids) this room's AI may read beyond this one, added by
-    /// the user with `/ai allow <room>` (and removed with `/ai remove
-    /// <room>`). Per-device, like the session itself; the gate for
-    /// `matrix.rooms.messages.read` checks this on top of the group grant.
-    read_rooms: HashSet<String>,
 }
 
 /// All a2app state, owned by the UI thread.
@@ -247,6 +246,11 @@ pub struct A2AppState {
     registry_dirty: bool,
     last_persist: Instant,
     last_timed_check: Instant,
+    /// A slow heartbeat kept alive only while a generation runs, so the
+    /// stall watchdog in [`advance_generation`] fires even when a hung agent
+    /// stops producing events (see [`crate::a2app_agent::pipeline`]'s
+    /// `STALL_SECS`). Stopped once no generation is live.
+    generation_timer: Option<Timer>,
 }
 
 impl A2AppState {
@@ -320,6 +324,7 @@ pub fn init() {
             registry_dirty: false,
             last_persist: Instant::now(),
             last_timed_check: Instant::now(),
+            generation_timer: None,
         });
     });
 }
@@ -371,6 +376,11 @@ pub enum A2AppOp {
     /// Opens the "AI in this room" management panel for an AI room.
     #[cfg(unix)]
     AiRoomPanel(OwnedRoomId),
+    /// The user pressed Escape in an AI room: abort whatever its agent is
+    /// currently doing (an in-flight turn, queued prompts, or the app build
+    /// its `launch_splash_app` tool is waiting on), leaving the session idle.
+    #[cfg(unix)]
+    AbortAiRoom(OwnedRoomId),
 }
 
 
@@ -597,6 +607,23 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     #[cfg(unix)]
     advance_ai_sessions(cx, ui);
     advance_generation(cx, ui);
+    // Keep the generation stall-watchdog heartbeat alive exactly while a
+    // generation runs: its own events wake this loop constantly while the
+    // agent streams, but a silent (hung) agent produces none, and the stall
+    // check in advance_generation can only fire on an event.
+    with_a2app(|state| {
+        let running = state.generation.is_some();
+        match (running, state.generation_timer) {
+            (true, None) => {
+                state.generation_timer = Some(cx.start_interval(STALL_HEARTBEAT_SECS));
+            }
+            (false, Some(timer)) => {
+                cx.stop_timer(timer);
+                state.generation_timer = None;
+            }
+            _ => {}
+        }
+    });
     process_broker(cx, ui);
 
     // An action the user took that was refused or failed gets a popup that
@@ -1165,6 +1192,10 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
         A2AppOp::AiRoomPanel(room_id) => {
             open_ai_room_panel(cx, ui, &room_id);
         }
+        #[cfg(unix)]
+        A2AppOp::AbortAiRoom(room_id) => {
+            abort_ai_room_work(cx, ui, &room_id);
+        }
     }
 }
 
@@ -1287,6 +1318,17 @@ fn advance_generation(cx: &mut Cx, ui: &WidgetRef) {
     }
     let done = with_a2app(|state| {
         let generation = state.generation.as_mut()?;
+        // The stall watchdog: a live-but-silent agent (hung provider, dead
+        // network) produces no events, so it would otherwise leave the UI
+        // busy forever — and a session whose `launch_splash_app` tool call is
+        // waiting on this build would stay parked on an unanswered call. Fail
+        // the run so it resolves (the room's AI then reports the failure).
+        if generation.is_stalled() {
+            refresh_console(state, true);
+            let reason = "The agent went silent; the run was stopped.".to_string();
+            state.console.status = reason.clone();
+            return Some(Done::Failed(reason));
+        }
         match generation.advance(cx) {
             GenOutcome::Working => {
                 refresh_console(state, false);
@@ -1556,6 +1598,16 @@ fn queue_room_action(cx: &mut Cx, room_id: OwnedRoomId, action: RoomAction) -> R
     cx.action(AppStateAction::NavigateToRoom { room_to_close: None, destination_room });
     cx.action(A2AppRoomAction::Pending { room_id });
     Ok(())
+}
+
+/// Brings `room_id` forward (navigating to it if needed) and, once its
+/// timeline is showing, scrolls to `event_id` — how a click on a permalink to
+/// a message in ANOTHER room resolves (e.g. an AI reply that points at
+/// content the user asked about, or any chat link to a message elsewhere).
+/// Same-room links never come here; they jump directly on the RoomScreen.
+/// `Err` when the room isn't a joined room Robrix can open.
+pub fn open_event_in_room(cx: &mut Cx, room_id: OwnedRoomId, event_id: OwnedEventId) -> Result<(), String> {
+    queue_room_action(cx, room_id, RoomAction::JumpToEvent(event_id))
 }
 
 /// Archives the working copy as a new version and points the app at it.
@@ -1843,6 +1895,89 @@ fn show_next_permission_prompt(cx: &mut Cx, ui: &WidgetRef) {
     ui.modal(cx, ids!(a2app_permission_modal)).open(cx);
 }
 
+/// The verb phrase a permission prompt shows for one parked AI tool call —
+/// what the AI wants to *do* ("read recent messages in this room"), not a
+/// catalog noun ("Recent messages"), so the popup reads like the request it
+/// answers.
+#[cfg(unix)]
+fn ai_prompt_action(
+    rooms: Option<&RoomsListRef>,
+    perm: Permission,
+    parked: &[ParkedRequest],
+) -> String {
+    for p in parked {
+        if let ParkedRequest::AiTool { room_id: _room_id, job } = p {
+            return match job {
+                SessionJob::ReadTool { kind, .. } => match kind {
+                    ReadToolKind::Messages { .. } => String::from("read recent messages in this room"),
+                    ReadToolKind::Older { .. } => String::from("read this room's older messages"),
+                    ReadToolKind::Info => String::from("see this room's details"),
+                    ReadToolKind::OtherRoom { room, .. } => {
+                        let name = rooms
+                            .and_then(|r| room_display_name(r, room.as_str()))
+                            .unwrap_or_else(|| room.clone());
+                        format!("read messages in “{name}”")
+                    }
+                    ReadToolKind::ListRooms => String::from("see a list of your rooms"),
+                    // Ungated plumbing never parks behind a prompt; this arm
+                    // exists for exhaustiveness.
+                    ReadToolKind::Memory { .. } => String::from("recall its own past replies"),
+                },
+                SessionJob::LaunchSplashApp { .. } => String::from("build and run a mini-app"),
+                SessionJob::SendRoomMessage { .. } => continue,
+            };
+        }
+    }
+    match perm {
+        Permission::MatrixRoomRead => String::from("read messages in this room"),
+        Permission::MatrixRoomInfo => String::from("see this room's details"),
+        Permission::MatrixRoomsRead => String::from("read messages in another room"),
+        Permission::MatrixRoomsList => String::from("see a list of your rooms"),
+        Permission::AppGeneration => String::from("build and run a mini-app"),
+        _ => perm.title().to_string(),
+    }
+}
+
+/// Why an AI tool is asking, shown under the prompt's action line.
+#[cfg(unix)]
+fn ai_prompt_reason(
+    rooms: Option<&RoomsListRef>,
+    perm: Permission,
+    parked: &[ParkedRequest],
+) -> String {
+    for p in parked {
+        if let ParkedRequest::AiTool { room_id: _room_id, job } = p {
+            return match job {
+                SessionJob::ReadTool { kind, .. } => match kind {
+                    ReadToolKind::Messages { .. } => String::from("It is catching up on this conversation to answer you."),
+                    ReadToolKind::Older { .. } => String::from("It needs more of this conversation's history to answer you."),
+                    ReadToolKind::Info => String::from("It wants to know which room it is in."),
+                    ReadToolKind::OtherRoom { room, .. } => {
+                        let name = rooms
+                            .and_then(|r| room_display_name(r, room.as_str()))
+                            .unwrap_or_else(|| room.clone());
+                        format!("You asked it to read “{name}”, which is outside this room.")
+                    }
+                    ReadToolKind::ListRooms => String::from("It needs to know which rooms you have before it can offer to read one."),
+                    // Ungated plumbing never parks behind a prompt; this arm
+                    // exists for exhaustiveness.
+                    ReadToolKind::Memory { .. } => String::from("It is recalling what it previously said in this room."),
+                },
+                SessionJob::LaunchSplashApp { .. } => String::from("It is building an app you asked for."),
+                SessionJob::SendRoomMessage { .. } => continue,
+            };
+        }
+    }
+    match perm {
+        Permission::MatrixRoomRead => String::from("It is catching up on this conversation to answer you."),
+        Permission::MatrixRoomInfo => String::from("It wants to know which room it is in."),
+        Permission::MatrixRoomsRead => String::from("It needs to read a room outside this one."),
+        Permission::MatrixRoomsList => String::from("It needs to know which rooms you have."),
+        Permission::AppGeneration => String::from("It is building an app you asked for."),
+        _ => String::from("It needs this to answer your messages in this room."),
+    }
+}
+
 /// Builds what the prompt modal shows for one (subject, group, parked) tuple.
 /// An AI room's agent subject is presented as the room's AI with the concrete
 /// read it asked for; a mini-app keeps its registry identity and the app's own
@@ -1858,13 +1993,13 @@ fn prompt_info_for(
         let room_name = rooms
             .and_then(|r| room_display_name(r, room))
             .unwrap_or_else(|| room.to_string());
-        let capability = parked.iter().find_map(ai_parked_capability).map(|c| c.title.to_string());
         return PromptInfo {
             app_name: format!("AI in {room_name}"),
             app_icon: String::from("🤖"),
             perm,
-            reason: Some(String::from("It needs this to answer messages in this room.")),
-            capability,
+            reason: Some(ai_prompt_reason(rooms, perm, parked)),
+            capability: Some(ai_prompt_action(rooms, perm, parked)),
+            agent: true,
         };
     }
     let (app_name, app_icon, reason) = state.registry.get(subject)
@@ -1888,22 +2023,7 @@ fn prompt_info_for(
         ParkedRequest::AiTool { .. } => None,
     })
     .map(|c| c.title.to_string());
-    PromptInfo { app_name, app_icon, perm, reason, capability }
-}
-
-/// The catalog capability behind one parked AI tool call, if it names one.
-/// Only the read tools carry capabilities today; the native tools
-/// (`send_message`, `launch_splash_app`) are room plumbing and never prompt.
-fn ai_parked_capability(parked: &ParkedRequest) -> Option<&'static a2app_core::capabilities::Capability> {
-    match parked {
-        #[cfg(unix)]
-        ParkedRequest::AiTool { job, .. } => match job {
-            SessionJob::ReadTool { kind, .. } => kind.capability(),
-            SessionJob::LaunchSplashApp { .. } => a2app_core::capabilities::by_id("apps.generate"),
-            SessionJob::SendRoomMessage { .. } => None,
-        },
-        _ => None,
-    }
+    PromptInfo { app_name, app_icon, perm, reason, capability, agent: false }
 }
 
 /// Answers one session tool call with a finished result, whatever variant it
@@ -2139,6 +2259,69 @@ fn save_dirty(state: &mut A2AppState) {
     }
 }
 
+/// How long shutdown waits for a cancelled agent to end its turn before its
+/// process is killed anyway.
+const AI_SHUTDOWN_GRACE: Duration = Duration::from_millis(2000);
+
+/// Aborts every in-flight AI operation as the app shuts down: the one running
+/// generation (if any) and each live room session's current turn.
+///
+/// Each agent is told to abandon its turn with an explicit `session/cancel` —
+/// not just killed — so it can stop the LLM-provider request it is waiting
+/// on, and then a short grace is spent draining the sessions until their
+/// cancelled turns actually end (a `TurnDone` with a `cancelled` stop reason)
+/// or the grace expires. Whatever is still busy when this returns is cut off
+/// by process death: the held [`Generation`] drops here (killing its agent
+/// child), and the sessions' transports drop when the thread-local state is
+/// torn down right after. Provider-side work is therefore stopped two ways —
+/// the explicit cancel while the agent is alive to relay it, and the dropped
+/// HTTP connection once the child dies (streaming providers abort on that).
+///
+/// Called from `App::handle_shutdown` after state persistence. Returns
+/// immediately when nothing is running.
+#[cfg(unix)]
+pub fn shutdown() {
+    // Take the generation out of state and cancel its agent. It is held here
+    // (rather than dropped) for the grace below: dropping kills the child
+    // immediately, which can race the cancel that was just written to it.
+    let mut generation = with_a2app(|state| state.generation.take()).flatten();
+    if let Some(generation) = generation.as_mut() {
+        generation.cancel();
+    }
+    let had_work = with_a2app(|state| {
+        let mut had = generation.is_some();
+        for session in state.ai_sessions.values_mut() {
+            had |= session.abort();
+        }
+        had
+    })
+    .unwrap_or(false);
+    if !had_work {
+        return;
+    }
+    // Let the cancels land: drain each session until its turn is over. A live
+    // generation's cancellation isn't observable here (driving it needs a
+    // `Cx`, which shutdown no longer has), so it gets the full bounded grace
+    // before its child is killed on drop below.
+    let deadline = Instant::now() + AI_SHUTDOWN_GRACE;
+    while Instant::now() < deadline {
+        let sessions_idle = with_a2app(|state| {
+            for session in state.ai_sessions.values_mut() {
+                session.advance();
+            }
+            state.ai_sessions.values().all(|s| !s.is_busy())
+        })
+        .unwrap_or(true);
+        if sessions_idle && generation.is_none() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Dropping the generation here kills its agent child; the sessions'
+    // transports die with the process teardown right after this returns.
+    drop(generation);
+}
+
 /// Runs a `/miniapp` slash command typed in a room: bare opens the Mini Apps
 /// screen, "run <name>" opens an installed app attached to this room,
 /// "share <name>" posts an installed app's bundle into the room, and
@@ -2231,12 +2414,19 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
                 state
                     .ai_rooms
                     .entry(room_id)
-                    .or_insert(AiRoomInfo { cursor: None, posted_by_tool_this_turn: false, read_burst: 0, read_window_started: None, session_on: true, pending_tool_calls: Vec::new(), status_busy: false, status_queued: 0, read_rooms: HashSet::new() });
+                    .or_insert(AiRoomInfo { cursor: None, posted_by_tool_this_turn: false, read_burst: 0, read_window_started: None, session_on: true, pending_tool_calls: Vec::new(), status_busy: false, status_queued: 0 });
             });
         }
         AiRoomAction::CreateFailed { error } => {
             // app.rs already showed the error popup.
             log!("AI Rooms: AI room creation failed: {error}");
+        }
+        AiRoomAction::MarkFailed { error } => {
+            log!("AI Rooms: FAILED to mark the room as an AI room: {error}");
+            enqueue_popup_notification(
+                format!("Couldn't mark this room as an AI room: {error}"),
+                PopupKind::Error, Some(6.0),
+            );
         }
         AiRoomAction::NotAiRoom { room_id } => {
             log!("AI Rooms: room {room_id} has no ai_room marker; treating it as an ordinary room.");
@@ -2245,7 +2435,7 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
         AiRoomAction::Attached { room_id, name, cursor } => {
             log!("AI Rooms: room {room_id} is an AI room (name: {name:?}, saved forwarding cursor: {cursor:?}); attaching session.");
             with_a2app(|state| {
-                state.ai_rooms.insert(room_id.clone(), AiRoomInfo { cursor, posted_by_tool_this_turn: false, read_burst: 0, read_window_started: None, session_on: true, pending_tool_calls: Vec::new(), status_busy: false, status_queued: 0, read_rooms: HashSet::new() });
+                state.ai_rooms.insert(room_id.clone(), AiRoomInfo { cursor, posted_by_tool_this_turn: false, read_burst: 0, read_window_started: None, session_on: true, pending_tool_calls: Vec::new(), status_busy: false, status_queued: 0 });
             });
             attach_ai_session(cx, ui, &room_id, name);
         }
@@ -2257,10 +2447,13 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
             );
         }
         AiRoomAction::ToolReadResult { id, result } => {
-            // A granted read finished on the worker; answer the tool call that
-            // has been waiting on it and record the outcome on the turn's
-            // receipt. The sender is gone if the session ended meanwhile — a
-            // send failure is the cleanup (and no receipt is left behind).
+            // A read finished on the worker; answer the tool call that has
+            // been waiting on it. A granted read's outcome is recorded on the
+            // turn's receipt; ungated memory reads (recalling its own past
+            // turns) are room plumbing, not something the user watches for,
+            // so they leave no chip. The sender is gone if the session ended
+            // meanwhile — a send failure is the cleanup (and no receipt is
+            // left behind).
             if let Some((room_id, kind, answer)) =
                 with_a2app(|state| state.ai_reads.remove(&id)).flatten()
             {
@@ -2268,7 +2461,23 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
                     Ok(_) => (String::new(), true),
                     Err(e) => (e.clone(), false),
                 };
-                note_ai_tool_call(&room_id, read_tool_name(&kind), ok, &summary);
+                match &result {
+                    Ok(text) => log!(
+                        "AI Rooms: room {}'s {} tool answered OK ({} chars).",
+                        room_id,
+                        read_tool_name(&kind),
+                        text.chars().count()
+                    ),
+                    Err(e) => log!(
+                        "AI Rooms: room {}'s {} tool answered Err: {}",
+                        room_id,
+                        read_tool_name(&kind),
+                        e
+                    ),
+                }
+                if !matches!(kind, ReadToolKind::Memory { .. }) {
+                    note_ai_tool_call(&room_id, read_tool_name(&kind), ok, &summary);
+                }
                 let _ = answer.send(result);
             }
         }
@@ -2310,67 +2519,45 @@ fn set_ai_room_power(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, on: boo
 }
 
 /// The `/ai` command: with no argument it opens the "AI in this room" panel;
-/// `allow <room>` / `remove <room>` maintain the rooms this AI may read
-/// beyond this one. a2app + unix only (other builds no-op the action).
+/// `enable` marks the current room as an AI room. Reads of other rooms are
+/// asked for at the ordinary permission prompt — there is no allowlist to
+/// maintain. a2app + unix only (other builds no-op the action).
 #[cfg(unix)]
 pub fn ai_panel_command(cx: &mut Cx, arg: &str, room_id: &OwnedRoomId) {
     let known = with_a2app(|state| state.ai_rooms.contains_key(room_id)).unwrap_or(false);
+    let arg = arg.trim();
+
+    // `/ai enable` writes the marker to an existing room, turning it into an
+    // AI room; the room's agent attaches like any marked room.
+    if arg == "enable" {
+        if known {
+            enqueue_popup_notification(
+                "This room is already an AI room.",
+                PopupKind::Warning, Some(4.0),
+            );
+            return;
+        }
+        submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::Mark {
+            room_id: room_id.clone(),
+        }));
+        enqueue_popup_notification(
+            "Marking this room as an AI room...",
+            PopupKind::Info, Some(4.0),
+        );
+        return;
+    }
+
     if !known {
         enqueue_popup_notification(
-            "This isn't an AI room — there is no AI here to manage.",
+            "This isn't an AI room — there is no AI here to manage (try /ai enable).",
             PopupKind::Warning,
             Some(5.0),
         );
         return;
     }
-    let arg = arg.trim();
-    let edit_rooms = |state: &mut A2AppState, add: bool, target: &str| {
-        let Some(info) = state.ai_rooms.get_mut(room_id) else { return false };
-        if add {
-            info.read_rooms.insert(target.to_string())
-        } else {
-            info.read_rooms.remove(target)
-        }
-    };
-    if let Some(target) = arg.strip_prefix("allow ") {
-        let target = target.trim();
-        if OwnedRoomId::try_from(target).is_err() {
-            enqueue_popup_notification(
-                format!("\"{target}\" isn't a valid room id (it should look like !abc:server.org)."),
-                PopupKind::Error,
-                Some(5.0),
-            );
-            return;
-        }
-        if with_a2app(|state| edit_rooms(state, true, target)).unwrap_or(false) {
-            enqueue_popup_notification(
-                format!("This room's AI may now read {target}."),
-                PopupKind::Info,
-                Some(4.0),
-            );
-        }
-        return;
-    }
-    if let Some(target) = arg.strip_prefix("remove ") {
-        let target = target.trim();
-        if with_a2app(|state| edit_rooms(state, false, target)).unwrap_or(false) {
-            enqueue_popup_notification(
-                format!("This room's AI can no longer read {target}."),
-                PopupKind::Info,
-                Some(4.0),
-            );
-        } else {
-            enqueue_popup_notification(
-                format!("{target} wasn't on this AI's read list."),
-                PopupKind::Warning,
-                Some(4.0),
-            );
-        }
-        return;
-    }
     if !arg.is_empty() {
         enqueue_popup_notification(
-            "Usage: /ai — or /ai allow <room-id> / /ai remove <room-id>.",
+            "Usage: /ai — or /ai enable to turn this room into an AI room.",
             PopupKind::Warning,
             Some(5.0),
         );
@@ -2435,10 +2622,19 @@ fn refresh_ai_room_panel(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
             }
             s
         };
-        let managed: Vec<Permission> = [Permission::MatrixRoomRead, Permission::MatrixRoomInfo, Permission::AppGeneration]
-            .into_iter()
-            .filter(|p| ai_room_declares_perm(*p))
-            .collect();
+        // Kept in the same order as the panel's rows (read / info / generate
+        // / other rooms / room list); `ai_room_declares_perm` filters to what
+        // this room's AI actually offers.
+        let managed: Vec<Permission> = [
+            Permission::MatrixRoomRead,
+            Permission::MatrixRoomInfo,
+            Permission::AppGeneration,
+            Permission::MatrixRoomsRead,
+            Permission::MatrixRoomsList,
+        ]
+        .into_iter()
+        .filter(|p| ai_room_declares_perm(*p))
+        .collect();
         let rows: Vec<String> = managed.iter().map(|p| line(*p)).collect();
         let usage = {
             let parts: Vec<String> = managed
@@ -2601,6 +2797,58 @@ pub fn ai_room_status(room_id: &OwnedRoomId) -> Option<AiRoomStatus> {
         })
     })
     .flatten()
+}
+
+/// Whether the room's AI session is mid-work right now: a turn in flight, or
+/// member prompts queued behind it. The room's Escape-to-abort gate — when
+/// false there is nothing for the user to stop.
+#[cfg(unix)]
+pub fn ai_room_is_busy(room_id: &OwnedRoomId) -> bool {
+    with_a2app(|state| {
+        state.ai_sessions.get(room_id).map(|s| s.is_busy() || s.queued_len() > 0)
+    })
+    .flatten()
+    .unwrap_or(false)
+}
+
+/// Aborts what an AI room's agent is currently doing, in the order that lets
+/// every piece settle: the app build its `launch_splash_app` tool call is
+/// waiting on is cancelled first (dropping the [`Generation`] kills its agent
+/// and resolves the waiting tool call, so the room's own session cannot stay
+/// parked on it), then the session itself is asked to abandon its turn and
+/// drop queued prompts. The session survives, idle, for the next message.
+/// Only the room's own generation is touched — a build the Mini Apps screen
+/// (or another room) started keeps running.
+#[cfg(unix)]
+fn abort_ai_room_work(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
+    // Cancel the room's own generation first, if one is running. Exactly the
+    // Mini Apps screen's Stop, but scoped to this room's build.
+    let cancels_generation = with_a2app(|state| {
+        state.ai_generation_room.as_ref().is_some_and(|r| r == room_id)
+            && state.generation.is_some()
+    })
+    .unwrap_or(false);
+    if cancels_generation {
+        with_a2app(|state| {
+            // Dropping the Generation kills its agent child process.
+            state.generation = None;
+            state.console.status = String::from("Cancelled.");
+        });
+        resolve_session_generation(
+            cx,
+            ui,
+            None,
+            Err(String::from("The generation was cancelled.")),
+        );
+    }
+    // Then abandon the session's turn (and drop anything queued behind it).
+    // A no-op when the session is idle or already gone.
+    with_a2app(|state| {
+        if let Some(session) = state.ai_sessions.get_mut(room_id) {
+            session.abort();
+        }
+    });
+    ui.redraw(cx);
 }
 
 /// Forwards newly-seen member messages (in timeline order) to an AI room's
@@ -2850,6 +3098,22 @@ fn run_ai_read_tool(
     kind: ReadToolKind,
     answer: Sender<Result<String, String>>,
 ) {
+    // `read_room_memory` is ungated room plumbing — the agent recalling its
+    // OWN past replies — not a catalog capability, so it never floods, asks,
+    // records, or gets refused. Park it on the same id map the granted reads
+    // use and fetch it on the worker like any other read.
+    if let ReadToolKind::Memory { .. } = &kind {
+        let id = NEXT_AI_TOOL_ID.fetch_add(1, Ordering::Relaxed);
+        with_a2app(|state| {
+            state.ai_reads.insert(id, (room_id.clone(), kind.clone(), answer));
+        });
+        submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::ToolRead {
+            id,
+            room_id: room_id.clone(),
+            tool: kind,
+        }));
+        return;
+    }
     let Some(cap) = kind.capability() else {
         let _ = answer.send(Err("this tool is no longer offered".to_string()));
         return;
@@ -2882,26 +3146,20 @@ fn run_ai_read_tool(
     let subject = agent_subject(room_id.as_str());
     let verdict =
         with_a2app(|state| ai_capability_verdict(state, room_id, cap)).unwrap_or(Effective::Denied);
+    log!(
+        "AI Rooms: room {}'s {} tool verdict: {:?}",
+        room_id,
+        read_tool_name(&kind),
+        verdict
+    );
     match verdict {
         Effective::Granted => {
-            // Cross-room reads additionally need the TARGET room on this AI's
-            // allowlist (`/ai allow <room>`); a group grant alone is not
-            // enough — it answers "may it read other rooms at all", not
-            // "which rooms".
-            if let ReadToolKind::OtherRoom { room, .. } = &kind {
-                let allowed = with_a2app(|state| {
-                    state.ai_rooms.get(room_id).map(|i| i.read_rooms.contains(room)).unwrap_or(false)
-                }).unwrap_or(false);
-                if !allowed {
-                    let text = format!(
-                        "Reading {room} is not allowed: the user must add it first with \
-                         `/ai allow {room}` in this room's AI settings."
-                    );
-                    note_ai_tool_call(room_id, read_tool_name(&kind), false, &text);
-                    let _ = answer.send(Err(text));
-                    return;
-                }
-            }
+            // A cross-room read is gated by the same group grant as any other
+            // read: once the user has allowed `matrix.rooms.messages.read`
+            // (prompted on the first read of a room outside this one), the
+            // AI may read any joined room it names. No allowlist to
+            // maintain.
+            //
             // The group answered; record that the session actually used it —
             // the same "Used" record a mini-app's granted call leaves, so the
             // room's AI panel can show what it has been doing.
@@ -3174,7 +3432,11 @@ fn post_ai_reply(room_id: &OwnedRoomId, text: String) {
         room_id: room_id.clone(),
         content: AiReplyContent {
             v: 1,
-            text,
+            text: text.clone(),
+            // Markdown→HTML, so a user mention or a permalink the agent put
+            // in its reply renders as a clickable pill (see
+            // `ai_room_events::agent_reply_formatted_html`).
+            formatted: crate::a2app::ai_room_events::agent_reply_formatted_html(&text),
             tool_calls,
             model: None,
             created_at,

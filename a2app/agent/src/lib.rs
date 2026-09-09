@@ -509,11 +509,22 @@ pub fn blocker() -> Option<Blocker> {
 /// Anthropic-compatible bridge, else an external `octos acp` — with the
 /// provider auto-detected from the environment when octos was never
 /// configured, so an exported API key is the ONLY setup needed.
+///
+/// The generation agent runs WITHOUT extended thinking (see
+/// [`prefs::AgentPrefs::for_app_generation`]): it is a one-shot sub-agent
+/// writing one Splash file, and for octos any reasoning params would map to
+/// thinking for the very providers Robrix runs it on. Chat sessions use
+/// [`start_backend_with_mcp`] directly and keep the user's full picks.
 pub fn start_backend(
     workspace: &std::path::Path,
     prefs: &prefs::AgentPrefs,
 ) -> Result<Box<dyn AgentTransport>, String> {
-    start_backend_with_mcp(workspace, prefs, &[])
+    let prefs = prefs.for_app_generation();
+    makepad_widgets::log!(
+        "app-generation agent: extended thinking forced OFF for this run \
+         (model pick kept, effort cleared, thinking=off)"
+    );
+    start_backend_with_mcp(workspace, &prefs, &[])
 }
 
 /// [`start_backend`] plus the stdio MCP servers the spawned agent is told
@@ -545,9 +556,38 @@ pub fn start_backend_with_mcp(
     // octos takes its reasoning effort from its own config file rather than a
     // flag, so delivering that pick means editing that file (see
     // prefs::apply_octos_effort).
-    if let prefs::Backend::Octos { .. } = backend {
-        if let Err(e) = prefs::apply_octos_effort(prefs.effort.as_deref()) {
+    if let prefs::Backend::Octos { provider } = &backend {
+        // DeepSeek's V4 family is the exception that must NEVER receive an
+        // effort: octos translates ANY `reasoning_effort` for it into
+        // `reasoning_effort` + `thinking: enabled` (see octos-llm's
+        // openai.rs — every level switches extended thinking on), and
+        // Robrix's DeepSeek default is flash-with-no-thinking. So a DeepSeek
+        // run delivers no effort pick, and a `reasoning_effort` left in
+        // octos's config by anything else is stripped: octos then emits no
+        // thinking parameters and the model stays on its no-thinking
+        // default. Applies to every DeepSeek agent — chat sessions and the
+        // app-generation pipeline alike.
+        let effort = if provider == "deepseek" {
+            None
+        } else {
+            prefs.effort.as_deref()
+        };
+        if let Err(e) = prefs::apply_octos_effort(effort) {
             makepad_widgets::error!("couldn't set octos reasoning effort: {e}");
+        } else {
+            // The mechanism octos actually reads at `octos acp` boot: whether
+            // the model gets any thinking at all hinges on this config field
+            // (`gateway.reasoning_effort`), so the log shows what the spawned
+            // agent will really run with. `None` = octos emits no reasoning
+            // params and the model stays on its own default.
+            makepad_widgets::log!(
+                "octos {provider} agent: reasoning_effort={effort:?} ({}); \
+                 cleared from {}",
+                if effort.is_none() { "no extended thinking" } else { "thinking on" },
+                octos_config_candidates().into_iter().find(|p| p.exists())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "no config file (nothing to clear)".to_string())
+            );
         }
     }
     if let Ok(cmd) = std::env::var("ROBRIX_AGENT_CMD") {

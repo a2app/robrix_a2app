@@ -12,6 +12,10 @@
 use makepad_widgets::*;
 use serde::{Deserialize, Serialize};
 
+// For the `reply_body` HtmlOrPlaintext child accessor in the card's
+// populate; `HtmlOrPlaintext` and its widget are shared from `crate::shared`.
+use crate::shared::html_or_plaintext::HtmlOrPlaintextWidgetExt as _;
+
 /// The state event that marks a room as an AI room. `state_key` is always
 /// `""` (one marker per room). Only the room creator's own client ever
 /// writes this (state-event power levels keep other members from forging
@@ -51,6 +55,12 @@ pub struct AiReplyToolCall {
 pub struct AiReplyContent {
     pub v: u32,
     pub text: String,
+    /// The reply rendered as HTML (Markdown → HTML, mentions/links as
+    /// `matrix.to` anchors), when the text has any formatting worth it. Rendered
+    /// like an ordinary rich message, so a user handle or a permalink the agent
+    /// included becomes a clickable pill. `None` when the reply is plain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formatted: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<AiReplyToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -105,14 +115,9 @@ script_mod! {
             text: "AI"
         }
 
-        reply_text := Label {
+        reply_body := HtmlOrPlaintext {
             width: Fill, height: Fit
             padding: 0, margin: 0
-            flow: Flow.Right{wrap: true},
-            draw_text +: {
-                text_style: MESSAGE_TEXT_STYLE {},
-                color: (MESSAGE_TEXT_COLOR)
-            }
         }
 
         reply_tools := Label {
@@ -143,13 +148,47 @@ impl Widget for AiReplyTimelineCard {
     }
 }
 
+/// Converts an agent's reply text into display HTML when it carries any
+/// formatting: Markdown→HTML exactly like Robrix's own composer, so user
+/// mentions written as `[Name](https://matrix.to/#/@user:server)` and message
+/// links written as `[..](https://matrix.to/#/!room:server/$event)` come out
+/// as clickable `matrix.to` anchors — which the timeline renders as pills.
+/// Returns `None` when the text is plain (no headings, lists, emphasis, links
+/// …), in which case the card renders the plain text path instead.
+pub fn agent_reply_formatted_html(text: &str) -> Option<String> {
+    use matrix_sdk::ruma::events::room::message::{MessageType, RoomMessageEventContent};
+    let content = RoomMessageEventContent::text_markdown(text);
+    match content.msgtype {
+        MessageType::Text(m) => m.formatted.map(|f| f.body),
+        MessageType::Notice(m) => m.formatted.map(|f| f.body),
+        _ => None,
+    }
+}
+
 impl AiReplyTimelineCardRef {
     /// Populates the card from an `ai_reply` event's content.
     /// Re-set on every draw, since timeline items get recycled.
     pub fn populate(&self, cx: &mut Cx, content: Option<&AiReplyContent>) {
         let Some(inner) = self.borrow_mut() else { return };
-        let text = content.map(|c| c.text.as_str()).unwrap_or("(unreadable reply)");
-        inner.view.label(cx, ids!(reply_text)).set_text(cx, text);
+        let view = &inner.view;
+        // The reply renders like an ordinary message: rich HTML when the text
+        // had any Markdown (so a user handle or a permalink the agent included
+        // becomes a clickable pill), plain text otherwise (bare URLs still get
+        // linkified). See `agent_reply_formatted_html` for the rich side.
+        let reply_body = view.html_or_plaintext(cx, ids!(reply_body));
+        match content.and_then(|c| c.formatted.as_ref()) {
+            Some(html) => {
+                let html = crate::utils::linkify_get_urls(html, true, None);
+                reply_body.show_html(cx, html);
+            }
+            None => {
+                let text = content.map(|c| c.text.as_str()).unwrap_or("(unreadable reply)");
+                match crate::utils::linkify_get_urls(text, false, None) {
+                    std::borrow::Cow::Owned(linkified) => reply_body.show_html(cx, linkified),
+                    std::borrow::Cow::Borrowed(_) => reply_body.show_plaintext(cx, text),
+                }
+            }
+        }
         let tools_line = content
             .filter(|c| !c.tool_calls.is_empty())
             .map(|c| {
@@ -166,7 +205,7 @@ impl AiReplyTimelineCardRef {
                 format!("Used: {}", parts.join(", "))
             })
             .unwrap_or_default();
-        let reply_tools = inner.view.label(cx, ids!(reply_tools));
+        let reply_tools = view.label(cx, ids!(reply_tools));
         reply_tools.set_visible(cx, !tools_line.is_empty());
         reply_tools.set_text(cx, &tools_line);
     }

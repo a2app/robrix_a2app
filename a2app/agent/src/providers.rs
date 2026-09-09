@@ -366,6 +366,26 @@ pub fn effective_provider() -> Option<String> {
 /// a config Robrix writes never sets one.
 const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-v4-flash";
 
+/// The model Robrix itself defaults a provider to, when its stock octos
+/// registry default would run the wrong reasoning mode. Only DeepSeek today:
+/// octos's `deepseek-chat` default routes to a model whose default has
+/// extended thinking on, and nothing octos sends can turn a default-on model
+/// off — the no-thinking variant has to be NAMED. See [`Backend::model_override`]
+/// for when this is applied.
+pub(crate) fn default_model_for(provider: &str) -> Option<&'static str> {
+    (provider == "deepseek").then_some(DEEPSEEK_DEFAULT_MODEL)
+}
+
+/// Whether the octos config a run would read names a model at all. When it
+/// does (a hand edit, or a Robrix setup that wrote one), that model wins over
+/// [`default_model_for`] — except a no-reasoning run, which overrides it.
+pub(crate) fn model_in_config() -> bool {
+    read_config()
+        .get("model")
+        .and_then(|m| m.as_str())
+        .is_some_and(|m| !m.trim().is_empty())
+}
+
 /// Shared by [`save_key`] and [`set_active`], which both move `provider` — one
 /// copy so the two verbs can't drift. Rules:
 ///

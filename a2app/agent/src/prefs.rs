@@ -279,13 +279,14 @@ impl Backend {
                 Knob::new(KnobId::Effort, "Effort", claude_efforts()),
                 Knob::new(KnobId::Thinking, "Thinking", &[("On", "on"), ("Off", "off")]),
             ],
-            // Effort for every provider: octos applies `gateway.reasoning_effort`
-            // to each turn and maps it per provider (OpenAI/Grok get
-            // `reasoning_effort`, Gemini a thinking budget, Anthropic a thinking
-            // block); models without a reasoning style ignore it. Model only
-            // where we can name models honestly — inventing ids for a provider
-            // we can't enumerate would just error at generation time, and
-            // Ollama already auto-picks the best installed model.
+            // Effort for most providers: octos applies
+            // `gateway.reasoning_effort` to each turn and maps it per provider
+            // (OpenAI/Grok get `reasoning_effort`, Gemini a thinking budget,
+            // Anthropic a thinking block); models without a reasoning style
+            // ignore it. Model only where we can name models honestly —
+            // inventing ids for a provider we can't enumerate would just error
+            // at generation time, and Ollama already auto-picks the best
+            // installed model.
             Self::Octos { provider } => match provider.as_str() {
                 // Kimi Coding Plan. Effort IS delivered (k3 takes
                 // low|high|max, thinking always on) but has no medium rung.
@@ -297,6 +298,14 @@ impl Backend {
                 // there is no honest control to show — the model's own
                 // default is the whole story.
                 "moonshot" | "kimi" => Vec::new(),
+                // DeepSeek (V4 family). NO control at all, by design: octos
+                // maps ANY `reasoning_effort` for the V4 family to
+                // `reasoning_effort` + `thinking: enabled`, so effort and
+                // extended thinking are the same switch — and DeepSeek runs
+                // with thinking off at all times (see the guard in
+                // `start_backend_with_mcp`). Offering the knob would offer
+                // turning thinking back on.
+                "deepseek" => Vec::new(),
                 "anthropic" => vec![
                     Knob::new(KnobId::Model, "Model", CLAUDE_MODELS),
                     Knob::new(KnobId::Effort, "Effort", OCTOS_EFFORTS),
@@ -353,31 +362,55 @@ impl Backend {
         }
     }
 
-    /// The saved model pick, but only when THIS backend actually offers a
-    /// control for it.
+    /// The model a run actually launches with — one of, in order of
+    /// precedence:
     ///
-    /// The pick is persisted globally, so a model chosen while one provider
-    /// was configured is still in the file when another one is. Passing it on
-    /// regardless is a baffling failure, not a useful passthrough: sending
-    /// `claude-opus-5` to the Kimi coding plan makes octos stop recognising
-    /// the model as k3, so it stops suppressing `temperature` for it, and the
-    /// endpoint 400s with "invalid temperature: only 1 is allowed for this
-    /// model" — a message about a parameter nobody set, naming neither the
-    /// model nor the provider.
+    /// 1. the user's saved pick, but only when THIS backend offers a Model
+    ///    knob for it;
+    /// 2. Robrix's own default for providers whose stock octos registry
+    ///    default is wrong for this app (see below);
+    /// 3. nothing — the agent's own config or registry default.
+    ///
+    /// Rule (1) is guarded because the pick is persisted globally, so a model
+    /// chosen while one provider was configured is still in the file when
+    /// another one is. Passing it on regardless is a baffling failure, not a
+    /// useful passthrough: sending `claude-opus-5` to the Kimi coding plan
+    /// makes octos stop recognising the model as k3, so it stops suppressing
+    /// `temperature` for it, and the endpoint 400s with "invalid temperature:
+    /// only 1 is allowed for this model" — a message about a parameter nobody
+    /// set, naming neither the model nor the provider.
+    ///
+    /// Rule (2) is DeepSeek: octos's registry default is `deepseek-chat`,
+    /// which today routes to a model whose DEFAULT has extended thinking on —
+    /// so an app that asked for no reasoning still gets streams of thinking,
+    /// because nothing octos sends can turn a default-on model off. Robrix's
+    /// own DeepSeek setups therefore pin `deepseek-v4-flash` (the
+    /// no-thinking-by-default variant; the Providers page writes the same
+    /// model into the config it creates). The flag is applied when the run
+    /// asks for no reasoning (generation always does) or when the config
+    /// names no model at all — an explicitly configured DeepSeek model is
+    /// respected, except by a no-reasoning run, which overrides it.
     ///
     /// Shared by the child process (which sends `--model`) and the embedded
     /// agent (which sets `AcpCommand.model`). They had separate copies of this
     /// rule for exactly one commit, which is how the bug above shipped.
     pub fn model_override(&self, prefs: &AgentPrefs) -> Option<String> {
-        let model = prefs.model.as_ref()?;
-        if !matches!(self, Self::Octos { .. }) {
+        let Self::Octos { provider } = self else {
             return None;
+        };
+        // Rule (1): the saved pick, only for backends that offer a Model knob.
+        if let Some(model) = prefs.model.as_ref()
+            && self.knobs().iter().any(|k| k.id == KnobId::Model)
+        {
+            return Some(model.clone());
         }
-        // A backend with no Model knob runs its provider's default.
-        if !self.knobs().iter().any(|k| k.id == KnobId::Model) {
-            return None;
+        // Rule (2): Robrix's default model for providers whose registry
+        // default would defeat the requested reasoning mode.
+        let no_reasoning = prefs.thinking.as_deref() == Some("off");
+        if provider == "deepseek" && (no_reasoning || !super::providers::model_in_config()) {
+            return super::providers::default_model_for("deepseek").map(str::to_string);
         }
-        Some(model.clone())
+        None
     }
 }
 
@@ -494,6 +527,26 @@ impl AgentPrefs {
             KnobId::Thinking => self.thinking = value,
         }
     }
+
+    /// The picks a one-shot app-generation agent runs with: the user's model
+    /// pick, but NEVER extended thinking.
+    ///
+    /// Deliberately drops the effort pick too, not just `thinking`: on octos
+    /// the two are the same switch for every thinking-capable provider — any
+    /// `reasoning_effort` level maps to a thinking block for Anthropic, to
+    /// `thinking: enabled` for DeepSeek V4 (see the guard in
+    /// `start_backend_with_mcp`), and Kimi's plan keeps thinking on at every
+    /// rung. So "no thinking" means "no reasoning params at all". A Claude
+    /// Code backend (the `ROBRIX_AGENT_CMD` override) reads `thinking: off`
+    /// as `MAX_THINKING_TOKENS=0`. Chat sessions call `start_backend_with_mcp`
+    /// with the user's full picks and are unaffected.
+    pub fn for_app_generation(&self) -> Self {
+        Self {
+            model: self.model.clone(),
+            effort: None,
+            thinking: Some("off".to_string()),
+        }
+    }
 }
 
 fn agent_prefs_path() -> std::path::PathBuf {
@@ -591,6 +644,68 @@ mod tests {
         assert_eq!(ids, vec![KnobId::Effort]);
         // A foreign ACP binary is a black box — nothing at all.
         assert!(Backend::Custom.knobs().is_empty());
+    }
+
+    /// DeepSeek's V4 family gets NO effort knob: octos turns ANY
+    /// `reasoning_effort` for it into a `thinking: enabled` switch, and
+    /// DeepSeek runs with thinking off at all times. The knob would be an
+    /// invitation to flip that back on.
+    #[test]
+    fn deepseek_never_gets_an_effort_knob() {
+        let deepseek = Backend::Octos { provider: "deepseek".into() };
+        assert!(deepseek.knobs().is_empty(), "deepseek must not offer effort");
+        assert!(deepseek.top_effort().is_none());
+        // The real rule: a saved model pick from ANOTHER provider must never be
+        // sent to deepseek (no Model knob), but a no-reasoning run or a config
+        // with no model still gets Robrix's flash default — otherwise octos's
+        // stock `deepseek-chat` default runs a thinking-by-default model no
+        // matter what Robrix asks for. Scope the config reads to a scratch dir
+        // so the ambient ~/.octos config can't leak into the assertion.
+        let _guard = super::super::CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("octos-deepseek-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: single-threaded test (the suite runs these serially).
+        unsafe { std::env::set_var("OCTOS_CONFIG_DIR", &dir) };
+        std::fs::write(dir.join("config.json"), r#"{"version":1,"provider":"deepseek"}"#).unwrap();
+
+        let foreign_pick = AgentPrefs {
+            model: Some("claude-opus-5".into()),
+            effort: Some("max".into()),
+            ..Default::default()
+        };
+        // No model in the config: deepseek gets Robrix's flash default, never
+        // the foreign saved pick.
+        assert_eq!(
+            deepseek.args(&foreign_pick),
+            vec!["--model".to_string(), "deepseek-v4-flash".to_string()],
+        );
+        assert!(deepseek.env(&foreign_pick).is_empty(), "deepseek gets no env knobs");
+
+        // An explicitly configured deepseek model is respected when thinking
+        // isn't being forced off.
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"version":1,"provider":"deepseek","model":"deepseek-v4"}"#,
+        )
+        .unwrap();
+        assert!(deepseek.args(&foreign_pick).is_empty(), "a named model wins over the default");
+
+        // But a no-reasoning run (the app-generation agent) overrides even an
+        // explicit thinking model, because that model would defeat the ask.
+        let no_reasoning = AgentPrefs {
+            model: None,
+            effort: None,
+            thinking: Some("off".into()),
+        };
+        assert_eq!(
+            deepseek.args(&no_reasoning),
+            vec!["--model".to_string(), "deepseek-v4-flash".to_string()],
+        );
+
+        unsafe { std::env::remove_var("OCTOS_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The create UI's segmented controls carry these labels literally — a
@@ -713,6 +828,37 @@ mod tests {
         assert_eq!(
             Backend::ClaudeCode.env(&prefs),
             vec![("ANTHROPIC_MODEL".to_string(), "claude-something-new".to_string())]
+        );
+    }
+
+    /// The app-generation sub-agent must never run with extended thinking,
+    /// however the user's global picks are set. It keeps the model pick but
+    /// drops effort (on octos any effort maps to thinking for Anthropic /
+    /// DeepSeek V4 / Kimi) and pins `thinking` to off (the Claude Code
+    /// delivery of the same rule).
+    #[test]
+    fn app_generation_prefs_never_think() {
+        let user = AgentPrefs {
+            model: Some("claude-sonnet-5".into()),
+            effort: Some("max".into()),
+            thinking: Some("on".into()),
+        };
+        let generation = user.for_app_generation();
+        assert_eq!(generation.model.as_deref(), Some("claude-sonnet-5"), "model pick is kept");
+        assert_eq!(generation.effort, None, "effort is dropped so octos emits no reasoning params");
+        assert_eq!(generation.thinking.as_deref(), Some("off"));
+        // And the original is untouched — a chat session still gets the
+        // user's own picks.
+        assert_eq!(user.effort.as_deref(), Some("max"));
+        assert_eq!(user.thinking.as_deref(), Some("on"));
+        // Delivery check: a Claude Code backend turns thinking=off into a
+        // zero budget, exactly as the CLI spells "thinking off".
+        assert_eq!(
+            Backend::ClaudeCode.env(&generation),
+            vec![
+                ("ANTHROPIC_MODEL".to_string(), "claude-sonnet-5".to_string()),
+                ("MAX_THINKING_TOKENS".to_string(), "0".to_string()),
+            ]
         );
     }
 }

@@ -155,10 +155,36 @@ impl ToolServer {
         }
 
         // A fresh directory per session keeps sockets from colliding and makes
-        // teardown a single directory removal.
-        let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
-        let dir = root.join(format!("session-{id}"));
-        std::fs::create_dir(&dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
+        // teardown a single directory removal. A Robrix process that was killed
+        // (not dropped) leaves its session-<n> directories behind, and the
+        // process-wide counter restarts at 1, so a taken id is reclaimed when
+        // stale — its socket is gone or accepts no connection — and skipped
+        // when a live listener still owns it (a concurrent second process must
+        // never have its live session torn down).
+        let dir = loop {
+            let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+            let dir = root.join(format!("session-{id}"));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => break dir,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let socket = dir.join("tools.sock");
+                    if UnixStream::connect(&socket).is_ok() {
+                        // A live session (e.g. another process) owns this id;
+                        // leave it alone and take the next one.
+                        continue;
+                    }
+                    // A killed process's leftovers: clear the socket and dir.
+                    let _ = std::fs::remove_file(&socket);
+                    std::fs::remove_dir(&dir).map_err(|e| {
+                        format!("couldn't clear stale session dir {}: {e}", dir.display())
+                    })?;
+                    std::fs::create_dir(&dir)
+                        .map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
+                    break dir;
+                }
+                Err(e) => return Err(format!("couldn't create {}: {e}", dir.display())),
+            }
+        };
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use a2app_agent::mcp::McpServer;
 use robrix::a2app::ai::server::ToolServer;
-use robrix::a2app::ai::tools::{AiHost, register_session_tools};
+use robrix::a2app::ai::tools::{AiHost, ReadToolKind, register_session_tools};
 use rmcp::model::{CallToolRequestParams, ClientInfo, Implementation};
 use rmcp::service::{RoleClient, RunningService, serve_client};
 use rmcp::transport::child_process::TokioChildProcess;
@@ -67,6 +67,10 @@ impl AiHost for RecordingHost {
             .unwrap()
             .push(format!("send_room_message({text:?})"));
         Ok("posted".to_string())
+    }
+
+    fn read_tool(&self, _kind: ReadToolKind) -> Result<String, String> {
+        Err("read_tool not exercised by this test".to_string())
     }
 }
 

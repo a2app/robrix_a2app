@@ -78,6 +78,9 @@ pub struct PromptInfo {
     /// The specific ability that triggered the ask (its catalog title), when
     /// a parked request identifies one.
     pub capability: Option<String>,
+    /// Whether the asker is a room's AI agent (vs an installed mini-app):
+    /// changes the wording of the blurb and reason lines.
+    pub agent: bool,
 }
 
 /// The user's answer, emitted as a global action for the runtime to apply.
@@ -133,18 +136,27 @@ impl MiniAppPermissionPromptRef {
             "{} \"{}\" wants to: {}",
             info.app_icon, info.app_name, asked,
         ));
-        // Allowing answers for the whole group; App Info can narrow it.
-        let blurb = match info.capability {
-            Some(_) => format!(
+        // Allowing answers for the whole group; the room's AI panel (agents)
+        // or App Info (mini-apps) can change it later.
+        let blurb = if info.agent {
+            format!(
+                "Allowing covers the \"{}\" group for this room's AI; you can change it later in the room's AI panel.",
+                info.perm.title(),
+            )
+        } else if info.capability.is_some() {
+            format!(
                 "{} Allowing covers the \"{}\" group; single abilities can be blocked in App Info.",
                 info.perm.blurb(), info.perm.title(),
-            ),
-            None => info.perm.blurb().to_string(),
+            )
+        } else {
+            info.perm.blurb().to_string()
         };
         inner.view.label(cx, ids!(prompt_blurb)).set_text(cx, &blurb);
-        let reason_text = match info.reason.as_deref() {
-            Some(reason) => format!("The app's stated reason: \"{reason}\""),
-            None => String::from("The app gave no reason for needing this."),
+        let reason_text = match (info.agent, info.reason.as_deref()) {
+            (true, Some(reason)) => reason.to_string(),
+            (true, None) => String::from("It needs this to answer your messages in this room."),
+            (false, Some(reason)) => format!("The app's stated reason: \"{reason}\""),
+            (false, None) => String::from("The app gave no reason for needing this."),
         };
         inner.view.label(cx, ids!(prompt_reason)).set_text(cx, &reason_text);
         inner.view.button(cx, ids!(allow_once_button)).set_visible(cx, inner.show_once);

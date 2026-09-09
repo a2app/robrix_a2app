@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use a2app_agent::mcp::McpServer;
 use robrix::a2app::ai::server::ToolServer;
-use robrix::a2app::ai::tools::{AiHost, register_session_tools};
+use robrix::a2app::ai::tools::{AiHost, ReadToolKind, register_session_tools};
 use serde_json::{Value, json};
 
 /// How long a reply may take before the test gives up. A local socket round
@@ -78,6 +78,12 @@ impl AiHost for RecordingHost {
             .unwrap()
             .push(format!("send_room_message({text:?})"));
         Ok("posted".to_string())
+    }
+
+    fn read_tool(&self, _kind: ReadToolKind) -> Result<String, String> {
+        // The transport tests never drive a read; record nothing, answer
+        // as if the read were refused so a stray call is visible in `calls`.
+        Err("read_tool not exercised by this test".to_string())
     }
 }
 
@@ -280,12 +286,25 @@ fn a_full_mcp_session_over_the_relay_child() {
     client.notify("notifications/initialized", json!({}));
     client.expect_silence(Duration::from_millis(500));
 
-    // tools/list: both registered tools, with their schemas, no cursor.
+    // tools/list: the session's full tool set — the capability-gated reads,
+    // the generator, and the two ungated native tools — no cursor.
     let result = client.request("tools/list", json!({}));
     assert!(result.get("nextCursor").is_none(), "never paginate");
     let tools = result["tools"].as_array().expect("tools is a list");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, vec!["launch_splash_app", "send_message"]);
+    assert_eq!(
+        names,
+        vec![
+            "read_room_messages",
+            "read_older_messages",
+            "room_info",
+            "list_rooms",
+            "read_other_room_messages",
+            "launch_splash_app",
+            "read_room_memory",
+            "send_message",
+        ]
+    );
     for tool in tools {
         assert!(tool["description"].as_str().unwrap().len() > 20);
         assert_eq!(tool["inputSchema"]["type"], "object");
