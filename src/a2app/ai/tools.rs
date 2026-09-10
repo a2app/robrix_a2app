@@ -38,9 +38,9 @@ pub trait AiHost: Send + Sync {
     /// Posts `text` into the room associated with this session.
     fn send_room_message(&self, text: &str) -> Result<String, String>;
 
-    /// Posts `text` into ANOTHER joined room as an agent state-event card,
-    /// gated per room (the user is asked the first time this agent posts
-    /// into each room).
+    /// Posts `text` into ANOTHER joined room as an `m.notice` message, gated
+    /// per room (the user is asked the first time this agent posts into each
+    /// room).
     fn post_room_message(&self, room: &str, text: &str) -> Result<String, String>;
 
     /// One capability-gated attached-room read. The host hands it to the UI
@@ -545,12 +545,12 @@ impl Tool for SendMessageTool {
 }
 
 /// `post_room_message` — post an agent-authored message into another joined
-/// room as an AI state-event card.
+/// room as an `m.notice` message.
 ///
-/// The card is the same `ai_reply` state event the agent's own room shows
-/// (never `m.room.message`, so it can't loop back anywhere). Permission is
-/// granted PER ROOM: the user is asked the first time the agent posts into
-/// each room it names, and an allowance covers exactly that room.
+/// A notice is an ordinary `m.room.message` (never the agent's own `ai_reply`
+/// state card), so it needs no state-power privilege in the target room.
+/// Permission is granted PER ROOM: the user is asked the first time the agent
+/// posts into each room it names, and an allowance covers exactly that room.
 pub struct PostRoomMessageTool {
     host: Arc<dyn AiHost>,
 }
@@ -567,8 +567,8 @@ impl Tool for PostRoomMessageTool {
     }
 
     fn description(&self) -> &str {
-        "Posts a message to another of the user's joined rooms as an AI \
-         card, using the same formatting and linking as send_message \
+        "Posts a message to another of the user's joined rooms as a \
+         notice, using the same formatting and linking as send_message \
          (Markdown: **bold**, *italic*, lists; link a person with their \
          full matrix id [Name](https://matrix.to/#/@user:server); link a \
          specific message with its permalink \

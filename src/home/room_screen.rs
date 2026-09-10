@@ -932,9 +932,28 @@ pub(crate) fn index_of_event(
 /// Scans an AI room's currently-loaded timeline for member text messages
 /// after its forwarding cursor, and forwards any new ones to its agent
 /// session (see [`crate::a2app::runtime::forward_ai_room_texts`]).
+///
+/// Only messages from the room's most privileged member(s) become prompts:
+/// the agent answers the room's owner, so a message is forwarded only when
+/// its sender holds the highest power level in the room.
 #[cfg(all(feature = "a2app", unix))]
-fn scan_ai_room_messages(room_id: &OwnedRoomId, items: &Vector<Arc<TimelineItem>>) {
+fn scan_ai_room_messages(
+    room_id: &OwnedRoomId,
+    items: &Vector<Arc<TimelineItem>>,
+    room_members: Option<&[RoomMember]>,
+) {
+    use matrix_sdk::ruma::events::room::power_levels::UserPowerLevel;
+
     let Some(scan_state) = crate::a2app::runtime::ai_room_scan_state(room_id) else { return };
+    // Until the member list is loaded we can't tell who is most privileged,
+    // so forward nothing rather than risk answering a lower-power member's
+    // message. The cursor stays put, so the next scan (after members arrive)
+    // still sees these messages as new.
+    let Some(members) = room_members else {
+        log!("AI Rooms: no member list for room {room_id} yet; skipping this scan.");
+        return;
+    };
+    let max_power: Option<UserPowerLevel> = members.iter().map(|m| m.power_level()).max();
     let start_idx = match &scan_state.cursor {
         Some(cursor_id) => {
             let found = items.iter().position(|it| {
@@ -964,6 +983,14 @@ fn scan_ai_room_messages(room_id: &OwnedRoomId, items: &Vector<Arc<TimelineItem>
         }
         let MsgLikeKind::Message(msg) = &msg_like.kind else { continue };
         let MessageType::Text(text_content) = msg.msgtype() else { continue };
+        // Forward only the room's top-privileged speakers.
+        let sender = ev.sender();
+        let is_most_privileged = max_power.is_some_and(|max_power| {
+            members.iter().any(|m| m.user_id() == sender && m.power_level() == max_power)
+        });
+        if !is_most_privileged {
+            continue;
+        }
         new_texts.push((event_id.to_owned(), text_content.body.clone()));
     }
     if new_texts.is_empty() {
@@ -2444,7 +2471,7 @@ impl RoomScreen {
         #[cfg(all(feature = "a2app", unix))]
         if num_updates > 0 {
             if let TimelineKind::MainRoom { room_id } = &tl.kind {
-                scan_ai_room_messages(room_id, &tl.items);
+                scan_ai_room_messages(room_id, &tl.items, tl.room_members.as_ref().map(|v| v.as_slice()));
             }
         }
 
