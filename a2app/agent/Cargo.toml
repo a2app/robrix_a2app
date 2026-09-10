@@ -19,10 +19,12 @@ serde_json = "1.0"
 ## The in-process octos agent backend (feature `embedded`).
 ## TEMPORARY: the fork/branch of octos-org/octos#1914, which exposes
 ## `AcpCommand::factory()`, the agent factory `octos acp` serves.
+## Consumed straight from gterzian/octos `acp-embedding-seam` (ahead of
+## project-robius/octos) as a normal git dependency; no local path patch.
 ## Repin to an upstream rev once that lands.
-octos-agent = { git = "https://github.com/project-robius/octos", branch = "acp-embedding-seam", default-features = false, optional = true }
-octos-core  = { git = "https://github.com/project-robius/octos", branch = "acp-embedding-seam", optional = true }
-octos-cli   = { git = "https://github.com/project-robius/octos", branch = "acp-embedding-seam", optional = true }
+octos-agent = { git = "https://github.com/gterzian/octos", branch = "acp-embedding-seam", default-features = false, optional = true }
+octos-core  = { git = "https://github.com/gterzian/octos", branch = "acp-embedding-seam", optional = true }
+octos-cli   = { git = "https://github.com/gterzian/octos", branch = "acp-embedding-seam", optional = true }
 ## Debug-only: surface octos's tracing (MCP connect, provider resolution) on
 ## stderr in debug builds of the embedded backend. Not used in release builds.
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
