@@ -2592,6 +2592,7 @@ fn stop_ai_session(room_id: &OwnedRoomId) {
     with_a2app(|state| {
         state.ai_sessions.remove(room_id);
         state.ai_reads.retain(|_, (r, _, _)| r != room_id);
+        state.ai_posts.retain(|_, (r, _)| r != room_id);
         let subject = agent_subject(room_id.as_str());
         state.permissions.clear_once_for(&subject);
         state.perms_dirty = true;
@@ -3017,26 +3018,58 @@ pub fn forward_ai_room_texts(
     }
 }
 
+/// Whether a parked permission prompt is holding a tool call for `room_id`.
+#[cfg(unix)]
+fn prompt_parks_room_tool(prompt: &PermissionPrompt, room_id: &OwnedRoomId) -> bool {
+    prompt.parked.iter().any(|p| {
+        matches!(p, ParkedRequest::AiTool { room_id: r, .. } if r == room_id)
+    })
+}
+
+/// Whether `room_id`'s agent session already has a tool call in flight: a
+/// granted read, a cross-room post, a generation, or a call parked behind the
+/// permission prompt. The runtime won't dispatch the next tool call until the
+/// current one is answered, so a session's tools run serially.
+#[cfg(unix)]
+fn session_has_inflight_tool(state: &A2AppState, room_id: &OwnedRoomId) -> bool {
+    state.ai_reads.values().any(|(r, _, _)| r == room_id)
+        || state.ai_posts.values().any(|(r, _)| r == room_id)
+        || state
+            .ai_sessions
+            .get(room_id)
+            .is_some_and(|session| session.is_generating())
+        || state
+            .active_prompt
+            .as_ref()
+            .is_some_and(|p| prompt_parks_room_tool(p, room_id))
+        || state.prompts.iter().any(|p| prompt_parks_room_tool(p, room_id))
+}
+
 /// Drives every room's AI session for one event pass. First the tool calls
 /// that arrived on the sessions' serve threads are executed (the real work:
 /// posting to the room, starting the generation pipeline); then each agent
 /// is advanced and its replies/errors/deaths are acted on.
 #[cfg(unix)]
 fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
-    // 1. Tool calls waiting on the UI thread. Executing one can touch
-    //    generation state (start_generation), so drain first, then act.
-    let jobs: Vec<(OwnedRoomId, Vec<SessionJob>)> = with_a2app(|state| {
-        state
-            .ai_sessions
-            .iter_mut()
-            .map(|(room_id, session)| (room_id.clone(), session.drain_jobs()))
-            .filter(|(_, jobs)| !jobs.is_empty())
-            .collect()
-    }).unwrap_or_default();
-    for (room_id, jobs) in jobs {
-        for job in jobs {
-            execute_session_job(cx, ui, &room_id, job);
+    // 1. Tool calls waiting on the UI thread. One per session per pass, and
+    //    only when that session has no tool already in flight, so an agent's
+    //    calls execute serially instead of all starting at once.
+    let jobs: Vec<(OwnedRoomId, SessionJob)> = with_a2app(|state| {
+        let all_rooms: Vec<OwnedRoomId> = state.ai_sessions.keys().cloned().collect();
+        let ready_rooms: Vec<OwnedRoomId> = all_rooms
+            .into_iter()
+            .filter(|room_id| !session_has_inflight_tool(state, room_id))
+            .collect();
+        let mut out = Vec::new();
+        for room_id in ready_rooms {
+            if let Some(job) = state.ai_sessions.get_mut(&room_id).and_then(|s| s.try_recv_job()) {
+                out.push((room_id, job));
+            }
         }
+        out
+    }).unwrap_or_default();
+    for (room_id, job) in jobs {
+        execute_session_job(cx, ui, &room_id, job);
     }
 
     // 2. Agent events since the last pass.
@@ -3144,9 +3177,11 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
             // A dead session is a (re)start boundary for "Allow Once": drop
             // its one-time grants so the next agent asks again, exactly as an
             // app's isolate teardown ends its one-time grants. In-flight
-            // granted reads are orphaned too — their tool calls died with the
-            // serve threads, so any late result has nothing to answer.
+            // granted reads and cross-room posts are orphaned too — their
+            // tool calls died with the serve threads, so any late result has
+            // nothing to answer.
             state.ai_reads.retain(|_, (r, _, _)| r != &room_id);
+            state.ai_posts.retain(|_, (r, _)| r != &room_id);
             let subject = agent_subject(room_id.as_str());
             state.permissions.clear_once_for(&subject);
             state.perms_dirty = true;

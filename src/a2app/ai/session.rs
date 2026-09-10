@@ -326,13 +326,12 @@ impl AiSession {
         self.queued.len()
     }
 
-    /// The tool calls waiting on the UI thread, drained by the runtime.
-    pub fn drain_jobs(&mut self) -> Vec<SessionJob> {
-        let mut jobs = Vec::new();
-        while let Ok(job) = self.jobs.try_recv() {
-            jobs.push(job);
-        }
-        jobs
+    /// Takes at most one queued tool call from the serve threads. The runtime
+    /// calls this once per session per event pass, and only when the session
+    /// has no tool call already in flight, so a session's tool calls execute
+    /// serially (one at a time) rather than all starting at once.
+    pub fn try_recv_job(&mut self) -> Option<SessionJob> {
+        self.jobs.try_recv().ok()
     }
 
     /// Records where the generation the runtime is about to start for this
@@ -345,6 +344,12 @@ impl AiSession {
     /// for this session has completed (or been cancelled).
     pub fn take_generation_answer(&mut self) -> Option<Sender<Result<String, String>>> {
         self.generation_answer.take()
+    }
+
+    /// Whether a `launch_splash_app` build the runtime started for this
+    /// session is still in flight (its answer has not been taken yet).
+    pub fn is_generating(&self) -> bool {
+        self.generation_answer.is_some()
     }
 
     /// Sends the user's request to the agent, or queues it while a turn (or
