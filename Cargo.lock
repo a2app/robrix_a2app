@@ -5435,6 +5435,7 @@ dependencies = [
 [[package]]
 name = "octos-agent"
 version = "2.0.2"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#c9f408f37774131a9ad285f2f986b9784ab7f676"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5485,6 +5486,7 @@ dependencies = [
 [[package]]
 name = "octos-bus"
 version = "2.0.2"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#c9f408f37774131a9ad285f2f986b9784ab7f676"
 dependencies = [
  "aes",
  "async-trait",
@@ -5512,6 +5514,7 @@ dependencies = [
 [[package]]
 name = "octos-cli"
 version = "2.0.2"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#c9f408f37774131a9ad285f2f986b9784ab7f676"
 dependencies = [
  "agent-client-protocol",
  "argon2",
@@ -5575,6 +5578,7 @@ dependencies = [
 [[package]]
 name = "octos-core"
 version = "2.0.2"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#c9f408f37774131a9ad285f2f986b9784ab7f676"
 dependencies = [
  "chrono",
  "eyre",
@@ -5588,6 +5592,7 @@ dependencies = [
 [[package]]
 name = "octos-diagnostics"
 version = "2.0.2"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#c9f408f37774131a9ad285f2f986b9784ab7f676"
 dependencies = [
  "eyre",
  "octos-core",
@@ -5599,6 +5604,7 @@ dependencies = [
 [[package]]
 name = "octos-fleet"
 version = "2.0.2"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#c9f408f37774131a9ad285f2f986b9784ab7f676"
 dependencies = [
  "eyre",
  "octos-core",
@@ -5612,6 +5618,7 @@ dependencies = [
 [[package]]
 name = "octos-fleet-worker"
 version = "2.0.2"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#c9f408f37774131a9ad285f2f986b9784ab7f676"
 dependencies = [
  "async-trait",
  "eyre",
@@ -5628,6 +5635,7 @@ dependencies = [
 [[package]]
 name = "octos-llm"
 version = "2.0.2"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#c9f408f37774131a9ad285f2f986b9784ab7f676"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5649,6 +5657,7 @@ dependencies = [
 [[package]]
 name = "octos-memory"
 version = "2.0.2"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#c9f408f37774131a9ad285f2f986b9784ab7f676"
 dependencies = [
  "bincode",
  "chrono",
@@ -5667,6 +5676,7 @@ dependencies = [
 [[package]]
 name = "octos-pipeline"
 version = "2.0.2"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#c9f408f37774131a9ad285f2f986b9784ab7f676"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5688,6 +5698,7 @@ dependencies = [
 [[package]]
 name = "octos-plugin"
 version = "2.0.2"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#c9f408f37774131a9ad285f2f986b9784ab7f676"
 dependencies = [
  "eyre",
  "metrics",
@@ -5701,6 +5712,7 @@ dependencies = [
 [[package]]
 name = "octos-services"
 version = "2.0.2"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#c9f408f37774131a9ad285f2f986b9784ab7f676"
 dependencies = [
  "chrono",
  "dirs",
@@ -5721,6 +5733,7 @@ dependencies = [
 [[package]]
 name = "octos-store"
 version = "2.0.2"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#c9f408f37774131a9ad285f2f986b9784ab7f676"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5740,6 +5753,7 @@ dependencies = [
 [[package]]
 name = "octos-swarm"
 version = "2.0.2"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#c9f408f37774131a9ad285f2f986b9784ab7f676"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5758,6 +5772,7 @@ dependencies = [
 [[package]]
 name = "octos-workflows"
 version = "2.0.2"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#c9f408f37774131a9ad285f2f986b9784ab7f676"
 dependencies = [
  "chrono",
  "eyre",

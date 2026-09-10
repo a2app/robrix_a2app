@@ -215,16 +215,9 @@ askar-storage = { git = "https://github.com/openwallet-foundation/askar.git" }
 [patch."https://github.com/ruma/ruma"]
 ruma = { git = "https://github.com/project-robius/ruma.git", branch = "tsp" }
 
-## The octos agent crates a2app links (octos-agent/-core/-cli, acp-embedding-seam)
-## come from the sibling ../octos checkout so this branch consumes the patched
-## octos (client mcpServers + per-server tool timeout) before it is pushed to
-## project-robius/octos. Their transitive octos crates resolve from the same
-## local workspace. Drop this patch and repin Cargo.lock once the commit lands
-## upstream.
-[patch."https://github.com/project-robius/octos"]
-octos-agent = { path = "../octos/crates/octos-agent" }
-octos-core = { path = "../octos/crates/octos-core" }
-octos-cli = { path = "../octos/crates/octos-cli" }
+## The octos agent crates a2app links (octos-agent/-core/-cli) are consumed
+## directly from gterzian/octos `acp-embedding-seam`; see
+## `a2app/agent/Cargo.toml`. No local path patch.
 
 [build-dependencies]
 toml = "1"
