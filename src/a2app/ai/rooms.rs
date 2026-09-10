@@ -22,6 +22,7 @@ use matrix_sdk::ruma::{
         AnyInitialStateEvent, AnyRoomAccountDataEventContent, InitialStateEvent,
         RoomAccountDataEventType, StateEventType,
         room::encryption::RoomEncryptionEventContent,
+        room::message::RoomMessageEventContent,
     },
     serde::Raw,
 };
@@ -73,9 +74,11 @@ pub enum AiRoomRequest {
     /// Writes one agent turn (a completed reply, or a `send_message` tool
     /// call) as an `ai_reply` state event.
     PostReply { room_id: OwnedRoomId, content: AiReplyContent },
-    /// Writes one agent turn as an `ai_reply` state event into ANOTHER
-    /// joined room (the `post_room_message` tool). Answers the parked tool
-    /// call through [`AiRoomAction::PostToRoomResult`] once the write lands.
+    /// Posts one agent turn into ANOTHER joined room as an `m.notice`
+    /// message (the `post_room_message` tool). Unlike an `ai_reply` state
+    /// event, this needs no state-power privilege — it's an ordinary message
+    /// the account may send. Answers the parked tool call through
+    /// [`AiRoomAction::PostToRoomResult`] once the write lands.
     PostToRoom {
         id: u64,
         target: OwnedRoomId,
@@ -180,19 +183,19 @@ pub async fn handle_ai_room_request(request: AiRoomRequest) {
         AiRoomRequest::PostToRoom { id, target, content } => {
             let Some(room) = get_client().and_then(|c| c.get_room(&target)) else {
                 let msg = format!("room {target} not found in client (are you still joined?)");
-                log!("AI Rooms worker: can't post ai_reply to {target}: {msg}");
+                log!("AI Rooms worker: can't post a notice to {target}: {msg}");
                 Cx::post_action(AiRoomAction::PostToRoomResult { id, result: Err(msg) });
                 return;
             };
-            match post_reply(&room, &content).await {
+            match post_notice(&room, &content).await {
                 Ok(_) => {
                     Cx::post_action(AiRoomAction::PostToRoomResult {
                         id,
-                        result: Ok(String::from("Posted to the room as an AI card.")),
+                        result: Ok(String::from("Posted to the room as a notice.")),
                     });
                 }
                 Err(e) => {
-                    log!("AI Rooms worker: FAILED to post ai_reply to {target}: {e}");
+                    log!("AI Rooms worker: FAILED to post a notice to {target}: {e}");
                     Cx::post_action(AiRoomAction::PostToRoomResult { id, result: Err(e) });
                 }
             }
@@ -559,12 +562,13 @@ fn next_reply_state_key() -> String {
 
 /// Writes one agent turn as an `ai_reply` state event with a fresh state key
 /// (so it never overwrites a previous turn's reply).
-/// Turns a failed `ai_reply` state write into a message the caller — and the
-/// model, for cross-room posts — can act on. A 403/M_FORBIDDEN here is almost
-/// always a power-level shortfall: posting a custom state event requires the
-/// account's power in that room to be at least the room's `state_default`
-/// (50 = Moderator by default). Name that instead of echoing the raw server
-/// error, which reads as a mystery to the agent (and to the room's owner).
+/// Turns a failed `ai_reply` state write into a message the caller (and the
+/// room's owner, via the UI popup) can act on. A 403/M_FORBIDDEN here is
+/// almost always a power-level shortfall: posting a custom state event
+/// requires the account's power in that room to be at least the room's
+/// `state_default` (50 = Moderator by default). Name that instead of echoing
+/// the raw server error, which reads as a mystery to the agent (and to the
+/// room's owner).
 fn friendly_state_post_error(e: &matrix_sdk::Error) -> String {
     use matrix_sdk::ruma::api::error::ErrorKind;
     if matches!(e.client_api_error_kind(), Some(ErrorKind::Forbidden)) {
@@ -591,6 +595,53 @@ async fn post_reply(room: &Room, content: &AiReplyContent) -> Result<(), String>
         Err(e) => {
             let friendly = friendly_state_post_error(&e);
             log!("AI Rooms worker: ai_reply write to room {} failed: {friendly}", room.room_id());
+            Err(friendly)
+        }
+    }
+}
+
+/// Turns a failed `m.notice` write into a message the caller — and the
+/// model, for cross-room posts — can act on. A 403/M_FORBIDDEN here means the
+/// account simply isn't allowed to send messages in that room (its power is
+/// below `events_default`, normally 0), so name that instead of echoing the
+/// raw server error.
+fn friendly_notice_post_error(e: &matrix_sdk::Error) -> String {
+    use matrix_sdk::ruma::api::error::ErrorKind;
+    if matches!(e.client_api_error_kind(), Some(ErrorKind::Forbidden)) {
+        return String::from(
+            "the homeserver refused the message: this account is not allowed to send messages \
+             in that room. Check the room's permissions, then ask me to post again.",
+        );
+    }
+    e.to_string()
+}
+
+/// Prefix prepended to a cross-room notice so its recipients can tell it was
+/// posted by the room's AI agent (through the user's own account) rather than
+/// typed by the user directly.
+const NOTICE_PROVENANCE_PREFIX: &str = "🤖 Robrix AI: ";
+
+/// Writes one agent turn as an `m.notice` message (a normal `m.room.message`
+/// with `msgtype` `m.notice`) into ANOTHER joined room. Notices need no
+/// state-power privilege, so a cross-room post works with an ordinary
+/// `events_default` power level instead of `state_default` (50 = Moderator).
+async fn post_notice(room: &Room, content: &AiReplyContent) -> Result<(), String> {
+    let message = match content.formatted.as_deref().filter(|html| !html.is_empty()) {
+        Some(html) => {
+            let body = format!("{NOTICE_PROVENANCE_PREFIX}{}", content.text);
+            let html_body = format!("<strong>{NOTICE_PROVENANCE_PREFIX}</strong>{html}");
+            RoomMessageEventContent::notice_html(body, html_body)
+        }
+        None => RoomMessageEventContent::notice_plain(format!("{NOTICE_PROVENANCE_PREFIX}{}", content.text)),
+    };
+    match room.send(message).await {
+        Ok(response) => {
+            log!("AI Rooms worker: posted a notice -> {} in room {}.", response.response.event_id, room.room_id());
+            Ok(())
+        }
+        Err(e) => {
+            let friendly = friendly_notice_post_error(&e);
+            log!("AI Rooms worker: notice write to room {} failed: {friendly}", room.room_id());
             Err(friendly)
         }
     }

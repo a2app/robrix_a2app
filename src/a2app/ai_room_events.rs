@@ -2,10 +2,11 @@
 //! timeline widgets that render them.
 //!
 //! An AI room is an ordinary room carrying a `rs.robius.robrix.ai_room`
-//! marker state event; the agent's output is written back as
-//! `rs.robius.robrix.ai_reply` state events (never `m.room.message`, so it
-//! can't loop back as input). Everything else the agent does while a turn is
-//! live is also reflected as state events so the chat doubles as its
+//! marker state event; the agent's output into its own room is written back
+//! as `rs.robius.robrix.ai_reply` state events (never `m.room.message`, so it
+//! can't loop back as input). Cross-room posts (`post_room_message`) are
+//! ordinary `m.notice` messages instead. Everything else the agent does while
+//! a turn is live is also reflected as state events so the chat doubles as its
 //! activity log: `rs.robius.robrix.ai_activity` rows mark "thinking…" /
 //! errors / the session stopping, and each tool call is its own
 //! `rs.robius.robrix.ai_tool_call` row (written `Started` when the agent

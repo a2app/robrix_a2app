@@ -54,8 +54,8 @@ pub enum SessionJob {
     LaunchSplashApp { description: String, answer: Sender<Result<String, String>> },
     /// `send_message`: post plain text into the session's room.
     SendRoomMessage { text: String, answer: Sender<Result<String, String>> },
-    /// `post_room_message`: post text into ANOTHER joined room as an AI
-    /// state-event card. The runtime decides against the room's per-room
+    /// `post_room_message`: post text into ANOTHER joined room as an
+    /// `m.notice` message. The runtime decides against the room's per-room
     /// send allowlist whether this may run — prompting the user the first
     /// time this agent posts into each target room — then posts on the
     /// async worker and answers here when the write lands.

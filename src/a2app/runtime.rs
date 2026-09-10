@@ -3333,8 +3333,8 @@ fn run_ai_read_tool(
 }
 
 /// Executes the `post_room_message` tool for a session: posts the agent's
-/// text into ANOTHER joined room as an `ai_reply` state-event card, gated PER
-/// ROOM. Unlike a group-granted read, an allowance covers exactly the target
+/// text into ANOTHER joined room as an `m.notice` message, gated PER ROOM.
+/// Unlike a group-granted read, an allowance covers exactly the target
 /// room: the user is asked the first time this agent posts into each room it
 /// names, and the room joins the subject's send allowlist on Allow. A group
 /// `Denied` on `matrix.rooms.message.send` is the kill switch; a group
