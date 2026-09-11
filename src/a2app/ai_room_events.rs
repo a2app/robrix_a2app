@@ -63,6 +63,13 @@ pub struct AiRoomMarkerContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiReplyToolCall {
     pub name: String,
+    /// Human-readable target/detail for the call, when there is one (the room
+    /// name for a cross-room read or post, the space name, the generated
+    /// app's description). Rendered after the humanized action
+    /// ([`ai_tool_display_name`]): `Read messages in “General”`. `None` when
+    /// the call has no target worth naming.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     #[serde(default)]
     pub ok: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -151,8 +158,14 @@ pub enum AiToolCallStatus {
 pub struct AiToolCallContent {
     pub v: u32,
     /// The tool's name as the agent called it (e.g. `read_room_messages`,
-    /// `launch_splash_app`, `send_message`).
+    /// `launch_splash_app`, `send_message`). The chat never shows this raw;
+    /// [`ai_tool_display_name`] turns it into a phrase.
     pub name: String,
+    /// Human-readable target/detail, as on [`AiReplyToolCall::detail`]: the
+    /// room name for a cross-room read or post, the space name, the generated
+    /// app's description. `None` when the call has no particular target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     pub status: AiToolCallStatus,
     /// Whether the call succeeded; meaningful once `status` is `Done`.
     #[serde(default)]
@@ -309,14 +322,14 @@ impl AiReplyTimelineCardRef {
             .filter(|c| !c.tool_calls.is_empty())
             .map(|c| {
                 let parts: Vec<String> = c.tool_calls.iter().map(|t| {
-                    let mut name = t.name.clone();
+                    let mut label = format!("{}{}", ai_tool_display_name(&t.name), detail_suffix(t.detail.as_deref()));
                     if !t.ok {
-                        name.push_str(" ✗");
+                        label.push_str(" ✗");
                         if !t.summary.is_empty() {
-                            name.push_str(&format!(" ({})", t.summary));
+                            label.push_str(&format!(" ({})", t.summary));
                         }
                     }
-                    name
+                    label
                 }).collect();
                 format!("Used: {}", parts.join(", "))
             })
@@ -373,26 +386,84 @@ pub fn ai_activity_label(content: &AiActivityContent) -> String {
     }
 }
 
-/// The one-line text an [`AiToolCallContent`] row renders as.
-pub fn ai_tool_call_label(content: &AiToolCallContent) -> String {
-    let name = content.name.trim();
-    match content.status {
-        AiToolCallStatus::Started => {
-            let name = if name.is_empty() { "a tool" } else { name };
-            format!("⚙ using {name}…")
+/// The human phrase the chat shows for a tool's raw MCP name, so a row reads
+/// as what the AI *did* rather than as an identifier: `read_room_memory` →
+/// "Read room memory", `list_space_rooms` → "Listed a space's rooms".
+///
+/// Known tools get a curated phrase; an unknown name (a future tool, or one
+/// this build doesn't know) falls back to a generic `snake_case`-to-words
+/// humanization, so it still reads as a phrase rather than leaking the raw
+/// identifier.
+pub fn ai_tool_display_name(name: &str) -> String {
+    match name.trim() {
+        "read_room_messages" => String::from("Read recent messages"),
+        "read_older_messages" => String::from("Read older messages"),
+        "room_info" => String::from("Read room details"),
+        "read_other_room_messages" => String::from("Read messages"),
+        "list_rooms" => String::from("Listed your rooms"),
+        "list_spaces" => String::from("Listed your spaces"),
+        "space_info" => String::from("Read space details"),
+        "list_space_rooms" => String::from("Listed a space's rooms"),
+        "read_room_memory" => String::from("Read room memory"),
+        "launch_splash_app" => String::from("Built and ran a mini-app"),
+        "send_message" => String::from("Replied"),
+        "post_room_message" => String::from("Posted a message"),
+        // octos's own tools, kept on the session's profile (see
+        // `a2app_agent::robrix_session_profile`). Robrix doesn't execute
+        // these; the agent closes their card itself.
+        "web_search" => String::from("Searched the web"),
+        "web_fetch" => String::from("Read a web page"),
+        "browser" => String::from("Browsed the web"),
+        "" => String::from("Used a tool"),
+        other => humanize_identifier(other),
+    }
+}
+
+/// Falls back to words for an identifier this build doesn't have a curated
+/// phrase for: underscores become spaces and the first letter is capitalized
+/// (`some_new_tool` → "Some new tool").
+fn humanize_identifier(name: &str) -> String {
+    let words = name.replace(['_', '-'], " ");
+    let trimmed = words.trim();
+    let mut chars = trimmed.chars();
+    match chars.next() {
+        None => String::from("Used a tool"),
+        Some(first) => {
+            let mut out: String = first.to_ascii_uppercase().to_string();
+            out.push_str(chars.as_str());
+            out
         }
+    }
+}
+
+/// The `detail` rendered after an action phrase, with a leading space, or the
+/// empty string when there is none.
+fn detail_suffix(detail: Option<&str>) -> String {
+    match detail.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(detail) => format!(" {detail}"),
+        None => String::new(),
+    }
+}
+
+/// The one-line text an [`AiToolCallContent`] row renders as: the humanized
+/// action plus whatever target detail the call carried (`Read messages in
+/// “General”`, `Built and ran a mini-app “a pomodoro timer”`).
+pub fn ai_tool_call_label(content: &AiToolCallContent) -> String {
+    let action = ai_tool_display_name(&content.name);
+    let detail = detail_suffix(content.detail.as_deref());
+    match content.status {
+        AiToolCallStatus::Started => format!("⚙ {action}{detail}…"),
         AiToolCallStatus::Done => {
-            let name = if name.is_empty() { "a tool" } else { name };
             if content.ok {
                 if content.summary.is_empty() {
-                    format!("✓ used {name}")
+                    format!("✓ {action}{detail}")
                 } else {
-                    format!("✓ used {name}: {}", content.summary)
+                    format!("✓ {action}{detail}: {}", content.summary)
                 }
             } else if content.summary.is_empty() {
-                format!("✗ {name} refused")
+                format!("✗ {action}{detail} refused")
             } else {
-                format!("✗ {name}: {}", content.summary)
+                format!("✗ {action}{detail}: {}", content.summary)
             }
         }
     }
@@ -421,5 +492,40 @@ impl AiEventTimelineCardRef {
         let label = view.label(cx, ids!(event_label));
         label.set_visible(cx, !text.is_empty());
         label.set_text(cx, text);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The chat never shows a raw MCP identifier: every known tool gets a
+    /// phrase, and an unknown one humanizes instead of leaking its name.
+    #[test]
+    fn tool_names_render_as_phrases() {
+        assert_eq!(ai_tool_display_name("read_room_memory"), "Read room memory");
+        assert_eq!(ai_tool_display_name("read_other_room_messages"), "Read messages");
+        assert_eq!(ai_tool_display_name("list_space_rooms"), "Listed a space's rooms");
+        assert_eq!(ai_tool_display_name("send_message"), "Replied");
+        assert_eq!(ai_tool_display_name("web_search"), "Searched the web");
+        assert_eq!(ai_tool_display_name("web_fetch"), "Read a web page");
+        assert_eq!(ai_tool_display_name("some_new_tool"), "Some new tool");
+        assert_eq!(ai_tool_display_name("   "), "Used a tool");
+    }
+
+    /// A call row carries its target detail after the action phrase, so a
+    /// cross-room read names the room it looked in.
+    #[test]
+    fn labels_carry_the_target_detail() {
+        let content = AiToolCallContent {
+            v: 1,
+            name: "read_other_room_messages".to_string(),
+            detail: Some("in “General”".to_string()),
+            status: AiToolCallStatus::Done,
+            ok: true,
+            summary: String::new(),
+            created_at: 0,
+        };
+        assert_eq!(ai_tool_call_label(&content), "✓ Read messages in “General”");
     }
 }

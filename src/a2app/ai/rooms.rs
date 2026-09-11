@@ -238,15 +238,19 @@ pub async fn handle_ai_room_request(request: AiRoomRequest) {
 async fn read_tool(room_id: &OwnedRoomId, tool: ReadToolKind) -> Result<String, String> {
     use crate::a2app::matrix::room as matrix_room;
     use crate::a2app::matrix::rooms as matrix_rooms;
+    use crate::a2app::matrix::spaces as matrix_spaces;
     match tool {
-        ReadToolKind::Messages { limit } => matrix_room::read_messages(room_id.clone(), limit).await,
+        // The AI's read tools return full message bodies (the model quotes
+        // and reasons about what a human wrote); only the mini-app services
+        // clip.
+        ReadToolKind::Messages { limit } => matrix_room::read_messages(room_id.clone(), limit, true).await,
         ReadToolKind::Older { before, limit } => {
             let before = before
                 .as_deref()
                 .map(OwnedEventId::try_from)
                 .transpose()
                 .map_err(|_| "not a valid event id")?;
-            matrix_room::older_messages(room_id.clone(), before, limit).await
+            matrix_room::older_messages(room_id.clone(), before, limit, true).await
         }
         ReadToolKind::Info => matrix_room::info(room_id.clone()).await,
         // The target room was granted on the UI thread; fetch from it
@@ -254,9 +258,18 @@ async fn read_tool(room_id: &OwnedRoomId, tool: ReadToolKind) -> Result<String, 
         // found"/"room not joined").
         ReadToolKind::OtherRoom { room, limit } => {
             let target = OwnedRoomId::try_from(room.as_str()).map_err(|_| "not a valid room id")?;
-            matrix_room::read_messages(target, limit).await
+            matrix_room::read_messages(target, limit, true).await
         }
         ReadToolKind::ListRooms => matrix_rooms::joined_rooms_list().await,
+        ReadToolKind::ListSpaces => matrix_spaces::list().await,
+        ReadToolKind::SpaceInfo { space } => {
+            let space = OwnedRoomId::try_from(space.as_str()).map_err(|_| "not a valid space id")?;
+            matrix_spaces::info(space).await
+        }
+        ReadToolKind::SpaceRooms { space } => {
+            let space = OwnedRoomId::try_from(space.as_str()).map_err(|_| "not a valid space id")?;
+            matrix_spaces::rooms(space).await
+        }
         // Ungated plumbing (no capability): the agent recalling its own turns.
         ReadToolKind::Memory { limit } => room_memory(room_id, limit).await,
     }

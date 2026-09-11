@@ -285,13 +285,17 @@ async fn build_agent(
         // for this model" against the Kimi coding plan.
         provider: crate::providers::session_provider(),
         model: crate::prefs::Backend::detect().model_override(prefs),
-        // Host-managed sessions (the room's long-lived agent) run octos's
-        // built-in `hosted` profile: octos's registry is emptied of native
-        // tools, so the model can only call the tools Robrix advertised in
-        // `mcp_servers` — every call is mediated by Robrix. The one-shot
-        // app-generation agent (host_managed = false) keeps the default
-        // `coding` surface.
-        profile: host_managed.then(|| "hosted".to_string()),
+        // Host-managed sessions (the room's long-lived agent) run Robrix's
+        // session profile: octos's registry is emptied of native tools except
+        // `group:web`, so the model can look things up / read pages and
+        // otherwise only call the tools Robrix advertised in `mcp_servers` —
+        // every one mediated by Robrix. The one-shot app-generation agent
+        // (host_managed = false) keeps the default `coding` surface.
+        profile: if host_managed {
+            Some(crate::robrix_session_profile()?)
+        } else {
+            None
+        },
         ..Default::default()
     };
 
@@ -385,8 +389,17 @@ impl octos_agent::ProgressReporter for Reporter {
             E::ReasoningChunk { text, .. } => {
                 send(&self.evt_tx, AcpEvent::Thought(text));
             }
-            E::ToolStarted { name, .. } => {
-                send(&self.evt_tx, AcpEvent::ToolCall(name));
+            E::ToolStarted { name, tool_id, .. } => {
+                send(&self.evt_tx, AcpEvent::ToolCall { id: tool_id, title: name });
+            }
+            // The terminal status of a tool call. Needed to close the live
+            // card for octos's own tools (web_search/web_fetch/browser),
+            // which Robrix does not itself execute and so cannot resolve.
+            E::ToolCompleted { tool_id, success, output_preview, .. } => {
+                send(
+                    &self.evt_tx,
+                    AcpEvent::ToolCallDone { id: tool_id, ok: success, summary: output_preview },
+                );
             }
             // Nothing to render, but they are proof the agent is alive, and
             // the pipeline's stall watchdog measures the gap since the LAST
@@ -397,7 +410,6 @@ impl octos_agent::ProgressReporter for Reporter {
             | E::TaskStarted { .. }
             | E::LlmStatus { .. }
             | E::ToolProgress { .. }
-            | E::ToolCompleted { .. }
             | E::FileModified { .. }
             | E::PlanUpdated { .. }
             | E::TokenUsage { .. }

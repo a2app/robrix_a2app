@@ -143,6 +143,44 @@ session-scoped MCP tool server (`src/a2app/ai/server.rs` + `bridge.rs`).
    A turn that already spoke through `send_message` has its redundant trailing
    text dropped, so one turn = one card.
 
+### Tools the agent can call
+
+The session registers exactly these on its MCP server (`ai::tools::
+register_session_tools`), and every one is executed by Robrix. The
+gated ones map onto the mini-app capability catalog, so the first use prompts
+the user and the choice is shared with mini-apps. Message reads return full
+bodies; only the mini-app services clip.
+
+| Tool | What it does | Gate |
+|---|---|---|
+| `send_message` | Replies in this room (becomes the turn's `ai_reply`) | none (room plumbing) |
+| `read_room_memory` | Recalls the agent's own past turns and tool calls in this room | none |
+| `read_room_messages` | Reads this room's recent messages | `matrix.room.messages.read` |
+| `read_older_messages` | Pages further back in this room | `matrix.room.messages.paginate` |
+| `room_info` | Reads this room's name, topic, members, join rule, encryption | `matrix.room.info.read` |
+| `list_rooms` | Lists the user's joined rooms and DMs | `matrix.rooms.list` |
+| `read_other_room_messages` | Reads another joined room the model names | `matrix.rooms.messages.read` |
+| `post_room_message` | Posts a notice into another joined room | `matrix.rooms.message.send` (per room) |
+| `list_spaces` | Lists the spaces the user has joined | `matrix.spaces.list` |
+| `space_info` | Reads one space's details | `matrix.space.info.read` |
+| `list_space_rooms` | Lists the rooms/subspaces inside one space | `matrix.space.rooms.list` |
+| `launch_splash_app` | Builds and runs a mini-app from a description | `apps.generate` |
+
+Each call is its own `rs.robius.robrix.ai_tool_call` state row, written
+`Started` when the model picks the tool and rewritten `Done` with the outcome.
+The row (and the reply card's receipt chips) render a human phrase rather than
+the raw tool name — e.g. `Read messages in “General”`, `Built and ran a
+mini-app “a pomodoro timer”`.
+
+**octos's own web tools are kept too.** Sessions run under Robrix's octos
+profile (`a2app_agent::robrix_session_profile`), which is the built-in
+`hosted` envelope (no shell/files/search/memory/spawn) plus `group:web`:
+`web_search` (Tavily/Exa/DuckDuckGo/Brave/You.com/Perplexity, free fallback),
+`web_fetch` (read a page), and `browser`. These are octos-native, so Robrix
+does not execute or capability-gate them; the agent closes their live cards
+itself from the ACP `tool_call_update`. Everything Robrix registers above
+remains mediated and gated.
+
 ### Trying it offline (no API key)
 
 The octos `scenario` provider (`octos/crates/octos-llm/src/registry/`

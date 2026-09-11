@@ -76,6 +76,18 @@ pub enum ReadToolKind {
     /// `list_rooms` → `matrix.rooms.list`: the joined rooms and DMs the
     /// model may offer to read, with names and ids.
     ListRooms,
+    /// `list_spaces` → `matrix.spaces.list`: the spaces the user has joined,
+    /// with names and ids. Spaces are how the user's rooms are organised, so
+    /// this is the map the model uses before drilling into one.
+    ListSpaces,
+    /// `space_info` → `matrix.space.info.read`: one named space's details
+    /// (name, topic, member/room counts, join rule, world-readable).
+    SpaceInfo { space: String },
+    /// `list_space_rooms` → `matrix.space.rooms.list`: the child rooms and
+    /// subspaces of one named space. The separate tool keeps the (potentially
+    /// large, per-space) hierarchy walk behind its own grant rather than
+    /// folding every room of every space into `list_spaces`.
+    SpaceRooms { space: String },
     /// `read_room_memory` (ungated): this room's recent `ai_reply` turns —
     /// the agent's OWN past replies and tool calls. Not a catalog capability:
     /// the runtime treats it as always allowed, like `send_message`.
@@ -94,6 +106,9 @@ impl ReadToolKind {
             ReadToolKind::Info => "matrix.room.info.read",
             ReadToolKind::OtherRoom { .. } => "matrix.rooms.messages.read",
             ReadToolKind::ListRooms => "matrix.rooms.list",
+            ReadToolKind::ListSpaces => "matrix.spaces.list",
+            ReadToolKind::SpaceInfo { .. } => "matrix.space.info.read",
+            ReadToolKind::SpaceRooms { .. } => "matrix.space.rooms.list",
             ReadToolKind::Memory { .. } => "",
         }
     }
@@ -118,6 +133,9 @@ pub const AI_ROOM_READ_CAP_IDS: &[&str] = &[
     "matrix.room.info.read",
     "matrix.rooms.messages.read",
     "matrix.rooms.list",
+    "matrix.spaces.list",
+    "matrix.space.info.read",
+    "matrix.space.rooms.list",
 ];
 
 /// Everything an AI session may do that sits in the mini-app capability
@@ -132,6 +150,9 @@ pub const AI_ROOM_SESSION_CAP_IDS: &[&str] = &[
     "matrix.room.info.read",
     "matrix.rooms.messages.read",
     "matrix.rooms.list",
+    "matrix.spaces.list",
+    "matrix.space.info.read",
+    "matrix.space.rooms.list",
     "apps.generate",
     "matrix.rooms.message.send",
 ];
@@ -145,6 +166,9 @@ pub fn read_tool_name(kind: &ReadToolKind) -> &'static str {
         ReadToolKind::Info => "room_info",
         ReadToolKind::OtherRoom { .. } => "read_other_room_messages",
         ReadToolKind::ListRooms => "list_rooms",
+        ReadToolKind::ListSpaces => "list_spaces",
+        ReadToolKind::SpaceInfo { .. } => "space_info",
+        ReadToolKind::SpaceRooms { .. } => "list_space_rooms",
         ReadToolKind::Memory { .. } => "read_room_memory",
     }
 }
@@ -373,6 +397,137 @@ impl Tool for ListRoomsTool {
     fn call(&self, _arguments: &Map<String, Value>) -> Result<String, String> {
         self.host.read_tool(ReadToolKind::ListRooms)
     }
+}
+
+/// `list_spaces` — the joined spaces, with names and ids. Gated by
+/// `matrix.spaces.list`; the user is asked on first use.
+pub struct ListSpacesTool {
+    host: Arc<dyn AiHost>,
+}
+
+impl ListSpacesTool {
+    pub fn new(host: Arc<dyn AiHost>) -> Self {
+        Self { host }
+    }
+}
+
+impl Tool for ListSpacesTool {
+    fn name(&self) -> &str {
+        "list_spaces"
+    }
+
+    fn description(&self) -> &str {
+        "Lists the spaces you have joined: space id, name, topic and member \
+         count. A space groups rooms, so this is the map to look at before \
+         drilling into one with list_space_rooms or space_info."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object", "additionalProperties": false })
+    }
+
+    fn call(&self, _arguments: &Map<String, Value>) -> Result<String, String> {
+        self.host.read_tool(ReadToolKind::ListSpaces)
+    }
+}
+
+/// `space_info` — one named space's cheap public facts. Gated by
+/// `matrix.space.info.read`; the user is asked on first use.
+pub struct SpaceInfoTool {
+    host: Arc<dyn AiHost>,
+}
+
+impl SpaceInfoTool {
+    pub fn new(host: Arc<dyn AiHost>) -> Self {
+        Self { host }
+    }
+}
+
+impl Tool for SpaceInfoTool {
+    fn name(&self) -> &str {
+        "space_info"
+    }
+
+    fn description(&self) -> &str {
+        "Returns one space's details: name, topic, member count, join rule, \
+         whether it is world-readable, and how many child rooms/subspaces it \
+         has. Pass the space id from list_spaces."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "space": {
+                    "type": "string",
+                    "description": "The space (matrix room) id to inspect, e.g. !abc:server.org (see list_spaces).",
+                },
+            },
+            "required": ["space"],
+            "additionalProperties": false,
+        })
+    }
+
+    fn call(&self, arguments: &Map<String, Value>) -> Result<String, String> {
+        let space = space_arg(arguments)?;
+        self.host.read_tool(ReadToolKind::SpaceInfo { space })
+    }
+}
+
+/// `list_space_rooms` — the child rooms and subspaces of one named space.
+/// Gated by `matrix.space.rooms.list`; the user is asked on first use.
+pub struct ListSpaceRoomsTool {
+    host: Arc<dyn AiHost>,
+}
+
+impl ListSpaceRoomsTool {
+    pub fn new(host: Arc<dyn AiHost>) -> Self {
+        Self { host }
+    }
+}
+
+impl Tool for ListSpaceRoomsTool {
+    fn name(&self) -> &str {
+        "list_space_rooms"
+    }
+
+    fn description(&self) -> &str {
+        "Lists the rooms and subspaces inside one space: name, room id, \
+         topic, whether it is a space, whether you are joined, member count \
+         and join rule. Use list_spaces to find the space id, then this to \
+         see the rooms it groups."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "space": {
+                    "type": "string",
+                    "description": "The space (matrix room) id to list the rooms of, e.g. !abc:server.org (see list_spaces).",
+                },
+            },
+            "required": ["space"],
+            "additionalProperties": false,
+        })
+    }
+
+    fn call(&self, arguments: &Map<String, Value>) -> Result<String, String> {
+        let space = space_arg(arguments)?;
+        self.host.read_tool(ReadToolKind::SpaceRooms { space })
+    }
+}
+
+/// The required `space` id argument shared by the space tools, trimmed and
+/// refused when absent.
+fn space_arg(arguments: &Map<String, Value>) -> Result<String, String> {
+    arguments
+        .get("space")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "this tool needs a `space` id".to_string())
 }
 
 /// `read_room_memory` — recall the agent's own past replies in this room.
@@ -631,6 +786,9 @@ pub fn register_session_tools(server: &mut a2app_agent::mcp::McpServer, host: Ar
     server.add_tool(RoomInfoTool::new(host.clone()));
     server.add_tool(ListRoomsTool::new(host.clone()));
     server.add_tool(ReadOtherRoomMessagesTool::new(host.clone()));
+    server.add_tool(ListSpacesTool::new(host.clone()));
+    server.add_tool(SpaceInfoTool::new(host.clone()));
+    server.add_tool(ListSpaceRoomsTool::new(host.clone()));
     server.add_tool(LaunchSplashAppTool::new(host.clone()));
     // Ungated native tools (the agent's own room plumbing).
     server.add_tool(ReadRoomMemoryTool::new(host.clone()));
@@ -652,6 +810,9 @@ mod tests {
             (ReadToolKind::Info, "matrix.room.info.read"),
             (ReadToolKind::OtherRoom { room: "!r:s".to_string(), limit: 10 }, "matrix.rooms.messages.read"),
             (ReadToolKind::ListRooms, "matrix.rooms.list"),
+            (ReadToolKind::ListSpaces, "matrix.spaces.list"),
+            (ReadToolKind::SpaceInfo { space: "!s:s".to_string() }, "matrix.space.info.read"),
+            (ReadToolKind::SpaceRooms { space: "!s:s".to_string() }, "matrix.space.rooms.list"),
         ];
         for (kind, id) in cases {
             assert_eq!(kind.capability_id(), id);
@@ -671,6 +832,9 @@ mod tests {
             Info,
             OtherRoom { room: "!r:s".to_string(), limit: 1 },
             ListRooms,
+            ListSpaces,
+            SpaceInfo { space: "!s:s".to_string() },
+            SpaceRooms { space: "!s:s".to_string() },
         ] {
             let id = kind.capability_id();
             assert!(

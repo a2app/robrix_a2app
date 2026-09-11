@@ -80,6 +80,14 @@ impl AiHost for RecordingHost {
         Ok("posted".to_string())
     }
 
+    fn post_room_message(&self, room: &str, text: &str) -> Result<String, String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("post_room_message({room:?}, {text:?})"));
+        Ok("posted to the room as a notice".to_string())
+    }
+
     fn read_tool(&self, _kind: ReadToolKind) -> Result<String, String> {
         // The transport tests never drive a read; record nothing, answer
         // as if the read were refused so a stray call is visible in `calls`.
@@ -300,9 +308,13 @@ fn a_full_mcp_session_over_the_relay_child() {
             "room_info",
             "list_rooms",
             "read_other_room_messages",
+            "list_spaces",
+            "space_info",
+            "list_space_rooms",
             "launch_splash_app",
             "read_room_memory",
             "send_message",
+            "post_room_message",
         ]
     );
     for tool in tools {

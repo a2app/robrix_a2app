@@ -13,7 +13,7 @@ use matrix_sdk_ui::spaces::room_list::SpaceRoomListPaginationState;
 use super::rooms::room_name;
 use crate::sliding_sync::get_client;
 
-pub(super) async fn list() -> Result<String, String> {
+pub(crate) async fn list() -> Result<String, String> {
     let client = get_client().ok_or("not logged in")?;
     let mut out: Vec<serde_json::Value> = Vec::new();
     for space in client.joined_rooms().into_iter().filter(|r| r.is_space()) {
@@ -27,7 +27,7 @@ pub(super) async fn list() -> Result<String, String> {
     Ok(serde_json::json!({ "spaces": out }).to_string())
 }
 
-pub(super) async fn info(space_id: OwnedRoomId) -> Result<String, String> {
+pub(crate) async fn info(space_id: OwnedRoomId) -> Result<String, String> {
     let client = get_client().ok_or("not logged in")?;
     let space = client.get_room(&space_id).ok_or("space not found")?;
     if !space.is_space() || space.state() != RoomState::Joined {
@@ -55,7 +55,7 @@ pub(super) async fn info(space_id: OwnedRoomId) -> Result<String, String> {
     }).to_string())
 }
 
-pub(super) async fn rooms(space_id: OwnedRoomId) -> Result<String, String> {
+pub(crate) async fn rooms(space_id: OwnedRoomId) -> Result<String, String> {
     let client = get_client().ok_or("not logged in")?;
     let list = SpaceRoomList::new(client, space_id).await;
     // Each page is one /hierarchy request; stop at the end or at the row cap.

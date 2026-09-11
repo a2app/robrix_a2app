@@ -69,6 +69,14 @@ impl AiHost for RecordingHost {
         Ok("posted".to_string())
     }
 
+    fn post_room_message(&self, room: &str, text: &str) -> Result<String, String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("post_room_message({room:?}, {text:?})"));
+        Ok("posted to the room as a notice".to_string())
+    }
+
     fn read_tool(&self, _kind: ReadToolKind) -> Result<String, String> {
         Err("read_tool not exercised by this test".to_string())
     }

@@ -211,6 +211,27 @@ mod tests {
         assert_eq!(Blocker::NoProvider.command(), None);
     }
 
+    /// The profile Robrix hands octos must parse against octos's own schema,
+    /// keep the web tools, and evict every shell/file/search/memory tool. A
+    /// typo here would make every AI-room session fail to start, and a too-wide
+    /// allow list would silently re-open the native toolset.
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn session_profile_parses_and_scopes_to_web_tools() {
+        let def = octos_agent::profile::ProfileDefinition::from_json_str(
+            super::ROBRIX_SESSION_PROFILE,
+        )
+        .expect("octos parses the session profile");
+        assert!(def.tools.allows("web_search"));
+        assert!(def.tools.allows("web_fetch"));
+        assert!(def.tools.allows("browser"));
+        assert!(!def.tools.allows("shell"));
+        assert!(!def.tools.allows("read_file"));
+        assert!(!def.tools.allows("write_file"));
+        assert!(!def.tools.allows("grep"));
+        assert!(!def.tools.allows("spawn"));
+    }
+
     #[test]
     fn provider_detection_prefers_anthropic_and_skips_empty() {
         let get = |var: &str| match var {
@@ -532,6 +553,53 @@ pub fn start_backend(
     start_backend_with_mcp(workspace, &prefs, &[], false)
 }
 
+/// Robrix's octos profile for its long-lived AI-room sessions, written to
+/// Robrix's own data root and returned as an absolute path for octos's
+/// `--profile` / `AcpCommand::profile`.
+///
+/// octos's built-in `hosted` profile empties the native tool registry, so the
+/// only tools a session can call are the ones Robrix advertises over ACP
+/// `mcpServers` (every one capability-gated). Sessions want that envelope
+/// *plus* octos's own web tools — `web_search`, `web_fetch`, `browser`
+/// (`group:web`) — so the room agent can look something up or read a page when
+/// the user asks. octos resolves a profile by built-in name, by
+/// `~/.octos/profiles/<id>/`, or by an absolute path; writing the JSON under
+/// our own data root and passing the path keeps the user's `~/.octos`
+/// untouched.
+///
+/// Kept to `group:web`: shell, files, search, memory and sub-agent spawn stay
+/// out, exactly as `hosted` leaves them. The web tools are octos-native, so
+/// they are not gated by Robrix's capability prompts; everything Robrix
+/// registers still is.
+///
+/// The file is rewritten only when its content changes, so a long-running app
+/// does not churn it while still picking up an edit on the next session start.
+pub fn robrix_session_profile() -> Result<String, String> {
+    use std::io::Write as _;
+    let dir = a2app_core::data_root().join("agent_profiles");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
+    let path = dir.join("robrix-session.json");
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(ROBRIX_SESSION_PROFILE) {
+        let mut file = std::fs::File::create(&path)
+            .map_err(|e| format!("couldn't write {}: {e}", path.display()))?;
+        file.write_all(ROBRIX_SESSION_PROFILE.as_bytes())
+            .map_err(|e| format!("couldn't write {}: {e}", path.display()))?;
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// The JSON body of [`robrix_session_profile`]'s file. A constant so the test
+/// below can validate it against octos's schema without touching the disk.
+const ROBRIX_SESSION_PROFILE: &str = r#"{
+  "name": "robrix-session",
+  "version": 1,
+  "description": "Robrix AI-room session: octos's own web tools only (group:web), with every other tool call mediated by Robrix's MCP server. Mirrors the built-in `hosted` profile plus web lookup/fetch so the room agent can research on request.",
+  "tools": { "mode": "allow_list", "tools": ["group:web"] },
+  "agents": []
+}
+"#;
+
 /// [`start_backend`] plus the stdio MCP servers the spawned agent is told
 /// about in `session/new` (`mcpServers`). A long-lived AI session passes the
 /// one Robrix tool server it bound for itself here; the one-shot create-app
@@ -547,15 +615,15 @@ pub fn start_backend(
 /// it exactly like the child process does.
 ///
 /// `host_managed` scopes the agent's own toolset. When `true`, the agent
-/// runs as a *host-managed* session: octos backends apply the built-in
-/// `hosted` profile, which empties octos's registry of native tools
-/// (shell/bash, file tools, search, memory, spawn, …), so the only tools
-/// the model can call are the ones Robrix advertises through `mcp_servers`
-/// — every call is mediated by Robrix and maps to a mini-app capability.
-/// When `false` the backend keeps its own default toolset. Honored by the
-/// octos backends (embedded and `octos acp` child); a `ROBRIX_AGENT_CMD`
-/// override or the claude-code bridge brings its own tools and is left
-/// unchanged.
+/// runs as a *host-managed* session: octos backends apply Robrix's session
+/// profile ([`robrix_session_profile`]) — the built-in `hosted` envelope
+/// (zero native shell/files/search/memory/spawn tools) plus `group:web`, so
+/// the only non-web tools the model can call are the ones Robrix advertises
+/// through `mcp_servers`, each mediated by Robrix and mapped to a mini-app
+/// capability. When `false` the backend keeps its own default toolset.
+/// Honored by the octos backends (embedded and `octos acp` child); a
+/// `ROBRIX_AGENT_CMD` override or the claude-code bridge brings its own
+/// tools and is left unchanged.
 pub fn start_backend_with_mcp(
     workspace: &std::path::Path,
     prefs: &prefs::AgentPrefs,
@@ -640,13 +708,18 @@ pub fn start_backend_with_mcp(
             // another provider's endpoint.
             return Ok(Box::new(AcpClient::spawn(&cmd, workspace, &bridge_env, &[], mcp_servers)?));
         }
-        // A host-managed session strips octos's native tools by running the
-        // built-in `hosted` profile (see octos-agent's profile system). The
+        // A host-managed session strips octos's native tools by running
+        // Robrix's session profile (see octos-agent's profile system). The
         // one-shot generation agent (host_managed = false) keeps the default
         // `coding` surface.
-        let mut cmd = octos_acp_command(prefs);
+        let cmd = octos_acp_command(prefs);
+        let mut extra = extra;
         if host_managed {
-            cmd.push_str(" --profile hosted");
+            // Pass the profile as a REAL argument, not appended to the
+            // shell-like command string: `AcpClient::spawn` splits that string
+            // on whitespace, and the data root can contain spaces.
+            extra.push(String::from("--profile"));
+            extra.push(robrix_session_profile()?);
         }
         Ok(Box::new(AcpClient::spawn(&cmd, workspace, &env, &extra, mcp_servers)?))
     }
@@ -728,3 +801,4 @@ pub fn runtime(prefs: &prefs::AgentPrefs) -> Runtime {
         Runtime::Child(octos_acp_command(prefs))
     }
 }
+
