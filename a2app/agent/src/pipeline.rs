@@ -334,10 +334,15 @@ impl Generation {
                         };
                     }
                 }
-                AcpEvent::ToolCall(title) => {
+                AcpEvent::ToolCall { title, .. } => {
                     makepad_widgets::log!("app generation: agent tool call: {title}");
                     self.status = format!("Agent: {title}…");
                     self.log(format!("🔧 {title}"));
+                }
+                AcpEvent::ToolCallDone { ok, .. } => {
+                    // The console's per-call line is enough; the completion is
+                    // surfaced only so the stall clock moved (see `advance`).
+                    makepad_widgets::log!("app generation: agent tool call finished (ok: {ok})");
                 }
                 AcpEvent::Thought(text) => {
                     // The trail gets ONE line per thinking stretch, not one per

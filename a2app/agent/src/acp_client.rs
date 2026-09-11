@@ -45,8 +45,16 @@ pub enum AcpEvent {
     SessionReady,
     /// A streamed chunk of the agent's reply text (`agent_message_chunk`).
     Chunk(String),
-    /// The agent invoked a tool (title only — shown as status, not blocked on).
-    ToolCall(String),
+    /// The agent invoked a tool. `id` is its ACP `toolCallId` (how the
+    /// matching completion is correlated); `title` is the tool name/title the
+    /// agent reported. Shown as status, not blocked on.
+    ToolCall { id: String, title: String },
+    /// The agent finished a tool call. `id` matches the earlier
+    /// [`AcpEvent::ToolCall`]; `ok` is false for a failed call; `summary` is
+    /// the output preview the agent carried, when any. This is what closes
+    /// the live card for a tool Robrix does not itself execute (octos's own
+    /// `web_search` / `web_fetch` / `browser`).
+    ToolCallDone { id: String, ok: bool, summary: String },
     /// A chunk of the agent's extended *thinking* (`agent_thought_chunk`).
     /// This is the only thing a reasoning model emits during the long quiet
     /// stretch before it starts writing, so dropping it (as this client used
@@ -545,6 +553,26 @@ mod tests {
     }
 }
 
+/// Pulls the short output preview out of an ACP `tool_call_update`'s
+/// `content` array, regardless of which `ToolCallContent` variant wrapped it.
+/// Empty when the update carries none (the common case for a tool that just
+/// reports a status).
+fn tool_call_output_preview(update: &Value) -> String {
+    update
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|entries| {
+            entries.iter().find_map(|entry| {
+                entry
+                    .pointer("/content/text")
+                    .and_then(Value::as_str)
+                    .or_else(|| entry.get("text").and_then(Value::as_str))
+            })
+        })
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// Reduces one incoming JSON-RPC line to zero or more `AcpEvent`s, advancing
 /// the handshake as a side effect. Runs on the reader thread; only touches
 /// `Shared`, never the UI.
@@ -584,12 +612,35 @@ fn reduce_line(shared: &Shared, line: &str) -> Vec<AcpEvent> {
                 return vec![AcpEvent::Thought(text.to_string())];
             }
             Some("tool_call") => {
+                let id = update
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 let title = update
                     .get("title")
                     .and_then(Value::as_str)
                     .unwrap_or("tool")
                     .to_string();
-                return vec![AcpEvent::ToolCall(title)];
+                return vec![AcpEvent::ToolCall { id, title }];
+            }
+            Some("tool_call_update") => {
+                // The terminal status of a call the agent started. A
+                // pending/in-progress update is just proof of life.
+                let status = update.get("status").and_then(Value::as_str).unwrap_or("");
+                if status == "completed" || status == "failed" {
+                    let id = update
+                        .get("toolCallId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    return vec![AcpEvent::ToolCallDone {
+                        id,
+                        ok: status == "completed",
+                        summary: tool_call_output_preview(update),
+                    }];
+                }
+                return vec![AcpEvent::Tick];
             }
             Some("plan") => {
                 let Some(entries) = update.get("entries").and_then(Value::as_array) else {

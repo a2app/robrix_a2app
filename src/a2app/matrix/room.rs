@@ -21,10 +21,22 @@ fn as_message(event: &TimelineEvent) -> Option<OriginalSyncRoomMessageEvent> {
     }
 }
 
+/// How many chars a message body is clipped to for the mini-app service
+/// reads. The AI's own read tools ask for the body whole (see `full_body`),
+/// because the model has to quote and reason about what a human actually
+/// wrote — a truncated body makes it report that the tool cut the message.
+const SERVICE_BODY_CLIP: usize = 500;
+
 /// The `{sender, sender_id, event_id, body, ts, msgtype}` shape every message list carries.
-fn message_json(msg: &OriginalSyncRoomMessageEvent) -> serde_json::Value {
+///
+/// `full_body` keeps the whole message text; only the mini-app services clip
+/// (to `SERVICE_BODY_CLIP`), so a scripted reader does not have to guard
+/// against a megabyte message. The AI read tools pass `true`.
+fn message_json(msg: &OriginalSyncRoomMessageEvent, full_body: bool) -> serde_json::Value {
     let mut body = remove_plain_reply_fallback(msg.content.body()).to_string();
-    clip_chars(&mut body, 500);
+    if !full_body {
+        clip_chars(&mut body, SERVICE_BODY_CLIP);
+    }
     serde_json::json!({
         "sender": msg.sender.localpart(),
         "sender_id": msg.sender,
@@ -85,14 +97,14 @@ pub(super) async fn thread_replies(room_id: OwnedRoomId, event_id: OwnedEventId,
     let mut replies: Vec<OriginalSyncRoomMessageEvent> = related.iter().filter_map(as_message).collect();
     replies.sort_by_key(|m| m.origin_server_ts);
     let newest = replies.len().saturating_sub(limit as usize);
-    let replies: Vec<serde_json::Value> = replies[newest..].iter().map(message_json).collect();
+    let replies: Vec<serde_json::Value> = replies[newest..].iter().map(|m| message_json(m, false)).collect();
     Ok(serde_json::json!({
-        "root": as_message(&root).map(|m| message_json(&m)),
+        "root": as_message(&root).map(|m| message_json(&m, false)),
         "replies": replies,
     }).to_string())
 }
 
-pub(crate) async fn older_messages(room_id: OwnedRoomId, before: Option<OwnedEventId>, limit: u32) -> Result<String, String> {
+pub(crate) async fn older_messages(room_id: OwnedRoomId, before: Option<OwnedEventId>, limit: u32, full_body: bool) -> Result<String, String> {
     use matrix_sdk::room::MessagesOptions;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
@@ -114,7 +126,7 @@ pub(crate) async fn older_messages(room_id: OwnedRoomId, before: Option<OwnedEve
         let context = room.event_with_context(anchor, true, (limit as u32 * 2).into(), None).await
             .map_err(|e| format!("couldn't load older messages: {e}"))?;
         out.extend(context.events_before.iter().filter_map(as_message).map(|m| {
-            add_row_context(message_json(&m), &m, &room_id, my_read_ts, &me)
+            add_row_context(message_json(&m, full_body), &m, &room_id, my_read_ts, &me)
         }));
         from = context.prev_batch_token;
     }
@@ -129,7 +141,7 @@ pub(crate) async fn older_messages(room_id: OwnedRoomId, before: Option<OwnedEve
         let messages = room.messages(options).await
             .map_err(|e| format!("couldn't load older messages: {e}"))?;
         out.extend(messages.chunk.iter().filter_map(as_message).map(|m| {
-            add_row_context(message_json(&m), &m, &room_id, my_read_ts, &me)
+            add_row_context(message_json(&m, full_body), &m, &room_id, my_read_ts, &me)
         }));
         from = messages.end;
         if from.is_none() {
@@ -181,10 +193,10 @@ pub(super) async fn event(room_id: OwnedRoomId, event_id: OwnedEventId) -> Resul
             _ => {}
         }
     }
-    let mut out = message_json(&msg);
+    let mut out = message_json(&msg, false);
     if let Some(Relation::Replacement(edit)) = latest_edit.as_ref().and_then(|e| e.content.relates_to.as_ref()) {
         let mut body = remove_plain_reply_fallback(edit.new_content.msgtype.body()).to_string();
-        clip_chars(&mut body, 500);
+        clip_chars(&mut body, SERVICE_BODY_CLIP);
         out["body"] = body.into();
     }
     out["edited"] = latest_edit.is_some().into();
@@ -358,22 +370,25 @@ fn push_message(
     room_id: &OwnedRoomId,
     my_read_ts: Option<u64>,
     me: &OwnedUserId,
+    full_body: bool,
 ) {
     if let Some(Relation::Replacement(edit)) = &msg.content.relates_to {
         edits.entry(edit.event_id.clone())
             .or_insert_with(|| remove_plain_reply_fallback(edit.new_content.msgtype.body()).to_string());
         return;
     }
-    let mut row = message_json(&msg);
+    let mut row = message_json(&msg, full_body);
     if let Some(mut body) = edits.remove(&msg.event_id) {
-        clip_chars(&mut body, 500);
+        if !full_body {
+            clip_chars(&mut body, SERVICE_BODY_CLIP);
+        }
         row["body"] = body.into();
     }
     out.push(add_row_context(row, &msg, room_id, my_read_ts, me));
 }
 
 /// `matrix.read_messages`, and `matrix.rooms_messages` for any joined room.
-pub(crate) async fn read_messages(room_id: matrix_sdk::ruma::OwnedRoomId, limit: u32) -> Result<String, String> {
+pub(crate) async fn read_messages(room_id: matrix_sdk::ruma::OwnedRoomId, limit: u32, full_body: bool) -> Result<String, String> {
     use matrix_sdk::RoomState;
     use matrix_sdk::room::MessagesOptions;
     use crate::sliding_sync::get_client;
@@ -397,7 +412,7 @@ pub(crate) async fn read_messages(room_id: matrix_sdk::ruma::OwnedRoomId, limit:
                 let Ok(AnySyncTimelineEvent::MessageLike(
                     AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(msg))
                 )) = event.raw().deserialize() else { continue };
-                push_message(&mut out, &mut edits, msg, &room_id, my_read_ts, &me);
+                push_message(&mut out, &mut edits, msg, &room_id, my_read_ts, &me, full_body);
                 if out.len() >= limit as usize {
                     break;
                 }
@@ -420,7 +435,7 @@ pub(crate) async fn read_messages(room_id: matrix_sdk::ruma::OwnedRoomId, limit:
                 let Ok(AnySyncTimelineEvent::MessageLike(
                     AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(msg))
                 )) = event.raw().deserialize() else { continue };
-                push_message(&mut out, &mut edits, msg, &room_id, my_read_ts, &me);
+                push_message(&mut out, &mut edits, msg, &room_id, my_read_ts, &me, full_body);
                 if out.len() >= limit as usize {
                     break;
                 }

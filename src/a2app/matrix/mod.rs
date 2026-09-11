@@ -309,7 +309,7 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
     let (reply, result) = match request {
         A2AppMatrixRequest::RoomInfo { room_id, reply } => (reply, room::info(room_id).await),
         A2AppMatrixRequest::ReadMessages { room_id, limit, reply } =>
-            (reply, room::read_messages(room_id, limit).await),
+            (reply, room::read_messages(room_id, limit, false).await),
         A2AppMatrixRequest::SendMessage { room_id, body, reply } =>
             (reply, send::message(room_id, body).await),
         A2AppMatrixRequest::Members { room_id, limit, reply } => {
@@ -605,7 +605,7 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
         A2AppMatrixRequest::ThreadReplies { room_id, event_id, limit, reply } =>
             (reply, room::thread_replies(room_id, event_id, limit).await),
         A2AppMatrixRequest::OlderMessages { room_id, before, limit, reply } =>
-            (reply, room::older_messages(room_id, before, limit).await),
+            (reply, room::older_messages(room_id, before, limit, false).await),
         A2AppMatrixRequest::Event { room_id, event_id, reply } =>
             (reply, room::event(room_id, event_id).await),
         A2AppMatrixRequest::ReadReceipts { room_id, user_id, reply } =>
@@ -625,7 +625,7 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
         A2AppMatrixRequest::RoomPreview { room, via, reply } => (reply, rooms::preview(room, via).await),
         A2AppMatrixRequest::RoomsInfo { room_id, reply } => (reply, room::info(room_id).await),
         A2AppMatrixRequest::RoomsMessages { room_id, limit, reply } =>
-            (reply, room::read_messages(room_id, limit).await),
+            (reply, room::read_messages(room_id, limit, false).await),
 
         // --- spaces ---
         A2AppMatrixRequest::Spaces { reply } => (reply, spaces::list().await),

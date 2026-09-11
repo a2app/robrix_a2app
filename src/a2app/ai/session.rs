@@ -27,7 +27,7 @@
 //! Unix socket, which is what keeps the sandboxed test run meaningful here
 //! (the socket halves are covered by `tests/mcp_transport.rs` on CI).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::Arc;
@@ -152,6 +152,13 @@ pub enum SessionUpdate {
     /// turns this into the tool call's `Started` state event and matches its
     /// eventual outcome back to the same row.
     ToolCallStarted { name: String },
+    /// The agent finished one of its OWN tools (octos's `web_search`,
+    /// `web_fetch`, `browser`), which Robrix does not itself execute, so it
+    /// never sees the tool result through the MCP host. The runtime rewrites
+    /// the call's live row `Done` with this outcome. A Robrix-registered tool
+    /// is resolved by the host instead, so its late ACP completion finds no
+    /// running row and is a no-op.
+    ToolCallFinished { name: String, ok: bool, summary: String },
     /// The agent reported an error on the in-flight turn.
     Error(String),
     /// The agent process is gone (died, was killed, or never started). The
@@ -217,6 +224,10 @@ pub struct AiSession {
     /// Set when the agent process is gone (`ProcessGone`); prompts are then
     /// refused and the runtime drops the session.
     transport_dead: bool,
+    /// The ACP `toolCallId` of each tool call started this session, mapped to
+    /// the tool's name, so a `tool_call_update` completion can close the right
+    /// live row. Cleared at each turn's end (a call cannot outlive its turn).
+    tool_call_names: HashMap<String, String>,
     /// Chars of reply text streamed so far this turn (diagnostics only).
     turn_reply_chars: usize,
     /// Chars of thinking streamed so far this turn (diagnostics only).
@@ -235,11 +246,12 @@ impl AiSession {
     /// provider, agent missing, socket bind failure).
     ///
     /// The session agent is *host-managed* (`host_managed = true`): an octos
-    /// backend runs its built-in `hosted` profile, so octos's native tools
-    /// (shell/bash, file tools, memory, …) are absent. The only tools the
-    /// model can call are the ones registered on `server` below — all of
-    /// which Robrix executes and gates — so every piece of tool access is
-    /// mediated by Robrix and maps to capabilities shared with mini-apps.
+    /// backend runs Robrix's session profile, so octos's native tools
+    /// (shell/bash, file tools, memory, …) are absent — except its own web
+    /// tools (`web_search`, `web_fetch`, `browser`), which the profile keeps
+    /// so the agent can research or read a page on request. Everything else
+    /// the model can call is registered on `server` below and mediated by
+    /// Robrix, mapping to capabilities shared with mini-apps.
     pub fn start(room_id: OwnedRoomId, prefs: AgentPrefs) -> Result<Self, String> {
         // The rendezvous: serve threads send jobs here, the UI thread drains.
         let (jobs_tx, jobs_rx) = channel::<SessionJob>();
@@ -300,6 +312,7 @@ impl AiSession {
             queued: VecDeque::new(),
             generation_answer: None,
             transport_dead: false,
+            tool_call_names: HashMap::new(),
             turn_reply_chars: 0,
             turn_thought_chars: 0,
             turn_thought_logged: false,
@@ -408,6 +421,9 @@ impl AiSession {
                     if stop_reason != "cancelled" && !text.trim().is_empty() {
                         updates.push(SessionUpdate::Reply { text });
                     }
+                    // A tool call cannot outlive its turn; drop the id map
+                    // (any row still open stays Started history, as before).
+                    self.tool_call_names.clear();
                     self.flush_queue();
                 }
                 AcpEvent::Error(msg) => {
@@ -415,6 +431,7 @@ impl AiSession {
                     // The agent answered the outstanding request with an
                     // error; it is idle again, and any queued asks continue.
                     self.busy = false;
+                    self.tool_call_names.clear();
                     updates.push(SessionUpdate::Error(msg));
                     self.flush_queue();
                 }
@@ -422,6 +439,7 @@ impl AiSession {
                     log!("AI session {}: agent process gone: {}", self.room_id, clip(&msg, 240));
                     self.busy = false;
                     self.transport_dead = true;
+                    self.tool_call_names.clear();
                     updates.push(SessionUpdate::Gone(msg));
                 }
                 // Streamed content a chat does not need to echo back to the
@@ -453,9 +471,21 @@ impl AiSession {
                         );
                     }
                 }
-                AcpEvent::ToolCall(title) => {
-                    log!("AI session {}: agent tool call: {}", self.room_id, title);
+                AcpEvent::ToolCall { id, title } => {
+                    log!("AI session {}: agent tool call: {title} (id {id})", self.room_id);
+                    if !id.is_empty() {
+                        self.tool_call_names.insert(id, title.clone());
+                    }
                     updates.push(SessionUpdate::ToolCallStarted { name: title });
+                }
+                AcpEvent::ToolCallDone { id, ok, summary } => {
+                    log!(
+                        "AI session {}: agent tool call {id} finished (ok: {ok})",
+                        self.room_id
+                    );
+                    if let Some(name) = self.tool_call_names.remove(&id) {
+                        updates.push(SessionUpdate::ToolCallFinished { name, ok, summary });
+                    }
                 }
                 AcpEvent::Plan(steps) => {
                     log!("AI session {}: agent plan updated ({} steps)", self.room_id, steps.len());

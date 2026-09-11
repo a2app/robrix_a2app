@@ -171,6 +171,10 @@ struct ActiveToolCall {
     /// The state key of the posted `Started` row — the `Done` update rewrites
     /// that same row instead of appending a new one.
     key: String,
+    /// Human-readable target detail (the room/space name, the generated app's
+    /// description), set when the call's [`SessionJob`] reaches the UI thread.
+    /// Rendered after the humanized action; `None` when there is no target.
+    detail: Option<String>,
 }
 
 /// An AI room's marker/forwarding state, tracked once the room is opened.
@@ -1900,6 +1904,74 @@ fn ai_job_tool_name(job: &SessionJob) -> &'static str {
     }
 }
 
+/// The human-readable target detail for one tool call, rendered after the
+/// humanized action in the live row and on the turn's receipt chip. The room
+/// and space names come from the rooms list; a missing list (before Home is
+/// up) falls back to the raw id. `None` when the call has no target to name.
+#[cfg(unix)]
+fn session_job_detail(rooms: Option<&RoomsListRef>, job: &SessionJob) -> Option<String> {
+    match job {
+        SessionJob::ReadTool { kind, .. } => read_kind_detail(kind, &|id| resolve_room_label(rooms, id)),
+        SessionJob::PostRoomMessage { room_id, .. } => {
+            Some(format!("into “{}”", resolve_room_label(rooms, room_id)))
+        }
+        SessionJob::LaunchSplashApp { description, .. } => {
+            let description = description.trim();
+            if description.is_empty() {
+                None
+            } else {
+                let mut clipped: String = description.chars().take(60).collect();
+                if description.chars().count() > 60 {
+                    clipped.push('…');
+                }
+                Some(format!("“{clipped}”"))
+            }
+        }
+        // Named so the live row opens (and finishes) with a target even
+        // though the reply itself is the visible output; a synchronous-finish
+        // tool must not leave a stranded `Started` row when the job reaches
+        // the UI thread before the agent's `started` event.
+        SessionJob::SendRoomMessage { .. } => Some(String::from("in this room")),
+    }
+}
+
+/// The display name for a room or space id, for the tool cards and prompts:
+/// the rooms list's name when it has one, else the SDK's cached name (which
+/// also covers spaces and rooms the list has not built yet), else the raw id
+/// as a last resort. Never returns an empty string.
+#[cfg(unix)]
+fn resolve_room_label(rooms: Option<&RoomsListRef>, room_id: &str) -> String {
+    if let Some(name) = rooms.and_then(|r| room_display_name(r, room_id)) {
+        return name;
+    }
+    if let Ok(id) = OwnedRoomId::try_from(room_id)
+        && let Some(room) = crate::sliding_sync::get_client().and_then(|c| c.get_room(&id))
+        && let Some(name) = room.cached_display_name()
+    {
+        return name.to_string();
+    }
+    room_id.to_string()
+}
+
+/// The target detail for one read, by kind. Reads confined to this room name
+/// no room (the row is already in it); a cross-room or space read names its
+/// target so the user can tell where the AI looked.
+#[cfg(unix)]
+fn read_kind_detail(kind: &ReadToolKind, room_label: &impl Fn(&str) -> String) -> Option<String> {
+    match kind {
+        ReadToolKind::OtherRoom { room, .. } => Some(format!("in “{}”", room_label(room))),
+        ReadToolKind::SpaceInfo { space } => Some(format!("for “{}”", room_label(space))),
+        ReadToolKind::SpaceRooms { space } => Some(format!("in “{}”", room_label(space))),
+        // This room's own reads and the user-wide lists carry no target.
+        ReadToolKind::Messages { .. }
+        | ReadToolKind::Older { .. }
+        | ReadToolKind::Info
+        | ReadToolKind::ListRooms
+        | ReadToolKind::ListSpaces
+        | ReadToolKind::Memory { .. } => None,
+    }
+}
+
 /// Refuses one parked request outright (a "Not Now" dismissal): a mini-app
 /// bridge request is declined through the broker exactly as a stored Deny
 /// would be; an AI tool call is answered with an error the model can read and
@@ -1959,22 +2031,23 @@ fn ai_prompt_action(
                     ReadToolKind::Older { .. } => String::from("read this room's older messages"),
                     ReadToolKind::Info => String::from("see this room's details"),
                     ReadToolKind::OtherRoom { room, .. } => {
-                        let name = rooms
-                            .and_then(|r| room_display_name(r, room.as_str()))
-                            .unwrap_or_else(|| room.clone());
-                        format!("read messages in “{name}”")
+                        format!("read messages in “{}”", resolve_room_label(rooms, room))
                     }
                     ReadToolKind::ListRooms => String::from("see a list of your rooms"),
+                    ReadToolKind::ListSpaces => String::from("see your spaces"),
+                    ReadToolKind::SpaceInfo { space } => {
+                        format!("see details of the space “{}”", resolve_room_label(rooms, space))
+                    }
+                    ReadToolKind::SpaceRooms { space } => {
+                        format!("see the rooms in the space “{}”", resolve_room_label(rooms, space))
+                    }
                     // Ungated plumbing never parks behind a prompt; this arm
                     // exists for exhaustiveness.
                     ReadToolKind::Memory { .. } => String::from("recall its own past replies"),
                 },
                 SessionJob::LaunchSplashApp { .. } => String::from("build and run a mini-app"),
                 SessionJob::PostRoomMessage { room_id: room, .. } => {
-                    let name = rooms
-                        .and_then(|r| room_display_name(r, room.as_str()))
-                        .unwrap_or_else(|| room.clone());
-                    format!("post a message into “{name}”")
+                    format!("post a message into “{}”", resolve_room_label(rooms, room))
                 }
                 SessionJob::SendRoomMessage { .. } => continue,
             };
@@ -2005,22 +2078,23 @@ fn ai_prompt_reason(
                     ReadToolKind::Older { .. } => String::from("It needs more of this conversation's history to answer you."),
                     ReadToolKind::Info => String::from("It wants to know which room it is in."),
                     ReadToolKind::OtherRoom { room, .. } => {
-                        let name = rooms
-                            .and_then(|r| room_display_name(r, room.as_str()))
-                            .unwrap_or_else(|| room.clone());
-                        format!("You asked it to read “{name}”, which is outside this room.")
+                        format!("You asked it to read “{}”, which is outside this room.", resolve_room_label(rooms, room))
                     }
                     ReadToolKind::ListRooms => String::from("It needs to know which rooms you have before it can offer to read one."),
+                    ReadToolKind::ListSpaces => String::from("It needs to know which spaces you have before it can list the rooms inside one."),
+                    ReadToolKind::SpaceInfo { space } => {
+                        format!("It wants details of the space “{}” so it can tell you about it.", resolve_room_label(rooms, space))
+                    }
+                    ReadToolKind::SpaceRooms { space } => {
+                        format!("It wants to see the rooms grouped under the space “{}” so it can tell you about them.", resolve_room_label(rooms, space))
+                    }
                     // Ungated plumbing never parks behind a prompt; this arm
                     // exists for exhaustiveness.
                     ReadToolKind::Memory { .. } => String::from("It is recalling what it previously said in this room."),
                 },
                 SessionJob::LaunchSplashApp { .. } => String::from("It is building an app you asked for."),
                 SessionJob::PostRoomMessage { room_id: room, .. } => {
-                    let name = rooms
-                        .and_then(|r| room_display_name(r, room.as_str()))
-                        .unwrap_or_else(|| room.clone());
-                    format!("It wants to post a message into “{name}”, outside this room. It can only post there if you allow this room.")
+                    format!("It wants to post a message into “{}”, outside this room. It can only post there if you allow this room.", resolve_room_label(rooms, room))
                 }
                 SessionJob::SendRoomMessage { .. } => continue,
             };
@@ -2573,9 +2647,9 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
                 // turn's receipt chip. Ungated memory reads (recalling its
                 // own past turns) are room plumbing, not something the user
                 // watches for, so they leave no chip — only their row.
-                finish_ai_tool_call(&room_id, read_tool_name(&kind), ok, &summary);
+                let detail = finish_ai_tool_call(&room_id, read_tool_name(&kind), ok, &summary);
                 if !matches!(kind, ReadToolKind::Memory { .. }) {
-                    note_ai_tool_call(&room_id, read_tool_name(&kind), ok, &summary);
+                    push_ai_tool_receipt(&room_id, read_tool_name(&kind), detail, ok, &summary);
                 }
                 let _ = answer.send(result);
             }
@@ -3106,6 +3180,20 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
                         log!("AI Rooms: room {room_id}'s agent started tool {name}.");
                         on_ai_tool_call_started(&room_id, &name);
                     }
+                    SessionUpdate::ToolCallFinished { name, ok, summary } => {
+                        // The agent's OWN tool (octos's web_search/web_fetch/
+                        // browser) finished; close its live row. A Robrix
+                        // tool's row was already rewritten Done by the host,
+                        // so this finds no running row and does nothing; no
+                        // receipt chip either way (the result never reached
+                        // the model through Robrix).
+                        let summary: String = summary.chars().take(200).collect();
+                        log!(
+                            "AI Rooms: room {room_id}'s agent tool {name} finished (ok: {ok}{}).",
+                            if summary.is_empty() { String::new() } else { format!(": {summary}") }
+                        );
+                        finish_ai_tool_call(&room_id, &name, ok, &summary);
+                    }
                     SessionUpdate::Reply { text } => {
                         log!("AI Rooms: room {room_id}'s agent finished a turn ({} chars).", text.len());
                         // A turn whose `send_message` tool already posted to
@@ -3592,6 +3680,12 @@ fn run_ai_generation(
 /// result back to the serve thread that called the tool.
 #[cfg(unix)]
 fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: SessionJob) {
+    // The job is the only place the call's arguments exist, so this is where
+    // the human-readable target detail is computed and pinned to the call's
+    // live row (reposted with it) and, later, its receipt chip.
+    let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
+    let detail = session_job_detail(rooms.as_ref(), &job);
+    record_tool_call_detail(room_id, ai_job_tool_name(&job), detail);
     match job {
         SessionJob::SendRoomMessage { text, answer } => {
             // Remember this turn already spoke to the room through the tool,
@@ -3690,13 +3784,33 @@ fn ai_now_millis() -> u64 {
 #[cfg(unix)]
 fn note_ai_tool_call(room_id: &OwnedRoomId, name: &str, ok: bool, summary: &str) {
     let summary: String = summary.chars().take(48).collect();
-    finish_ai_tool_call(room_id, name, ok, &summary);
+    // `finish_ai_tool_call` returns the target detail recorded for the call
+    // when its job reached the UI thread, so the receipt chip names the same
+    // room/space/app the live row did.
+    let detail = finish_ai_tool_call(room_id, name, ok, &summary);
+    push_ai_tool_receipt(room_id, name, detail, ok, &summary);
+}
+
+/// Adds one finished call to the room's pending receipt list, shown on the
+/// turn's `ai_reply` card. Split out of [`note_ai_tool_call`] so a caller
+/// that already finished the live row (the async read result, which may skip
+/// the receipt for ungated memory reads) does not finish it twice and lose
+/// the call's target detail.
+#[cfg(unix)]
+fn push_ai_tool_receipt(
+    room_id: &OwnedRoomId,
+    name: &str,
+    detail: Option<String>,
+    ok: bool,
+    summary: &str,
+) {
     with_a2app(|state| {
         if let Some(info) = state.ai_rooms.get_mut(room_id) {
             info.pending_tool_calls.push(AiReplyToolCall {
                 name: name.to_string(),
+                detail,
                 ok,
-                summary,
+                summary: summary.chars().take(48).collect(),
             });
         }
     });
@@ -3709,18 +3823,58 @@ fn note_ai_tool_call(room_id: &OwnedRoomId, name: &str, ok: bool, summary: &str)
 /// name; rows with no match (their `Started` event hasn't drained yet, or
 /// never will) are left as `Started` history.
 #[cfg(unix)]
-fn finish_ai_tool_call(room_id: &OwnedRoomId, name: &str, ok: bool, summary: &str) {
-    // Take the matching row's key OUT of the borrow: the state-event post
-    // below must run after `with_a2app` releases its guard.
-    let finished_key = with_a2app(|state| {
+fn finish_ai_tool_call(room_id: &OwnedRoomId, name: &str, ok: bool, summary: &str) -> Option<String> {
+    // Take the matching row's key and detail OUT of the borrow: the
+    // state-event post below must run after `with_a2app` releases its guard.
+    let finished = with_a2app(|state| {
         state.ai_rooms.get_mut(room_id).and_then(|info| {
             let pos = info.active_tool_calls.iter().position(|c| c.name == name);
-            pos.map(|p| info.active_tool_calls.remove(p).key)
+            pos.map(|p| {
+                let call = info.active_tool_calls.remove(p);
+                (call.key, call.detail)
+            })
         })
     })
     .flatten();
-    if let Some(key) = finished_key {
-        post_ai_tool_call_done(room_id, name, &key, ok, summary);
+    if let Some((key, detail)) = finished {
+        post_ai_tool_call_done(room_id, name, &key, detail.as_deref(), ok, summary);
+        return detail;
+    }
+    None
+}
+
+/// Applies one tool call's human-readable target detail to its live row and
+/// (re)posts that row `Started`. Called from [`execute_session_job`] as soon
+/// as the job — which holds the arguments — reaches the UI thread. The ACP
+/// `started` event only carries the tool name, so it opens the row without a
+/// detail; this reposts the same row (same key) with the detail once known.
+/// If the job wins the race and arrives before the ACP event, it creates the
+/// row here and [`on_ai_tool_call_started`] then leaves it alone.
+///
+/// The outcome ([`finish_ai_tool_call`]) reads the detail back when it
+/// rewrites the row `Done` and builds the turn's receipt chip.
+#[cfg(unix)]
+fn record_tool_call_detail(room_id: &OwnedRoomId, name: &str, detail: Option<String>) {
+    if detail.is_none() {
+        return;
+    }
+    let key = with_a2app(|state| {
+        let info = state.ai_rooms.get_mut(room_id)?;
+        if let Some(call) = info.active_tool_calls.iter_mut().find(|c| c.name == name) {
+            call.detail = detail.clone();
+            return Some(call.key.clone());
+        }
+        let key = next_ai_state_key("tool");
+        info.active_tool_calls.push(ActiveToolCall {
+            name: name.to_string(),
+            key: key.clone(),
+            detail: detail.clone(),
+        });
+        Some(key)
+    })
+    .flatten();
+    if let Some(key) = key {
+        post_ai_tool_call_started(room_id, name, &key, detail.as_deref());
     }
 }
 
@@ -3742,24 +3896,50 @@ fn post_ai_activity(room_id: &OwnedRoomId, kind: AiActivityKind, label: Option<&
 /// records the row so its outcome can rewrite it `Done`.
 #[cfg(unix)]
 fn on_ai_tool_call_started(room_id: &OwnedRoomId, name: &str) {
+    // `execute_session_job` runs before the agent events are drained and
+    // already opened the row (with its detail) if the job won the race; never
+    // mint a second row for the same call.
+    let already = with_a2app(|state| {
+        state
+            .ai_rooms
+            .get(room_id)
+            .is_some_and(|info| info.active_tool_calls.iter().any(|c| c.name == name))
+    })
+    .unwrap_or(false);
+    if already {
+        return;
+    }
     let key = next_ai_state_key("tool");
     with_a2app(|state| {
         if let Some(info) = state.ai_rooms.get_mut(room_id) {
             info.active_tool_calls.push(ActiveToolCall {
                 name: name.to_string(),
                 key: key.clone(),
+                detail: None,
             });
         }
     });
+    post_ai_tool_call_started(room_id, name, &key, None);
+}
+
+/// Serializes one `ai_tool_call` row in its `Started` state under `key`.
+#[cfg(unix)]
+fn post_ai_tool_call_started(
+    room_id: &OwnedRoomId,
+    name: &str,
+    key: &str,
+    detail: Option<&str>,
+) {
     let content = AiToolCallContent {
         v: 1,
         name: name.to_string(),
+        detail: detail.map(ToString::to_string),
         status: AiToolCallStatus::Started,
         ok: false,
         summary: String::new(),
         created_at: ai_now_millis(),
     };
-    post_ai_state_event(room_id, AI_TOOL_CALL_EVENT_TYPE, &key, &content);
+    post_ai_state_event(room_id, AI_TOOL_CALL_EVENT_TYPE, key, &content);
 }
 
 /// Rewrites one `ai_tool_call` row (its `Started` key) as `Done`, carrying
@@ -3769,12 +3949,14 @@ fn post_ai_tool_call_done(
     room_id: &OwnedRoomId,
     name: &str,
     key: &str,
+    detail: Option<&str>,
     ok: bool,
     summary: &str,
 ) {
     let content = AiToolCallContent {
         v: 1,
         name: name.to_string(),
+        detail: detail.map(ToString::to_string),
         status: AiToolCallStatus::Done,
         ok,
         summary: summary.to_string(),
