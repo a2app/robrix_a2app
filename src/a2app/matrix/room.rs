@@ -178,12 +178,12 @@ pub(super) async fn read_receipts(room_id: OwnedRoomId, user_id: Option<OwnedUse
     for member in members.iter().take(200) {
         let user_id = member.user_id();
         let mut candidates = vec![
-            room.load_user_receipt(ReceiptType::Read, ReceiptThread::Unthreaded, user_id).await.ok().flatten(),
+            room.load_user_receipt(ReceiptType::Read, &ReceiptThread::Unthreaded, user_id).await.ok().flatten(),
         ];
         // Our own position may only exist as a private receipt.
         if me.as_deref() == Some(user_id) {
             candidates.push(
-                room.load_user_receipt(ReceiptType::ReadPrivate, ReceiptThread::Unthreaded, user_id).await.ok().flatten(),
+                room.load_user_receipt(ReceiptType::ReadPrivate, &ReceiptThread::Unthreaded, user_id).await.ok().flatten(),
             );
         }
         let Some((event_id, receipt)) = candidates.into_iter().flatten().max_by_key(|(_, r)| r.ts) else {

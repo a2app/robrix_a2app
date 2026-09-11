@@ -9,7 +9,7 @@ use eyeball_im::VectorDiff;
 use matrix_sdk::{Room, RoomInfo, RoomState};
 use matrix_sdk::event_cache::{EventsOrigin, RoomEventCacheUpdate, TimelineVectorDiffs};
 use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
-use matrix_sdk::ruma::events::{AnySyncEphemeralRoomEvent, AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent, SyncMessageLikeEvent};
+use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent, SyncMessageLikeEvent};
 use matrix_sdk::ruma::events::receipt::ReceiptType;
 use matrix_sdk::ruma::events::room::message::Relation;
 use tokio::runtime::Handle;
@@ -224,19 +224,16 @@ pub async fn watch_room(room_id: OwnedRoomId) {
                                 }
                             }
                         }
-                        Ok(RoomEventCacheUpdate::AddEphemeralEvents { events }) => {
+                        Ok(RoomEventCacheUpdate::AddReadReceiptEvent { event }) => {
                             let mut receipts = Vec::new();
-                            for raw in events {
-                                let Ok(AnySyncEphemeralRoomEvent::Receipt(receipt_event)) = raw.deserialize() else { continue };
-                                for (event_id, by_type) in receipt_event.content.0 {
-                                    for (kind, users) in by_type {
-                                        if !matches!(kind, ReceiptType::Read | ReceiptType::ReadPrivate) { continue }
-                                        receipts.extend(users.into_iter().map(|(user_id, receipt)| RoomReceipt {
-                                            user_id,
-                                            event_id: event_id.clone(),
-                                            ts: receipt.ts.map(|ts| u64::from(ts.get())),
-                                        }));
-                                    }
+                            for (event_id, by_type) in event.0 {
+                                for (kind, users) in by_type {
+                                    if !matches!(kind, ReceiptType::Read | ReceiptType::ReadPrivate) { continue }
+                                    receipts.extend(users.into_iter().map(|(user_id, receipt)| RoomReceipt {
+                                        user_id,
+                                        event_id: event_id.clone(),
+                                        ts: receipt.ts.map(|ts| u64::from(ts.get())),
+                                    }));
                                 }
                             }
                             if !receipts.is_empty() {

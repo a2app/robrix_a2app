@@ -15,7 +15,7 @@ metadata.makepad-auto-version = "zqpv-Yj-K7WNVK2I8h5Okhho46Q="
 
 [dependencies]
 makepad-widgets = { workspace = true }
-makepad-code-editor = { git = "https://github.com/makepad/makepad", branch = "dev" }
+makepad-code-editor = { workspace = true }
 
 
 robius-directories = { git = "https://github.com/project-robius/robius" }
@@ -23,6 +23,7 @@ robius-file-picker = { git = "https://github.com/project-robius/robius" }
 robius-location    = { git = "https://github.com/project-robius/robius" }
 robius-open        = { git = "https://github.com/project-robius/robius" }
 robius-share       = { git = "https://github.com/project-robius/robius" }
+robius-speech      = { git = "https://github.com/project-robius/robius", branch = "speech_to_text" }
 robius-use-makepad = "0.1.1" ## auto-configures all `robius-*` crates to work with Makepad.
 
 
@@ -40,12 +41,12 @@ clap = { version = "4.0.16", features = ["derive"] }
 crossbeam-channel = "0.5.10"
 crossbeam-queue = "0.3.8"
 eyeball = { version = "0.8.8", features = ["tracing"] } # same as matrix-sdk-ui
-eyeball-im = { version = "0.8.0", features = [ "tracing" ] } # same as matrix-sdk-ui
+eyeball-im = { version = "0.9.0", features = [ "tracing" ] } # same as matrix-sdk-ui
 futures = "0.3"
-imbl = { version = "6.1.0", features = ["serde"] } # same as matrix-sdk-ui
+imbl = { version = "7.0.1", features = ["serde"] } # same as matrix-sdk-ui
 futures-util = "0.3"
 hashbrown = { version = "0.16", features = ["raw-entry"] }
-htmlize = { version = "1.0.5", features = ["unescape"] }
+htmlize = { version = "1.1", features = ["unescape"] }
 indexmap = "2.6.0"
 libc = "0.2"
 mime = "0.3"
@@ -59,6 +60,8 @@ matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", default-fe
     "sqlite",
     "bundled-sqlite",
     "sso-login",
+    ## The SDK no longer registers a rustls crypto provider unless we ask for one.
+    "rustls-aws-lc-rs",
 ] }
 matrix-sdk-ui = { git = "https://github.com/matrix-org/matrix-rust-sdk", default-features = false }
 ## Use the same ruma version as what's specified in matrix-sdk's Cargo.toml.
@@ -69,7 +72,7 @@ matrix-sdk-ui = { git = "https://github.com/matrix-org/matrix-rust-sdk", default
 ## * Note: we need a feature like "compat-unset-display-name" to unset display names, but that doesn't exist yet.
 ##
 ## Note: we actually patch this below to use our `tsp` branch instead.
-ruma = { git = "https://github.com/ruma/ruma", rev = "8beb557b466a43b057c9c155277c77fe8766fadf", features = [
+ruma = { git = "https://github.com/ruma/ruma", rev = "0908aaa9847093ecb32bc6edf0af525f726717fd", features = [
     "compat-optional",
     "compat-unset-avatar",
     "unstable-compat-lax-syncv5-deser",
@@ -161,19 +164,22 @@ members = ["a2app/core", "a2app/agent"]
 ## One source of truth for the makepad pin: the a2app crates inherit it, so
 ## a repin here can't leave them on a different fork or branch.
 [workspace.dependencies]
-makepad-widgets = { git = "https://github.com/makepad/makepad", branch = "dev", features = ["serde"] }
+# makepad-widgets = { git = "https://github.com/makepad/makepad", branch = "dev", features = ["serde"] }
+# makepad-code-editor = { git = "https://github.com/makepad/makepad", branch = "dev" }
+makepad-widgets = { git = "https://github.com/kevinaboos/makepad", branch = "button-grab-key-focus", features = ["serde"] }
+makepad-code-editor = { git = "https://github.com/kevinaboos/makepad", branch = "button-grab-key-focus" }
 
 
 [patch.crates-io]
 ## This is required to avoid a version conflict on the libsqlite3-sys crate,
 ## which is a native crate that can only exist once in the dependency graph.
 ## The `matrix-sdk` crate's dependencies require a specific version of `libsqlite3-sys`
-## (via rustsqlite which requires libsqlite3-sys 0.35.0),
+## (via rustsqlite which requires libsqlite3-sys 0.38),
 ## whereas the `tsp_sdk` crate depends on `sqlx`, which requires a different version
 ## of `libsqlite3-sys` (via `aries-askar`, which depends on `askar-storage`,
 ## which requires libsqlite3-sys 0.30.0).
 ## So this patch is a custom version of sqlx 0.8.6 that updates the libsqlite3-sys
-## dependency to version 0.35.0, which is compatible with the version required by
+## dependency to version 0.38, which is compatible with the version required by
 ## the matrix-sdk crate.
 ## See <https://github.com/launchbadge/sqlx/pull/3928/files#diff-4f4849707ed063bc5de6d9f6d105f0e7baf62d1085b3c8aee4a547468b89248fR57>
 sqlx = { git = "https://github.com/project-robius/sqlx.git", branch = "update_libsqlite3-sys_version" }
@@ -199,11 +205,6 @@ askar-storage = { git = "https://github.com/openwallet-foundation/askar.git" }
 ## so we patch the git source, not crates-io.
 [patch."https://github.com/ruma/ruma"]
 ruma = { git = "https://github.com/project-robius/ruma.git", branch = "tsp" }
-
-## See our PR: <https://github.com/matrix-org/matrix-rust-sdk/pull/6976>
-## Remove this once that PR is merged in.
-[patch."https://github.com/matrix-org/matrix-rust-sdk"]
-matrix-sdk-store-encryption = { git = "https://github.com/project-robius/matrix-rust-sdk.git", branch = "store-cipher-serde-bytes" }
 
 [build-dependencies]
 toml = "1"
@@ -254,6 +255,11 @@ debug-assertions = false
 [package.metadata.makepad.android]
 ## Specifying "auto" will set it to a format like 'YYYYMMDDHH'.
 version_code = "auto"
+
+
+## Robrix has some plist keys that need to be merged into Makepad's generated iOS Info.plist.
+[package.metadata.makepad.ios]
+info_plist = "packaging/ios/Info.additions.plist"
 
 
 ## Configuration for `cargo packager`
@@ -352,14 +358,14 @@ section = "utils"
 [package.metadata.packager.macos]
 minimum_system_version = "11.0"
 frameworks = []
-info_plist_path = "./packaging/Info.plist"
-entitlements = "./packaging/Entitlements.plist"
+info_plist_path = "./packaging/macos/Info.plist"
+entitlements = "./packaging/macos/Entitlements.plist"
 signing_identity = "Developer ID Application: GOSIM FOUNDATION LTD. (HMX6XGJZ3R)"
 
 
 ## Configuration for `cargo packager`'s generation of a macOS `.dmg`.
 [package.metadata.packager.dmg]
-background = "./packaging/Robrix macOS dmg background.png"
+background = "./packaging/macos/dmg-background.png"
 window_size = { width = 960, height = 540 }
 app_position = { x = 200, y = 250 }
 application_folder_position = { x = 760, y = 250 }
