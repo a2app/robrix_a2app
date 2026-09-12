@@ -23,6 +23,7 @@ use crate::home::rooms_list::RoomsListRef;
 use crate::app::ConfirmDeleteAction;
 use crate::shared::confirmation_modal::ConfirmationModalContent;
 use crate::shared::popup_list::{enqueue_popup_notification, PopupKind};
+use crate::shared::speech_text_input::SpeechTextInputWidgetExt;
 use crate::shared::room_picker_modal::{RoomPickerContent, RoomPickerModalAction};
 
 script_mod! {
@@ -427,11 +428,15 @@ script_mod! {
                     SubsectionLabel { text: "Create or modify a mini-app", margin: 0 }
                 }
 
-                prompt_input := RobrixTextInput {
+                prompt_input := SpeechTextInput {
                     width: Fill, height: Fit
-                    padding: 12
-                    empty_text: "Describe a new mini-app or changes to one…"
-                    draw_text +: { text_style: REGULAR_TEXT {font_size: 11.5} }
+                    text_padding: 12
+                    mic_tooltip: "Describe the app by voice"
+
+                    text_input +: {
+                        empty_text: "Describe a new mini-app or changes to one…"
+                        draw_text +: { text_style: REGULAR_TEXT {font_size: 11.5} }
+                    }
                 }
 
                 View {
@@ -1501,7 +1506,7 @@ impl Widget for MiniAppsScreen {
         }
 
         // ----- list pane -----
-        if let Some(text) = self.view.text_input(cx, ids!(prompt_input)).changed(actions) {
+        if let Some(text) = self.view.text_input(cx, ids!(prompt_input.text_input)).changed(actions) {
             self.reclassify(cx, &text);
         }
         if self.view.button(cx, ids!(intent_switch_button)).clicked(actions) {
@@ -1509,7 +1514,7 @@ impl Widget for MiniAppsScreen {
             self.show_intent_hint(cx);
         }
         if self.view.button(cx, ids!(generate_button)).clicked(actions) {
-            let request = self.view.text_input(cx, ids!(prompt_input)).text();
+            let request = self.view.text_input(cx, ids!(prompt_input.text_input)).text();
             let request = request.trim().to_string();
             if request.is_empty() {
                 enqueue_popup_notification("Describe the app you want first.", PopupKind::Warning, Some(3.0));
@@ -1533,7 +1538,7 @@ impl Widget for MiniAppsScreen {
             cx.action(A2AppOp::RetryGeneration);
         }
         if self.view.button(cx, ids!(new_prompt_button)).clicked(actions) {
-            self.view.text_input(cx, ids!(prompt_input)).set_text(cx, "");
+            self.view.speech_text_input(cx, ids!(prompt_input)).set_text(cx, "");
             self.reclassify(cx, "");
             cx.action(A2AppOp::NewPrompt);
         }
@@ -1589,7 +1594,7 @@ impl Widget for MiniAppsScreen {
                 let name = with_a2app(|state| {
                     state.registry.get(&app_id).map(|a| a.name.clone())
                 }).flatten().unwrap_or_else(|| app_id.clone());
-                self.view.text_input(cx, ids!(prompt_input))
+                self.view.speech_text_input(cx, ids!(prompt_input))
                     .set_text(cx, &format!("Change the {name} app: "));
                 self.set_pane(cx, Pane::List);
             }
