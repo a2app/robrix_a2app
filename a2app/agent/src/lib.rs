@@ -54,6 +54,24 @@ impl AgentTransport for AcpClient {
     }
 }
 
+/// A host-side gate for the agent's OWN internet tools (`web_search`,
+/// `web_fetch`, `browser`), which run inside octos rather than as Robrix MCP
+/// tools, so the capability broker never sees them.
+///
+/// The in-process backend installs one of these per turn: before any of those
+/// tools opens a socket it calls [`NetworkApproval::approve`] with the host it
+/// means to reach, and the implementation blocks until the user has allowed
+/// or refused that host (via the same prompt the MCP tools use). Returning
+/// `Err(reason)` refuses the call and the reason is shown to the model. The
+/// child `octos acp` backend has no in-process callback channel today, so it
+/// wires no approval and the web tools fail closed there.
+pub trait NetworkApproval: Send + Sync {
+    /// Decide whether the agent's web tool may reach `host`/`url`. Blocks
+    /// until the UI answers. `Ok(())` allows; `Err(reason)` refuses with the
+    /// reason the model sees.
+    fn approve(&self, tool: &str, host: &str, url: &str) -> Result<(), String>;
+}
+
 /// Well-known provider API-key env vars → the octos provider they imply, in
 /// preference order. Lets the app work with ZERO octos setup: a key
 /// already exported in the shell is enough — the provider name is inferred
@@ -550,7 +568,7 @@ pub fn start_backend(
         "app-generation agent: extended thinking forced OFF for this run \
          (model pick kept, effort cleared, thinking=off)"
     );
-    start_backend_with_mcp(workspace, &prefs, &[], false)
+    start_backend_with_mcp(workspace, &prefs, &[], false, None)
 }
 
 /// Robrix's octos profile for its long-lived AI-room sessions, written to
@@ -568,9 +586,12 @@ pub fn start_backend(
 /// untouched.
 ///
 /// Kept to `group:web`: shell, files, search, memory and sub-agent spawn stay
-/// out, exactly as `hosted` leaves them. The web tools are octos-native, so
-/// they are not gated by Robrix's capability prompts; everything Robrix
-/// registers still is.
+/// out, exactly as `hosted` leaves them. The web tools are octos-native, but
+/// they are gated by Robrix's permission system too: the in-process backend
+/// installs a per-turn [`NetworkApproval`] bridge, so every host they reach
+/// must have been allowed for this room's AI (see [`NetworkApproval`]). The
+/// child `octos acp` backend has no in-process bridge and fails closed there.
+/// Everything Robrix registers is capability-gated as before.
 ///
 /// The file is rewritten only when its content changes, so a long-running app
 /// does not churn it while still picking up an edit on the next session start.
@@ -629,7 +650,11 @@ pub fn start_backend_with_mcp(
     prefs: &prefs::AgentPrefs,
     mcp_servers: &[crate::mcp::McpServerConfig],
     host_managed: bool,
+    network_approval: Option<std::sync::Arc<dyn NetworkApproval>>,
 ) -> Result<Box<dyn AgentTransport>, String> {
+    // Used only by the in-process backend; the child-process backends have no
+    // channel for it today and fail closed inside octos.
+    let _ = &network_approval;
     // Refuse before spawning rather than translating an errno afterwards: the
     // check knows WHICH program is missing, so it can name it and the install.
     if let Some(blocked) = blocker() {
@@ -697,6 +722,7 @@ pub fn start_backend_with_mcp(
             prefs,
             mcp_servers,
             host_managed,
+            network_approval,
         )?));
     }
     #[cfg(not(feature = "embedded"))]

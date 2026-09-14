@@ -440,6 +440,23 @@ pub struct PermissionStore {
     /// listed here too.
     #[serde(default)]
     send_rooms: BTreeMap<String, BTreeSet<String>>,
+    /// Per-subject allowlists of internet hosts the subject may reach (the
+    /// AI-room agent's per-URL grants for `network.http`). Keyed by subject
+    /// (an app id or an agent key, see [`agent_subject`]) then host. A host
+    /// grant is specific to that host: it is what lets one domain be allowed
+    /// without unlocking the whole internet, the way a group grant would.
+    /// The group grant still answers first — a group `Denied` kills the
+    /// capability entirely — but a group `Granted` alone does NOT allow a
+    /// host; the host must be listed here too. Subdomains of a listed host
+    /// are admitted by the caller's matching rule, so `example.com` covers
+    /// `docs.example.com` but never `notexample.com`.
+    #[serde(default)]
+    net_hosts: BTreeMap<String, BTreeSet<String>>,
+    /// Session-only host grants (the prompt's "Allow Once"): live for this
+    /// session only and never hit disk, like [`Self::once`]. Checked after
+    /// the durable allowlist so "once" cannot become forever.
+    #[serde(skip)]
+    net_once: std::collections::HashSet<(String, String)>,
     /// Apps the host stopped for abusing the bridge, and why. Persisted
     /// deliberately: an app that hammered its way to a stop must not get a
     /// clean slate by being restarted, or the escalation means nothing.
@@ -558,6 +575,64 @@ impl PermissionStore {
         self.send_rooms
             .get(subject)
             .map(|rooms| rooms.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether `subject` may reach `host` on the internet — one host at a
+    /// time (see `net_hosts`). A host is allowed only when the user
+    /// explicitly allowed THAT host (or a parent domain of it); a group
+    /// grant does not unlock the internet.
+    pub fn is_host_allowed(&self, subject: &str, host: &str) -> bool {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        let matches = |allowed: &str| {
+            let allowed = allowed.trim().trim_end_matches('.').to_ascii_lowercase();
+            !allowed.is_empty() && (host == allowed || host.ends_with(&format!(".{allowed}")))
+        };
+        if self
+            .net_once
+            .iter()
+            .any(|(id, once_host)| id == subject && matches(once_host))
+        {
+            return true;
+        }
+        let Some(hosts) = self.net_hosts.get(subject) else { return false };
+        hosts.iter().any(|allowed| matches(allowed))
+    }
+
+    /// Grants `host` for this session only (the prompt's "Allow Once").
+    pub fn allow_host_once(&mut self, subject: &str, host: &str) {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if !host.is_empty() {
+            self.net_once.insert((subject.to_string(), host));
+        }
+    }
+
+    /// Records that `subject` may reach `host` (durable, like the group
+    /// grants). A no-op when already allowed.
+    pub fn allow_host(&mut self, subject: &str, host: &str) {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() {
+            return;
+        }
+        self.net_hosts
+            .entry(subject.to_string())
+            .or_default()
+            .insert(host);
+    }
+
+    /// Removes `subject`'s grant for `host`, if any.
+    pub fn disallow_host(&mut self, subject: &str, host: &str) {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if let Some(hosts) = self.net_hosts.get_mut(subject) {
+            hosts.remove(&host);
+        }
+    }
+
+    /// All hosts `subject` may reach (for a per-host management UI).
+    pub fn host_grants(&self, subject: &str) -> Vec<String> {
+        self.net_hosts
+            .get(subject)
+            .map(|hosts| hosts.iter().cloned().collect())
             .unwrap_or_default()
     }
 
@@ -685,6 +760,8 @@ impl PermissionStore {
         self.cap_overrides.remove(app_id);
         self.until.remove(app_id);
         self.uses.remove(app_id);
+        self.net_hosts.remove(app_id);
+        self.net_once.retain(|(id, _)| id != app_id);
         self.clear_once_for(app_id);
         self.access.retain(|r| r.app_id != app_id);
     }
@@ -1179,6 +1256,36 @@ mod tests {
         // them lose the declaration instead of gaining a fake capability.
         assert_eq!(Permission::from_str("background"), None);
         assert_eq!(Permission::from_str("storage-large"), None);
+    }
+
+    /// Per-host internet grants are exact-or-subdomain, never suffix
+    /// lookalikes; a session "once" host is admitted without touching disk,
+    /// and an uninstall forgets both.
+    #[test]
+    fn net_host_grants_are_per_host_and_cannot_be_spoofed() {
+        let mut store = PermissionStore::default();
+        assert!(!store.is_host_allowed("ai-room:!r:s", "example.com"));
+        store.allow_host("ai-room:!r:s", "example.com");
+        assert!(store.is_host_allowed("ai-room:!r:s", "example.com"));
+        assert!(store.is_host_allowed("ai-room:!r:s", "docs.example.com"));
+        assert!(store.is_host_allowed("ai-room:!r:s", "EXAMPLE.COM"));
+        assert!(!store.is_host_allowed("ai-room:!r:s", "notexample.com"));
+        assert!(!store.is_host_allowed("ai-room:!r:s", "example.com.evil.tld"));
+        // A different subject shares the same store but not the grant.
+        assert!(!store.is_host_allowed("other", "example.com"));
+        // "Allow Once" is session-only and also exact-or-subdomain.
+        store.allow_host_once("ai-room:!r:s", "once.example");
+        assert!(store.is_host_allowed("ai-room:!r:s", "once.example"));
+        assert!(store.is_host_allowed("ai-room:!r:s", "a.once.example"));
+        assert!(!store.is_host_allowed("ai-room:!r:s", "once.example.evil"));
+        // Disallow removes the durable grant but not the session one.
+        store.disallow_host("ai-room:!r:s", "example.com");
+        assert!(!store.is_host_allowed("ai-room:!r:s", "example.com"));
+        assert!(store.is_host_allowed("ai-room:!r:s", "once.example"));
+        // Durable grants only; the session one is not listed.
+        assert!(store.host_grants("ai-room:!r:s").is_empty());
+        store.remove_app("ai-room:!r:s");
+        assert!(!store.is_host_allowed("ai-room:!r:s", "once.example"));
     }
 
     /// A restricted app holds nothing, whatever it was granted before —

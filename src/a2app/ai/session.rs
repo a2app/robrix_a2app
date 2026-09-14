@@ -70,6 +70,17 @@ pub enum SessionJob {
     /// parking it behind a permission prompt on first use — then fetches the
     /// data on the async worker and answers here when the result lands.
     ReadTool { kind: ReadToolKind, answer: Sender<Result<String, String>> },
+    /// The agent's OWN internet tool (`web_search`, `web_fetch`, `browser`)
+    /// wants to reach `host`/`url`. The runtime decides against the room's
+    /// per-host allowlist — prompting the user the first time each host is
+    /// reached — and answers here when the user has decided. Blocks the
+    /// agent's web tool until then.
+    NetworkAccess {
+        tool: String,
+        host: String,
+        url: String,
+        answer: Sender<Result<String, String>>,
+    },
 }
 
 /// The real [`AiHost`]: hands each tool call to the UI thread and blocks on
@@ -136,6 +147,32 @@ impl AiHost for SessionHost {
     }
 }
 
+/// Bridges octos's in-process web-tool gate to the same UI-thread permission
+/// decision the MCP tools use: the call parks on the `jobs` channel until the
+/// runtime has prompted (or matched an existing host grant) and answered.
+impl a2app_agent::NetworkApproval for SessionHost {
+    fn approve(&self, tool: &str, host: &str, url: &str) -> Result<(), String> {
+        let (answer_tx, answer_rx) = channel();
+        self.jobs
+            .send(SessionJob::NetworkAccess {
+                tool: tool.to_string(),
+                host: host.to_string(),
+                url: url.to_string(),
+                answer: answer_tx,
+            })
+            .map_err(|_| "this session's UI thread is gone".to_string())?;
+        // Wake the UI thread: it polls the job channel on each event pass, and
+        // a network request can arrive after the agent's last ACP event has
+        // already been drained, so without this signal the gate would sit
+        // unanswered until some unrelated event woke the app.
+        makepad_widgets::SignalToUI::set_ui_signal();
+        answer_rx
+            .recv()
+            .map_err(|_| "this session ended before the network request was answered".to_string())?
+            .map(|_| ())
+    }
+}
+
 /// What one [`AiSession::advance`] produced for the runtime to act on.
 #[derive(Debug)]
 pub enum SessionUpdate {
@@ -144,6 +181,10 @@ pub enum SessionUpdate {
     /// A turn completed with the agent's final text (empty replies are
     /// filtered out — a refusal or cancel posts nothing).
     Reply { text: String },
+    /// A turn ended WITHOUT a reply: cancelled (the user pressed Escape) or
+    /// finished with empty output. The runtime settles the turn card with
+    /// this; without it a cancelled turn's card would stay "running" forever.
+    TurnEnded,
     /// The agent's reasoning stream started on the in-flight turn (emitted
     /// once per turn), so the chat can show a "thinking…" row while the
     /// model is still quiet.
@@ -255,10 +296,10 @@ impl AiSession {
     pub fn start(room_id: OwnedRoomId, prefs: AgentPrefs) -> Result<Self, String> {
         // The rendezvous: serve threads send jobs here, the UI thread drains.
         let (jobs_tx, jobs_rx) = channel::<SessionJob>();
-        let host: Arc<dyn AiHost> = Arc::new(SessionHost { jobs: jobs_tx });
+        let host = Arc::new(SessionHost { jobs: jobs_tx });
 
         let mut template = McpServer::new();
-        register_session_tools(&mut template, host);
+        register_session_tools(&mut template, host.clone() as Arc<dyn AiHost>);
         let server = ToolServer::bind(template)?;
         server.start()?;
 
@@ -300,7 +341,13 @@ impl AiSession {
         );
 
         let transport =
-            a2app_agent::start_backend_with_mcp(&workspace, &prefs, &[tool_server], true)?;
+            a2app_agent::start_backend_with_mcp(
+                &workspace,
+                &prefs,
+                &[tool_server],
+                true,
+                Some(host as Arc<dyn a2app_agent::NetworkApproval>),
+            )?;
 
         Ok(Self {
             room_id,
@@ -417,9 +464,13 @@ impl AiSession {
                     // A cancelled turn (the user pressed Escape) has nothing
                     // to add on its own: the cancellation is why the turn is
                     // over, and echoing the agent's abort text would read as
-                    // an answer. Everything else posts as usual.
+                    // an answer. Everything else posts as usual. Either way
+                    // the turn ENDED, so tell the runtime to settle the turn
+                    // card — a cancelled turn must not stay "running".
                     if stop_reason != "cancelled" && !text.trim().is_empty() {
                         updates.push(SessionUpdate::Reply { text });
+                    } else {
+                        updates.push(SessionUpdate::TurnEnded);
                     }
                     // A tool call cannot outlive its turn; drop the id map
                     // (any row still open stays Started history, as before).

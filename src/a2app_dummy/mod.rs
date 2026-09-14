@@ -16,6 +16,8 @@ script_mod! {
     mod.widgets.MiniAppTimelineCard = View { visible: false }
     mod.widgets.AiReplyTimelineCard = View { visible: false }
     mod.widgets.AiEventTimelineCard = View { visible: false }
+    mod.widgets.AiTurnTimelineCard = View { visible: false }
+    mod.widgets.AiTurnSpinner = View { visible: false }
     mod.widgets.MiniAppTabScreen = View { visible: false }
     mod.widgets.MiniAppDock = View {
         width: Fill, height: Fill

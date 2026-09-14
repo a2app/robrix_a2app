@@ -46,7 +46,22 @@ pub const AI_ACTIVITY_EVENT_TYPE: &str = "rs.robius.robrix.ai_activity";
 /// rows therefore show its full lifecycle in the timeline. This is what
 /// makes every tool call a first-class, capability-visible event in the
 /// room rather than a footnote on the final reply.
+///
+/// New turns no longer write these rows: a turn's calls are aggregated into
+/// its single [`AI_TURN_EVENT_TYPE`] card, so the chat shows one collapsible
+/// widget per assistant turn instead of a scatter of one-liners. The
+/// per-call event type is kept only so rooms written by older builds still
+/// render (each old row as its own small card).
 pub const AI_TOOL_CALL_EVENT_TYPE: &str = "rs.robius.robrix.ai_tool_call";
+/// One state event per assistant turn that called at least one tool: the
+/// ordered tool calls the turn made, plus whether the turn is still running.
+/// A fresh key is minted on the turn's first tool call and the SAME key is
+/// rewritten as calls start, gain their target detail, and finish; the turn
+/// is finally rewritten `Done` when its reply (or error) arrives. State events
+/// are not replaced in a Matrix timeline, so each rewrite is its own event;
+/// the renderer shows only the latest `turn` id and hides the earlier
+/// snapshots, yielding exactly one collapsible card per turn.
+pub const AI_TURN_EVENT_TYPE: &str = "rs.robius.robrix.ai_turn";
 
 /// The content of the `rs.robius.robrix.ai_room` marker event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +169,8 @@ pub enum AiToolCallStatus {
 /// [`AiToolCallStatus::Done`] with the outcome once Robrix executes (or
 /// refuses) it — so the room's state always holds the latest status and the
 /// timeline holds the full lifecycle.
+///
+/// Legacy: new turns aggregate their calls into [`AiTurnContent`] instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiToolCallContent {
     pub v: u32,
@@ -174,6 +191,69 @@ pub struct AiToolCallContent {
     /// summary when the tool returns one. Empty when there is nothing to say.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub summary: String,
+    pub created_at: u64,
+}
+
+/// Whether the whole turn is still in flight. Drives the turn card's colour
+/// and spinner: `Running` is the warm "working" state, `Done` the settled
+/// one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiTurnStatus {
+    Running,
+    Done,
+}
+
+/// The lifecycle of one tool call inside an [`AiTurnContent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiTurnToolStatus {
+    Started,
+    Done,
+}
+
+/// One tool call a turn made, as shown inside the turn's collapsible card.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiTurnToolCall {
+    /// The tool's raw MCP name (see [`ai_tool_display_name`]).
+    pub name: String,
+    /// Human-readable target/detail, as on [`AiReplyToolCall::detail`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub status: AiTurnToolStatus,
+    /// Whether the call succeeded; meaningful once `status` is `Done`.
+    #[serde(default)]
+    pub ok: bool,
+    /// Why it failed, or its success summary. Empty when nothing to say.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+}
+
+/// The content of one `rs.robius.robrix.ai_turn` state event: every tool call
+/// an assistant turn made, in the order they started, plus whether the turn is
+/// still running. Written on the first tool call and rewritten in place until
+/// the turn's reply (or error) marks it `Done`, so the timeline shows one
+/// collapsible widget per turn that changes colour and shows a spinner while
+/// the agent works.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiTurnContent {
+    pub v: u32,
+    /// The turn's stable id (the state key every rewrite of this turn reuses).
+    /// The timeline keeps every rewrite as its own event, so the renderer
+    /// shows only the latest snapshot of a turn and hides the earlier ones —
+    /// one collapsible card per turn, never a stack of them.
+    #[serde(default)]
+    pub turn: String,
+    /// Whether this is the FIRST snapshot of its turn (the state-key row the
+    /// turn was created with). The renderer anchors the card at this row and
+    /// reads the latest snapshot's content for it, so the card never jumps
+    /// position as the turn progresses. `None` on rows written before this
+    /// field existed, which fall back to the latest-scan behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first: Option<bool>,
+    pub status: AiTurnStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<AiTurnToolCall>,
     pub created_at: u64,
 }
 
@@ -254,6 +334,101 @@ script_mod! {
             visible: false
             padding: 0, margin: 0
             flow: Flow.Right{wrap: true},
+            draw_text +: {
+                text_style: SMALL_STATE_TEXT_STYLE {},
+                color: (SMALL_STATE_TEXT_COLOR)
+            }
+        }
+    }
+
+    // A small spinning arc, animated by a looping animator (the built-in
+    // LoadingSpinner cannot be used here: it is driven by `draw_pass.time`,
+    // which only advances on frames something else requests). Shown only
+    // while a turn is running.
+    mod.widgets.AiTurnSpinner = #(AiTurnSpinner::register_widget(vm)) {
+        width: 13, height: 13,
+        show_bg: true,
+        draw_bg +: {
+            color: uniform(#x0f88fe)
+            rotation: uniform(0.0)
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                let radius = min(self.rect_size.x, self.rect_size.y) * 0.5 - 1.5
+                let center = self.rect_size * 0.5
+                let start = self.rotation * 2.0 * PI
+                sdf.arc_round_caps(center.x, center.y, radius, start, start + 2.0 * PI * 0.72, 2.0)
+                return sdf.fill(self.color)
+            }
+        }
+        animator: Animator {
+            spin: {
+                default: @off
+                off: AnimatorState {
+                    redraw: true,
+                    from: {all: Forward {duration: 0.0}}
+                    apply: { draw_bg: {rotation: 0.0} }
+                }
+                on: AnimatorState {
+                    redraw: true,
+                    from: {all: Loop {duration: 1.0, end: 1.0}}
+                    apply: { draw_bg: {rotation: 1.0} }
+                }
+            }
+        }
+    }
+
+    // One assistant turn's tool calls, grouped into a single collapsible
+    // card. While the turn runs the card is warm-tinted and shows a spinner;
+    // once the turn's reply (or error) lands it settles to the neutral tint
+    // and the spinner disappears. Clicking the header toggles the tool list.
+    mod.widgets.AiTurnTimelineCard = set_type_default() do #(AiTurnTimelineCard::register_widget(vm)) {
+        ..mod.widgets.RoundedView
+
+        width: Fill,
+        height: Fit,
+        flow: Down
+        spacing: 5
+        padding: Inset{top: 6, bottom: 6, left: 10, right: 10}
+        margin: Inset{top: 2, bottom: 2, left: 10, right: 60}
+
+        show_bg: true
+        draw_bg +: {
+            color: #xEEF5FF
+            border_color: (COLOR_DIVIDER_DARK)
+            border_size: 1.0
+            border_radius: 4.0
+        }
+
+        header := View {
+            width: Fill, height: Fit
+            flow: Right, align: Align{y: 0.5}, spacing: 6
+            cursor: MouseCursor.Hand
+
+            turn_arrow := Label {
+                width: Fit, height: Fit
+                padding: 0, margin: 0
+                draw_text +: {
+                    text_style: SMALL_STATE_TEXT_STYLE {},
+                    color: (SMALL_STATE_TEXT_COLOR)
+                }
+                text: "▸"
+            }
+            turn_spinner := mod.widgets.AiTurnSpinner {}
+            turn_title := Label {
+                width: Fill, height: Fit
+                padding: 0, margin: 0
+                flow: Flow.Right{wrap: true},
+                draw_text +: {
+                    text_style: SMALL_STATE_TEXT_STYLE {},
+                    color: (SMALL_STATE_TEXT_COLOR)
+                }
+            }
+        }
+
+        turn_body := Label {
+            width: Fill, height: Fit
+            visible: false
+            padding: 0, margin: Inset{left: 19}
             draw_text +: {
                 text_style: SMALL_STATE_TEXT_STYLE {},
                 color: (SMALL_STATE_TEXT_COLOR)
@@ -359,6 +534,199 @@ impl Widget for AiEventTimelineCard {
     }
 }
 
+/// The little looping spinner shown on a running turn card.
+#[derive(Script, ScriptHook, Widget, Animator)]
+pub struct AiTurnSpinner {
+    #[source] source: ScriptObjectRef,
+    #[deref] view: View,
+    #[apply_default] animator: Animator,
+}
+
+impl Widget for AiTurnSpinner {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if self.animator_handle_event(cx, event).must_redraw() {
+            self.redraw(cx);
+        }
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl AiTurnSpinnerRef {
+    /// Starts (`spinning`) or stops the spinner's looping animation. Called by
+    /// the turn card as the turn's status changes.
+    pub fn set_spinning(&self, cx: &mut Cx, spinning: bool) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.animator_play(cx, if spinning { ids!(spin.on) } else { ids!(spin.off) });
+        }
+    }
+}
+
+/// The one collapsible card an assistant turn's tool calls are grouped into.
+///
+/// The header carries an expand/collapse arrow, the running spinner, and a
+/// title (`Working…` while the turn is live, `Used N tools` once it settles);
+/// the body lists each call, one per line. The card's tint and the spinner's
+/// visibility are driven by [`AiTurnContent::status`], so a glance at the
+/// timeline tells a running turn from a finished one.
+#[derive(Script, ScriptHook, Widget)]
+pub struct AiTurnTimelineCard {
+    #[deref] view: View,
+    /// Whether the tool list is expanded. Preserved across repopulates so a
+    /// turn card the user opened does not snap shut on the next live update.
+    #[rust(true)] is_expanded: bool,
+    /// Whether this turn has any tool calls to show. Kept so the expand state
+    /// can be applied without re-reading the body label (whose `text()`
+    /// accessor is not available on `LabelRef`).
+    #[rust] has_tools: bool,
+}
+
+impl Widget for AiTurnTimelineCard {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if let Hit::FingerUp(fe) = event.hits(cx, self.view.area()) {
+            if fe.is_over && fe.is_primary_hit() && fe.was_tap() {
+                self.is_expanded = !self.is_expanded;
+                self.apply_expanded(cx);
+                self.redraw(cx);
+            }
+        }
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl AiTurnTimelineCard {
+    /// Applies the current expand state to the arrow and body.
+    fn apply_expanded(&mut self, cx: &mut Cx) {
+        self.view.label(cx, ids!(turn_arrow)).set_text(cx, if self.is_expanded { "▾" } else { "▸" });
+        self.view.label(cx, ids!(turn_body)).set_visible(cx, self.is_expanded && self.has_tools);
+    }
+}
+
+/// The phrase a turn card's header shows.
+fn ai_turn_title(content: &AiTurnContent) -> String {
+    let n = content.tool_calls.len();
+    match content.status {
+        AiTurnStatus::Running => {
+            if n <= 1 {
+                String::from("Working…")
+            } else {
+                format!("Working… ({n} tools)")
+            }
+        }
+        AiTurnStatus::Done => match n {
+            0 => String::from("Used a tool"),
+            1 => String::from("Used 1 tool"),
+            _ => format!("Used {n} tools"),
+        },
+    }
+}
+
+/// The one-line text one tool call inside a turn card renders as. Mirrors
+/// [`ai_tool_call_label`] but without the per-call status glyph, since a
+/// leading `✓`/`✗` reads better in a list than the `⚙`/`✓` pair.
+pub fn ai_turn_tool_label(call: &AiTurnToolCall) -> String {
+    let action = match call.status {
+        AiTurnToolStatus::Started => ai_tool_display_name_running(&call.name),
+        AiTurnToolStatus::Done => ai_tool_display_name(&call.name),
+    };
+    let detail = detail_suffix(call.detail.as_deref());
+    match call.status {
+        AiTurnToolStatus::Started => format!("· {action}{detail}…"),
+        AiTurnToolStatus::Done => {
+            if call.ok {
+                if call.summary.is_empty() {
+                    format!("✓ {action}{detail}")
+                } else {
+                    format!("✓ {action}{detail}: {}", call.summary)
+                }
+            } else if call.summary.is_empty() {
+                format!("✗ {action}{detail} refused")
+            } else {
+                format!("✗ {action}{detail}: {}", call.summary)
+            }
+        }
+    }
+}
+
+/// Like [`ai_turn_tool_label`], but for a turn that has SETTLED: a call that
+/// never reported an outcome (the turn was cancelled, aborted, or the app
+/// restarted mid-call) is shown as interrupted instead of still running — so a
+/// settled card never contains a dangling "Reading a web page…" line.
+pub fn ai_turn_tool_label_settled(call: &AiTurnToolCall) -> String {
+    if call.status == AiTurnToolStatus::Started {
+        let action = ai_tool_display_name(&call.name);
+        let detail = detail_suffix(call.detail.as_deref());
+        format!("⊘ {action}{detail} (interrupted)")
+    } else {
+        ai_turn_tool_label(call)
+    }
+}
+
+impl AiTurnTimelineCardRef {
+    /// Populates the turn card from an `ai_turn` event's content. Re-set on
+    /// every draw, since timeline items get recycled.
+    pub fn populate(&self, cx: &mut Cx, content: Option<&AiTurnContent>) {
+        let Some(content) = content else {
+            if let Some(mut inner) = self.borrow_mut() {
+                inner.view.set_visible(cx, false);
+            }
+            return;
+        };
+        let running = content.status == AiTurnStatus::Running;
+        // Warm while working, cool once settled. The border follows the same
+        // family so the card reads as one object in either state.
+        let (bg, border) = if running {
+            (vec4(1.0, 0.972, 0.902, 1.0), vec4(0.98, 0.82, 0.45, 1.0))
+        } else {
+            (vec4(0.933, 0.961, 1.0, 1.0), vec4(0.78, 0.78, 0.8, 1.0))
+        };
+        // Applied on the card's own widget ref (not the inner `view`), since
+        // `draw_bg` lives on the widget's script object. Must run before the
+        // `borrow_mut` below, or the script call re-borrows the same RefCell.
+        let mut card = self.clone();
+        script_apply_eval!(cx, card, {
+            draw_bg +: {
+                color: #(bg)
+                border_color: #(border)
+            }
+        });
+        // Start/stop the spinner's loop with the turn, so a settled card stops
+        // scheduling animation frames. The built-in LoadingSpinner is avoided
+        // here because it is driven by `draw_pass.time` and would sit frozen
+        // between unrelated redraws; this one animates itself while running.
+        self.widget(cx, ids!(turn_spinner))
+            .as_ai_turn_spinner()
+            .set_spinning(cx, running);
+        let Some(mut inner) = self.borrow_mut() else { return };
+        inner.view.set_visible(cx, true);
+        inner.view.label(cx, ids!(turn_title)).set_text(cx, &ai_turn_title(content));
+        inner.view.widget(cx, ids!(turn_spinner)).set_visible(cx, running);
+        let body = content
+            .tool_calls
+            .iter()
+            .map(|call| {
+                if running {
+                    ai_turn_tool_label(call)
+                } else {
+                    ai_turn_tool_label_settled(call)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        inner.has_tools = !content.tool_calls.is_empty();
+        inner.view.label(cx, ids!(turn_body)).set_text(cx, &body);
+        inner.apply_expanded(cx);
+        inner.view.redraw(cx);
+    }
+}
+
 /// The one-line text an [`AiActivityContent`] row renders as.
 pub fn ai_activity_label(content: &AiActivityContent) -> String {
     match content.kind {
@@ -419,6 +787,32 @@ pub fn ai_tool_display_name(name: &str) -> String {
     }
 }
 
+/// The present-progressive phrase for a tool that is STILL RUNNING, so a live
+/// row reads `Replying in this room…` rather than `Replied in this room…`.
+/// Only the verb differs from [`ai_tool_display_name`]; unknown tools keep the
+/// humanized fallback (there is no safe way to derive an `-ing` form).
+pub fn ai_tool_display_name_running(name: &str) -> String {
+    match name.trim() {
+        "read_room_messages" => String::from("Reading recent messages"),
+        "read_older_messages" => String::from("Reading older messages"),
+        "room_info" => String::from("Reading room details"),
+        "read_other_room_messages" => String::from("Reading messages"),
+        "list_rooms" => String::from("Listing your rooms"),
+        "list_spaces" => String::from("Listing your spaces"),
+        "space_info" => String::from("Reading space details"),
+        "list_space_rooms" => String::from("Listing a space's rooms"),
+        "read_room_memory" => String::from("Reading room memory"),
+        "launch_splash_app" => String::from("Building and running a mini-app"),
+        "send_message" => String::from("Replying"),
+        "post_room_message" => String::from("Posting a message"),
+        "web_search" => String::from("Searching the web"),
+        "web_fetch" => String::from("Reading a web page"),
+        "browser" => String::from("Browsing the web"),
+        "" => String::from("Using a tool"),
+        other => humanize_identifier(other),
+    }
+}
+
 /// Falls back to words for an identifier this build doesn't have a curated
 /// phrase for: underscores become spaces and the first letter is capitalized
 /// (`some_new_tool` → "Some new tool").
@@ -449,7 +843,10 @@ fn detail_suffix(detail: Option<&str>) -> String {
 /// action plus whatever target detail the call carried (`Read messages in
 /// “General”`, `Built and ran a mini-app “a pomodoro timer”`).
 pub fn ai_tool_call_label(content: &AiToolCallContent) -> String {
-    let action = ai_tool_display_name(&content.name);
+    let action = match content.status {
+        AiToolCallStatus::Started => ai_tool_display_name_running(&content.name),
+        AiToolCallStatus::Done => ai_tool_display_name(&content.name),
+    };
     let detail = detail_suffix(content.detail.as_deref());
     match content.status {
         AiToolCallStatus::Started => format!("⚙ {action}{detail}…"),
@@ -527,5 +924,60 @@ mod tests {
             created_at: 0,
         };
         assert_eq!(ai_tool_call_label(&content), "✓ Read messages in “General”");
+    }
+
+    /// A turn card's title and per-call lines reflect the running/done state,
+    /// so a glance tells a live turn from a finished one.
+    #[test]
+    fn turn_card_labels_track_the_turn_state() {
+        let running = AiTurnContent {
+            v: 1,
+            turn: "turn-1".to_string(),
+            first: Some(true),
+            status: AiTurnStatus::Running,
+            tool_calls: vec![
+                AiTurnToolCall {
+                    name: "web_search".to_string(),
+                    detail: None,
+                    status: AiTurnToolStatus::Started,
+                    ok: false,
+                    summary: String::new(),
+                },
+                AiTurnToolCall {
+                    name: "read_room_messages".to_string(),
+                    detail: None,
+                    status: AiTurnToolStatus::Done,
+                    ok: true,
+                    summary: String::new(),
+                },
+                AiTurnToolCall {
+                    name: "send_message".to_string(),
+                    detail: Some("in this room".to_string()),
+                    status: AiTurnToolStatus::Started,
+                    ok: false,
+                    summary: String::new(),
+                },
+            ],
+            created_at: 0,
+        };
+        assert_eq!(ai_turn_title(&running), "Working… (3 tools)");
+        assert_eq!(ai_turn_tool_label(&running.tool_calls[0]), "· Searching the web…");
+        assert_eq!(ai_turn_tool_label(&running.tool_calls[1]), "✓ Read recent messages");
+        // A running call uses the present-progressive phrase, not the past one.
+        assert_eq!(ai_turn_tool_label(&running.tool_calls[2]), "· Replying in this room…");
+        // A call still `Started` when the turn settles is shown as interrupted,
+        // not as still working.
+        assert_eq!(
+            ai_turn_tool_label_settled(&running.tool_calls[0]),
+            "⊘ Searched the web (interrupted)"
+        );
+
+        let mut done = AiTurnContent { status: AiTurnStatus::Done, ..running };
+        assert_eq!(ai_turn_title(&done), "Used 3 tools");
+        done.tool_calls[2].status = AiTurnToolStatus::Done;
+        done.tool_calls[2].ok = true;
+        assert_eq!(ai_turn_tool_label(&done.tool_calls[2]), "✓ Replied in this room");
+        let one = AiTurnContent { tool_calls: done.tool_calls[..1].to_vec(), ..done };
+        assert_eq!(ai_turn_title(&one), "Used 1 tool");
     }
 }

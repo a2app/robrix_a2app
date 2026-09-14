@@ -155,6 +155,10 @@ pub const AI_ROOM_SESSION_CAP_IDS: &[&str] = &[
     "matrix.space.rooms.list",
     "apps.generate",
     "matrix.rooms.message.send",
+    // Internet access (the agent's own web_search / web_fetch / browser
+    // tools), gated per host so nothing reaches the network until the user
+    // has allowed that host for this room's AI.
+    "network.http",
 ];
 
 /// The MCP tool name for a read kind — what shows on the room's `ai_reply`

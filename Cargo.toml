@@ -218,7 +218,16 @@ ruma = { git = "https://github.com/project-robius/ruma.git", branch = "tsp" }
 
 ## The octos agent crates a2app links (octos-agent/-core/-cli) are consumed
 ## directly from gterzian/octos `acp-embedding-seam`; see
-## `a2app/agent/Cargo.toml`. No local path patch.
+## `a2app/agent/Cargo.toml`.
+##
+## TEMPORARY LOCAL PATCH (testing only): the sibling ../octos checkout carries
+## the per-URL network-access seam the AI-room web tools are gated through.
+## Remove this block (and repin the git dependencies in a2app/agent/Cargo.toml)
+## once the seam lands upstream.
+[patch."https://github.com/gterzian/octos"]
+octos-agent = { path = "../octos/crates/octos-agent" }
+octos-core  = { path = "../octos/crates/octos-core" }
+octos-cli   = { path = "../octos/crates/octos-cli" }
 
 [build-dependencies]
 toml = "1"

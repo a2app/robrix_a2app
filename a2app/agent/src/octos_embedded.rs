@@ -110,6 +110,7 @@ impl EmbeddedOctos {
         prefs: &AgentPrefs,
         mcp_servers: &[RobrixMcpServerConfig],
         host_managed: bool,
+        network_approval: Option<Arc<dyn crate::NetworkApproval>>,
     ) -> Result<Self, String> {
         std::fs::create_dir_all(workspace).ok();
         let (evt_tx, events) = std::sync::mpsc::channel();
@@ -120,7 +121,7 @@ impl EmbeddedOctos {
         let sd = shutdown.clone();
         let servers = mcp_servers.to_vec();
         std::thread::spawn(move || {
-            agent_thread(ws, prefs, servers, host_managed, cmd_rx, evt_tx, sd)
+            agent_thread(ws, prefs, servers, host_managed, network_approval, cmd_rx, evt_tx, sd)
         });
         Ok(Self { events, cmd_tx, shutdown })
     }
@@ -176,6 +177,7 @@ fn agent_thread(
     prefs: AgentPrefs,
     mcp_servers: Vec<RobrixMcpServerConfig>,
     host_managed: bool,
+    network_approval: Option<Arc<dyn crate::NetworkApproval>>,
     cmd_rx: Receiver<Cmd>,
     evt_tx: Sender<AcpEvent>,
     shutdown: Arc<Shutdown>,
@@ -235,7 +237,14 @@ fn agent_thread(
     // Blocking command loop OUTSIDE the runtime: recv() parks this thread;
     // each turn runs to completion on the runtime.
     while let Ok(Cmd::Prompt(text)) = cmd_rx.recv() {
-        rt.block_on(run_turn(&agent, &shutdown, &evt_tx, &mut history, &text));
+        rt.block_on(run_turn(
+            &agent,
+            &shutdown,
+            &evt_tx,
+            &mut history,
+            &text,
+            network_approval.as_ref(),
+        ));
     }
 }
 
@@ -421,6 +430,36 @@ impl octos_agent::ProgressReporter for Reporter {
     }
 }
 
+/// Adapts Robrix's blocking [`crate::NetworkApproval`] to octos's async
+/// per-turn network-access requester. The approval itself runs on a blocking
+/// thread, so the agent's tokio worker is never parked on the UI while the
+/// user reads the prompt.
+struct RobrixNetworkRequester {
+    approval: Arc<dyn crate::NetworkApproval>,
+}
+
+#[async_trait::async_trait]
+impl octos_agent::tools::NetworkAccessRequester for RobrixNetworkRequester {
+    async fn request_network_access(
+        &self,
+        request: octos_agent::tools::NetworkAccessRequest,
+    ) -> octos_agent::tools::NetworkAccessDecision {
+        let approval = self.approval.clone();
+        let tool = request.tool_name;
+        let host = request.host;
+        let url = request.url;
+        let allowed = tokio::task::spawn_blocking(move || approval.approve(&tool, &host, &url))
+            .await
+            .unwrap_or_else(|_| Err("network approval channel closed".to_string()))
+            .is_ok();
+        if allowed {
+            octos_agent::tools::NetworkAccessDecision::Allow
+        } else {
+            octos_agent::tools::NetworkAccessDecision::Deny
+        }
+    }
+}
+
 /// One prompt turn, following `octos acp`'s run_prompt_turn to the letter:
 /// stale-cancel reset before the turn, cancelled-Err mapped to a cancel (not
 /// an error), and the two-guard history append.
@@ -430,6 +469,7 @@ async fn run_turn(
     evt_tx: &Sender<AcpEvent>,
     history: &mut Vec<octos_core::Message>,
     text: &str,
+    network_approval: Option<&Arc<dyn crate::NetworkApproval>>,
 ) {
     // NOTE: the stale-cancel reset happens in send_prompt (UI side), BEFORE
     // the command is queued — so a cancel/drop arriving while the turn waits
@@ -440,7 +480,21 @@ async fn run_turn(
     }));
 
     let snapshot = history.clone();
-    let outcome = agent.process_message(text, &snapshot, vec![]).await;
+    let process = agent.process_message(text, &snapshot, vec![]);
+    // Gate the agent's OWN web tools (web_search / web_fetch / browser) on the
+    // same permission system the Robrix MCP tools use: every host they reach
+    // must have been allowed for this room's AI. With no approval wired
+    // (the child `octos acp` backend), the tools fail closed inside octos.
+    let outcome = match network_approval {
+        Some(approval) => {
+            let requester: Arc<dyn octos_agent::tools::NetworkAccessRequester> =
+                Arc::new(RobrixNetworkRequester { approval: approval.clone() });
+            octos_agent::tools::NETWORK_ACCESS_CTX
+                .scope(requester, process)
+                .await
+        }
+        None => process.await,
+    };
     let cancelled = shutdown.is_set();
 
     match outcome {

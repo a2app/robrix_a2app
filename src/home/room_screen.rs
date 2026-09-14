@@ -702,6 +702,9 @@ script_mod! {
             // An AI room's live activity rows (thinking/error markers, tool
             // calls) — invisible stubs without `a2app`.
             AiEventTimelineCard := mod.widgets.AiEventTimelineCard {}
+            // One assistant turn's grouped, collapsible tool-call card — an
+            // invisible stub without `a2app`.
+            AiTurnTimelineCard := mod.widgets.AiTurnTimelineCard {}
         }
 
         // A jump to bottom button (with an unread message badge) that is shown
@@ -1785,7 +1788,8 @@ impl Widget for RoomScreen {
                                     timeline::AnyOtherStateEventContentChange::_Custom { event_type }
                                         if event_type == crate::a2app::ai_room_events::AI_REPLY_EVENT_TYPE
                                             || event_type == crate::a2app::ai_room_events::AI_ACTIVITY_EVENT_TYPE
-                                            || event_type == crate::a2app::ai_room_events::AI_TOOL_CALL_EVENT_TYPE => false,
+                                            || event_type == crate::a2app::ai_room_events::AI_TOOL_CALL_EVENT_TYPE
+                                            || event_type == crate::a2app::ai_room_events::AI_TURN_EVENT_TYPE => false,
                                     timeline::AnyOtherStateEventContentChange::_Custom { .. } => true,
                                     _ => false,
                                 };
@@ -1800,6 +1804,8 @@ impl Widget for RoomScreen {
                                         event_tl_item,
                                         other,
                                         item_drawn_status,
+                                        tl_items,
+                                        tl_idx,
                                     )
                                 }
                             }
@@ -6334,6 +6340,71 @@ fn populate_other_message_like(
     )
 }
 
+/// The latest snapshot content for the `ai_turn` turn that begins at or after
+/// `idx` (inclusive). The anchor row calls this so its card shows the turn's
+/// current state while staying put as newer snapshots arrive. Scans forward
+/// and stops at the first `ai_turn` belonging to a different turn.
+#[cfg(feature = "a2app")]
+fn ai_turn_latest(
+    items: &Vector<Arc<TimelineItem>>,
+    idx: usize,
+    turn: &str,
+) -> Option<crate::a2app::ai_room_events::AiTurnContent> {
+    use crate::a2app::ai_room_events::{AI_TURN_EVENT_TYPE, AiTurnContent};
+    let mut latest = None;
+    for item in items.iter().skip(idx) {
+        let TimelineItemKind::Event(event) = item.kind() else { continue };
+        let TimelineItemContent::OtherState(other) = event.content() else { continue };
+        let timeline::AnyOtherStateEventContentChange::_Custom { event_type } = other.content()
+        else {
+            continue;
+        };
+        if event_type != AI_TURN_EVENT_TYPE {
+            continue;
+        }
+        match event
+            .latest_json()
+            .and_then(|raw| raw.deserialize_as::<serde_json::Value>().ok())
+            .and_then(|v| v.get("content").cloned())
+            .and_then(|c| serde_json::from_value::<AiTurnContent>(c).ok())
+        {
+            Some(c) if c.turn == turn => latest = Some(c),
+            Some(_) => break, // a later turn's snapshot
+            None => {}
+        }
+    }
+    latest
+}
+
+/// Whether the `ai_turn` row at `idx` is the latest snapshot of its turn.
+///
+/// Only used for rows written before `AiTurnContent::first` existed: current
+/// rows anchor explicitly. See [`ai_turn_latest`] for the anchor path.
+#[cfg(feature = "a2app")]
+fn ai_turn_is_latest(items: &Vector<Arc<TimelineItem>>, idx: usize, turn: &str) -> bool {
+    use crate::a2app::ai_room_events::AI_TURN_EVENT_TYPE;
+    for item in items.iter().skip(idx + 1) {
+        let TimelineItemKind::Event(event) = item.kind() else { continue };
+        let TimelineItemContent::OtherState(other) = event.content() else { continue };
+        let timeline::AnyOtherStateEventContentChange::_Custom { event_type } = other.content()
+        else {
+            continue;
+        };
+        if event_type != AI_TURN_EVENT_TYPE {
+            continue;
+        }
+        let same_turn = event
+            .latest_json()
+            .and_then(|raw| raw.deserialize_as::<serde_json::Value>().ok())
+            .and_then(|v| v.get("content").cloned())
+            .and_then(|c| serde_json::from_value::<crate::a2app::ai_room_events::AiTurnContent>(c).ok())
+            .map(|c| c.turn == turn)
+            .unwrap_or(false);
+        return !same_turn;
+    }
+    true
+}
+
 /// Routes a custom state event: an AI room's `ai_reply` turns get their own
 /// timeline card, its live `ai_activity` markers ("thinking…" / errors /
 /// stopped) and `ai_tool_call` rows get the small live-activity card, and
@@ -6346,13 +6417,16 @@ fn populate_other_state_event(
     event_tl_item: &EventTimelineItem,
     other: &timeline::OtherState,
     item_drawn_status: ItemDrawnStatus,
+    tl_items: &Vector<Arc<TimelineItem>>,
+    tl_idx: usize,
 ) -> (WidgetRef, ItemDrawnStatus) {
     #[cfg(feature = "a2app")]
     if let timeline::AnyOtherStateEventContentChange::_Custom { event_type } = other.content() {
         use crate::a2app::ai_room_events::{
-            AI_ACTIVITY_EVENT_TYPE, AI_REPLY_EVENT_TYPE, AI_TOOL_CALL_EVENT_TYPE,
+            AI_ACTIVITY_EVENT_TYPE, AI_REPLY_EVENT_TYPE, AI_TOOL_CALL_EVENT_TYPE, AI_TURN_EVENT_TYPE,
             AiActivityContent, AiReplyContent, AiReplyTimelineCardWidgetRefExt,
-            AiEventTimelineCardWidgetRefExt, AiToolCallContent,
+            AiEventTimelineCardWidgetRefExt, AiToolCallContent, AiTurnContent, AiTurnStatus,
+            AiTurnTimelineCardWidgetRefExt,
         };
         let raw_content = || {
             event_tl_item
@@ -6366,6 +6440,50 @@ fn populate_other_state_event(
                 let content =
                     raw_content().and_then(|c| serde_json::from_value::<AiReplyContent>(c).ok());
                 item.as_ai_reply_timeline_card().populate(cx, content.as_ref());
+            }
+            return (item, ItemDrawnStatus::both_drawn());
+        }
+        if event_type == AI_TURN_EVENT_TYPE {
+            let content =
+                raw_content().and_then(|c| serde_json::from_value::<AiTurnContent>(c).ok());
+            let turn = content.as_ref().map(|c| c.turn.clone()).unwrap_or_default();
+            // The card is anchored at the turn's FIRST snapshot and always
+            // renders that row (filled with the latest snapshot's content), so
+            // it stays put as the turn progresses instead of disappearing from
+            // one row and reappearing at the next. Later snapshots render as
+            // empty. Rows written before `first` existed fall back to the
+            // latest-scan (and render their final `Done` snapshot directly).
+            let is_anchor = match content.as_ref().map(|c| c.first) {
+                Some(Some(first)) => first,
+                _ => content.as_ref().is_none_or(|c| {
+                    c.status == crate::a2app::ai_room_events::AiTurnStatus::Done
+                        || ai_turn_is_latest(tl_items, tl_idx, &c.turn)
+                }),
+            };
+            if !is_anchor {
+                return (list.item(cx, item_id, id!(Empty)), ItemDrawnStatus::both_drawn());
+            }
+            let mut render = ai_turn_latest(tl_items, tl_idx, &turn).or(content);
+            // A turn is only "running" while it is the room's ACTIVE turn.
+            // If the final `Done` snapshot never landed (app restarted
+            // mid-turn, room re-attached, session GC'd), the last snapshot
+            // still says `Running`; settle the card anyway so it never shows
+            // a spinner for work that is long over.
+            let room_active = match timeline_kind {
+                TimelineKind::MainRoom { room_id } => {
+                    crate::a2app::runtime::ai_room_active_turn(room_id)
+                        .is_some_and(|active| active == turn)
+                }
+                _ => false,
+            };
+            if let Some(content) = render.as_mut() {
+                if !room_active {
+                    content.status = AiTurnStatus::Done;
+                }
+            }
+            let (item, existed) = list.item_with_existed(cx, item_id, id!(AiTurnTimelineCard));
+            if !(existed && item_drawn_status.content_drawn) {
+                item.as_ai_turn_timeline_card().populate(cx, render.as_ref());
             }
             return (item, ItemDrawnStatus::both_drawn());
         }
