@@ -138,8 +138,9 @@ session-scoped MCP tool server (`src/a2app/ai/server.rs` + `bridge.rs`).
    prompts; the first prompt after a (re)start carries a short plaintext
    transcript preamble for context.
 4. **Answer**: the agent calls Robrix's own MCP tools — `send_message` (posts
-   an `ai_reply`) and `launch_splash_app` (runs the mini-app generation
-   pipeline) — or ends its turn with text, which is posted as the `ai_reply`.
+   an `ai_reply`), `launch_splash_app` (runs the mini-app generation pipeline),
+   or `list_apps`/`launch_app` (find and run an app that already exists) — or
+   ends its turn with text, which is posted as the `ai_reply`.
    A turn that already spoke through `send_message` has its redundant trailing
    text dropped, so one turn = one card.
 
@@ -164,7 +165,14 @@ bodies; only the mini-app services clip.
 | `list_spaces` | Lists the spaces the user has joined | `matrix.spaces.list` |
 | `space_info` | Reads one space's details | `matrix.space.info.read` |
 | `list_space_rooms` | Lists the rooms/subspaces inside one space | `matrix.space.rooms.list` |
-| `launch_splash_app` | Builds and runs a mini-app from a description | `apps.generate` |
+| `list_apps` | Lists the mini-apps installed and available in this room (id, name, description, scope, running) | `app-launch` |
+| `launch_app` | Runs an already-installed mini-app in this room, by id from `list_apps` | `app-launch` (run only) |
+| `launch_splash_app` | Builds and runs a NEW mini-app from a description | `apps.generate` |
+
+`launch_splash_app` is create-only: it never rewrites an installed app. Running
+an app that already exists is `launch_app`'s job — list the ids with
+`list_apps`, then launch one. (The Mini Apps screen's own create bar still
+classifies create-vs-modify from its text; only the agent's tool is create-only.)
 
 Each call is its own `rs.robius.robrix.ai_tool_call` state row, written
 `Started` when the model picks the tool and rewritten `Done` with the outcome.

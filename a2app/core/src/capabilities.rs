@@ -411,6 +411,9 @@ pub const CATALOG: &[Capability] = &[
     cap!("on_launch", "Launch context hook", "Be told how the instance was opened: slash command, timeline card, list, or tab.", Read, Incoming, Instance, None, PlannedMachinery, Low, []),
     // ----- app-generation -----
     cap!("apps.generate", "Build and run a mini-app", "Run the AI generation pipeline: spend your provider's usage to write, validate and install a new sandboxed app into this room, then run it. Reached only by an AI room's own session — no installed app can invoke the generator.", Act, Outgoing, Room, Some(P::AppGeneration), Available, Medium, []),
+    // ----- app-launch -----
+    cap!("apps.list", "List installed mini-apps", "Id, name, description, scope and running flag of the apps available in this room, so the AI can name one to run. Reveals the installed-app list, so it prompts. Reached only by an AI room's own session.", Read, Outgoing, Apps, Some(P::AppLaunch), Available, Medium, []),
+    cap!("apps.launch", "Open an installed mini-app", "Run an installed mini-app in this room's dock. Reached only by an AI room's own session; it never creates or changes an app.", Act, Outgoing, Apps, Some(P::AppLaunch), Available, Low, []),
     // ----- mcp-tools -----
     cap!("mcp.tools.register", "Register an AI tool", "Offer one named tool, with the exact description and argument schema the model will see, to this room's AI. The user reviews that text before it can reach the model, and again if it changes.", Write, Outgoing, App, Some(P::McpTools), Available, High, ["mcp.tools.register"]),
     cap!("mcp.tools.unregister", "Remove an AI tool", "Withdraw a tool this instance registered with the room's AI.", Write, Outgoing, App, Some(P::McpTools), Available, Low, ["mcp.tools.unregister"]),

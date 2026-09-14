@@ -69,6 +69,19 @@ impl AiHost for RecordingHost {
         Ok("posted".to_string())
     }
 
+    fn list_apps(&self) -> Result<String, String> {
+        self.calls.lock().unwrap().push("list_apps()".to_string());
+        Ok(json!({"apps": [{"id": "smoke-app", "name": "Smoke App"}]}).to_string())
+    }
+
+    fn launch_app(&self, app_id: &str) -> Result<String, String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("launch_app({app_id:?})"));
+        Ok(json!({"app_id": app_id, "name": "Smoke App", "status": "running"}).to_string())
+    }
+
     fn post_room_message(&self, room: &str, text: &str) -> Result<String, String> {
         self.calls
             .lock()
@@ -131,6 +144,8 @@ async fn an_rmcp_client_lists_and_calls_robrix_tools_over_the_relay() {
     let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
     assert!(names.iter().any(|n| n == "send_message"), "tools advertised: {names:?}");
     assert!(names.iter().any(|n| n == "launch_splash_app"), "tools advertised: {names:?}");
+    assert!(names.iter().any(|n| n == "list_apps"), "tools advertised: {names:?}");
+    assert!(names.iter().any(|n| n == "launch_app"), "tools advertised: {names:?}");
 
     // send_message round trip through rmcp -> relay -> socket -> host.
     let mut params = CallToolRequestParams::new("send_message");

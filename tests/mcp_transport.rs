@@ -72,6 +72,34 @@ impl AiHost for RecordingHost {
         .to_string())
     }
 
+    fn list_apps(&self) -> Result<String, String> {
+        self.calls.lock().unwrap().push("list_apps()".to_string());
+        Ok(json!({
+            "apps": [{
+                "id": "smoke-app",
+                "name": "Smoke App",
+                "description": "A smoke-test app",
+                "scope": "room",
+                "builtin": false,
+                "running": false,
+            }],
+        })
+        .to_string())
+    }
+
+    fn launch_app(&self, app_id: &str) -> Result<String, String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("launch_app({app_id:?})"));
+        Ok(json!({
+            "app_id": app_id,
+            "name": "Smoke App",
+            "status": "running",
+        })
+        .to_string())
+    }
+
     fn send_room_message(&self, text: &str) -> Result<String, String> {
         self.calls
             .lock()
@@ -312,6 +340,8 @@ fn a_full_mcp_session_over_the_relay_child() {
             "space_info",
             "list_space_rooms",
             "launch_splash_app",
+            "list_apps",
+            "launch_app",
             "read_room_memory",
             "send_message",
             "post_room_message",
@@ -342,13 +372,33 @@ fn a_full_mcp_session_over_the_relay_child() {
     assert_eq!(result["isError"], false);
     assert_eq!(result["content"][0]["text"], "posted");
 
-    // The host (this process) saw both calls with the model's arguments.
+    // list_apps: the stub host's JSON app list comes back verbatim.
+    let result = client.request("tools/call", json!({"name": "list_apps", "arguments": {}}));
+    assert_eq!(result["isError"], false);
+    let listed: Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(listed["apps"][0]["id"], "smoke-app");
+
+    // launch_app: the id reaches the host and the running summary comes back.
+    let result = client.request(
+        "tools/call",
+        json!({"name": "launch_app", "arguments": {"app_id": "smoke-app"}}),
+    );
+    assert_eq!(result["isError"], false);
+    let launched: Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(launched["app_id"], "smoke-app");
+    assert_eq!(launched["status"], "running");
+
+    // The host (this process) saw every call with the model's arguments.
     let calls = host.calls();
     assert_eq!(
         calls,
         vec![
             "launch_splash_app(\"a counter app\")".to_string(),
             "send_message(\"hello room\")".to_string(),
+            "list_apps()".to_string(),
+            "launch_app(\"smoke-app\")".to_string(),
         ]
     );
 
@@ -360,6 +410,14 @@ fn a_full_mcp_session_over_the_relay_child() {
     );
     assert_eq!(result["isError"], true);
     assert!(result["content"][0]["text"].as_str().unwrap().contains("must not be empty"));
+
+    // A blank app_id trips launch_app's own validation.
+    let result = client.request(
+        "tools/call",
+        json!({"name": "launch_app", "arguments": {"app_id": "   "}}),
+    );
+    assert_eq!(result["isError"], true);
+    assert!(result["content"][0]["text"].as_str().unwrap().contains("non-empty"));
 
     // An unknown tool is a JSON-RPC error (-32602), not a tool failure.
     let reply = client.raw_request(

@@ -774,6 +774,8 @@ pub fn ai_tool_display_name(name: &str) -> String {
         "list_space_rooms" => String::from("Listed a space's rooms"),
         "read_room_memory" => String::from("Read room memory"),
         "launch_splash_app" => String::from("Built and ran a mini-app"),
+        "list_apps" => String::from("Listed your mini-apps"),
+        "launch_app" => String::from("Launched a mini-app"),
         "send_message" => String::from("Replied"),
         "post_room_message" => String::from("Posted a message"),
         // octos's own tools, kept on the session's profile (see
@@ -803,6 +805,8 @@ pub fn ai_tool_display_name_running(name: &str) -> String {
         "list_space_rooms" => String::from("Listing a space's rooms"),
         "read_room_memory" => String::from("Reading room memory"),
         "launch_splash_app" => String::from("Building and running a mini-app"),
+        "list_apps" => String::from("Listing your mini-apps"),
+        "launch_app" => String::from("Launching a mini-app"),
         "send_message" => String::from("Replying"),
         "post_room_message" => String::from("Posting a message"),
         "web_search" => String::from("Searching the web"),

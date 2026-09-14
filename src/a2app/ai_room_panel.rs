@@ -91,6 +91,21 @@ script_mod! {
             }
         }
 
+        app_use_row := View {
+            width: Fill, height: Fit
+            flow: Down
+            spacing: 4
+            app_use_state := ModalBody {}
+            app_use_buttons := View {
+                width: Fill, height: Fit
+                flow: Right
+                spacing: 8
+                app_use_allow := ButtonFlat { text: "Allow" }
+                app_use_ask := ButtonFlat { text: "Ask each time" }
+                app_use_block := ButtonFlatter { text: "Don't allow" }
+            }
+        }
+
         rooms_read_row := View {
             width: Fill, height: Fit
             flow: Down
@@ -228,6 +243,14 @@ impl Widget for AiRoomPanel {
         } else if self.view.button(cx, ids!(gen_block)).clicked(actions) {
             emit_panel_action(cx, &room_id, Some(Permission::AppGeneration), AiRoomPanelCommand::Deny);
         }
+        // Open your mini-apps.
+        if self.view.button(cx, ids!(app_use_allow)).clicked(actions) {
+            emit_panel_action(cx, &room_id, Some(Permission::AppLaunch), AiRoomPanelCommand::Allow);
+        } else if self.view.button(cx, ids!(app_use_ask)).clicked(actions) {
+            emit_panel_action(cx, &room_id, Some(Permission::AppLaunch), AiRoomPanelCommand::Ask);
+        } else if self.view.button(cx, ids!(app_use_block)).clicked(actions) {
+            emit_panel_action(cx, &room_id, Some(Permission::AppLaunch), AiRoomPanelCommand::Deny);
+        }
         // Read messages in other rooms.
         if self.view.button(cx, ids!(rooms_read_allow)).clicked(actions) {
             emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomsRead), AiRoomPanelCommand::Allow);
@@ -268,8 +291,9 @@ impl AiRoomPanelRef {
         v.label(cx, ids!(read_state)).set_text(cx, row(0));
         v.label(cx, ids!(info_state)).set_text(cx, row(1));
         v.label(cx, ids!(gen_state)).set_text(cx, row(2));
-        v.label(cx, ids!(rooms_read_state)).set_text(cx, row(3));
-        v.label(cx, ids!(rooms_list_state)).set_text(cx, row(4));
+        v.label(cx, ids!(app_use_state)).set_text(cx, row(3));
+        v.label(cx, ids!(rooms_read_state)).set_text(cx, row(4));
+        v.label(cx, ids!(rooms_list_state)).set_text(cx, row(5));
         v.label(cx, ids!(usage_label)).set_text(cx, &info.usage);
         let restrict_notice = info.restriction.clone().unwrap_or_default();
         let restricted = !restrict_notice.is_empty();

@@ -27,13 +27,28 @@ use a2app_core::capabilities::by_id;
 /// state a tool needs (the app registry to install into, the Matrix room to
 /// post to, the running `Generation`). Each method returns the text payload the
 /// model sees: `Ok` text for a success, `Err` text for a failure the model
-/// should be told about. `launch_splash_app`'s success payload is a small JSON
-/// summary the model can quote; everything else is prose.
+/// should be told about. The app tools (`launch_splash_app`, `list_apps`,
+/// `launch_app`) return small JSON summaries the model can quote; everything
+/// else is prose.
 pub trait AiHost: Send + Sync {
-    /// Generates and installs a room-scoped mini-app from a natural-language
-    /// description, then runs it. Returns a structured summary on success:
+    /// Generates and installs a NEW room-scoped mini-app from a natural-language
+    /// description, then runs it. This is create-only: it never rewrites an
+    /// existing app (use [`AiHost::launch_app`] to run one of those). Returns a
+    /// structured summary on success:
     /// `{"app_id":…,"name":…,"status":"installed_and_running"}`.
     fn launch_splash_app(&self, description: &str) -> Result<String, String>;
+
+    /// Lists the installed mini-apps available to this session — the
+    /// account-scoped apps plus any app scoped to this session's own room — as
+    /// JSON the model reads and picks a [`AiHost::launch_app`] id from. Returns
+    /// `{"apps":[{…}]}`.
+    fn list_apps(&self) -> Result<String, String>;
+
+    /// Runs an already-installed mini-app in this session's room, by id. This
+    /// never generates or rewrites: an unknown (or otherwise unavailable) id is
+    /// an error the model can read. Returns
+    /// `{"app_id":…,"name":…,"status":"running"}`.
+    fn launch_app(&self, app_id: &str) -> Result<String, String>;
 
     /// Posts `text` into the room associated with this session.
     fn send_room_message(&self, text: &str) -> Result<String, String>;
@@ -178,12 +193,12 @@ impl ReadToolKind {
 
 /// The capability ids an AI session offers as gated attached-room reads —
 /// the read half of its declaration profile (see
-/// [`AI_ROOM_SESSION_CAP_IDS`], which adds the generator). Kept beside the
-/// tool impls so the tool list and the runtime's gate cannot disagree. The
-/// native `send_message` tool is room plumbing, not a catalog capability, so
-/// it is deliberately not listed anywhere here — and neither is
-/// `read_room_memory`, which is the same kind of ungated plumbing (the agent
-/// recalling its own past turns).
+/// [`AI_ROOM_SESSION_CAP_IDS`], which adds the generator and the app tools).
+/// Kept beside the tool impls so the tool list and the runtime's gate cannot
+/// disagree. The native `send_message` tool is room plumbing, not a catalog
+/// capability, so it is deliberately not listed anywhere here — and neither
+/// is `read_room_memory`, which is the same kind of ungated plumbing (the
+/// agent recalling its own past turns).
 pub const AI_ROOM_READ_CAP_IDS: &[&str] = &[
     "matrix.room.messages.read",
     "matrix.room.messages.paginate",
@@ -196,11 +211,11 @@ pub const AI_ROOM_READ_CAP_IDS: &[&str] = &[
 ];
 
 /// Everything an AI session may do that sits in the mini-app capability
-/// catalog: the read tools above, the generator (`launch_splash_app`), and
-/// posting into the user's other rooms (`post_room_message` — gated per
-/// room, see the runtime). What the runtime's gate checks against, so every
-/// offered capability is declared — a profile list can only grow by editing
-/// this array.
+/// catalog: the read tools above, the generator (`launch_splash_app`), the
+/// app tools (`list_apps`, `launch_app`), and posting into the user's other
+/// rooms (`post_room_message` — gated per room, see the runtime). What the
+/// runtime's gate checks against, so every offered capability is declared —
+/// a profile list can only grow by editing this array.
 pub const AI_ROOM_SESSION_CAP_IDS: &[&str] = &[
     "matrix.room.messages.read",
     "matrix.room.messages.paginate",
@@ -211,6 +226,8 @@ pub const AI_ROOM_SESSION_CAP_IDS: &[&str] = &[
     "matrix.space.info.read",
     "matrix.space.rooms.list",
     "apps.generate",
+    "apps.list",
+    "apps.launch",
     "matrix.rooms.message.send",
     // The AI room can invoke tools a mini-app registered in it (each tool is
     // granted per tool, see `PermissionStore::tool_effective`); declaring the
@@ -222,6 +239,15 @@ pub const AI_ROOM_SESSION_CAP_IDS: &[&str] = &[
     // has allowed that host for this room's AI.
     "network.http",
 ];
+
+/// The catalog capability behind `list_apps`; the runtime gates the tool
+/// against it. Kept beside the session profile so the tool list and the gate
+/// cannot disagree (mirrors [`ReadToolKind::capability_id`]).
+pub const LIST_APPS_CAP_ID: &str = "apps.list";
+
+/// The catalog capability behind `launch_app`; the runtime gates the tool
+/// against it (see [`LIST_APPS_CAP_ID`]).
+pub const LAUNCH_APP_CAP_ID: &str = "apps.launch";
 
 /// The MCP tool name for a read kind — what shows on the room's `ai_reply`
 /// receipt chip.
@@ -671,9 +697,11 @@ impl Tool for LaunchSplashAppTool {
     }
 
     fn description(&self) -> &str {
-        "Builds a sandboxed mini-app from a natural-language description and \
+        "Builds a NEW sandboxed mini-app from a natural-language description and \
          installs it into this room, then runs it. Call this when the user asks \
-         to create, build, make, or modify an app. The result is a JSON summary \
+         to create, build, or make a brand-new app. It always creates a new app; \
+         it never changes one that already exists. To run an app the user \
+         already has, use list_apps and launch_app. The result is a JSON summary \
          of the installed app."
     }
 
@@ -701,6 +729,99 @@ impl Tool for LaunchSplashAppTool {
             return Err("`description` must not be empty".to_string());
         }
         self.host.launch_splash_app(description)
+    }
+}
+
+/// `list_apps` — the installed mini-apps available in this room.
+///
+/// Read-only metadata (id, name, description, scope, running) so the model can
+/// name one to `launch_app`; it never exposes an app's source or data.
+pub struct ListAppsTool {
+    host: Arc<dyn AiHost>,
+}
+
+impl ListAppsTool {
+    pub fn new(host: Arc<dyn AiHost>) -> Self {
+        Self { host }
+    }
+}
+
+impl Tool for ListAppsTool {
+    fn name(&self) -> &str {
+        "list_apps"
+    }
+
+    fn description(&self) -> &str {
+        "Lists the mini-apps installed and available in this room, with each \
+         app's `id`, name, description, whether it is scoped to this room or the \
+         whole account, and whether it is currently running. Call this when the \
+         user asks to open, run, or start an app they already have, then pass \
+         the `id` to launch_app. This only lists apps; to write a new one, use \
+         launch_splash_app."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+        })
+    }
+
+    fn call(&self, _arguments: &Map<String, Value>) -> Result<String, String> {
+        self.host.list_apps()
+    }
+}
+
+/// `launch_app` — run an already-installed mini-app in this room, by id.
+///
+/// The counterpart to `launch_splash_app`: it never generates, rewrites, or
+/// installs. The id must come from `list_apps`; an unknown or unavailable id is
+/// an error the model can read and recover from.
+pub struct LaunchAppTool {
+    host: Arc<dyn AiHost>,
+}
+
+impl LaunchAppTool {
+    pub fn new(host: Arc<dyn AiHost>) -> Self {
+        Self { host }
+    }
+}
+
+impl Tool for LaunchAppTool {
+    fn name(&self) -> &str {
+        "launch_app"
+    }
+
+    fn description(&self) -> &str {
+        "Runs an already-installed mini-app in this room, identified by the `id` \
+         from list_apps. It opens the app in this room's dock. This never \
+         creates or changes an app — to build a new one, use launch_splash_app."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "app_id": {
+                    "type": "string",
+                    "description": "The id of an installed app, exactly as returned by list_apps.",
+                },
+            },
+            "required": ["app_id"],
+            "additionalProperties": false,
+        })
+    }
+
+    fn call(&self, arguments: &Map<String, Value>) -> Result<String, String> {
+        let app_id = arguments
+            .get("app_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "`launch_app` needs a non-empty string `app_id`".to_string())?
+            .to_string();
+        self.host.launch_app(&app_id)
     }
 }
 
@@ -856,6 +977,8 @@ pub fn register_session_tools(server: &mut a2app_agent::mcp::McpServer, host: Ar
     server.add_tool(SpaceInfoTool::new(host.clone()));
     server.add_tool(ListSpaceRoomsTool::new(host.clone()));
     server.add_tool(LaunchSplashAppTool::new(host.clone()));
+    server.add_tool(ListAppsTool::new(host.clone()));
+    server.add_tool(LaunchAppTool::new(host.clone()));
     // Ungated native tools (the agent's own room plumbing).
     server.add_tool(ReadRoomMemoryTool::new(host.clone()));
     server.add_tool(SendMessageTool::new(host.clone()));
@@ -911,6 +1034,22 @@ mod tests {
         }
         for id in AI_ROOM_SESSION_CAP_IDS {
             assert!(by_id(id).is_some_and(|c| c.is_available()), "{id} not available");
+        }
+    }
+
+    /// The app tools (`list_apps`, `launch_app`) map onto declared, gateable
+    /// capabilities in the session profile — so neither can be offered to a
+    /// model without a permission prompt behind it.
+    #[test]
+    fn app_tools_are_gated_by_declared_capabilities() {
+        for id in [LIST_APPS_CAP_ID, LAUNCH_APP_CAP_ID] {
+            assert!(
+                AI_ROOM_SESSION_CAP_IDS.contains(&id),
+                "{id} is offered as a tool but not in AI_ROOM_SESSION_CAP_IDS"
+            );
+            let cap = by_id(id).unwrap_or_else(|| panic!("{id} dropped from the catalog"));
+            assert!(cap.is_available(), "{id} not available");
+            assert_eq!(cap.group.map(|g| g.as_str()), Some("app-launch"), "{id} group");
         }
     }
 

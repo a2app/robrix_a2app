@@ -53,6 +53,13 @@ pub enum SessionJob {
     /// room. The runtime answers on `answer` when the pipeline finishes — or
     /// refuses up front (no provider, another generation running).
     LaunchSplashApp { description: String, answer: Sender<Result<String, String>> },
+    /// `list_apps`: read the installed apps available to this room. Pure
+    /// UI-thread metadata; answered immediately.
+    ListApps { answer: Sender<Result<String, String>> },
+    /// `launch_app`: open an already-installed app in this room. Never
+    /// generates; the runtime looks the id up and refuses if it is not
+    /// available here.
+    LaunchApp { app_id: String, answer: Sender<Result<String, String>> },
     /// `send_message`: post plain text into the session's room.
     SendRoomMessage { text: String, answer: Sender<Result<String, String>> },
     /// `post_room_message`: post text into ANOTHER joined room as an
@@ -117,6 +124,29 @@ impl AiHost for SessionHost {
         answer_rx
             .recv()
             .map_err(|_| "this session ended before the app was built".to_string())?
+    }
+
+    fn list_apps(&self) -> Result<String, String> {
+        let (answer_tx, answer_rx) = channel();
+        self.jobs
+            .send(SessionJob::ListApps { answer: answer_tx })
+            .map_err(|_| "this session's UI thread is gone".to_string())?;
+        answer_rx
+            .recv()
+            .map_err(|_| "this session ended before the app list was read".to_string())?
+    }
+
+    fn launch_app(&self, app_id: &str) -> Result<String, String> {
+        let (answer_tx, answer_rx) = channel();
+        self.jobs
+            .send(SessionJob::LaunchApp {
+                app_id: app_id.to_string(),
+                answer: answer_tx,
+            })
+            .map_err(|_| "this session's UI thread is gone".to_string())?;
+        answer_rx
+            .recv()
+            .map_err(|_| "this session ended before the app launched".to_string())?
     }
 
     fn send_room_message(&self, text: &str) -> Result<String, String> {

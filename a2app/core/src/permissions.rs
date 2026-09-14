@@ -89,6 +89,11 @@ pub enum Permission {
     /// changed description re-prompts, and the UI shows the exact text before
     /// it can reach the model's context.
     McpTools,
+    /// List the installed mini-apps available in a room, and run one in that
+    /// room's dock (the AI session's `list_apps`/`launch_app` tools). Reached
+    /// only by an AI room's own session, never by a mini-app manifest; it
+    /// never creates or changes an app.
+    AppLaunch,
 }
 
 /// Runtime permissions prompt the user on first use; normal ones auto-grant
@@ -100,7 +105,7 @@ pub enum Tier {
 }
 
 impl Permission {
-    pub const ALL: [Permission; 38] = [
+    pub const ALL: [Permission; 39] = [
         Permission::Network,
         Permission::Location,
         Permission::Notifications,
@@ -139,6 +144,7 @@ impl Permission {
         Permission::RobrixObserve,
         Permission::AppGeneration,
         Permission::McpTools,
+        Permission::AppLaunch,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -181,6 +187,7 @@ impl Permission {
             Permission::RobrixObserve => "robrix-observe",
             Permission::AppGeneration => "app-generation",
             Permission::McpTools => "mcp-tools",
+            Permission::AppLaunch => "app-launch",
         }
     }
 
@@ -222,7 +229,8 @@ impl Permission {
             | Permission::RobrixUi
             | Permission::RobrixObserve
             | Permission::AppGeneration
-            | Permission::McpTools => Tier::Runtime,
+            | Permission::McpTools
+            | Permission::AppLaunch => Tier::Runtime,
             Permission::ClipboardWrite
             | Permission::OpenUrl
             | Permission::Files
@@ -276,6 +284,7 @@ impl Permission {
             Permission::RobrixObserve => "Watch what you're doing",
             Permission::AppGeneration => "Build and run mini-apps",
             Permission::McpTools => "Register AI tools",
+            Permission::AppLaunch => "Open your mini-apps",
         }
     }
 
@@ -319,6 +328,7 @@ impl Permission {
             Permission::RobrixObserve => "📡",
             Permission::AppGeneration => "⚡",
             Permission::McpTools => "🧩",
+            Permission::AppLaunch => "🚀",
         }
     }
 
@@ -364,6 +374,7 @@ impl Permission {
             Permission::RobrixObserve => "Be told which room or screen you switch to.",
             Permission::AppGeneration => "Run the AI app-builder here. It spends your provider's usage and installs a new sandboxed app into this room.",
             Permission::McpTools => "Register tools the AI in this room can call. The app's tool name and full description are shown for your review before they reach the AI.",
+            Permission::AppLaunch => "See which mini-apps you have installed and open one in this room. This never creates or changes an app.",
         }
     }
 }

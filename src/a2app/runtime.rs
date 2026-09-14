@@ -56,7 +56,7 @@ use crate::a2app::ai::session::{AiSession, PromptOutcome, SessionJob, SessionUpd
 #[cfg(unix)]
 use crate::a2app::ai::rooms::{next_ai_state_key, AiRoomAction, AiRoomRequest};
 #[cfg(unix)]
-use crate::a2app::ai::tools::{AI_ROOM_SESSION_CAP_IDS, ReadToolKind, read_tool_name};
+use crate::a2app::ai::tools::{AI_ROOM_SESSION_CAP_IDS, LAUNCH_APP_CAP_ID, LIST_APPS_CAP_ID, ReadToolKind, read_tool_name};
 #[cfg(unix)]
 use crate::a2app::ai_room_panel::{
     AiRoomPanelAction, AiRoomPanelCommand, AiRoomPanelInfo, AiRoomPanelWidgetRefExt,
@@ -2175,6 +2175,8 @@ fn ai_job_tool_name(job: &SessionJob) -> String {
     match job {
         SessionJob::ReadTool { kind, .. } => read_tool_name(kind).to_string(),
         SessionJob::LaunchSplashApp { .. } => String::from("launch_splash_app"),
+        SessionJob::ListApps { .. } => String::from("list_apps"),
+        SessionJob::LaunchApp { .. } => String::from("launch_app"),
         SessionJob::SendRoomMessage { .. } => String::from("send_message"),
         SessionJob::PostRoomMessage { .. } => String::from("post_room_message"),
         // Not a tool call: the agent's web tool is already shown by its ACP
@@ -2213,6 +2215,9 @@ fn session_job_detail(rooms: Option<&RoomsListRef>, job: &SessionJob) -> Option<
         // tool must not leave a stranded `Started` row when the job reaches
         // the UI thread before the agent's `started` event.
         SessionJob::SendRoomMessage { .. } => Some(String::from("in this room")),
+        // A launch names the app it runs; the read-only list has no target.
+        SessionJob::LaunchApp { app_id, .. } => Some(format!("“{}”", resolve_app_label(app_id))),
+        SessionJob::ListApps { .. } => None,
         // No target of its own: the ACP `tool_call` event names the web tool,
         // and the turn card is reposted with that name; this job carries only
         // the host the user is being asked about.
@@ -2238,6 +2243,16 @@ fn resolve_room_label(rooms: Option<&RoomsListRef>, room_id: &str) -> String {
         return name.to_string();
     }
     room_id.to_string()
+}
+
+/// The display name for an installed app, for tool-card targets: the
+/// manifest's name when the app still exists, else the raw id as a last
+/// resort. Never returns an empty string (an app id is never empty).
+#[cfg(unix)]
+fn resolve_app_label(app_id: &str) -> String {
+    with_a2app(|state| state.registry.get(app_id).map(|m| m.name.clone()))
+        .flatten()
+        .unwrap_or_else(|| app_id.to_string())
 }
 
 /// The target detail for one read, by kind. Reads confined to this room name
@@ -2355,6 +2370,12 @@ fn ai_prompt_action(
                     ReadToolKind::Memory { .. } => String::from("recall its own past replies"),
                 },
                 SessionJob::LaunchSplashApp { .. } => String::from("build and run a mini-app"),
+                SessionJob::ListApps { .. } => String::from("see which mini-apps you have installed"),
+                // The prompt is built inside `with_a2app`, so it must not
+                // re-enter to resolve the app's display name; the id is fine.
+                SessionJob::LaunchApp { app_id, .. } => {
+                    format!("run the mini-app \"{app_id}\"")
+                }
                 SessionJob::PostRoomMessage { room_id: room, .. } => {
                     format!("post a message into “{}”", resolve_room_label(rooms, room))
                 }
@@ -2417,6 +2438,11 @@ fn ai_prompt_reason(
                     ReadToolKind::Memory { .. } => String::from("It is recalling what it previously said in this room."),
                 },
                 SessionJob::LaunchSplashApp { .. } => String::from("It is building an app you asked for."),
+                SessionJob::ListApps { .. } => String::from("It needs to know which mini-apps you have before it can run one."),
+                // Built inside `with_a2app`: use the id, do not re-enter.
+                SessionJob::LaunchApp { app_id, .. } => {
+                    format!("You asked it to run the mini-app \"{app_id}\".")
+                }
                 SessionJob::PostRoomMessage { room_id: room, .. } => {
                     format!("It wants to post a message into “{}”, outside this room. It can only post there if you allow this room.", resolve_room_label(rooms, room))
                 }
@@ -2517,6 +2543,8 @@ fn prompt_info_for(
 fn answer_session_job(job: SessionJob, result: Result<String, String>) {
     match job {
         SessionJob::LaunchSplashApp { answer, .. }
+        | SessionJob::ListApps { answer, .. }
+        | SessionJob::LaunchApp { answer, .. }
         | SessionJob::SendRoomMessage { answer, .. }
         | SessionJob::ReadTool { answer, .. }
         | SessionJob::PostRoomMessage { answer, .. }
@@ -3276,12 +3304,13 @@ fn refresh_ai_room_panel(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
             s
         };
         // Kept in the same order as the panel's rows (read / info / generate
-        // / other rooms / room list); `ai_room_declares_perm` filters to what
-        // this room's AI actually offers.
+        // / apps / other rooms / room list); `ai_room_declares_perm` filters
+        // to what this room's AI actually offers.
         let managed: Vec<Permission> = [
             Permission::MatrixRoomRead,
             Permission::MatrixRoomInfo,
             Permission::AppGeneration,
+            Permission::AppLaunch,
             Permission::MatrixRoomsRead,
             Permission::MatrixRoomsList,
         ]
@@ -3912,6 +3941,30 @@ fn ai_room_declares_cap(cap: &a2app_core::capabilities::Capability) -> bool {
     AI_ROOM_SESSION_CAP_IDS.contains(&cap.id)
 }
 
+/// One app tool's (`list_apps`, `launch_app`) verdict against its room's
+/// subject, with the same shape as a read's gate: a granted verdict records
+/// the group use so the room's panel shows it, exactly as a granted read
+/// does. The caller still owns the answer and decides whether to run, refuse,
+/// or park behind the prompt.
+#[cfg(unix)]
+fn ai_app_tool_verdict(
+    room_id: &OwnedRoomId,
+    cap: &a2app_core::capabilities::Capability,
+) -> Effective {
+    let subject = agent_subject(room_id.as_str());
+    let verdict =
+        with_a2app(|state| ai_capability_verdict(state, room_id, cap)).unwrap_or(Effective::Denied);
+    if verdict == Effective::Granted {
+        if let Some(group) = cap.group {
+            with_a2app(|state| {
+                state.permissions.record_access(&subject, group, versions::now_unix());
+                state.perms_dirty = true;
+            });
+        }
+    }
+    verdict
+}
+
 /// The session's verdict for one catalog capability against its room subject
 /// — the shared gate the mini-app broker mirrors, so a room's AI and an app
 /// can never be decided differently for the same capability.
@@ -4168,12 +4221,206 @@ fn post_ai_room_message(
     }));
 }
 
+/// Executes the `list_apps` tool: the installed apps this room's agent may
+/// launch — account-scoped apps plus apps scoped to this room — as JSON the
+/// model reads and picks a `launch_app` id from. Gated like a read against
+/// the room's subject (`apps.list`), so a first use parks the call behind the
+/// permission prompt.
+#[cfg(unix)]
+fn run_ai_list_apps(
+    cx: &mut Cx,
+    ui: &WidgetRef,
+    room_id: &OwnedRoomId,
+    answer: Sender<Result<String, String>>,
+) {
+    let Some(cap) = a2app_core::capabilities::by_id(LIST_APPS_CAP_ID) else {
+        let _ = answer.send(Err("this tool is no longer offered".to_string()));
+        return;
+    };
+    match ai_app_tool_verdict(room_id, cap) {
+        Effective::Granted => {
+            let apps = with_a2app(|state| {
+                state
+                    .registry
+                    .iter()
+                    .filter(|m| match &m.scope {
+                        A2AppScope::Account => true,
+                        A2AppScope::Room { room_id: owner } => owner == room_id.as_str(),
+                    })
+                    .map(|m| {
+                        let mut entry = serde_json::json!({
+                            "id": m.id,
+                            "name": m.name,
+                            "description": m.description,
+                            "scope": match &m.scope {
+                                A2AppScope::Room { .. } => "room",
+                                A2AppScope::Account => "account",
+                            },
+                            "builtin": m.builtin,
+                            "running": instances::is_running(&m.id),
+                        });
+                        if let A2AppScope::Room { room_id } = &m.scope {
+                            entry["room_id"] = serde_json::json!(room_id);
+                        }
+                        entry
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+            let text = serde_json::json!({ "apps": apps }).to_string();
+            note_ai_tool_call(room_id, "list_apps", true, "");
+            let _ = answer.send(Ok(text));
+        }
+        Effective::Denied | Effective::Undeclared => {
+            let text = match cap.group {
+                Some(group) => ai_tool_refused_text(group),
+                None => String::from("The user has not allowed the AI in this room to do that."),
+            };
+            note_ai_tool_call(room_id, "list_apps", false, &text);
+            let _ = answer.send(Err(text));
+        }
+        Effective::NeedsPrompt => {
+            let Some(group) = cap.group else {
+                let _ = answer.send(Err("this tool is no longer offered".to_string()));
+                return;
+            };
+            queue_permission_prompt(
+                cx,
+                ui,
+                agent_subject(room_id.as_str()),
+                group,
+                ParkedRequest::AiTool {
+                    room_id: room_id.clone(),
+                    job: SessionJob::ListApps { answer },
+                },
+                None,
+            );
+        }
+    }
+}
+
+/// Executes the `launch_app` tool for a session: opens an already-installed
+/// app in the session's room. This is the run path ONLY — no generation. Like
+/// a read, it is gated against the room's subject (`apps.launch`), so a first
+/// use parks the call behind the permission prompt. An id that is unknown,
+/// scoped to another room, or restricted is an error the model reads and can
+/// recover from (it can call `list_apps` for valid ids).
+#[cfg(unix)]
+fn run_ai_launch_app(
+    cx: &mut Cx,
+    ui: &WidgetRef,
+    room_id: &OwnedRoomId,
+    app_id: String,
+    answer: Sender<Result<String, String>>,
+) {
+    let Some(cap) = a2app_core::capabilities::by_id(LAUNCH_APP_CAP_ID) else {
+        let _ = answer.send(Err("this tool is no longer offered".to_string()));
+        return;
+    };
+    match ai_app_tool_verdict(room_id, cap) {
+        Effective::Granted => run_ai_launch_app_granted(cx, room_id, app_id, answer),
+        Effective::Denied | Effective::Undeclared => {
+            let text = match cap.group {
+                Some(group) => ai_tool_refused_text(group),
+                None => String::from("The user has not allowed the AI in this room to do that."),
+            };
+            note_ai_tool_call(room_id, "launch_app", false, &text);
+            let _ = answer.send(Err(text));
+        }
+        Effective::NeedsPrompt => {
+            let Some(group) = cap.group else {
+                let _ = answer.send(Err("this tool is no longer offered".to_string()));
+                return;
+            };
+            queue_permission_prompt(
+                cx,
+                ui,
+                agent_subject(room_id.as_str()),
+                group,
+                ParkedRequest::AiTool {
+                    room_id: room_id.clone(),
+                    job: SessionJob::LaunchApp { app_id, answer },
+                },
+                None,
+            );
+        }
+    }
+}
+
+/// The granted half of [`run_ai_launch_app`]: look the id up and run it, or
+/// answer with the reason it cannot run.
+#[cfg(unix)]
+fn run_ai_launch_app_granted(
+    cx: &mut Cx,
+    room_id: &OwnedRoomId,
+    app_id: String,
+    answer: Sender<Result<String, String>>,
+) {
+    enum Refusal {
+        Unknown,
+        OtherRoom(MiniAppId),
+        Restricted(MiniAppId),
+    }
+    let outcome: Result<MiniAppManifest, Refusal> = with_a2app(|state| {
+        let Some(manifest) = state.registry.get(&app_id).cloned() else {
+            return Err(Refusal::Unknown);
+        };
+        match &manifest.scope {
+            A2AppScope::Account => {}
+            A2AppScope::Room { room_id: owner } if owner == room_id.as_str() => {}
+            A2AppScope::Room { .. } => return Err(Refusal::OtherRoom(manifest.id)),
+        }
+        if state.permissions.is_restricted(&manifest.id) {
+            return Err(Refusal::Restricted(manifest.id));
+        }
+        Ok(manifest)
+    })
+    .unwrap_or(Err(Refusal::Unknown));
+
+    match outcome {
+        Ok(manifest) => {
+            // Dock it into this room exactly as a freshly built app is docked
+            // (`resolve_session_generation`), so "launch" lands where the
+            // conversation is.
+            cx.action(A2AppOp::OpenApp {
+                app_id: manifest.id.clone(),
+                room_id: Some(room_id.clone()),
+                in_room_pane: true,
+            });
+            let summary = serde_json::json!({
+                "app_id": manifest.id,
+                "name": manifest.name,
+                "status": "running",
+            });
+            note_ai_tool_call(room_id, "launch_app", true, "");
+            let _ = answer.send(Ok(summary.to_string()));
+        }
+        Err(refusal) => {
+            let text = match refusal {
+                Refusal::Unknown => format!(
+                    "There is no installed mini-app with id \"{app_id}\". Use list_apps to see the ids that exist."
+                ),
+                Refusal::OtherRoom(id) => format!(
+                    "\"{id}\" belongs to another room, so it can't run here. Use list_apps for the apps available in this room."
+                ),
+                Refusal::Restricted(id) => format!(
+                    "\"{id}\" was stopped for hammering the host with requests; the user has to let it run again from its app info."
+                ),
+            };
+            note_ai_tool_call(room_id, "launch_app", false, &text);
+            let _ = answer.send(Err(text));
+        }
+    }
+}
+
 /// Executes the `launch_splash_app` tool for a session: first gated against
 /// the room's subject like any other capability (`apps.generate`), then — if
 /// granted — run through the same generation machinery the Mini Apps screen
 /// uses, with the waiting tool call answered when the build finishes. The
 /// build tool is the one capability with real cost (provider tokens), so a
-/// first use prompts exactly like a read does.
+/// first use prompts exactly like a read does. This is CREATE-only: it always
+/// runs `Intent::Create`, so the agent can never rewrite an app through it —
+/// running an existing app is `launch_app`'s job.
 #[cfg(unix)]
 fn run_ai_generation(
     cx: &mut Cx,
@@ -4229,7 +4476,7 @@ fn run_ai_generation(
                     }
                 }
             });
-            start_generation(cx, ui, description, Some(room_id.clone()), None);
+            start_generation(cx, ui, description, Some(room_id.clone()), Some(Intent::Create));
             // Generation::start can still fail after the blockers passed (an
             // agent that dies instantly); it reports that by leaving no
             // generation running. Unblock the tool call rather than strand it.
@@ -4304,6 +4551,12 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
         }
         SessionJob::LaunchSplashApp { description, answer } => {
             run_ai_generation(cx, ui, room_id, description, answer);
+        }
+        SessionJob::ListApps { answer } => {
+            run_ai_list_apps(cx, ui, room_id, answer);
+        }
+        SessionJob::LaunchApp { app_id, answer } => {
+            run_ai_launch_app(cx, ui, room_id, app_id, answer);
         }
         SessionJob::ReadTool { kind, answer } => {
             run_ai_read_tool(cx, ui, room_id, kind, answer);
