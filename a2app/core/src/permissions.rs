@@ -83,6 +83,12 @@ pub enum Permission {
     /// and installs a new sandboxed mini-app). Reached only by an AI room's
     /// own session, never by a mini-app manifest.
     AppGeneration,
+    /// Register a callable tool with the room's AI, or (on the agent side)
+    /// invoke a tool a mini-app registered. Each tool is granted on its own:
+    /// registration stores the app-authored description's content hash so a
+    /// changed description re-prompts, and the UI shows the exact text before
+    /// it can reach the model's context.
+    McpTools,
 }
 
 /// Runtime permissions prompt the user on first use; normal ones auto-grant
@@ -94,7 +100,7 @@ pub enum Tier {
 }
 
 impl Permission {
-    pub const ALL: [Permission; 37] = [
+    pub const ALL: [Permission; 38] = [
         Permission::Network,
         Permission::Location,
         Permission::Notifications,
@@ -132,6 +138,7 @@ impl Permission {
         Permission::RobrixPreferences,
         Permission::RobrixObserve,
         Permission::AppGeneration,
+        Permission::McpTools,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -173,6 +180,7 @@ impl Permission {
             Permission::RobrixPreferences => "robrix-preferences",
             Permission::RobrixObserve => "robrix-observe",
             Permission::AppGeneration => "app-generation",
+            Permission::McpTools => "mcp-tools",
         }
     }
 
@@ -213,7 +221,8 @@ impl Permission {
             | Permission::RobrixComposer
             | Permission::RobrixUi
             | Permission::RobrixObserve
-            | Permission::AppGeneration => Tier::Runtime,
+            | Permission::AppGeneration
+            | Permission::McpTools => Tier::Runtime,
             Permission::ClipboardWrite
             | Permission::OpenUrl
             | Permission::Files
@@ -266,6 +275,7 @@ impl Permission {
             Permission::RobrixPreferences => "Robrix settings",
             Permission::RobrixObserve => "Watch what you're doing",
             Permission::AppGeneration => "Build and run mini-apps",
+            Permission::McpTools => "Register AI tools",
         }
     }
 
@@ -308,6 +318,7 @@ impl Permission {
             Permission::RobrixPreferences => "⚙️",
             Permission::RobrixObserve => "📡",
             Permission::AppGeneration => "⚡",
+            Permission::McpTools => "🧩",
         }
     }
 
@@ -352,6 +363,7 @@ impl Permission {
             Permission::RobrixPreferences => "Know display settings like view mode, zoom and theme so the app can match Robrix.",
             Permission::RobrixObserve => "Be told which room or screen you switch to.",
             Permission::AppGeneration => "Run the AI app-builder here. It spends your provider's usage and installs a new sandboxed app into this room.",
+            Permission::McpTools => "Register tools the AI in this room can call. The app's tool name and full description are shown for your review before they reach the AI.",
         }
     }
 }
@@ -457,6 +469,23 @@ pub struct PermissionStore {
     /// the durable allowlist so "once" cannot become forever.
     #[serde(skip)]
     net_once: std::collections::HashSet<(String, String)>,
+    /// Per-tool grants for the `mcp-tools` group, keyed by subject (an
+    /// installed app's id for registration, an AI room's agent key for
+    /// invocation) then the namespaced tool name. The value is the content
+    /// hash of the app-authored (description, args) at grant time, so a
+    /// changed description no longer matches and the user is asked again;
+    /// invocation grants store an empty string (the description gate already
+    /// ran at registration).
+    #[serde(default)]
+    tool_grants: BTreeMap<String, BTreeMap<String, String>>,
+    /// Session-only "Allow Once" tool grants, never persisted.
+    #[serde(skip)]
+    tool_once: std::collections::HashSet<(String, String)>,
+    /// Session-only tool denials (a "Don't Allow" on one registration or
+    /// invocation). Not persisted: a fresh session asks again rather than
+    /// silently blocking a tool forever with no UI to clear it.
+    #[serde(skip)]
+    tool_denied: std::collections::HashSet<(String, String)>,
     /// Apps the host stopped for abusing the bridge, and why. Persisted
     /// deliberately: an app that hammered its way to a stop must not get a
     /// clean slate by being restarted, or the escalation means nothing.
@@ -636,6 +665,87 @@ impl PermissionStore {
             .unwrap_or_default()
     }
 
+    /// The content hash the user approved for `subject`'s tool `tool`, if
+    /// any. `None` means never granted (or a session one-time grant exists).
+    pub fn tool_grant(&self, subject: &str, tool: &str) -> Option<&str> {
+        self.tool_grants
+            .get(subject)
+            .and_then(|tools| tools.get(tool))
+            .map(String::as_str)
+    }
+
+    /// Records a durable per-tool grant. `content_hash` is the registration
+    /// description's hash (or `""` for an invocation grant).
+    pub fn allow_tool(&mut self, subject: &str, tool: &str, content_hash: &str) {
+        self.tool_once.remove(&(subject.to_string(), tool.to_string()));
+        self.tool_denied.remove(&(subject.to_string(), tool.to_string()));
+        self.tool_grants
+            .entry(subject.to_string())
+            .or_default()
+            .insert(tool.to_string(), content_hash.to_string());
+    }
+
+    /// Grants one tool for this session only.
+    pub fn allow_tool_once(&mut self, subject: &str, tool: &str) {
+        self.tool_once.insert((subject.to_string(), tool.to_string()));
+    }
+
+    pub fn has_tool_once(&self, subject: &str, tool: &str) -> bool {
+        self.tool_once.contains(&(subject.to_string(), tool.to_string()))
+    }
+
+    /// Refuses one tool for this session only (never persisted).
+    pub fn deny_tool(&mut self, subject: &str, tool: &str) {
+        self.tool_denied.insert((subject.to_string(), tool.to_string()));
+    }
+
+    pub fn is_tool_denied(&self, subject: &str, tool: &str) -> bool {
+        self.tool_denied.contains(&(subject.to_string(), tool.to_string()))
+    }
+
+    /// Every tool `subject` has a durable grant for.
+    pub fn tool_grants(&self, subject: &str) -> Vec<String> {
+        self.tool_grants
+            .get(subject)
+            .map(|tools| tools.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Drops every tool grant and session denial for `subject` (the room's AI
+    /// session ending, an app restart, or an uninstall). Reports whether
+    /// anything changed.
+    pub fn clear_tool_grants_for(&mut self, subject: &str) -> bool {
+        let a = self.tool_grants.remove(subject).is_some();
+        let before = self.tool_once.len() + self.tool_denied.len();
+        self.tool_once.retain(|(s, _)| s != subject);
+        self.tool_denied.retain(|(s, _)| s != subject);
+        a || self.tool_once.len() + self.tool_denied.len() != before
+    }
+
+    /// The per-tool decision for `subject`'s tool. `content` is the
+    /// registration content hash (`Some`) or `None` for an invocation, where
+    /// the description gate already ran at registration. Restricted subjects
+    /// hold nothing. A session one-time grant or an unchanged durable grant
+    /// is `Granted`; otherwise the caller prompts.
+    pub fn tool_effective(&self, subject: &str, tool: &str, content: Option<&str>) -> Effective {
+        if self.is_restricted(subject) {
+            return Effective::Denied;
+        }
+        if self.is_tool_denied(subject, tool) {
+            return Effective::Denied;
+        }
+        if self.has_tool_once(subject, tool) {
+            return Effective::Granted;
+        }
+        match self.tool_grant(subject, tool) {
+            // A changed description is new text entering the model's context,
+            // so it must be reviewed again even though the tool name is the
+            // same.
+            Some(hash) if content.is_none_or(|c| c == hash) => Effective::Granted,
+            _ => Effective::NeedsPrompt,
+        }
+    }
+
     /// Grants a capability until `until_unix` (the sheet's "Allow for 1 hour").
     pub fn grant_until(&mut self, app_id: &str, perm: Permission, until_unix: u64) {
         self.once.remove(&(app_id.to_string(), perm));
@@ -695,6 +805,9 @@ impl PermissionStore {
         self.cap_overrides.clear();
         self.until.clear();
         self.once.clear();
+        self.tool_grants.clear();
+        self.tool_once.clear();
+        self.tool_denied.clear();
     }
 
     /// Bars an app from running after it abused the host bridge. This is the
@@ -749,14 +862,18 @@ impl PermissionStore {
     /// Reports whether anything was actually dropped, so callers can skip a
     /// snapshot republish when nothing changed.
     pub fn clear_once_for(&mut self, app_id: &str) -> bool {
-        let before = self.once.len();
+        let before = self.once.len() + self.tool_once.len();
         self.once.retain(|(id, _)| id != app_id);
-        before != self.once.len()
+        // "Allow Once" for a tool dies with its isolate/session too, exactly
+        // like a one-time group grant.
+        self.tool_once.retain(|(id, _)| id != app_id);
+        before != self.once.len() + self.tool_once.len()
     }
 
     /// Forget an app entirely (uninstall). A reinstall starts from Ask.
     pub fn remove_app(&mut self, app_id: &str) {
         self.grants.remove(app_id);
+        self.clear_tool_grants_for(app_id);
         self.cap_overrides.remove(app_id);
         self.until.remove(app_id);
         self.uses.remove(app_id);
@@ -1180,6 +1297,37 @@ mod tests {
         m2.allow_net = false;
         m2.normalize_permissions();
         assert!(m2.allow_net, "declaration backfills the legacy flag");
+    }
+
+    /// `mcp-tools` grants are PER TOOL: a tool the user allowed stays
+    /// allowed, its neighbours still prompt, a changed description (new hash)
+    /// re-prompts, and a session one-time/deny answer is scoped to the tool.
+    #[test]
+    fn tool_grants_are_per_tool_and_content_sensitive() {
+        let mut store = PermissionStore::default();
+        let subject = "board";
+        let play = "app_board_play";
+        let other = "app_board_other";
+        assert_eq!(store.tool_effective(subject, play, Some("h1")), Effective::NeedsPrompt);
+        store.allow_tool(subject, play, "h1");
+        assert_eq!(store.tool_effective(subject, play, Some("h1")), Effective::Granted);
+        // An invocation (no content hash) rides the registration grant.
+        assert_eq!(store.tool_effective(subject, play, None), Effective::Granted);
+        // A changed description is new model-visible text: ask again.
+        assert_eq!(store.tool_effective(subject, play, Some("h2")), Effective::NeedsPrompt);
+        // A different tool is unaffected by the first tool's grant.
+        assert_eq!(store.tool_effective(subject, other, Some("h1")), Effective::NeedsPrompt);
+        // A session one-time grant covers a tool with no durable grant.
+        store.allow_tool_once(subject, other);
+        assert_eq!(store.tool_effective(subject, other, Some("h1")), Effective::Granted);
+        // A session deny wins, even over a one-time allow.
+        store.allow_tool_once(subject, play);
+        store.deny_tool(subject, play);
+        assert_eq!(store.tool_effective(subject, play, Some("h1")), Effective::Denied);
+        // Clearing a subject drops durable grants and session answers alike.
+        assert!(store.clear_tool_grants_for(subject));
+        assert_eq!(store.tool_effective(subject, play, Some("h1")), Effective::NeedsPrompt);
+        assert_eq!(store.tool_effective(subject, other, Some("h1")), Effective::NeedsPrompt);
     }
 
     #[test]

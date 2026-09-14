@@ -31,7 +31,7 @@
 //! messaging, whatever comes next — through the same registry.
 
 use std::io::{BufRead, Read, Write};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use serde_json::{json, Map, Value};
 
@@ -187,9 +187,17 @@ enum Inbound {
 ///
 /// Cheap to clone: the tool set is shared (`Arc`), so a listener can clone a
 /// template per connection and hand each one to its own thread.
+/// The shared, mutable tool set a session's connections serve from.
+///
+/// A [`McpServer`] (and every per-connection clone derived from it) holds one
+/// `Arc` to this, so a tool registered AFTER a connection is up is visible to
+/// that connection's next `tools/list`. That sharing is what makes dynamic
+/// registration real rather than a snapshot frozen at bind time.
+pub type ToolRegistry = Arc<RwLock<Vec<Arc<dyn Tool>>>>;
+
 #[derive(Clone)]
 pub struct McpServer {
-    tools: Vec<Arc<dyn Tool>>,
+    tools: ToolRegistry,
 }
 
 impl McpServer {
@@ -197,20 +205,52 @@ impl McpServer {
     /// after) the connection starts — `tools/list` reflects whatever is
     /// registered when it arrives.
     pub fn new() -> Self {
-        Self { tools: Vec::new() }
+        Self { tools: Arc::new(RwLock::new(Vec::new())) }
     }
 
     /// Adds one tool to the registry. Adding a host tool is this call plus the
     /// [`Tool`] implementation; nothing else in Robrix or the protocol layer
-    /// changes.
-    pub fn add_tool(&mut self, tool: impl Tool + 'static) {
-        self.tools.push(Arc::from(tool));
+    /// changes. Takes `&self` because the registry is shared behind a lock:
+    /// a tool may be added to a live server while connections are serving.
+    pub fn add_tool(&self, tool: impl Tool + 'static) {
+        self.add_tool_arc(Arc::from(tool));
     }
 
-    /// The registered tools, in registration order — what `tools/list` will
-    /// advertise.
-    pub fn tools(&self) -> impl Iterator<Item = &dyn Tool> {
-        self.tools.iter().map(|t| t.as_ref())
+    /// The `Arc`-taking form, for a tool built once and shared (a dynamically
+    /// registered mini-app tool, say).
+    pub fn add_tool_arc(&self, tool: Arc<dyn Tool>) {
+        if let Ok(mut tools) = self.tools.write() {
+            tools.push(tool);
+        }
+    }
+
+    /// Removes the tool named `name`, returning whether one was removed — the
+    /// dynamic counterpart to [`Self::add_tool`].
+    pub fn remove_tool(&self, name: &str) -> bool {
+        let Ok(mut tools) = self.tools.write() else { return false };
+        let before = tools.len();
+        tools.retain(|t| t.name() != name);
+        tools.len() != before
+    }
+
+    /// Whether a tool named `name` is registered.
+    pub fn has_tool(&self, name: &str) -> bool {
+        self.tools
+            .read()
+            .map(|tools| tools.iter().any(|t| t.name() == name))
+            .unwrap_or(false)
+    }
+
+    /// A snapshot of the registered tools, in registration order — what
+    /// `tools/list` advertises and what a registry owner iterates to prune.
+    pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.tools.read().map(|tools| tools.clone()).unwrap_or_default()
+    }
+
+    /// The shared registry handle, so the process that owns the session can
+    /// add and remove tools on a live server.
+    pub fn registry(&self) -> ToolRegistry {
+        self.tools.clone()
     }
 
     /// Handles one inbound frame (a single line, newline already stripped) and
@@ -273,10 +313,12 @@ impl McpServer {
         Ok(json!({
             "protocolVersion": version,
             "capabilities": {
-                // Tools are the whole surface. `listChanged: false` promises
-                // no `notifications/tools/list_changed` — the tool set is
-                // static for the life of a session.
-                "tools": {"listChanged": false},
+                // Tools are the whole surface, and the set CAN change during a
+                // session: a mini-app registers one at runtime, so we promise
+                // `notifications/tools/list_changed` and emit it whenever the
+                // registry gains or loses a tool. A client that ignores the
+                // capability still catches up on its next `tools/list`.
+                "tools": {"listChanged": true},
             },
             "serverInfo": {
                 "name": SERVER_NAME,
@@ -287,7 +329,7 @@ impl McpServer {
 
     fn list_tools(&self) -> Result<Value, McpError> {
         let tools: Vec<Value> = self
-            .tools
+            .tools()
             .iter()
             .map(|tool| {
                 json!({
@@ -310,8 +352,8 @@ impl McpServer {
             .and_then(Value::as_str)
             .ok_or_else(|| McpError::invalid_params("tools/call needs a `name`"))?;
         let tool = self
-            .tools
-            .iter()
+            .tools()
+            .into_iter()
             .find(|tool| tool.name() == name)
             .ok_or_else(|| McpError::invalid_params(format!("unknown tool `{name}`")))?;
         // `arguments` is optional and must be an object; anything else is a
@@ -348,6 +390,17 @@ impl Default for McpServer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The server-initiated notification a connected client needs in order to
+/// refresh its cached tool list after a runtime registration or removal. It is
+/// a notification (no `id`), so the server sends it without expecting a reply.
+pub fn tools_list_changed_notification() -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/tools/list_changed",
+    })
+    .to_string()
 }
 
 /// Splits a raw JSON-RPC value into what the server should do with it.
@@ -451,7 +504,7 @@ mod tests {
     }
 
     fn server() -> McpServer {
-        let mut server = McpServer::new();
+        let server = McpServer::new();
         server.add_tool(EchoTool);
         server.add_tool(FailingTool);
         server
@@ -493,7 +546,7 @@ mod tests {
         let result = result.unwrap();
         assert_eq!(result["protocolVersion"], "2025-11-25");
         assert_eq!(result["serverInfo"]["name"], SERVER_NAME);
-        assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
+        assert_eq!(result["capabilities"]["tools"]["listChanged"], true);
 
         // An older client's version is echoed back, not bumped.
         let replies = server.handle_frame(
@@ -550,6 +603,49 @@ mod tests {
         let result = result.unwrap();
         assert_eq!(result["isError"], false);
         assert_eq!(result["content"][0]["text"], "hi there");
+    }
+
+    /// The registry is shared and mutable after a connection exists: a tool
+    /// added to one clone shows up on every other clone's `tools/list`, a
+    /// removal drops it, and `tools_list_changed_notification` is the exact
+    /// notification the server pushes so a client refreshes its cache.
+    #[test]
+    fn the_registry_is_shared_and_dynamically_mutable() {
+        let server = server();
+        // A second handle (what `accept_loop` clones per connection) sees the
+        // same registry, not a frozen copy.
+        let connection = server.clone();
+
+        let names = |s: &McpServer| -> Vec<String> {
+            let replies = s.handle_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+            );
+            let (_, result) = reply_of(&replies[0]);
+            result.unwrap()["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(names(&connection), vec!["echo", "boom"]);
+
+        // Register after the "connection" was made. A fresh-built tool is
+        // shared as an `Arc` through the lock.
+        server.add_tool_arc(Arc::new(EchoTool));
+        assert!(server.has_tool("echo"));
+        assert_eq!(names(&connection).len(), 3);
+
+        // Removal is visible through the same handle.
+        assert!(server.remove_tool("boom"));
+        assert!(!server.has_tool("boom"));
+        assert_eq!(names(&connection), vec!["echo", "echo"]);
+        assert!(!server.remove_tool("never-there"));
+
+        // The notification is a no-id server->client frame.
+        let note: Value = serde_json::from_str(&tools_list_changed_notification()).unwrap();
+        assert_eq!(note["method"], "notifications/tools/list_changed");
+        assert!(note.get("id").is_none());
     }
 
     /// A tool that fails reports through isError (model-visible), not as a

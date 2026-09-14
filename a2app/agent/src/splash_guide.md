@@ -303,6 +303,7 @@ and scope (this room, account, device, app-local). Available today:
 | clipboard-read | `device.clipboard.read` | read · device |
 | clipboard-write | `device.clipboard.write` | write · device |
 | ipc | `ipc.send` (write), `ipc.apps.list` (read), `on_ipc_message` (Robrix→app hook) | app-local |
+| mcp-tools | `mcp.tools.register` (write), `mcp.tools.unregister` (write), `on_tool_call` (Robrix→app hook) | app-local · high risk |
 | open-url | `device.url.open` | write · device |
 | share | `device.share` | write · device |
 | files | `device.files.pick` (read), `device.files.save` (write) | device |
@@ -328,6 +329,58 @@ Ungated plumbing every app has: `host.env.read` (`"env"`),
 `events.unsubscribe`, `ui.pane.read`, `ui.pane.close`, `storage.quota`,
 and the hooks `on_permissions_changed(caps)`, `on_app_resize(w, h)`,
 `on_focus_changed(json)`, `on_surface_changed(json)`; see "Your own pane".
+
+## Letting the AI call your app (MCP tools)
+
+An app attached to a room whose AI is on can register tools the AI calls.
+This is how the model ACTS on your app: it invokes a tool, your handler runs,
+and the value you return goes back to the model. Registering a tool puts its
+name AND description in front of the model, so the user reviews that exact
+text first and is asked again if it changes. Declare the group:
+
+```splash
+// permissions: mcp-tools
+// why-mcp-tools: Lets the AI in this room read the board and play its moves.
+```
+
+Register and withdraw tools with `host.request`:
+
+- `"mcp.tools.register"`: `{name, description, args}` -> `{tool}`.
+  `args` is an array of flat `{name, type, description}` objects; `type` is
+  one of `string`, `integer`, `number`, `boolean`, `array`, `object`. The
+  model sees the name as `app_<your app id>_<name>`, so it can never shadow a
+  built-in tool or another app's.
+- `"mcp.tools.unregister"`: `{name}` -> `{}`.
+
+The AI's call arrives as a top-level hook carrying BOTH the model-facing name
+(`tool`) and your own name (`name`), so route on `name`:
+
+```splash
+fn on_tool_call(json){
+    let ev = json.parse_json()            // {call_id, tool, name, arguments}
+    if ev.name == "ttt_play" {
+        // ... validate ev.arguments.cell, update the UI ...
+        host.request("mcp.tools.result",
+            {call_id: ev.call_id, ok: true, result: state.to_json()}, on_result)
+        return nil
+    }
+    host.request("mcp.tools.result",
+        {call_id: ev.call_id, ok: false, result: "unknown tool"}, on_result)
+}
+fn on_result(r){ if !r.is_ok { ui.note.set_text(r.error) } }
+```
+
+Rules:
+- Answer EVERY call exactly once with `"mcp.tools.result"`
+  `{call_id, ok, result}`; `result` becomes the text the model reads (a JSON
+  string is ideal). The model waits up to ~20 seconds, so answer promptly.
+- Register on boot and again from `on_permissions_changed`; a refusal is
+  `r.is_ok == false` with the reason. If the user denies, tell them in the app
+  and keep working — never assume the AI can call.
+- At most 16 tools; names may use letters, digits, `_` and `-`; descriptions
+  may be up to 1200 characters.
+- `mcp.tools.result` is ungated plumbing; only `mcp-tools` (registration and
+  invocation) is prompted.
 
 ## Live room updates (Robrix -> app hooks)
 

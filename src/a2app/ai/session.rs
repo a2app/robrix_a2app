@@ -39,9 +39,10 @@ use a2app_agent::mcp::SERVER_NAME;
 use a2app_agent::mcp::{McpServer, McpServerConfig};
 use makepad_widgets::log;
 use matrix_sdk::ruma::OwnedRoomId;
+use serde_json::{Map, Value};
 
 use super::server::ToolServer;
-use super::tools::{AiHost, ReadToolKind, register_session_tools};
+use super::tools::{AiHost, MiniAppTool, MiniAppToolBridge, ReadToolKind, register_session_tools};
 
 /// A tool call that arrived on a session's MCP serve thread, waiting for the
 /// UI thread to execute it. Each variant carries the channel the answer goes
@@ -79,6 +80,15 @@ pub enum SessionJob {
         tool: String,
         host: String,
         url: String,
+        answer: Sender<Result<String, String>>,
+    },
+    /// A tool a mini-app registered was called by the model. The runtime
+    /// delivers `on_tool_call` to the owning isolate and answers here when the
+    /// app replies `mcp.tools.result` (or the bounded wait times out), so the
+    /// serve thread that called the tool unblocks either way.
+    InvokeMiniAppTool {
+        tool: String,
+        arguments: Map<String, Value>,
         answer: Sender<Result<String, String>>,
     },
 }
@@ -144,6 +154,25 @@ impl AiHost for SessionHost {
         answer_rx
             .recv()
             .map_err(|_| "this session ended before the read completed".to_string())?
+    }
+}
+
+/// The real bridge for app-registered tools: hand the invocation to the UI
+/// thread and block on the app's answer. Same rendezvous as [`AiHost`], so the
+/// serve thread parks while the app (and, if it chooses, the user) works.
+impl MiniAppToolBridge for SessionHost {
+    fn invoke(&self, tool: &str, arguments: &Map<String, Value>) -> Result<String, String> {
+        let (answer_tx, answer_rx) = channel();
+        self.jobs
+            .send(SessionJob::InvokeMiniAppTool {
+                tool: tool.to_string(),
+                arguments: arguments.clone(),
+                answer: answer_tx,
+            })
+            .map_err(|_| "this session's UI thread is gone".to_string())?;
+        answer_rx
+            .recv()
+            .map_err(|_| "this session ended before the app answered".to_string())?
     }
 }
 
@@ -247,9 +276,13 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 pub struct AiSession {
     room_id: OwnedRoomId,
     transport: Box<dyn AgentTransport>,
-    /// Kept for its drop: closes the socket and live connections. The tools
-    /// on it answer through `jobs` below, so nothing here needs reading.
-    _server: ToolServer,
+    /// The live tool server: owns the socket and the shared, mutable registry
+    /// that mini-app tools are added to and removed from. Dropping it closes
+    /// the socket and live connections.
+    server: ToolServer,
+    /// The bridge an app-registered tool uses to reach its isolate; a clone of
+    /// the same [`SessionHost`] the built-in tools use.
+    mini_app_bridge: Arc<dyn MiniAppToolBridge>,
     /// Tool calls from the server's serve threads, drained by the runtime.
     jobs: Receiver<SessionJob>,
     /// True once the agent reported `SessionReady`.
@@ -302,6 +335,9 @@ impl AiSession {
         register_session_tools(&mut template, host.clone() as Arc<dyn AiHost>);
         let server = ToolServer::bind(template)?;
         server.start()?;
+        // `host` is also the bridge an app tool calls through; keep an
+        // `Arc<dyn MiniAppToolBridge>` view of the same object.
+        let mini_app_bridge: Arc<dyn MiniAppToolBridge> = host.clone();
 
         // A dedicated workspace per session: the agent's tools are rooted at
         // its cwd, and a chat session lives far longer than a generation, so
@@ -352,7 +388,8 @@ impl AiSession {
         Ok(Self {
             room_id,
             transport,
-            _server: server,
+            server,
+            mini_app_bridge,
             jobs: jobs_rx,
             ready: false,
             busy: false,
@@ -369,6 +406,36 @@ impl AiSession {
     /// The room this session chats in.
     pub fn room_id(&self) -> &OwnedRoomId {
         &self.room_id
+    }
+
+    /// Installs (or replaces) a mini-app's reviewed tool on this session's
+    /// live MCP server and pushes `notifications/tools/list_changed`, so the
+    /// connected agent refreshes its tool list without a new session.
+    ///
+    /// Replacing is deliberate: a re-registration after a changed description
+    /// was re-reviewed must update what the model sees, and a re-install after
+    /// a session restart must refresh the same name. Cross-instance shadowing
+    /// is refused by the runtime before this is reached.
+    pub fn register_miniapp_tool(
+        &self,
+        full_name: String,
+        description: String,
+        schema: Value,
+    ) -> Result<(), String> {
+        self.server.remove_tool(&full_name);
+        let tool = MiniAppTool::new(full_name, description, schema, self.mini_app_bridge.clone());
+        self.server.add_tool(Arc::new(tool));
+        Ok(())
+    }
+
+    /// Withdraws one mini-app tool and notifies the connected agents.
+    pub fn unregister_miniapp_tool(&self, full_name: &str) -> bool {
+        self.server.remove_tool(full_name)
+    }
+
+    /// Whether a tool name is already taken on this session.
+    pub fn has_tool(&self, full_name: &str) -> bool {
+        self.server.has_tool(full_name)
     }
 
     /// Whether the agent finished its handshake and can take a prompt.

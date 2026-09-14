@@ -22,7 +22,10 @@ use a2app_core::permissions::{
     Effective, GrantState, Permission, PermissionStore, agent_room_of, agent_subject, is_agent_subject,
 };
 use a2app_core::persistence::{self, A2AppPersistedState};
-use a2app_core::services::{self, Broker, BrokerAsk, BrokerCtx, HostAction, HostQuery, Reply, MATRIX_WRITE_OFF_MSG};
+use a2app_core::services::{
+    self, AppToolRequest, Broker, BrokerAsk, BrokerCtx, HostAction, HostQuery, Reply,
+    MATRIX_WRITE_OFF_MSG,
+};
 use a2app_core::versions::{self, VersionOrigin};
 use a2app_agent::intent::Intent;
 use a2app_agent::pipeline::{GenOutcome, Generation};
@@ -30,7 +33,7 @@ use a2app_agent::prefs::AgentPrefs;
 
 use crate::a2app::host_pane::{MiniAppHostPaneAction, MiniAppHostPaneWidgetRefExt};
 use crate::a2app::permission_prompt::{
-    MiniAppPermissionPromptWidgetRefExt, PermissionPromptAction, PromptInfo,
+    MiniAppPermissionPromptWidgetRefExt, PermissionPromptAction, PromptInfo, ToolPreview,
 };
 use crate::a2app::dock::{DockCmd, PaneOp};
 use crate::a2app::instances::{self, MiniAppInstanceAction, Surface};
@@ -101,6 +104,51 @@ type AiReadPending = (OwnedRoomId, ReadToolKind, Sender<Result<String, String>>)
 /// [`AiRoomAction::PostToRoomResult`] lands.
 type AiPostPending = (OwnedRoomId, Sender<Result<String, String>>);
 
+/// Next id for an app-tool invocation: the runtime-generated `call_id` handed
+/// to the isolate in `on_tool_call`, which the app echoes back with its
+/// `mcp.tools.result` so the exact waiting serve thread can be answered.
+#[cfg(unix)]
+static NEXT_APP_TOOL_CALL_ID: AtomicU64 = AtomicU64::new(1);
+
+/// How long an app-tool invocation waits for the app's `mcp.tools.result`
+/// before the model is told it timed out. Comfortably under octos's 60s
+/// `tools/call` cancel, and long enough for a user to click something.
+#[cfg(unix)]
+const APP_TOOL_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A mini-app tool installed on one room's agent session: where to route an
+/// invocation and what to withdraw if the owning instance goes away.
+#[cfg(unix)]
+pub struct AppToolRegistration {
+    /// The namespaced name the model sees (also the map key).
+    pub full_name: String,
+    /// The app's own chosen name, so `on_tool_call` can route without knowing
+    /// the runtime-assigned namespace prefix.
+    pub raw_name: String,
+    /// The room whose session serves the tool.
+    pub room_id: OwnedRoomId,
+    pub app_id: MiniAppId,
+    /// The isolate that registered it (an app may have several instances).
+    pub heap_key: usize,
+    /// The app-authored description and args, kept for the invocation prompt.
+    pub description: String,
+    /// The validated JSON Schema, so a restarted session can re-install the
+    /// tool without re-review.
+    pub schema: serde_json::Value,
+    pub args: Vec<(String, String, String)>,
+}
+
+/// One app-tool invocation waiting on the app's `mcp.tools.result`, keyed by
+/// the `call_id` the runtime gave the isolate.
+#[cfg(unix)]
+pub struct AppToolPending {
+    pub room_id: OwnedRoomId,
+    pub app_id: MiniAppId,
+    pub full_name: String,
+    pub answer: Sender<Result<String, String>>,
+    pub since: Instant,
+}
+
 thread_local! {
     static A2APP: RefCell<Option<A2AppState>> = const { RefCell::new(None) };
 }
@@ -149,6 +197,19 @@ pub enum ParkedRequest {
     },
 }
 
+/// The exact tool an `mcp-tools` prompt is about: the app-authored text the
+/// modal shows the user, and what the answer records as a per-tool grant.
+#[derive(Clone, Debug)]
+pub struct PromptToolGrant {
+    pub full_name: String,
+    pub name: String,
+    /// The app-authored description, verbatim — exactly what the model sees.
+    pub description: String,
+    pub args: Vec<(String, String, String)>,
+    /// Registration content hash (empty for an invocation grant).
+    pub content_hash: String,
+}
+
 /// A runtime permission prompt waiting for (or showing to) the user.
 pub struct PermissionPrompt {
     /// The permission-store subject the answer is recorded for: an installed
@@ -160,6 +221,8 @@ pub struct PermissionPrompt {
     /// Requests parked behind this prompt; replayed or refused once the user
     /// answers.
     pub parked: Vec<ParkedRequest>,
+    /// For an `mcp-tools` prompt: the tool under review.
+    pub tool: Option<PromptToolGrant>,
 }
 
 /// The state of the AI generation console shown in the Mini Apps screen.
@@ -292,6 +355,14 @@ pub struct A2AppState {
     /// [`AiRoomAction::PostToRoomResult`] lands.
     #[cfg(unix)]
     pub ai_posts: HashMap<u64, AiPostPending>,
+    /// Live mini-app tools on each room's agent session, by the namespaced
+    /// name the model sees. What routes an incoming `tools/call` back to the
+    /// owning isolate, and what teardown prunes.
+    #[cfg(unix)]
+    pub app_tools: HashMap<String, AppToolRegistration>,
+    /// App-tool invocations waiting on the app's answer, by call id.
+    #[cfg(unix)]
+    pub app_tool_calls: HashMap<u64, AppToolPending>,
     perms_dirty: bool,
     registry_dirty: bool,
     last_persist: Instant,
@@ -373,6 +444,10 @@ pub fn init() {
             ai_reads: HashMap::new(),
             #[cfg(unix)]
             ai_posts: HashMap::new(),
+            #[cfg(unix)]
+            app_tools: HashMap::new(),
+            #[cfg(unix)]
+            app_tool_calls: HashMap::new(),
             perms_dirty: false,
             registry_dirty: false,
             last_persist: Instant::now(),
@@ -1508,8 +1583,15 @@ fn process_broker(cx: &mut Cx, ui: &WidgetRef) {
 
 fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
     match ask {
-        BrokerAsk::Prompt { app_id, perm, request } => {
-            queue_permission_prompt(cx, ui, app_id, perm, ParkedRequest::Bridge(request));
+        BrokerAsk::Prompt { app_id, perm, request, tool } => {
+            let grant = tool.map(|t| PromptToolGrant {
+                full_name: t.full_name,
+                name: t.name,
+                description: t.description,
+                args: t.args,
+                content_hash: t.content_hash,
+            });
+            queue_permission_prompt(cx, ui, app_id, perm, ParkedRequest::Bridge(request), grant);
         }
         BrokerAsk::Notify { app_id, summary } => {
             let name = with_a2app(|state| {
@@ -1614,7 +1696,165 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
                 apply_op(cx, ui, A2AppOp::CloseHostPane);
             }
         }
+        #[cfg(unix)]
+        BrokerAsk::McpRegisterTool { reply, request } => {
+            register_app_tool(cx, reply, request);
+        }
+        #[cfg(unix)]
+        BrokerAsk::McpUnregisterTool { reply, app_id, heap_key, full_name } => {
+            unregister_app_tool(cx, reply, &app_id, heap_key, &full_name);
+        }
+        #[cfg(unix)]
+        BrokerAsk::McpToolResult { reply, app_id, call_id, ok, text } => {
+            complete_app_tool_call(cx, reply, &app_id, call_id, ok, &text);
+        }
+        // AI sessions are Unix-only today, so the tool bridge is too. The
+        // broker still constructs these asks on other platforms, so answer
+        // them rather than fail to compile.
+        #[cfg(not(unix))]
+        BrokerAsk::McpRegisterTool { reply, .. }
+        | BrokerAsk::McpUnregisterTool { reply, .. }
+        | BrokerAsk::McpToolResult { reply, .. } => {
+            services::respond(cx, reply, Err("AI tools are not available on this platform"));
+        }
     }
+}
+
+/// Installs a reviewed mini-app tool on the room's live agent session, then
+/// answers the app with the namespaced name the model will see. A room with
+/// no live session has nothing to register onto, so the app is told to retry.
+#[cfg(unix)]
+fn register_app_tool(cx: &mut Cx, reply: Reply, request: AppToolRequest) {
+    let Some(room_id) = request
+        .room
+        .as_deref()
+        .and_then(|r| OwnedRoomId::try_from(r).ok())
+    else {
+        return services::respond(
+            cx,
+            reply,
+            Err("this app is not attached to a room with an AI session"),
+        );
+    };
+    let result = with_a2app(|state| {
+        // A name already owned by another instance is a shadowing attempt.
+        // The SAME instance may re-register (a change was re-reviewed, or it
+        // is retrying from `on_permissions_changed`), which replaces in place.
+        match state.app_tools.get(&request.full_name) {
+            Some(existing) if existing.heap_key != request.heap_key => {
+                return Err(String::from("a tool with that name is already registered"));
+            }
+            Some(_) => {}
+            None => {
+                let already = state
+                    .app_tools
+                    .values()
+                    .filter(|reg| reg.heap_key == request.heap_key)
+                    .count();
+                if already >= a2app_core::services::MAX_APP_TOOLS_PER_INSTANCE {
+                    return Err(String::from("this app has registered too many AI tools"));
+                }
+            }
+        }
+        if !state.ai_sessions.contains_key(&room_id) {
+            return Err(String::from("this room has no live AI session right now"));
+        }
+        {
+            let session = state.ai_sessions.get(&room_id).expect("checked above");
+            session.register_miniapp_tool(
+                request.full_name.clone(),
+                request.description.clone(),
+                request.schema.clone(),
+            )?;
+        }
+        state.app_tools.insert(
+            request.full_name.clone(),
+            AppToolRegistration {
+                full_name: request.full_name.clone(),
+                raw_name: request.name.clone(),
+                room_id: room_id.clone(),
+                app_id: request.app_id.clone(),
+                heap_key: request.heap_key,
+                description: request.description.clone(),
+                schema: request.schema.clone(),
+                args: request.args.clone(),
+            },
+        );
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(String::from("app state unavailable")));
+    match result {
+        Ok(()) => services::respond(
+            cx,
+            reply,
+            Ok(&serde_json::json!({ "tool": request.full_name }).to_string()),
+        ),
+        Err(e) => services::respond(cx, reply, Err(&e)),
+    }
+}
+
+/// Withdraws one tool, but only for the instance that registered it.
+#[cfg(unix)]
+fn unregister_app_tool(
+    cx: &mut Cx,
+    reply: Reply,
+    app_id: &str,
+    heap_key: usize,
+    full_name: &str,
+) {
+    let removed = with_a2app(|state| {
+        let owner = state
+            .app_tools
+            .get(full_name)
+            .map(|reg| (reg.heap_key, reg.app_id.clone(), reg.room_id.clone()));
+        match owner {
+            Some((reg_heap, reg_app, room)) if reg_heap == heap_key && reg_app == app_id => {
+                state.app_tools.remove(full_name);
+                if let Some(session) = state.ai_sessions.get(&room) {
+                    session.unregister_miniapp_tool(full_name);
+                }
+                true
+            }
+            _ => false,
+        }
+    })
+    .unwrap_or(false);
+    if removed {
+        services::respond(cx, reply, Ok("{}"));
+    } else {
+        services::respond(cx, reply, Err("no such tool registered by this app"));
+    }
+}
+
+/// Hands an app's answer to the serve thread parked on the call, and mirrors
+/// the outcome on the model-facing turn card. A call id the app never got (or
+/// one already swept by the timeout) is refused rather than misrouted.
+#[cfg(unix)]
+fn complete_app_tool_call(
+    cx: &mut Cx,
+    reply: Reply,
+    app_id: &str,
+    call_id: u64,
+    ok: bool,
+    text: &str,
+) {
+    let pending = with_a2app(|state| match state.app_tool_calls.get(&call_id) {
+        Some(p) if p.app_id == app_id => state.app_tool_calls.remove(&call_id),
+        _ => None,
+    })
+    .flatten();
+    let Some(pending) = pending else {
+        return services::respond(cx, reply, Err("no matching tool call for this app"));
+    };
+    let summary: String = text.chars().take(200).collect();
+    let detail = finish_ai_tool_call(&pending.room_id, &pending.full_name, ok, &summary);
+    push_ai_tool_receipt(&pending.room_id, &pending.full_name, detail, ok, &summary);
+    let _ = if ok {
+        pending.answer.send(Ok(text.to_string()))
+    } else {
+        pending.answer.send(Err(text.to_string()))
+    };
+    services::respond(cx, reply, Ok("{}"));
 }
 
 /// Applies one nav.* / composer.* call. Global moves happen right here;
@@ -1879,6 +2119,7 @@ fn queue_permission_prompt(
     subject: String,
     perm: Permission,
     parked: ParkedRequest,
+    tool: Option<PromptToolGrant>,
 ) {
     with_a2app(|state| {
         // "Not Now" this session: refuse without re-asking, so a looping
@@ -1889,13 +2130,15 @@ fn queue_permission_prompt(
             return;
         }
         // Merge into an already-active or queued prompt for the same pair.
-        // Network prompts are per HOST: two different hosts must never share a
-        // prompt, or one answer would decide for both.
+        // Network prompts are per HOST and tool prompts per TOOL: two
+        // different hosts/tools must never share a prompt, or one answer
+        // would decide for both.
         let new_host = match &parked {
             #[cfg(unix)]
             ParkedRequest::NetworkAccess { host, .. } => Some(host.clone()),
             _ => None,
         };
+        let new_tool = tool.as_ref().map(|t| t.full_name.clone());
         let same = |p: &PermissionPrompt| {
             if p.subject != subject || p.perm != perm {
                 return false;
@@ -1905,7 +2148,8 @@ fn queue_permission_prompt(
                 ParkedRequest::NetworkAccess { host, .. } => Some(host.clone()),
                 _ => None,
             });
-            existing_host == new_host
+            let existing_tool = p.tool.as_ref().map(|t| t.full_name.clone());
+            existing_host == new_host && existing_tool == new_tool
         };
         if let Some(active) = state.active_prompt.as_mut().filter(|p| same(p)) {
             active.parked.push(parked);
@@ -1919,6 +2163,7 @@ fn queue_permission_prompt(
             subject,
             perm,
             parked: vec![parked],
+            tool,
         });
     });
     show_next_permission_prompt(cx, ui);
@@ -1926,15 +2171,17 @@ fn queue_permission_prompt(
 
 /// The tool name an AI session job maps to (the name the model called).
 #[cfg(unix)]
-fn ai_job_tool_name(job: &SessionJob) -> &'static str {
+fn ai_job_tool_name(job: &SessionJob) -> String {
     match job {
-        SessionJob::ReadTool { kind, .. } => read_tool_name(kind),
-        SessionJob::LaunchSplashApp { .. } => "launch_splash_app",
-        SessionJob::SendRoomMessage { .. } => "send_message",
-        SessionJob::PostRoomMessage { .. } => "post_room_message",
+        SessionJob::ReadTool { kind, .. } => read_tool_name(kind).to_string(),
+        SessionJob::LaunchSplashApp { .. } => String::from("launch_splash_app"),
+        SessionJob::SendRoomMessage { .. } => String::from("send_message"),
+        SessionJob::PostRoomMessage { .. } => String::from("post_room_message"),
         // Not a tool call: the agent's web tool is already shown by its ACP
         // events; this job only asks whether a host may be reached.
-        SessionJob::NetworkAccess { .. } => "network_access",
+        SessionJob::NetworkAccess { .. } => String::from("network_access"),
+        // A tool a mini-app registered; its name is already namespaced.
+        SessionJob::InvokeMiniAppTool { tool, .. } => tool.clone(),
     }
 }
 
@@ -1970,6 +2217,8 @@ fn session_job_detail(rooms: Option<&RoomsListRef>, job: &SessionJob) -> Option<
         // and the turn card is reposted with that name; this job carries only
         // the host the user is being asked about.
         SessionJob::NetworkAccess { .. } => None,
+        // The tool name already names it; no extra target to add.
+        SessionJob::InvokeMiniAppTool { .. } => None,
     }
 }
 
@@ -2028,7 +2277,7 @@ fn refuse_parked_request(cx: &mut Cx, perm: Permission, parked: ParkedRequest) {
             // (with a receipt, so the user sees the AI was stopped from it —
             // and its live tool row rewritten Done).
             let reason = ai_tool_refused_text(perm);
-            note_ai_tool_call(&room_id, ai_job_tool_name(&job), false, &reason);
+            note_ai_tool_call(&room_id, &ai_job_tool_name(&job), false, &reason);
             answer_session_job(job, Err(reason));
         }
         #[cfg(unix)]
@@ -2053,7 +2302,14 @@ fn show_next_permission_prompt(cx: &mut Cx, ui: &WidgetRef) {
             return None;
         }
         let prompt = state.prompts.pop_front()?;
-        let info = prompt_info_for(state, rooms.as_ref(), &prompt.subject, prompt.perm, &prompt.parked);
+        let info = prompt_info_for(
+            state,
+            rooms.as_ref(),
+            &prompt.subject,
+            prompt.perm,
+            &prompt.parked,
+            prompt.tool.as_ref(),
+        );
         state.active_prompt = Some(prompt);
         Some(info)
     })
@@ -2106,10 +2362,15 @@ fn ai_prompt_action(
                 // A network-access job never reaches this arm (it parks as
                 // `ParkedRequest::NetworkAccess` and is handled above).
                 SessionJob::NetworkAccess { .. } => continue,
+                // An app-tool invocation names its tool directly.
+                SessionJob::InvokeMiniAppTool { tool, .. } => {
+                    format!("use the mini-app tool \"{tool}\"")
+                }
             };
         }
     }
     match perm {
+        Permission::McpTools => String::from("use a tool a mini-app registered"),
         Permission::Network => String::from("connect to the internet"),
         Permission::MatrixRoomRead => String::from("read messages in this room"),
         Permission::MatrixRoomInfo => String::from("see this room's details"),
@@ -2162,10 +2423,18 @@ fn ai_prompt_reason(
                 SessionJob::SendRoomMessage { .. } => continue,
                 // A network-access job never reaches this arm (handled above).
                 SessionJob::NetworkAccess { .. } => continue,
+                SessionJob::InvokeMiniAppTool { tool, .. } => format!(
+                    "You allowed this app to register \"{tool}\". The description you reviewed is \
+                     the text the model sees; the app's answer is returned to the model."
+                ),
             };
         }
     }
     match perm {
+        Permission::McpTools => String::from(
+            "The AI wants to call a tool this mini-app registered. Its description was shown \
+             when you allowed it; allowing here lets the model invoke it.",
+        ),
         Permission::Network => String::from("It needs to fetch something from the internet."),
         Permission::MatrixRoomRead => String::from("It is catching up on this conversation to answer you."),
         Permission::MatrixRoomInfo => String::from("It wants to know which room it is in."),
@@ -2186,7 +2455,13 @@ fn prompt_info_for(
     subject: &str,
     perm: Permission,
     parked: &[ParkedRequest],
+    tool: Option<&PromptToolGrant>,
 ) -> PromptInfo {
+    let tool_preview = tool.map(|t| ToolPreview {
+        name: t.name.clone(),
+        description: t.description.clone(),
+        args: t.args.clone(),
+    });
     if let Some(room) = agent_room_of(subject) {
         let room_name = rooms
             .and_then(|r| room_display_name(r, room))
@@ -2198,32 +2473,41 @@ fn prompt_info_for(
             reason: Some(ai_prompt_reason(rooms, perm, parked)),
             capability: Some(ai_prompt_action(rooms, perm, parked)),
             agent: true,
+            tool: tool_preview,
         };
     }
     let (app_name, app_icon, reason) = state.registry.get(subject)
         .map(|m| (m.name.clone(), m.icon.clone(), m.reason_for(perm).map(str::to_string)))
         .unwrap_or_else(|| (subject.to_string(), String::new(), None));
     // Name the exact ability that asked, not just its group; a parked
-    // subscribe names the hook it is for.
-    let capability = parked.iter().find_map(|p| match p {
-        ParkedRequest::Bridge(request) => {
-            let Some(request) = request else { return None };
-            let hook_name = (request.service == "events.subscribe")
-                .then(|| serde_json::from_str::<serde_json::Value>(&request.args_json).ok())
-                .flatten()
-                .and_then(|args| args["event"].as_str().map(str::to_string));
-            match hook_name {
-                Some(name) => a2app_core::capabilities::for_hook(&name),
-                None => a2app_core::capabilities::for_service(&request.service),
+    // subscribe names the hook it is for. An mcp-tools registration names the
+    // tool itself, which is what the user is reviewing.
+    let capability = if perm == Permission::McpTools {
+        Some(match tool {
+            Some(t) => format!("register the tool \"{}\"", t.name),
+            None => String::from("register an AI tool"),
+        })
+    } else {
+        parked.iter().find_map(|p| match p {
+            ParkedRequest::Bridge(request) => {
+                let Some(request) = request else { return None };
+                let hook_name = (request.service == "events.subscribe")
+                    .then(|| serde_json::from_str::<serde_json::Value>(&request.args_json).ok())
+                    .flatten()
+                    .and_then(|args| args["event"].as_str().map(str::to_string));
+                match hook_name {
+                    Some(name) => a2app_core::capabilities::for_hook(&name),
+                    None => a2app_core::capabilities::for_service(&request.service),
+                }
             }
-        }
-        #[cfg(unix)]
-        ParkedRequest::AiTool { .. } => None,
-        #[cfg(unix)]
-        ParkedRequest::NetworkAccess { .. } => None,
-    })
-    .map(|c| c.title.to_string());
-    PromptInfo { app_name, app_icon, perm, reason, capability, agent: false }
+            #[cfg(unix)]
+            ParkedRequest::AiTool { .. } => None,
+            #[cfg(unix)]
+            ParkedRequest::NetworkAccess { .. } => None,
+        })
+        .map(|c| c.title.to_string())
+    };
+    PromptInfo { app_name, app_icon, perm, reason, capability, agent: false, tool: tool_preview }
 }
 
 /// Answers one session tool call with a finished result, whatever variant it
@@ -2236,7 +2520,8 @@ fn answer_session_job(job: SessionJob, result: Result<String, String>) {
         | SessionJob::SendRoomMessage { answer, .. }
         | SessionJob::ReadTool { answer, .. }
         | SessionJob::PostRoomMessage { answer, .. }
-        | SessionJob::NetworkAccess { answer, .. } => {
+        | SessionJob::NetworkAccess { answer, .. }
+        | SessionJob::InvokeMiniAppTool { answer, .. } => {
             let _ = answer.send(result);
         }
     }
@@ -2312,6 +2597,49 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
                 with_a2app(|state| state.active_prompt = Some(prompt));
                 return;
             }
+        }
+    } else if prompt.perm == Permission::McpTools {
+        // An mcp-tools prompt grants ONE tool, not the whole group. A durable
+        // group Deny would kill every tool this app/AI might use, which is a
+        // broader decision than this prompt asks for, so an Allow records the
+        // specific tool (with the description's content hash for a
+        // registration) and a refusal is session-scoped.
+        match (answer, prompt.tool.clone()) {
+            (PermissionPromptAction::Allow, Some(tool)) => {
+                with_a2app(|state| {
+                    state.permissions.allow_tool(
+                        &prompt.subject,
+                        &tool.full_name,
+                        &tool.content_hash,
+                    );
+                    // Keep the group "on" for App Info; it is a kill switch
+                    // now, not the per-tool gate.
+                    state.permissions.set(
+                        &prompt.subject,
+                        Permission::McpTools,
+                        GrantState::Granted,
+                    );
+                    state.perms_dirty = true;
+                });
+                true
+            }
+            (PermissionPromptAction::AllowOnce, Some(tool)) => {
+                with_a2app(|state| {
+                    state.permissions.allow_tool_once(&prompt.subject, &tool.full_name)
+                });
+                true
+            }
+            (PermissionPromptAction::Deny | PermissionPromptAction::NotNow, Some(tool)) => {
+                with_a2app(|state| state.permissions.deny_tool(&prompt.subject, &tool.full_name));
+                false
+            }
+            (PermissionPromptAction::None, _) => {
+                with_a2app(|state| state.active_prompt = Some(prompt));
+                return;
+            }
+            // No tool attached (shouldn't happen): refuse rather than grant a
+            // whole group on an ambiguous answer.
+            (_, None) => false,
         }
     } else {
         match answer {
@@ -2413,7 +2741,7 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
                         });
                     }
                     let reason = ai_tool_refused_text(perm);
-                    note_ai_tool_call(&room_id, ai_job_tool_name(&job), false, &reason);
+                    note_ai_tool_call(&room_id, &ai_job_tool_name(&job), false, &reason);
                     answer_session_job(job, Err(reason));
                 }
             }
@@ -2804,6 +3132,20 @@ fn stop_ai_session(room_id: &OwnedRoomId) {
         state.ai_sessions.remove(room_id);
         state.ai_reads.retain(|_, (r, _, _)| r != room_id);
         state.ai_posts.retain(|_, (r, _)| r != room_id);
+        // Answer any app-tool invocation parked on this session; the tools
+        // themselves stay in `app_tools` so a restarted session can re-install
+        // them without re-prompting (see `attach_ai_session`).
+        let ids: Vec<u64> = state
+            .app_tool_calls
+            .iter()
+            .filter(|(_, p)| &p.room_id == room_id)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            if let Some(p) = state.app_tool_calls.remove(&id) {
+                let _ = p.answer.send(Err(String::from("this room's AI session stopped")));
+            }
+        }
         let subject = agent_subject(room_id.as_str());
         state.permissions.clear_once_for(&subject);
         state.perms_dirty = true;
@@ -3062,6 +3404,21 @@ fn attach_ai_session(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, _name: 
         );
     } else {
         log!("AI Rooms: started the agent session for AI room {room_id}.");
+        // Re-install app tools this room already had. Their descriptions were
+        // reviewed when first registered, so a session restart does not ask
+        // again; a tool whose isolate is gone is pruned by `sweep_app_tools`.
+        with_a2app(|state| {
+            let Some(session) = state.ai_sessions.get(room_id) else { return };
+            let tools: Vec<(String, String, serde_json::Value)> = state
+                .app_tools
+                .values()
+                .filter(|reg| &reg.room_id == room_id)
+                .map(|reg| (reg.full_name.clone(), reg.description.clone(), reg.schema.clone()))
+                .collect();
+            for (name, description, schema) in tools {
+                let _ = session.register_miniapp_tool(name, description, schema);
+            }
+        });
     }
     ui.redraw(cx);
 }
@@ -3257,14 +3614,76 @@ fn prompt_parks_room_tool(prompt: &PermissionPrompt, room_id: &OwnedRoomId) -> b
     })
 }
 
+/// Expires app-tool invocations the app never answered and withdraws tools
+/// whose owning instance is gone. Called once per event pass before jobs are
+/// drained, so a dead or slow app never leaves the model waiting past the
+/// timeout and a quit app's tools never linger in the model's list.
+#[cfg(unix)]
+fn sweep_app_tools() {
+    // A live tool belongs to a live isolate. Quit/uninstalled apps drop
+    // theirs, and any call parked on the tool is answered at once.
+    let dead: Vec<String> = with_a2app(|state| {
+        state
+            .app_tools
+            .iter()
+            .filter(|(_, reg)| instances::key_of_heap(reg.heap_key).is_none())
+            .map(|(name, _)| name.clone())
+            .collect()
+    })
+    .unwrap_or_default();
+    for name in dead {
+        with_a2app(|state| {
+            if let Some(reg) = state.app_tools.remove(&name) {
+                if let Some(session) = state.ai_sessions.get(&reg.room_id) {
+                    session.unregister_miniapp_tool(&name);
+                }
+            }
+            let ids: Vec<u64> = state
+                .app_tool_calls
+                .iter()
+                .filter(|(_, p)| p.full_name == name)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in ids {
+                if let Some(p) = state.app_tool_calls.remove(&id) {
+                    let _ = p.answer.send(Err(format!(
+                        "the mini-app tool `{name}` stopped before it answered"
+                    )));
+                }
+            }
+        });
+    }
+    // Timeouts: an app that got the hook but never replied must not hold the
+    // model's serve thread past the bound.
+    let expired: Vec<u64> = with_a2app(|state| {
+        let now = Instant::now();
+        state
+            .app_tool_calls
+            .iter()
+            .filter(|(_, p)| now.duration_since(p.since) >= APP_TOOL_TIMEOUT)
+            .map(|(id, _)| *id)
+            .collect()
+    })
+    .unwrap_or_default();
+    for id in expired {
+        if let Some(p) = with_a2app(|state| state.app_tool_calls.remove(&id)).flatten() {
+            let reason = format!("the mini-app did not answer `{}` in time", p.full_name);
+            note_ai_tool_call(&p.room_id, &p.full_name, false, &reason);
+            let _ = p.answer.send(Err(reason));
+        }
+    }
+}
+
 /// Whether `room_id`'s agent session already has a tool call in flight: a
-/// granted read, a cross-room post, a generation, or a call parked behind the
-/// permission prompt. The runtime won't dispatch the next tool call until the
-/// current one is answered, so a session's tools run serially.
+/// granted read, a cross-room post, a generation, an app-tool invocation
+/// awaiting its isolate, or a call parked behind the permission prompt. The
+/// runtime won't dispatch the next tool call until the current one is
+/// answered, so a session's tools run serially.
 #[cfg(unix)]
 fn session_has_inflight_tool(state: &A2AppState, room_id: &OwnedRoomId) -> bool {
     state.ai_reads.values().any(|(r, _, _)| r == room_id)
         || state.ai_posts.values().any(|(r, _)| r == room_id)
+        || state.app_tool_calls.values().any(|p| &p.room_id == room_id)
         || state
             .ai_sessions
             .get(room_id)
@@ -3282,6 +3701,11 @@ fn session_has_inflight_tool(state: &A2AppState, room_id: &OwnedRoomId) -> bool 
 /// is advanced and its replies/errors/deaths are acted on.
 #[cfg(unix)]
 fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
+    // 0. Expire unanswered app-tool calls and withdraw tools whose isolate is
+    //    gone, so a dead or slow mini-app never strands the model or leaves a
+    //    stale tool in the model's list.
+    sweep_app_tools();
+
     // 1. Tool calls waiting on the UI thread. One per session per pass, and
     //    only when that session has no tool already in flight, so an agent's
     //    calls execute serially instead of all starting at once.
@@ -3619,6 +4043,7 @@ fn run_ai_read_tool(
                     room_id: room_id.clone(),
                     job: SessionJob::ReadTool { kind, answer },
                 },
+                None,
             );
         }
     }
@@ -3704,6 +4129,7 @@ fn run_ai_room_post(
                     room_id: session_room.clone(),
                     job,
                 },
+                None,
             );
         }
     }
@@ -3840,6 +4266,7 @@ fn run_ai_generation(
                     room_id: room_id.clone(),
                     job: SessionJob::LaunchSplashApp { description, answer },
                 },
+                None,
             );
         }
     }
@@ -3854,7 +4281,7 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
     // live row (reposted with it) and, later, its receipt chip.
     let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
     let detail = session_job_detail(rooms.as_ref(), &job);
-    record_tool_call_detail(room_id, ai_job_tool_name(&job), detail);
+    record_tool_call_detail(room_id, &ai_job_tool_name(&job), detail);
     match job {
         SessionJob::SendRoomMessage { text, answer } => {
             // Remember this turn already spoke to the room through the tool,
@@ -3883,6 +4310,111 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
         }
         SessionJob::NetworkAccess { tool, host, url, answer } => {
             run_network_access(cx, ui, room_id, &tool, &host, &url, answer);
+        }
+        SessionJob::InvokeMiniAppTool { tool, arguments, answer } => {
+            // Gate 2: the model is asking to invoke an app tool. Each tool is
+            // granted on its own for this room's AI; first use parks behind a
+            // prompt that shows the tool and the arguments. The `McpTools`
+            // group is a kill switch only.
+            let subject = agent_subject(room_id.as_str());
+            let decided = with_a2app(|state| {
+                if state.permissions.state(&subject, Permission::McpTools) == GrantState::Denied {
+                    return Effective::Denied;
+                }
+                state.permissions.tool_effective(&subject, &tool, None)
+            })
+            .unwrap_or(Effective::NeedsPrompt);
+            match decided {
+                Effective::Granted => {
+                    run_app_tool_invocation(cx, room_id, tool, arguments, answer);
+                }
+                Effective::NeedsPrompt => {
+                    let grant = with_a2app(|state| {
+                        state.app_tools.get(&tool).map(|reg| PromptToolGrant {
+                            full_name: tool.clone(),
+                            name: tool.clone(),
+                            description: reg.description.clone(),
+                            args: reg.args.clone(),
+                            content_hash: String::new(),
+                        })
+                    })
+                    .flatten();
+                    queue_permission_prompt(
+                        cx,
+                        ui,
+                        subject,
+                        Permission::McpTools,
+                        ParkedRequest::AiTool {
+                            room_id: room_id.clone(),
+                            job: SessionJob::InvokeMiniAppTool { tool, arguments, answer },
+                        },
+                        grant,
+                    );
+                }
+                Effective::Denied | Effective::Undeclared => {
+                    let reason = format!(
+                        "The user did not allow the AI to use the mini-app tool \"{tool}\"."
+                    );
+                    note_ai_tool_call(room_id, &tool, false, &reason);
+                    let _ = answer.send(Err(reason));
+                }
+            }
+        }
+    }
+}
+
+/// Delivers one app-tool invocation into the owning isolate as
+/// `on_tool_call`, parking the model's serve thread in `app_tool_calls` until
+/// the app answers `mcp.tools.result` (or [`APP_TOOL_TIMEOUT`] sweeps it).
+#[cfg(unix)]
+fn run_app_tool_invocation(
+    cx: &mut Cx,
+    room_id: &OwnedRoomId,
+    tool: String,
+    arguments: serde_json::Map<String, serde_json::Value>,
+    answer: Sender<Result<String, String>>,
+) {
+    let Some((app_id, heap_key, raw_name)) = with_a2app(|state| {
+        state
+            .app_tools
+            .get(&tool)
+            .map(|reg| (reg.app_id.clone(), reg.heap_key, reg.raw_name.clone()))
+    })
+    .flatten()
+    else {
+        let _ = answer.send(Err(format!("the mini-app tool `{tool}` is no longer registered")));
+        return;
+    };
+    let call_id = NEXT_APP_TOOL_CALL_ID.fetch_add(1, Ordering::Relaxed);
+    with_a2app(|state| {
+        state.app_tool_calls.insert(
+            call_id,
+            AppToolPending {
+                room_id: room_id.clone(),
+                app_id,
+                full_name: tool.clone(),
+                answer,
+                since: Instant::now(),
+            },
+        );
+    });
+    let payload = serde_json::json!({
+        "call_id": call_id,
+        "tool": tool,
+        // The app's own name, so it routes without knowing the `app_<id>_`
+        // prefix the runtime chose.
+        "name": raw_name,
+        "arguments": arguments,
+    })
+    .to_string();
+    let called = instances::call_hook_by_heap(cx, heap_key, live_id!(on_tool_call), &[&payload]);
+    if !called {
+        // The app is gone or never defined the hook; answer at once rather
+        // than leave the model waiting for the timeout.
+        if let Some(pending) = with_a2app(|state| state.app_tool_calls.remove(&call_id)).flatten() {
+            let _ = pending.answer.send(Err(format!(
+                "the mini-app did not handle the tool call `{tool}`"
+            )));
         }
     }
 }
@@ -3956,6 +4488,7 @@ fn run_network_access(
                     url: url.to_string(),
                     answer,
                 },
+                None,
             );
         }
     }

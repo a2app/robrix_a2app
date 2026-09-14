@@ -28,7 +28,7 @@ use makepad_widgets::*;
 
 use crate::layout::PaneSide;
 use crate::manifest::{AppRegistry, MiniAppId};
-use crate::permissions::{Effective, Permission, PermissionStore};
+use crate::permissions::{Effective, GrantState, Permission, PermissionStore};
 
 pub const PLATFORM: &str = if cfg!(target_os = "macos") {
     "macos"
@@ -115,6 +115,159 @@ pub fn respond(cx: &mut Cx, reply: Reply, result: Result<&str, &str>) {
     }
 }
 
+/// How many tools one instance may have registered with the room's AI at
+/// once. Bounds what a runaway script can push into the model's context.
+pub const MAX_APP_TOOLS_PER_INSTANCE: usize = 16;
+/// Cap on an app-authored tool description, in chars. It is shown to the user
+/// AND handed to the model, so it is bounded before either.
+pub const MAX_APP_TOOL_DESCRIPTION_CHARS: usize = 1200;
+/// Cap on the app-authored tool name, in chars.
+pub const MAX_APP_TOOL_NAME_CHARS: usize = 48;
+/// Cap on the number of arguments a tool may declare.
+pub const MAX_APP_TOOL_ARGS: usize = 20;
+
+/// A parsed `mcp.tools.register`: everything the user must review and the
+/// runtime needs to install the tool on a room's agent session.
+#[derive(Clone, Debug)]
+pub struct AppToolRequest {
+    pub app_id: MiniAppId,
+    /// The instance's host tag (app plus room), which scopes the tool.
+    pub instance_tag: String,
+    /// The attached room, when the instance has one. The tool is registered
+    /// on THAT room's AI session.
+    pub room: Option<String>,
+    /// The registering isolate, so invocations route back to exactly it.
+    pub heap_key: usize,
+    /// The app's chosen name, as written.
+    pub name: String,
+    /// The namespaced name the model will see (`app_<id>_<name>`).
+    pub full_name: String,
+    /// The app-authored description, verbatim.
+    pub description: String,
+    /// The JSON Schema built from the app's flat `args`.
+    pub schema: serde_json::Value,
+    /// `(name, type, description)` per argument, for the consent prompt.
+    pub args: Vec<(String, String, String)>,
+    /// Hash of (description, args): a changed value must be re-reviewed.
+    pub content_hash: String,
+}
+
+/// The namespaced MCP name for a tool an app registered: `app_<id>_<name>`,
+/// with anything outside `[a-z0-9_]` folded to `_`. Namespacing is what keeps
+/// an app from shadowing a built-in tool or another app's tool.
+pub fn app_tool_full_name(app_id: &str, name: &str) -> String {
+    fn clean(s: &str) -> String {
+        s.chars()
+            .map(|c| {
+                let c = c.to_ascii_lowercase();
+                if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }
+            })
+            .collect()
+    }
+    format!("app_{}_{}", clean(app_id), clean(name))
+}
+
+/// A stable content hash for a tool registration, over the description and
+/// the argument list in order. Stored with the grant so a changed description
+/// no longer matches and the user is asked again.
+fn app_tool_content_hash(description: &str, args: &[(String, String, String)]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    description.hash(&mut hasher);
+    for (name, ty, desc) in args {
+        name.hash(&mut hasher);
+        ty.hash(&mut hasher);
+        desc.hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+/// Validates and normalizes a `mcp.tools.register` request into an
+/// [`AppToolRequest`]. Every bound here is a bound on text that can reach the
+/// model, so refusals are explicit and early.
+pub fn parse_app_tool_request(
+    manifest: &crate::manifest::MiniAppManifest,
+    req: &SplashHostRequest,
+    args: &serde_json::Value,
+) -> Result<AppToolRequest, String> {
+    let name = args["name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .ok_or("mcp.tools.register needs a {name}")?;
+    if name.chars().count() > MAX_APP_TOOL_NAME_CHARS {
+        return Err(format!("tool name is too long (max {MAX_APP_TOOL_NAME_CHARS} characters)"));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err(String::from("tool name may only use letters, digits, '_' and '-'"));
+    }
+    let description = args["description"]
+        .as_str()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .ok_or("mcp.tools.register needs a {description}")?;
+    if description.chars().count() > MAX_APP_TOOL_DESCRIPTION_CHARS {
+        return Err(format!(
+            "tool description is too long (max {MAX_APP_TOOL_DESCRIPTION_CHARS} characters)"
+        ));
+    }
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    let mut parsed_args = Vec::new();
+    if let Some(list) = args.get("args") {
+        let Some(list) = list.as_array() else {
+            return Err(String::from("`args` must be an array of {name, type, description} objects"));
+        };
+        if list.len() > MAX_APP_TOOL_ARGS {
+            return Err(format!("too many arguments (max {MAX_APP_TOOL_ARGS})"));
+        }
+        for item in list {
+            let arg_name = item["name"]
+                .as_str()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .ok_or("each argument needs a {name}")?;
+            if !arg_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return Err(format!(
+                    "argument name `{arg_name}` may only use letters, digits and '_'"
+                ));
+            }
+            let ty = item["type"].as_str().unwrap_or("string");
+            if !matches!(ty, "string" | "integer" | "number" | "boolean" | "array" | "object") {
+                return Err(format!("argument `{arg_name}` has unknown type `{ty}`"));
+            }
+            let desc = item["description"].as_str().unwrap_or("");
+            properties.insert(
+                arg_name.to_string(),
+                serde_json::json!({ "type": ty, "description": desc }),
+            );
+            required.push(serde_json::json!(arg_name));
+            parsed_args.push((arg_name.to_string(), ty.to_string(), desc.to_string()));
+        }
+    }
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false,
+    });
+    let full_name = app_tool_full_name(&manifest.id, name);
+    let content_hash = app_tool_content_hash(description, &parsed_args);
+    let (_, room) = crate::manifest::split_instance_tag(&req.app_tag);
+    Ok(AppToolRequest {
+        app_id: manifest.id.clone(),
+        instance_tag: req.app_tag.clone(),
+        room: room.map(str::to_string),
+        heap_key: req.heap_key,
+        name: name.to_string(),
+        full_name,
+        description: description.to_string(),
+        schema,
+        args: parsed_args,
+        content_hash,
+    })
+}
+
 /// Work only the host can do, returned from [`Broker::process`].
 pub enum BrokerAsk {
     /// Queue a runtime-permission prompt. `request`, when present, is parked
@@ -123,6 +276,10 @@ pub enum BrokerAsk {
         app_id: MiniAppId,
         perm: Permission,
         request: Option<SplashHostRequest>,
+        /// For an `mcp-tools` prompt: the exact tool under review, so the
+        /// modal can show the app-authored description and the answer can
+        /// record a per-tool grant.
+        tool: Option<AppToolRequest>,
     },
     /// Deliver an (already policy-checked) IPC message to `to`'s running
     /// isolates, then answer `reply` with the delivered count. `from_heap`
@@ -178,6 +335,15 @@ pub enum BrokerAsk {
     },
     /// A fact only the host holds; answered with `reply` on the UI thread.
     HostQuery { reply: Reply, query: HostQuery },
+    /// Install a reviewed mini-app tool on the room's agent session, then
+    /// answer `reply` with the namespaced tool name the model will see.
+    McpRegisterTool { reply: Reply, request: AppToolRequest },
+    /// Withdraw one of an instance's tools from the room's session, then
+    /// answer `reply`.
+    McpUnregisterTool { reply: Reply, app_id: MiniAppId, heap_key: usize, full_name: String },
+    /// An app answered one `on_tool_call`: hand the result to the serve thread
+    /// parked on it, then answer `reply`.
+    McpToolResult { reply: Reply, app_id: MiniAppId, call_id: u64, ok: bool, text: String },
 }
 
 pub enum HostQuery {
@@ -537,7 +703,11 @@ impl Broker {
         // Same-app IPC is inside one sandbox: no permission involved.
         let self_ipc = req.service == "ipc.send"
             && ipc_target.as_deref() == Some(manifest.id.as_str());
-        let needs = if self_ipc { None } else { capability.group };
+        // mcp.tools.* carry their own per-tool consent (the registration
+        // prompt shows the app's exact description), so they bypass the
+        // generic group gate and decide inside their match arms.
+        let per_tool_service = req.service.starts_with("mcp.tools.");
+        let needs = if self_ipc || per_tool_service { None } else { capability.group };
         if let Some(perm) = needs {
             // The group answers the prompt; the user can still block this
             // single capability underneath it.
@@ -567,6 +737,7 @@ impl Broker {
                         app_id: manifest.id.clone(),
                         perm,
                         request: Some(req),
+                        tool: None,
                     });
                     return;
                 }
@@ -671,6 +842,7 @@ impl Broker {
                             app_id: manifest.id.clone(),
                             perm,
                             request: Some(req),
+                            tool: None,
                         });
                     }
                 }
@@ -816,6 +988,79 @@ impl Broker {
                     data_json,
                 });
             }
+            "mcp.tools.register" => match parse_app_tool_request(&manifest, &req, &args) {
+                Err(e) => respond(cx, reply, Err(&e)),
+                Ok(tool) => {
+                    // The group is a kill switch: a durable Deny in App Info
+                    // blocks every tool this app might offer, however it
+                    // words the description.
+                    if ctx.permissions.state(&manifest.id, Permission::McpTools)
+                        == GrantState::Denied
+                    {
+                        return respond(cx, reply, Err(&format!(
+                            "\"{}\" is denied for this app. Allow it in App Info",
+                            Permission::McpTools.title()
+                        )));
+                    }
+                    match ctx.permissions.tool_effective(
+                        &manifest.id,
+                        &tool.full_name,
+                        Some(&tool.content_hash),
+                    ) {
+                        Effective::Granted => {
+                            asks.push(BrokerAsk::Used {
+                                app_id: manifest.id.clone(),
+                                perm: Permission::McpTools,
+                            });
+                            asks.push(BrokerAsk::McpRegisterTool { reply, request: tool });
+                        }
+                        Effective::NeedsPrompt if req.may_prompt => {
+                            asks.push(BrokerAsk::Prompt {
+                                app_id: manifest.id.clone(),
+                                perm: Permission::McpTools,
+                                request: Some(req),
+                                tool: Some(tool),
+                            });
+                        }
+                        // Denied, or a prompt this surface may not show.
+                        _ => respond(cx, reply, Err(&format!(
+                            "the tool \"{}\" is not allowed for this app",
+                            tool.name
+                        ))),
+                    }
+                }
+            },
+            "mcp.tools.unregister" => {
+                let Some(name) = args["name"].as_str().map(str::trim).filter(|n| !n.is_empty())
+                else {
+                    return respond(cx, reply, Err("mcp.tools.unregister needs a {name}"));
+                };
+                let full_name = app_tool_full_name(&manifest.id, name);
+                asks.push(BrokerAsk::McpUnregisterTool {
+                    reply,
+                    app_id: manifest.id.clone(),
+                    heap_key: req.heap_key,
+                    full_name,
+                });
+            }
+            "mcp.tools.result" => {
+                let Some(call_id) = args["call_id"].as_u64() else {
+                    return respond(cx, reply, Err("mcp.tools.result needs a numeric {call_id}"));
+                };
+                let ok = args["ok"].as_bool().unwrap_or(false);
+                let text = match &args["result"] {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Null => String::new(),
+                    other => other.to_string(),
+                };
+                asks.push(BrokerAsk::McpToolResult {
+                    reply,
+                    app_id: manifest.id.clone(),
+                    call_id,
+                    ok,
+                    text,
+                });
+            }
             service if matrix::is_service(service) => {
                 match matrix::parse(service, &args, instance_room.is_some()) {
                     Ok(call) => asks.push(BrokerAsk::Matrix {
@@ -866,6 +1111,7 @@ impl Broker {
                             app_id: manifest.id.clone(),
                             perm,
                             request: Some(req),
+                            tool: None,
                         });
                     }
                 }
@@ -1152,5 +1398,90 @@ fn read_clipboard() -> Result<String, String> {
     #[cfg(not(target_os = "macos"))]
     {
         Err("clipboard read is not available on this platform".to_string())
+    }
+}
+
+#[cfg(test)]
+mod app_tool_tests {
+    use super::*;
+
+    fn manifest(id: &str) -> crate::manifest::MiniAppManifest {
+        crate::manifest::MiniAppManifest {
+            id: id.into(),
+            name: "Board".into(),
+            icon: "t".into(),
+            tint: 0,
+            description: String::new(),
+            source: String::new(),
+            allow_net: false,
+            permissions: vec!["mcp-tools".into()],
+            permission_reasons: Default::default(),
+            capabilities: Vec::new(),
+            builtin: false,
+            widget: None,
+            shortcuts: vec![],
+            scope: Default::default(),
+            current_version: None,
+        }
+    }
+
+    fn request(app_tag: &str, heap_key: usize) -> SplashHostRequest {
+        SplashHostRequest {
+            app_tag: app_tag.to_string(),
+            heap_key,
+            req_id: 1,
+            service: "mcp.tools.register".to_string(),
+            args_json: String::from("null"),
+            may_prompt: true,
+        }
+    }
+
+    #[test]
+    fn tool_names_are_namespaced_and_sanitized() {
+        assert_eq!(app_tool_full_name("my-app", "TTT_Play"), "app_my_app_ttt_play");
+        assert_eq!(app_tool_full_name("board", "play"), "app_board_play");
+    }
+
+    #[test]
+    fn a_valid_registration_parses_into_a_schema_and_hash() {
+        let m = manifest("board");
+        let args = serde_json::json!({
+            "name": "play",
+            "description": "Place a mark on the board.",
+            "args": [{"name": "cell", "type": "integer", "description": "0-8"}],
+        });
+        let req = request("board@!room:server", 7);
+        let parsed = parse_app_tool_request(&m, &req, &args).unwrap();
+        assert_eq!(parsed.full_name, "app_board_play");
+        assert_eq!(parsed.name, "play");
+        assert_eq!(parsed.room.as_deref(), Some("!room:server"));
+        assert_eq!(parsed.heap_key, 7);
+        assert_eq!(parsed.schema["properties"]["cell"]["type"], "integer");
+        assert_eq!(parsed.schema["required"], serde_json::json!(["cell"]));
+
+        // A changed description produces a different hash, so the stored grant
+        // no longer matches and the user is asked to review it again.
+        let mut changed = args.clone();
+        changed["description"] = serde_json::json!("Place a mark, but differently.");
+        let parsed2 = parse_app_tool_request(&m, &req, &changed).unwrap();
+        assert_ne!(parsed.content_hash, parsed2.content_hash);
+    }
+
+    #[test]
+    fn bad_registrations_are_refused() {
+        let m = manifest("board");
+        let req = request("board", 1);
+        assert!(parse_app_tool_request(&m, &req, &serde_json::json!({"description": "x"})).is_err());
+        assert!(parse_app_tool_request(&m, &req, &serde_json::json!({"name": "x"})).is_err());
+        assert!(
+            parse_app_tool_request(&m, &req, &serde_json::json!({"name": "a b", "description": "x"}))
+                .is_err()
+        );
+        let bad = serde_json::json!({
+            "name": "x",
+            "description": "y",
+            "args": [{"name": "n", "type": "wat"}],
+        });
+        assert!(parse_app_tool_request(&m, &req, &bad).is_err());
     }
 }

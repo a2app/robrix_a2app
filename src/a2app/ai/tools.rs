@@ -50,6 +50,63 @@ pub trait AiHost: Send + Sync {
     fn read_tool(&self, kind: ReadToolKind) -> Result<String, String>;
 }
 
+/// The UI-thread rendezvous an app-registered tool uses: `invoke` marshals the
+/// call to the session's runtime (which delivers it to the owning isolate and
+/// blocks until the app answers) and returns the app's text result. Split from
+/// [`AiHost`] so the built-in tools don't have to grow a mini-app method, and
+/// so the MCP protocol layer never has to know apps exist.
+pub trait MiniAppToolBridge: Send + Sync {
+    fn invoke(&self, tool: &str, arguments: &Map<String, Value>) -> Result<String, String>;
+}
+
+/// A tool a running mini-app registered with this session's MCP server.
+///
+/// The name is namespaced by the runtime (`app_<id>_<name>`) so an app can
+/// never shadow a built-in or another app's tool; the description and schema
+/// are the app's own, shown to the user before the tool goes live. `call`
+/// blocks the serve thread while the app works — exactly like the built-in
+/// tools that marshal to the UI thread — and the runtime bounds that wait.
+pub struct MiniAppTool {
+    full_name: String,
+    description: String,
+    schema: Value,
+    bridge: Arc<dyn MiniAppToolBridge>,
+}
+
+impl MiniAppTool {
+    pub fn new(
+        full_name: impl Into<String>,
+        description: impl Into<String>,
+        schema: Value,
+        bridge: Arc<dyn MiniAppToolBridge>,
+    ) -> Self {
+        Self {
+            full_name: full_name.into(),
+            description: description.into(),
+            schema,
+            bridge,
+        }
+    }
+}
+
+impl Tool for MiniAppTool {
+    fn name(&self) -> &str {
+        &self.full_name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn input_schema(&self) -> Value {
+        self.schema.clone()
+    }
+
+    fn call(&self, arguments: &Map<String, Value>) -> Result<String, String> {
+        self.bridge.invoke(&self.full_name, arguments)
+    }
+}
+
 /// The read the model asked for, parsed and clamped by its [`Tool`] impl into
 /// the shape the executor (and the async matrix worker) needs. One variant per
 /// tool; every variant except [`ReadToolKind::Memory`] maps 1:1 onto a catalog
@@ -155,6 +212,11 @@ pub const AI_ROOM_SESSION_CAP_IDS: &[&str] = &[
     "matrix.space.rooms.list",
     "apps.generate",
     "matrix.rooms.message.send",
+    // The AI room can invoke tools a mini-app registered in it (each tool is
+    // granted per tool, see `PermissionStore::tool_effective`); declaring the
+    // incoming hook puts the `mcp-tools` group in the room's AI panel so the
+    // user can see and revoke it there.
+    "on_tool_call",
     // Internet access (the agent's own web_search / web_fetch / browser
     // tools), gated per host so nothing reaches the network until the user
     // has allowed that host for this room's AI.
@@ -876,5 +938,48 @@ mod tests {
         let mut args = Map::new();
         args.insert("limit".into(), json!(999));
         assert_eq!(parse_limit(&args), MAX_READ_LIMIT, "memory reads stay bounded too");
+    }
+
+    /// A mini-app tool is the model-facing name plus the app's own description
+    /// and schema, and a call is forwarded verbatim to the bridge (which
+    /// routes it into the isolate). This is the protocol half of the bridge,
+    /// independent of any socket.
+    #[test]
+    fn a_miniapp_tool_forwards_its_name_and_arguments() {
+        #[derive(Default)]
+        struct RecordingBridge {
+            calls: std::sync::Mutex<Vec<(String, Map<String, Value>)>>,
+        }
+        impl MiniAppToolBridge for RecordingBridge {
+            fn invoke(&self, tool: &str, arguments: &Map<String, Value>) -> Result<String, String> {
+                self.calls.lock().unwrap().push((tool.to_string(), arguments.clone()));
+                Ok(json!({ "board": ["X", "", "O"], "turn": "X" }).to_string())
+            }
+        }
+
+        let bridge = Arc::new(RecordingBridge::default());
+        let schema = json!({
+            "type": "object",
+            "properties": {"cell": {"type": "integer"}},
+            "required": ["cell"],
+        });
+        let tool = MiniAppTool::new(
+            "app_board_play",
+            "Place a mark on the board.",
+            schema.clone(),
+            bridge.clone(),
+        );
+        assert_eq!(tool.name(), "app_board_play");
+        assert_eq!(tool.description(), "Place a mark on the board.");
+        assert_eq!(tool.input_schema(), schema);
+
+        let mut args = Map::new();
+        args.insert("cell".into(), json!(4));
+        let out = tool.call(&args).unwrap();
+        assert!(out.contains("board"));
+        let calls = bridge.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "app_board_play");
+        assert_eq!(calls[0].1["cell"], json!(4));
     }
 }

@@ -10,62 +10,102 @@
 //! that need UI-thread state (the app registry, a `Cx`) go through a host that
 //! marshals to the UI thread and blocks on the reply.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::time::Duration;
 
-use a2app_agent::mcp::{MAX_FRAME_BYTES, McpServer, read_frame};
+use a2app_agent::mcp::{MAX_FRAME_BYTES, McpServer, Tool, read_frame, tools_list_changed_notification};
+
+/// One frame the serve thread wants written to its client: a JSON-RPC reply
+/// (a reaction to a request) or a server-initiated notification pushed by the
+/// process that owns the session (a mini-app registered a tool). A single
+/// writer thread per connection serializes both, so they never interleave
+/// mid-frame.
+#[derive(Clone, Debug)]
+enum ConnMsg {
+    /// Bytes to write verbatim (the caller includes the trailing newline).
+    Frame(Vec<u8>),
+    /// Tear the connection down: sent by the reader loop at EOF and by
+    /// [`ToolServer`]'s drop.
+    Close,
+}
+
+/// A handle to one connection's writer thread, so the [`ToolServer`] can push
+/// a tool-list notification to a connection that is idle (blocked reading).
+type ConnSender = mpsc::Sender<ConnMsg>;
 
 /// Handles one accepted connection until the peer closes it (or sends a frame
-/// too large to be a protocol we can answer). Reports WHY the connection
-/// ended on stderr, so a relay that dies mid-session ("socket EOF right after
-/// initialize") can be traced to the exact serve-thread exit.
-/// Handles one accepted connection until the peer closes it (or sends a frame
 /// too large to be a protocol we can answer).
-fn serve_connection(mut stream: UnixStream, server: McpServer) {
+///
+/// Reading and writing are split across two threads: the reader blocks on the
+/// next request while the writer blocks on the next frame to send. That is
+/// what lets the server PUSH `notifications/tools/list_changed` while the
+/// client is quiet — a single-threaded read/write loop could only ever answer.
+fn serve_connection(stream: UnixStream, server: McpServer, rx: mpsc::Receiver<ConnMsg>, tx: ConnSender) {
     let read_half = match stream.try_clone() {
         Ok(read_half) => read_half,
         Err(_) => return,
     };
+
+    // The writer owns the socket and exits on Close (or when the last sender
+    // drops), shutting the socket so the reader unblocks.
+    let writer = {
+        let mut stream = stream;
+        std::thread::spawn(move || {
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    ConnMsg::Frame(bytes) => {
+                        if stream.write_all(&bytes).is_err() {
+                            break;
+                        }
+                        let _ = stream.flush();
+                    }
+                    ConnMsg::Close => break,
+                }
+            }
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        })
+    };
+
     let mut reader = std::io::BufReader::new(read_half);
     let mut buf = Vec::new();
     while read_frame(&mut reader, MAX_FRAME_BYTES, &mut buf) {
         if buf.len() >= MAX_FRAME_BYTES {
             // Oversized frame: not a protocol we can answer; treat the peer as
             // broken and drop the connection.
-            return;
+            break;
         }
         let Ok(line) = std::str::from_utf8(&buf) else {
             continue;
         };
         for reply in server.handle_frame(line) {
-            if stream
-                .write_all(reply.as_bytes())
-                .and_then(|_| stream.write_all(b"\n"))
-                .and_then(|_| stream.flush())
-                .is_err()
-            {
-                return;
+            let mut frame = reply.into_bytes();
+            frame.push(b'\n');
+            if tx.send(ConnMsg::Frame(frame)).is_err() {
+                break;
             }
         }
     }
+    let _ = tx.send(ConnMsg::Close);
+    let _ = writer.join();
 }
 
 /// Accepts connections until told to stop (the session ended). Each connection
-/// is served on its own thread with its own copy of the tool set — the tools
-/// are shared (`Arc`), so this is cheap and a busy agent never blocks another.
-/// Every accepted connection is registered in `conns` under a fresh id and
-/// removed when its serve thread finishes, so [`ToolServer`]'s teardown can
-/// close exactly the connections still alive.
+/// is served on its own thread from the shared tool registry; every accepted
+/// connection's writer is registered under a fresh id and removed when its
+/// serve thread finishes, so [`ToolServer`] can push tool-list notifications
+/// to exactly the connections still alive.
 fn accept_loop(
     listener: UnixListener,
     template: McpServer,
     stop: Arc<AtomicBool>,
-    conns: Arc<Mutex<Vec<(u64, UnixStream)>>>,
+    conns: Arc<Mutex<HashMap<u64, ConnSender>>>,
 ) {
     let mut next_id = 0u64;
     while !stop.load(Ordering::Relaxed) {
@@ -88,20 +128,16 @@ fn accept_loop(
                     eprintln!("robrix tool server: could not clear nonblocking on an accepted connection: {e}");
                     continue;
                 }
-                // Register a write handle so session teardown (Drop) can
-                // interrupt this connection even while its serve thread is
-                // blocked reading from it.
-                if let Ok(handle) = stream.try_clone() {
-                    if let Ok(mut conns) = conns.lock() {
-                        conns.push((id, handle));
-                    }
+                let (tx, rx) = mpsc::channel::<ConnMsg>();
+                if let Ok(mut conns) = conns.lock() {
+                    conns.insert(id, tx.clone());
                 }
                 let template = template.clone();
                 let conns = conns.clone();
                 std::thread::spawn(move || {
-                    serve_connection(stream, template);
+                    serve_connection(stream, template, rx, tx);
                     if let Ok(mut conns) = conns.lock() {
-                        conns.retain(|(conn_id, _)| *conn_id != id);
+                        conns.remove(&id);
                     }
                 });
             }
@@ -128,9 +164,9 @@ pub struct ToolServer {
     path: PathBuf,
     /// Set on drop to end the accept loop.
     stop: Arc<AtomicBool>,
-    /// Every live connection's write handle, shut down on drop so the session's
-    /// relay children see EOF the moment the session ends.
-    conns: Arc<Mutex<Vec<(u64, UnixStream)>>>,
+    /// Every live connection's writer handle, so registry changes can push
+    /// tool-list notifications and teardown can close the connections.
+    conns: Arc<Mutex<HashMap<u64, ConnSender>>>,
 }
 
 impl ToolServer {
@@ -209,8 +245,45 @@ impl ToolServer {
             dir,
             path,
             stop: Arc::new(AtomicBool::new(false)),
-            conns: Arc::new(Mutex::new(Vec::new())),
+            conns: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Registers a dynamically created tool on the live session and pushes
+    /// `notifications/tools/list_changed` so every connected agent refreshes
+    /// its cache. This is the runtime entry point for mini-app tools.
+    pub fn add_tool(&self, tool: Arc<dyn Tool>) {
+        self.template.add_tool_arc(tool);
+        self.notify_tools_changed();
+    }
+
+    /// Removes a dynamically registered tool and notifies the connected
+    /// agents, so a tool whose app just stopped cannot linger in the model's
+    /// list. Returns whether a tool was actually removed.
+    pub fn remove_tool(&self, name: &str) -> bool {
+        let removed = self.template.remove_tool(name);
+        if removed {
+            self.notify_tools_changed();
+        }
+        removed
+    }
+
+    /// Whether a tool is registered on this session (built-in or dynamic).
+    pub fn has_tool(&self, name: &str) -> bool {
+        self.template.has_tool(name)
+    }
+
+    /// Pushes one `notifications/tools/list_changed` frame to every live
+    /// connection. A dead sender is ignored; its serve thread is on its way
+    /// out and will unregister itself.
+    fn notify_tools_changed(&self) {
+        let mut frame = tools_list_changed_notification().into_bytes();
+        frame.push(b'\n');
+        if let Ok(conns) = self.conns.lock() {
+            for tx in conns.values() {
+                let _ = tx.send(ConnMsg::Frame(frame.clone()));
+            }
+        }
     }
 
     /// The socket path the session's `--mcp-bridge` child must be told to
@@ -243,13 +316,15 @@ impl Drop for ToolServer {
         let _ = std::fs::remove_file(&self.path);
         let _ = std::fs::remove_dir(&self.dir);
         // Close every live connection: the session is over, so its relay
-        // children must see EOF and exit rather than hang waiting on us. The
-        // blocked reads in their serve threads unblock and those threads exit.
-        if let Ok(mut conns) = self.conns.lock() {
-            for (_, conn) in conns.iter() {
-                let _ = conn.shutdown(std::net::Shutdown::Both);
-            }
-            conns.clear();
+        // children must see EOF and exit rather than hang waiting on us. Each
+        // writer thread shuts its socket, which unblocks the reader; the serve
+        // threads then exit and unregister themselves.
+        let senders: Vec<ConnSender> = match self.conns.lock() {
+            Ok(mut conns) => conns.drain().map(|(_, tx)| tx).collect(),
+            Err(_) => Vec::new(),
+        };
+        for tx in senders {
+            let _ = tx.send(ConnMsg::Close);
         }
     }
 }
@@ -284,7 +359,7 @@ mod tests {
     }
 
     fn echo_server() -> ToolServer {
-        let mut template = McpServer::new();
+        let template = McpServer::new();
         template.add_tool(EchoTool);
         ToolServer::bind(template).expect("bind a session socket")
     }

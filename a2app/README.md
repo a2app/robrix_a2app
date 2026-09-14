@@ -172,6 +172,27 @@ The row (and the reply card's receipt chips) render a human phrase rather than
 the raw tool name — e.g. `Read messages in “General”`, `Built and ran a
 mini-app “a pomodoro timer”`.
 
+**A mini-app can register its own tools at runtime.** With the `mcp-tools`
+permission, an app calls `host.request("mcp.tools.register", {name,
+description, args})`; Robrix installs a `MiniAppTool` on the room session's
+live MCP server and pushes `notifications/tools/list_changed`, so the agent's
+cached list refreshes without a new session. When the model calls the tool,
+the runtime delivers `on_tool_call({call_id, tool, name, arguments})` into the
+own isolate; the app answers `host.request("mcp.tools.result", {call_id, ok,
+result})` and that text is the model's tool result (a bounded ~20 s wait, then
+the model is told it timed out). Tools are namespaced `app_<id>_<name>` so an
+app can never shadow a built-in, and an instance's tools are withdrawn when it
+quits or its session stops.
+
+Two consent gates guard this, because the tool's description and result are
+app-authored text that lands in the model's context. Registration prompts per
+tool, showing the **full description and argument list verbatim** (the exact
+text the model will read); a changed description hashes differently and
+re-prompts. Invocation prompts per tool on first use, showing the same review
+text plus the concrete arguments. Durable registration grants store the
+content hash; refusals are session-scoped. See `a2app/core/src/permissions.rs`
+(`tool_effective`) and `src/a2app/ai/tools.rs` (`MiniAppTool`).
+
 **octos's own web tools are kept too.** Sessions run under Robrix's octos
 profile (`a2app_agent::robrix_session_profile`), which is the built-in
 `hosted` envelope (no shell/files/search/memory/spawn) plus `group:web`:
@@ -180,6 +201,23 @@ profile (`a2app_agent::robrix_session_profile`), which is the built-in
 does not execute or capability-gate them; the agent closes their live cards
 itself from the ACP `tool_call_update`. Everything Robrix registers above
 remains mediated and gated.
+
+### Registering AI tools from an app
+
+A mini-app attached to an AI room can expose callable tools to the agent (the
+inverse of `launch_splash_app`: the model calls INTO the app). This is what
+makes a two-way app possible — a tic-tac-toe board the AI plays on, a
+scorekeeper it updates, etc.
+
+The app side (all on one group, `mcp-tools`):
+
+- `mcp.tools.register` `{name, description, args:[{name,type,description}]}`
+  -> `{tool}`; `mcp.tools.unregister` `{name}`.
+- `fn on_tool_call(json)` with `{call_id, tool, name, arguments}`; answer
+  `mcp.tools.result` `{call_id, ok, result}`.
+- `mcp.tools.result` is ungated plumbing; registration and invocation are
+  prompted per tool. The guide (`a2app/agent/src/splash_guide.md`, section
+  "Letting the AI call your app") is the generator-facing reference.
 
 ### Trying it offline (no API key)
 

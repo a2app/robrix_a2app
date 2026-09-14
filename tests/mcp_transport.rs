@@ -288,7 +288,7 @@ fn a_full_mcp_session_over_the_relay_child() {
     );
     assert_eq!(result["protocolVersion"], "2025-11-25");
     assert_eq!(result["serverInfo"]["name"], "robrix-tools");
-    assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
+    assert_eq!(result["capabilities"]["tools"]["listChanged"], true);
 
     // The initialized notification is answered with silence.
     client.notify("notifications/initialized", json!({}));
