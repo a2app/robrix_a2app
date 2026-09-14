@@ -167,6 +167,8 @@ bodies; only the mini-app services clip.
 | `list_space_rooms` | Lists the rooms/subspaces inside one space | `matrix.space.rooms.list` |
 | `list_apps` | Lists the mini-apps installed and available in this room (id, name, description, scope, running) | `app-launch` |
 | `launch_app` | Runs an already-installed mini-app in this room, by id from `list_apps` | `app-launch` (run only) |
+| `list_mini_app_tools` | Lists the tools the room's mini-apps registered (id, name, description, args) | `mcp-tools` (kill switch) |
+| `call_mini_app_tool` | Calls one registered mini-app tool by id, forwarding `arguments` | `mcp-tools` (per tool) |
 | `launch_splash_app` | Builds and runs a NEW mini-app from a description | `apps.generate` |
 
 `launch_splash_app` is create-only: it never rewrites an installed app. Running
@@ -183,14 +185,27 @@ mini-app “a pomodoro timer”`.
 **A mini-app can register its own tools at runtime.** With the `mcp-tools`
 permission, an app calls `host.request("mcp.tools.register", {name,
 description, args})`; Robrix installs a `MiniAppTool` on the room session's
-live MCP server and pushes `notifications/tools/list_changed`, so the agent's
-cached list refreshes without a new session. When the model calls the tool,
-the runtime delivers `on_tool_call({call_id, tool, name, arguments})` into the
-own isolate; the app answers `host.request("mcp.tools.result", {call_id, ok,
-result})` and that text is the model's tool result (a bounded ~20 s wait, then
-the model is told it timed out). Tools are namespaced `app_<id>_<name>` so an
-app can never shadow a built-in, and an instance's tools are withdrawn when it
-quits or its session stops.
+live MCP server and pushes `notifications/tools/list_changed`, so a client
+that honours that notification can refresh its list without a new session.
+When the model calls the tool, the runtime delivers
+`on_tool_call({call_id, tool, name, arguments})` into the own isolate; the app
+answers `host.request("mcp.tools.result", {call_id, ok, result})` and that
+text is the model's tool result (a bounded ~20 s wait, then the model is told
+it timed out). Tools are namespaced `app_<id>_<name>` so an app can never
+shadow a built-in, and an instance's tools are withdrawn when it quits or its
+session stops.
+
+**The stable bridge is what makes registration work under octos.** octos's MCP
+client discovers a server's tools once, at session start, and does not act on
+`notifications/tools/list_changed` (or re-list afterwards), so a tool added to
+the live server can never enter the model's toolset on its own. Every session
+therefore also advertises two tools that are present from the start:
+`list_mini_app_tools` (the registered tools — id, name, description, args) and
+`call_mini_app_tool` (`{tool, arguments}`). The model lists with the first and
+calls through the second, and the runtime validates the id, applies the same
+per-tool gate as a direct call, and routes into the owning isolate. The
+per-tool `MiniAppTool` registrations remain, so a client whose MCP stack does
+honour `list_changed` can still call them directly.
 
 Two consent gates guard this, because the tool's description and result are
 app-authored text that lands in the model's context. Registration prompts per

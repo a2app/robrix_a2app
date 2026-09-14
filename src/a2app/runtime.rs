@@ -144,7 +144,13 @@ pub struct AppToolRegistration {
 pub struct AppToolPending {
     pub room_id: OwnedRoomId,
     pub app_id: MiniAppId,
+    /// The namespaced name the runtime routes by (also the app-tool key).
     pub full_name: String,
+    /// The name the agent's turn card used for this call: the namespaced name
+    /// when the model called the tool directly, or `call_mini_app_tool` when
+    /// it came through the stable bridge. The finishing update must close the
+    /// row the agent actually opened.
+    pub display_name: String,
     pub answer: Sender<Result<String, String>>,
     pub since: Instant,
 }
@@ -1847,8 +1853,8 @@ fn complete_app_tool_call(
         return services::respond(cx, reply, Err("no matching tool call for this app"));
     };
     let summary: String = text.chars().take(200).collect();
-    let detail = finish_ai_tool_call(&pending.room_id, &pending.full_name, ok, &summary);
-    push_ai_tool_receipt(&pending.room_id, &pending.full_name, detail, ok, &summary);
+    let detail = finish_ai_tool_call(&pending.room_id, &pending.display_name, ok, &summary);
+    push_ai_tool_receipt(&pending.room_id, &pending.display_name, detail, ok, &summary);
     let _ = if ok {
         pending.answer.send(Ok(text.to_string()))
     } else {
@@ -2184,6 +2190,8 @@ fn ai_job_tool_name(job: &SessionJob) -> String {
         SessionJob::NetworkAccess { .. } => String::from("network_access"),
         // A tool a mini-app registered; its name is already namespaced.
         SessionJob::InvokeMiniAppTool { tool, .. } => tool.clone(),
+        SessionJob::CallMiniAppTool { .. } => String::from("call_mini_app_tool"),
+        SessionJob::ListMiniAppTools { .. } => String::from("list_mini_app_tools"),
     }
 }
 
@@ -2224,6 +2232,13 @@ fn session_job_detail(rooms: Option<&RoomsListRef>, job: &SessionJob) -> Option<
         SessionJob::NetworkAccess { .. } => None,
         // The tool name already names it; no extra target to add.
         SessionJob::InvokeMiniAppTool { .. } => None,
+        // A bridged call still targets one app tool; name it for the card.
+        SessionJob::CallMiniAppTool { tool, .. } => with_a2app(|state| {
+            state.app_tools.get(tool).map(|reg| format!("“{}”", reg.raw_name))
+        })
+        .flatten(),
+        // A listing has no single target of its own.
+        SessionJob::ListMiniAppTools { .. } => None,
     }
 }
 
@@ -2387,6 +2402,12 @@ fn ai_prompt_action(
                 SessionJob::InvokeMiniAppTool { tool, .. } => {
                     format!("use the mini-app tool \"{tool}\"")
                 }
+                // A bridged call is the same request; name the app's tool.
+                SessionJob::CallMiniAppTool { tool, .. } => {
+                    format!("use the mini-app tool \"{tool}\"")
+                }
+                // Never parked (it answers immediately), but exhaustive.
+                SessionJob::ListMiniAppTools { .. } => continue,
             };
         }
     }
@@ -2453,6 +2474,12 @@ fn ai_prompt_reason(
                     "You allowed this app to register \"{tool}\". The description you reviewed is \
                      the text the model sees; the app's answer is returned to the model."
                 ),
+                SessionJob::CallMiniAppTool { tool, .. } => format!(
+                    "You allowed this app to register \"{tool}\". The description you reviewed is \
+                     the text the model sees; the app's answer is returned to the model."
+                ),
+                // Never parked (it answers immediately), but exhaustive.
+                SessionJob::ListMiniAppTools { .. } => continue,
             };
         }
     }
@@ -2549,7 +2576,9 @@ fn answer_session_job(job: SessionJob, result: Result<String, String>) {
         | SessionJob::ReadTool { answer, .. }
         | SessionJob::PostRoomMessage { answer, .. }
         | SessionJob::NetworkAccess { answer, .. }
-        | SessionJob::InvokeMiniAppTool { answer, .. } => {
+        | SessionJob::InvokeMiniAppTool { answer, .. }
+        | SessionJob::CallMiniAppTool { answer, .. }
+        | SessionJob::ListMiniAppTools { answer } => {
             let _ = answer.send(result);
         }
     }
@@ -3697,7 +3726,7 @@ fn sweep_app_tools() {
     for id in expired {
         if let Some(p) = with_a2app(|state| state.app_tool_calls.remove(&id)).flatten() {
             let reason = format!("the mini-app did not answer `{}` in time", p.full_name);
-            note_ai_tool_call(&p.room_id, &p.full_name, false, &reason);
+            note_ai_tool_call(&p.room_id, &p.display_name, false, &reason);
             let _ = p.answer.send(Err(reason));
         }
     }
@@ -4565,55 +4594,164 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
             run_network_access(cx, ui, room_id, &tool, &host, &url, answer);
         }
         SessionJob::InvokeMiniAppTool { tool, arguments, answer } => {
-            // Gate 2: the model is asking to invoke an app tool. Each tool is
-            // granted on its own for this room's AI; first use parks behind a
-            // prompt that shows the tool and the arguments. The `McpTools`
-            // group is a kill switch only.
-            let subject = agent_subject(room_id.as_str());
-            let decided = with_a2app(|state| {
-                if state.permissions.state(&subject, Permission::McpTools) == GrantState::Denied {
-                    return Effective::Denied;
-                }
-                state.permissions.tool_effective(&subject, &tool, None)
-            })
-            .unwrap_or(Effective::NeedsPrompt);
-            match decided {
-                Effective::Granted => {
-                    run_app_tool_invocation(cx, room_id, tool, arguments, answer);
-                }
-                Effective::NeedsPrompt => {
-                    let grant = with_a2app(|state| {
-                        state.app_tools.get(&tool).map(|reg| PromptToolGrant {
-                            full_name: tool.clone(),
-                            name: tool.clone(),
-                            description: reg.description.clone(),
-                            args: reg.args.clone(),
-                            content_hash: String::new(),
-                        })
-                    })
-                    .flatten();
-                    queue_permission_prompt(
-                        cx,
-                        ui,
-                        subject,
-                        Permission::McpTools,
-                        ParkedRequest::AiTool {
-                            room_id: room_id.clone(),
-                            job: SessionJob::InvokeMiniAppTool { tool, arguments, answer },
-                        },
-                        grant,
-                    );
-                }
-                Effective::Denied | Effective::Undeclared => {
-                    let reason = format!(
-                        "The user did not allow the AI to use the mini-app tool \"{tool}\"."
-                    );
-                    note_ai_tool_call(room_id, &tool, false, &reason);
-                    let _ = answer.send(Err(reason));
-                }
-            }
+            run_mini_app_tool_call(cx, ui, room_id, tool, arguments, false, answer);
+        }
+        SessionJob::CallMiniAppTool { tool, arguments, answer } => {
+            run_mini_app_tool_call(cx, ui, room_id, tool, arguments, true, answer);
+        }
+        SessionJob::ListMiniAppTools { answer } => {
+            run_ai_list_mini_app_tools(room_id, answer);
         }
     }
+}
+
+/// Gate 2 for a mini-app tool: an invocation — whether the model called the
+/// tool directly or through the stable `call_mini_app_tool` bridge — is
+/// granted per tool for this room's AI; first use parks behind a prompt that
+/// shows the tool and the arguments. The `McpTools` group is a kill switch
+/// only.
+///
+/// `via_bridge` changes only which job name the turn card is closed under: the
+/// agent reports the bridge call as `call_mini_app_tool`, while a direct call
+/// carries the tool's own namespaced name.
+#[cfg(unix)]
+fn run_mini_app_tool_call(
+    cx: &mut Cx,
+    ui: &WidgetRef,
+    room_id: &OwnedRoomId,
+    tool: String,
+    arguments: serde_json::Map<String, serde_json::Value>,
+    via_bridge: bool,
+    answer: Sender<Result<String, String>>,
+) {
+    // The bridge takes a free-form id, so a name the model invented must be
+    // refused rather than prompt for a tool nobody registered. The same check
+    // covers a direct call for a tool withdrawn since the agent listed it.
+    //
+    // Accept either the namespaced `tool` id from `list_mini_app_tools` or
+    // the app's own name: the app's room message says `ttt_play`, while the
+    // list exposes `app_tic-tac-toe_ttt_play`, and the model should not have
+    // to know which is which. A raw name matching more than one tool in the
+    // room is ambiguous and refused rather than guessed at.
+    let resolved_tool: Option<String> =
+        if with_a2app(|state| state.app_tools.contains_key(&tool)).unwrap_or(false) {
+            Some(tool.clone())
+        } else {
+            with_a2app(|state| {
+                let mut matches = state
+                    .app_tools
+                    .values()
+                    .filter(|reg| &reg.room_id == room_id && reg.raw_name == tool)
+                    .map(|reg| reg.full_name.clone());
+                let first = matches.next()?;
+                if matches.next().is_none() { Some(first) } else { None }
+            })
+            .flatten()
+        };
+    let Some(tool) = resolved_tool else {
+        let reason = format!(
+            "There is no mini-app tool `{tool}` registered in this room. \
+             Use list_mini_app_tools to see the tools the apps offer."
+        );
+        let _ = answer.send(Err(reason));
+        return;
+    };
+    let display_name = if via_bridge { "call_mini_app_tool".to_string() } else { tool.clone() };
+    let subject = agent_subject(room_id.as_str());
+    let decided = with_a2app(|state| {
+        if state.permissions.state(&subject, Permission::McpTools) == GrantState::Denied {
+            return Effective::Denied;
+        }
+        state.permissions.tool_effective(&subject, &tool, None)
+    })
+    .unwrap_or(Effective::NeedsPrompt);
+    match decided {
+        Effective::Granted => {
+            run_app_tool_invocation(cx, room_id, tool, arguments, display_name, answer);
+        }
+        Effective::NeedsPrompt => {
+            let grant = with_a2app(|state| {
+                state.app_tools.get(&tool).map(|reg| PromptToolGrant {
+                    full_name: tool.clone(),
+                    name: tool.clone(),
+                    description: reg.description.clone(),
+                    args: reg.args.clone(),
+                    content_hash: String::new(),
+                })
+            })
+            .flatten();
+            // The parked job must remember the bridge so the replay opens the
+            // same turn-card name the agent already reported.
+            let job = if via_bridge {
+                SessionJob::CallMiniAppTool { tool, arguments, answer }
+            } else {
+                SessionJob::InvokeMiniAppTool { tool, arguments, answer }
+            };
+            queue_permission_prompt(
+                cx,
+                ui,
+                subject,
+                Permission::McpTools,
+                ParkedRequest::AiTool { room_id: room_id.clone(), job },
+                grant,
+            );
+        }
+        Effective::Denied | Effective::Undeclared => {
+            let reason = format!(
+                "The user did not allow the AI to use the mini-app tool \"{}\".",
+                tool
+            );
+            note_ai_tool_call(room_id, &display_name, false, &reason);
+            let _ = answer.send(Err(reason));
+        }
+    }
+}
+
+/// Executes the `list_mini_app_tools` tool: the tools mini-apps registered on
+/// this room's session, as JSON the model reads to pick a `tool` id for
+/// `call_mini_app_tool`. Metadata only — the app's source and data never leave
+/// it. A group `Denied` is the kill switch for the whole feature, so it
+/// reports none.
+#[cfg(unix)]
+fn run_ai_list_mini_app_tools(
+    room_id: &OwnedRoomId,
+    answer: Sender<Result<String, String>>,
+) {
+    let subject = agent_subject(room_id.as_str());
+    let denied = with_a2app(|state| {
+        state.permissions.state(&subject, Permission::McpTools) == GrantState::Denied
+    })
+    .unwrap_or(false);
+    if denied {
+        note_ai_tool_call(room_id, "list_mini_app_tools", false, "");
+        let _ = answer.send(Err(String::from(
+            "The user has turned off mini-app tools for this room's AI.",
+        )));
+        return;
+    }
+    let tools = with_a2app(|state| {
+        state
+            .app_tools
+            .values()
+            .filter(|reg| &reg.room_id == room_id)
+            .map(|reg| {
+                serde_json::json!({
+                    "tool": reg.full_name,
+                    "name": reg.raw_name,
+                    "description": reg.description,
+                    "args": reg.args.iter().map(|(name, ty, desc)| serde_json::json!({
+                        "name": name,
+                        "type": ty,
+                        "description": desc,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+    let text = serde_json::json!({ "tools": tools }).to_string();
+    note_ai_tool_call(room_id, "list_mini_app_tools", true, "");
+    let _ = answer.send(Ok(text));
 }
 
 /// Delivers one app-tool invocation into the owning isolate as
@@ -4625,6 +4763,7 @@ fn run_app_tool_invocation(
     room_id: &OwnedRoomId,
     tool: String,
     arguments: serde_json::Map<String, serde_json::Value>,
+    display_name: String,
     answer: Sender<Result<String, String>>,
 ) {
     let Some((app_id, heap_key, raw_name)) = with_a2app(|state| {
@@ -4646,6 +4785,7 @@ fn run_app_tool_invocation(
                 room_id: room_id.clone(),
                 app_id,
                 full_name: tool.clone(),
+                display_name,
                 answer,
                 since: Instant::now(),
             },

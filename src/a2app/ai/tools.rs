@@ -50,6 +50,23 @@ pub trait AiHost: Send + Sync {
     /// `{"app_id":…,"name":…,"status":"running"}`.
     fn launch_app(&self, app_id: &str) -> Result<String, String>;
 
+    /// Lists the tools the mini-apps in this session's room have registered,
+    /// as JSON the model reads before calling
+    /// [`AiHost::call_mini_app_tool`]. Each entry carries the `tool` id to
+    /// pass back, the app's own name for it, the description and the argument
+    /// list. Returns `{"tools":[{…}]}` — empty when no app offers one.
+    fn list_mini_app_tools(&self) -> Result<String, String>;
+
+    /// Calls one mini-app tool by the `tool` id from
+    /// [`AiHost::list_mini_app_tools`], forwarding `arguments` verbatim. This
+    /// is the stable entry point that works for tools registered after the
+    /// agent's session started; the app's own answer is the result.
+    fn call_mini_app_tool(
+        &self,
+        tool: &str,
+        arguments: Map<String, Value>,
+    ) -> Result<String, String>;
+
     /// Posts `text` into the room associated with this session.
     fn send_room_message(&self, text: &str) -> Result<String, String>;
 
@@ -825,6 +842,119 @@ impl Tool for LaunchAppTool {
     }
 }
 
+/// `list_mini_app_tools` — the tools the room's mini-apps offer the agent.
+///
+/// Sibling of `list_apps`: that one names the apps, this one names the
+/// callable tools inside them. It exists because an agent discovers its MCP
+/// tools once, at session start, so a tool an app registers later can never
+/// appear in that snapshot on its own — the model reaches it through the
+/// stable `call_mini_app_tool` instead, after reading this list.
+///
+/// Read-only metadata (id, name, description, arguments): it never exposes an
+/// app's source or data, and the invocation itself is still gated per tool.
+pub struct ListMiniAppToolsTool {
+    host: Arc<dyn AiHost>,
+}
+
+impl ListMiniAppToolsTool {
+    pub fn new(host: Arc<dyn AiHost>) -> Self {
+        Self { host }
+    }
+}
+
+impl Tool for ListMiniAppToolsTool {
+    fn name(&self) -> &str {
+        "list_mini_app_tools"
+    }
+
+    fn description(&self) -> &str {
+        "Lists the tools the mini-apps in this room have registered for you to \
+         call, with each tool's `tool` id, its name, description, and \
+         arguments. A mini-app can offer tools at runtime, so its own list can \
+         change while you talk to it. Call this whenever a mini-app tells you \
+         it has a tool, then pass the `tool` id to call_mini_app_tool. This \
+         only lists; nothing is invoked."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+        })
+    }
+
+    fn call(&self, _arguments: &Map<String, Value>) -> Result<String, String> {
+        self.host.list_mini_app_tools()
+    }
+}
+
+/// `call_mini_app_tool` — invoke a tool one of the room's mini-apps registered.
+///
+/// The stable counterpart to `list_mini_app_tools`: a session advertises this
+/// from the start, so the model can call a tool that was registered after the
+/// agent connected. The runtime validates the id, applies the same per-tool
+/// permission gate as a direct call, and routes the invocation into the
+/// owning isolate.
+pub struct CallMiniAppToolTool {
+    host: Arc<dyn AiHost>,
+}
+
+impl CallMiniAppToolTool {
+    pub fn new(host: Arc<dyn AiHost>) -> Self {
+        Self { host }
+    }
+}
+
+impl Tool for CallMiniAppToolTool {
+    fn name(&self) -> &str {
+        "call_mini_app_tool"
+    }
+
+    fn description(&self) -> &str {
+        "Calls a tool a mini-app in this room registered, using a `tool` id \
+         from list_mini_app_tools and passing `arguments` as a JSON object \
+         matching that tool's arguments. Use it to act inside an app — play a \
+         game move, update its state, read what it holds. The result is the \
+         app's own answer. If you do not know the tool ids or their \
+         arguments, call list_mini_app_tools first."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "tool": {
+                    "type": "string",
+                    "description": "The `tool` id from list_mini_app_tools (or the app's own name for it).",
+                },
+                "arguments": {
+                    "type": "object",
+                    "description": "Arguments for the tool, matching its declared arguments.",
+                },
+            },
+            "required": ["tool"],
+            "additionalProperties": false,
+        })
+    }
+
+    fn call(&self, arguments: &Map<String, Value>) -> Result<String, String> {
+        let tool = arguments
+            .get("tool")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| "`call_mini_app_tool` needs a non-empty string `tool`".to_string())?
+            .to_string();
+        let tool_arguments = match arguments.get("arguments") {
+            None | Some(Value::Null) => Map::new(),
+            Some(Value::Object(map)) => map.clone(),
+            Some(_) => return Err("`arguments` must be a JSON object".to_string()),
+        };
+        self.host.call_mini_app_tool(&tool, tool_arguments)
+    }
+}
+
 /// `send_message` — post an agent-authored message to the session's room.
 ///
 /// This is how the agent talks to the user. It exists so a session can reply
@@ -979,6 +1109,10 @@ pub fn register_session_tools(server: &mut a2app_agent::mcp::McpServer, host: Ar
     server.add_tool(LaunchSplashAppTool::new(host.clone()));
     server.add_tool(ListAppsTool::new(host.clone()));
     server.add_tool(LaunchAppTool::new(host.clone()));
+    // The stable bridge to tools mini-apps register at runtime: an agent that
+    // learned its tool list once can still discover and call them.
+    server.add_tool(ListMiniAppToolsTool::new(host.clone()));
+    server.add_tool(CallMiniAppToolTool::new(host.clone()));
     // Ungated native tools (the agent's own room plumbing).
     server.add_tool(ReadRoomMemoryTool::new(host.clone()));
     server.add_tool(SendMessageTool::new(host.clone()));

@@ -82,6 +82,23 @@ impl AiHost for RecordingHost {
         Ok(json!({"app_id": app_id, "name": "Smoke App", "status": "running"}).to_string())
     }
 
+    fn list_mini_app_tools(&self) -> Result<String, String> {
+        self.calls.lock().unwrap().push("list_mini_app_tools()".to_string());
+        Ok(json!({"tools": []}).to_string())
+    }
+
+    fn call_mini_app_tool(
+        &self,
+        tool: &str,
+        arguments: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<String, String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("call_mini_app_tool({tool:?}, {arguments:?})"));
+        Ok("ok".to_string())
+    }
+
     fn post_room_message(&self, room: &str, text: &str) -> Result<String, String> {
         self.calls
             .lock()
@@ -146,6 +163,8 @@ async fn an_rmcp_client_lists_and_calls_robrix_tools_over_the_relay() {
     assert!(names.iter().any(|n| n == "launch_splash_app"), "tools advertised: {names:?}");
     assert!(names.iter().any(|n| n == "list_apps"), "tools advertised: {names:?}");
     assert!(names.iter().any(|n| n == "launch_app"), "tools advertised: {names:?}");
+    assert!(names.iter().any(|n| n == "list_mini_app_tools"), "tools advertised: {names:?}");
+    assert!(names.iter().any(|n| n == "call_mini_app_tool"), "tools advertised: {names:?}");
 
     // send_message round trip through rmcp -> relay -> socket -> host.
     let mut params = CallToolRequestParams::new("send_message");

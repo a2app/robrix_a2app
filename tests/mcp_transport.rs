@@ -100,6 +100,31 @@ impl AiHost for RecordingHost {
         .to_string())
     }
 
+    fn list_mini_app_tools(&self) -> Result<String, String> {
+        self.calls.lock().unwrap().push("list_mini_app_tools()".to_string());
+        Ok(json!({
+            "tools": [{
+                "tool": "app_smoke-app_play",
+                "name": "play",
+                "description": "Plays a move on the board",
+                "args": [{"name": "move", "type": "string", "description": "the move"}],
+            }],
+        })
+        .to_string())
+    }
+
+    fn call_mini_app_tool(
+        &self,
+        tool: &str,
+        arguments: serde_json::Map<String, Value>,
+    ) -> Result<String, String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("call_mini_app_tool({tool:?}, {arguments:?})"));
+        Ok(json!({"result": "ok"}).to_string())
+    }
+
     fn send_room_message(&self, text: &str) -> Result<String, String> {
         self.calls
             .lock()
@@ -342,6 +367,8 @@ fn a_full_mcp_session_over_the_relay_child() {
             "launch_splash_app",
             "list_apps",
             "launch_app",
+            "list_mini_app_tools",
+            "call_mini_app_tool",
             "read_room_memory",
             "send_message",
             "post_room_message",
@@ -390,6 +417,21 @@ fn a_full_mcp_session_over_the_relay_child() {
     assert_eq!(launched["app_id"], "smoke-app");
     assert_eq!(launched["status"], "running");
 
+    // list_mini_app_tools: the stub host's tool list comes back verbatim.
+    let result = client.request("tools/call", json!({"name": "list_mini_app_tools", "arguments": {}}));
+    assert_eq!(result["isError"], false);
+    let listed_tools: Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(listed_tools["tools"][0]["tool"], "app_smoke-app_play");
+
+    // call_mini_app_tool: the id and arguments reach the host.
+    let result = client.request(
+        "tools/call",
+        json!({"name": "call_mini_app_tool", "arguments": {"tool": "app_smoke-app_play", "arguments": {"move": "center"}}}),
+    );
+    assert_eq!(result["isError"], false);
+    assert_eq!(result["content"][0]["text"], "{\"result\":\"ok\"}");
+
     // The host (this process) saw every call with the model's arguments.
     let calls = host.calls();
     assert_eq!(
@@ -399,6 +441,8 @@ fn a_full_mcp_session_over_the_relay_child() {
             "send_message(\"hello room\")".to_string(),
             "list_apps()".to_string(),
             "launch_app(\"smoke-app\")".to_string(),
+            "list_mini_app_tools()".to_string(),
+            "call_mini_app_tool(\"app_smoke-app_play\", {\"move\": String(\"center\")})".to_string(),
         ]
     );
 

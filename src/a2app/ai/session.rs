@@ -60,6 +60,22 @@ pub enum SessionJob {
     /// generates; the runtime looks the id up and refuses if it is not
     /// available here.
     LaunchApp { app_id: String, answer: Sender<Result<String, String>> },
+    /// `list_mini_app_tools`: read the tools the mini-apps in this room have
+    /// registered, as JSON the model reads before calling
+    /// [`SessionJob::CallMiniAppTool`]. Pure UI-thread metadata; answered
+    /// immediately.
+    ListMiniAppTools { answer: Sender<Result<String, String>> },
+    /// `call_mini_app_tool`: invoke one registered app tool through the
+    /// stable bridge — the tool every session advertises from the start, so
+    /// an agent that discovered its tool list once can still reach tools
+    /// registered later. In effect identical to
+    /// [`SessionJob::InvokeMiniAppTool`]; kept distinct so the turn card
+    /// matches the name the agent actually reports.
+    CallMiniAppTool {
+        tool: String,
+        arguments: Map<String, Value>,
+        answer: Sender<Result<String, String>>,
+    },
     /// `send_message`: post plain text into the session's room.
     SendRoomMessage { text: String, answer: Sender<Result<String, String>> },
     /// `post_room_message`: post text into ANOTHER joined room as an
@@ -134,6 +150,34 @@ impl AiHost for SessionHost {
         answer_rx
             .recv()
             .map_err(|_| "this session ended before the app list was read".to_string())?
+    }
+
+    fn list_mini_app_tools(&self) -> Result<String, String> {
+        let (answer_tx, answer_rx) = channel();
+        self.jobs
+            .send(SessionJob::ListMiniAppTools { answer: answer_tx })
+            .map_err(|_| "this session's UI thread is gone".to_string())?;
+        answer_rx
+            .recv()
+            .map_err(|_| "this session ended before the tool list was read".to_string())?
+    }
+
+    fn call_mini_app_tool(
+        &self,
+        tool: &str,
+        arguments: Map<String, Value>,
+    ) -> Result<String, String> {
+        let (answer_tx, answer_rx) = channel();
+        self.jobs
+            .send(SessionJob::CallMiniAppTool {
+                tool: tool.to_string(),
+                arguments,
+                answer: answer_tx,
+            })
+            .map_err(|_| "this session's UI thread is gone".to_string())?;
+        answer_rx
+            .recv()
+            .map_err(|_| "this session ended before the app tool answered".to_string())?
     }
 
     fn launch_app(&self, app_id: &str) -> Result<String, String> {

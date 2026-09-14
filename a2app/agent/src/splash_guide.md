@@ -352,6 +352,50 @@ Register and withdraw tools with `host.request`:
   built-in tool or another app's.
 - `"mcp.tools.unregister"`: `{name}` -> `{}`.
 
+There is no `host.mcp` object and no `register(...)` method: the ONLY way to
+register is the service call below, with the service name as the first
+argument. A complete, compilable registration (this is what the host expects,
+character for character):
+
+```splash
+// permissions: mcp-tools
+// why-mcp-tools: Lets the AI in this room read the board and play its moves.
+
+fn register_tools(){
+    host.request("mcp.tools.register", {
+        name: "ttt_play",
+        description: "Play one move on the tic-tac-toe board.",
+        args: [
+            {name: "cell", type: "integer", description: "Board cell 0-8, left to right, top to bottom"}
+        ]
+    }, fn(r){
+        if !r.is_ok {
+            ui.note.set_text("The AI can't play yet: " + r.error)
+        }
+        return nil
+    })
+    host.request("mcp.tools.register", {
+        name: "ttt_board",
+        description: "Return the current board as JSON.",
+        args: []
+    }, fn(r){
+        if !r.is_ok {
+            ui.note.set_text("The AI can't read the board: " + r.error)
+        }
+        return nil
+    })
+}
+
+// Boot: register once the app is up. `on_permissions_changed` is NOT called
+// at startup — only after a grant changes — so the boot timeout is what
+// registers on open, and the hook re-registers after any grant/revoke.
+let _boot = start_timeout(0.05, || register_tools())
+fn on_permissions_changed(caps){ register_tools() }
+```
+
+Register every tool from those two places only: never from a button or a
+timer that repeats, or the same tool is re-submitted over and over.
+
 The AI's call arrives as a top-level hook carrying BOTH the model-facing name
 (`tool`) and your own name (`name`), so route on `name`:
 
@@ -367,16 +411,27 @@ fn on_tool_call(json){
     host.request("mcp.tools.result",
         {call_id: ev.call_id, ok: false, result: "unknown tool"}, on_result)
 }
-fn on_result(r){ if !r.is_ok { ui.note.set_text(r.error) } }
+fn on_result(r){
+    if !r.is_ok {
+        ui.note.set_text(r.error)
+    }
+    return nil
+}
 ```
+
+Every callback body ends with a statement (`return nil`), never with an `if`:
+a callback that is JUST a final `if` lands in expression position and fails
+to compile. The `return nil` above is not decoration — it is what makes the
+function parse.
 
 Rules:
 - Answer EVERY call exactly once with `"mcp.tools.result"`
   `{call_id, ok, result}`; `result` becomes the text the model reads (a JSON
   string is ideal). The model waits up to ~20 seconds, so answer promptly.
-- Register on boot and again from `on_permissions_changed`; a refusal is
-  `r.is_ok == false` with the reason. If the user denies, tell them in the app
-  and keep working — never assume the AI can call.
+- Register on boot with a `start_timeout(0.05, ...)` (as above) and again
+  from `on_permissions_changed`; a refusal is `r.is_ok == false` with the
+  reason. If the user denies, tell them in the app and keep working — never
+  assume the AI can call.
 - At most 16 tools; names may use letters, digits, `_` and `-`; descriptions
   may be up to 1200 characters.
 - `mcp.tools.result` is ungated plumbing; only `mcp-tools` (registration and
@@ -409,7 +464,10 @@ fn on_invite_received(json){ load() }        // {room_id, name, inviter_id, invi
 fn on_unread_totals_changed(json){ load() }  // {unread, mentions}
 fn watch(){
     host.request("events.subscribe", {event: "on_room_message"}, fn(r){
-        if !r.is_ok { ui.status.set_text("Live updates are off: " + r.error) }
+        if !r.is_ok {
+            ui.status.set_text("Live updates are off: " + r.error)
+        }
+        return nil
     })
 }
 ```
@@ -487,6 +545,8 @@ Two doorways:
   `"share"`, `"files.pick"`/`"files.save"`, `"auth.check"`,
   `"ipc.send"` (`{to: "self"}` is free of any permission; receivers define
   top-level `fn on_ipc_message(from, data)`, data is a JSON string),
+  `"mcp.tools.register"` / `"mcp.tools.unregister"` (see "Letting the AI call
+  your app" — no other API registers tools),
   `"permissions.query"`, `"permissions.request"`, the `"nav.*"` and
   `"composer.*"` services (see Acting inside Robrix below).
   `host.capabilities()` / `host.has("network")` report current grants.
@@ -775,7 +835,10 @@ user still presses Send:
 fn open_member(i){
     if i >= items.len() { return nil }
     host.request("nav.user", {user_id: items[i].user_id}, fn(r){
-        if !r.is_ok { ui.header.set_text(r.error) }
+        if !r.is_ok {
+            ui.header.set_text(r.error)
+        }
+        return nil
     })
 }
 ```
