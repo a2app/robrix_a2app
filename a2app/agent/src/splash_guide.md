@@ -405,11 +405,11 @@ fn on_tool_call(json){
     if ev.name == "ttt_play" {
         // ... validate ev.arguments.cell, update the UI ...
         host.request("mcp.tools.result",
-            {call_id: ev.call_id, ok: true, result: state.to_json()}, on_result)
+            {call_id: ev.call_id, "ok": true, result: state.to_json()}, on_result)
         return nil
     }
     host.request("mcp.tools.result",
-        {call_id: ev.call_id, ok: false, result: "unknown tool"}, on_result)
+        {call_id: ev.call_id, "ok": false, result: "unknown tool"}, on_result)
 }
 fn on_result(r){
     if !r.is_ok {
@@ -426,8 +426,11 @@ function parse.
 
 Rules:
 - Answer EVERY call exactly once with `"mcp.tools.result"`
-  `{call_id, ok, result}`; `result` becomes the text the model reads (a JSON
+  `{call_id, "ok", result}`; `result` becomes the text the model reads (a JSON
   string is ideal). The model waits up to ~20 seconds, so answer promptly.
+- **The result key `ok` MUST be quoted**: `{"ok": true}`, never `ok: true`.
+  `ok` is a keyword, so an unquoted `ok:` parses as an ok-test followed by a
+  stray `:` and fails validation ("Expected expression … found Operator(:)").
 - Register on boot with a `start_timeout(0.05, ...)` (as above) and again
   from `on_permissions_changed`; a refusal is `r.is_ok == false` with the
   reason. If the user denies, tell them in the app and keep working — never
@@ -612,7 +615,8 @@ Landmines in callback-heavy code (each cost a debug cycle):
 - `.to_chars()` yields CHAR CODES (numbers), not characters — build strings
   with `.split("...")`, never by concatenating to_chars output.
 - The result field is `r.is_ok`, never `r.ok`: `ok` is a keyword and `r.ok`
-  is not a field access.
+  is not a field access. The same word is a keyword as an OBJECT KEY too:
+  write `{"ok": true}` (quoted), never `ok: true`.
 
 ## Matrix services (Robrix)
 
