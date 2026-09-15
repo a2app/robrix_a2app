@@ -3534,6 +3534,8 @@ impl RoomScreen {
         // pane doesn't remain shown when this RoomScreen is reused for a new room.
         self.user_profile_sliding_pane(cx, ids!(user_profile_sliding_pane)).reset(cx);
 
+        self.room_input_popup_menu(cx, ids!(room_input_popup_menu)).close(cx);
+
         self.room_name_id = Some(room_name_id.clone());
         self.timeline_kind = Some(timeline_kind.clone());
 
@@ -3577,8 +3579,12 @@ impl RoomScreen {
             use crate::a2app::dock::MiniAppDockWidgetExt;
             self.view.mini_app_dock(cx, ids!(mini_app_dock)).set_room(cx, None, "");
         }
-        // Dropping the loading pane state cancels any in-progress event search.
-        self.loading_pane(cx, ids!(loading_pane)).hide(cx);
+
+        // Close all overlay views before this screen is reused for another room.
+        self.loading_pane(cx, ids!(loading_pane)).hide(cx); // also cancels an in-progress search
+        self.user_profile_sliding_pane(cx, ids!(user_profile_sliding_pane)).reset(cx);
+        self.room_input_popup_menu(cx, ids!(room_input_popup_menu)).close(cx);
+
         self.room_name_id = None;
         self.timeline_kind = None;
         self.pinned_events.clear();
