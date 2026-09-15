@@ -416,6 +416,10 @@ pub struct AccessRecord {
 /// doing lately" without turning permissions.json's sibling into a log file.
 pub const MAX_ACCESS_RECORDS: usize = 240;
 
+/// The current [`PermissionStore`] schema. Bump it when a stored grant's
+/// meaning changes, and extend [`PermissionStore::migrate`].
+pub const PERMISSIONS_SCHEMA: u32 = 1;
+
 /// All grants, keyed app id -> permission id. Owned by the host, persisted
 /// whole-file on every change (it is tiny, and a lost file just re-asks).
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -452,6 +456,11 @@ pub struct PermissionStore {
     /// switch-gated write is refused without a prompt until the user turns it on.
     #[serde(default)]
     matrix_write: bool,
+    /// Persisted schema version, bumped when a stored grant's *meaning*
+    /// changes so [`Self::migrate`] can rewrite old files. Defaults to 0 for
+    /// files written before the field existed (and for a fresh store).
+    #[serde(default)]
+    schema: u32,
     /// Per-subject allowlists of rooms the subject may post messages into as
     /// the user (the AI-room agent's per-room grants for
     /// `matrix.rooms.message.send`). Keyed by subject (an app id or an agent
@@ -463,6 +472,18 @@ pub struct PermissionStore {
     /// listed here too.
     #[serde(default)]
     send_rooms: BTreeMap<String, BTreeSet<String>>,
+    /// Per-subject allowlists of rooms the subject may READ messages from,
+    /// beyond the room it is attached to (the AI-room agent's per-room grants
+    /// for `matrix.rooms.messages.read`). Keyed by subject (an app id or an
+    /// agent key, see [`agent_subject`]) then room id. A room grant is
+    /// specific to that room: it is what lets one target room be allowed
+    /// without unlocking every room, the way a group grant would. The group
+    /// grant still answers first — a group `Denied` kills the capability
+    /// entirely — but a group `Granted` alone does NOT allow a room; the room
+    /// must be listed here too. Mirrors `send_rooms`, because reading a room
+    /// is at least as sensitive as posting into it.
+    #[serde(default)]
+    read_rooms: BTreeMap<String, BTreeSet<String>>,
     /// Per-subject allowlists of internet hosts the subject may reach (the
     /// AI-room agent's per-URL grants for `network.http`). Keyed by subject
     /// (an app id or an agent key, see [`agent_subject`]) then host. A host
@@ -585,6 +606,26 @@ impl PermissionStore {
         self.matrix_write = on;
     }
 
+    /// Rewrites grants whose *meaning* changed across schema versions.
+    ///
+    /// Schema 1 made cross-room reads per-room (`read_rooms`) instead of a
+    /// blanket `matrix-rooms-read` group grant. A blanket grant written by the
+    /// old cross-room read prompt must not keep unlocking every room the agent
+    /// names, so it is reset to `Ask` and the per-room prompt re-asks. A
+    /// post-upgrade panel “allow all rooms” is written at schema 1 and kept.
+    pub fn migrate(&mut self) {
+        if self.schema >= PERMISSIONS_SCHEMA {
+            return;
+        }
+        let key = Permission::MatrixRoomsRead.as_str();
+        for grants in self.grants.values_mut() {
+            if grants.get(key).copied() == Some(GrantState::Granted) {
+                grants.insert(key.to_string(), GrantState::Ask);
+            }
+        }
+        self.schema = PERMISSIONS_SCHEMA;
+    }
+
     /// Whether `subject` may post messages into `room` as the user — one
     /// room at a time (see `send_rooms`). A room is allowed only when the
     /// user explicitly allowed THAT room; group grants do not unlock rooms.
@@ -613,6 +654,39 @@ impl PermissionStore {
     /// All rooms `subject` may post into (for a per-room management UI).
     pub fn room_send_grants(&self, subject: &str) -> Vec<String> {
         self.send_rooms
+            .get(subject)
+            .map(|rooms| rooms.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether `subject` may read messages from `room` — one room at a time
+    /// (see `read_rooms`). A room is allowed only when the user explicitly
+    /// allowed THAT room; group grants do not unlock rooms.
+    pub fn is_room_read_allowed(&self, subject: &str, room: &str) -> bool {
+        self.read_rooms
+            .get(subject)
+            .is_some_and(|rooms| rooms.contains(room))
+    }
+
+    /// Records that `subject` may read messages from `room` (durable, like the
+    /// group grants). A no-op when already allowed.
+    pub fn allow_room_read(&mut self, subject: &str, room: &str) {
+        self.read_rooms
+            .entry(subject.to_string())
+            .or_default()
+            .insert(room.to_string());
+    }
+
+    /// Removes `subject`'s per-room read grant for `room`, if any.
+    pub fn disallow_room_read(&mut self, subject: &str, room: &str) {
+        if let Some(rooms) = self.read_rooms.get_mut(subject) {
+            rooms.remove(room);
+        }
+    }
+
+    /// All rooms `subject` may read from (for a per-room management UI).
+    pub fn room_read_grants(&self, subject: &str) -> Vec<String> {
+        self.read_rooms
             .get(subject)
             .map(|rooms| rooms.iter().cloned().collect())
             .unwrap_or_default()
@@ -1283,6 +1357,46 @@ mod tests {
         // Revoke.
         store.disallow_room_send(subject, "!x:example.org");
         assert!(!store.is_room_send_allowed(subject, "!x:example.org"));
+    }
+
+    #[test]
+    fn room_read_grants_are_per_room_and_independent_of_group_grants() {
+        let mut store = PermissionStore::default();
+        let subject = "ai-room:!a:example.org";
+        // Nothing allowed until a room is explicitly granted.
+        assert!(!store.is_room_read_allowed(subject, "!x:example.org"));
+        assert!(store.room_read_grants(subject).is_empty());
+        // A group grant alone must NOT unlock any room (per-room semantics).
+        store.set(subject, Permission::MatrixRoomsRead, GrantState::Granted);
+        assert!(!store.is_room_read_allowed(subject, "!x:example.org"));
+        // Granting one room covers exactly that room.
+        store.allow_room_read(subject, "!x:example.org");
+        assert!(store.is_room_read_allowed(subject, "!x:example.org"));
+        assert!(!store.is_room_read_allowed(subject, "!y:example.org"));
+        assert_eq!(store.room_read_grants(subject), vec!["!x:example.org".to_string()]);
+        // Subjects are namespaced: another agent's grants don't leak.
+        let other = "ai-room:!b:example.org";
+        assert!(!store.is_room_read_allowed(other, "!x:example.org"));
+        store.allow_room_read(other, "!y:example.org");
+        assert!(store.is_room_read_allowed(other, "!y:example.org"));
+        assert!(!store.is_room_read_allowed(subject, "!y:example.org"));
+        // Revoke.
+        store.disallow_room_read(subject, "!x:example.org");
+        assert!(!store.is_room_read_allowed(subject, "!x:example.org"));
+    }
+
+    #[test]
+    fn migrate_resets_the_old_blanket_cross_room_read_grant() {
+        let mut store = PermissionStore::default();
+        let subject = "ai-room:!a:example.org";
+        // A grant written by the pre-per-room build means "all rooms".
+        store.set(subject, Permission::MatrixRoomsRead, GrantState::Granted);
+        store.migrate();
+        assert_eq!(store.state(subject, Permission::MatrixRoomsRead), GrantState::Ask);
+        // Migration runs once: a deliberate post-upgrade panel grant survives.
+        store.set(subject, Permission::MatrixRoomsRead, GrantState::Granted);
+        store.migrate();
+        assert_eq!(store.state(subject, Permission::MatrixRoomsRead), GrantState::Granted);
     }
 
     #[test]

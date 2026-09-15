@@ -6340,10 +6340,18 @@ fn populate_other_message_like(
     )
 }
 
-/// The latest snapshot content for the `ai_turn` turn that begins at or after
-/// `idx` (inclusive). The anchor row calls this so its card shows the turn's
-/// current state while staying put as newer snapshots arrive. Scans forward
-/// and stops at the first `ai_turn` belonging to a different turn.
+/// The newest snapshot content for the `ai_turn` `turn`, at or after `idx`.
+///
+/// A turn's snapshots are written as async network requests under one state
+/// key, so `origin_server_ts` order (and therefore timeline order) can differ
+/// from the order they were produced: the last same-turn row in the timeline
+/// is not necessarily the newest, which made the card's tool count and status
+/// flicker backwards. The snapshots of one turn are written back-to-back, so
+/// this scans outward from the anchor and stops at the first `ai_turn` of a
+/// different turn, keeping the one with the highest `seq` (later timeline
+/// position wins a tie, the fallback for rows written before `seq`). The
+/// backward pass catches the rare case where a later snapshot was ordered
+/// before the anchor by the server.
 #[cfg(feature = "a2app")]
 fn ai_turn_latest(
     items: &Vector<Arc<TimelineItem>>,
@@ -6351,29 +6359,52 @@ fn ai_turn_latest(
     turn: &str,
 ) -> Option<crate::a2app::ai_room_events::AiTurnContent> {
     use crate::a2app::ai_room_events::{AI_TURN_EVENT_TYPE, AiTurnContent};
-    let mut latest = None;
-    for item in items.iter().skip(idx) {
-        let TimelineItemKind::Event(event) = item.kind() else { continue };
-        let TimelineItemContent::OtherState(other) = event.content() else { continue };
+    let parse = |item: &Arc<TimelineItem>| -> Option<AiTurnContent> {
+        let TimelineItemKind::Event(event) = item.kind() else { return None };
+        let TimelineItemContent::OtherState(other) = event.content() else { return None };
         let timeline::AnyOtherStateEventContentChange::_Custom { event_type } = other.content()
         else {
-            continue;
+            return None;
         };
         if event_type != AI_TURN_EVENT_TYPE {
-            continue;
+            return None;
         }
-        match event
+        event
             .latest_json()
             .and_then(|raw| raw.deserialize_as::<serde_json::Value>().ok())
             .and_then(|v| v.get("content").cloned())
             .and_then(|c| serde_json::from_value::<AiTurnContent>(c).ok())
-        {
-            Some(c) if c.turn == turn => latest = Some(c),
-            Some(_) => break, // a later turn's snapshot
-            None => {}
+    };
+    let mut best: Option<AiTurnContent> = None;
+    for item in items.iter().skip(idx) {
+        let Some(content) = parse(item) else { continue };
+        if content.turn != turn {
+            // A different turn's snapshot ends this turn's contiguous run.
+            // (Only break once we have the turn itself; an anchor that failed
+            // to parse should not swallow the same-turn snapshots after it.)
+            if best.is_some() {
+                break;
+            }
+            continue;
+        }
+        // Forward: a later timeline position wins a `seq` tie, which is the
+        // right fallback for rows written before `seq` existed.
+        if best.as_ref().is_none_or(|prev| content.seq >= prev.seq) {
+            best = Some(content);
         }
     }
-    latest
+    for item in items.iter().take(idx).rev() {
+        let Some(content) = parse(item) else { continue };
+        if content.turn != turn {
+            break;
+        }
+        // Backward: only a STRICTLY newer `seq` may override, so an equal-`seq`
+        // legacy row closer to the anchor (a later timeline position) is kept.
+        if best.as_ref().is_none_or(|prev| content.seq > prev.seq) {
+            best = Some(content);
+        }
+    }
+    best
 }
 
 /// Whether the `ai_turn` row at `idx` is the latest snapshot of its turn.
@@ -6481,10 +6512,14 @@ fn populate_other_state_event(
                     content.status = AiTurnStatus::Done;
                 }
             }
-            let (item, existed) = list.item_with_existed(cx, item_id, id!(AiTurnTimelineCard));
-            if !(existed && item_drawn_status.content_drawn) {
-                item.as_ai_turn_timeline_card().populate(cx, render.as_ref());
-            }
+            let (item, _existed) = list.item_with_existed(cx, item_id, id!(AiTurnTimelineCard));
+            // Always repopulate: the card lives on the turn's anchor row, but
+            // its content comes from the turn's newest snapshot, which lands
+            // on a LATER timeline row. The anchor item itself never changes,
+            // so the timeline's drawn-item cache would otherwise leave the
+            // card stale (a thinking-only card would never show its tool
+            // calls). `populate` no-ops cheaply when the snapshot is unchanged.
+            item.as_ai_turn_timeline_card().populate(cx, render.as_ref());
             return (item, ItemDrawnStatus::both_drawn());
         }
         let (item, existed) = list.item_with_existed(cx, item_id, id!(AiEventTimelineCard));

@@ -252,6 +252,13 @@ struct ActiveTurn {
     key: String,
     /// The turn's tool calls, in the order they started.
     tool_calls: Vec<AiTurnToolCall>,
+    /// Whether the model is reasoning on this turn right now (a `Thought`
+    /// stream is live), rendered as the card's leading body line.
+    thinking: bool,
+    /// Monotonic snapshot counter, bumped on every rewrite. The writes race
+    /// over the network, so this is what lets the renderer pick the newest
+    /// snapshot regardless of the order the server applied them in.
+    seq: u64,
     /// Milliseconds since the epoch, fixed for the turn and reused on every
     /// rewrite so the row's timestamp is stable.
     created_at: u64,
@@ -287,6 +294,27 @@ pub struct AiRoomInfo {
     /// working and closed when its reply (or error) lands. `None` before the
     /// turn's first tool call and between turns.
     active_turn: Option<ActiveTurn>,
+    /// The newest `ai_turn` snapshot waiting to be written, coalesced: a burst
+    /// of turn activity (thinking, each tool start/detail/finish) keeps only
+    /// the latest snapshot here until the previous write completes and the
+    /// rate-limit cooldown passes. A single state-event write is then sent,
+    /// instead of one per update — matrix.org rate-limits state events hard
+    /// (429 M_LIMIT_EXCEEDED), and a turn can otherwise produce dozens.
+    pending_ai_turn: Option<(String, AiTurnContent)>,
+    /// Whether an `ai_turn` write for this room is in flight. Cleared by
+    /// [`AiRoomAction::StateEventPosted`]; no further `ai_turn` write is sent
+    /// while it is set, so the SDK's own 429 retries are not compounded.
+    ai_turn_in_flight: bool,
+    /// When this room's last `ai_turn` write was submitted, so writes are
+    /// spaced under the server's state-event rate limit.
+    last_ai_turn_post: Option<Instant>,
+    /// The current minimum spacing between this room's `ai_turn` writes. It
+    /// starts at [`AI_TURN_POST_MIN_INTERVAL`], doubles (up to
+    /// [`AI_TURN_POST_MAX_INTERVAL`]) whenever the homeserver rejects a write
+    /// as rate-limited, and halves back down on success — so it converges on
+    /// whatever state-event budget the server actually enforces instead of
+    /// relying on a hard-coded guess.
+    ai_turn_backoff: Duration,
     /// What the room's busy/queued status row last showed. Compared against
     /// the live session each event pass, so the row redraws only when its
     /// state actually changes (and hides once the agent goes idle).
@@ -378,6 +406,11 @@ pub struct A2AppState {
     /// stops producing events (see [`crate::a2app_agent::pipeline`]'s
     /// `STALL_SECS`). Stopped once no generation is live.
     generation_timer: Option<Timer>,
+    /// Timer that wakes the runtime to flush coalesced `ai_turn` state-event
+    /// writes while any room still has a pending snapshot or a write in
+    /// flight.
+    #[cfg(unix)]
+    ai_turn_flush_timer: Option<Timer>,
 }
 
 impl A2AppState {
@@ -459,6 +492,8 @@ pub fn init() {
             last_persist: Instant::now(),
             last_timed_check: Instant::now(),
             generation_timer: None,
+            #[cfg(unix)]
+            ai_turn_flush_timer: None,
         });
     });
 }
@@ -2772,14 +2807,23 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
             #[cfg(unix)]
             ParkedRequest::AiTool { room_id, job } => {
                 if granted {
-                    // Per-room grants for cross-room posts: an Allow unlocks
-                    // exactly the target room, so record it before re-running
-                    // the job (its gate now lets it through).
-                    if let SessionJob::PostRoomMessage { room_id: target, .. } = &job {
-                        with_a2app(|state| {
-                            state.permissions.allow_room_send(&subject, target);
-                            state.perms_dirty = true;
-                        });
+                    // Per-room grants for cross-room posts and reads: an Allow
+                    // unlocks exactly the target room, so record it before
+                    // re-running the job (its gate now lets it through).
+                    match &job {
+                        SessionJob::PostRoomMessage { room_id: target, .. } => {
+                            with_a2app(|state| {
+                                state.permissions.allow_room_send(&subject, target);
+                                state.perms_dirty = true;
+                            });
+                        }
+                        SessionJob::ReadTool { kind: ReadToolKind::OtherRoom { room, .. }, .. } => {
+                            with_a2app(|state| {
+                                state.permissions.allow_room_read(&subject, room);
+                                state.perms_dirty = true;
+                            });
+                        }
+                        _ => {}
                     }
                     // The grant is stored above; re-run the session job so its
                     // own gate now lets it through to the real work.
@@ -2787,11 +2831,15 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
                 } else {
                     // Denied: the call is refused with a receipt naming it, so
                     // the turn's card shows the AI was stopped from doing it
-                    // (and its live tool row is rewritten Done). A cross-room
-                    // post is denied PER ROOM: reset the group to Ask so one
-                    // room's refusal does not silently block every other room
-                    // the agent might name later.
-                    if matches!(job, SessionJob::PostRoomMessage { .. }) {
+                    // (and its live tool row is rewritten Done). Cross-room
+                    // posts and reads are denied PER ROOM: reset the group to
+                    // Ask so one room's refusal does not silently block every
+                    // other room the agent might name later.
+                    if matches!(
+                        job,
+                        SessionJob::PostRoomMessage { .. }
+                            | SessionJob::ReadTool { kind: ReadToolKind::OtherRoom { .. }, .. }
+                    ) {
                         with_a2app(|state| {
                             state.permissions.set(&subject, perm, GrantState::Ask);
                             state.perms_dirty = true;
@@ -3087,7 +3135,7 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
                 state
                     .ai_rooms
                     .entry(room_id)
-                    .or_insert(AiRoomInfo { cursor: None, posted_by_tool_this_turn: false, read_burst: 0, read_window_started: None, session_on: true, pending_tool_calls: Vec::new(), active_turn: None, status_busy: false, status_queued: 0 });
+                    .or_insert(AiRoomInfo { cursor: None, posted_by_tool_this_turn: false, read_burst: 0, read_window_started: None, session_on: true, pending_tool_calls: Vec::new(), active_turn: None, pending_ai_turn: None, ai_turn_in_flight: false, last_ai_turn_post: None, ai_turn_backoff: AI_TURN_POST_MIN_INTERVAL, status_busy: false, status_queued: 0 });
             });
         }
         AiRoomAction::CreateFailed { error } => {
@@ -3108,7 +3156,7 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
         AiRoomAction::Attached { room_id, name, cursor } => {
             log!("AI Rooms: room {room_id} is an AI room (name: {name:?}, saved forwarding cursor: {cursor:?}); attaching session.");
             with_a2app(|state| {
-                state.ai_rooms.insert(room_id.clone(), AiRoomInfo { cursor, posted_by_tool_this_turn: false, read_burst: 0, read_window_started: None, session_on: true, pending_tool_calls: Vec::new(), active_turn: None, status_busy: false, status_queued: 0 });
+                state.ai_rooms.insert(room_id.clone(), AiRoomInfo { cursor, posted_by_tool_this_turn: false, read_burst: 0, read_window_started: None, session_on: true, pending_tool_calls: Vec::new(), active_turn: None, pending_ai_turn: None, ai_turn_in_flight: false, last_ai_turn_post: None, ai_turn_backoff: AI_TURN_POST_MIN_INTERVAL, status_busy: false, status_queued: 0 });
             });
             attach_ai_session(cx, ui, &room_id, name);
         }
@@ -3174,6 +3222,27 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
                     push_ai_tool_receipt(&room_id, read_tool_name(&kind), detail, ok, &summary);
                 }
                 let _ = answer.send(result);
+            }
+        }
+        AiRoomAction::StateEventPosted { room_id, event_type, success } => {
+            // Release the coalescing guard for this room's turn card so the
+            // next pending snapshot can be written (see
+            // `flush_pending_ai_turns`), and adapt the write spacing: a rate
+            // limit widens it, a success narrows it back. Other event types
+            // share this feedback but gate nothing.
+            if event_type.as_str() == AI_TURN_EVENT_TYPE {
+                with_a2app(|state| {
+                    if let Some(info) = state.ai_rooms.get_mut(&room_id) {
+                        info.ai_turn_in_flight = false;
+                        if success {
+                            info.ai_turn_backoff =
+                                (info.ai_turn_backoff / 2).max(AI_TURN_POST_MIN_INTERVAL);
+                        } else {
+                            info.ai_turn_backoff =
+                                (info.ai_turn_backoff * 2).min(AI_TURN_POST_MAX_INTERVAL);
+                        }
+                    }
+                });
             }
         }
     }
@@ -3806,11 +3875,13 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
                 match update {
                     SessionUpdate::Ready => log!("AI Rooms: room {room_id}'s agent session is ready."),
                     SessionUpdate::Thinking => {
-                        // First reasoning chunk of a turn: the chat gets a
-                        // "thinking…" row so a long quiet stretch reads as
-                        // the model working, not silence.
+                        // First reasoning chunk of a turn: the turn card is
+                        // opened (or updated) with a `thinking` marker, so a
+                        // turn that thinks before it calls a tool shows a warm
+                        // card from its very first activity instead of a
+                        // separate one-line row.
                         log!("AI Rooms: room {room_id}'s agent started thinking.");
-                        post_ai_activity(&room_id, AiActivityKind::Thinking, None);
+                        note_ai_turn_thinking(&room_id);
                     }
                     SessionUpdate::ToolCallStarted { name } => {
                         // Every tool call becomes its own `ai_tool_call`
@@ -3950,6 +4021,11 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
     if !status_changed.is_empty() {
         ui.redraw(cx);
     }
+
+    // 4. Emit at most one coalesced turn snapshot per room, spaced under the
+    //    homeserver's state-event rate limit. Any room whose write is still
+    //    in flight (or cooling down) keeps the flush timer armed.
+    flush_pending_ai_turns(cx);
 }
 
 /// Whether an AI room's profile declares one permission group: it does if any
@@ -4068,8 +4144,42 @@ fn run_ai_read_tool(
         return;
     }
     let subject = agent_subject(room_id.as_str());
-    let verdict =
-        with_a2app(|state| ai_capability_verdict(state, room_id, cap)).unwrap_or(Effective::Denied);
+    // Cross-room reads are granted PER ROOM, exactly like cross-room posts:
+    // the `matrix.rooms.messages.read` group is the kill switch and the prompt
+    // unit, but a group `Granted` alone must not unlock every room the agent
+    // names. Only the agent's own-room reads keep the ordinary group gate.
+    let target_room = match &kind {
+        ReadToolKind::OtherRoom { room, .. } => match OwnedRoomId::try_from(room.as_str()) {
+            Ok(target) => Some(target),
+            Err(_) => {
+                let err = format!("`{room}` is not a valid matrix room id");
+                note_ai_tool_call(room_id, read_tool_name(&kind), false, &err);
+                let _ = answer.send(Err(err));
+                return;
+            }
+        },
+        _ => None,
+    };
+    let verdict = match &target_room {
+        Some(target) => with_a2app(|state| {
+            let store = &state.permissions;
+            let group_state = cap.group.map(|g| store.state(&subject, g));
+            if group_state == Some(GrantState::Denied) {
+                Effective::Denied
+            } else if group_state == Some(GrantState::Granted) {
+                // The AI panel's explicit "allow all rooms" grant.
+                Effective::Granted
+            } else if store.is_room_read_allowed(&subject, target.as_str()) {
+                Effective::Granted
+            } else {
+                Effective::NeedsPrompt
+            }
+        })
+        .unwrap_or(Effective::Denied),
+        None => {
+            with_a2app(|state| ai_capability_verdict(state, room_id, cap)).unwrap_or(Effective::Denied)
+        }
+    };
     log!(
         "AI Rooms: room {}'s {} tool verdict: {:?}",
         room_id,
@@ -4078,15 +4188,11 @@ fn run_ai_read_tool(
     );
     match verdict {
         Effective::Granted => {
-            // A cross-room read is gated by the same group grant as any other
-            // read: once the user has allowed `matrix.rooms.messages.read`
-            // (prompted on the first read of a room outside this one), the
-            // AI may read any joined room it names. No allowlist to
-            // maintain.
-            //
-            // The group answered; record that the session actually used it —
-            // the same "Used" record a mini-app's granted call leaves, so the
-            // room's AI panel can show what it has been doing.
+            // A granted read records that the session actually used it — the
+            // same "Used" record a mini-app's granted call leaves, so the
+            // room's AI panel can show what it has been doing. (A cross-room
+            // read's allowance is the per-room entry the prompt wrote, not a
+            // blanket group grant.)
             if let Some(group) = cap.group {
                 with_a2app(|state| {
                     state.permissions.record_access(&subject, group, versions::now_unix());
@@ -5007,21 +5113,26 @@ fn push_ai_tool_receipt(
 #[cfg(unix)]
 fn finish_ai_tool_call(room_id: &OwnedRoomId, name: &str, ok: bool, summary: &str) -> Option<String> {
     let mut detail_out = None;
-    let posted = with_turn(room_id, AiTurnStatus::Running, false, |calls| {
+    let posted = with_turn(room_id, AiTurnStatus::Running, false, None, |calls| {
         let pos = calls
             .iter()
             .position(|c| c.name == name && c.status == AiTurnToolStatus::Started)
             .or_else(|| calls.iter().position(|c| c.name == name));
-        if let Some(pos) = pos {
-            let call = &mut calls[pos];
-            call.status = AiTurnToolStatus::Done;
-            call.ok = ok;
-            call.summary = summary.chars().take(48).collect();
-            detail_out = call.detail.clone();
-        }
+        let Some(pos) = pos else { return false };
+        let call = &mut calls[pos];
+        call.status = AiTurnToolStatus::Done;
+        call.ok = ok;
+        call.summary = summary.chars().take(48).collect();
+        detail_out = call.detail.clone();
+        true
     });
-    if let Some((key, content)) = posted {
-        post_ai_turn(room_id, &key, &content);
+    if let Some((key, content, changed)) = posted {
+        // A completion with no matching running call (e.g. the agent's own
+        // tool firing twice) changes nothing; skip the redundant rewrite so
+        // it does not race the real snapshots.
+        if changed {
+            post_ai_turn(room_id, &key, &content);
+        }
     }
     detail_out
 }
@@ -5038,27 +5149,47 @@ fn record_tool_call_detail(room_id: &OwnedRoomId, name: &str, detail: Option<Str
     if detail.is_none() {
         return;
     }
-    let posted = with_turn(room_id, AiTurnStatus::Running, true, |calls| {
-        if let Some(call) = calls.iter_mut().find(|c| c.name == name) {
-            call.detail = detail;
-        } else {
-            calls.push(AiTurnToolCall {
-                name: name.to_string(),
-                detail,
-                status: AiTurnToolStatus::Started,
-                ok: false,
-                summary: String::new(),
-            });
+    let posted = with_turn(room_id, AiTurnStatus::Running, true, Some(false), |calls| {
+        // Match the OLDEST still-running call with this name (mirroring
+        // `finish_ai_tool_call`), falling back to any call with the name so a
+        // job that lost the race to a `Done` rewrite can still fill in its
+        // detail. Matching by name alone picked the first call, so repeated
+        // tool names attached the detail to the wrong line.
+        let pos = calls
+            .iter()
+            .position(|c| c.name == name && c.status == AiTurnToolStatus::Started)
+            .or_else(|| calls.iter().position(|c| c.name == name));
+        match pos {
+            Some(pos) => {
+                if calls[pos].detail == detail {
+                    return false;
+                }
+                calls[pos].detail = detail;
+                true
+            }
+            None => {
+                calls.push(AiTurnToolCall {
+                    name: name.to_string(),
+                    detail,
+                    status: AiTurnToolStatus::Started,
+                    ok: false,
+                    summary: String::new(),
+                });
+                true
+            }
         }
     });
-    if let Some((key, content)) = posted {
-        post_ai_turn(room_id, &key, &content);
+    if let Some((key, content, changed)) = posted {
+        if changed {
+            post_ai_turn(room_id, &key, &content);
+        }
     }
 }
 
 /// Posts one `ai_activity` state row with a fresh key — an append-only
 /// marker in the room's transcript that the agent is doing something visible
-/// (thinking started, a turn error, the session stopping).
+/// (a turn error or the session stopping). `thinking` is not posted as an
+/// activity row: it lives inside the open turn's card.
 #[cfg(unix)]
 fn post_ai_activity(room_id: &OwnedRoomId, kind: AiActivityKind, label: Option<&str>) {
     let content = AiActivityContent {
@@ -5075,37 +5206,59 @@ fn post_ai_activity(room_id: &OwnedRoomId, kind: AiActivityKind, label: Option<&
 /// `execute_session_job` already opened it with its detail.
 #[cfg(unix)]
 fn on_ai_tool_call_started(room_id: &OwnedRoomId, name: &str) {
-    let posted = with_turn(room_id, AiTurnStatus::Running, true, |calls| {
-        if !calls
+    let posted = with_turn(room_id, AiTurnStatus::Running, true, Some(false), |calls| {
+        if calls
             .iter()
             .any(|c| c.name == name && c.status == AiTurnToolStatus::Started)
         {
-            calls.push(AiTurnToolCall {
-                name: name.to_string(),
-                detail: None,
-                status: AiTurnToolStatus::Started,
-                ok: false,
-                summary: String::new(),
-            });
+            return false;
         }
+        calls.push(AiTurnToolCall {
+            name: name.to_string(),
+            detail: None,
+            status: AiTurnToolStatus::Started,
+            ok: false,
+            summary: String::new(),
+        });
+        true
     });
-    if let Some((key, content)) = posted {
-        post_ai_turn(room_id, &key, &content);
+    if let Some((key, content, changed)) = posted {
+        if changed {
+            post_ai_turn(room_id, &key, &content);
+        }
+    }
+}
+
+/// Opens the turn's card on the model's first `Thought` (creating it if the
+/// turn had not started yet) and marks it `thinking`, so a turn that reasons
+/// before it calls a tool still shows a warm, spinning card with a
+/// `💭 Thinking…` line. Reposts only when the marker actually changed.
+#[cfg(unix)]
+fn note_ai_turn_thinking(room_id: &OwnedRoomId) {
+    let posted = with_turn(room_id, AiTurnStatus::Running, true, Some(true), |_| false);
+    if let Some((key, content, changed)) = posted {
+        if changed {
+            post_ai_turn(room_id, &key, &content);
+        }
     }
 }
 
 /// Runs `f` against this room's open turn, then returns the turn's state key
 /// and a fresh [`AiTurnContent`] snapshot to repost. When `create` is true a
-/// missing turn is minted first (the turn's first tool call); when false an
+/// missing turn is minted first (the turn's first activity); when false an
 /// absent turn yields `None` (an outcome for a call that never started must
-/// not conjure an empty card).
+/// not conjure an empty card). `thinking` sets the turn's reasoning marker
+/// when given. The closure returns whether it actually changed the tool list,
+/// which the caller uses to skip a redundant rewrite. The snapshot carries a
+/// bumped `seq` either way, so the renderer can always pick the newest.
 #[cfg(unix)]
 fn with_turn(
     room_id: &OwnedRoomId,
     status: AiTurnStatus,
     create: bool,
-    f: impl FnOnce(&mut Vec<AiTurnToolCall>),
-) -> Option<(String, AiTurnContent)> {
+    thinking: Option<bool>,
+    f: impl FnOnce(&mut Vec<AiTurnToolCall>) -> bool,
+) -> Option<(String, AiTurnContent, bool)> {
     with_a2app(|state| {
         let info = state.ai_rooms.get_mut(room_id)?;
         let created = create && info.active_turn.is_none();
@@ -5113,11 +5266,24 @@ fn with_turn(
             info.active_turn = Some(ActiveTurn {
                 key: next_ai_state_key("turn"),
                 tool_calls: Vec::new(),
+                thinking: false,
+                seq: 0,
                 created_at: ai_now_millis(),
             });
+            // A fresh turn starts from the base spacing; the adaptive backoff
+            // only widens it again if this turn's writes are rejected.
+            info.ai_turn_backoff = AI_TURN_POST_MIN_INTERVAL;
         }
         let turn = info.active_turn.as_mut()?;
-        f(&mut turn.tool_calls);
+        let mut changed = created;
+        if let Some(thinking) = thinking {
+            if turn.thinking != thinking {
+                turn.thinking = thinking;
+                changed = true;
+            }
+        }
+        changed |= f(&mut turn.tool_calls);
+        turn.seq = turn.seq.saturating_add(1);
         Some((
             turn.key.clone(),
             AiTurnContent {
@@ -5125,9 +5291,12 @@ fn with_turn(
                 turn: turn.key.clone(),
                 first: Some(created),
                 status,
+                seq: turn.seq,
+                thinking: turn.thinking,
                 tool_calls: turn.tool_calls.clone(),
                 created_at: turn.created_at,
             },
+            changed,
         ))
     })
     .flatten()
@@ -5140,7 +5309,11 @@ fn with_turn(
 fn close_active_turn(room_id: &OwnedRoomId) {
     let closed = with_a2app(|state| {
         let info = state.ai_rooms.get_mut(room_id)?;
-        let turn = info.active_turn.take()?;
+        let mut turn = info.active_turn.take()?;
+        // The final snapshot gets the highest `seq` of the turn, so it wins the
+        // renderer's newest-snapshot selection even if it lands before an
+        // earlier rewrite.
+        turn.seq = turn.seq.saturating_add(1);
         Some((
             turn.key.clone(),
             AiTurnContent {
@@ -5148,6 +5321,8 @@ fn close_active_turn(room_id: &OwnedRoomId) {
                 turn: turn.key.clone(),
                 first: Some(false),
                 status: AiTurnStatus::Done,
+                seq: turn.seq,
+                thinking: turn.thinking,
                 tool_calls: turn.tool_calls,
                 created_at: turn.created_at,
             },
@@ -5159,11 +5334,79 @@ fn close_active_turn(room_id: &OwnedRoomId) {
     }
 }
 
-/// Serializes one `ai_turn` row under `key` (reusing the key rewrites the
-/// same timeline row instead of appending a new one).
+/// The starting minimum spacing between `ai_turn` state-event writes for one
+/// room. matrix.org responds `429 M_LIMIT_EXCEEDED` to state events written
+/// faster than roughly this (`retry_after` was observed at 4s), and a busy
+/// turn can otherwise produce dozens of snapshots.
+#[cfg(unix)]
+const AI_TURN_POST_MIN_INTERVAL: Duration = Duration::from_secs(5);
+/// The upper bound the adaptive `ai_turn` write spacing backs off to when the
+/// homeserver keeps rejecting writes as rate-limited.
+#[cfg(unix)]
+const AI_TURN_POST_MAX_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Queues one `ai_turn` snapshot for this room, replacing any earlier pending
+/// one: only the newest snapshot matters, so coalescing a burst of turn
+/// updates into a single write is what keeps Robrix under the homeserver's
+/// state-event rate limit. The actual write happens in
+/// [`flush_pending_ai_turns`].
 #[cfg(unix)]
 fn post_ai_turn(room_id: &OwnedRoomId, key: &str, content: &AiTurnContent) {
-    post_ai_state_event(room_id, AI_TURN_EVENT_TYPE, key, content);
+    with_a2app(|state| {
+        if let Some(info) = state.ai_rooms.get_mut(room_id) {
+            info.pending_ai_turn = Some((key.to_string(), content.clone()));
+        }
+    });
+}
+
+/// Writes at most one coalesced `ai_turn` snapshot per room per its adaptive
+/// spacing (starting at [`AI_TURN_POST_MIN_INTERVAL`]), and only once the
+/// previous write has finished. Overlapping writes are what turned a single
+/// 429 into a retry storm: the SDK retries a rate-limited state event
+/// (honoring `retry_after`), so the room must stop producing new ones until
+/// that settles. Called every runtime pass; also keeps a timer alive so the
+/// final snapshot of an otherwise idle turn still goes out.
+#[cfg(unix)]
+fn flush_pending_ai_turns(cx: &mut Cx) {
+    let now = Instant::now();
+    let mut to_post: Vec<(OwnedRoomId, String, AiTurnContent)> = Vec::new();
+    let mut needs_timer = false;
+    with_a2app(|state| {
+        for (room_id, info) in state.ai_rooms.iter_mut() {
+            if info.ai_turn_in_flight {
+                needs_timer = true;
+                continue;
+            }
+            if info.pending_ai_turn.is_none() {
+                continue;
+            }
+            let cooled_down = info
+                .last_ai_turn_post
+                .is_none_or(|last| now.duration_since(last) >= info.ai_turn_backoff);
+            if !cooled_down {
+                needs_timer = true;
+                continue;
+            }
+            if let Some((key, content)) = info.pending_ai_turn.take() {
+                info.ai_turn_in_flight = true;
+                info.last_ai_turn_post = Some(now);
+                to_post.push((room_id.clone(), key, content));
+                // Keep the timer armed so the follow-up (the latest snapshot
+                // coalesced while this write was in flight) is not stranded.
+                needs_timer = true;
+            }
+        }
+        if needs_timer {
+            if state.ai_turn_flush_timer.is_none() {
+                state.ai_turn_flush_timer = Some(cx.start_interval(AI_TURN_POST_MIN_INTERVAL.as_secs_f64()));
+            }
+        } else if let Some(timer) = state.ai_turn_flush_timer.take() {
+            cx.stop_timer(timer);
+        }
+    });
+    for (room_id, key, content) in to_post {
+        post_ai_state_event(&room_id, AI_TURN_EVENT_TYPE, &key, &content);
+    }
 }
 
 /// Serializes one AI-session activity/tool-call row and hands it to the

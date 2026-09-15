@@ -440,9 +440,9 @@ impl Tool for ReadOtherRoomMessagesTool {
         "Returns the recent text messages of another joined room you name, as \
          JSON rows with the sender, sender_id, event_id, the row's own \
          room_id, body, and an unread flag (true when the user hasn't read it \
-         yet). The user is asked to allow the first read of a room outside \
-         this one; once allowed you may read any of their rooms. Use \
-         list_rooms to see which rooms exist."
+         yet). The user is asked to allow each room the first time you read \
+         from it; once allowed that one room stays allowed, but a different \
+         room is a fresh ask. Use list_rooms to see which rooms exist."
     }
 
     fn input_schema(&self) -> Value {
@@ -1185,6 +1185,47 @@ mod tests {
             assert!(cap.is_available(), "{id} not available");
             assert_eq!(cap.group.map(|g| g.as_str()), Some("app-launch"), "{id} group");
         }
+    }
+
+    /// Granting “read this room” must NOT unlock `read_other_room_messages`:
+    /// the two are separate permission groups, so the session must still be
+    /// prompted the first time it reads a room outside its own. This guards the
+    /// distinction the runtime's gate depends on.
+    #[test]
+    fn this_room_read_does_not_grant_other_rooms() {
+        use a2app_core::permissions::{
+            agent_subject, Effective, GrantState, Permission, PermissionStore,
+        };
+        let subject = agent_subject("!room:server.org");
+        let declares_perm = |p: Permission| {
+            AI_ROOM_SESSION_CAP_IDS
+                .iter()
+                .any(|id| by_id(id).and_then(|c| c.group).is_some_and(|g| g == p))
+        };
+        let declares_cap =
+            |c: &a2app_core::capabilities::Capability| AI_ROOM_SESSION_CAP_IDS.contains(&c.id);
+        let mut store = PermissionStore::default();
+        store.set(&subject, Permission::MatrixRoomRead, GrantState::Granted);
+        assert_eq!(
+            store.effective_capability_for(
+                &subject,
+                declares_perm,
+                declares_cap,
+                by_id("matrix.room.messages.read").unwrap()
+            ),
+            Effective::Granted,
+            "reading this room's messages should be allowed"
+        );
+        assert_eq!(
+            store.effective_capability_for(
+                &subject,
+                declares_perm,
+                declares_cap,
+                by_id("matrix.rooms.messages.read").unwrap()
+            ),
+            Effective::NeedsPrompt,
+            "reading another room must still prompt"
+        );
     }
 
     #[test]

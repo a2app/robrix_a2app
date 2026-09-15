@@ -288,9 +288,9 @@ pub enum SessionUpdate {
     /// finished with empty output. The runtime settles the turn card with
     /// this; without it a cancelled turn's card would stay "running" forever.
     TurnEnded,
-    /// The agent's reasoning stream started on the in-flight turn (emitted
-    /// once per turn), so the chat can show a "thinking…" row while the
-    /// model is still quiet.
+    /// The agent's reasoning stream started (or restarted after a tool call)
+    /// on the in-flight turn, so its card can show a `💭 Thinking…` line while
+    /// the model is still quiet.
     Thinking,
     /// The agent started one tool call; `name` is the tool's name. Robrix
     /// turns this into the tool call's `Started` state event and matches its
@@ -645,9 +645,11 @@ impl AiSession {
                 AcpEvent::Thought(text) => {
                     self.turn_thought_chars = self.turn_thought_chars.saturating_add(text.len());
                     if !self.turn_thought_logged {
-                        // First thought of the turn: surface it once so the
-                        // room can show a "thinking…" row; a long think keeps
-                        // the flag set (only periodic diagnostics below).
+                        // First thought of the current segment: surface it so
+                        // the turn card can show its `💭 Thinking…` line. The
+                        // flag is cleared again on each tool call, so the next
+                        // reasoning segment re-emits; a long uninterrupted
+                        // think keeps it set (only periodic diagnostics below).
                         self.turn_thought_logged = true;
                         updates.push(SessionUpdate::Thinking);
                         log!(
@@ -668,6 +670,12 @@ impl AiSession {
                     if !id.is_empty() {
                         self.tool_call_names.insert(id, title.clone());
                     }
+                    // A tool call ends the current thinking segment. Clear the
+                    // once-per-turn guard so the next `Thought` chunk (the
+                    // model reasoning about this call's result) surfaces a
+                    // fresh `Thinking` update — the turn card can then show
+                    // the `💭 Thinking…` line again between tool calls.
+                    self.turn_thought_logged = false;
                     updates.push(SessionUpdate::ToolCallStarted { name: title });
                 }
                 AcpEvent::ToolCallDone { id, ok, summary } => {

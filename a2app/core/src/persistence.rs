@@ -44,10 +44,14 @@ pub fn save_permissions(store: &crate::permissions::PermissionStore) -> Result<(
 
 /// Saved grants, or the empty (all-Ask) store on a first run or unreadable file.
 pub fn load_permissions() -> crate::permissions::PermissionStore {
-    std::fs::read(data_root().join(PERMISSIONS_FILE_NAME))
+    let mut store: crate::permissions::PermissionStore = std::fs::read(data_root().join(PERMISSIONS_FILE_NAME))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // A store written by an older build may carry grants whose meaning has
+    // changed (see `PermissionStore::migrate`).
+    store.migrate();
+    store
 }
 
 /// Registry state that isn't an app of its own: uninstall archives and

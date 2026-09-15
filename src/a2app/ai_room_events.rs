@@ -7,14 +7,17 @@
 //! can't loop back as input). Cross-room posts (`post_room_message`) are
 //! ordinary `m.notice` messages instead. Everything else the agent does while
 //! a turn is live is also reflected as state events so the chat doubles as its
-//! activity log: `rs.robius.robrix.ai_activity` rows mark "thinking…" /
-//! errors / the session stopping, and each tool call is its own
-//! `rs.robius.robrix.ai_tool_call` row (written `Started` when the agent
-//! picks the tool and rewritten `Done` with its outcome when Robrix
-//! finishes it). This module holds just the wire types and the rendering
-//! side, so it can be used from `room_screen.rs` on every platform; the
-//! session/forwarding machinery that actually *acts* on these events
-//! (unix-only, see `ai::rooms`) builds on top of it.
+//! activity log: each assistant turn is a single
+//! `rs.robius.robrix.ai_turn` card carrying its thinking marker and its tool
+//! calls, while `rs.robius.robrix.ai_activity` rows mark a turn that errored
+//! or the session stopping. (Older rooms also carry per-call
+//! `rs.robius.robrix.ai_tool_call` rows, written `Started` when the agent
+//! picked the tool and rewritten `Done` with its outcome when Robrix
+//! finished it; new turns aggregate those into the turn card.) This module
+//! holds just the wire types and the rendering side, so it can be used from
+//! `room_screen.rs` on every platform; the session/forwarding machinery that
+//! actually *acts* on these events (unix-only, see `ai::rooms`) builds on top
+//! of it.
 
 use makepad_widgets::*;
 use serde::{Deserialize, Serialize};
@@ -35,10 +38,11 @@ pub const AI_REPLY_EVENT_TYPE: &str = "rs.robius.robrix.ai_reply";
 /// re-forward the whole transcript as new prompts.
 pub const AI_SESSION_DATA_EVENT_TYPE: &str = "rs.robius.robrix.ai_session_data";
 /// One append-only state event per notable *live* agent activity that is not
-/// itself a reply: the model starting to think (shown as "thinking…"), a
-/// turn that errored, or the session stopping. Each row gets its own fresh
-/// state key, so the chat's timeline doubles as the agent's activity log
-/// (same shape as the completed `ai_reply` rows, minus the prose).
+/// itself a reply: a turn that errored, or the session stopping. Each row
+/// gets its own fresh state key, so the chat's timeline doubles as the
+/// agent's activity log (same shape as the completed `ai_reply` rows, minus
+/// the prose). `thinking` is not one of these: it lives inside the turn's
+/// `ai_turn` card (see [`AiTurnContent::thinking`]).
 pub const AI_ACTIVITY_EVENT_TYPE: &str = "rs.robius.robrix.ai_activity";
 /// One state event per agent tool call. A fresh key is minted when the call
 /// starts (`Started`); when Robrix finishes executing the call the same key
@@ -131,6 +135,9 @@ pub struct AiSessionCursorContent {
 #[serde(rename_all = "snake_case")]
 pub enum AiActivityKind {
     /// The model is reasoning before it writes (a `Thought` stream started).
+    /// Only written by older builds: a new turn shows this inside its
+    /// `ai_turn` card via [`AiTurnContent::thinking`] instead. Still
+    /// deserialized so existing rows keep rendering.
     Thinking,
     /// The turn failed with an error the room should see.
     Error,
@@ -139,9 +146,9 @@ pub enum AiActivityKind {
 }
 
 /// The content of one `rs.robius.robrix.ai_activity` state event: a live
-/// marker of something the agent is doing that the chat should show (e.g.
-/// "thinking…"). Fresh state key per row — the timeline keeps the history,
-/// exactly like it keeps every `ai_reply`.
+/// marker of something the agent is doing that the chat should show (a turn
+/// error or the session stopping). Fresh state key per row — the timeline
+/// keeps the history, exactly like it keeps every `ai_reply`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiActivityContent {
     pub v: u32,
@@ -252,6 +259,20 @@ pub struct AiTurnContent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first: Option<bool>,
     pub status: AiTurnStatus,
+    /// A monotonic sequence number for this turn's snapshots, incremented on
+    /// every rewrite. The writes are async and can reach the server out of
+    /// order, so the timeline's last same-turn row is not necessarily the
+    /// newest; the renderer selects the snapshot with the highest `seq`
+    /// instead, which keeps the card's count and status from flickering
+    /// backwards. `0` on rows written before this field existed.
+    #[serde(default)]
+    pub seq: u64,
+    /// Whether the model is reasoning on this turn right now (a `Thought`
+    /// stream is live). Rendered as a `💭 Thinking…` line inside the card's
+    /// body, so a turn that thinks before it calls a tool still shows a card
+    /// from its first activity.
+    #[serde(default)]
+    pub thinking: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<AiTurnToolCall>,
     pub created_at: u64,
@@ -341,16 +362,18 @@ script_mod! {
         }
     }
 
-    // A small spinning arc, animated by a looping animator (the built-in
-    // LoadingSpinner cannot be used here: it is driven by `draw_pass.time`,
-    // which only advances on frames something else requests). Shown only
-    // while a turn is running.
+    // A small spinning arc, animated by a looping animator. The built-in
+    // LoadingSpinner is avoided here because its `draw_pass.time` pixel
+    // shader flags the shader `uses_time`, which forces the whole window to
+    // repaint at display rate for as long as the spinner is visible — far too
+    // heavy to keep running through every turn. The animator drives a
+    // per-widget `rotation` instead.
     mod.widgets.AiTurnSpinner = #(AiTurnSpinner::register_widget(vm)) {
         width: 13, height: 13,
         show_bg: true,
         draw_bg +: {
             color: uniform(#x0f88fe)
-            rotation: uniform(0.0)
+            rotation: instance(0.0)
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
                 let radius = min(self.rect_size.x, self.rect_size.y) * 0.5 - 1.5
@@ -516,9 +539,9 @@ impl AiReplyTimelineCardRef {
 }
 
 /// The card that renders one live agent-activity row: an `ai_activity`
-/// marker (thinking started / error / stopped) or an `ai_tool_call` row
-/// (started, or done with its outcome). Both are small muted one-liners so a
-/// busy turn reads as a short log in the chat instead of a wall of cards.
+/// marker (error / stopped) or a legacy `ai_tool_call` row (started, or done
+/// with its outcome). Both are small muted one-liners so a busy turn reads as
+/// a short log in the chat instead of a wall of cards.
 #[derive(Script, ScriptHook, Widget)]
 pub struct AiEventTimelineCard {
     #[deref] view: View,
@@ -540,6 +563,12 @@ pub struct AiTurnSpinner {
     #[source] source: ScriptObjectRef,
     #[deref] view: View,
     #[apply_default] animator: Animator,
+    /// Whether the spinner is currently told to spin. `animator_play` restarts
+    /// the loop track (re-sampling the current rotation and resetting its start
+    /// time) on every call, so the card's per-repopulate `set_spinning` pinned
+    /// the arc when turn updates arrived faster than one rotation. This guard
+    /// makes those same-state calls no-ops.
+    #[rust] spinning: bool,
 }
 
 impl Widget for AiTurnSpinner {
@@ -557,9 +586,14 @@ impl Widget for AiTurnSpinner {
 
 impl AiTurnSpinnerRef {
     /// Starts (`spinning`) or stops the spinner's looping animation. Called by
-    /// the turn card as the turn's status changes.
+    /// the turn card on every populate, so a no-op transition is ignored here
+    /// rather than restarting the animation.
     pub fn set_spinning(&self, cx: &mut Cx, spinning: bool) {
         if let Some(mut inner) = self.borrow_mut() {
+            if inner.spinning == spinning {
+                return;
+            }
+            inner.spinning = spinning;
             inner.animator_play(cx, if spinning { ids!(spin.on) } else { ids!(spin.off) });
         }
     }
@@ -578,10 +612,23 @@ pub struct AiTurnTimelineCard {
     /// Whether the tool list is expanded. Preserved across repopulates so a
     /// turn card the user opened does not snap shut on the next live update.
     #[rust(true)] is_expanded: bool,
-    /// Whether this turn has any tool calls to show. Kept so the expand state
-    /// can be applied without re-reading the body label (whose `text()`
-    /// accessor is not available on `LabelRef`).
-    #[rust] has_tools: bool,
+    /// Whether this turn's body has anything to show (a thinking line or at
+    /// least one tool call). Kept so the expand state can be applied without
+    /// re-reading the body label (whose `text()` accessor is not available on
+    /// `LabelRef`).
+    #[rust] has_body: bool,
+    /// The turn key of the snapshot currently shown, part of the cache that
+    /// lets the renderer re-run `populate` on every draw (see
+    /// [`AiTurnTimelineCardRef::populate`]) while the widget skips the work
+    /// when the snapshot has not changed.
+    #[rust] last_turn: String,
+    /// The `seq` of the snapshot currently shown.
+    #[rust] last_seq: u64,
+    /// The effective running state of the snapshot currently shown (the
+    /// renderer may settle an orphaned turn without a new `seq`).
+    #[rust] last_running: bool,
+    /// Whether the card is currently visible; a hidden card always repopulates.
+    #[rust] last_visible: bool,
 }
 
 impl Widget for AiTurnTimelineCard {
@@ -605,7 +652,7 @@ impl AiTurnTimelineCard {
     /// Applies the current expand state to the arrow and body.
     fn apply_expanded(&mut self, cx: &mut Cx) {
         self.view.label(cx, ids!(turn_arrow)).set_text(cx, if self.is_expanded { "▾" } else { "▸" });
-        self.view.label(cx, ids!(turn_body)).set_visible(cx, self.is_expanded && self.has_tools);
+        self.view.label(cx, ids!(turn_body)).set_visible(cx, self.is_expanded && self.has_body);
     }
 }
 
@@ -614,14 +661,17 @@ fn ai_turn_title(content: &AiTurnContent) -> String {
     let n = content.tool_calls.len();
     match content.status {
         AiTurnStatus::Running => {
-            if n <= 1 {
+            if content.thinking && n == 0 {
+                String::from("Thinking…")
+            } else if n <= 1 {
                 String::from("Working…")
             } else {
                 format!("Working… ({n} tools)")
             }
         }
         AiTurnStatus::Done => match n {
-            0 => String::from("Used a tool"),
+            0 if content.thinking => String::from("Thought"),
+            0 => String::from("Finished"),
             1 => String::from("Used 1 tool"),
             _ => format!("Used {n} tools"),
         },
@@ -675,11 +725,26 @@ impl AiTurnTimelineCardRef {
     pub fn populate(&self, cx: &mut Cx, content: Option<&AiTurnContent>) {
         let Some(content) = content else {
             if let Some(mut inner) = self.borrow_mut() {
+                inner.last_visible = false;
                 inner.view.set_visible(cx, false);
             }
             return;
         };
         let running = content.status == AiTurnStatus::Running;
+        // The renderer calls this on every draw for the turn's anchor row,
+        // because the turn's newest snapshot lands on a LATER timeline row
+        // while the anchor stays put. Most calls carry the same snapshot, so
+        // skip the work unless the turn, its sequence, or its effective
+        // running state actually changed.
+        if let Some(inner) = self.borrow() {
+            if inner.last_visible
+                && inner.last_turn == content.turn
+                && inner.last_seq == content.seq
+                && inner.last_running == running
+            {
+                return;
+            }
+        }
         // Warm while working, cool once settled. The border follows the same
         // family so the card reads as one object in either state.
         let (bg, border) = if running {
@@ -698,9 +763,9 @@ impl AiTurnTimelineCardRef {
             }
         });
         // Start/stop the spinner's loop with the turn, so a settled card stops
-        // scheduling animation frames. The built-in LoadingSpinner is avoided
-        // here because it is driven by `draw_pass.time` and would sit frozen
-        // between unrelated redraws; this one animates itself while running.
+        // scheduling animation frames. The idempotent `spinning` guard inside
+        // `set_spinning` keeps these per-populate calls from restarting the
+        // loop track (which used to pin the arc at one angle).
         self.widget(cx, ids!(turn_spinner))
             .as_ai_turn_spinner()
             .set_spinning(cx, running);
@@ -708,21 +773,27 @@ impl AiTurnTimelineCardRef {
         inner.view.set_visible(cx, true);
         inner.view.label(cx, ids!(turn_title)).set_text(cx, &ai_turn_title(content));
         inner.view.widget(cx, ids!(turn_spinner)).set_visible(cx, running);
-        let body = content
-            .tool_calls
-            .iter()
-            .map(|call| {
-                if running {
-                    ai_turn_tool_label(call)
-                } else {
-                    ai_turn_tool_label_settled(call)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        inner.has_tools = !content.tool_calls.is_empty();
-        inner.view.label(cx, ids!(turn_body)).set_text(cx, &body);
+        // The thinking marker leads the body while the turn runs, then the
+        // tool calls follow; once the turn settles it is folded into the
+        // settled phrasing ("Thought").
+        let mut lines: Vec<String> = Vec::new();
+        if content.thinking {
+            lines.push(if running { String::from("💭 Thinking…") } else { String::from("💭 Thought") });
+        }
+        lines.extend(content.tool_calls.iter().map(|call| {
+            if running {
+                ai_turn_tool_label(call)
+            } else {
+                ai_turn_tool_label_settled(call)
+            }
+        }));
+        inner.has_body = !lines.is_empty();
+        inner.view.label(cx, ids!(turn_body)).set_text(cx, &lines.join("\n"));
         inner.apply_expanded(cx);
+        inner.last_turn = content.turn.clone();
+        inner.last_seq = content.seq;
+        inner.last_running = running;
+        inner.last_visible = true;
         inner.view.redraw(cx);
     }
 }
@@ -943,6 +1014,8 @@ mod tests {
             turn: "turn-1".to_string(),
             first: Some(true),
             status: AiTurnStatus::Running,
+            seq: 1,
+            thinking: false,
             tool_calls: vec![
                 AiTurnToolCall {
                     name: "web_search".to_string(),
@@ -987,5 +1060,42 @@ mod tests {
         assert_eq!(ai_turn_tool_label(&done.tool_calls[2]), "✓ Replied in this room");
         let one = AiTurnContent { tool_calls: done.tool_calls[..1].to_vec(), ..done };
         assert_eq!(ai_turn_title(&one), "Used 1 tool");
+    }
+
+    /// A turn that opens on a `Thought` stream (before any tool call) gets a
+    /// card with a `Thinking…` title, and settles as `Thought` once the reply
+    /// lands. This is what keeps a thinking-only turn visible in the timeline.
+    #[test]
+    fn turn_card_represents_thinking() {
+        let thinking = AiTurnContent {
+            v: 1,
+            turn: "turn-2".to_string(),
+            first: Some(true),
+            status: AiTurnStatus::Running,
+            seq: 1,
+            thinking: true,
+            tool_calls: Vec::new(),
+            created_at: 0,
+        };
+        assert_eq!(ai_turn_title(&thinking), "Thinking…");
+
+        // Once a tool starts, the model is no longer thinking: the run-state
+        // title drops the thinking phrasing but the card stays warm.
+        let working = AiTurnContent {
+            thinking: false,
+            tool_calls: vec![AiTurnToolCall {
+                name: "web_search".to_string(),
+                detail: None,
+                status: AiTurnToolStatus::Started,
+                ok: false,
+                summary: String::new(),
+            }],
+            ..thinking.clone()
+        };
+        assert_eq!(ai_turn_title(&working), "Working…");
+
+        // A thinking-only turn that settled keeps its thinking marker.
+        let settled = AiTurnContent { status: AiTurnStatus::Done, ..thinking };
+        assert_eq!(ai_turn_title(&settled), "Thought");
     }
 }

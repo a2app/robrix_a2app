@@ -125,6 +125,42 @@ pub enum AiRoomAction {
     /// A granted [`AiRoomRequest::ToolRead`] finished; `result` is the JSON
     /// text (or the error) the waiting tool call must be answered with.
     ToolReadResult { id: u64, result: Result<String, String> },
+    /// A state-event write finished (succeeded or failed). The runtime uses
+    /// this to release the room's `ai_turn` in-flight flag — and to widen or
+    /// narrow its write spacing — so the next coalesced turn snapshot can go
+    /// out without piling onto the server's state-event rate limit.
+    StateEventPosted { room_id: OwnedRoomId, event_type: String, success: bool },
+}
+
+/// Sends one best-effort AI state row with a capped retry policy. The SDK's
+/// default is to retry a rate-limited request without bound, which turns a
+/// single `429 M_LIMIT_EXCEEDED` into a long storm that competes with the
+/// reply and everything else in the room. These rows are advisory — the
+/// coalescing runtime re-sends the latest snapshot afterwards — so a few
+/// attempts are enough.
+async fn send_ai_state_event(
+    room: &Room,
+    event_type: &str,
+    state_key: &str,
+    content: serde_json::Value,
+) -> Result<(), String> {
+    use matrix_sdk::ruma::api::client::state::send_state_event;
+    use matrix_sdk::utils::IntoRawStateEventContent;
+    let request = send_state_event::v3::Request::new_raw(
+        room.room_id().to_owned(),
+        event_type.into(),
+        state_key.to_owned(),
+        content.into_raw_state_event_content(),
+    );
+    // Start from the client's config (keeping its 60s timeout and any
+    // concurrency cap) and only tighten the retry limit.
+    let config = room.client().request_config().retry_limit(3);
+    room.client()
+        .send(request)
+        .with_request_config(config)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Runs one AI-room Matrix operation on the async worker.
@@ -203,13 +239,21 @@ pub async fn handle_ai_room_request(request: AiRoomRequest) {
         AiRoomRequest::PostAiStateEvent { room_id, event_type, state_key, content } => {
             let Some(room) = get_client().and_then(|c| c.get_room(&room_id)) else {
                 log!("AI Rooms worker: can't post {event_type} to {room_id}: room not found in client.");
+                // Still release the runtime's in-flight flag; the row is lost
+                // but the turn must not wedge behind it.
+                Cx::post_action(AiRoomAction::StateEventPosted { room_id, event_type, success: false });
                 return;
             };
-            if let Err(e) = room.send_state_event_raw(&event_type, &state_key, content).await {
-                // Best-effort rows: a failure must not derail the turn (the
-                // final `ai_reply` still carries the receipts), so log only.
-                log!("AI Rooms worker: FAILED to post {event_type} (key {state_key}) to {room_id}: {e}");
-            }
+            let success = match send_ai_state_event(&room, &event_type, &state_key, content).await {
+                Ok(()) => true,
+                Err(e) => {
+                    // Best-effort rows: a failure must not derail the turn (the
+                    // final `ai_reply` still carries the receipts), so log only.
+                    log!("AI Rooms worker: FAILED to post {event_type} (key {state_key}) to {room_id}: {e}");
+                    false
+                }
+            };
+            Cx::post_action(AiRoomAction::StateEventPosted { room_id, event_type, success });
         }
         AiRoomRequest::ToolRead { id, room_id, tool } => {
             let result = read_tool(&room_id, tool.clone()).await;
