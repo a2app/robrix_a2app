@@ -429,11 +429,30 @@ script_mod! {
                 }
 
                 prompt_input := SpeechTextInput {
-                    width: Fill, height: Fit
+                    width: Fill
+                    // Grows with the prompt, then scrolls. The cap lives here rather than on
+                    // the inner input: TextInput reads its scroll threshold from the tightest
+                    // `Fit{max}` on an *ancestor* turtle, skipping its own walk.
+                    height: Fit { max: FitBound.Abs(250.0) }
                     text_padding: 12
                     mic_tooltip: "Describe the app by voice"
 
+                    // Unlike the other speech inputs, this one grows, so the mic sits beside
+                    // the first line instead of sinking with the bottom edge. The top inset
+                    // centres it on that line while the prompt is still one line tall.
+                    speech_overlay +: {
+                        align: Align{x: 1.0, y: 0.0}
+                        padding: Inset{top: 2, bottom: 0, left: 4, right: 6}
+                    }
+                    // `mic_clearance` only ever insets the scroll bar's bottom, which a
+                    // top-mounted mic doesn't need, so it drops to the normal inset and the
+                    // top inset below keeps the bar clear of the button instead.
+                    mic_clearance: 3
+                    scroll_bar_inset: Inset{top: 36, right: 4, bottom: 3}
+
                     text_input +: {
+                        // Enter inserts a newline; the Generate button submits.
+                        is_multiline: true
                         empty_text: "Describe a new mini-app or changes to one…"
                         draw_text +: { text_style: REGULAR_TEXT {font_size: 11.5} }
                     }
