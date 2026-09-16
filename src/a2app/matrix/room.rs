@@ -53,8 +53,8 @@ fn message_json(msg: &OriginalSyncRoomMessageEvent, full_body: bool) -> serde_js
 async fn my_read_receipt_ts(room: &matrix_sdk::Room) -> Option<u64> {
     let me = current_user_id()?;
     let candidates = [
-        room.load_user_receipt(ReceiptType::Read, ReceiptThread::Unthreaded, &me).await.ok().flatten(),
-        room.load_user_receipt(ReceiptType::ReadPrivate, ReceiptThread::Unthreaded, &me).await.ok().flatten(),
+        room.load_user_receipt(ReceiptType::Read, &ReceiptThread::Unthreaded, &me).await.ok().flatten(),
+        room.load_user_receipt(ReceiptType::ReadPrivate, &ReceiptThread::Unthreaded, &me).await.ok().flatten(),
     ];
     candidates.into_iter().flatten().max_by_key(|(_, r)| r.ts)
         .and_then(|(_, r)| r.ts)
