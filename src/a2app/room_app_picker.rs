@@ -87,16 +87,20 @@ script_mod! {
             }
         }
         buttons_view := ModalButtonsRow {
+            flow: Right
+            align: Align{x: 0.0, y: 0.5}
+            spacing: 0
             padding: Inset{top: 16}
+            all_apps_button := RobrixNeutralIconButton {
+                padding: 10
+                icon_walk: Walk{width: 0, height: 0, margin: 0}
+                text: "See all Mini-Apps"
+            }
+            FillerX {}
             cancel_button := RobrixNeutralIconButton {
                 padding: 10
                 icon_walk: Walk{width: 0, height: 0, margin: 0}
                 text: "Cancel"
-            }
-            all_apps_button := RobrixIconButton {
-                padding: 10
-                icon_walk: Walk{width: 0, height: 0, margin: 0}
-                text: "Mini Apps"
             }
         }
     }
@@ -225,7 +229,7 @@ impl WidgetMatchEvent for RoomAppPicker {
 
 impl RoomAppPicker {
     fn show(&mut self, cx: &mut Cx, room_name_id: RoomNameId, is_space: bool) {
-        self.view.label(cx, ids!(context_name)).set_text(cx, &room_name_id.display());
+        self.view.label(cx, ids!(context_name)).set_text(cx, &format!("in {}", room_name_id.display()));
         self.context = Some((room_name_id, is_space));
         self.keywords.clear();
         let input = self.view.text_input(cx, ids!(search_input));
