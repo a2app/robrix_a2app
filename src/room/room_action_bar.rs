@@ -6,7 +6,7 @@ use crate::shared::popup_list::{enqueue_popup_notification, PopupKind};
 
 // currently there's a fixed number of action buttons,
 // but later we'll do that dynamically once we have more features implemented.
-const ACTION_COUNT: usize = 5;
+const ACTION_COUNT: usize = ACTIONS.len();
 const HEADER_HEIGHT: f64 = 45.0;
 const BUTTON_SIZE: f64 = 40.0;
 const HEADER_BUTTON_GAP: f64 = 2.0;
@@ -144,6 +144,7 @@ script_mod! {
             color: #0000
         }
 
+        room_mini_apps_button       := mod.widgets.RoomActionButton {draw_icon.svg: ICON_SPARKLE, visible: false}
         room_info_button            := mod.widgets.RoomActionButton {draw_icon.svg: ICON_INFO}
         room_threads_button         := mod.widgets.RoomActionButton {draw_icon.svg: ICON_REPLY_IN_THREAD}
         room_pinned_messages_button := mod.widgets.RoomActionButton {draw_icon.svg: ICON_PIN}
@@ -162,6 +163,7 @@ script_mod! {
             flow: Flow.Right{wrap: true}
             spacing: 4
             padding: Inset{left: 8, right: 8, top: 8, bottom: 4}
+            room_mini_apps_button := RoomActionTextButton {draw_icon.svg: ICON_SPARKLE, visible: false}
             room_info_button := RoomActionTextButton {draw_icon.svg: ICON_INFO}
             room_settings_button := RoomActionTextButton {draw_icon.svg: ICON_SETTINGS}
             room_threads_button := RoomActionTextButton {draw_icon.svg: ICON_REPLY_IN_THREAD}
@@ -209,7 +211,10 @@ script_mod! {
 
 /// This also defines the ordering of the buttons, from right to left
 /// so that buttons don't move around when the bar's width changes.
-const ACTIONS: [(LiveId, &str); ACTION_COUNT] = [
+/// Earlier entries have priority when only some buttons fit in the header.
+const ACTIONS: &[(LiveId, &str)] = &[
+    #[cfg(feature = "a2app")]
+    (id!(room_mini_apps_button), "Mini Apps"),
     (id!(room_info_button), "Room info"),
     (id!(room_settings_button), "Room settings"),
     (id!(room_threads_button), "Threads"),
@@ -281,7 +286,11 @@ impl Widget for RoomActionBar {
             {
                 self.set_expanded(cx, !self.is_expanded);
             }
-            for (id, label) in ACTIONS {
+            for &(id, label) in ACTIONS {
+                if id == id!(room_mini_apps_button) {
+                    // TODO: browse, select, and run mini-apps in this room or space.
+                    continue;
+                }
                 if self.view.button(cx, &[id]).clicked(actions)
                     || self.view.button(cx, &[id!(expanded_room_actions), id]).clicked(actions)
                 {
