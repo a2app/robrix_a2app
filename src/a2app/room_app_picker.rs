@@ -76,16 +76,6 @@ script_mod! {
             }
         }
 
-        Label {
-            width: Fill, height: Fit
-            flow: Flow.Right{wrap: true}
-            padding: 0
-            text: "See all other mini-apps and generate new ones in the Mini Apps screen."
-            draw_text +: {
-                color: (MESSAGE_TEXT_COLOR)
-                text_style: REGULAR_TEXT {font_size: 10.5}
-            }
-        }
         buttons_view := ModalButtonsRow {
             flow: Right
             align: Align{x: 0.0, y: 0.5}
@@ -94,7 +84,7 @@ script_mod! {
             all_apps_button := RobrixNeutralIconButton {
                 padding: 10
                 icon_walk: Walk{width: 0, height: 0, margin: 0}
-                text: "See all Mini-Apps"
+                text: "Go to Mini-Apps page"
             }
             FillerX {}
             cancel_button := RobrixNeutralIconButton {
