@@ -1527,12 +1527,7 @@ fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, heap: usize, action: HostAct
                 }
                 (HostAction::ClosePane, _) => PaneOp::Close,
                 (HostAction::BreakOut, Some(Surface::Tab)) => return Ok(()),
-                (HostAction::SetSide { side }, Some(Surface::Dock)) => {
-                    if side.is_vertical() && !desktop {
-                        return Err(String::from("side panes need the desktop layout"));
-                    }
-                    PaneOp::SetSide(*side)
-                }
+                (HostAction::SetSide { side }, Some(Surface::Dock)) => PaneOp::SetSide(*side),
                 (HostAction::Minimize, Some(Surface::Dock)) => PaneOp::Minimize,
                 (HostAction::BreakOut, Some(Surface::Dock)) if desktop => PaneOp::BreakOut,
                 (HostAction::BreakOut, Some(Surface::Dock)) => {

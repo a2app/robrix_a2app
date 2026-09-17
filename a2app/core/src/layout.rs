@@ -13,16 +13,13 @@ pub enum PaneSide {
 }
 
 impl PaneSide {
-    /// The side after this one in the cycle. A narrow window has no room
-    /// for a side pane, so there the cycle is just top and bottom.
-    pub fn next(self, vertical_ok: bool) -> Self {
-        match (self, vertical_ok) {
-            (PaneSide::Right, true) => PaneSide::Bottom,
-            (PaneSide::Bottom, true) => PaneSide::Left,
-            (PaneSide::Left, true) => PaneSide::Top,
-            (PaneSide::Top, true) => PaneSide::Right,
-            (PaneSide::Top, false) => PaneSide::Bottom,
-            (_, false) => PaneSide::Top,
+    /// The side after this one in the cycle, in every view mode.
+    pub fn next(self) -> Self {
+        match self {
+            PaneSide::Right => PaneSide::Bottom,
+            PaneSide::Bottom => PaneSide::Left,
+            PaneSide::Left => PaneSide::Top,
+            PaneSide::Top => PaneSide::Right,
         }
     }
 
