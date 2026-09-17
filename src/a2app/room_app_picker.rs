@@ -1,4 +1,4 @@
-//! A compact picker for mini-apps that can run in the current room or space.
+//! A large modal picker for mini-apps that can run in the current room or space.
 
 use makepad_widgets::*;
 
@@ -16,9 +16,20 @@ script_mod! {
     use mod.widgets.*
 
     mod.widgets.RoomAppPicker = set_type_default() do #(RoomAppPicker::register_widget(vm)) {
-        ..mod.widgets.SmallModal
+        ..mod.widgets.RoundedView
 
-        width: Fill {max: 500}
+        width: Fill {max: 1000}
+        height: Fill
+        margin: 30
+        flow: Down
+        padding: Inset{top: 20, right: 25, bottom: 20, left: 25}
+
+        show_bg: true
+        draw_bg +: {
+            color: (COLOR_PRIMARY)
+            border_radius: 6.0
+            border_size: 0.0
+        }
 
         title := ModalTitle {
             text: "Run a mini-app"
@@ -41,7 +52,7 @@ script_mod! {
         }
 
         apps_list := PortalList {
-            width: Fill, height: 300
+            width: Fill, height: Fill
             flow: Down
             margin: Inset{top: 10, bottom: 12}
 
