@@ -79,7 +79,8 @@ impl MiniAppManifest {
         let scopes = self.permissions.iter()
             .filter_map(|p| crate::permissions::Permission::from_str(p))
             .flat_map(crate::capabilities::in_group)
-            .filter(|c| c.is_available()
+            .filter(|c| self.declares_capability(c)
+                && c.is_available()
                 && c.direction == crate::capabilities::Direction::Outgoing
                 && c.access != crate::capabilities::Access::Act)
             .map(|c| c.scope);
@@ -95,6 +96,22 @@ impl MiniAppManifest {
             (true, _) => RunsIn::Spaces,
             (false, true) => RunsIn::Rooms,
             (false, false) => RunsIn::Account,
+        }
+    }
+
+    /// Whether this app belongs in the picker for this room or space.
+    /// A bound app stays in its own context, including utilities that need
+    /// no Matrix services. Unbound account apps stay on the Mini Apps screen.
+    pub fn can_run_in_context(&self, room_id: &str, is_space: bool) -> bool {
+        let bound_here = match &self.scope {
+            A2AppScope::Room { room_id: bound } if bound != room_id => return false,
+            A2AppScope::Room { .. } => true,
+            A2AppScope::Account => false,
+        };
+        match self.runs_in() {
+            RunsIn::Room | RunsIn::Rooms => !is_space,
+            RunsIn::Spaces => is_space,
+            RunsIn::Account => bound_here,
         }
     }
 
@@ -359,6 +376,62 @@ mod tests {
             scope: A2AppScope::Room { room_id: "!r:example.org".into() },
             current_version: Some("20260724-153204".into()),
         }
+    }
+
+    #[test]
+    fn context_picker_separates_room_space_and_account_apps() {
+        let apps = crate::builtin::builtin_apps();
+        for (id, in_room, in_space) in [
+            ("room-peek", true, false),
+            ("search", true, false),
+            ("inbox", true, false),
+            ("spaces", false, true),
+            ("account", false, false),
+            ("inspector", false, false),
+        ] {
+            let app = apps.iter().find(|app| app.id == id).unwrap();
+            assert_eq!(app.can_run_in_context("!room:example.org", false), in_room, "{id}");
+            assert_eq!(app.can_run_in_context("!space:example.org", true), in_space, "{id}");
+        }
+    }
+
+    #[test]
+    fn context_picker_respects_bindings_without_overriding_context_type() {
+        let mut app = base();
+        // A room-bound utility does not need Matrix permissions to belong here.
+        assert!(app.can_run_in_context("!r:example.org", false));
+        assert!(!app.can_run_in_context("!other:example.org", false));
+        assert!(!app.can_run_in_context("!other:example.org", true));
+        // The scope stores space IDs in the same field as room IDs.
+        assert!(app.can_run_in_context("!r:example.org", true));
+
+        app.permissions = vec!["matrix-room-info".into()];
+        assert!(app.can_run_in_context("!r:example.org", false));
+        assert!(!app.can_run_in_context("!r:example.org", true));
+        assert!(!app.can_run_in_context("!other:example.org", false));
+
+        app.permissions = vec!["matrix-spaces".into()];
+        assert!(app.can_run_in_context("!r:example.org", true));
+        assert!(!app.can_run_in_context("!r:example.org", false));
+        assert!(!app.can_run_in_context("!other:example.org", true));
+    }
+
+    #[test]
+    fn runs_in_uses_narrowed_capabilities_instead_of_whole_permission_groups() {
+        let mut app = base();
+        app.scope = A2AppScope::Account;
+        app.permissions = vec!["matrix-room-info".into(), "matrix-spaces".into()];
+        assert_eq!(app.runs_in(), RunsIn::Room);
+
+        // Listening to a room hook does not make a space app room-specific.
+        app.capabilities = vec!["on_room_info_changed".into()];
+        assert_eq!(app.runs_in(), RunsIn::Spaces);
+        assert!(app.can_run_in_context("!space:example.org", true));
+        assert!(!app.can_run_in_context("!room:example.org", false));
+
+        // Narrowing one group leaves the other declared groups intact.
+        app.capabilities.push("matrix.room.info.read".into());
+        assert_eq!(app.runs_in(), RunsIn::Room);
     }
 
     /// A refine may ADD what the rewrite needs but never drops a declaration

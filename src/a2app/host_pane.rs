@@ -103,6 +103,8 @@ pub struct MiniAppHostPane {
     #[rust] templates: Templates,
     /// The instance currently shown in the pane.
     #[rust] active: Option<InstanceKey>,
+    /// Only ordinary rooms have a dock to return the instance to.
+    #[rust] can_return_to_room: bool,
 }
 
 impl ScriptHook for MiniAppHostPane {
@@ -160,7 +162,8 @@ impl Widget for MiniAppHostPane {
             if self.view.button(cx, ids!(close_button)).clicked(actions) {
                 cx.action(MiniAppHostPaneAction::CloseClicked);
             }
-            if self.view.button(cx, ids!(return_button)).pressed(actions)
+            if self.can_return_to_room
+                && self.view.button(cx, ids!(return_button)).pressed(actions)
                 && let Some((app_id, Some(room_id))) = self.active.clone()
             {
                 cx.action(MiniAppHostPaneAction::ReturnToRoom { app_id, room_id });
@@ -181,8 +184,8 @@ impl Widget for MiniAppHostPane {
 
 impl MiniAppHostPaneRef {
     /// Shows the app, adopting its running instance or starting one. `room`
-    /// binds it like a docked instance and offers a way back. False when
-    /// another surface is showing that instance.
+    /// binds it to a room or space; ordinary rooms offer a way back to the
+    /// dock. False when another surface is showing that instance.
     pub fn open_app(&self, cx: &mut Cx, manifest: &MiniAppManifest, grants: Vec<String>, room: Option<OwnedRoomId>) -> bool {
         let Some(mut inner) = self.borrow_mut() else { return false };
         let uid = inner.widget_uid();
@@ -199,7 +202,11 @@ impl MiniAppHostPaneRef {
             instances::release(cx, &previous, uid);
         }
         inner.fit_window(cx);
-        inner.view.button(cx, ids!(return_button)).set_visible(cx, key.1.is_some());
+        let can_return_to_room = key.1.as_ref()
+            .and_then(|room_id| crate::sliding_sync::get_client()?.get_room(room_id))
+            .is_some_and(|room| !room.is_space());
+        inner.can_return_to_room = can_return_to_room;
+        inner.view.button(cx, ids!(return_button)).set_visible(cx, can_return_to_room);
         inner.view.mini_app_host_area(cx, ids!(host_area)).set_host(Some(host));
         inner.view.label(cx, ids!(app_glyph)).set_text(cx, &manifest.icon);
         inner.view.label(cx, ids!(app_title)).set_text(cx, &manifest.name);
@@ -212,6 +219,7 @@ impl MiniAppHostPaneRef {
     pub fn close_active(&self, cx: &mut Cx, keep: bool) -> Option<InstanceKey> {
         let mut inner = self.borrow_mut()?;
         let key = inner.active.take()?;
+        inner.can_return_to_room = false;
         let uid = inner.widget_uid();
         inner.view.mini_app_host_area(cx, ids!(host_area)).set_host(None);
         if keep {
@@ -229,6 +237,7 @@ impl MiniAppHostPaneRef {
         let Some(mut inner) = self.borrow_mut() else { return };
         if inner.active.as_ref().is_some_and(|(app, _)| app == app_id) {
             inner.active = None;
+            inner.can_return_to_room = false;
             inner.view.mini_app_host_area(cx, ids!(host_area)).set_host(None);
             inner.view.redraw(cx);
         }

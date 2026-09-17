@@ -15,6 +15,8 @@ pub mod host_set;
 pub mod instances;
 /// The Mini Apps management screen (a top-level navigation tab page).
 pub mod mini_apps_screen;
+/// Selects an installed mini-app for a particular room or space.
+pub mod room_app_picker;
 /// The runtime permission prompt modal.
 pub mod permission_prompt;
 /// The in-room mini-app pane docked beside a room's timeline.
@@ -39,4 +41,5 @@ pub fn script_mod(vm: &mut ScriptVm) {
     tab_screen::script_mod(vm);
     timeline_card::script_mod(vm);
     mini_apps_screen::script_mod(vm);
+    room_app_picker::script_mod(vm);
 }

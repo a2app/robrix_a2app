@@ -10,6 +10,7 @@ script_mod! {
     use mod.widgets.*
 
     mod.widgets.MiniAppsScreen = View { visible: false }
+    mod.widgets.RoomAppPicker = View { visible: false }
     mod.widgets.MiniAppHostPane = View { visible: false }
     mod.widgets.MiniAppPermissionPrompt = View { visible: false }
     mod.widgets.MiniAppTimelineCard = View { visible: false }

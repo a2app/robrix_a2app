@@ -3510,6 +3510,8 @@ impl RoomScreen {
         room_name_id: &RoomNameId,
         thread_root_event_id: Option<OwnedEventId>,
     ) {
+        self.view.room_action_bar(cx, ids!(room_actions))
+            .set_room_context(Some(room_name_id), false);
         let timeline_kind = if let Some(thread_root_event_id) = thread_root_event_id {
             TimelineKind::Thread {
                 room_id: room_name_id.room_id().clone(),
@@ -3577,6 +3579,7 @@ impl RoomScreen {
     }
 
     pub fn hide_displayed_room(&mut self, cx: &mut Cx) {
+        self.view.room_action_bar(cx, ids!(room_actions)).set_room_context(None, false);
         if self.tl_state.is_some() {
             self.hide_timeline();
         }

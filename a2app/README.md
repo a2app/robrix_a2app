@@ -15,6 +15,10 @@ cargo run --features a2app
 - A **Mini Apps** button in the navigation bar (sparkle icon; can be hidden in
   App Settings) that opens the Mini Apps screen: create apps with AI, run them,
   and manage each one's permissions, versions, storage, and source.
+- A **Mini Apps** button in room and space action bars opens a searchable
+  picker of apps relevant to that context. Room apps run in the room's pane;
+  space apps open in a modal attached to that space. A footer links to the
+  main Mini Apps screen to see all apps or generate new ones.
 - A **create bar**: describe an app ("a pomodoro timer") and an ACP agent
   (`octos acp` by default; Claude Code and any other ACP agent work too)
   writes it in the Splash dialect, validated with the real parser and

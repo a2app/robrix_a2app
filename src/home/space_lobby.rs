@@ -20,6 +20,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::shared::avatar::{AvatarImage, AvatarState};
 use crate::shared::expand_arrow::ExpandArrow;
 use crate::shared::hover_highlight::handle_hover_hit_with_test;
+use crate::room::room_action_bar::RoomActionBarWidgetExt;
 use crate::utils::replace_linebreaks_separators;
 /// The horizontal indent width (in pixels) per tree level.
 const TREE_INDENT_WIDTH: f64 = 44.0;
@@ -519,6 +520,8 @@ script_mod! {
         draw_bg +: {
             color: COLOR_PRIMARY
         }
+
+        room_actions := mod.widgets.RoomActionBar {}
 
         // Header with parent space info
         header := SolidView {
@@ -1455,6 +1458,8 @@ impl Widget for SpaceLobbyScreen {
             }
         }
 
+        let room_rect = self.view.area().rect(cx);
+        self.view.room_action_bar(cx, ids!(room_actions)).draw_shadow(cx, room_rect);
         DrawStep::done()
     }
 }
@@ -1861,6 +1866,8 @@ impl SpaceLobbyScreen {
     }
 
     pub fn set_displayed_space(&mut self, cx: &mut Cx, space_name_id: &RoomNameId) {
+        self.view.room_action_bar(cx, ids!(room_actions))
+            .set_room_context(Some(space_name_id), true);
         let space_name = space_name_id.display();
         let parent_name = self.view.label(cx, ids!(header.parent_space_row.parent_name));
         parent_name.set_text(cx, &space_name);
@@ -1911,6 +1918,7 @@ impl SpaceLobbyScreen {
     }
 
     pub fn hide_displayed_space(&mut self, cx: &mut Cx) {
+        self.view.room_action_bar(cx, ids!(room_actions)).set_room_context(None, false);
         self.save_current_state();
         self.space_name_id = None;
         self.space_avatar_state = AvatarState::Unknown;

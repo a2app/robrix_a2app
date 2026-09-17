@@ -355,8 +355,19 @@ script_mod! {
                         }
 
                         SpaceLobbyScreenStackNavigationView := mod.widgets.RobrixStackNavigationView {
+                            header +: {
+                                height: Fit
+                                content := mod.widgets.RoomActionBarHeader {
+                                    padding: Inset{
+                                        left: (mod.widgets.SAFE_INSET_PAD_LEFT),
+                                        right: (mod.widgets.SAFE_INSET_PAD_RIGHT),
+                                    }
+                                }
+                            }
                             body +: {
-                                space_lobby_screen := mod.widgets.SpaceLobbyScreen {}
+                                space_lobby_screen := mod.widgets.SpaceLobbyScreen {
+                                    room_actions +: {visible: false}
+                                }
                             }
                         }
                     }
@@ -776,6 +787,8 @@ impl HomeScreen {
                 Self::hide_displayed_stack_screen(cx, &stack_navigation_view);
                 stack_navigation_view.room_action_bar(cx, ids!(header.content))
                     .set_expanded(cx, false);
+                stack_navigation_view.room_action_bar(cx, ids!(header.content))
+                    .set_room_context(Some(room_name_id), false);
                 Self::set_mobile_stack_header_height(cx, &stack_navigation_view, 45.0);
                 let thread_root = if let SelectedRoom::Thread { thread_root_event_id, .. } = selected_screen {
                     Some(thread_root_event_id.clone())
@@ -808,6 +821,10 @@ impl HomeScreen {
                     return None;
                 };
                 Self::hide_displayed_stack_screen(cx, &stack_navigation_view);
+                let header = stack_navigation_view.room_action_bar(cx, ids!(header.content));
+                header.set_expanded(cx, false);
+                header.set_room_context(Some(space_name_id), true);
+                Self::set_mobile_stack_header_height(cx, &stack_navigation_view, 45.0);
                 stack_navigation_view
                     .space_lobby_screen(cx, ids!(space_lobby_screen))
                     .set_displayed_space(cx, space_name_id);
@@ -852,6 +869,7 @@ impl HomeScreen {
     }
 
     fn hide_displayed_stack_screen(cx: &mut Cx, stack_navigation_view: &WidgetRef) {
+        stack_navigation_view.room_action_bar(cx, ids!(header.content)).set_room_context(None, false);
         stack_navigation_view
             .room_screen(cx, ids!(room_screen))
             .hide_displayed_room(cx);

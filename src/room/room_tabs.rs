@@ -33,7 +33,7 @@ pub struct RoomTabs {
 impl RoomTabs {
     pub fn tab_template(room: &SelectedRoom) -> LiveId {
         match room {
-            SelectedRoom::JoinedRoom { .. } | SelectedRoom::Thread { .. } => id!(RoomTab),
+            SelectedRoom::JoinedRoom { .. } | SelectedRoom::Thread { .. } | SelectedRoom::Space { .. } => id!(RoomTab),
             _ => id!(CloseableTab),
         }
     }
@@ -116,7 +116,7 @@ impl RoomTabs {
         for (tab_id, room) in rooms {
             let tab = dock.widget(cx, &[TabBar::tab_node_name(*tab_id)]);
             if let Some(mut tab) = tab.borrow_mut::<Tab>() {
-                let right = if matches!(room, SelectedRoom::JoinedRoom { .. } | SelectedRoom::Thread { .. }) {
+                let right = if matches!(room, SelectedRoom::JoinedRoom { .. } | SelectedRoom::Thread { .. } | SelectedRoom::Space { .. }) {
                     // Include a 4px gap before the expansion control.
                     37.0
                 } else {
@@ -141,7 +141,7 @@ impl RoomTabs {
         changed
     }
 
-    /// Draws the expand/collapse button on each visible joined room or thread tab.
+    /// Draws the expand/collapse button on each visible room, thread, or space tab.
     ///
     /// Call this after the dock is drawn (when each tab's position is known),
     /// so it can properly place each button in the right spot.
@@ -161,7 +161,7 @@ impl RoomTabs {
                 .map(|bar| (tab.tab_id, bar.rect))
         }).collect();
         for (tab_id, room) in rooms {
-            if !matches!(room, SelectedRoom::JoinedRoom { .. } | SelectedRoom::Thread { .. }) {
+            if !matches!(room, SelectedRoom::JoinedRoom { .. } | SelectedRoom::Thread { .. } | SelectedRoom::Space { .. }) {
                 continue;
             }
             let tab_widget = dock.widget(cx, &[TabBar::tab_node_name(*tab_id)]);

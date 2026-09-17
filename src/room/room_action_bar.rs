@@ -3,6 +3,7 @@
 use makepad_widgets::*;
 
 use crate::shared::popup_list::{enqueue_popup_notification, PopupKind};
+use crate::utils::RoomNameId;
 
 // currently there's a fixed number of action buttons,
 // but later we'll do that dynamically once we have more features implemented.
@@ -259,6 +260,8 @@ pub struct RoomActionBar {
     #[rust] latest_header_height: Option<f64>,
     #[rust] redraw_next_frame: NextFrame,
     #[rust] icon_tooltip: RoomActionTooltip,
+    /// The room or space belonging to this bar, independent of the focused tab.
+    #[rust] room_context: Option<(RoomNameId, bool)>,
 }
 
 impl ScriptHook for RoomActionBar {
@@ -274,27 +277,43 @@ impl Widget for RoomActionBar {
         }
         if !self.is_desktop_mode {
             let mut buttons: Vec<_> = ACTIONS.iter().map(|(id, label)| {
-                (self.view.widget(cx, &[*id]), *label)
+                (self.view.widget(cx, &[*id]), self.action_label(*id, label))
             }).collect();
             buttons.push((self.view.widget(cx, ids!(button_container.left_button)), "Back"));
             self.icon_tooltip.handle_event(cx, event, buttons, TooltipPosition::Bottom);
         }
         self.view.handle_event(cx, event, scope);
         if let Event::Actions(actions) = event {
+            for action in actions {
+                if let Some(crate::app::AppStateAction::RoomNameUpdated(name)
+                    | crate::app::AppStateAction::RoomLoadedSuccessfully { room_name_id: name, .. }) = action.downcast_ref()
+                    && let Some((room, _)) = self.room_context.as_mut()
+                    && room.room_id() == name.room_id()
+                {
+                    *room = name.clone();
+                }
+            }
             if !self.is_desktop_mode && (self.view.button(cx, ids!(expand_room_actions_button)).clicked(actions)
                 || self.view.button(cx, ids!(collapse_room_actions_button)).clicked(actions))
             {
                 self.set_expanded(cx, !self.is_expanded);
             }
             for &(id, label) in ACTIONS {
-                if id == id!(room_mini_apps_button) {
-                    // TODO: browse, select, and run mini-apps in this room or space.
-                    continue;
-                }
+                if !self.action_available(id) { continue; }
                 if self.view.button(cx, &[id]).clicked(actions)
                     || self.view.button(cx, &[id!(expanded_room_actions), id]).clicked(actions)
                 {
-                    show_room_action_placeholder(label);
+                    if id == id!(room_mini_apps_button) {
+                        #[cfg(feature = "a2app")]
+                        if let Some((room_name_id, is_space)) = &self.room_context {
+                            cx.action(crate::a2app::room_app_picker::RoomAppPickerAction::Show {
+                                room_name_id: room_name_id.clone(),
+                                is_space: *is_space,
+                            });
+                        }
+                        continue;
+                    }
+                    show_room_action_placeholder(self.action_label(id, label));
                 }
             }
         }
@@ -309,7 +328,7 @@ impl Widget for RoomActionBar {
                     .size_in_lpxs.width as f64 * title.draw_text.font_scale as f64
                     + title.walk.margin.width()
             }).unwrap_or(width);
-            inline_count(width, title_width)
+            inline_count(width, title_width).min(ACTIONS.iter().filter(|(id, _)| self.action_available(*id)).count())
         } else {
             // in desktop view mode, the dock tabs only show the expand/collapse button.
             0
@@ -339,6 +358,19 @@ impl Widget for RoomActionBar {
 }
 
 impl RoomActionBar {
+    fn action_available(&self, id: LiveId) -> bool {
+        !self.room_context.as_ref().is_some_and(|(_, is_space)| *is_space)
+            || (id != id!(room_threads_button) && id != id!(room_pinned_messages_button))
+    }
+
+    fn action_label(&self, id: LiveId, label: &'static str) -> &'static str {
+        if self.room_context.as_ref().is_some_and(|(_, is_space)| *is_space) {
+            if id == id!(room_info_button) { return "Space info"; }
+            if id == id!(room_settings_button) { return "Space settings"; }
+        }
+        label
+    }
+
     fn set_expanded(&mut self, cx: &mut Cx, expanded: bool) {
         self.is_expanded = expanded;
         self.latest_layout = None;
@@ -380,13 +412,15 @@ impl RoomActionBar {
             }
         }
 
-        for (index, (id, label)) in ACTIONS.iter().enumerate() {
+        let mut index = 0;
+        for (id, label) in ACTIONS {
+            let available = self.action_available(*id);
             let button = self.view.widget(cx, &[*id]);
-            let in_header_row = !self.is_desktop_mode && index < inline;
+            let in_header_row = available && !self.is_desktop_mode && index < inline;
             button.set_visible(cx, in_header_row);
             let expanded_button = expanded_room_actions.widget(cx, &[*id]);
-            expanded_button.set_visible(cx, show_overflow);
-            expanded_button.set_text(cx, label);
+            expanded_button.set_visible(cx, available && show_overflow);
+            expanded_button.set_text(cx, self.action_label(*id, label));
             if in_header_row {
                 let slots_after = index + 2;
                 let x = width - HEADER_BUTTON_INSET - slots_after as f64 * (BUTTON_SIZE + HEADER_BUTTON_GAP) + HEADER_BUTTON_GAP;
@@ -394,6 +428,7 @@ impl RoomActionBar {
                 let mut button = button;
                 script_apply_eval!(cx, button, {enable_long_press: true});
             }
+            if available { index += 1; }
         }
     }
 }
@@ -414,6 +449,13 @@ fn place(cx: &mut Cx, widget: &WidgetRef, x: f64, y: f64, width: f64, height: f6
 }
 
 impl RoomActionBarRef {
+    pub fn set_room_context(&self, room: Option<&RoomNameId>, is_space: bool) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.room_context = room.map(|room| (room.clone(), is_space));
+            inner.latest_layout = None;
+        }
+    }
+
     pub fn draw_shadow(&self, cx: &mut Cx2d, room_rect: Rect) {
         if let Some(mut inner) = self.borrow_mut()
             && inner.view.visible && inner.is_desktop_mode && inner.is_expanded

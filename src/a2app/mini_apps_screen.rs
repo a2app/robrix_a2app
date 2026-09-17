@@ -13,7 +13,7 @@ use makepad_code_editor::code_view::CodeViewWidgetExt;
 use matrix_sdk::ruma::OwnedRoomId;
 
 use a2app_core::diff::{line_diff, DiffLine};
-use a2app_core::manifest::{A2AppScope, MiniAppId, RunsIn};
+use a2app_core::manifest::{A2AppScope, MiniAppId, MiniAppManifest, RunsIn};
 use a2app_core::permissions::{Effective, GrantState, Permission};
 use a2app_core::persistence;
 use a2app_core::versions::AppVersion;
@@ -1101,8 +1101,6 @@ script_mod! {
 /// Actions emitted by the per-row widgets, applied by the screen.
 #[derive(Clone, Debug, Default)]
 pub enum MiniAppsScreenAction {
-    OpenApp(MiniAppId),
-    ShowInfo(MiniAppId),
     CyclePermission { app_id: MiniAppId, perm: Permission },
     CycleCapability { app_id: MiniAppId, cap_id: String },
     UseVersion { app_id: MiniAppId, stamp: String },
@@ -1119,6 +1117,15 @@ pub enum MiniAppsScreenAction {
 // Row widgets
 // -----------------------------------------------------------------------
 
+/// Scoped to the row widget so other screens and pickers cannot open the same app.
+#[derive(Clone, Debug, Default)]
+pub(super) enum MiniAppRowAction {
+    OpenApp(MiniAppId),
+    ShowInfo(MiniAppId),
+    #[default]
+    None,
+}
+
 #[derive(Script, ScriptHook, Widget)]
 pub struct MiniAppRow {
     #[deref] view: View,
@@ -1130,9 +1137,9 @@ impl Widget for MiniAppRow {
         self.view.handle_event(cx, event, scope);
         if let Event::Actions(actions) = event {
             if self.view.button(cx, ids!(row_open_button)).clicked(actions) {
-                cx.action(MiniAppsScreenAction::OpenApp(self.app_id.clone()));
+                cx.widget_action(self.widget_uid(), MiniAppRowAction::OpenApp(self.app_id.clone()));
             } else if self.view.button(cx, ids!(row_settings_button)).clicked(actions) {
-                cx.action(MiniAppsScreenAction::ShowInfo(self.app_id.clone()));
+                cx.widget_action(self.widget_uid(), MiniAppRowAction::ShowInfo(self.app_id.clone()));
             }
         }
     }
@@ -1142,19 +1149,19 @@ impl Widget for MiniAppRow {
 }
 
 /// One list row's texts, gathered per draw without cloning any app's source.
-struct MiniAppRowData {
-    id: MiniAppId,
+pub(super) struct MiniAppRowData {
+    pub(super) id: MiniAppId,
     icon: String,
     name: String,
     /// Where it runs, plus running / stopped.
     detail: String,
     summary: String,
     tint: u32,
-    open_label: &'static str,
+    pub(super) open_label: &'static str,
 }
 
 impl MiniAppRow {
-    fn populate(&mut self, cx: &mut Cx, row: &MiniAppRowData) {
+    pub(super) fn populate(&mut self, cx: &mut Cx, row: &MiniAppRowData) {
         self.app_id = row.id.clone();
         self.view.label(cx, ids!(row_glyph)).set_text(cx, &row.icon);
         self.view.label(cx, ids!(row_name)).set_text(cx, &row.name);
@@ -1169,6 +1176,39 @@ impl MiniAppRow {
         let mut row_tile = self.view.view(cx, ids!(row_tile));
         script_apply_eval!(cx, row_tile, { draw_bg +: { color: #(tile) } });
     }
+}
+
+/// Shared presentation data for the management screen and the room/space picker.
+/// Copy only row text, never the app source or its other manifest data.
+pub(super) fn mini_app_rows(
+    cx: &mut Cx,
+    include: impl Fn(&MiniAppManifest) -> bool,
+) -> Vec<MiniAppRowData> {
+    with_a2app(|state| {
+        state.registry.iter().filter(|m| include(m)).map(|m| {
+            let mut detail = match (&m.scope, m.runs_in()) {
+                (A2AppScope::Room { room_id }, _) => format!("Runs in {}", room_label(cx, room_id)),
+                (_, RunsIn::Room) => String::from("Runs in a room"),
+                (_, RunsIn::Rooms) => String::from("Works across your rooms"),
+                (_, RunsIn::Spaces) => String::from("Works across your spaces"),
+                (_, RunsIn::Account) => String::from("Account-wide"),
+            };
+            if state.permissions.is_restricted(&m.id) {
+                detail.push_str(" · stopped for abuse");
+            } else if state.is_running(&m.id) {
+                detail.push_str(" · running");
+            }
+            MiniAppRowData {
+                id: m.id.clone(),
+                icon: m.icon.clone(),
+                name: m.name.clone(),
+                detail,
+                summary: m.description.clone(),
+                tint: m.tint,
+                open_label: run_label(&m.scope, m.runs_in()),
+            }
+        }).collect()
+    }).unwrap_or_default()
 }
 
 #[derive(Script, ScriptHook, Widget)]
@@ -1430,6 +1470,20 @@ impl Widget for MiniAppsScreen {
             cx.action(A2AppOp::SetMatrixWrite(on));
         }
 
+        for (_, row) in self.view.flat_list(cx, ids!(apps_list)).items_with_actions(actions) {
+            match actions.find_widget_action(row.widget_uid()).cast() {
+                MiniAppRowAction::OpenApp(app_id) => {
+                    self.open_app(cx, app_id);
+                    break;
+                }
+                MiniAppRowAction::ShowInfo(app_id) => {
+                    self.show_info(cx, app_id);
+                    break;
+                }
+                MiniAppRowAction::None => {}
+            }
+        }
+
         for action in actions {
             // A /miniapp generation lands on this screen; make sure the
             // console (list pane) is showing, not a leftover info pane.
@@ -1451,14 +1505,6 @@ impl Widget for MiniAppsScreen {
                 continue;
             }
             match action.downcast_ref::<MiniAppsScreenAction>() {
-                Some(MiniAppsScreenAction::OpenApp(app_id)) => {
-                    self.open_app(cx, app_id.clone());
-                    continue;
-                }
-                Some(MiniAppsScreenAction::ShowInfo(app_id)) => {
-                    self.show_info(cx, app_id.clone());
-                    continue;
-                }
                 Some(MiniAppsScreenAction::CyclePermission { app_id, perm }) => {
                     self.cycle_permission(cx, app_id, *perm);
                     continue;
@@ -2051,35 +2097,7 @@ impl MiniAppsScreen {
         // don't draw, so only one of these runs per draw pass.
         match self.pane {
             Pane::List => {
-                // Texts only; cloning whole manifests here would copy every
-                // app's source per draw.
-                let rows: Vec<MiniAppRowData> = with_a2app(|state| {
-                    state.registry.iter().map(|m| {
-                        let running = state.is_running(&m.id);
-                        let open_label = run_label(&m.scope, m.runs_in());
-                        let mut detail = match (&m.scope, m.runs_in()) {
-                            (A2AppScope::Room { room_id }, _) => format!("Runs in {}", room_label(cx, room_id)),
-                            (_, RunsIn::Room) => String::from("Runs in a room"),
-                            (_, RunsIn::Rooms) => String::from("Works across your rooms"),
-                            (_, RunsIn::Spaces) => String::from("Works across your spaces"),
-                            (_, RunsIn::Account) => String::from("Account-wide"),
-                        };
-                        if state.permissions.is_restricted(&m.id) {
-                            detail.push_str(" · stopped for abuse");
-                        } else if running {
-                            detail.push_str(" · running");
-                        }
-                        MiniAppRowData {
-                            id: m.id.clone(),
-                            icon: m.icon.clone(),
-                            name: m.name.clone(),
-                            detail,
-                            summary: m.description.clone(),
-                            tint: m.tint,
-                            open_label,
-                        }
-                    }).collect()
-                }).unwrap_or_default();
+                let rows = mini_app_rows(cx, |_| true);
                 for row_data in &rows {
                     let item_live_id = LiveId::from_str(&row_data.id);
                     let Some(item) = list.item(cx, item_live_id, id!(mini_app_row)) else { continue };
@@ -2198,5 +2216,87 @@ impl MiniAppsScreen {
             item.label(cx, ids!(line)).set_text(cx, text);
             item.draw_all(cx, &mut Scope::empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod picker_tests {
+    use super::*;
+    use crate::a2app::room_app_picker::{RoomAppPickerAction, RoomAppPickerWidgetRefExt};
+    use crate::home::navigation_tab_bar::NavigationBarAction;
+    use crate::utils::RoomNameId;
+
+    #[test]
+    fn picker_dsl_and_actions_stay_scoped_to_their_surface() {
+        // Register and instantiate the real DSL without starting App, a window,
+        // or the Matrix/a2app runtimes, so no user session or storage is touched.
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let (screen, picker) = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
+            let screen = WidgetRef::script_from_value(vm, value);
+            let value = script_eval!(vm, { mod.widgets.RoomAppPicker {} });
+            (screen, WidgetRef::script_from_value(vm, value))
+        });
+        assert!(screen.borrow::<MiniAppsScreen>().is_some());
+        assert!(!picker.button(&cx, ids!(all_apps_button)).is_empty());
+
+        let screen_row = screen.flat_list(&cx, ids!(apps_list))
+            .item(&mut cx, id!(test_app), id!(mini_app_row)).unwrap();
+        screen_row.borrow_mut::<MiniAppRow>().unwrap().app_id = "screen-app".into();
+        let picker_row = picker.portal_list(&cx, ids!(apps_list))
+            .item(&mut cx, 0, id!(app_row));
+        picker_row.borrow_mut::<MiniAppRow>().unwrap().app_id = "picker-app".into();
+
+        let clicked = |cx: &mut Cx, widget: &WidgetRef| {
+            let button_uid = widget.button(cx, ids!(row_open_button)).widget_uid();
+            cx.capture_actions(|cx| cx.widget_action(button_uid, ButtonAction::Clicked(Default::default())))
+        };
+        let clicks = clicked(&mut cx, &picker_row);
+        let row_actions = cx.capture_actions(|cx| {
+            picker.handle_event(cx, &Event::Actions(clicks), &mut Scope::empty());
+        });
+        assert!(matches!(
+            row_actions.find_widget_action(picker_row.widget_uid()).cast(),
+            MiniAppRowAction::OpenApp(id) if id == "picker-app"
+        ));
+        let unrelated = cx.capture_actions(|cx| {
+            screen.handle_event(cx, &Event::Actions(row_actions), &mut Scope::empty());
+        });
+        assert!(unrelated.is_empty(), "picker rows must not launch from a hidden management screen");
+
+        let clicks = clicked(&mut cx, &screen_row);
+        let row_actions = cx.capture_actions(|cx| {
+            screen.handle_event(cx, &Event::Actions(clicks), &mut Scope::empty());
+        });
+        let launched = cx.capture_actions(|cx| {
+            screen.handle_event(cx, &Event::Actions(row_actions), &mut Scope::empty());
+        });
+        assert_eq!(launched.len(), 1);
+        assert!(matches!(launched[0].downcast_ref(),
+            Some(A2AppOp::OpenApp { app_id, room_id: None, .. }) if app_id == "screen-app"));
+
+        let context = RoomNameId::empty(OwnedRoomId::try_from("!picker:example.org").unwrap());
+        picker.as_room_app_picker().show(&mut cx, context.clone(), false);
+        let button_uid = picker.button(&cx, ids!(all_apps_button)).widget_uid();
+        let clicks = cx.capture_actions(|cx| {
+            cx.widget_action(button_uid, ButtonAction::Clicked(Default::default()));
+        });
+        let navigation = cx.capture_actions(|cx| {
+            picker.handle_event(cx, &Event::Actions(clicks), &mut Scope::empty());
+        });
+        assert_eq!(navigation.len(), 2);
+        assert!(matches!(navigation[0].downcast_ref(), Some(RoomAppPickerAction::Close)));
+        assert!(matches!(navigation[1].downcast_ref(), Some(NavigationBarAction::GoToMiniApps)));
+
+        picker.as_room_app_picker().show(&mut cx, context, false);
+        let dismiss = cx.capture_actions(|cx| cx.action(ModalAction::Dismissed));
+        let response = cx.capture_actions(|cx| {
+            picker.handle_event(cx, &Event::Actions(dismiss), &mut Scope::empty());
+        });
+        assert!(response.is_empty(), "dismissal must not re-emit Close in a loop");
     }
 }

@@ -179,7 +179,14 @@ fn join_room(){
 
 fn on_permissions_changed(caps){ reload() }
 
-let _boot = start_timeout(0.05, || reload())
+let _boot = start_timeout(0.05, || {
+    host.request("env", nil, fn(r){
+        if r.is_ok && r.data.room_attached {
+            trail.push({space_id: r.data.room_id name: shown_name(r.data.room_name, r.data.room_id)})
+        }
+        reload()
+    })
+})
 
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}

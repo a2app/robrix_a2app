@@ -145,6 +145,11 @@ script_mod! {
                             content := FileUploadModal {}
                         }
 
+                        // Select a mini-app for the room or space that opened the picker.
+                        room_app_picker_modal := Modal {
+                            content := RoomAppPicker {}
+                        }
+
                         // Hosts running Splash mini-apps (a2app feature);
                         // an invisible stub in builds without it.
                         mini_app_host_modal := Modal {
@@ -596,6 +601,25 @@ impl MatchEvent for App {
                     continue;
                 }
                 _ => {}
+            }
+
+            #[cfg(feature = "a2app")]
+            if let Some(picker_action) = action.downcast_ref::<crate::a2app::room_app_picker::RoomAppPickerAction>() {
+                use crate::a2app::room_app_picker::{RoomAppPickerAction, RoomAppPickerWidgetRefExt};
+                let modal = self.ui.modal(cx, ids!(room_app_picker_modal));
+                let picker = self.ui.room_app_picker(cx, ids!(room_app_picker_modal.content));
+                match picker_action {
+                    RoomAppPickerAction::Show { room_name_id, is_space } => {
+                        modal.open(cx);
+                        picker.show(cx, room_name_id.clone(), *is_space);
+                    }
+                    RoomAppPickerAction::Close => {
+                        picker.clear(cx);
+                        modal.close(cx);
+                    }
+                    RoomAppPickerAction::None => {}
+                }
+                continue;
             }
 
             // Handle RoomPickerModalAction to open/close the room picker modal.
