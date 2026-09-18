@@ -7,7 +7,7 @@
 //! state in `<data_root>/permissions.json`, deliberately outside every app's
 //! own storage jail.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -79,6 +79,21 @@ pub enum Permission {
     RobrixPreferences,
     /// Be told which room or screen you switch to.
     RobrixObserve,
+    /// Run the AI app-generation pipeline (spends the user's provider tokens
+    /// and installs a new sandboxed mini-app). Reached only by an AI room's
+    /// own session, never by a mini-app manifest.
+    AppGeneration,
+    /// Register a callable tool with the room's AI, or (on the agent side)
+    /// invoke a tool a mini-app registered. Each tool is granted on its own:
+    /// registration stores the app-authored description's content hash so a
+    /// changed description re-prompts, and the UI shows the exact text before
+    /// it can reach the model's context.
+    McpTools,
+    /// List the installed mini-apps available in a room, and run one in that
+    /// room's dock (the AI session's `list_apps`/`launch_app` tools). Reached
+    /// only by an AI room's own session, never by a mini-app manifest; it
+    /// never creates or changes an app.
+    AppLaunch,
 }
 
 /// Runtime permissions prompt the user on first use; normal ones auto-grant
@@ -90,7 +105,7 @@ pub enum Tier {
 }
 
 impl Permission {
-    pub const ALL: [Permission; 36] = [
+    pub const ALL: [Permission; 39] = [
         Permission::Network,
         Permission::Location,
         Permission::Notifications,
@@ -127,6 +142,9 @@ impl Permission {
         Permission::RobrixUi,
         Permission::RobrixPreferences,
         Permission::RobrixObserve,
+        Permission::AppGeneration,
+        Permission::McpTools,
+        Permission::AppLaunch,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -167,6 +185,9 @@ impl Permission {
             Permission::RobrixUi => "robrix-ui",
             Permission::RobrixPreferences => "robrix-preferences",
             Permission::RobrixObserve => "robrix-observe",
+            Permission::AppGeneration => "app-generation",
+            Permission::McpTools => "mcp-tools",
+            Permission::AppLaunch => "app-launch",
         }
     }
 
@@ -206,7 +227,10 @@ impl Permission {
             | Permission::RobrixNavigation
             | Permission::RobrixComposer
             | Permission::RobrixUi
-            | Permission::RobrixObserve => Tier::Runtime,
+            | Permission::RobrixObserve
+            | Permission::AppGeneration
+            | Permission::McpTools
+            | Permission::AppLaunch => Tier::Runtime,
             Permission::ClipboardWrite
             | Permission::OpenUrl
             | Permission::Files
@@ -258,6 +282,9 @@ impl Permission {
             Permission::RobrixUi => "Its own pane",
             Permission::RobrixPreferences => "Robrix settings",
             Permission::RobrixObserve => "Watch what you're doing",
+            Permission::AppGeneration => "Build and run mini-apps",
+            Permission::McpTools => "Register AI tools",
+            Permission::AppLaunch => "Open your mini-apps",
         }
     }
 
@@ -299,6 +326,9 @@ impl Permission {
             Permission::RobrixUi => "🪟",
             Permission::RobrixPreferences => "⚙️",
             Permission::RobrixObserve => "📡",
+            Permission::AppGeneration => "⚡",
+            Permission::McpTools => "🧩",
+            Permission::AppLaunch => "🚀",
         }
     }
 
@@ -342,6 +372,9 @@ impl Permission {
             Permission::RobrixUi => "Resize, move, minimize or break out its pane, badge its tab, and ask for keyboard focus.",
             Permission::RobrixPreferences => "Know display settings like view mode, zoom and theme so the app can match Robrix.",
             Permission::RobrixObserve => "Be told which room or screen you switch to.",
+            Permission::AppGeneration => "Run the AI app-builder here. It spends your provider's usage and installs a new sandboxed app into this room.",
+            Permission::McpTools => "Register tools the AI in this room can call. The app's tool name and full description are shown for your review before they reach the AI.",
+            Permission::AppLaunch => "See which mini-apps you have installed and open one in this room. This never creates or changes an app.",
         }
     }
 }
@@ -383,6 +416,10 @@ pub struct AccessRecord {
 /// doing lately" without turning permissions.json's sibling into a log file.
 pub const MAX_ACCESS_RECORDS: usize = 240;
 
+/// The current [`PermissionStore`] schema. Bump it when a stored grant's
+/// meaning changes, and extend [`PermissionStore::migrate`].
+pub const PERMISSIONS_SCHEMA: u32 = 1;
+
 /// All grants, keyed app id -> permission id. Owned by the host, persisted
 /// whole-file on every change (it is tiny, and a lost file just re-asks).
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -419,6 +456,68 @@ pub struct PermissionStore {
     /// switch-gated write is refused without a prompt until the user turns it on.
     #[serde(default)]
     matrix_write: bool,
+    /// Persisted schema version, bumped when a stored grant's *meaning*
+    /// changes so [`Self::migrate`] can rewrite old files. Defaults to 0 for
+    /// files written before the field existed (and for a fresh store).
+    #[serde(default)]
+    schema: u32,
+    /// Per-subject allowlists of rooms the subject may post messages into as
+    /// the user (the AI-room agent's per-room grants for
+    /// `matrix.rooms.message.send`). Keyed by subject (an app id or an agent
+    /// key, see [`agent_subject`]) then room id. A room grant is specific to
+    /// that room: it is what lets one target room be allowed without
+    /// unlocking every room, the way a group grant would. The group grant
+    /// still answers first — a group `Denied` kills the capability entirely
+    /// — but a group `Granted` alone does NOT allow a room; the room must be
+    /// listed here too.
+    #[serde(default)]
+    send_rooms: BTreeMap<String, BTreeSet<String>>,
+    /// Per-subject allowlists of rooms the subject may READ messages from,
+    /// beyond the room it is attached to (the AI-room agent's per-room grants
+    /// for `matrix.rooms.messages.read`). Keyed by subject (an app id or an
+    /// agent key, see [`agent_subject`]) then room id. A room grant is
+    /// specific to that room: it is what lets one target room be allowed
+    /// without unlocking every room, the way a group grant would. The group
+    /// grant still answers first — a group `Denied` kills the capability
+    /// entirely — but a group `Granted` alone does NOT allow a room; the room
+    /// must be listed here too. Mirrors `send_rooms`, because reading a room
+    /// is at least as sensitive as posting into it.
+    #[serde(default)]
+    read_rooms: BTreeMap<String, BTreeSet<String>>,
+    /// Per-subject allowlists of internet hosts the subject may reach (the
+    /// AI-room agent's per-URL grants for `network.http`). Keyed by subject
+    /// (an app id or an agent key, see [`agent_subject`]) then host. A host
+    /// grant is specific to that host: it is what lets one domain be allowed
+    /// without unlocking the whole internet, the way a group grant would.
+    /// The group grant still answers first — a group `Denied` kills the
+    /// capability entirely — but a group `Granted` alone does NOT allow a
+    /// host; the host must be listed here too. Subdomains of a listed host
+    /// are admitted by the caller's matching rule, so `example.com` covers
+    /// `docs.example.com` but never `notexample.com`.
+    #[serde(default)]
+    net_hosts: BTreeMap<String, BTreeSet<String>>,
+    /// Session-only host grants (the prompt's "Allow Once"): live for this
+    /// session only and never hit disk, like [`Self::once`]. Checked after
+    /// the durable allowlist so "once" cannot become forever.
+    #[serde(skip)]
+    net_once: std::collections::HashSet<(String, String)>,
+    /// Per-tool grants for the `mcp-tools` group, keyed by subject (an
+    /// installed app's id for registration, an AI room's agent key for
+    /// invocation) then the namespaced tool name. The value is the content
+    /// hash of the app-authored (description, args) at grant time, so a
+    /// changed description no longer matches and the user is asked again;
+    /// invocation grants store an empty string (the description gate already
+    /// ran at registration).
+    #[serde(default)]
+    tool_grants: BTreeMap<String, BTreeMap<String, String>>,
+    /// Session-only "Allow Once" tool grants, never persisted.
+    #[serde(skip)]
+    tool_once: std::collections::HashSet<(String, String)>,
+    /// Session-only tool denials (a "Don't Allow" on one registration or
+    /// invocation). Not persisted: a fresh session asks again rather than
+    /// silently blocking a tool forever with no UI to clear it.
+    #[serde(skip)]
+    tool_denied: std::collections::HashSet<(String, String)>,
     /// Apps the host stopped for abusing the bridge, and why. Persisted
     /// deliberately: an app that hammered its way to a stop must not get a
     /// clean slate by being restarted, or the escalation means nothing.
@@ -440,6 +539,37 @@ pub struct Restriction {
     /// the run's counters — and this is the number that explains the stop.
     #[serde(default)]
     pub refusals: u64,
+}
+
+/// The reserved prefix for permission subjects that are not installed
+/// mini-apps. Today that is exactly one kind: the AI-room agent session that
+/// backs a room carrying the `ai_room` marker. Its grants live in the SAME
+/// [`PermissionStore`] (the maps are string-keyed), namespaced under this
+/// prefix so a room can never collide with — or be mistaken for — an
+/// installed app id (app ids are slug-safe and contain neither ':' nor '!',
+/// which room ids always do).
+pub const AGENT_SUBJECT_PREFIX: &str = "ai-room:";
+
+/// The permission-store key for an AI room's agent session: one durable
+/// subject per room, keyed by the room's matrix id. The room's `ai_room`
+/// marker persists and the session is re-attached to it after restarts, so
+/// grants keyed here are as durable as an app's — and as revocable.
+pub fn agent_subject(room_id: &str) -> String {
+    format!("{AGENT_SUBJECT_PREFIX}{room_id}")
+}
+
+/// Whether a store key names an agent session rather than a mini-app.
+/// Callers that must behave differently for agents (the room-scoped AI
+/// panel, session teardown) branch on this.
+pub fn is_agent_subject(subject: &str) -> bool {
+    subject.starts_with(AGENT_SUBJECT_PREFIX)
+}
+
+/// The room id a subject key names, when it is an agent subject. The store
+/// deliberately has no notion of rooms; the runtime that owns the sessions
+/// maps the key back to its room when it needs to.
+pub fn agent_room_of(subject: &str) -> Option<&str> {
+    subject.strip_prefix(AGENT_SUBJECT_PREFIX)
 }
 
 impl PermissionStore {
@@ -474,6 +604,231 @@ impl PermissionStore {
 
     pub fn set_matrix_write(&mut self, on: bool) {
         self.matrix_write = on;
+    }
+
+    /// Rewrites grants whose *meaning* changed across schema versions.
+    ///
+    /// Schema 1 made cross-room reads per-room (`read_rooms`) instead of a
+    /// blanket `matrix-rooms-read` group grant. A blanket grant written by the
+    /// old cross-room read prompt must not keep unlocking every room the agent
+    /// names, so it is reset to `Ask` and the per-room prompt re-asks. A
+    /// post-upgrade panel “allow all rooms” is written at schema 1 and kept.
+    pub fn migrate(&mut self) {
+        if self.schema >= PERMISSIONS_SCHEMA {
+            return;
+        }
+        let key = Permission::MatrixRoomsRead.as_str();
+        for grants in self.grants.values_mut() {
+            if grants.get(key).copied() == Some(GrantState::Granted) {
+                grants.insert(key.to_string(), GrantState::Ask);
+            }
+        }
+        self.schema = PERMISSIONS_SCHEMA;
+    }
+
+    /// Whether `subject` may post messages into `room` as the user — one
+    /// room at a time (see `send_rooms`). A room is allowed only when the
+    /// user explicitly allowed THAT room; group grants do not unlock rooms.
+    pub fn is_room_send_allowed(&self, subject: &str, room: &str) -> bool {
+        self.send_rooms
+            .get(subject)
+            .is_some_and(|rooms| rooms.contains(room))
+    }
+
+    /// Records that `subject` may post messages into `room` (durable, like
+    /// the group grants). A no-op when already allowed.
+    pub fn allow_room_send(&mut self, subject: &str, room: &str) {
+        self.send_rooms
+            .entry(subject.to_string())
+            .or_default()
+            .insert(room.to_string());
+    }
+
+    /// Removes `subject`'s per-room grant for `room`, if any.
+    pub fn disallow_room_send(&mut self, subject: &str, room: &str) {
+        if let Some(rooms) = self.send_rooms.get_mut(subject) {
+            rooms.remove(room);
+        }
+    }
+
+    /// All rooms `subject` may post into (for a per-room management UI).
+    pub fn room_send_grants(&self, subject: &str) -> Vec<String> {
+        self.send_rooms
+            .get(subject)
+            .map(|rooms| rooms.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether `subject` may read messages from `room` — one room at a time
+    /// (see `read_rooms`). A room is allowed only when the user explicitly
+    /// allowed THAT room; group grants do not unlock rooms.
+    pub fn is_room_read_allowed(&self, subject: &str, room: &str) -> bool {
+        self.read_rooms
+            .get(subject)
+            .is_some_and(|rooms| rooms.contains(room))
+    }
+
+    /// Records that `subject` may read messages from `room` (durable, like the
+    /// group grants). A no-op when already allowed.
+    pub fn allow_room_read(&mut self, subject: &str, room: &str) {
+        self.read_rooms
+            .entry(subject.to_string())
+            .or_default()
+            .insert(room.to_string());
+    }
+
+    /// Removes `subject`'s per-room read grant for `room`, if any.
+    pub fn disallow_room_read(&mut self, subject: &str, room: &str) {
+        if let Some(rooms) = self.read_rooms.get_mut(subject) {
+            rooms.remove(room);
+        }
+    }
+
+    /// All rooms `subject` may read from (for a per-room management UI).
+    pub fn room_read_grants(&self, subject: &str) -> Vec<String> {
+        self.read_rooms
+            .get(subject)
+            .map(|rooms| rooms.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether `subject` may reach `host` on the internet — one host at a
+    /// time (see `net_hosts`). A host is allowed only when the user
+    /// explicitly allowed THAT host (or a parent domain of it); a group
+    /// grant does not unlock the internet.
+    pub fn is_host_allowed(&self, subject: &str, host: &str) -> bool {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        let matches = |allowed: &str| {
+            let allowed = allowed.trim().trim_end_matches('.').to_ascii_lowercase();
+            !allowed.is_empty() && (host == allowed || host.ends_with(&format!(".{allowed}")))
+        };
+        if self
+            .net_once
+            .iter()
+            .any(|(id, once_host)| id == subject && matches(once_host))
+        {
+            return true;
+        }
+        let Some(hosts) = self.net_hosts.get(subject) else { return false };
+        hosts.iter().any(|allowed| matches(allowed))
+    }
+
+    /// Grants `host` for this session only (the prompt's "Allow Once").
+    pub fn allow_host_once(&mut self, subject: &str, host: &str) {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if !host.is_empty() {
+            self.net_once.insert((subject.to_string(), host));
+        }
+    }
+
+    /// Records that `subject` may reach `host` (durable, like the group
+    /// grants). A no-op when already allowed.
+    pub fn allow_host(&mut self, subject: &str, host: &str) {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() {
+            return;
+        }
+        self.net_hosts
+            .entry(subject.to_string())
+            .or_default()
+            .insert(host);
+    }
+
+    /// Removes `subject`'s grant for `host`, if any.
+    pub fn disallow_host(&mut self, subject: &str, host: &str) {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if let Some(hosts) = self.net_hosts.get_mut(subject) {
+            hosts.remove(&host);
+        }
+    }
+
+    /// All hosts `subject` may reach (for a per-host management UI).
+    pub fn host_grants(&self, subject: &str) -> Vec<String> {
+        self.net_hosts
+            .get(subject)
+            .map(|hosts| hosts.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The content hash the user approved for `subject`'s tool `tool`, if
+    /// any. `None` means never granted (or a session one-time grant exists).
+    pub fn tool_grant(&self, subject: &str, tool: &str) -> Option<&str> {
+        self.tool_grants
+            .get(subject)
+            .and_then(|tools| tools.get(tool))
+            .map(String::as_str)
+    }
+
+    /// Records a durable per-tool grant. `content_hash` is the registration
+    /// description's hash (or `""` for an invocation grant).
+    pub fn allow_tool(&mut self, subject: &str, tool: &str, content_hash: &str) {
+        self.tool_once.remove(&(subject.to_string(), tool.to_string()));
+        self.tool_denied.remove(&(subject.to_string(), tool.to_string()));
+        self.tool_grants
+            .entry(subject.to_string())
+            .or_default()
+            .insert(tool.to_string(), content_hash.to_string());
+    }
+
+    /// Grants one tool for this session only.
+    pub fn allow_tool_once(&mut self, subject: &str, tool: &str) {
+        self.tool_once.insert((subject.to_string(), tool.to_string()));
+    }
+
+    pub fn has_tool_once(&self, subject: &str, tool: &str) -> bool {
+        self.tool_once.contains(&(subject.to_string(), tool.to_string()))
+    }
+
+    /// Refuses one tool for this session only (never persisted).
+    pub fn deny_tool(&mut self, subject: &str, tool: &str) {
+        self.tool_denied.insert((subject.to_string(), tool.to_string()));
+    }
+
+    pub fn is_tool_denied(&self, subject: &str, tool: &str) -> bool {
+        self.tool_denied.contains(&(subject.to_string(), tool.to_string()))
+    }
+
+    /// Every tool `subject` has a durable grant for.
+    pub fn tool_grants(&self, subject: &str) -> Vec<String> {
+        self.tool_grants
+            .get(subject)
+            .map(|tools| tools.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Drops every tool grant and session denial for `subject` (the room's AI
+    /// session ending, an app restart, or an uninstall). Reports whether
+    /// anything changed.
+    pub fn clear_tool_grants_for(&mut self, subject: &str) -> bool {
+        let a = self.tool_grants.remove(subject).is_some();
+        let before = self.tool_once.len() + self.tool_denied.len();
+        self.tool_once.retain(|(s, _)| s != subject);
+        self.tool_denied.retain(|(s, _)| s != subject);
+        a || self.tool_once.len() + self.tool_denied.len() != before
+    }
+
+    /// The per-tool decision for `subject`'s tool. `content` is the
+    /// registration content hash (`Some`) or `None` for an invocation, where
+    /// the description gate already ran at registration. Restricted subjects
+    /// hold nothing. A session one-time grant or an unchanged durable grant
+    /// is `Granted`; otherwise the caller prompts.
+    pub fn tool_effective(&self, subject: &str, tool: &str, content: Option<&str>) -> Effective {
+        if self.is_restricted(subject) {
+            return Effective::Denied;
+        }
+        if self.is_tool_denied(subject, tool) {
+            return Effective::Denied;
+        }
+        if self.has_tool_once(subject, tool) {
+            return Effective::Granted;
+        }
+        match self.tool_grant(subject, tool) {
+            // A changed description is new text entering the model's context,
+            // so it must be reviewed again even though the tool name is the
+            // same.
+            Some(hash) if content.is_none_or(|c| c == hash) => Effective::Granted,
+            _ => Effective::NeedsPrompt,
+        }
     }
 
     /// Grants a capability until `until_unix` (the sheet's "Allow for 1 hour").
@@ -535,6 +890,9 @@ impl PermissionStore {
         self.cap_overrides.clear();
         self.until.clear();
         self.once.clear();
+        self.tool_grants.clear();
+        self.tool_once.clear();
+        self.tool_denied.clear();
     }
 
     /// Bars an app from running after it abused the host bridge. This is the
@@ -589,17 +947,23 @@ impl PermissionStore {
     /// Reports whether anything was actually dropped, so callers can skip a
     /// snapshot republish when nothing changed.
     pub fn clear_once_for(&mut self, app_id: &str) -> bool {
-        let before = self.once.len();
+        let before = self.once.len() + self.tool_once.len();
         self.once.retain(|(id, _)| id != app_id);
-        before != self.once.len()
+        // "Allow Once" for a tool dies with its isolate/session too, exactly
+        // like a one-time group grant.
+        self.tool_once.retain(|(id, _)| id != app_id);
+        before != self.once.len() + self.tool_once.len()
     }
 
     /// Forget an app entirely (uninstall). A reinstall starts from Ask.
     pub fn remove_app(&mut self, app_id: &str) {
         self.grants.remove(app_id);
+        self.clear_tool_grants_for(app_id);
         self.cap_overrides.remove(app_id);
         self.until.remove(app_id);
         self.uses.remove(app_id);
+        self.net_hosts.remove(app_id);
+        self.net_once.retain(|(id, _)| id != app_id);
         self.clear_once_for(app_id);
         self.access.retain(|r| r.app_id != app_id);
     }
@@ -647,28 +1011,45 @@ impl PermissionStore {
     }
 
     pub fn effective(&self, manifest: &MiniAppManifest, perm: Permission) -> Effective {
-        if !manifest.declares(perm) {
+        self.effective_for(&manifest.id, |p| manifest.declares(p), perm)
+    }
+
+    /// The subject-general form of [`Self::effective`]: the same decision for
+    /// ANY permission subject — an installed app, or an AI room's agent
+    /// session keyed by [`agent_subject`] — whose declarations are supplied
+    /// rather than read from a manifest. `declares` answers "does this subject
+    /// declare permission `perm`?" (an app's manifest, an agent session's
+    /// tool profile). Grants, once/timed answers, capability overrides,
+    /// restrictions and the global switches all live in the store and are
+    /// looked up by `subject`, so the two subject kinds share one decision.
+    pub fn effective_for(
+        &self,
+        subject: &str,
+        declares: impl Fn(Permission) -> bool,
+        perm: Permission,
+    ) -> Effective {
+        if !declares(perm) {
             return Effective::Undeclared;
         }
-        // A restricted app holds nothing, whatever it was granted before. It
-        // should not be running at all, but this is the choke point every
+        // A restricted subject holds nothing, whatever it was granted before.
+        // It should not be running at all, but this is the choke point every
         // capability check goes through, so it is where the guarantee belongs
         // rather than in whichever caller remembers to ask.
-        if self.is_restricted(&manifest.id) {
+        if self.is_restricted(subject) {
             return Effective::Denied;
         }
-        let stored = self.state(&manifest.id, perm);
+        let stored = self.state(subject, perm);
         // Session and timed grants outrank Ask but never a stored Denied:
         // "just this once" must not resurrect something you turned off.
         if stored != GrantState::Denied {
-            if self.has_once(&manifest.id, perm) {
+            if self.has_once(subject, perm) {
                 return Effective::Granted;
             }
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            if self.timed_until(&manifest.id, perm, now).is_some() {
+            if self.timed_until(subject, perm, now).is_some() {
                 return Effective::Granted;
             }
         }
@@ -682,9 +1063,20 @@ impl PermissionStore {
         }
     }
 
-    /// Whether the capability is usable right now (prompt-pending counts as no).
+    /// Whether the permission is usable right now (prompt-pending counts as
+    /// no) — the app-keyed wrapper over [`Self::is_granted_for`].
     pub fn is_granted(&self, manifest: &MiniAppManifest, perm: Permission) -> bool {
-        self.effective(manifest, perm) == Effective::Granted
+        self.is_granted_for(&manifest.id, |p| manifest.declares(p), perm)
+    }
+
+    /// Subject-general form of [`Self::is_granted`].
+    pub fn is_granted_for(
+        &self,
+        subject: &str,
+        declares: impl Fn(Permission) -> bool,
+        perm: Permission,
+    ) -> bool {
+        self.effective_for(subject, declares, perm) == Effective::Granted
     }
 
     /// The user's stored answer for one (app, capability); `Ask` = follows
@@ -706,28 +1098,51 @@ impl PermissionStore {
         }
     }
 
-    /// What one capability nets out to: its own override first, then its
-    /// group's answer; a group `Denied` (or a restriction) beats everything.
     pub fn effective_capability(
         &self,
         manifest: &MiniAppManifest,
         cap: &crate::capabilities::Capability,
     ) -> Effective {
+        self.effective_capability_for(
+            &manifest.id,
+            |p| manifest.declares(p),
+            |c| manifest.declares_capability(c),
+            cap,
+        )
+    }
+
+    /// The subject-general form of [`Self::effective_capability`]: the same
+    /// capability decision for ANY subject — an installed app, or an AI
+    /// room's agent session — with its declarations supplied.
+    ///
+    /// `declares_perm` answers "does this subject declare permission
+    /// `perm`?" and `declares_cap` "does it declare capability `cap`?" (for a
+    /// manifest those are `declares`/`declares_capability`; for an agent
+    /// session, its tool profile). Callers keep the manifest invariant — a
+    /// declared capability implies its group — so the group answer below
+    /// always resolves the way an app's does.
+    pub fn effective_capability_for(
+        &self,
+        subject: &str,
+        declares_perm: impl Fn(Permission) -> bool,
+        declares_cap: impl Fn(&crate::capabilities::Capability) -> bool,
+        cap: &crate::capabilities::Capability,
+    ) -> Effective {
         if !cap.is_available() {
             return Effective::Undeclared;
         }
-        if !manifest.declares_capability(cap) {
+        if !declares_cap(cap) {
             return Effective::Undeclared;
         }
-        if self.is_restricted(&manifest.id) {
+        if self.is_restricted(subject) {
             return Effective::Denied;
         }
         if cap.status == crate::capabilities::Status::RefusedBySwitch && !self.matrix_write {
             return Effective::Denied;
         }
         let Some(group) = cap.group else { return Effective::Granted };
-        let group_effective = self.effective(manifest, group);
-        match self.capability_state(&manifest.id, cap.id) {
+        let group_effective = self.effective_for(subject, &declares_perm, group);
+        match self.capability_state(subject, cap.id) {
             GrantState::Denied => Effective::Denied,
             GrantState::Granted => match group_effective {
                 Effective::Denied | Effective::Undeclared => group_effective,
@@ -742,16 +1157,33 @@ impl PermissionStore {
     /// inside the app's isolate, so `host.has("network")` and
     /// `host.has("matrix.room.members.read")` both work.
     pub fn granted_caps(&self, manifest: &MiniAppManifest) -> Vec<String> {
+        self.granted_caps_for(&manifest.id, |p| manifest.declares(p), |c| manifest.declares_capability(c))
+    }
+
+    /// The names currently usable by `subject` — every granted permission
+    /// group id plus every granted capability id — the subject-general form
+    /// of [`Self::granted_caps`]. What a running isolate's `host.has(...)`
+    /// answers from (via the snapshot); an agent session's runtime will ask
+    /// this directly for its room's key.
+    pub fn granted_caps_for(
+        &self,
+        subject: &str,
+        declares_perm: impl Fn(Permission) -> bool,
+        declares_cap: impl Fn(&crate::capabilities::Capability) -> bool,
+    ) -> Vec<String> {
         let mut out: Vec<String> = Permission::ALL
             .into_iter()
-            .filter(|p| self.is_granted(manifest, *p))
+            .filter(|p| self.is_granted_for(subject, &declares_perm, *p))
             .map(|p| p.as_str().to_string())
             .collect();
         out.extend(
             crate::capabilities::CATALOG
                 .iter()
                 .filter(|c| c.group.is_some())
-                .filter(|c| self.effective_capability(manifest, c) == Effective::Granted)
+                .filter(|c| {
+                    self.effective_capability_for(subject, &declares_perm, &declares_cap, c)
+                        == Effective::Granted
+                })
                 .map(|c| c.id.to_string()),
         );
         out
@@ -902,6 +1334,72 @@ mod tests {
     }
 
     #[test]
+    fn room_send_grants_are_per_room_and_independent_of_group_grants() {
+        let mut store = PermissionStore::default();
+        let subject = "ai-room:!a:example.org";
+        // Nothing allowed until a room is explicitly granted.
+        assert!(!store.is_room_send_allowed(subject, "!x:example.org"));
+        assert!(store.room_send_grants(subject).is_empty());
+        // A group grant alone must NOT unlock any room (per-room semantics).
+        store.set(subject, Permission::MatrixRoomsSend, GrantState::Granted);
+        assert!(!store.is_room_send_allowed(subject, "!x:example.org"));
+        // Granting one room covers exactly that room.
+        store.allow_room_send(subject, "!x:example.org");
+        assert!(store.is_room_send_allowed(subject, "!x:example.org"));
+        assert!(!store.is_room_send_allowed(subject, "!y:example.org"));
+        assert_eq!(store.room_send_grants(subject), vec!["!x:example.org".to_string()]);
+        // Subjects are namespaced: another agent's grants don't leak.
+        let other = "ai-room:!b:example.org";
+        assert!(!store.is_room_send_allowed(other, "!x:example.org"));
+        store.allow_room_send(other, "!y:example.org");
+        assert!(store.is_room_send_allowed(other, "!y:example.org"));
+        assert!(!store.is_room_send_allowed(subject, "!y:example.org"));
+        // Revoke.
+        store.disallow_room_send(subject, "!x:example.org");
+        assert!(!store.is_room_send_allowed(subject, "!x:example.org"));
+    }
+
+    #[test]
+    fn room_read_grants_are_per_room_and_independent_of_group_grants() {
+        let mut store = PermissionStore::default();
+        let subject = "ai-room:!a:example.org";
+        // Nothing allowed until a room is explicitly granted.
+        assert!(!store.is_room_read_allowed(subject, "!x:example.org"));
+        assert!(store.room_read_grants(subject).is_empty());
+        // A group grant alone must NOT unlock any room (per-room semantics).
+        store.set(subject, Permission::MatrixRoomsRead, GrantState::Granted);
+        assert!(!store.is_room_read_allowed(subject, "!x:example.org"));
+        // Granting one room covers exactly that room.
+        store.allow_room_read(subject, "!x:example.org");
+        assert!(store.is_room_read_allowed(subject, "!x:example.org"));
+        assert!(!store.is_room_read_allowed(subject, "!y:example.org"));
+        assert_eq!(store.room_read_grants(subject), vec!["!x:example.org".to_string()]);
+        // Subjects are namespaced: another agent's grants don't leak.
+        let other = "ai-room:!b:example.org";
+        assert!(!store.is_room_read_allowed(other, "!x:example.org"));
+        store.allow_room_read(other, "!y:example.org");
+        assert!(store.is_room_read_allowed(other, "!y:example.org"));
+        assert!(!store.is_room_read_allowed(subject, "!y:example.org"));
+        // Revoke.
+        store.disallow_room_read(subject, "!x:example.org");
+        assert!(!store.is_room_read_allowed(subject, "!x:example.org"));
+    }
+
+    #[test]
+    fn migrate_resets_the_old_blanket_cross_room_read_grant() {
+        let mut store = PermissionStore::default();
+        let subject = "ai-room:!a:example.org";
+        // A grant written by the pre-per-room build means "all rooms".
+        store.set(subject, Permission::MatrixRoomsRead, GrantState::Granted);
+        store.migrate();
+        assert_eq!(store.state(subject, Permission::MatrixRoomsRead), GrantState::Ask);
+        // Migration runs once: a deliberate post-upgrade panel grant survives.
+        store.set(subject, Permission::MatrixRoomsRead, GrantState::Granted);
+        store.migrate();
+        assert_eq!(store.state(subject, Permission::MatrixRoomsRead), GrantState::Granted);
+    }
+
+    #[test]
     fn matrix_tiers_split_read_write_from_info() {
         let store = PermissionStore::default();
         let m = manifest(&["matrix-room-info", "matrix-room-read", "matrix-room-send", "matrix-profile"]);
@@ -924,6 +1422,37 @@ mod tests {
         m2.allow_net = false;
         m2.normalize_permissions();
         assert!(m2.allow_net, "declaration backfills the legacy flag");
+    }
+
+    /// `mcp-tools` grants are PER TOOL: a tool the user allowed stays
+    /// allowed, its neighbours still prompt, a changed description (new hash)
+    /// re-prompts, and a session one-time/deny answer is scoped to the tool.
+    #[test]
+    fn tool_grants_are_per_tool_and_content_sensitive() {
+        let mut store = PermissionStore::default();
+        let subject = "board";
+        let play = "app_board_play";
+        let other = "app_board_other";
+        assert_eq!(store.tool_effective(subject, play, Some("h1")), Effective::NeedsPrompt);
+        store.allow_tool(subject, play, "h1");
+        assert_eq!(store.tool_effective(subject, play, Some("h1")), Effective::Granted);
+        // An invocation (no content hash) rides the registration grant.
+        assert_eq!(store.tool_effective(subject, play, None), Effective::Granted);
+        // A changed description is new model-visible text: ask again.
+        assert_eq!(store.tool_effective(subject, play, Some("h2")), Effective::NeedsPrompt);
+        // A different tool is unaffected by the first tool's grant.
+        assert_eq!(store.tool_effective(subject, other, Some("h1")), Effective::NeedsPrompt);
+        // A session one-time grant covers a tool with no durable grant.
+        store.allow_tool_once(subject, other);
+        assert_eq!(store.tool_effective(subject, other, Some("h1")), Effective::Granted);
+        // A session deny wins, even over a one-time allow.
+        store.allow_tool_once(subject, play);
+        store.deny_tool(subject, play);
+        assert_eq!(store.tool_effective(subject, play, Some("h1")), Effective::Denied);
+        // Clearing a subject drops durable grants and session answers alike.
+        assert!(store.clear_tool_grants_for(subject));
+        assert_eq!(store.tool_effective(subject, play, Some("h1")), Effective::NeedsPrompt);
+        assert_eq!(store.tool_effective(subject, other, Some("h1")), Effective::NeedsPrompt);
     }
 
     #[test]
@@ -1000,6 +1529,36 @@ mod tests {
         // them lose the declaration instead of gaining a fake capability.
         assert_eq!(Permission::from_str("background"), None);
         assert_eq!(Permission::from_str("storage-large"), None);
+    }
+
+    /// Per-host internet grants are exact-or-subdomain, never suffix
+    /// lookalikes; a session "once" host is admitted without touching disk,
+    /// and an uninstall forgets both.
+    #[test]
+    fn net_host_grants_are_per_host_and_cannot_be_spoofed() {
+        let mut store = PermissionStore::default();
+        assert!(!store.is_host_allowed("ai-room:!r:s", "example.com"));
+        store.allow_host("ai-room:!r:s", "example.com");
+        assert!(store.is_host_allowed("ai-room:!r:s", "example.com"));
+        assert!(store.is_host_allowed("ai-room:!r:s", "docs.example.com"));
+        assert!(store.is_host_allowed("ai-room:!r:s", "EXAMPLE.COM"));
+        assert!(!store.is_host_allowed("ai-room:!r:s", "notexample.com"));
+        assert!(!store.is_host_allowed("ai-room:!r:s", "example.com.evil.tld"));
+        // A different subject shares the same store but not the grant.
+        assert!(!store.is_host_allowed("other", "example.com"));
+        // "Allow Once" is session-only and also exact-or-subdomain.
+        store.allow_host_once("ai-room:!r:s", "once.example");
+        assert!(store.is_host_allowed("ai-room:!r:s", "once.example"));
+        assert!(store.is_host_allowed("ai-room:!r:s", "a.once.example"));
+        assert!(!store.is_host_allowed("ai-room:!r:s", "once.example.evil"));
+        // Disallow removes the durable grant but not the session one.
+        store.disallow_host("ai-room:!r:s", "example.com");
+        assert!(!store.is_host_allowed("ai-room:!r:s", "example.com"));
+        assert!(store.is_host_allowed("ai-room:!r:s", "once.example"));
+        // Durable grants only; the session one is not listed.
+        assert!(store.host_grants("ai-room:!r:s").is_empty());
+        store.remove_app("ai-room:!r:s");
+        assert!(!store.is_host_allowed("ai-room:!r:s", "once.example"));
     }
 
     /// A restricted app holds nothing, whatever it was granted before —
@@ -1113,5 +1672,172 @@ mod tests {
         n.capabilities = vec!["device.clipboard.write".to_string()];
         n.normalize_permissions();
         assert!(n.declares(Permission::ClipboardWrite));
+    }
+
+    /// The subject-general functions are the SAME decision as the manifest
+    /// ones, for any subject — proven by running both over the whole catalog
+    /// for one app in a mixed grant/deny/override state. The app-keyed
+    /// methods are thin wrappers, so the two can never drift.
+    #[test]
+    fn subject_general_functions_match_the_manifest_path() {
+        use crate::capabilities::CATALOG;
+        let mut m = manifest(&["matrix-room-read", "network", "clipboard-read"]);
+        m.capabilities = vec!["matrix.room.members.read".to_string()];
+        m.normalize_permissions();
+        let mut store = PermissionStore::default();
+        store.set("t", Permission::MatrixRoomRead, GrantState::Granted);
+        store.set_capability("t", "matrix.room.members.read", GrantState::Denied);
+        store.set("t", Permission::Network, GrantState::Denied);
+
+        for cap in CATALOG {
+            let app = store.effective_capability(&m, cap);
+            let generic = store.effective_capability_for(
+                &m.id,
+                |p| m.declares(p),
+                |c| m.declares_capability(c),
+                cap,
+            );
+            assert_eq!(app, generic, "capability {} differs under a subject key", cap.id);
+        }
+        for perm in Permission::ALL {
+            assert_eq!(
+                store.effective(&m, perm),
+                store.effective_for(&m.id, |p| m.declares(p), perm),
+                "permission {} differs under a subject key",
+                perm.as_str()
+            );
+        }
+        assert_eq!(
+            store.granted_caps(&m),
+            store.granted_caps_for(&m.id, |p| m.declares(p), |c| m.declares_capability(c)),
+        );
+    }
+
+    /// An AI room's agent session is a first-class permission subject: grants
+    /// live under its room's namespaced key, the same tiers prompt, per-group
+    /// answers and per-capability overrides layer identically, the write
+    /// switch and restrictions gate it, and the session can ask what it may
+    /// do right now — the store has no app-only assumptions left.
+    #[test]
+    fn an_ai_room_subject_behaves_like_an_app() {
+        use crate::capabilities::by_id;
+        let room = "!design:matrix.org";
+        let subject = agent_subject(room);
+        assert!(is_agent_subject(&subject));
+        assert_eq!(agent_room_of(&subject), Some(room));
+        // App ids are slug-safe; the namespaced key can never be one.
+        assert!(!is_agent_subject("roll-call"));
+        assert!(agent_room_of("roll-call").is_none());
+
+        // The session's tool profile: the attached-room reads it offers.
+        let profile = [
+            "matrix.room.messages.read",
+            "matrix.room.members.read",
+            "matrix.room.info.read",
+        ];
+        let declares_perm = |p: Permission| {
+            profile.iter().any(|id| by_id(id).and_then(|c| c.group).is_some_and(|g| g == p))
+        };
+        let declares_cap = |c: &crate::capabilities::Capability| profile.contains(&c.id);
+
+        let mut store = PermissionStore::default();
+        let messages = by_id("matrix.room.messages.read").unwrap();
+        let members = by_id("matrix.room.members.read").unwrap();
+        let info = by_id("matrix.room.info.read").unwrap();
+
+        // First use of a runtime-tier group prompts, exactly like an app's.
+        assert_eq!(
+            store.effective_capability_for(&subject, declares_perm, declares_cap, messages),
+            Effective::NeedsPrompt
+        );
+        assert_eq!(
+            store.effective_capability_for(&subject, declares_perm, declares_cap, members),
+            Effective::NeedsPrompt
+        );
+        // A normal-tier group auto-grants on declaration, like an app's.
+        assert_eq!(
+            store.effective_capability_for(&subject, declares_perm, declares_cap, info),
+            Effective::Granted
+        );
+        let caps = store.granted_caps_for(&subject, declares_perm, declares_cap);
+        assert!(caps.iter().any(|c| c == "matrix-room-info"));
+        assert!(caps.iter().any(|c| c == "matrix.room.info.read"));
+        // Nothing runtime-tier is granted before the user answers.
+        assert!(!caps.iter().any(|c| c == "matrix.room.messages.read"));
+        assert!(!caps.iter().any(|c| c == "matrix.room.members.read"));
+
+        // Granting the runtime group unlocks every declared capability in it.
+        store.set(&subject, Permission::MatrixRoomRead, GrantState::Granted);
+        assert_eq!(
+            store.effective_capability_for(&subject, declares_perm, declares_cap, members),
+            Effective::Granted
+        );
+        let caps = store.granted_caps_for(&subject, declares_perm, declares_cap);
+        assert!(caps.iter().any(|c| c == "matrix-room-read"));
+        assert!(caps.iter().any(|c| c == "matrix.room.messages.read"));
+        assert!(caps.iter().any(|c| c == "matrix.room.info.read"));
+        // A capability outside the profile is never granted (undeclared).
+        assert!(!caps.iter().any(|c| c == "matrix.room.pins.read"));
+        assert_eq!(
+            store.effective_capability_for(
+                &subject,
+                declares_perm,
+                declares_cap,
+                by_id("matrix.room.pins.read").unwrap()
+            ),
+            Effective::Undeclared
+        );
+
+        // One capability can be blocked under its granted group.
+        store.set_capability(&subject, members.id, GrantState::Denied);
+        assert_eq!(
+            store.effective_capability_for(&subject, declares_perm, declares_cap, members),
+            Effective::Denied
+        );
+        assert_eq!(
+            store.effective_capability_for(&subject, declares_perm, declares_cap, info),
+            Effective::Granted
+        );
+
+        // The write switch gates a switch-gated capability for a room subject
+        // just as it does for an app.
+        let send_profile = ["matrix.room.message.send"];
+        let send_declares_perm = |p: Permission| {
+            send_profile
+                .iter()
+                .any(|id| by_id(id).and_then(|c| c.group).is_some_and(|g| g == p))
+        };
+        let send_declares_cap = |c: &crate::capabilities::Capability| send_profile.contains(&c.id);
+        let send = by_id("matrix.room.message.send").unwrap();
+        store.set(&subject, Permission::MatrixRoomSend, GrantState::Granted);
+        assert_eq!(
+            store.effective_capability_for(&subject, send_declares_perm, send_declares_cap, send),
+            Effective::Denied,
+            "matrix_write is off by default; a granted group is not enough"
+        );
+        store.set_matrix_write(true);
+        assert_eq!(
+            store.effective_capability_for(&subject, send_declares_perm, send_declares_cap, send),
+            Effective::Granted
+        );
+
+        // A restricted session holds nothing, whatever it was granted.
+        store.restrict(&subject, "made far too many tool calls", 1000, 42);
+        assert_eq!(
+            store.effective_capability_for(&subject, declares_perm, declares_cap, info),
+            Effective::Denied
+        );
+        store.unrestrict(&subject);
+        assert_eq!(
+            store.effective_capability_for(&subject, declares_perm, declares_cap, info),
+            Effective::Granted
+        );
+
+        // Persisted whole-file like everything else, keyed by the room.
+        let json = serde_json::to_string(&store).unwrap();
+        let reloaded: PermissionStore = serde_json::from_str(&json).unwrap();
+        assert_eq!(reloaded.state(&subject, Permission::MatrixRoomRead), GrantState::Granted);
+        assert_eq!(reloaded.capability_state(&subject, members.id), GrantState::Denied);
+        assert!(reloaded.matrix_write());
     }
 }

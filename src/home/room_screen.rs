@@ -79,6 +79,16 @@ const JUMP_SEARCH_NOT_FOUND_DELAY: f64 = 2.0;
 /// requesting more back pagination.
 const MAX_BACKWARDS_PAGINATIONS_WITHOUT_PROGRESS: usize = 5;
 
+/// How far below the timeline's bottom edge the newest message may be for the
+/// AI-room status pill's appearance to still pull the timeline flush to it.
+/// The pill's own height is ~30px, so the extra slack covers the smooth
+/// scroll-to-end that a send kicks off racing the pill's viewport shrink
+/// (which is what leaves the portal a few pixels short of the end). Anything
+/// farther down means the user has scrolled up to read history, and the pill
+/// must not yank them back to the bottom.
+#[cfg(all(feature = "a2app", unix))]
+const AI_STATUS_PILL_RETAIL_LEEWAY: f64 = 120.0;
+
 
 static UNNAMED_ROOM: &str = "Unnamed Room";
 
@@ -688,6 +698,14 @@ script_mod! {
             ReadMarker := mod.widgets.ReadMarker {}
             // A mini-app shared into the room (an invisible stub without `a2app`).
             MiniAppTimelineCard := mod.widgets.MiniAppTimelineCard {}
+            // An AI room's agent turn (an invisible stub without `a2app`).
+            AiReplyTimelineCard := mod.widgets.AiReplyTimelineCard {}
+            // An AI room's live activity rows (thinking/error markers, tool
+            // calls) — invisible stubs without `a2app`.
+            AiEventTimelineCard := mod.widgets.AiEventTimelineCard {}
+            // One assistant turn's grouped, collapsible tool-call card — an
+            // invisible stub without `a2app`.
+            AiTurnTimelineCard := mod.widgets.AiTurnTimelineCard {}
         }
 
         // A jump to bottom button (with an unread message badge) that is shown
@@ -732,6 +750,32 @@ script_mod! {
                                     timeline := mod.widgets.Timeline { }
                                 }
                             }
+                        }
+                    }
+                }
+
+                // An AI room's live status pill, just above the input bar:
+                // visible while the room's agent is starting up, working on a
+                // turn, or has member messages queued behind it. It answers
+                // "was my message queued, or is the AI processing it?" before
+                // the reply card lands (populated each draw, hidden by default).
+                ai_room_status_row := RoundedView {
+                    visible: false
+                    width: Fill, height: Fit
+                    margin: Inset{left: 8, right: 8, top: 4, bottom: 2}
+                    padding: Inset{left: 10, right: 10, top: 3, bottom: 3}
+                    show_bg: true
+                    draw_bg +: {
+                        color: (COLOR_LIST_ITEM_BG_HOVER)
+                        border_radius: 5.0
+                    }
+                    ai_room_status := Label {
+                        width: Fill, height: Fit
+                        flow: Flow.Right{wrap: true}
+                        align: Align{x: 0.5, y: 0.5}
+                        draw_text +: {
+                            text_style: REGULAR_TEXT { font_size: 11 },
+                            color: (COLOR_ACTIVE_PRIMARY)
                         }
                     }
                 }
@@ -900,6 +944,76 @@ pub(crate) fn index_of_event(
         .map(|position| max_idx.saturating_sub(position).saturating_sub(1))
 }
 
+/// Scans an AI room's currently-loaded timeline for member text messages
+/// after its forwarding cursor, and forwards any new ones to its agent
+/// session (see [`crate::a2app::runtime::forward_ai_room_texts`]).
+///
+/// Only messages from the room's most privileged member(s) become prompts:
+/// the agent answers the room's owner, so a message is forwarded only when
+/// its sender holds the highest power level in the room.
+#[cfg(all(feature = "a2app", unix))]
+fn scan_ai_room_messages(
+    room_id: &OwnedRoomId,
+    items: &Vector<Arc<TimelineItem>>,
+    room_members: Option<&[RoomMember]>,
+) {
+    use matrix_sdk::ruma::events::room::power_levels::UserPowerLevel;
+
+    let Some(scan_state) = crate::a2app::runtime::ai_room_scan_state(room_id) else { return };
+    // Until the member list is loaded we can't tell who is most privileged,
+    // so forward nothing rather than risk answering a lower-power member's
+    // message. The cursor stays put, so the next scan (after members arrive)
+    // still sees these messages as new.
+    let Some(members) = room_members else {
+        log!("AI Rooms: no member list for room {room_id} yet; skipping this scan.");
+        return;
+    };
+    let max_power: Option<UserPowerLevel> = members.iter().map(|m| m.power_level()).max();
+    let start_idx = match &scan_state.cursor {
+        Some(cursor_id) => {
+            let found = items.iter().position(|it| {
+                it.as_event()
+                    .and_then(|e| e.event_id())
+                    .map(ToOwned::to_owned)
+                    .as_ref() == Some(cursor_id)
+            });
+            let Some(pos) = found else {
+                // The cursor event isn't in the currently-loaded window;
+                // wait for it to reappear rather than risk re-forwarding
+                // history that was already answered.
+                log!("AI Rooms: cursor event {cursor_id} for room {room_id} isn't in the loaded timeline window; skipping this scan.");
+                return;
+            };
+            pos + 1
+        }
+        None => 0,
+    };
+    let mut new_texts = Vec::new();
+    for item in items.iter().skip(start_idx) {
+        let Some(ev) = item.as_event() else { continue };
+        let Some(event_id) = ev.event_id() else { continue };
+        let TimelineItemContent::MsgLike(msg_like) = ev.content() else { continue };
+        if msg_like.thread_root.is_some() {
+            continue;
+        }
+        let MsgLikeKind::Message(msg) = &msg_like.kind else { continue };
+        let MessageType::Text(text_content) = msg.msgtype() else { continue };
+        // Forward only the room's top-privileged speakers.
+        let sender = ev.sender();
+        let is_most_privileged = max_power.is_some_and(|max_power| {
+            members.iter().any(|m| m.user_id() == sender && m.power_level() == max_power)
+        });
+        if !is_most_privileged {
+            continue;
+        }
+        new_texts.push((event_id.to_owned(), text_content.body.clone()));
+    }
+    if new_texts.is_empty() {
+        return;
+    }
+    crate::a2app::runtime::forward_ai_room_texts(room_id, new_texts);
+}
+
 /// The main widget that displays a single Matrix room.
 #[derive(Script, Widget)]
 pub struct RoomScreen {
@@ -931,6 +1045,18 @@ pub struct RoomScreen {
     #[rust] pending_read_receipt_jump: Option<OwnedUserId>,
     /// Fires when a background search for a jumped-to event has gone quiet.
     #[rust] jump_search_timer: Timer,
+
+    /// Whether the AI-room status pill ("AI agent is working on your message…")
+    /// first became visible on the current draw. See
+    /// [`RoomScreen::populate_ai_room_status`] and the portal-draw pass in
+    /// [`RoomScreen::draw_walk`]: the pill sits just below the timeline, so its
+    /// first frame shrinks the timeline viewport by the pill's own height — and
+    /// if the newest message was on screen then, that shrink would cut it off
+    /// below the fold. The flag tells the portal draw that follows to re-tail
+    /// the timeline so the pill shows *below* the last message instead of
+    /// hiding it.
+    #[cfg(all(feature = "a2app", unix))]
+    #[rust] ai_status_just_shown: bool,
 }
 
 /// Cached references to RoomScreen child widgets used in every event handler.
@@ -1363,7 +1489,7 @@ impl Widget for RoomScreen {
         // Here, we handle and remove any general actions that are relevant to only this RoomScreen.
         // Removing the handled actions ensures they are not mistakenly handled by other RoomScreen widget instances.
         actions_generated_within_this_room_screen.retain(|action| {
-            if self.handle_link_clicked(cx, action, &user_profile_sliding_pane) {
+            if self.handle_link_clicked(cx, action, &user_profile_sliding_pane, &portal_list, &loading_pane) {
                 return false;
             }
 
@@ -1467,11 +1593,23 @@ impl Widget for RoomScreen {
             return DrawStep::done();
         }
 
+        // The AI-room status row is populated on every draw: the transitions
+        // that change it (turn end, queue flush, agent finishing startup) are
+        // driven by the runtime's event passes, not by timeline updates.
+        #[cfg(all(feature = "a2app", unix))]
+        self.populate_ai_room_status(cx);
+
 
         let room_screen_widget_uid = self.widget_uid();
         while let Some(subview) = self.view.draw_walk(cx, scope, walk).step() {
             // Here, we only need to handle drawing the portal list.
             let portal_list_ref = subview.as_portal_list();
+            // The portal's current viewport height, read before borrowing its
+            // contents below. This frame's layout already includes the
+            // AI-status pill's visibility (populate_ai_room_status ran above),
+            // so a pill that just appeared has already shrunk this height.
+            #[cfg(all(feature = "a2app", unix))]
+            let portal_height = portal_list_ref.area().rect(cx).size.y;
             let Some(mut list_ref) = portal_list_ref.borrow_mut() else {
                 error!("!!! RoomScreen::draw_walk(): BUG: expected a PortalList widget, but got something else");
                 continue;
@@ -1486,6 +1624,27 @@ impl Widget for RoomScreen {
 
             let list = list_ref.deref_mut();
             list.set_item_range(cx, 0, last_item_id);
+
+            // The AI-room status pill (see populate_ai_room_status above) sits
+            // just below the timeline, so the first frame it appears it shrinks
+            // the timeline viewport by the pill's own height. If the newest
+            // message — the one that started this very turn — was on screen at
+            // that moment, the shrink cuts it off below the fold (and it can
+            // race the smooth scroll-to-end a send kicks off, leaving the
+            // portal pinned a few pixels short of the end). Re-arm the portal's
+            // tail so it settles flush and the pill reads as sitting *below*
+            // the last message rather than hiding it. A user who has scrolled
+            // up to read (newest message far off-screen) keeps their place.
+            #[cfg(all(feature = "a2app", unix))]
+            if std::mem::take(&mut self.ai_status_just_shown) {
+                let newest_on_screen = last_item_id.checked_sub(1).is_some_and(|last_id| {
+                    list.position_of_item(cx, last_id)
+                        .is_some_and(|pos| pos < portal_height + AI_STATUS_PILL_RETAIL_LEEWAY)
+                });
+                if newest_on_screen {
+                    list.set_tail_range(true);
+                }
+            }
 
             while let Some(item_id) = list.next_visible_item(cx) {
                 let item = {
@@ -1619,20 +1778,28 @@ impl Widget for RoomScreen {
                             TimelineItemContent::OtherState(other) => {
                                 // Don't shown noisy updates like policy rules, server ACLs, space links, custom state events, etc.
                                 // We could always make this configurable, e.g., some kind of dev mode.
-                                let should_hide = matches!(
-                                    other.content(),
+                                // An AI room's `ai_reply` turns are the one custom state event
+                                // that *is* shown, as a timeline card (see `populate_other_state_event`).
+                                let should_hide = match other.content() {
                                     timeline::AnyOtherStateEventContentChange::PolicyRuleRoom(_)
                                     | timeline::AnyOtherStateEventContentChange::PolicyRuleServer(_)
                                     | timeline::AnyOtherStateEventContentChange::PolicyRuleUser(_)
                                     | timeline::AnyOtherStateEventContentChange::RoomServerAcl(_)
                                     | timeline::AnyOtherStateEventContentChange::SpaceChild(_)
-                                    | timeline::AnyOtherStateEventContentChange::SpaceParent(_)
-                                    | timeline::AnyOtherStateEventContentChange::_Custom { .. }
-                                );
+                                    | timeline::AnyOtherStateEventContentChange::SpaceParent(_) => true,
+                                    #[cfg(feature = "a2app")]
+                                    timeline::AnyOtherStateEventContentChange::_Custom { event_type }
+                                        if event_type == crate::a2app::ai_room_events::AI_REPLY_EVENT_TYPE
+                                            || event_type == crate::a2app::ai_room_events::AI_ACTIVITY_EVENT_TYPE
+                                            || event_type == crate::a2app::ai_room_events::AI_TOOL_CALL_EVENT_TYPE
+                                            || event_type == crate::a2app::ai_room_events::AI_TURN_EVENT_TYPE => false,
+                                    timeline::AnyOtherStateEventContentChange::_Custom { .. } => true,
+                                    _ => false,
+                                };
                                 if should_hide {
                                     (list.item(cx, item_id, id!(Empty)), ItemDrawnStatus::both_drawn())
                                 } else {
-                                    populate_small_state_event(
+                                    populate_other_state_event(
                                         cx,
                                         list,
                                         item_id,
@@ -1640,6 +1807,8 @@ impl Widget for RoomScreen {
                                         event_tl_item,
                                         other,
                                         item_drawn_status,
+                                        tl_items,
+                                        tl_idx,
                                     )
                                 }
                             }
@@ -1734,6 +1903,64 @@ impl Widget for RoomScreen {
 }
 
 impl RoomScreen {
+    /// Populates the AI-room status pill (starting / working / queued) from
+    /// the room's live session state. Called every draw; hidden for ordinary
+    /// rooms, idle sessions, and rooms without a live session.
+    #[cfg(all(feature = "a2app", unix))]
+    fn populate_ai_room_status(&mut self, cx: &mut Cx2d) {
+        let status = self.tl_state.as_ref().and_then(|tl| match &tl.kind {
+            TimelineKind::MainRoom { room_id } => crate::a2app::runtime::ai_room_status(room_id),
+            _ => None,
+        });
+        let row = self.view(cx, ids!(ai_room_status_row));
+        let was_visible = row.visible();
+        let Some(status) = status else {
+            row.set_visible(cx, false);
+            return;
+        };
+        let (visible, text) = if status.busy {
+            // The agent accepted the prompt and is working on the turn.
+            (
+                true,
+                if status.queued > 0 {
+                    format!(
+                        "AI agent is working on your message… · {} more queued",
+                        status.queued
+                    )
+                } else {
+                    "AI agent is working on your message…".to_string()
+                },
+            )
+        } else if status.queued > 0 {
+            // Not busy yet but prompts are waiting: the agent is still
+            // starting up (they flush as soon as it reports ready).
+            (
+                true,
+                format!(
+                    "Message queued — AI agent is starting up… · {} queued",
+                    status.queued
+                ),
+            )
+        } else {
+            (false, String::new())
+        };
+        // The pill sits just below the timeline, so the first frame it appears
+        // it shrinks the timeline viewport by its own height. If the newest
+        // message (the one that started this turn) was on screen at that
+        // moment, the shrink cuts it off below the fold — the user had to
+        // scroll down to see the message they'd just sent. The portal-draw
+        // pass in `draw_walk` sees this flag and re-tails the timeline, so the
+        // pill ends up *below* the last message instead of hiding it.
+        if visible && !was_visible {
+            self.ai_status_just_shown = true;
+        }
+        row.set_visible(cx, visible);
+        if visible {
+            let label = self.view.label(cx, ids!(ai_room_status));
+            label.set_text(cx, &text);
+        }
+    }
+
     fn room_id(&self) -> Option<&OwnedRoomId> {
         self.room_name_id.as_ref().map(|r| r.room_id())
     }
@@ -2304,6 +2531,16 @@ impl RoomScreen {
             }
         }
 
+        // Forward any new member text messages in an AI room to its agent
+        // session. Cheap to call on every update pass: rooms that aren't
+        // (known to be) AI rooms are a single synchronous map lookup away.
+        #[cfg(all(feature = "a2app", unix))]
+        if num_updates > 0 {
+            if let TimelineKind::MainRoom { room_id } = &tl.kind {
+                scan_ai_room_messages(room_id, &tl.items, tl.room_members.as_ref().map(|v| v.as_slice()));
+            }
+        }
+
         if items_changed {
             (tl.index_of_last_own_sent, tl.index_of_first_own_failed) =
                 own_send_indices(&tl.items, tl.kind.thread_root_event_id().is_none());
@@ -2320,7 +2557,6 @@ impl RoomScreen {
                 }),
                 _ => None,
             });
-
         if should_continue_backwards_pagination {
             tl.is_paginating = true;
             submit_async_request(MatrixRequest::PaginateTimeline {
@@ -2364,6 +2600,8 @@ impl RoomScreen {
         cx: &mut Cx,
         action: &Action,
         pane: &UserProfileSlidingPaneRef,
+        portal_list: &PortalListRef,
+        loading_pane: &LoadingPaneRef,
     ) -> bool {
         // A closure that handles both MatrixToUri and MatrixUri links,
         // and returns whether the link was handled.
@@ -2426,11 +2664,33 @@ impl RoomScreen {
                     //       a room preview for that room.
                     false
                 }
-                MatrixId::Event(room_id, event_id) => {
-                    log!("TODO: open event {} in room {}", event_id, room_id);
-                    // TODO: this requires the same first step as the `MatrixId::Room` case above,
-                    //       but then we need to call Room::event_with_context() to get the event
-                    //       and its context (surrounding events ?).
+                MatrixId::Event(room, event_id) => {
+                    // A link to a specific message: jump to it in-app. A
+                    // same-room link (an AI reply quoting this room's own
+                    // content, or any chat permalink) scrolls the current
+                    // timeline to that message and highlights it; a link to
+                    // another room's message — as an AI reply's cross-room
+                    // reference is — brings that room forward at the message
+                    // (a2app builds, where the jump machinery lives).
+                    if self.timeline_kind.as_ref().is_some_and(|k| k.room_id().as_str() == room.as_str()) {
+                        self.jump_to_event(
+                            cx,
+                            event_id,
+                            None,
+                            String::from("the message that link points to"),
+                            portal_list,
+                            loading_pane,
+                        );
+                        return true;
+                    }
+                    // An alias can't name a room we can open; only concrete ids.
+                    #[cfg(feature = "a2app")]
+                    if let Ok(room_id) = OwnedRoomId::try_from(room.as_str())
+                        && crate::a2app::runtime::open_event_in_room(cx, room_id, event_id.clone()).is_ok()
+                    {
+                        return true;
+                    }
+                    log!("Couldn't open event {} in room {} in-app; falling back to the external link.", event_id, room);
                     false
                 }
                 _ => false,
@@ -3293,6 +3553,10 @@ impl RoomScreen {
                         mark_as_unread: false,
                     });
                 }
+                // Check (once) whether this room is an AI room, so its
+                // session can be attached.
+                #[cfg(all(feature = "a2app", unix))]
+                crate::a2app::runtime::on_room_shown(&room_id);
             }
         }
 
@@ -6071,6 +6335,216 @@ fn populate_other_message_like(
                 event_tl_item.sender().as_str(),
                 Some(timeline_kind.room_id().clone()),
             );
+        }
+        return (item, ItemDrawnStatus::both_drawn());
+    }
+    populate_small_state_event(
+        cx,
+        list,
+        item_id,
+        timeline_kind,
+        event_tl_item,
+        other,
+        item_drawn_status,
+    )
+}
+
+/// The newest snapshot content for the `ai_turn` `turn`, at or after `idx`.
+///
+/// A turn's snapshots are written as async network requests under one state
+/// key, so `origin_server_ts` order (and therefore timeline order) can differ
+/// from the order they were produced: the last same-turn row in the timeline
+/// is not necessarily the newest, which made the card's tool count and status
+/// flicker backwards. The snapshots of one turn are written back-to-back, so
+/// this scans outward from the anchor and stops at the first `ai_turn` of a
+/// different turn, keeping the one with the highest `seq` (later timeline
+/// position wins a tie, the fallback for rows written before `seq`). The
+/// backward pass catches the rare case where a later snapshot was ordered
+/// before the anchor by the server.
+#[cfg(feature = "a2app")]
+fn ai_turn_latest(
+    items: &Vector<Arc<TimelineItem>>,
+    idx: usize,
+    turn: &str,
+) -> Option<crate::a2app::ai_room_events::AiTurnContent> {
+    use crate::a2app::ai_room_events::{AI_TURN_EVENT_TYPE, AiTurnContent};
+    let parse = |item: &Arc<TimelineItem>| -> Option<AiTurnContent> {
+        let TimelineItemKind::Event(event) = item.kind() else { return None };
+        let TimelineItemContent::OtherState(other) = event.content() else { return None };
+        let timeline::AnyOtherStateEventContentChange::_Custom { event_type } = other.content()
+        else {
+            return None;
+        };
+        if event_type != AI_TURN_EVENT_TYPE {
+            return None;
+        }
+        event
+            .latest_json()
+            .and_then(|raw| raw.deserialize_as::<serde_json::Value>().ok())
+            .and_then(|v| v.get("content").cloned())
+            .and_then(|c| serde_json::from_value::<AiTurnContent>(c).ok())
+    };
+    let mut best: Option<AiTurnContent> = None;
+    for item in items.iter().skip(idx) {
+        let Some(content) = parse(item) else { continue };
+        if content.turn != turn {
+            // A different turn's snapshot ends this turn's contiguous run.
+            // (Only break once we have the turn itself; an anchor that failed
+            // to parse should not swallow the same-turn snapshots after it.)
+            if best.is_some() {
+                break;
+            }
+            continue;
+        }
+        // Forward: a later timeline position wins a `seq` tie, which is the
+        // right fallback for rows written before `seq` existed.
+        if best.as_ref().is_none_or(|prev| content.seq >= prev.seq) {
+            best = Some(content);
+        }
+    }
+    for item in items.iter().take(idx).rev() {
+        let Some(content) = parse(item) else { continue };
+        if content.turn != turn {
+            break;
+        }
+        // Backward: only a STRICTLY newer `seq` may override, so an equal-`seq`
+        // legacy row closer to the anchor (a later timeline position) is kept.
+        if best.as_ref().is_none_or(|prev| content.seq > prev.seq) {
+            best = Some(content);
+        }
+    }
+    best
+}
+
+/// Whether the `ai_turn` row at `idx` is the latest snapshot of its turn.
+///
+/// Only used for rows written before `AiTurnContent::first` existed: current
+/// rows anchor explicitly. See [`ai_turn_latest`] for the anchor path.
+#[cfg(feature = "a2app")]
+fn ai_turn_is_latest(items: &Vector<Arc<TimelineItem>>, idx: usize, turn: &str) -> bool {
+    use crate::a2app::ai_room_events::AI_TURN_EVENT_TYPE;
+    for item in items.iter().skip(idx + 1) {
+        let TimelineItemKind::Event(event) = item.kind() else { continue };
+        let TimelineItemContent::OtherState(other) = event.content() else { continue };
+        let timeline::AnyOtherStateEventContentChange::_Custom { event_type } = other.content()
+        else {
+            continue;
+        };
+        if event_type != AI_TURN_EVENT_TYPE {
+            continue;
+        }
+        let same_turn = event
+            .latest_json()
+            .and_then(|raw| raw.deserialize_as::<serde_json::Value>().ok())
+            .and_then(|v| v.get("content").cloned())
+            .and_then(|c| serde_json::from_value::<crate::a2app::ai_room_events::AiTurnContent>(c).ok())
+            .map(|c| c.turn == turn)
+            .unwrap_or(false);
+        return !same_turn;
+    }
+    true
+}
+
+/// Routes a custom state event: an AI room's `ai_reply` turns get their own
+/// timeline card, its live `ai_activity` markers ("thinking…" / errors /
+/// stopped) and `ai_tool_call` rows get the small live-activity card, and
+/// everything else stays a small state event.
+fn populate_other_state_event(
+    cx: &mut Cx,
+    list: &mut PortalList,
+    item_id: usize,
+    timeline_kind: &TimelineKind,
+    event_tl_item: &EventTimelineItem,
+    other: &timeline::OtherState,
+    item_drawn_status: ItemDrawnStatus,
+    tl_items: &Vector<Arc<TimelineItem>>,
+    tl_idx: usize,
+) -> (WidgetRef, ItemDrawnStatus) {
+    #[cfg(feature = "a2app")]
+    if let timeline::AnyOtherStateEventContentChange::_Custom { event_type } = other.content() {
+        use crate::a2app::ai_room_events::{
+            AI_ACTIVITY_EVENT_TYPE, AI_REPLY_EVENT_TYPE, AI_TOOL_CALL_EVENT_TYPE, AI_TURN_EVENT_TYPE,
+            AiActivityContent, AiReplyContent, AiReplyTimelineCardWidgetRefExt,
+            AiEventTimelineCardWidgetRefExt, AiToolCallContent, AiTurnContent, AiTurnStatus,
+            AiTurnTimelineCardWidgetRefExt,
+        };
+        let raw_content = || {
+            event_tl_item
+                .latest_json()
+                .and_then(|raw| raw.deserialize_as::<serde_json::Value>().ok())
+                .and_then(|v| v.get("content").cloned())
+        };
+        if event_type == AI_REPLY_EVENT_TYPE {
+            let (item, existed) = list.item_with_existed(cx, item_id, id!(AiReplyTimelineCard));
+            if !(existed && item_drawn_status.content_drawn) {
+                let content =
+                    raw_content().and_then(|c| serde_json::from_value::<AiReplyContent>(c).ok());
+                item.as_ai_reply_timeline_card().populate(cx, content.as_ref());
+            }
+            return (item, ItemDrawnStatus::both_drawn());
+        }
+        if event_type == AI_TURN_EVENT_TYPE {
+            let content =
+                raw_content().and_then(|c| serde_json::from_value::<AiTurnContent>(c).ok());
+            let turn = content.as_ref().map(|c| c.turn.clone()).unwrap_or_default();
+            // The card is anchored at the turn's FIRST snapshot and always
+            // renders that row (filled with the latest snapshot's content), so
+            // it stays put as the turn progresses instead of disappearing from
+            // one row and reappearing at the next. Later snapshots render as
+            // empty. Rows written before `first` existed fall back to the
+            // latest-scan (and render their final `Done` snapshot directly).
+            let is_anchor = match content.as_ref().map(|c| c.first) {
+                Some(Some(first)) => first,
+                _ => content.as_ref().is_none_or(|c| {
+                    c.status == crate::a2app::ai_room_events::AiTurnStatus::Done
+                        || ai_turn_is_latest(tl_items, tl_idx, &c.turn)
+                }),
+            };
+            if !is_anchor {
+                return (list.item(cx, item_id, id!(Empty)), ItemDrawnStatus::both_drawn());
+            }
+            let mut render = ai_turn_latest(tl_items, tl_idx, &turn).or(content);
+            // A turn is only "running" while it is the room's ACTIVE turn.
+            // If the final `Done` snapshot never landed (app restarted
+            // mid-turn, room re-attached, session GC'd), the last snapshot
+            // still says `Running`; settle the card anyway so it never shows
+            // a spinner for work that is long over.
+            let room_active = match timeline_kind {
+                TimelineKind::MainRoom { room_id } => {
+                    crate::a2app::runtime::ai_room_active_turn(room_id)
+                        .is_some_and(|active| active == turn)
+                }
+                _ => false,
+            };
+            if let Some(content) = render.as_mut() {
+                if !room_active {
+                    content.status = AiTurnStatus::Done;
+                }
+            }
+            let (item, _existed) = list.item_with_existed(cx, item_id, id!(AiTurnTimelineCard));
+            // Always repopulate: the card lives on the turn's anchor row, but
+            // its content comes from the turn's newest snapshot, which lands
+            // on a LATER timeline row. The anchor item itself never changes,
+            // so the timeline's drawn-item cache would otherwise leave the
+            // card stale (a thinking-only card would never show its tool
+            // calls). `populate` no-ops cheaply when the snapshot is unchanged.
+            item.as_ai_turn_timeline_card().populate(cx, render.as_ref());
+            return (item, ItemDrawnStatus::both_drawn());
+        }
+        let (item, existed) = list.item_with_existed(cx, item_id, id!(AiEventTimelineCard));
+        if !(existed && item_drawn_status.content_drawn) {
+            if event_type == AI_ACTIVITY_EVENT_TYPE {
+                let content =
+                    raw_content().and_then(|c| serde_json::from_value::<AiActivityContent>(c).ok());
+                item.as_ai_event_timeline_card().populate_activity(cx, content.as_ref());
+            } else if event_type == AI_TOOL_CALL_EVENT_TYPE {
+                let content =
+                    raw_content().and_then(|c| serde_json::from_value::<AiToolCallContent>(c).ok());
+                item.as_ai_event_timeline_card().populate_tool_call(cx, content.as_ref());
+            } else {
+                // A custom event type this build doesn't render: hide the row.
+                item.as_ai_event_timeline_card().populate_activity(cx, None);
+            }
         }
         return (item, ItemDrawnStatus::both_drawn());
     }

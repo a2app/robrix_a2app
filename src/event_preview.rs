@@ -534,6 +534,30 @@ pub fn text_preview_of_other_state(
             };
             format!("added a new child to this space: \"{state_key}\".")
         }
+        #[cfg(feature = "a2app")]
+        AnyOtherStateEventContentChange::_Custom { event_type }
+            if event_type == crate::a2app::ai_room_events::AI_REPLY_EVENT_TYPE =>
+        {
+            String::from("replied.")
+        }
+        #[cfg(feature = "a2app")]
+        AnyOtherStateEventContentChange::_Custom { event_type }
+            if event_type == crate::a2app::ai_room_events::AI_ACTIVITY_EVENT_TYPE =>
+        {
+            String::from("is thinking…")
+        }
+        #[cfg(feature = "a2app")]
+        AnyOtherStateEventContentChange::_Custom { event_type }
+            if event_type == crate::a2app::ai_room_events::AI_TOOL_CALL_EVENT_TYPE =>
+        {
+            String::from("used a tool.")
+        }
+        #[cfg(feature = "a2app")]
+        AnyOtherStateEventContentChange::_Custom { event_type }
+            if event_type == crate::a2app::ai_room_events::AI_TURN_EVENT_TYPE =>
+        {
+            String::from("used tools.")
+        }
         other => {
             let event_type = other.event_type().to_string();
             format!("changed this room's {} state.",

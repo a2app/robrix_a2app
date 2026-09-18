@@ -409,6 +409,16 @@ pub const CATALOG: &[Capability] = &[
     cap!("on_active_room_changed", "Know which room you switch to", "Which room, thread, or nothing Robrix now shows; latest-only per pass. Reveals browsing, so it prompts.", Read, Incoming, MultiRoom, Some(P::RobrixObserve), Available, High, ["on_active_room_changed"]),
     cap!("on_navigation_changed", "Know which screen you switch to", "Home, a space, settings, mini apps; latest-only per pass.", Read, Incoming, Client, Some(P::RobrixObserve), Available, Medium, ["on_navigation_changed"]),
     cap!("on_launch", "Launch context hook", "Be told how the instance was opened: slash command, timeline card, list, or tab.", Read, Incoming, Instance, None, PlannedMachinery, Low, []),
+    // ----- app-generation -----
+    cap!("apps.generate", "Build and run a mini-app", "Run the AI generation pipeline: spend your provider's usage to write, validate and install a new sandboxed app into this room, then run it. Reached only by an AI room's own session — no installed app can invoke the generator.", Act, Outgoing, Room, Some(P::AppGeneration), Available, Medium, []),
+    // ----- app-launch -----
+    cap!("apps.list", "List installed mini-apps", "Id, name, description, scope and running flag of the apps available in this room, so the AI can name one to run. Reveals the installed-app list, so it prompts. Reached only by an AI room's own session.", Read, Outgoing, Apps, Some(P::AppLaunch), Available, Medium, []),
+    cap!("apps.launch", "Open an installed mini-app", "Run an installed mini-app in this room's dock. Reached only by an AI room's own session; it never creates or changes an app.", Act, Outgoing, Apps, Some(P::AppLaunch), Available, Low, []),
+    // ----- mcp-tools -----
+    cap!("mcp.tools.register", "Register an AI tool", "Offer one named tool, with the exact description and argument schema the model will see, to this room's AI. The user reviews that text before it can reach the model, and again if it changes.", Write, Outgoing, App, Some(P::McpTools), Available, High, ["mcp.tools.register"]),
+    cap!("mcp.tools.unregister", "Remove an AI tool", "Withdraw a tool this instance registered with the room's AI.", Write, Outgoing, App, Some(P::McpTools), Available, Low, ["mcp.tools.unregister"]),
+    cap!("mcp.tools.result", "Answer an AI tool call", "Return the result of an on_tool_call to the model waiting on it. Plumbing: it only ever resolves a call the user already allowed.", Write, Outgoing, Instance, None, Available, Low, ["mcp.tools.result"]),
+    cap!("on_tool_call", "The AI called a tool", "Called with {call_id, tool, arguments} when this room's AI invokes a tool this instance registered; answer with mcp.tools.result.", Read, Incoming, Instance, Some(P::McpTools), Available, High, ["on_tool_call"]),
     // ----- never -----
     cap!("apps.manage", "Manage installed apps", "Never: install, uninstall, archive, restore, export or import apps stays a user-only surface.", Write, Outgoing, Apps, None, Never, Critical, []),
     cap!("matrix.space.leave", "Leave a space", "Never: leaving a space and its children is irreversible and user-only.", Write, Outgoing, Space, None, Never, Critical, []),
@@ -475,5 +485,16 @@ mod tests {
         assert_eq!(for_service("matrix.room_members").unwrap().id, "matrix.room.members.read");
         assert_eq!(for_hook("on_ipc_message").unwrap().group, Some(Permission::Ipc));
         assert!(for_service("nope").is_none());
+    }
+
+    /// The mini-app tool bridge resolves: registration/invocation are gated by
+    /// `mcp-tools`, answering a call is ungated plumbing, and the incoming
+    /// hook is catalogued so the guide and the gate agree.
+    #[test]
+    fn mcp_tool_services_resolve() {
+        assert_eq!(for_service("mcp.tools.register").unwrap().group, Some(Permission::McpTools));
+        assert_eq!(for_service("mcp.tools.unregister").unwrap().group, Some(Permission::McpTools));
+        assert_eq!(for_service("mcp.tools.result").unwrap().group, None);
+        assert_eq!(for_hook("on_tool_call").unwrap().group, Some(Permission::McpTools));
     }
 }

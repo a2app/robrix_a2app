@@ -7,6 +7,7 @@ name = "a2app-agent"
 version = "0.1.0"
 dependencies = [
  "a2app-core",
+ "async-trait",
  "chrono",
  "makepad-widgets",
  "octos-agent",
@@ -15,6 +16,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -5642,7 +5645,7 @@ dependencies = [
 [[package]]
 name = "octos-agent"
 version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=acp-embedding-seam#9abc94df7f0d1d5b7b803067434fe8b09d6a3898"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#ce2add2677b5fc8e03fd4129e1784a071d557d7a"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5693,7 +5696,7 @@ dependencies = [
 [[package]]
 name = "octos-bus"
 version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=acp-embedding-seam#9abc94df7f0d1d5b7b803067434fe8b09d6a3898"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#ce2add2677b5fc8e03fd4129e1784a071d557d7a"
 dependencies = [
  "aes 0.8.4",
  "async-trait",
@@ -5721,7 +5724,7 @@ dependencies = [
 [[package]]
 name = "octos-cli"
 version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=acp-embedding-seam#9abc94df7f0d1d5b7b803067434fe8b09d6a3898"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#ce2add2677b5fc8e03fd4129e1784a071d557d7a"
 dependencies = [
  "agent-client-protocol",
  "argon2",
@@ -5785,7 +5788,7 @@ dependencies = [
 [[package]]
 name = "octos-core"
 version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=acp-embedding-seam#9abc94df7f0d1d5b7b803067434fe8b09d6a3898"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#ce2add2677b5fc8e03fd4129e1784a071d557d7a"
 dependencies = [
  "chrono",
  "eyre",
@@ -5799,7 +5802,7 @@ dependencies = [
 [[package]]
 name = "octos-diagnostics"
 version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=acp-embedding-seam#9abc94df7f0d1d5b7b803067434fe8b09d6a3898"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#ce2add2677b5fc8e03fd4129e1784a071d557d7a"
 dependencies = [
  "eyre",
  "octos-core",
@@ -5811,7 +5814,7 @@ dependencies = [
 [[package]]
 name = "octos-fleet"
 version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=acp-embedding-seam#9abc94df7f0d1d5b7b803067434fe8b09d6a3898"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#ce2add2677b5fc8e03fd4129e1784a071d557d7a"
 dependencies = [
  "eyre",
  "octos-core",
@@ -5825,7 +5828,7 @@ dependencies = [
 [[package]]
 name = "octos-fleet-worker"
 version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=acp-embedding-seam#9abc94df7f0d1d5b7b803067434fe8b09d6a3898"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#ce2add2677b5fc8e03fd4129e1784a071d557d7a"
 dependencies = [
  "async-trait",
  "eyre",
@@ -5842,7 +5845,7 @@ dependencies = [
 [[package]]
 name = "octos-llm"
 version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=acp-embedding-seam#9abc94df7f0d1d5b7b803067434fe8b09d6a3898"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#ce2add2677b5fc8e03fd4129e1784a071d557d7a"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5864,7 +5867,7 @@ dependencies = [
 [[package]]
 name = "octos-memory"
 version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=acp-embedding-seam#9abc94df7f0d1d5b7b803067434fe8b09d6a3898"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#ce2add2677b5fc8e03fd4129e1784a071d557d7a"
 dependencies = [
  "bincode",
  "chrono",
@@ -5883,7 +5886,7 @@ dependencies = [
 [[package]]
 name = "octos-pipeline"
 version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=acp-embedding-seam#9abc94df7f0d1d5b7b803067434fe8b09d6a3898"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#ce2add2677b5fc8e03fd4129e1784a071d557d7a"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5905,7 +5908,7 @@ dependencies = [
 [[package]]
 name = "octos-plugin"
 version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=acp-embedding-seam#9abc94df7f0d1d5b7b803067434fe8b09d6a3898"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#ce2add2677b5fc8e03fd4129e1784a071d557d7a"
 dependencies = [
  "eyre",
  "metrics",
@@ -5919,7 +5922,7 @@ dependencies = [
 [[package]]
 name = "octos-services"
 version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=acp-embedding-seam#9abc94df7f0d1d5b7b803067434fe8b09d6a3898"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#ce2add2677b5fc8e03fd4129e1784a071d557d7a"
 dependencies = [
  "chrono",
  "dirs",
@@ -5940,7 +5943,7 @@ dependencies = [
 [[package]]
 name = "octos-store"
 version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=acp-embedding-seam#9abc94df7f0d1d5b7b803067434fe8b09d6a3898"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#ce2add2677b5fc8e03fd4129e1784a071d557d7a"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5960,7 +5963,7 @@ dependencies = [
 [[package]]
 name = "octos-swarm"
 version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=acp-embedding-seam#9abc94df7f0d1d5b7b803067434fe8b09d6a3898"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#ce2add2677b5fc8e03fd4129e1784a071d557d7a"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5979,7 +5982,7 @@ dependencies = [
 [[package]]
 name = "octos-workflows"
 version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=acp-embedding-seam#9abc94df7f0d1d5b7b803067434fe8b09d6a3898"
+source = "git+https://github.com/gterzian/octos?branch=acp-embedding-seam#ce2add2677b5fc8e03fd4129e1784a071d557d7a"
 dependencies = [
  "chrono",
  "eyre",
@@ -7370,6 +7373,7 @@ dependencies = [
  "rand 0.8.5",
  "rangemap",
  "reqwest 0.12.28",
+ "rmcp",
  "robius-directories",
  "robius-file-picker",
  "robius-location",

@@ -8,6 +8,7 @@
 
 pub mod acp_client;
 pub mod intent;
+pub mod mcp;
 #[cfg(feature = "embedded")]
 mod octos_embedded;
 pub mod pipeline;
@@ -51,6 +52,24 @@ impl AgentTransport for AcpClient {
     fn desc(&self) -> &str {
         self.cmd_desc()
     }
+}
+
+/// A host-side gate for the agent's OWN internet tools (`web_search`,
+/// `web_fetch`, `browser`), which run inside octos rather than as Robrix MCP
+/// tools, so the capability broker never sees them.
+///
+/// The in-process backend installs one of these per turn: before any of those
+/// tools opens a socket it calls [`NetworkApproval::approve`] with the host it
+/// means to reach, and the implementation blocks until the user has allowed
+/// or refused that host (via the same prompt the MCP tools use). Returning
+/// `Err(reason)` refuses the call and the reason is shown to the model. The
+/// child `octos acp` backend has no in-process callback channel today, so it
+/// wires no approval and the web tools fail closed there.
+pub trait NetworkApproval: Send + Sync {
+    /// Decide whether the agent's web tool may reach `host`/`url`. Blocks
+    /// until the UI answers. `Ok(())` allows; `Err(reason)` refuses with the
+    /// reason the model sees.
+    fn approve(&self, tool: &str, host: &str, url: &str) -> Result<(), String>;
 }
 
 /// Well-known provider API-key env vars → the octos provider they imply, in
@@ -210,6 +229,27 @@ mod tests {
         assert_eq!(Blocker::NoProvider.command(), None);
     }
 
+    /// The profile Robrix hands octos must parse against octos's own schema,
+    /// keep the web tools, and evict every shell/file/search/memory tool. A
+    /// typo here would make every AI-room session fail to start, and a too-wide
+    /// allow list would silently re-open the native toolset.
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn session_profile_parses_and_scopes_to_web_tools() {
+        let def = octos_agent::profile::ProfileDefinition::from_json_str(
+            super::ROBRIX_SESSION_PROFILE,
+        )
+        .expect("octos parses the session profile");
+        assert!(def.tools.allows("web_search"));
+        assert!(def.tools.allows("web_fetch"));
+        assert!(def.tools.allows("browser"));
+        assert!(!def.tools.allows("shell"));
+        assert!(!def.tools.allows("read_file"));
+        assert!(!def.tools.allows("write_file"));
+        assert!(!def.tools.allows("grep"));
+        assert!(!def.tools.allows("spawn"));
+    }
+
     #[test]
     fn provider_detection_prefers_anthropic_and_skips_empty() {
         let get = |var: &str| match var {
@@ -359,6 +399,10 @@ pub fn bridged_provider() -> Option<String> {
         .map(|(id, _)| id.to_string())
 }
 
+/// The child-backend bridge: only reachable when the embedded backend is NOT
+/// compiled in (an embedded agent never falls back to a Claude Code bridge),
+/// so the whole helper is gated rather than left dead in embedded builds.
+#[cfg(not(feature = "embedded"))]
 fn anthropic_compatible_bridge() -> Option<(String, Vec<(String, String)>)> {
     if on_path("octos") || !on_path("claude-code-acp") {
         return None;
@@ -504,10 +548,113 @@ pub fn blocker() -> Option<Blocker> {
 /// Anthropic-compatible bridge, else an external `octos acp` — with the
 /// provider auto-detected from the environment when octos was never
 /// configured, so an exported API key is the ONLY setup needed.
+///
+/// The generation agent runs WITHOUT extended thinking (see
+/// [`prefs::AgentPrefs::for_app_generation`]): it is a one-shot sub-agent
+/// writing one Splash file, and for octos any reasoning params would map to
+/// thinking for the very providers Robrix runs it on. Chat sessions use
+/// [`start_backend_with_mcp`] directly and keep the user's full picks.
+///
+/// The generation agent keeps its backend's own toolset
+/// (`host_managed = false`): it writes the app from its own reply, and under
+/// the persistent-guide build may use web lookups to check real Makepad
+/// API details. Only the room's long-lived session agent runs host-managed.
 pub fn start_backend(
     workspace: &std::path::Path,
     prefs: &prefs::AgentPrefs,
 ) -> Result<Box<dyn AgentTransport>, String> {
+    let prefs = prefs.for_app_generation();
+    makepad_widgets::log!(
+        "app-generation agent: extended thinking forced OFF for this run \
+         (model pick kept, effort cleared, thinking=off)"
+    );
+    start_backend_with_mcp(workspace, &prefs, &[], false, None)
+}
+
+/// Robrix's octos profile for its long-lived AI-room sessions, written to
+/// Robrix's own data root and returned as an absolute path for octos's
+/// `--profile` / `AcpCommand::profile`.
+///
+/// octos's built-in `hosted` profile empties the native tool registry, so the
+/// only tools a session can call are the ones Robrix advertises over ACP
+/// `mcpServers` (every one capability-gated). Sessions want that envelope
+/// *plus* octos's own web tools — `web_search`, `web_fetch`, `browser`
+/// (`group:web`) — so the room agent can look something up or read a page when
+/// the user asks. octos resolves a profile by built-in name, by
+/// `~/.octos/profiles/<id>/`, or by an absolute path; writing the JSON under
+/// our own data root and passing the path keeps the user's `~/.octos`
+/// untouched.
+///
+/// Kept to `group:web`: shell, files, search, memory and sub-agent spawn stay
+/// out, exactly as `hosted` leaves them. The web tools are octos-native, but
+/// they are gated by Robrix's permission system too: the in-process backend
+/// installs a per-turn [`NetworkApproval`] bridge, so every host they reach
+/// must have been allowed for this room's AI (see [`NetworkApproval`]). The
+/// child `octos acp` backend has no in-process bridge and fails closed there.
+/// Everything Robrix registers is capability-gated as before.
+///
+/// The file is rewritten only when its content changes, so a long-running app
+/// does not churn it while still picking up an edit on the next session start.
+pub fn robrix_session_profile() -> Result<String, String> {
+    use std::io::Write as _;
+    let dir = a2app_core::data_root().join("agent_profiles");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
+    let path = dir.join("robrix-session.json");
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(ROBRIX_SESSION_PROFILE) {
+        let mut file = std::fs::File::create(&path)
+            .map_err(|e| format!("couldn't write {}: {e}", path.display()))?;
+        file.write_all(ROBRIX_SESSION_PROFILE.as_bytes())
+            .map_err(|e| format!("couldn't write {}: {e}", path.display()))?;
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// The JSON body of [`robrix_session_profile`]'s file. A constant so the test
+/// below can validate it against octos's schema without touching the disk.
+const ROBRIX_SESSION_PROFILE: &str = r#"{
+  "name": "robrix-session",
+  "version": 1,
+  "description": "Robrix AI-room session: octos's own web tools only (group:web), with every other tool call mediated by Robrix's MCP server. Mirrors the built-in `hosted` profile plus web lookup/fetch so the room agent can research on request.",
+  "tools": { "mode": "allow_list", "tools": ["group:web"] },
+  "agents": []
+}
+"#;
+
+/// [`start_backend`] plus the stdio MCP servers the spawned agent is told
+/// about in `session/new` (`mcpServers`). A long-lived AI session passes the
+/// one Robrix tool server it bound for itself here; the one-shot create-app
+/// pipeline calls [`start_backend`], which advertises none.
+///
+/// Which agents honor the advertisement: claude-code-acp (the bridged
+/// backend), any `ROBRIX_AGENT_CMD` override, and octos — whose ACP handler
+/// connects per-session `mcpServers` and registers their tools (the coding
+/// profile is bypassed for client-advertised servers) — all read
+/// `mcpServers` from `session/new`, so the tools reach their models. An
+/// in-process embedded agent on iOS cannot exec the Robrix relay child at
+/// all, so the config is dropped there; on desktop the embedded agent honors
+/// it exactly like the child process does.
+///
+/// `host_managed` scopes the agent's own toolset. When `true`, the agent
+/// runs as a *host-managed* session: octos backends apply Robrix's session
+/// profile ([`robrix_session_profile`]) — the built-in `hosted` envelope
+/// (zero native shell/files/search/memory/spawn tools) plus `group:web`, so
+/// the only non-web tools the model can call are the ones Robrix advertises
+/// through `mcp_servers`, each mediated by Robrix and mapped to a mini-app
+/// capability. When `false` the backend keeps its own default toolset.
+/// Honored by the octos backends (embedded and `octos acp` child); a
+/// `ROBRIX_AGENT_CMD` override or the claude-code bridge brings its own
+/// tools and is left unchanged.
+pub fn start_backend_with_mcp(
+    workspace: &std::path::Path,
+    prefs: &prefs::AgentPrefs,
+    mcp_servers: &[crate::mcp::McpServerConfig],
+    host_managed: bool,
+    network_approval: Option<std::sync::Arc<dyn NetworkApproval>>,
+) -> Result<Box<dyn AgentTransport>, String> {
+    // Used only by the in-process backend; the child-process backends have no
+    // channel for it today and fail closed inside octos.
+    let _ = &network_approval;
     // Refuse before spawning rather than translating an errno afterwards: the
     // check knows WHICH program is missing, so it can name it and the install.
     if let Some(blocked) = blocker() {
@@ -519,9 +666,38 @@ pub fn start_backend(
     // octos takes its reasoning effort from its own config file rather than a
     // flag, so delivering that pick means editing that file (see
     // prefs::apply_octos_effort).
-    if let prefs::Backend::Octos { .. } = backend {
-        if let Err(e) = prefs::apply_octos_effort(prefs.effort.as_deref()) {
+    if let prefs::Backend::Octos { provider } = &backend {
+        // DeepSeek's V4 family is the exception that must NEVER receive an
+        // effort: octos translates ANY `reasoning_effort` for it into
+        // `reasoning_effort` + `thinking: enabled` (see octos-llm's
+        // openai.rs — every level switches extended thinking on), and
+        // Robrix's DeepSeek default is flash-with-no-thinking. So a DeepSeek
+        // run delivers no effort pick, and a `reasoning_effort` left in
+        // octos's config by anything else is stripped: octos then emits no
+        // thinking parameters and the model stays on its no-thinking
+        // default. Applies to every DeepSeek agent — chat sessions and the
+        // app-generation pipeline alike.
+        let effort = if provider == "deepseek" {
+            None
+        } else {
+            prefs.effort.as_deref()
+        };
+        if let Err(e) = prefs::apply_octos_effort(effort) {
             makepad_widgets::error!("couldn't set octos reasoning effort: {e}");
+        } else {
+            // The mechanism octos actually reads at `octos acp` boot: whether
+            // the model gets any thinking at all hinges on this config field
+            // (`gateway.reasoning_effort`), so the log shows what the spawned
+            // agent will really run with. `None` = octos emits no reasoning
+            // params and the model stays on its own default.
+            makepad_widgets::log!(
+                "octos {provider} agent: reasoning_effort={effort:?} ({}); \
+                 cleared from {}",
+                if effort.is_none() { "no extended thinking" } else { "thinking on" },
+                octos_config_candidates().into_iter().find(|p| p.exists())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "no config file (nothing to clear)".to_string())
+            );
         }
     }
     if let Ok(cmd) = std::env::var("ROBRIX_AGENT_CMD") {
@@ -531,11 +707,23 @@ pub fn start_backend(
         if let Ok(model) = std::env::var("ROBRIX_AGENT_MODEL") {
             env.push((String::from("ANTHROPIC_MODEL"), model));
         }
-        return Ok(Box::new(AcpClient::spawn(&cmd, workspace, &env, &extra)?));
+        return Ok(Box::new(AcpClient::spawn(&cmd, workspace, &env, &extra, mcp_servers)?));
     }
     #[cfg(feature = "embedded")]
     {
-        return Ok(Box::new(octos_embedded::EmbeddedOctos::start(workspace, prefs)?));
+        // An in-process agent on iOS cannot exec the Robrix relay child its
+        // own MCP server would be (exec() is prohibited), so nothing it could
+        // be told about is reachable — drop the config there. Everywhere else
+        // the embedded agent honors it exactly like the child process.
+        let mcp_servers: &[crate::mcp::McpServerConfig] =
+            if cfg!(target_os = "ios") { &[] } else { mcp_servers };
+        return Ok(Box::new(octos_embedded::EmbeddedOctos::start(
+            workspace,
+            prefs,
+            mcp_servers,
+            host_managed,
+            network_approval,
+        )?));
     }
     #[cfg(not(feature = "embedded"))]
     {
@@ -544,9 +732,22 @@ pub fn start_backend(
             // The bridge gets its own env only: `backend.env(prefs)` carries
             // octos's knobs, and the model/effort names in it mean nothing to
             // another provider's endpoint.
-            return Ok(Box::new(AcpClient::spawn(&cmd, workspace, &bridge_env, &[])?));
+            return Ok(Box::new(AcpClient::spawn(&cmd, workspace, &bridge_env, &[], mcp_servers)?));
         }
-        Ok(Box::new(AcpClient::spawn(&octos_acp_command(prefs), workspace, &env, &extra)?))
+        // A host-managed session strips octos's native tools by running
+        // Robrix's session profile (see octos-agent's profile system). The
+        // one-shot generation agent (host_managed = false) keeps the default
+        // `coding` surface.
+        let cmd = octos_acp_command(prefs);
+        let mut extra = extra;
+        if host_managed {
+            // Pass the profile as a REAL argument, not appended to the
+            // shell-like command string: `AcpClient::spawn` splits that string
+            // on whitespace, and the data root can contain spaces.
+            extra.push(String::from("--profile"));
+            extra.push(robrix_session_profile()?);
+        }
+        Ok(Box::new(AcpClient::spawn(&cmd, workspace, &env, &extra, mcp_servers)?))
     }
 }
 
@@ -626,3 +827,4 @@ pub fn runtime(prefs: &prefs::AgentPrefs) -> Runtime {
         Runtime::Child(octos_acp_command(prefs))
     }
 }
+

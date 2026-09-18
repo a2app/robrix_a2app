@@ -32,6 +32,7 @@ use makepad_widgets::SignalToUI;
 use octos_cli::commands::acp::AcpCommand;
 
 use crate::acp_client::AcpEvent;
+use crate::mcp::McpServerConfig as RobrixMcpServerConfig;
 use crate::prefs::AgentPrefs;
 use crate::AgentTransport;
 
@@ -93,7 +94,24 @@ pub struct EmbeddedOctos {
 }
 
 impl EmbeddedOctos {
-    pub fn start(workspace: &Path, prefs: &AgentPrefs) -> Result<Self, String> {
+    /// `mcp_servers` are the stdio tool servers this session advertises to the
+    /// agent — the same `McpServerConfig`s `AcpClient::spawn` puts in
+    /// `session/new`. The embedded backend hands them to octos's ACP factory
+    /// (`build_with_mcp`) instead, which connects them per session; on iOS the
+    /// caller passes none (the agent cannot exec the relay child there).
+    ///
+    /// `host_managed` scopes octos's own toolset: `true` applies the built-in
+    /// `hosted` profile (zero octos-native tools), so the only tools the model
+    /// can call are the ones this session advertises through `mcp_servers`.
+    /// The one-shot app-generation agent passes `false` and keeps octos's
+    /// default `coding` surface.
+    pub fn start(
+        workspace: &Path,
+        prefs: &AgentPrefs,
+        mcp_servers: &[RobrixMcpServerConfig],
+        host_managed: bool,
+        network_approval: Option<Arc<dyn crate::NetworkApproval>>,
+    ) -> Result<Self, String> {
         std::fs::create_dir_all(workspace).ok();
         let (evt_tx, events) = std::sync::mpsc::channel();
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
@@ -101,7 +119,10 @@ impl EmbeddedOctos {
         let ws = workspace.to_path_buf();
         let prefs = prefs.clone();
         let sd = shutdown.clone();
-        std::thread::spawn(move || agent_thread(ws, prefs, cmd_rx, evt_tx, sd));
+        let servers = mcp_servers.to_vec();
+        std::thread::spawn(move || {
+            agent_thread(ws, prefs, servers, host_managed, network_approval, cmd_rx, evt_tx, sd)
+        });
         Ok(Self { events, cmd_tx, shutdown })
     }
 }
@@ -154,10 +175,31 @@ fn send(evt_tx: &Sender<AcpEvent>, event: AcpEvent) {
 fn agent_thread(
     workspace: PathBuf,
     prefs: AgentPrefs,
+    mcp_servers: Vec<RobrixMcpServerConfig>,
+    host_managed: bool,
+    network_approval: Option<Arc<dyn crate::NetworkApproval>>,
     cmd_rx: Receiver<Cmd>,
     evt_tx: Sender<AcpEvent>,
     shutdown: Arc<Shutdown>,
 ) {
+    // Debug builds only: surface octos's own tracing (MCP connect/discovery,
+    // provider resolution) on stderr so an embedded-agent failure is visible
+    // in the `cargo run` console instead of vanishing into a dead subscriber.
+    // Robrix itself doesn't use tracing, so this prints octos lines only.
+    #[cfg(debug_assertions)]
+    {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(std::io::stderr)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| {
+                        "octos_agent::mcp=debug,octos_cli=info,octos=info".into()
+                    }),
+            )
+            .try_init();
+    }
+
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         // Deep agent futures; octos's own entrypoints use an 8MB stack.
@@ -172,7 +214,13 @@ fn agent_thread(
         }
     };
 
-    let agent = match rt.block_on(build_agent(&workspace, &prefs, &shutdown)) {
+    let agent = match rt.block_on(build_agent(
+        &workspace,
+        &prefs,
+        &shutdown,
+        &mcp_servers,
+        host_managed,
+    )) {
         Ok(agent) => agent,
         Err(e) => {
             send(&evt_tx, AcpEvent::ProcessGone(e));
@@ -189,7 +237,14 @@ fn agent_thread(
     // Blocking command loop OUTSIDE the runtime: recv() parks this thread;
     // each turn runs to completion on the runtime.
     while let Ok(Cmd::Prompt(text)) = cmd_rx.recv() {
-        rt.block_on(run_turn(&agent, &shutdown, &evt_tx, &mut history, &text));
+        rt.block_on(run_turn(
+            &agent,
+            &shutdown,
+            &evt_tx,
+            &mut history,
+            &text,
+            network_approval.as_ref(),
+        ));
     }
 }
 
@@ -220,6 +275,8 @@ async fn build_agent(
     workspace: &Path,
     prefs: &AgentPrefs,
     shutdown: &Arc<Shutdown>,
+    mcp_servers: &[RobrixMcpServerConfig],
+    host_managed: bool,
 ) -> Result<Arc<octos_agent::Agent>, String> {
     let cwd = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     let command = AcpCommand {
@@ -237,6 +294,17 @@ async fn build_agent(
         // for this model" against the Kimi coding plan.
         provider: crate::providers::session_provider(),
         model: crate::prefs::Backend::detect().model_override(prefs),
+        // Host-managed sessions (the room's long-lived agent) run Robrix's
+        // session profile: octos's registry is emptied of native tools except
+        // `group:web`, so the model can look things up / read pages and
+        // otherwise only call the tools Robrix advertised in `mcp_servers` —
+        // every one mediated by Robrix. The one-shot app-generation agent
+        // (host_managed = false) keeps the default `coding` surface.
+        profile: if host_managed {
+            Some(crate::robrix_session_profile()?)
+        } else {
+            None
+        },
         ..Default::default()
     };
 
@@ -247,7 +315,29 @@ async fn build_agent(
     // crash — safe only while that dir was our own private scratch. It is the
     // user's own ~/.octos now, and their episode history is not ours to delete.
     //
-    let built = factory.build(cwd).await.map_err(|e| e.to_string())?;
+    // The Robrix tool servers this session advertised are translated into
+    // octos config and handed to `build_with_mcp`, exactly the per-session
+    // `mcpServers` path the `octos acp` child process serves.
+    let octos_servers: Vec<octos_agent::McpServerConfig> = mcp_servers
+        .iter()
+        .map(|server| octos_agent::McpServerConfig {
+            command: Some(server.command.clone()),
+            args: server.args.clone(),
+            env: std::collections::HashMap::new(),
+            url: None,
+            headers: std::collections::HashMap::new(),
+            oauth: false,
+            scopes: Vec::new(),
+            concurrency_class: None,
+            // The relay's tools (app generation) run minutes-long by design;
+            // octos's 60s operator default would cancel them mid-build.
+            tool_call_timeout_secs: Some(600),
+        })
+        .collect();
+    let built = factory
+        .build_with_mcp(cwd, &octos_servers)
+        .await
+        .map_err(|e| e.to_string())?;
     finish_agent(built, shutdown)
 }
 
@@ -308,8 +398,17 @@ impl octos_agent::ProgressReporter for Reporter {
             E::ReasoningChunk { text, .. } => {
                 send(&self.evt_tx, AcpEvent::Thought(text));
             }
-            E::ToolStarted { name, .. } => {
-                send(&self.evt_tx, AcpEvent::ToolCall(name));
+            E::ToolStarted { name, tool_id, .. } => {
+                send(&self.evt_tx, AcpEvent::ToolCall { id: tool_id, title: name });
+            }
+            // The terminal status of a tool call. Needed to close the live
+            // card for octos's own tools (web_search/web_fetch/browser),
+            // which Robrix does not itself execute and so cannot resolve.
+            E::ToolCompleted { tool_id, success, output_preview, .. } => {
+                send(
+                    &self.evt_tx,
+                    AcpEvent::ToolCallDone { id: tool_id, ok: success, summary: output_preview },
+                );
             }
             // Nothing to render, but they are proof the agent is alive, and
             // the pipeline's stall watchdog measures the gap since the LAST
@@ -320,7 +419,6 @@ impl octos_agent::ProgressReporter for Reporter {
             | E::TaskStarted { .. }
             | E::LlmStatus { .. }
             | E::ToolProgress { .. }
-            | E::ToolCompleted { .. }
             | E::FileModified { .. }
             | E::PlanUpdated { .. }
             | E::TokenUsage { .. }
@@ -328,6 +426,36 @@ impl octos_agent::ProgressReporter for Reporter {
             | E::StreamDone { .. }
             | E::StreamRetry { .. } => send(&self.evt_tx, AcpEvent::Tick),
             _ => {}
+        }
+    }
+}
+
+/// Adapts Robrix's blocking [`crate::NetworkApproval`] to octos's async
+/// per-turn network-access requester. The approval itself runs on a blocking
+/// thread, so the agent's tokio worker is never parked on the UI while the
+/// user reads the prompt.
+struct RobrixNetworkRequester {
+    approval: Arc<dyn crate::NetworkApproval>,
+}
+
+#[async_trait::async_trait]
+impl octos_agent::tools::NetworkAccessRequester for RobrixNetworkRequester {
+    async fn request_network_access(
+        &self,
+        request: octos_agent::tools::NetworkAccessRequest,
+    ) -> octos_agent::tools::NetworkAccessDecision {
+        let approval = self.approval.clone();
+        let tool = request.tool_name;
+        let host = request.host;
+        let url = request.url;
+        let allowed = tokio::task::spawn_blocking(move || approval.approve(&tool, &host, &url))
+            .await
+            .unwrap_or_else(|_| Err("network approval channel closed".to_string()))
+            .is_ok();
+        if allowed {
+            octos_agent::tools::NetworkAccessDecision::Allow
+        } else {
+            octos_agent::tools::NetworkAccessDecision::Deny
         }
     }
 }
@@ -341,6 +469,7 @@ async fn run_turn(
     evt_tx: &Sender<AcpEvent>,
     history: &mut Vec<octos_core::Message>,
     text: &str,
+    network_approval: Option<&Arc<dyn crate::NetworkApproval>>,
 ) {
     // NOTE: the stale-cancel reset happens in send_prompt (UI side), BEFORE
     // the command is queued — so a cancel/drop arriving while the turn waits
@@ -351,7 +480,21 @@ async fn run_turn(
     }));
 
     let snapshot = history.clone();
-    let outcome = agent.process_message(text, &snapshot, vec![]).await;
+    let process = agent.process_message(text, &snapshot, vec![]);
+    // Gate the agent's OWN web tools (web_search / web_fetch / browser) on the
+    // same permission system the Robrix MCP tools use: every host they reach
+    // must have been allowed for this room's AI. With no approval wired
+    // (the child `octos acp` backend), the tools fail closed inside octos.
+    let outcome = match network_approval {
+        Some(approval) => {
+            let requester: Arc<dyn octos_agent::tools::NetworkAccessRequester> =
+                Arc::new(RobrixNetworkRequester { approval: approval.clone() });
+            octos_agent::tools::NETWORK_ACCESS_CTX
+                .scope(requester, process)
+                .await
+        }
+        None => process.await,
+    };
     let cancelled = shutdown.is_set();
 
     match outcome {

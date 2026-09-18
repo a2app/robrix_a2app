@@ -115,6 +115,170 @@ three commits). Move back to Robrix's shared pin once the PR lands.
 | `a2app-persistent-guide` | Install the Splash dialect guide on the agent once, so per-turn prompts shrink to a pointer line. |
 | `a2app-research` | Let the agent research with its tools (web search/fetch) before generating, baking found data into the app as constants. |
 
+## AI Rooms (agent chat sessions per Matrix room)
+
+An AI Room is an ordinary Matrix room backed by a Robrix agent session — the
+room *is* the session's transcript. Messages any member sends drive the agent;
+its output is written back as `rs.robius.robrix.ai_reply` **state events** (never
+`m.room.message`, so it can never loop back as input), rendered as timeline
+cards, and it survives restarts. The code lives in `src/a2app/ai/` (room
+creation + marker/cursor bookkeeping: `rooms.rs`), `src/a2app/runtime.rs`
+(session attach, message forwarding, reply posting) and
+`src/a2app/ai_room_events.rs` (event wire types + the timeline card). Unix-only:
+a session is an `a2app_agent::AgentTransport`, spawned per room with a
+session-scoped MCP tool server (`src/a2app/ai/server.rs` + `bridge.rs`).
+
+### How it works
+
+1. **Create** (Add Room screen → "start a new AI room"): a private encrypted
+   room whose `initial_state` carries a `rs.robius.robrix.ai_room` marker, so
+   there is no window where the room exists but isn't an AI room.
+2. **Attach**: opening a room checks the marker once (after its state has
+   synced — a brand-new room's state lags sliding sync, so a marker miss only
+   counts once `m.room.create` is cached; our own creations are recorded
+   immediately from the create response). A marked room gets its session.
+3. **Forward**: member text messages after the saved forwarding cursor (room
+   account data `rs.robius.robrix.ai_session_data`) are sent to the session as
+   prompts; the first prompt after a (re)start carries a short plaintext
+   transcript preamble for context.
+4. **Answer**: the agent calls Robrix's own MCP tools — `send_message` (posts
+   an `ai_reply`), `launch_splash_app` (runs the mini-app generation pipeline),
+   or `list_apps`/`launch_app` (find and run an app that already exists) — or
+   ends its turn with text, which is posted as the `ai_reply`.
+   A turn that already spoke through `send_message` has its redundant trailing
+   text dropped, so one turn = one card.
+
+### Tools the agent can call
+
+The session registers exactly these on its MCP server (`ai::tools::
+register_session_tools`), and every one is executed by Robrix. The
+gated ones map onto the mini-app capability catalog, so the first use prompts
+the user and the choice is shared with mini-apps. Message reads return full
+bodies; only the mini-app services clip.
+
+| Tool | What it does | Gate |
+|---|---|---|
+| `send_message` | Replies in this room (becomes the turn's `ai_reply`) | none (room plumbing) |
+| `read_room_memory` | Recalls the agent's own past turns and tool calls in this room | none |
+| `read_room_messages` | Reads this room's recent messages | `matrix.room.messages.read` |
+| `read_older_messages` | Pages further back in this room | `matrix.room.messages.paginate` |
+| `room_info` | Reads this room's name, topic, members, join rule, encryption | `matrix.room.info.read` |
+| `list_rooms` | Lists the user's joined rooms and DMs | `matrix.rooms.list` |
+| `read_other_room_messages` | Reads another joined room the model names | `matrix.rooms.messages.read` |
+| `post_room_message` | Posts a notice into another joined room | `matrix.rooms.message.send` (per room) |
+| `list_spaces` | Lists the spaces the user has joined | `matrix.spaces.list` |
+| `space_info` | Reads one space's details | `matrix.space.info.read` |
+| `list_space_rooms` | Lists the rooms/subspaces inside one space | `matrix.space.rooms.list` |
+| `list_apps` | Lists the mini-apps installed and available in this room (id, name, description, scope, running) | `app-launch` |
+| `launch_app` | Runs an already-installed mini-app in this room, by id from `list_apps` | `app-launch` (run only) |
+| `list_mini_app_tools` | Lists the tools the room's mini-apps registered (id, name, description, args) | `mcp-tools` (kill switch) |
+| `call_mini_app_tool` | Calls one registered mini-app tool by id, forwarding `arguments` | `mcp-tools` (per tool) |
+| `launch_splash_app` | Builds and runs a NEW mini-app from a description | `apps.generate` |
+
+`launch_splash_app` is create-only: it never rewrites an installed app. Running
+an app that already exists is `launch_app`'s job — list the ids with
+`list_apps`, then launch one. (The Mini Apps screen's own create bar still
+classifies create-vs-modify from its text; only the agent's tool is create-only.)
+
+Each call is its own `rs.robius.robrix.ai_tool_call` state row, written
+`Started` when the model picks the tool and rewritten `Done` with the outcome.
+The row (and the reply card's receipt chips) render a human phrase rather than
+the raw tool name — e.g. `Read messages in “General”`, `Built and ran a
+mini-app “a pomodoro timer”`.
+
+**A mini-app can register its own tools at runtime.** With the `mcp-tools`
+permission, an app calls `host.request("mcp.tools.register", {name,
+description, args})`; Robrix installs a `MiniAppTool` on the room session's
+live MCP server and pushes `notifications/tools/list_changed`, so a client
+that honours that notification can refresh its list without a new session.
+When the model calls the tool, the runtime delivers
+`on_tool_call({call_id, tool, name, arguments})` into the own isolate; the app
+answers `host.request("mcp.tools.result", {call_id, ok, result})` and that
+text is the model's tool result (a bounded ~20 s wait, then the model is told
+it timed out). Tools are namespaced `app_<id>_<name>` so an app can never
+shadow a built-in, and an instance's tools are withdrawn when it quits or its
+session stops.
+
+**The stable bridge is what makes registration work under octos.** octos's MCP
+client discovers a server's tools once, at session start, and does not act on
+`notifications/tools/list_changed` (or re-list afterwards), so a tool added to
+the live server can never enter the model's toolset on its own. Every session
+therefore also advertises two tools that are present from the start:
+`list_mini_app_tools` (the registered tools — id, name, description, args) and
+`call_mini_app_tool` (`{tool, arguments}`). The model lists with the first and
+calls through the second, and the runtime validates the id, applies the same
+per-tool gate as a direct call, and routes into the owning isolate. The
+per-tool `MiniAppTool` registrations remain, so a client whose MCP stack does
+honour `list_changed` can still call them directly.
+
+Two consent gates guard this, because the tool's description and result are
+app-authored text that lands in the model's context. Registration prompts per
+tool, showing the **full description and argument list verbatim** (the exact
+text the model will read); a changed description hashes differently and
+re-prompts. Invocation prompts per tool on first use, showing the same review
+text plus the concrete arguments. Durable registration grants store the
+content hash; refusals are session-scoped. See `a2app/core/src/permissions.rs`
+(`tool_effective`) and `src/a2app/ai/tools.rs` (`MiniAppTool`).
+
+**octos's own web tools are kept too.** Sessions run under Robrix's octos
+profile (`a2app_agent::robrix_session_profile`), which is the built-in
+`hosted` envelope (no shell/files/search/memory/spawn) plus `group:web`:
+`web_search` (Tavily/Exa/DuckDuckGo/Brave/You.com/Perplexity, free fallback),
+`web_fetch` (read a page), and `browser`. These are octos-native, so Robrix
+does not execute or capability-gate them; the agent closes their live cards
+itself from the ACP `tool_call_update`. Everything Robrix registers above
+remains mediated and gated.
+
+### Registering AI tools from an app
+
+A mini-app attached to an AI room can expose callable tools to the agent (the
+inverse of `launch_splash_app`: the model calls INTO the app). This is what
+makes a two-way app possible — a tic-tac-toe board the AI plays on, a
+scorekeeper it updates, etc.
+
+The app side (all on one group, `mcp-tools`):
+
+- `mcp.tools.register` `{name, description, args:[{name,type,description}]}`
+  -> `{tool}`; `mcp.tools.unregister` `{name}`.
+- `fn on_tool_call(json)` with `{call_id, tool, name, arguments}`; answer
+  `mcp.tools.result` `{call_id, ok, result}`.
+- `mcp.tools.result` is ungated plumbing; registration and invocation are
+  prompted per tool. The guide (`a2app/agent/src/splash_guide.md`, section
+  "Letting the AI call your app") is the generator-facing reference.
+
+### Trying it offline (no API key)
+
+The octos `scenario` provider (`octos/crates/octos-llm/src/registry/`
+`scenario.rs`) is a deterministic, key-less model built for exactly this. After
+`sh a2app/dev/offline-ai-setup.sh` (writes `provider: "scenario"` to
+`~/.octos/config.json`), run the app and chat in an AI room:
+
+```sh
+cargo run --features a2app-embedded-agent
+```
+
+- 1st message → `send_message` tool → a "pong" `ai_reply` card.
+- 2nd message → `launch_splash_app` → the offline demo installs a minimal
+  "this is a mini-app" app (the writer role's canned source — deliberately
+  free of `glass.*` widgets and `Fill` heights, both of which render blank in
+  the host's `Fit`-mounted Splash).
+- 3rd+ message → "pong" again.
+
+The sequence is tracked inside the session's scenario provider, not by
+scanning message history, because a failed turn makes octos drop history.
+
+### Notes for maintainers
+
+- The `robrix --mcp-bridge` relay + tool server are exercised headlessly by
+  `tests/mcp_transport.rs` (hand-written client) and `tests/mcp_rmcp.rs` (the
+  real rmcp client octos uses). `mcp_rmcp` is the regression test for a
+  macOS-only bug where `accept()` inherits the listener's `O_NONBLOCK` and the
+  blocking serve loop read EAGAIN between requests, dropping the connection
+  and silently removing the host tools.
+- `glass.*` widgets and `height: Fill` roots do not render in a mini-app host
+  today; built-in demo apps (`a2app/core/apps/*.splash`) show the working
+  idioms (natural sizes throughout).
+
 ## Not included yet
 
 - Splash resource limiting (CPU/memory/timer shares) — needs makepad#1189.

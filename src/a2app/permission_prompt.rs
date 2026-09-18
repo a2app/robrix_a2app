@@ -37,6 +37,24 @@ script_mod! {
             }
         }
 
+        // The app-authored tool text, shown VERBATIM and rendered as inert
+        // plain text: no markdown, no links, nothing the app can dress up.
+        // This is exactly what would enter the model's context.
+        prompt_tool := View {
+            width: Fill, height: Fit
+            visible: false
+            flow: Down
+            margin: Inset{top: 10}
+            tool_label := Label {
+                width: Fill, height: Fit
+                padding: 8, margin: 0
+                draw_text +: {
+                    text_style: REGULAR_TEXT {font_size: 10.5},
+                    color: #x1C274C
+                }
+            }
+        }
+
         ModalButtonsRow {
             align: Align{x: 0.5, y: 0.5}
             spacing: 16
@@ -68,6 +86,16 @@ script_mod! {
     }
 }
 
+/// The app-authored tool text shown verbatim on an `mcp-tools` prompt — the
+/// exact name, description and arguments that would enter the model's
+/// context.
+#[derive(Clone, Debug)]
+pub struct ToolPreview {
+    pub name: String,
+    pub description: String,
+    pub args: Vec<(String, String, String)>,
+}
+
 /// What the prompt modal needs to display one request.
 pub struct PromptInfo {
     pub app_name: String,
@@ -78,6 +106,11 @@ pub struct PromptInfo {
     /// The specific ability that triggered the ask (its catalog title), when
     /// a parked request identifies one.
     pub capability: Option<String>,
+    /// Whether the asker is a room's AI agent (vs an installed mini-app):
+    /// changes the wording of the blurb and reason lines.
+    pub agent: bool,
+    /// For an `mcp-tools` prompt: the app-authored tool text under review.
+    pub tool: Option<ToolPreview>,
 }
 
 /// The user's answer, emitted as a global action for the runtime to apply.
@@ -133,20 +166,48 @@ impl MiniAppPermissionPromptRef {
             "{} \"{}\" wants to: {}",
             info.app_icon, info.app_name, asked,
         ));
-        // Allowing answers for the whole group; App Info can narrow it.
-        let blurb = match info.capability {
-            Some(_) => format!(
+        // Allowing answers for the whole group; the room's AI panel (agents)
+        // or App Info (mini-apps) can change it later.
+        let blurb = if info.agent {
+            format!(
+                "Allowing covers the \"{}\" group for this room's AI; you can change it later in the room's AI panel.",
+                info.perm.title(),
+            )
+        } else if info.capability.is_some() {
+            format!(
                 "{} Allowing covers the \"{}\" group; single abilities can be blocked in App Info.",
                 info.perm.blurb(), info.perm.title(),
-            ),
-            None => info.perm.blurb().to_string(),
+            )
+        } else {
+            info.perm.blurb().to_string()
         };
         inner.view.label(cx, ids!(prompt_blurb)).set_text(cx, &blurb);
-        let reason_text = match info.reason.as_deref() {
-            Some(reason) => format!("The app's stated reason: \"{reason}\""),
-            None => String::from("The app gave no reason for needing this."),
+        let reason_text = match (info.agent, info.reason.as_deref()) {
+            (true, Some(reason)) => reason.to_string(),
+            (true, None) => String::from("It needs this to answer your messages in this room."),
+            (false, Some(reason)) => format!("The app's stated reason: \"{reason}\""),
+            (false, None) => String::from("The app gave no reason for needing this."),
         };
         inner.view.label(cx, ids!(prompt_reason)).set_text(cx, &reason_text);
+        // The app's own tool text, verbatim. The user reviews exactly what the
+        // model will read, so this is never reformatted.
+        match &info.tool {
+            Some(tool) => {
+                let mut text = format!("Tool name: {}\n\n{}", tool.name, tool.description);
+                if !tool.args.is_empty() {
+                    text.push_str("\n\nArguments:");
+                    for (name, ty, desc) in &tool.args {
+                        text.push_str(&format!("\n  • {name} ({ty})"));
+                        if !desc.trim().is_empty() {
+                            text.push_str(&format!(" — {desc}"));
+                        }
+                    }
+                }
+                inner.view.label(cx, ids!(tool_label)).set_text(cx, &text);
+                inner.view.view(cx, ids!(prompt_tool)).set_visible(cx, true);
+            }
+            None => inner.view.view(cx, ids!(prompt_tool)).set_visible(cx, false),
+        }
         inner.view.button(cx, ids!(allow_once_button)).set_visible(cx, inner.show_once);
         inner.view.redraw(cx);
     }

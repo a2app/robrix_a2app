@@ -164,6 +164,13 @@ script_mod! {
                             content := MiniAppPermissionPrompt {}
                         }
 
+                        // The "AI in this room" management panel (an invisible
+                        // stub in builds without `a2app` / on non-unix).
+                        ai_room_panel_modal := Modal {
+                            can_dismiss: true,
+                            content := AiRoomPanel {}
+                        }
+
                         PopupList {}
 
                         // Tooltips must be shown in front of all other UI elements,
@@ -708,6 +715,26 @@ impl MatchEvent for App {
                 }
                 _ => {}
             }
+
+            // Handle AI room creation: navigate to a newly-created AI room,
+            // or report why creation failed. (Attaching its session, and
+            // everything else about AI rooms, is handled in `a2app::runtime`.)
+            #[cfg(all(feature = "a2app", unix))]
+            match action.downcast_ref() {
+                Some(crate::a2app::ai::rooms::AiRoomAction::Created { room_name_id }) => {
+                    log!("AI Rooms: AI room created: {room_name_id:?}; navigating to it.");
+                    self.navigate_to_room(cx, None, &BasicRoomDetails::RoomId(room_name_id.clone()));
+                }
+                Some(crate::a2app::ai::rooms::AiRoomAction::CreateFailed { error }) => {
+                    log!("AI Rooms: AI room creation FAILED: {error}");
+                    enqueue_popup_notification(
+                        format!("Failed to create the AI room.\n\nError: {error}"),
+                        PopupKind::Error,
+                        None,
+                    );
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -1018,6 +1045,16 @@ impl App {
         self.lifecycle.shutdown_started = true;
 
         self.persist_runtime_state(cx, "shutdown");
+
+        // Abort any in-flight AI work before the process tears down: an
+        // explicit `session/cancel` goes to each live room session's agent and
+        // to the running app-generation agent, with a short grace for them to
+        // relay it to the LLM provider. Without this, a turn (or build) the
+        // AI was working on would be cut off only by the agent child process
+        // being killed — which drops the provider connection but sends no
+        // explicit stop.
+        #[cfg(all(feature = "a2app", unix))]
+        crate::a2app::runtime::shutdown();
 
         if let Err(_e) = crate::sliding_sync::stop_sync_service_for_shutdown(Duration::from_secs(3)) {
             error!("Failed to stop Matrix sync service before shutdown. Error: Timed out.");
