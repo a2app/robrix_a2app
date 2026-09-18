@@ -128,15 +128,27 @@ pub struct SessionHost {
     jobs: Sender<SessionJob>,
 }
 
+impl SessionHost {
+    /// Hands a job to the UI thread and wakes it: it polls the job channel on
+    /// each event pass, and a call can land after the agent's last ACP event
+    /// was drained, so without the signal it would sit until something else
+    /// woke the app.
+    fn submit(&self, job: SessionJob) -> Result<(), String> {
+        self.jobs
+            .send(job)
+            .map_err(|_| "this session's UI thread is gone".to_string())?;
+        makepad_widgets::SignalToUI::set_ui_signal();
+        Ok(())
+    }
+}
+
 impl AiHost for SessionHost {
     fn launch_splash_app(&self, description: &str) -> Result<String, String> {
         let (answer_tx, answer_rx) = channel();
-        self.jobs
-            .send(SessionJob::LaunchSplashApp {
+        self.submit(SessionJob::LaunchSplashApp {
                 description: description.to_string(),
                 answer: answer_tx,
-            })
-            .map_err(|_| "this session's UI thread is gone".to_string())?;
+            })?;
         answer_rx
             .recv()
             .map_err(|_| "this session ended before the app was built".to_string())?
@@ -144,9 +156,7 @@ impl AiHost for SessionHost {
 
     fn list_apps(&self) -> Result<String, String> {
         let (answer_tx, answer_rx) = channel();
-        self.jobs
-            .send(SessionJob::ListApps { answer: answer_tx })
-            .map_err(|_| "this session's UI thread is gone".to_string())?;
+        self.submit(SessionJob::ListApps { answer: answer_tx })?;
         answer_rx
             .recv()
             .map_err(|_| "this session ended before the app list was read".to_string())?
@@ -154,9 +164,7 @@ impl AiHost for SessionHost {
 
     fn list_mini_app_tools(&self) -> Result<String, String> {
         let (answer_tx, answer_rx) = channel();
-        self.jobs
-            .send(SessionJob::ListMiniAppTools { answer: answer_tx })
-            .map_err(|_| "this session's UI thread is gone".to_string())?;
+        self.submit(SessionJob::ListMiniAppTools { answer: answer_tx })?;
         answer_rx
             .recv()
             .map_err(|_| "this session ended before the tool list was read".to_string())?
@@ -168,13 +176,11 @@ impl AiHost for SessionHost {
         arguments: Map<String, Value>,
     ) -> Result<String, String> {
         let (answer_tx, answer_rx) = channel();
-        self.jobs
-            .send(SessionJob::CallMiniAppTool {
+        self.submit(SessionJob::CallMiniAppTool {
                 tool: tool.to_string(),
                 arguments,
                 answer: answer_tx,
-            })
-            .map_err(|_| "this session's UI thread is gone".to_string())?;
+            })?;
         answer_rx
             .recv()
             .map_err(|_| "this session ended before the app tool answered".to_string())?
@@ -182,12 +188,10 @@ impl AiHost for SessionHost {
 
     fn launch_app(&self, app_id: &str) -> Result<String, String> {
         let (answer_tx, answer_rx) = channel();
-        self.jobs
-            .send(SessionJob::LaunchApp {
+        self.submit(SessionJob::LaunchApp {
                 app_id: app_id.to_string(),
                 answer: answer_tx,
-            })
-            .map_err(|_| "this session's UI thread is gone".to_string())?;
+            })?;
         answer_rx
             .recv()
             .map_err(|_| "this session ended before the app launched".to_string())?
@@ -195,12 +199,10 @@ impl AiHost for SessionHost {
 
     fn send_room_message(&self, text: &str) -> Result<String, String> {
         let (answer_tx, answer_rx) = channel();
-        self.jobs
-            .send(SessionJob::SendRoomMessage {
+        self.submit(SessionJob::SendRoomMessage {
                 text: text.to_string(),
                 answer: answer_tx,
-            })
-            .map_err(|_| "this session's UI thread is gone".to_string())?;
+            })?;
         answer_rx
             .recv()
             .map_err(|_| "this session ended before the message was posted".to_string())?
@@ -208,13 +210,11 @@ impl AiHost for SessionHost {
 
     fn post_room_message(&self, room: &str, text: &str) -> Result<String, String> {
         let (answer_tx, answer_rx) = channel();
-        self.jobs
-            .send(SessionJob::PostRoomMessage {
+        self.submit(SessionJob::PostRoomMessage {
                 room_id: room.to_string(),
                 text: text.to_string(),
                 answer: answer_tx,
-            })
-            .map_err(|_| "this session's UI thread is gone".to_string())?;
+            })?;
         answer_rx
             .recv()
             .map_err(|_| "this session ended before the message was posted".to_string())?
@@ -222,9 +222,7 @@ impl AiHost for SessionHost {
 
     fn read_tool(&self, kind: ReadToolKind) -> Result<String, String> {
         let (answer_tx, answer_rx) = channel();
-        self.jobs
-            .send(SessionJob::ReadTool { kind, answer: answer_tx })
-            .map_err(|_| "this session's UI thread is gone".to_string())?;
+        self.submit(SessionJob::ReadTool { kind, answer: answer_tx })?;
         answer_rx
             .recv()
             .map_err(|_| "this session ended before the read completed".to_string())?
@@ -237,13 +235,11 @@ impl AiHost for SessionHost {
 impl MiniAppToolBridge for SessionHost {
     fn invoke(&self, tool: &str, arguments: &Map<String, Value>) -> Result<String, String> {
         let (answer_tx, answer_rx) = channel();
-        self.jobs
-            .send(SessionJob::InvokeMiniAppTool {
+        self.submit(SessionJob::InvokeMiniAppTool {
                 tool: tool.to_string(),
                 arguments: arguments.clone(),
                 answer: answer_tx,
-            })
-            .map_err(|_| "this session's UI thread is gone".to_string())?;
+            })?;
         answer_rx
             .recv()
             .map_err(|_| "this session ended before the app answered".to_string())?
@@ -256,19 +252,12 @@ impl MiniAppToolBridge for SessionHost {
 impl a2app_agent::NetworkApproval for SessionHost {
     fn approve(&self, tool: &str, host: &str, url: &str) -> Result<(), String> {
         let (answer_tx, answer_rx) = channel();
-        self.jobs
-            .send(SessionJob::NetworkAccess {
+        self.submit(SessionJob::NetworkAccess {
                 tool: tool.to_string(),
                 host: host.to_string(),
                 url: url.to_string(),
                 answer: answer_tx,
-            })
-            .map_err(|_| "this session's UI thread is gone".to_string())?;
-        // Wake the UI thread: it polls the job channel on each event pass, and
-        // a network request can arrive after the agent's last ACP event has
-        // already been drained, so without this signal the gate would sit
-        // unanswered until some unrelated event woke the app.
-        makepad_widgets::SignalToUI::set_ui_signal();
+            })?;
         answer_rx
             .recv()
             .map_err(|_| "this session ended before the network request was answered".to_string())?
@@ -620,12 +609,19 @@ impl AiSession {
                 }
                 AcpEvent::Error(msg) => {
                     log!("AI session {}: agent error after {} chars of thinking: {}", self.room_id, self.turn_thought_chars, clip(&msg, 240));
-                    // The agent answered the outstanding request with an
-                    // error; it is idle again, and any queued asks continue.
                     self.busy = false;
                     self.tool_call_names.clear();
-                    updates.push(SessionUpdate::Error(msg));
-                    self.flush_queue();
+                    if !self.ready {
+                        // The handshake itself failed: nothing can ever be
+                        // sent on this transport, so the session is gone.
+                        self.transport_dead = true;
+                        updates.push(SessionUpdate::Gone(msg));
+                    } else {
+                        // The agent answered the outstanding request with an
+                        // error; it is idle again, and any queued asks continue.
+                        updates.push(SessionUpdate::Error(msg));
+                        self.flush_queue();
+                    }
                 }
                 AcpEvent::ProcessGone(msg) => {
                     log!("AI session {}: agent process gone: {}", self.room_id, clip(&msg, 240));
@@ -657,7 +653,7 @@ impl AiSession {
                             self.room_id,
                             clip(&text, 160)
                         );
-                    } else if self.turn_thought_chars % 4096 == 0 {
+                    } else if self.turn_thought_chars.is_multiple_of(4096) {
                         log!(
                             "AI session {}: agent still thinking ({} chars so far)",
                             self.room_id,
@@ -712,7 +708,7 @@ impl AiSession {
 
     /// Sends the front of the queue, if any, to the now-idle agent.
     fn flush_queue(&mut self) {
-        if self.dead() || self.busy {
+        if self.dead() || self.busy || !self.ready {
             return;
         }
         if let Some(text) = self.queued.pop_front() {

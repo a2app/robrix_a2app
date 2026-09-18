@@ -28,7 +28,7 @@ use makepad_widgets::*;
 
 use crate::layout::PaneSide;
 use crate::manifest::{AppRegistry, MiniAppId};
-use crate::permissions::{Effective, GrantState, Permission, PermissionStore};
+use crate::permissions::{Effective, Permission, PermissionStore};
 
 pub const PLATFORM: &str = if cfg!(target_os = "macos") {
     "macos"
@@ -121,6 +121,9 @@ pub const MAX_APP_TOOLS_PER_INSTANCE: usize = 16;
 /// Cap on an app-authored tool description, in chars. It is shown to the user
 /// AND handed to the model, so it is bounded before either.
 pub const MAX_APP_TOOL_DESCRIPTION_CHARS: usize = 1200;
+/// Cap on an app-authored tool result, in chars: it goes straight into the
+/// model's context, so it is bounded like the description.
+pub const MAX_APP_TOOL_RESULT_CHARS: usize = 32_000;
 /// Cap on the app-authored tool name, in chars.
 pub const MAX_APP_TOOL_NAME_CHARS: usize = 48;
 /// Cap on the number of arguments a tool may declare.
@@ -182,14 +185,39 @@ fn app_tool_content_hash(description: &str, args: &[(String, String, String)]) -
     format!("{:016x}", hasher.finish())
 }
 
+/// The text an `mcp.tools.result` hands the model, clamped to
+/// [`MAX_APP_TOOL_RESULT_CHARS`] with a marker so the model knows it was cut.
+fn app_tool_result_text(result: &serde_json::Value) -> String {
+    let mut text = match result {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    };
+    if text.chars().count() > MAX_APP_TOOL_RESULT_CHARS {
+        text = text.chars().take(MAX_APP_TOOL_RESULT_CHARS).collect();
+        text.push_str("… [truncated]");
+    }
+    text
+}
+
 /// Validates and normalizes a `mcp.tools.register` request into an
 /// [`AppToolRequest`]. Every bound here is a bound on text that can reach the
-/// model, so refusals are explicit and early.
+/// model, so refusals are explicit and early. `mcp.tools.*` bypass the
+/// generic group gate, so the declaration check lives here instead.
 pub fn parse_app_tool_request(
     manifest: &crate::manifest::MiniAppManifest,
     req: &SplashHostRequest,
     args: &serde_json::Value,
 ) -> Result<AppToolRequest, String> {
+    if !manifest.declares(Permission::McpTools) {
+        return Err(format!("permission not declared: {}", Permission::McpTools.as_str()));
+    }
+    // A tool lands on the attached room's AI session; with no room there is
+    // nothing to register it on, so don't prompt for a grant that can't work.
+    let (_, room) = crate::manifest::split_instance_tag(&req.app_tag);
+    if room.is_none() {
+        return Err(String::from("this mini-app is not attached to a room"));
+    }
     let name = args["name"]
         .as_str()
         .map(str::trim)
@@ -237,6 +265,9 @@ pub fn parse_app_tool_request(
                 return Err(format!("argument `{arg_name}` has unknown type `{ty}`"));
             }
             let desc = item["description"].as_str().unwrap_or("");
+            if properties.contains_key(arg_name) {
+                return Err(format!("argument `{arg_name}` is declared twice"));
+            }
             properties.insert(
                 arg_name.to_string(),
                 serde_json::json!({ "type": ty, "description": desc }),
@@ -253,7 +284,6 @@ pub fn parse_app_tool_request(
     });
     let full_name = app_tool_full_name(&manifest.id, name);
     let content_hash = app_tool_content_hash(description, &parsed_args);
-    let (_, room) = crate::manifest::split_instance_tag(&req.app_tag);
     Ok(AppToolRequest {
         app_id: manifest.id.clone(),
         instance_tag: req.app_tag.clone(),
@@ -991,16 +1021,19 @@ impl Broker {
             "mcp.tools.register" => match parse_app_tool_request(&manifest, &req, &args) {
                 Err(e) => respond(cx, reply, Err(&e)),
                 Ok(tool) => {
-                    // The group is a kill switch: a durable Deny in App Info
-                    // blocks every tool this app might offer, however it
-                    // words the description.
-                    if ctx.permissions.state(&manifest.id, Permission::McpTools)
-                        == GrantState::Denied
-                    {
-                        return respond(cx, reply, Err(&format!(
-                            "\"{}\" is denied for this app. Allow it in App Info",
-                            Permission::McpTools.title()
-                        )));
+                    // The group is a kill switch (a durable Deny in App Info
+                    // blocks every tool this app might offer), and its
+                    // per-capability row can block registration underneath
+                    // it: the same gate every other service gets, minus the
+                    // prompt, which is per tool below.
+                    match ctx.permissions.effective_capability(&manifest, capability) {
+                        Effective::Undeclared => {
+                            return respond(cx, reply, Err(&format!(
+                                "permission not declared: {}", Permission::McpTools.as_str()
+                            )));
+                        }
+                        Effective::Denied => return Self::respond_denied(cx, &req),
+                        Effective::Granted | Effective::NeedsPrompt => {}
                     }
                     match ctx.permissions.tool_effective(
                         &manifest.id,
@@ -1031,6 +1064,11 @@ impl Broker {
                 }
             },
             "mcp.tools.unregister" => {
+                if !manifest.declares(Permission::McpTools) {
+                    return respond(cx, reply, Err(&format!(
+                        "permission not declared: {}", Permission::McpTools.as_str()
+                    )));
+                }
                 let Some(name) = args["name"].as_str().map(str::trim).filter(|n| !n.is_empty())
                 else {
                     return respond(cx, reply, Err("mcp.tools.unregister needs a {name}"));
@@ -1048,11 +1086,7 @@ impl Broker {
                     return respond(cx, reply, Err("mcp.tools.result needs a numeric {call_id}"));
                 };
                 let ok = args["ok"].as_bool().unwrap_or(false);
-                let text = match &args["result"] {
-                    serde_json::Value::String(s) => s.clone(),
-                    serde_json::Value::Null => String::new(),
-                    other => other.to_string(),
-                };
+                let text = app_tool_result_text(&args["result"]);
                 asks.push(BrokerAsk::McpToolResult {
                     reply,
                     app_id: manifest.id.clone(),
@@ -1467,10 +1501,57 @@ mod app_tool_tests {
         assert_ne!(parsed.content_hash, parsed2.content_hash);
     }
 
+    /// `mcp.tools.*` skip the generic group gate, so the manifest declaration
+    /// is checked here: an app that never asked for `mcp-tools` gets the same
+    /// refusal the gate would give, before any prompt.
+    #[test]
+    fn undeclared_mcp_tools_is_refused_before_any_prompt() {
+        let mut m = manifest("board");
+        m.permissions.clear();
+        let args = serde_json::json!({ "name": "play", "description": "Place a mark." });
+        let err = parse_app_tool_request(&m, &request("board@!room:server", 1), &args).unwrap_err();
+        assert_eq!(err, "permission not declared: mcp-tools");
+    }
+
+    /// A roomless instance has no AI session to land a tool on, so it is
+    /// told so instead of being prompted for a grant that can never work.
+    #[test]
+    fn roomless_registrations_are_refused() {
+        let m = manifest("board");
+        let args = serde_json::json!({ "name": "play", "description": "Place a mark." });
+        let err = parse_app_tool_request(&m, &request("board", 1), &args).unwrap_err();
+        assert_eq!(err, "this mini-app is not attached to a room");
+        assert!(parse_app_tool_request(&m, &request("board@!room:server", 1), &args).is_ok());
+    }
+
+    #[test]
+    fn duplicate_argument_names_are_refused() {
+        let m = manifest("board");
+        let args = serde_json::json!({
+            "name": "play",
+            "description": "Place a mark.",
+            "args": [{"name": "cell", "type": "integer"}, {"name": "cell", "type": "string"}],
+        });
+        let err = parse_app_tool_request(&m, &request("board@!room:server", 1), &args).unwrap_err();
+        assert_eq!(err, "argument `cell` is declared twice");
+    }
+
+    #[test]
+    fn tool_results_are_clamped_before_reaching_the_model() {
+        let short = serde_json::json!("fine");
+        assert_eq!(app_tool_result_text(&short), "fine");
+        assert_eq!(app_tool_result_text(&serde_json::Value::Null), "");
+        assert_eq!(app_tool_result_text(&serde_json::json!({"a": 1})), "{\"a\":1}");
+        let long = "é".repeat(MAX_APP_TOOL_RESULT_CHARS + 5);
+        let out = app_tool_result_text(&serde_json::json!(long));
+        assert!(out.ends_with("… [truncated]"));
+        assert_eq!(out.chars().count(), MAX_APP_TOOL_RESULT_CHARS + "… [truncated]".chars().count());
+    }
+
     #[test]
     fn bad_registrations_are_refused() {
         let m = manifest("board");
-        let req = request("board", 1);
+        let req = request("board@!room:server", 1);
         assert!(parse_app_tool_request(&m, &req, &serde_json::json!({"description": "x"})).is_err());
         assert!(parse_app_tool_request(&m, &req, &serde_json::json!({"name": "x"})).is_err());
         assert!(

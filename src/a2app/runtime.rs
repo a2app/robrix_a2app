@@ -19,13 +19,16 @@ use a2app_core::builtin;
 use a2app_core::bundle;
 use a2app_core::manifest::{A2AppScope, AppRegistry, MiniAppId, MiniAppManifest};
 use a2app_core::permissions::{
-    Effective, GrantState, Permission, PermissionStore, agent_room_of, agent_subject, is_agent_subject,
+    Effective, GrantState, Permission, PermissionStore, agent_subject, is_agent_subject,
 };
+#[cfg(unix)]
+use a2app_core::permissions::agent_room_of;
 use a2app_core::persistence::{self, A2AppPersistedState};
 use a2app_core::services::{
-    self, AppToolRequest, Broker, BrokerAsk, BrokerCtx, HostAction, HostQuery, Reply,
-    MATRIX_WRITE_OFF_MSG,
+    self, Broker, BrokerAsk, BrokerCtx, HostAction, HostQuery, Reply, MATRIX_WRITE_OFF_MSG,
 };
+#[cfg(unix)]
+use a2app_core::services::AppToolRequest;
 use a2app_core::versions::{self, VersionOrigin};
 use a2app_agent::intent::Intent;
 use a2app_agent::pipeline::{GenOutcome, Generation};
@@ -87,8 +90,14 @@ const ROOM_ACTION_TTL: Duration = Duration::from_secs(10);
 /// until the window rolls: an agent legitimately batches a few reads a turn;
 /// far more than that is a loop, and each refused call also tells the model to
 /// stop.
+#[cfg(unix)]
 const AI_READ_BUDGET: u32 = 24;
+#[cfg(unix)]
 const AI_READ_WINDOW: Duration = Duration::from_secs(10);
+/// How long a failed agent start is left alone before a new member message
+/// tries again.
+#[cfg(unix)]
+const AI_START_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 /// The next id for a granted AI-room read request, so the async worker's
 /// result can find the exact tool call it answers.
 #[cfg(unix)]
@@ -102,6 +111,7 @@ type AiReadPending = (OwnedRoomId, ReadToolKind, Sender<Result<String, String>>)
 /// sibling `ai_posts` map): the session room (for the receipt) and the
 /// channel that must answer the parked tool call when the async worker's
 /// [`AiRoomAction::PostToRoomResult`] lands.
+#[cfg(unix)]
 type AiPostPending = (OwnedRoomId, Sender<Result<String, String>>);
 
 /// Next id for an app-tool invocation: the runtime-generated `call_id` handed
@@ -294,13 +304,14 @@ pub struct AiRoomInfo {
     /// working and closed when its reply (or error) lands. `None` before the
     /// turn's first tool call and between turns.
     active_turn: Option<ActiveTurn>,
-    /// The newest `ai_turn` snapshot waiting to be written, coalesced: a burst
+    /// `ai_turn` snapshots waiting to be written, coalesced per turn: a burst
     /// of turn activity (thinking, each tool start/detail/finish) keeps only
-    /// the latest snapshot here until the previous write completes and the
-    /// rate-limit cooldown passes. A single state-event write is then sent,
-    /// instead of one per update — matrix.org rate-limits state events hard
-    /// (429 M_LIMIT_EXCEEDED), and a turn can otherwise produce dozens.
-    pending_ai_turn: Option<(String, AiTurnContent)>,
+    /// the turn's latest snapshot here until the previous write completes and
+    /// the rate-limit cooldown passes, while a previous turn's final snapshot
+    /// stays queued ahead of it. One state-event write per snapshot is then
+    /// sent, instead of one per update — matrix.org rate-limits state events
+    /// hard (429 M_LIMIT_EXCEEDED), and a turn can otherwise produce dozens.
+    pending_ai_turns: VecDeque<(String, AiTurnContent)>,
     /// Whether an `ai_turn` write for this room is in flight. Cleared by
     /// [`AiRoomAction::StateEventPosted`]; no further `ai_turn` write is sent
     /// while it is set, so the SDK's own 429 retries are not compounded.
@@ -320,6 +331,39 @@ pub struct AiRoomInfo {
     /// state actually changes (and hides once the agent goes idle).
     status_busy: bool,
     status_queued: usize,
+    /// The turn whose first `ai_turn` snapshot has been written: the card's
+    /// anchor row, decided at flush time (see `flush_pending_ai_turns`).
+    first_posted_turn: Option<String>,
+    /// The turn whose anchor write is in flight, so a failed write can give
+    /// the anchor back to the turn's next snapshot.
+    anchor_in_flight: Option<String>,
+    /// When starting this room's agent last failed, so a failure is retried
+    /// after a cooldown instead of on every timeline update.
+    start_failed_at: Option<Instant>,
+}
+
+#[cfg(unix)]
+impl AiRoomInfo {
+    fn new(cursor: Option<OwnedEventId>) -> Self {
+        Self {
+            cursor,
+            posted_by_tool_this_turn: false,
+            read_burst: 0,
+            read_window_started: None,
+            session_on: true,
+            pending_tool_calls: Vec::new(),
+            active_turn: None,
+            pending_ai_turns: VecDeque::new(),
+            ai_turn_in_flight: false,
+            last_ai_turn_post: None,
+            ai_turn_backoff: AI_TURN_POST_MIN_INTERVAL,
+            status_busy: false,
+            status_queued: 0,
+            first_posted_turn: None,
+            anchor_in_flight: None,
+            start_failed_at: None,
+        }
+    }
 }
 
 /// All a2app state, owned by the UI thread.
@@ -389,6 +433,10 @@ pub struct A2AppState {
     /// [`AiRoomAction::PostToRoomResult`] lands.
     #[cfg(unix)]
     pub ai_posts: HashMap<u64, AiPostPending>,
+    /// "Allow Once" answers for cross-room posts/reads: (agent subject,
+    /// group, room id). Session-only; dropped with the room's session.
+    #[cfg(unix)]
+    once_rooms: HashSet<(String, Permission, String)>,
     /// Live mini-app tools on each room's agent session, by the namespaced
     /// name the model sees. What routes an incoming `tools/call` back to the
     /// owning isolate, and what teardown prunes.
@@ -483,6 +531,8 @@ pub fn init() {
             ai_reads: HashMap::new(),
             #[cfg(unix)]
             ai_posts: HashMap::new(),
+            #[cfg(unix)]
+            once_rooms: HashSet::new(),
             #[cfg(unix)]
             app_tools: HashMap::new(),
             #[cfg(unix)]
@@ -2157,14 +2207,17 @@ fn queue_permission_prompt(
     parked: ParkedRequest,
     tool: Option<PromptToolGrant>,
 ) {
+    // "Not Now" this session: refuse without re-asking, so a looping caller
+    // (a script, or an agent that keeps trying the same tool) can't nag its
+    // way to an accidental Allow. Refusing re-enters the state, so it runs
+    // outside the borrow below.
+    let dismissed = with_a2app(|state| state.dismissed_prompts.contains(&(subject.clone(), perm)))
+        .unwrap_or(false);
+    if dismissed {
+        refuse_parked_request(cx, perm, parked);
+        return;
+    }
     with_a2app(|state| {
-        // "Not Now" this session: refuse without re-asking, so a looping
-        // caller (a script, or an agent that keeps trying the same tool)
-        // can't nag its way to an accidental Allow.
-        if state.dismissed_prompts.contains(&(subject.clone(), perm)) {
-            refuse_parked_request(cx, perm, parked);
-            return;
-        }
         // Merge into an already-active or queued prompt for the same pair.
         // Network prompts are per HOST and tool prompts per TOOL: two
         // different hosts/tools must never share a prompt, or one answer
@@ -2355,6 +2408,40 @@ fn refuse_parked_request(cx: &mut Cx, perm: Permission, parked: ParkedRequest) {
     }
 }
 
+/// Withdraws every prompt parked for a room's agent (its turn is over or its
+/// session gone): the parked calls are refused and the modal moves on.
+#[cfg(unix)]
+fn refuse_room_prompts(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
+    let subject = agent_subject(room_id.as_str());
+    let (parked, was_active) = with_a2app(|state| {
+        let mut parked: Vec<(Permission, ParkedRequest)> = Vec::new();
+        let mut was_active = false;
+        if state.active_prompt.as_ref().is_some_and(|p| p.subject == subject) {
+            if let Some(p) = state.active_prompt.take() {
+                let perm = p.perm;
+                parked.extend(p.parked.into_iter().map(|q| (perm, q)));
+                was_active = true;
+            }
+        }
+        let (mine, rest): (Vec<_>, Vec<_>) =
+            state.prompts.drain(..).partition(|p| p.subject == subject);
+        state.prompts = rest.into_iter().collect();
+        for p in mine {
+            let perm = p.perm;
+            parked.extend(p.parked.into_iter().map(|q| (perm, q)));
+        }
+        (parked, was_active)
+    })
+    .unwrap_or_default();
+    for (perm, request) in parked {
+        refuse_parked_request(cx, perm, request);
+    }
+    if was_active {
+        ui.modal(cx, ids!(a2app_permission_modal)).close(cx);
+        show_next_permission_prompt(cx, ui);
+    }
+}
+
 fn show_next_permission_prompt(cx: &mut Cx, ui: &WidgetRef) {
     let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
     let info = with_a2app(|state| {
@@ -2532,6 +2619,7 @@ fn ai_prompt_reason(
 /// An AI room's agent subject is presented as the room's AI with the concrete
 /// read it asked for; a mini-app keeps its registry identity and the app's own
 /// declared reason.
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn prompt_info_for(
     state: &A2AppState,
     rooms: Option<&RoomsListRef>,
@@ -2545,6 +2633,7 @@ fn prompt_info_for(
         description: t.description.clone(),
         args: t.args.clone(),
     });
+    #[cfg(unix)]
     if let Some(room) = agent_room_of(subject) {
         let room_name = rooms
             .and_then(|r| room_display_name(r, room))
@@ -2644,6 +2733,19 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
         })
         .collect();
 
+    // A prompt for a cross-room post/read decides ONE room: its answer must
+    // not write the group grant, or one Allow would unlock every room (the
+    // group `Granted` is the panel's explicit "all rooms").
+    #[cfg(unix)]
+    let per_room = !prompt.parked.is_empty()
+        && prompt.parked.iter().all(|p| matches!(p,
+            ParkedRequest::AiTool {
+                job: SessionJob::PostRoomMessage { .. }
+                    | SessionJob::ReadTool { kind: ReadToolKind::OtherRoom { .. }, .. },
+                ..
+            }));
+    #[cfg(not(unix))]
+    let per_room = false;
     let granted = if !network_hosts.is_empty() {
         match answer {
             PermissionPromptAction::Allow => {
@@ -2712,7 +2814,11 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
             }
             (PermissionPromptAction::AllowOnce, Some(tool)) => {
                 with_a2app(|state| {
-                    state.permissions.allow_tool_once(&prompt.subject, &tool.full_name)
+                    state.permissions.allow_tool_once(
+                        &prompt.subject,
+                        &tool.full_name,
+                        &tool.content_hash,
+                    )
                 });
                 true
             }
@@ -2731,16 +2837,20 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
     } else {
         match answer {
             PermissionPromptAction::Allow => {
-                with_a2app(|state| {
-                    state.permissions.set(&prompt.subject, prompt.perm, GrantState::Granted);
-                    state.perms_dirty = true;
-                });
+                if !per_room {
+                    with_a2app(|state| {
+                        state.permissions.set(&prompt.subject, prompt.perm, GrantState::Granted);
+                        state.perms_dirty = true;
+                    });
+                }
                 true
             }
             PermissionPromptAction::AllowOnce => {
                 // Session-only: never touches disk, dropped on isolate/session
                 // teardown.
-                with_a2app(|state| state.permissions.grant_once(&prompt.subject, prompt.perm));
+                if !per_room {
+                    with_a2app(|state| state.permissions.grant_once(&prompt.subject, prompt.perm));
+                }
                 true
             }
             PermissionPromptAction::Deny => {
@@ -2803,22 +2913,27 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
             ParkedRequest::AiTool { room_id, job } => {
                 if granted {
                     // Per-room grants for cross-room posts and reads: an Allow
-                    // unlocks exactly the target room, so record it before
-                    // re-running the job (its gate now lets it through).
-                    match &job {
-                        SessionJob::PostRoomMessage { room_id: target, .. } => {
-                            with_a2app(|state| {
-                                state.permissions.allow_room_send(&subject, target);
+                    // unlocks exactly the target room (durably; an Allow Once
+                    // for this session only), recorded before re-running the
+                    // job so its gate now lets it through.
+                    let durable = matches!(answer, PermissionPromptAction::Allow);
+                    let target = match &job {
+                        SessionJob::PostRoomMessage { room_id: target, .. } => Some((target.clone(), true)),
+                        SessionJob::ReadTool { kind: ReadToolKind::OtherRoom { room, .. }, .. } => Some((room.clone(), false)),
+                        _ => None,
+                    };
+                    if let Some((target, is_post)) = target {
+                        with_a2app(|state| {
+                            if durable && is_post {
+                                state.permissions.allow_room_send(&subject, &target);
                                 state.perms_dirty = true;
-                            });
-                        }
-                        SessionJob::ReadTool { kind: ReadToolKind::OtherRoom { room, .. }, .. } => {
-                            with_a2app(|state| {
-                                state.permissions.allow_room_read(&subject, room);
+                            } else if durable {
+                                state.permissions.allow_room_read(&subject, &target);
                                 state.perms_dirty = true;
-                            });
-                        }
-                        _ => {}
+                            } else {
+                                state.once_rooms.insert((subject.clone(), perm, target));
+                            }
+                        });
                     }
                     // The grant is stored above; re-run the session job so its
                     // own gate now lets it through to the real work.
@@ -3127,10 +3242,7 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
             let room_id = room_name_id.room_id().clone();
             log!("AI Rooms: recording newly-created AI room {room_id} ({}); no marker check needed.", room_name_id.display());
             with_a2app(|state| {
-                state
-                    .ai_rooms
-                    .entry(room_id)
-                    .or_insert(AiRoomInfo { cursor: None, posted_by_tool_this_turn: false, read_burst: 0, read_window_started: None, session_on: true, pending_tool_calls: Vec::new(), active_turn: None, pending_ai_turn: None, ai_turn_in_flight: false, last_ai_turn_post: None, ai_turn_backoff: AI_TURN_POST_MIN_INTERVAL, status_busy: false, status_queued: 0 });
+                state.ai_rooms.entry(room_id).or_insert_with(|| AiRoomInfo::new(None));
             });
         }
         AiRoomAction::CreateFailed { error } => {
@@ -3150,10 +3262,22 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
         }
         AiRoomAction::Attached { room_id, name, cursor } => {
             log!("AI Rooms: room {room_id} is an AI room (name: {name:?}, saved forwarding cursor: {cursor:?}); attaching session.");
-            with_a2app(|state| {
-                state.ai_rooms.insert(room_id.clone(), AiRoomInfo { cursor, posted_by_tool_this_turn: false, read_burst: 0, read_window_started: None, session_on: true, pending_tool_calls: Vec::new(), active_turn: None, pending_ai_turn: None, ai_turn_in_flight: false, last_ai_turn_post: None, ai_turn_backoff: AI_TURN_POST_MIN_INTERVAL, status_busy: false, status_queued: 0 });
-            });
-            attach_ai_session(cx, ui, &room_id, name);
+            // A second marker check for a room already attached (the room
+            // was shown twice before the first answer landed) must not reset
+            // its live cursor and turn state.
+            let already_known = with_a2app(|state| {
+                if state.ai_rooms.contains_key(&room_id) {
+                    return true;
+                }
+                state.ai_rooms.insert(room_id.clone(), AiRoomInfo::new(cursor));
+                false
+            })
+            .unwrap_or(true);
+            if already_known {
+                log!("AI Rooms: room {room_id} is already attached; ignoring the duplicate.");
+            } else {
+                attach_ai_session(cx, ui, &room_id, name);
+            }
         }
         AiRoomAction::PostReplyFailed { error } => {
             log!("AI Rooms: FAILED to post an ai_reply state event: {error}");
@@ -3229,6 +3353,12 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
                 with_a2app(|state| {
                     if let Some(info) = state.ai_rooms.get_mut(&room_id) {
                         info.ai_turn_in_flight = false;
+                        if let Some(key) = info.anchor_in_flight.take()
+                            && !success
+                            && info.first_posted_turn.as_deref() == Some(key.as_str())
+                        {
+                            info.first_posted_turn = None;
+                        }
                         if success {
                             info.ai_turn_backoff =
                                 (info.ai_turn_backoff / 2).max(AI_TURN_POST_MIN_INTERVAL);
@@ -3269,8 +3399,16 @@ fn stop_ai_session(room_id: &OwnedRoomId) {
         }
         let subject = agent_subject(room_id.as_str());
         state.permissions.clear_once_for(&subject);
+        state.once_rooms.retain(|(s, _, _)| s != &subject);
         state.perms_dirty = true;
+        // The turn died with the session: nothing of it may leak into the
+        // next session's first reply.
+        if let Some(info) = state.ai_rooms.get_mut(room_id) {
+            info.posted_by_tool_this_turn = false;
+            info.pending_tool_calls.clear();
+        }
     });
+    close_active_turn(room_id);
 }
 
 /// The panel's power switch: on (re)attaches the agent, off stops it and the
@@ -3287,6 +3425,7 @@ fn set_ai_room_power(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, on: boo
         attach_ai_session(cx, ui, room_id, None);
     } else {
         log!("AI Rooms: powering off room {room_id}'s AI.");
+        abort_ai_room_work(cx, ui, room_id);
         stop_ai_session(room_id);
     }
     ui.redraw(cx);
@@ -3514,9 +3653,13 @@ fn attach_ai_session(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, _name: 
     let prefs = with_a2app(|state| state.agent_prefs.clone())
         .unwrap_or_else(a2app_agent::prefs::load_agent_prefs);
     let started = with_a2app(|state| {
-        AiSession::start(room_id.clone(), prefs).map(|session| {
+        let started = AiSession::start(room_id.clone(), prefs).map(|session| {
             state.ai_sessions.insert(room_id.clone(), session);
-        })
+        });
+        if let Some(info) = state.ai_rooms.get_mut(room_id) {
+            info.start_failed_at = started.is_err().then(Instant::now);
+        }
+        started
     });
     if let Some(Err(e)) = started {
         log!("AI Rooms: FAILED to start the agent session for AI room {room_id}: {e}");
@@ -3616,6 +3759,12 @@ pub fn ai_room_active_turn(room_id: &OwnedRoomId) -> Option<String> {
     .flatten()
 }
 
+/// No AI sessions off unix, so no turn is ever active.
+#[cfg(not(unix))]
+pub fn ai_room_active_turn(_room_id: &OwnedRoomId) -> Option<String> {
+    None
+}
+
 /// Aborts what an AI room's agent is currently doing, in the order that lets
 /// every piece settle: the app build its `launch_splash_app` tool call is
 /// waiting on is cancelled first (dropping the [`Generation`] kills its agent
@@ -3653,6 +3802,9 @@ fn abort_ai_room_work(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
             session.abort();
         }
     });
+    // A prompt parked by the cancelled turn would run its tool call (post,
+    // build, launch) whenever it was answered; withdraw it.
+    refuse_room_prompts(cx, ui, room_id);
     // Settle the turn card immediately: a cancelled turn emits no `Reply`, and
     // if the turn is blocked on a tool/permission it may take a moment to end,
     // so the room's card would otherwise sit "running" after the user aborts.
@@ -3679,14 +3831,32 @@ pub fn forward_ai_room_texts(
     for (event_id, text) in &new_texts {
         log!("AI Rooms:   -> forwarding {event_id}: {}", text.chars().take(120).collect::<String>());
     }
+    // A start that just failed is not retried (with its popup) on every
+    // timeline update; the messages stay unforwarded until the cooldown ends.
+    let cooling = with_a2app(|state| {
+        !state.ai_sessions.contains_key(room_id)
+            && state
+                .ai_rooms
+                .get(room_id)
+                .and_then(|info| info.start_failed_at)
+                .is_some_and(|at| at.elapsed() < AI_START_RETRY_COOLDOWN)
+    })
+    .unwrap_or(false);
+    if cooling {
+        log!("AI Rooms: room {room_id}'s agent failed to start recently; not retrying yet.");
+        return;
+    }
     let prefs = with_a2app(|state| state.agent_prefs.clone())
         .unwrap_or_else(a2app_agent::prefs::load_agent_prefs);
     let mut last_cursor = None;
     for (event_id, text) in new_texts {
         let outcome: Result<PromptOutcome, String> = with_a2app(|state| {
             if !state.ai_sessions.contains_key(room_id) {
-                AiSession::start(room_id.clone(), prefs.clone())
-                    .map(|session| { state.ai_sessions.insert(room_id.clone(), session); })?;
+                let started = AiSession::start(room_id.clone(), prefs.clone());
+                if let Some(info) = state.ai_rooms.get_mut(room_id) {
+                    info.start_failed_at = started.is_err().then(Instant::now);
+                }
+                state.ai_sessions.insert(room_id.clone(), started?);
             }
             let outcome = state.ai_sessions.get_mut(room_id)
                 .map(|session| session.prompt(text.clone()))
@@ -3702,7 +3872,7 @@ pub fn forward_ai_room_texts(
             Ok(PromptOutcome::Dead) => {
                 log!("AI Rooms: room {room_id}'s agent session is dead; NOT forwarding {event_id}.");
                 enqueue_popup_notification(
-                    "This AI room's agent has stopped; reopen the room to restart it.",
+                    "This AI room's agent has stopped; it restarts on your next message.",
                     PopupKind::Warning, Some(6.0),
                 );
                 return;
@@ -3910,7 +4080,15 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
                             state
                                 .ai_rooms
                                 .get_mut(&room_id)
-                                .map(|info| std::mem::take(&mut info.posted_by_tool_this_turn))
+                                .map(|info| {
+                                    let posted = std::mem::take(&mut info.posted_by_tool_this_turn);
+                                    if posted {
+                                        // Receipts recorded after the tool's
+                                        // post would ride the NEXT turn's card.
+                                        info.pending_tool_calls.clear();
+                                    }
+                                    posted
+                                })
                                 .unwrap_or(false)
                         }).unwrap_or(false);
                         if posted_by_tool {
@@ -3977,20 +4155,19 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
             format!("The AI agent in this room stopped: {msg}"),
             PopupKind::Warning, Some(8.0),
         );
+        // A session that never finished its handshake is a failed start:
+        // give it the start cooldown, or every message would respawn one.
         with_a2app(|state| {
-            state.ai_sessions.remove(&room_id);
-            // A dead session is a (re)start boundary for "Allow Once": drop
-            // its one-time grants so the next agent asks again, exactly as an
-            // app's isolate teardown ends its one-time grants. In-flight
-            // granted reads and cross-room posts are orphaned too — their
-            // tool calls died with the serve threads, so any late result has
-            // nothing to answer.
-            state.ai_reads.retain(|_, (r, _, _)| r != &room_id);
-            state.ai_posts.retain(|_, (r, _)| r != &room_id);
-            let subject = agent_subject(room_id.as_str());
-            state.permissions.clear_once_for(&subject);
-            state.perms_dirty = true;
+            let never_ready = state.ai_sessions.get(&room_id).is_some_and(|s| !s.is_ready());
+            if never_ready && let Some(info) = state.ai_rooms.get_mut(&room_id) {
+                info.start_failed_at = Some(Instant::now());
+            }
         });
+        // A dead session is a (re)start boundary: its one-time grants,
+        // in-flight reads/posts, parked prompts and turn state all go, exactly
+        // as the panel's power-off does it.
+        refuse_room_prompts(cx, ui, &room_id);
+        stop_ai_session(&room_id);
         ui.redraw(cx);
     }
 
@@ -4028,6 +4205,7 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
 /// declared capability implies its group). The profile itself is
 /// [`AI_ROOM_SESSION_CAP_IDS`] in `ai::tools`, the single source for both the
 /// tool list and this gate.
+#[cfg(unix)]
 fn ai_room_declares_perm(perm: Permission) -> bool {
     AI_ROOM_SESSION_CAP_IDS.iter().any(|id| {
         a2app_core::capabilities::by_id(id)
@@ -4037,6 +4215,7 @@ fn ai_room_declares_perm(perm: Permission) -> bool {
 }
 
 /// Whether an AI room's profile declares one capability.
+#[cfg(unix)]
 fn ai_room_declares_cap(cap: &a2app_core::capabilities::Capability) -> bool {
     AI_ROOM_SESSION_CAP_IDS.contains(&cap.id)
 }
@@ -4159,12 +4338,15 @@ fn run_ai_read_tool(
         Some(target) => with_a2app(|state| {
             let store = &state.permissions;
             let group_state = cap.group.map(|g| store.state(&subject, g));
+            let once = cap
+                .group
+                .is_some_and(|g| state.once_rooms.contains(&(subject.clone(), g, target.to_string())));
             if group_state == Some(GrantState::Denied) {
                 Effective::Denied
             } else if group_state == Some(GrantState::Granted) {
                 // The AI panel's explicit "allow all rooms" grant.
                 Effective::Granted
-            } else if store.is_room_read_allowed(&subject, target.as_str()) {
+            } else if once || store.is_room_read_allowed(&subject, target.as_str()) {
                 Effective::Granted
             } else {
                 Effective::NeedsPrompt
@@ -4267,22 +4449,33 @@ fn run_ai_room_post(
     let subject = agent_subject(session_room.as_str());
     // The per-room decision lives in the store: a durable group Denied is the
     // kill switch; otherwise the allowlist decides room by room.
-    let verdict = with_a2app(|state| {
+    let (verdict, write_off) = with_a2app(|state| {
         let store = &state.permissions;
-        if store.state(&subject, group) == GrantState::Denied {
+        let verdict = if store.state(&subject, group) == GrantState::Denied {
             Some(false)
-        } else if store.is_room_send_allowed(&subject, &target) {
+        } else if store.is_room_send_allowed(&subject, &target)
+            || state.once_rooms.contains(&(subject.clone(), group, target.to_string()))
+        {
             Some(true)
         } else {
             None
-        }
+        };
+        (verdict, !store.matrix_write())
     })
-    .flatten();
+    .unwrap_or((Some(false), false));
     let job = SessionJob::PostRoomMessage {
         room_id: target,
         text,
         answer,
     };
+    // The global write switch covers the agent's cross-room posts like any
+    // other switch-gated write.
+    if write_off {
+        let text = format!("The AI can't post: {MATRIX_WRITE_OFF_MSG}.");
+        note_ai_tool_call(session_room, "post_room_message", false, &text);
+        answer_session_job(job, Err(text));
+        return;
+    }
     match verdict {
         Some(true) => {
             // Allowed for this room: record the group use and post on the
@@ -5340,16 +5533,20 @@ const AI_TURN_POST_MIN_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const AI_TURN_POST_MAX_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Queues one `ai_turn` snapshot for this room, replacing any earlier pending
-/// one: only the newest snapshot matters, so coalescing a burst of turn
-/// updates into a single write is what keeps Robrix under the homeserver's
-/// state-event rate limit. The actual write happens in
-/// [`flush_pending_ai_turns`].
+/// Queues one `ai_turn` snapshot for this room, replacing an earlier pending
+/// one of the SAME turn: only a turn's newest snapshot matters, so coalescing
+/// a burst of updates into a single write is what keeps Robrix under the
+/// homeserver's state-event rate limit. Another turn's pending snapshot (the
+/// previous turn's final `Done`) stays queued ahead of it. The actual write
+/// happens in [`flush_pending_ai_turns`].
 #[cfg(unix)]
 fn post_ai_turn(room_id: &OwnedRoomId, key: &str, content: &AiTurnContent) {
     with_a2app(|state| {
-        if let Some(info) = state.ai_rooms.get_mut(room_id) {
-            info.pending_ai_turn = Some((key.to_string(), content.clone()));
+        let Some(info) = state.ai_rooms.get_mut(room_id) else { return };
+        if let Some(slot) = info.pending_ai_turns.iter_mut().find(|(k, _)| k == key) {
+            slot.1 = content.clone();
+        } else {
+            info.pending_ai_turns.push_back((key.to_string(), content.clone()));
         }
     });
 }
@@ -5372,7 +5569,7 @@ fn flush_pending_ai_turns(cx: &mut Cx) {
                 needs_timer = true;
                 continue;
             }
-            if info.pending_ai_turn.is_none() {
+            if info.pending_ai_turns.is_empty() {
                 continue;
             }
             let cooled_down = info
@@ -5382,7 +5579,16 @@ fn flush_pending_ai_turns(cx: &mut Cx) {
                 needs_timer = true;
                 continue;
             }
-            if let Some((key, content)) = info.pending_ai_turn.take() {
+            if let Some((key, mut content)) = info.pending_ai_turns.pop_front() {
+                // The first snapshot of a turn to be WRITTEN is the card's
+                // anchor row, whatever the snapshot said when it was queued
+                // (a coalesced burst may have replaced the minting one).
+                let first = info.first_posted_turn.as_deref() != Some(key.as_str());
+                content.first = Some(first);
+                if first {
+                    info.first_posted_turn = Some(key.clone());
+                    info.anchor_in_flight = Some(key.clone());
+                }
                 info.ai_turn_in_flight = true;
                 info.last_ai_turn_post = Some(now);
                 to_post.push((room_id.clone(), key, content));

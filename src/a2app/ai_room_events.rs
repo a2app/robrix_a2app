@@ -724,6 +724,8 @@ impl AiTurnTimelineCardRef {
     /// every draw, since timeline items get recycled.
     pub fn populate(&self, cx: &mut Cx, content: Option<&AiTurnContent>) {
         let Some(content) = content else {
+            // A hidden view still gets NextFrame; stop the loop with it.
+            self.widget(cx, ids!(turn_spinner)).as_ai_turn_spinner().set_spinning(cx, false);
             if let Some(mut inner) = self.borrow_mut() {
                 inner.last_visible = false;
                 inner.view.set_visible(cx, false);
@@ -963,8 +965,11 @@ impl AiEventTimelineCardRef {
     }
 
     fn populate_text(&self, cx: &mut Cx, text: &str) {
-        let Some(inner) = self.borrow_mut() else { return };
-        let view = &inner.view;
+        let Some(mut inner) = self.borrow_mut() else { return };
+        let view = &mut inner.view;
+        // Nothing to show hides the whole card, not just its label (the
+        // bordered pill would otherwise render empty).
+        view.set_visible(cx, !text.is_empty());
         let label = view.label(cx, ids!(event_label));
         label.set_visible(cx, !text.is_empty());
         label.set_text(cx, text);

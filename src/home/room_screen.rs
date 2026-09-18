@@ -6449,6 +6449,7 @@ fn ai_turn_is_latest(items: &Vector<Arc<TimelineItem>>, idx: usize, turn: &str) 
 /// timeline card, its live `ai_activity` markers ("thinking…" / errors /
 /// stopped) and `ai_tool_call` rows get the small live-activity card, and
 /// everything else stays a small state event.
+#[cfg_attr(not(feature = "a2app"), allow(unused_variables))]
 fn populate_other_state_event(
     cx: &mut Cx,
     list: &mut PortalList,

@@ -15,8 +15,8 @@ use makepad_widgets::*;
 use matrix_sdk::Room;
 use matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState;
 use matrix_sdk::ruma::{
-    OwnedEventId, OwnedRoomId,
-    api::client::{room::create_room, state::get_state_event_for_key},
+    OwnedEventId, OwnedRoomId, UserId,
+    api::client::{room::create_room, state::{get_state_event_for_key, get_state_events}},
     assign,
     events::{
         AnyInitialStateEvent, AnyRoomAccountDataEventContent, InitialStateEvent,
@@ -332,13 +332,18 @@ async fn room_memory(room_id: &OwnedRoomId, limit: u32) -> Result<String, String
     use matrix_sdk::deserialized_responses::TimelineEvent;
 
     /// One past turn as a JSON row; `true` once `limit` rows are collected.
-    fn push_turn(out: &mut Vec<serde_json::Value>, event: &TimelineEvent, limit: usize) -> bool {
+    fn push_turn(out: &mut Vec<serde_json::Value>, event: &TimelineEvent, limit: usize, me: &str) -> bool {
         // Custom state types (the ai_reply event) aren't in the typed event
         // enum, so read the raw JSON and filter on the type string.
         let Ok(raw) = event.raw().deserialize_as::<serde_json::Value>() else {
             return out.len() >= limit;
         };
         if raw.get("type").and_then(serde_json::Value::as_str) != Some(AI_REPLY_EVENT_TYPE) {
+            return out.len() >= limit;
+        }
+        // Only this account's own turns are the agent's memory: another
+        // member with state power could write the type.
+        if raw.get("sender").and_then(serde_json::Value::as_str) != Some(me) {
             return out.len() >= limit;
         }
         let Some(content) = raw.get("content").cloned() else {
@@ -359,6 +364,7 @@ async fn room_memory(room_id: &OwnedRoomId, limit: u32) -> Result<String, String
     }
 
     let client = crate::sliding_sync::get_client().ok_or("not logged in")?;
+    let me = crate::sliding_sync::current_user_id().ok_or("not logged in")?;
     let room = client.get_room(room_id).ok_or("room not found")?;
     let limit = (limit as usize).clamp(1, 50);
     let mut out: Vec<serde_json::Value> = Vec::new();
@@ -368,7 +374,7 @@ async fn room_memory(room_id: &OwnedRoomId, limit: u32) -> Result<String, String
         && let Ok(events) = cache.events().await
     {
         for event in events.iter().rev() {
-            if push_turn(&mut out, event, limit) {
+            if push_turn(&mut out, event, limit, me.as_str()) {
                 break;
             }
         }
@@ -386,7 +392,7 @@ async fn room_memory(room_id: &OwnedRoomId, limit: u32) -> Result<String, String
             let messages = room.messages(options).await
                 .map_err(|e| format!("couldn't load the room's past turns: {e}"))?;
             for event in messages.chunk {
-                if push_turn(&mut out, &event, limit) {
+                if push_turn(&mut out, &event, limit, me.as_str()) {
                     break;
                 }
             }
@@ -559,9 +565,22 @@ fn deserialize_raw_state(raw: &RawAnySyncOrStrippedState) -> serde_json::Result<
 /// for the room to count; an emptied `{}` content — this module's convention
 /// for "un-marking" a room — does not.
 async fn read_marker(room: &Room) -> Option<AiRoomMarkerContent> {
+    let me = crate::sliding_sync::current_user_id()?;
     let raw = room.get_state_event(StateEventType::from(AI_ROOM_EVENT_TYPE), "").await.ok()??;
     let json = deserialize_raw_state(&raw).ok()?;
-    serde_json::from_value(json.get("content")?.clone()).ok()
+    marker_from_event(&json, &me)
+}
+
+/// The marker inside a full state event, if it is one this client should act
+/// on: only the local user's own marker attaches an agent here. Any member
+/// with state power can write the type, and a marker from someone else must
+/// not start a session on this account (nor a second agent in a shared room).
+fn marker_from_event(event: &serde_json::Value, me: &UserId) -> Option<AiRoomMarkerContent> {
+    if event.get("sender").and_then(serde_json::Value::as_str) != Some(me.as_str()) {
+        log!("AI Rooms worker: ignoring an ai_room marker sent by {:?} (not this account).", event.get("sender"));
+        return None;
+    }
+    serde_json::from_value(event.get("content")?.clone()).ok()
 }
 
 /// Reads the marker straight from the homeserver, bypassing the local state
@@ -571,20 +590,54 @@ async fn read_marker(room: &Room) -> Option<AiRoomMarkerContent> {
 /// absent (a 404), `Err` is a transient fetch failure.
 async fn read_marker_from_server(room: &Room) -> Result<Option<AiRoomMarkerContent>, String> {
     use matrix_sdk::ruma::api::error::ErrorKind;
-    let request = get_state_event_for_key::v3::Request::new(
-        room.room_id().to_owned(),
-        StateEventType::from(AI_ROOM_EVENT_TYPE),
-        String::new(),
+    let me = crate::sliding_sync::current_user_id().ok_or("not logged in")?;
+    // The full event, not just its content: the sender decides whether the
+    // marker is ours to act on.
+    let request = assign!(
+        get_state_event_for_key::v3::Request::new(
+            room.room_id().to_owned(),
+            StateEventType::from(AI_ROOM_EVENT_TYPE),
+            String::new(),
+        ),
+        { format: get_state_event_for_key::v3::StateEventFormat::Event }
     );
     match room.client().send(request).await {
-        Ok(response) => response
-            .into_content()
-            .deserialize_as_unchecked::<AiRoomMarkerContent>()
-            .map(Some)
-            .map_err(|e| e.to_string()),
+        Ok(response) => {
+            // A present but unparseable (or foreign) marker is an authoritative
+            // "not an AI room for this client", not a transient failure.
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(response.event_or_content.get())
+            else {
+                return Ok(None);
+            };
+            if event.get("sender").is_some() {
+                return Ok(marker_from_event(&event, &me));
+            }
+            // A server that predates `format=event` (Matrix v1.16) answers
+            // with the content alone; the room's full state carries senders.
+            read_marker_from_full_state(room, &me).await
+        }
         Err(e) if e.client_api_error_kind() == Some(&ErrorKind::NotFound) => Ok(None),
         Err(e) => Err(e.to_string()),
     }
+}
+
+/// The marker as found in the room's full state (`GET /rooms/{id}/state`),
+/// for servers whose per-key endpoint can't return the event's sender.
+async fn read_marker_from_full_state(
+    room: &Room,
+    me: &UserId,
+) -> Result<Option<AiRoomMarkerContent>, String> {
+    let request = get_state_events::v3::Request::new(room.room_id().to_owned());
+    let response = room.client().send(request).await.map_err(|e| e.to_string())?;
+    for raw in &response.room_state {
+        let Ok(event) = raw.deserialize_as_unchecked::<serde_json::Value>() else { continue };
+        if event.get("type").and_then(serde_json::Value::as_str) == Some(AI_ROOM_EVENT_TYPE)
+            && event.get("state_key").and_then(serde_json::Value::as_str) == Some("")
+        {
+            return Ok(marker_from_event(&event, me));
+        }
+    }
+    Ok(None)
 }
 
 /// Reads this room's forwarding-cursor account data, if any.

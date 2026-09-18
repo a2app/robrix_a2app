@@ -96,6 +96,60 @@ fn serve_connection(stream: UnixStream, server: McpServer, rx: mpsc::Receiver<Co
     let _ = writer.join();
 }
 
+/// `sun_path` is 104 bytes on Apple platforms (108 on Linux); `bind` rejects
+/// anything at or past it.
+const MAX_SOCKET_PATH_BYTES: usize = 104;
+
+/// Where session sockets live: the data dir's `sessions/` whenever its socket
+/// paths fit `sun_path`. When they can't (a long macOS user name, every iOS
+/// app container) a short per-user directory stands in: `$XDG_RUNTIME_DIR`
+/// where set, else the user's temp dir. See [`ensure_private_dir`] for why a
+/// fallback is only used once it is known to be ours.
+fn socket_root() -> Result<PathBuf, String> {
+    let longest_child = "/session-99999/tools.sock".len();
+    let fits = |dir: &PathBuf| dir.as_os_str().len() + longest_child < MAX_SOCKET_PATH_BYTES;
+    let data = a2app_core::data_root().join("sessions");
+    if fits(&data) {
+        return Ok(data);
+    }
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|d| !d.is_empty())
+        .map(|d| PathBuf::from(d).join("robrix-a2app"));
+    let tmp = std::env::temp_dir().join(format!("robrix-a2app-{uid}"));
+    runtime.into_iter().chain([tmp]).find(fits).ok_or_else(|| {
+        format!(
+            "no directory short enough for a Unix socket path (max {} bytes): {}",
+            MAX_SOCKET_PATH_BYTES - 1, data.display()
+        )
+    })
+}
+
+/// Creates `dir` (0700) and checks it is a real directory owned by this user
+/// and private. A socket root outside the data dir lives where other local
+/// users can create names, so a pre-planted directory must never be reused:
+/// its owner could swap the session socket for their own.
+fn ensure_private_dir(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
+    let meta = std::fs::symlink_metadata(dir)
+        .map_err(|e| format!("couldn't stat {}: {e}", dir.display()))?;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    if !meta.is_dir() || meta.uid() != unsafe { libc::getuid() } {
+        return Err(format!("{} is not a directory owned by this user", dir.display()));
+    }
+    if meta.mode() & 0o077 != 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("couldn't make {} private: {e}", dir.display()))?;
+    }
+    Ok(())
+}
+
 /// Accepts connections until told to stop (the session ended). Each connection
 /// is served on its own thread from the shared tool registry; every accepted
 /// connection's writer is registered under a fresh id and removed when its
@@ -144,7 +198,13 @@ fn accept_loop(
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Err(_) => return,
+            // Only a stopped server ends the loop; fd exhaustion or an
+            // aborted connect is retried, or later relays would hang.
+            Err(_) if stop.load(Ordering::Relaxed) => return,
+            Err(e) => {
+                eprintln!("robrix tool server: accept failed: {e}; retrying");
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
     }
 }
@@ -181,14 +241,8 @@ impl ToolServer {
     /// session's authority (which room it may post to, what it may install), so
     /// nothing else on the machine should be able to reach it.
     pub fn bind(template: McpServer) -> Result<Self, String> {
-        let root = a2app_core::data_root().join("sessions");
-        std::fs::create_dir_all(&root)
-            .map_err(|e| format!("couldn't create {}: {e}", root.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
-        }
+        let root = socket_root()?;
+        ensure_private_dir(&root)?;
 
         // A fresh directory per session keeps sockets from colliding and makes
         // teardown a single directory removal. A Robrix process that was killed
@@ -228,6 +282,13 @@ impl ToolServer {
         }
 
         let path = dir.join("tools.sock");
+        if path.as_os_str().len() >= MAX_SOCKET_PATH_BYTES {
+            let _ = std::fs::remove_dir(&dir);
+            return Err(format!(
+                "socket path {} is too long for a Unix socket ({} bytes; max {})",
+                path.display(), path.as_os_str().len(), MAX_SOCKET_PATH_BYTES - 1
+            ));
+        }
         let listener = UnixListener::bind(&path)
             .map_err(|e| format!("couldn't bind {}: {e}", path.display()))?;
         listener

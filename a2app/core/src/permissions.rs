@@ -510,9 +510,11 @@ pub struct PermissionStore {
     /// ran at registration).
     #[serde(default)]
     tool_grants: BTreeMap<String, BTreeMap<String, String>>,
-    /// Session-only "Allow Once" tool grants, never persisted.
+    /// Session-only "Allow Once" tool grants, never persisted. The value is
+    /// the content hash at grant time, like `tool_grants`, so a changed
+    /// description still re-prompts within the session.
     #[serde(skip)]
-    tool_once: std::collections::HashSet<(String, String)>,
+    tool_once: std::collections::HashMap<(String, String), String>,
     /// Session-only tool denials (a "Don't Allow" on one registration or
     /// invocation). Not persisted: a fresh session asks again rather than
     /// silently blocking a tool forever with no UI to clear it.
@@ -608,18 +610,20 @@ impl PermissionStore {
 
     /// Rewrites grants whose *meaning* changed across schema versions.
     ///
-    /// Schema 1 made cross-room reads per-room (`read_rooms`) instead of a
-    /// blanket `matrix-rooms-read` group grant. A blanket grant written by the
-    /// old cross-room read prompt must not keep unlocking every room the agent
-    /// names, so it is reset to `Ask` and the per-room prompt re-asks. A
-    /// post-upgrade panel “allow all rooms” is written at schema 1 and kept.
+    /// Schema 1 made the AGENT's cross-room reads per-room (`read_rooms`)
+    /// instead of a blanket `matrix-rooms-read` group grant. A blanket grant
+    /// written by the old cross-room read prompt must not keep unlocking every
+    /// room the agent names, so it is reset to `Ask` and the per-room prompt
+    /// re-asks. Only agent subjects are touched: a mini-app's group grant
+    /// still means what it always did. A post-upgrade panel “allow all rooms”
+    /// is written at schema 1 and kept.
     pub fn migrate(&mut self) {
         if self.schema >= PERMISSIONS_SCHEMA {
             return;
         }
         let key = Permission::MatrixRoomsRead.as_str();
-        for grants in self.grants.values_mut() {
-            if grants.get(key).copied() == Some(GrantState::Granted) {
+        for (subject, grants) in self.grants.iter_mut() {
+            if is_agent_subject(subject) && grants.get(key).copied() == Some(GrantState::Granted) {
                 grants.insert(key.to_string(), GrantState::Ask);
             }
         }
@@ -770,13 +774,15 @@ impl PermissionStore {
             .insert(tool.to_string(), content_hash.to_string());
     }
 
-    /// Grants one tool for this session only.
-    pub fn allow_tool_once(&mut self, subject: &str, tool: &str) {
-        self.tool_once.insert((subject.to_string(), tool.to_string()));
+    /// Grants one tool for this session only. `content_hash` is the
+    /// registration description's hash (or `""` for an invocation grant).
+    pub fn allow_tool_once(&mut self, subject: &str, tool: &str, content_hash: &str) {
+        self.tool_once
+            .insert((subject.to_string(), tool.to_string()), content_hash.to_string());
     }
 
     pub fn has_tool_once(&self, subject: &str, tool: &str) -> bool {
-        self.tool_once.contains(&(subject.to_string(), tool.to_string()))
+        self.tool_once.contains_key(&(subject.to_string(), tool.to_string()))
     }
 
     /// Refuses one tool for this session only (never persisted).
@@ -802,7 +808,7 @@ impl PermissionStore {
     pub fn clear_tool_grants_for(&mut self, subject: &str) -> bool {
         let a = self.tool_grants.remove(subject).is_some();
         let before = self.tool_once.len() + self.tool_denied.len();
-        self.tool_once.retain(|(s, _)| s != subject);
+        self.tool_once.retain(|(s, _), _| s != subject);
         self.tool_denied.retain(|(s, _)| s != subject);
         a || self.tool_once.len() + self.tool_denied.len() != before
     }
@@ -810,8 +816,8 @@ impl PermissionStore {
     /// The per-tool decision for `subject`'s tool. `content` is the
     /// registration content hash (`Some`) or `None` for an invocation, where
     /// the description gate already ran at registration. Restricted subjects
-    /// hold nothing. A session one-time grant or an unchanged durable grant
-    /// is `Granted`; otherwise the caller prompts.
+    /// hold nothing. An unchanged session one-time or durable grant is
+    /// `Granted`; otherwise the caller prompts.
     pub fn tool_effective(&self, subject: &str, tool: &str, content: Option<&str>) -> Effective {
         if self.is_restricted(subject) {
             return Effective::Denied;
@@ -819,8 +825,11 @@ impl PermissionStore {
         if self.is_tool_denied(subject, tool) {
             return Effective::Denied;
         }
-        if self.has_tool_once(subject, tool) {
-            return Effective::Granted;
+        // A one-time grant is as content-bound as a durable one.
+        if let Some(hash) = self.tool_once.get(&(subject.to_string(), tool.to_string())) {
+            if content.is_none_or(|c| c == hash) {
+                return Effective::Granted;
+            }
         }
         match self.tool_grant(subject, tool) {
             // A changed description is new text entering the model's context,
@@ -890,6 +899,10 @@ impl PermissionStore {
         self.cap_overrides.clear();
         self.until.clear();
         self.once.clear();
+        self.send_rooms.clear();
+        self.read_rooms.clear();
+        self.net_hosts.clear();
+        self.net_once.clear();
         self.tool_grants.clear();
         self.tool_once.clear();
         self.tool_denied.clear();
@@ -947,12 +960,13 @@ impl PermissionStore {
     /// Reports whether anything was actually dropped, so callers can skip a
     /// snapshot republish when nothing changed.
     pub fn clear_once_for(&mut self, app_id: &str) -> bool {
-        let before = self.once.len() + self.tool_once.len();
+        let before = self.once.len() + self.tool_once.len() + self.net_once.len();
         self.once.retain(|(id, _)| id != app_id);
-        // "Allow Once" for a tool dies with its isolate/session too, exactly
-        // like a one-time group grant.
-        self.tool_once.retain(|(id, _)| id != app_id);
-        before != self.once.len() + self.tool_once.len()
+        // "Allow Once" for a tool or a host dies with its isolate/session
+        // too, exactly like a one-time group grant.
+        self.tool_once.retain(|(id, _), _| id != app_id);
+        self.net_once.retain(|(id, _)| id != app_id);
+        before != self.once.len() + self.tool_once.len() + self.net_once.len()
     }
 
     /// Forget an app entirely (uninstall). A reinstall starts from Ask.
@@ -962,8 +976,9 @@ impl PermissionStore {
         self.cap_overrides.remove(app_id);
         self.until.remove(app_id);
         self.uses.remove(app_id);
+        self.send_rooms.remove(app_id);
+        self.read_rooms.remove(app_id);
         self.net_hosts.remove(app_id);
-        self.net_once.retain(|(id, _)| id != app_id);
         self.clear_once_for(app_id);
         self.access.retain(|r| r.app_id != app_id);
     }
@@ -1391,8 +1406,11 @@ mod tests {
         let subject = "ai-room:!a:example.org";
         // A grant written by the pre-per-room build means "all rooms".
         store.set(subject, Permission::MatrixRoomsRead, GrantState::Granted);
+        // A mini-app's group grant never changed meaning and is left alone.
+        store.set("t", Permission::MatrixRoomsRead, GrantState::Granted);
         store.migrate();
         assert_eq!(store.state(subject, Permission::MatrixRoomsRead), GrantState::Ask);
+        assert_eq!(store.state("t", Permission::MatrixRoomsRead), GrantState::Granted);
         // Migration runs once: a deliberate post-upgrade panel grant survives.
         store.set(subject, Permission::MatrixRoomsRead, GrantState::Granted);
         store.migrate();
@@ -1443,10 +1461,10 @@ mod tests {
         // A different tool is unaffected by the first tool's grant.
         assert_eq!(store.tool_effective(subject, other, Some("h1")), Effective::NeedsPrompt);
         // A session one-time grant covers a tool with no durable grant.
-        store.allow_tool_once(subject, other);
+        store.allow_tool_once(subject, other, "h1");
         assert_eq!(store.tool_effective(subject, other, Some("h1")), Effective::Granted);
         // A session deny wins, even over a one-time allow.
-        store.allow_tool_once(subject, play);
+        store.allow_tool_once(subject, play, "h1");
         store.deny_tool(subject, play);
         assert_eq!(store.tool_effective(subject, play, Some("h1")), Effective::Denied);
         // Clearing a subject drops durable grants and session answers alike.
@@ -1455,14 +1473,52 @@ mod tests {
         assert_eq!(store.tool_effective(subject, other, Some("h1")), Effective::NeedsPrompt);
     }
 
+    /// "Allow Once" on a registration is bound to the description it was
+    /// shown for: a reworded tool re-prompts even within the session, while
+    /// an invocation (no hash) rides the one-time grant.
+    #[test]
+    fn tool_once_grants_are_content_sensitive() {
+        let mut store = PermissionStore::default();
+        let (subject, play) = ("board", "app_board_play");
+        store.allow_tool_once(subject, play, "h1");
+        assert_eq!(store.tool_effective(subject, play, Some("h1")), Effective::Granted);
+        assert_eq!(store.tool_effective(subject, play, None), Effective::Granted);
+        assert_eq!(store.tool_effective(subject, play, Some("h2")), Effective::NeedsPrompt);
+        // The one-time grant ends with the isolate, like every other "once".
+        assert!(store.clear_once_for(subject));
+        assert!(!store.has_tool_once(subject, play));
+        assert_eq!(store.tool_effective(subject, play, Some("h1")), Effective::NeedsPrompt);
+    }
+
+    /// A one-time host grant is session-only like the others, so it must die
+    /// with the isolate too — not only on uninstall.
+    #[test]
+    fn clear_once_drops_one_time_host_grants() {
+        let mut store = PermissionStore::default();
+        store.allow_host_once("t", "example.com");
+        store.allow_host_once("u", "example.com");
+        assert!(store.is_host_allowed("t", "example.com"));
+        assert!(store.clear_once_for("t"));
+        assert!(!store.is_host_allowed("t", "example.com"));
+        assert!(store.is_host_allowed("u", "example.com"), "other subjects keep theirs");
+        assert!(!store.clear_once_for("t"), "nothing left to drop");
+    }
+
     #[test]
     fn uninstall_resets_to_ask() {
         let mut store = PermissionStore::default();
         let m = manifest(&["location"]);
         store.set("t", Permission::Location, GrantState::Granted);
         assert!(store.is_granted(&m, Permission::Location));
+        store.allow_room_send("t", "!x:example.org");
+        store.allow_room_read("t", "!x:example.org");
+        store.allow_host("t", "example.com");
         store.remove_app("t");
         assert_eq!(store.effective(&m, Permission::Location), Effective::NeedsPrompt);
+        // Per-room and per-host allowlists go with the app.
+        assert!(!store.is_room_send_allowed("t", "!x:example.org"));
+        assert!(!store.is_room_read_allowed("t", "!x:example.org"));
+        assert!(!store.is_host_allowed("t", "example.com"));
     }
 
     /// Strict mode is the answer to "an imported app got open-url for free":
@@ -1503,9 +1559,19 @@ mod tests {
         store.block_all(&m);
         assert_eq!(store.effective(&m, Permission::Network), Effective::Denied);
         assert_eq!(store.effective(&m, Permission::OpenUrl), Effective::Denied);
+        let agent = "ai-room:!a:example.org";
+        store.allow_room_send(agent, "!x:example.org");
+        store.allow_room_read(agent, "!x:example.org");
+        store.allow_host(agent, "example.com");
+        store.allow_host_once(agent, "once.example.org");
         store.reset_all();
         assert_eq!(store.effective(&m, Permission::Network), Effective::NeedsPrompt);
         assert_eq!(store.effective(&m, Permission::OpenUrl), Effective::Granted);
+        // First-run means the per-room and per-host allowlists are gone too.
+        assert!(!store.is_room_send_allowed(agent, "!x:example.org"));
+        assert!(!store.is_room_read_allowed(agent, "!x:example.org"));
+        assert!(!store.is_host_allowed(agent, "example.com"));
+        assert!(!store.is_host_allowed(agent, "once.example.org"));
     }
 
     /// Uses are counted per capability, and an uninstall forgets them.
