@@ -44,9 +44,14 @@ if [ -f "$CONFIG" ]; then
     tmp="$(mktemp)"
     # Rewrite provider + env_vars with jq if present, else fall back to python3.
     if command -v jq >/dev/null 2>&1; then
-        jq '.provider = "scenario"
+        if ! jq '.provider = "scenario"
             | .env_vars.ANTHROPIC_API_KEY = "sk-dummy-testing"
-            | .version = 1' "$CONFIG" > "$tmp" && mv "$tmp" "$CONFIG"
+            | .version = 1' "$CONFIG" > "$tmp"; then
+            rm -f "$tmp"
+            echo "error: couldn't rewrite $CONFIG (invalid JSON?)" >&2
+            exit 1
+        fi
+        mv "$tmp" "$CONFIG"
     else
         python3 - "$CONFIG" <<'PY'
 import json, sys

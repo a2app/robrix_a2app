@@ -438,7 +438,7 @@ fn a_full_mcp_session_over_the_relay_child() {
         calls,
         vec![
             "launch_splash_app(\"a counter app\")".to_string(),
-            "send_message(\"hello room\")".to_string(),
+            "send_room_message(\"hello room\")".to_string(),
             "list_apps()".to_string(),
             "launch_app(\"smoke-app\")".to_string(),
             "list_mini_app_tools()".to_string(),
@@ -500,10 +500,11 @@ fn the_relay_exits_when_the_host_session_ends() {
     assert_eq!(result["protocolVersion"], "2025-11-25");
 
     // The session ends: server dropped, socket closed. The relay must exit 0
-    // without us touching its stdin.
+    // without us touching its stdin (kept open until the exit is observed, so
+    // a stdin EOF can't be what ended it).
     drop(server);
-    drop(client);
     let code = wait_for_exit(&mut guard, EXIT_TIMEOUT);
+    drop(client);
     assert_eq!(code, Some(0), "the relay must exit 0 when the host ends the session");
 }
 

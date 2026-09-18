@@ -1011,7 +1011,11 @@ impl Tool for SendMessageTool {
         let text = arguments
             .get("text")
             .and_then(Value::as_str)
+            .map(str::trim)
             .ok_or_else(|| "`send_message` needs a string `text`".to_string())?;
+        if text.is_empty() {
+            return Err("`send_message` needs a non-empty `text`".to_string());
+        }
         self.host.send_room_message(text)
     }
 }

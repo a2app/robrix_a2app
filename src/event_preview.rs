@@ -544,7 +544,7 @@ pub fn text_preview_of_other_state(
         AnyOtherStateEventContentChange::_Custom { event_type }
             if event_type == crate::a2app::ai_room_events::AI_ACTIVITY_EVENT_TYPE =>
         {
-            String::from("is thinking…")
+            String::from("reported the AI agent stopped or hit an error.")
         }
         #[cfg(feature = "a2app")]
         AnyOtherStateEventContentChange::_Custom { event_type }

@@ -34,7 +34,8 @@ pub enum BridgeLaunch {
 
 /// Reads the launch decision from the process's own arguments.
 pub fn from_args() -> BridgeLaunch {
-    from_argv(std::env::args())
+    // Lossy rather than `args()`: a non-UTF-8 argument must not abort startup.
+    from_argv(std::env::args_os().map(|a| a.to_string_lossy().into_owned()))
 }
 
 /// The decision for an explicit argv (first entry is the binary, skipped).

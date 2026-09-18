@@ -57,7 +57,7 @@ pub const SERVER_NAME: &str = "robrix-tools";
 /// largest are `tools/list` replies carrying every tool's JSON schema); a
 /// frame past this is not a protocol we can answer anyway, so the reader
 /// treats it as a broken peer rather than buffering without bound. The bridge
-/// relay uses a far larger cap, since it forwards whatever the agent sends.
+/// relay (`copy_frames`) forwards uncapped; only this side enforces the limit.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 /// Reads one `\n`-terminated frame into `buf` (cleared first), tolerating a
