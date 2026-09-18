@@ -114,6 +114,19 @@ type AiReadPending = (OwnedRoomId, ReadToolKind, Sender<Result<String, String>>)
 #[cfg(unix)]
 type AiPostPending = (OwnedRoomId, Sender<Result<String, String>>);
 
+/// One `send_message` tool call waiting on its `ai_reply` write: the room and
+/// the turn that made the call, the channel that answers it, and the turn's
+/// receipts the write consumed — handed back if it fails, so they still ride
+/// that turn's card. The turn is recorded because the write outlives a turn
+/// the user cancels, and its result must not touch the next one.
+#[cfg(unix)]
+type AiReplyPending = (
+    OwnedRoomId,
+    Option<String>,
+    Sender<Result<String, String>>,
+    Vec<AiReplyToolCall>,
+);
+
 /// Next id for an app-tool invocation: the runtime-generated `call_id` handed
 /// to the isolate in `on_tool_call`, which the app echoes back with its
 /// `mcp.tools.result` so the exact waiting serve thread can be answered.
@@ -433,6 +446,10 @@ pub struct A2AppState {
     /// [`AiRoomAction::PostToRoomResult`] lands.
     #[cfg(unix)]
     pub ai_posts: HashMap<u64, AiPostPending>,
+    /// `send_message` writes in flight, keyed by request id; see
+    /// [`AiReplyPending`].
+    #[cfg(unix)]
+    ai_replies: HashMap<u64, AiReplyPending>,
     /// "Allow Once" answers for cross-room posts/reads: (agent subject,
     /// group, room id). Session-only; dropped with the room's session.
     #[cfg(unix)]
@@ -531,6 +548,8 @@ pub fn init() {
             ai_reads: HashMap::new(),
             #[cfg(unix)]
             ai_posts: HashMap::new(),
+            #[cfg(unix)]
+            ai_replies: HashMap::new(),
             #[cfg(unix)]
             once_rooms: HashSet::new(),
             #[cfg(unix)]
@@ -2985,6 +3004,12 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
 /// stop the app (the net runtime is baked in at VM alloc); anything else
 /// just gets the new caps list plus an `on_permissions_changed` call.
 fn apply_permission_to_running(cx: &mut Cx, ui: &WidgetRef, app_id: &str, perm: Permission) {
+    // The mcp-tools answer is a kill switch, so a Deny takes back the tools
+    // the app already installed on a room's agent, not just future ones.
+    #[cfg(unix)]
+    if perm == Permission::McpTools {
+        withdraw_app_tools_if_denied(app_id);
+    }
     prune_hook_subs();
     if !with_a2app(|state| state.is_running(app_id)).unwrap_or(false) {
         return;
@@ -3000,6 +3025,80 @@ fn apply_permission_to_running(cx: &mut Cx, ui: &WidgetRef, app_id: &str, perm: 
         }
     } else {
         instances::update_app_caps(cx, app_id, grants);
+    }
+}
+
+/// Whether `app_id` may offer tools to a room's agent right now: the same
+/// capability decision every other service gets, so an App Info Deny (group
+/// or the `mcp.tools.register` row under it) counts.
+#[cfg(unix)]
+fn app_tools_allowed(app_id: &str) -> bool {
+    let Some(cap) = a2app_core::capabilities::by_id("mcp.tools.register") else { return false };
+    with_a2app(|state| {
+        let Some(manifest) = state.registry.get(app_id) else { return false };
+        !matches!(
+            state.permissions.effective_capability(manifest, cap),
+            Effective::Denied | Effective::Undeclared
+        )
+    })
+    .unwrap_or(false)
+}
+
+/// Removes every tool `app_id` registered, off each room's live session, and
+/// answers any model call parked on one. Used when the user withdraws the
+/// app's permission to offer them.
+#[cfg(unix)]
+fn withdraw_app_tools(app_id: &str) {
+    let withdrawn = with_a2app(|state| {
+        let names: Vec<String> = state
+            .app_tools
+            .iter()
+            .filter(|(_, reg)| reg.app_id == app_id)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in &names {
+            if let Some(reg) = state.app_tools.remove(name)
+                && let Some(session) = state.ai_sessions.get(&reg.room_id)
+            {
+                session.unregister_miniapp_tool(name);
+            }
+        }
+        let ids: Vec<u64> = state
+            .app_tool_calls
+            .iter()
+            .filter(|(_, p)| names.contains(&p.full_name))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            if let Some(p) = state.app_tool_calls.remove(&id) {
+                let _ = p.answer.send(Err(String::from(
+                    "this mini-app is no longer allowed to offer tools",
+                )));
+            }
+        }
+        names
+    })
+    .unwrap_or_default();
+    if withdrawn.is_empty() {
+        return;
+    }
+    log!("a2app: withdrew {} AI tool(s) from app {app_id}: {withdrawn:?}", withdrawn.len());
+    enqueue_popup_notification(
+        format!(
+            "Took back {} AI tool{} from this app.",
+            withdrawn.len(),
+            if withdrawn.len() == 1 { "" } else { "s" }
+        ),
+        PopupKind::Info,
+        Some(4.0),
+    );
+}
+
+/// Withdraws an app's AI tools if it may no longer offer them.
+#[cfg(unix)]
+fn withdraw_app_tools_if_denied(app_id: &str) {
+    if !app_tools_allowed(app_id) {
+        withdraw_app_tools(app_id);
     }
 }
 
@@ -3279,12 +3378,61 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
                 attach_ai_session(cx, ui, &room_id, name);
             }
         }
-        AiRoomAction::PostReplyFailed { error } => {
-            log!("AI Rooms: FAILED to post an ai_reply state event: {error}");
-            enqueue_popup_notification(
-                format!("Couldn't post the AI agent's reply: {error}"),
-                PopupKind::Error, Some(6.0),
-            );
+        AiRoomAction::PostReplyResult { room_id, answer_id, result } => {
+            let parked = answer_id
+                .and_then(|id| with_a2app(|state| state.ai_replies.remove(&id)).flatten());
+            if let Err(error) = &result {
+                log!("AI Rooms: FAILED to post an ai_reply state event: {error}");
+                enqueue_popup_notification(
+                    format!("Couldn't post the AI agent's reply: {error}"),
+                    PopupKind::Error, Some(6.0),
+                );
+            }
+            let Some((_, turn, answer, receipts)) = parked else { return };
+            // The write outlives a turn the user cancelled (its tool call is
+            // abandoned, not awaited), so a result whose turn is over may only
+            // answer the call — never touch the turn that took its place.
+            let live_turn = with_a2app(|state| {
+                state
+                    .ai_rooms
+                    .get(&room_id)
+                    .and_then(|info| info.active_turn.as_ref().map(|t| t.key.clone()))
+            })
+            .flatten();
+            let same_turn = live_turn == turn;
+            match result {
+                Ok(()) => {
+                    // Only a landed write may silence the turn's trailing
+                    // text: the tool really did say this turn's piece.
+                    if same_turn {
+                        with_a2app(|state| {
+                            if let Some(info) = state.ai_rooms.get_mut(&room_id) {
+                                info.posted_by_tool_this_turn = true;
+                            }
+                        });
+                    }
+                    let _ = answer.send(Ok(String::from("Posted to the room.")));
+                }
+                Err(error) => {
+                    // Nothing was posted: give the turn its receipts back (minus
+                    // this call's optimistic one, re-added as failed below) so
+                    // they ride the reply the turn will now post itself.
+                    if same_turn {
+                        with_a2app(|state| {
+                            if let Some(info) = state.ai_rooms.get_mut(&room_id) {
+                                let mut restored = receipts;
+                                if restored.last().is_some_and(|c| c.name == "send_message") {
+                                    restored.pop();
+                                }
+                                restored.append(&mut info.pending_tool_calls);
+                                info.pending_tool_calls = restored;
+                            }
+                        });
+                        note_ai_tool_call(&room_id, "send_message", false, &error);
+                    }
+                    let _ = answer.send(Err(error));
+                }
+            }
         }
         AiRoomAction::PostToRoomResult { id, result } => {
             // A cross-room post finished on the worker; answer the tool call
@@ -3383,6 +3531,7 @@ fn stop_ai_session(room_id: &OwnedRoomId) {
         state.ai_sessions.remove(room_id);
         state.ai_reads.retain(|_, (r, _, _)| r != room_id);
         state.ai_posts.retain(|_, (r, _)| r != room_id);
+        state.ai_replies.retain(|_, (r, _, _, _)| r != room_id);
         // Answer any app-tool invocation parked on this session; the tools
         // themselves stay in `app_tools` so a restarted session can re-install
         // them without re-prompting (see `attach_ai_session`).
@@ -3493,6 +3642,45 @@ fn open_ai_room_panel(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
     refresh_ai_room_panel(cx, ui, room_id);
 }
 
+/// The panel's rows, in the order its widget lays them out.
+#[cfg(unix)]
+const AI_PANEL_PERMS: [Permission; 10] = [
+    Permission::MatrixRoomRead,
+    Permission::MatrixRoomInfo,
+    Permission::AppGeneration,
+    Permission::AppLaunch,
+    Permission::MatrixRoomsRead,
+    Permission::MatrixRoomsList,
+    Permission::MatrixSpaces,
+    Permission::MatrixRoomsSend,
+    Permission::McpTools,
+    Permission::Network,
+];
+
+/// Whether the panel's row for `perm` is only a kill switch: the group's
+/// `Granted` opens nothing by itself, because the gate asks per room
+/// ([`run_ai_room_post`]), per tool ([`run_mini_app_tool_call`]) or per site
+/// ([`run_network_access`]). Such a row offers no "Allow" button.
+#[cfg(unix)]
+fn ai_panel_is_kill_switch(perm: Permission) -> bool {
+    matches!(
+        perm,
+        Permission::MatrixRoomsSend | Permission::McpTools | Permission::Network
+    )
+}
+
+/// A group's name as the AI panel says it: the catalog titles are written for
+/// a mini-app declaring the permission, and a couple read wrong for an agent
+/// being granted it.
+#[cfg(unix)]
+fn ai_panel_title(perm: Permission) -> &'static str {
+    match perm {
+        Permission::McpTools => "Use mini-app tools",
+        Permission::Network => "Reach the internet",
+        other => other.title(),
+    }
+}
+
 /// Repopulates and shows the AI room panel for `room_id` with current state.
 #[cfg(unix)]
 fn refresh_ai_room_panel(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
@@ -3508,6 +3696,10 @@ fn refresh_ai_room_panel(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
             .permissions
             .effective_for(&subject, ai_room_declares_perm, perm)
         {
+            // These groups only ever act as a kill switch: what the AI may
+            // actually do is decided per room, per tool or per site, so a
+            // group grant must not read as blanket permission.
+            Effective::Granted if ai_panel_is_kill_switch(perm) => "ask each time",
             Effective::Granted => "allowed",
             Effective::Denied => "don't allow",
             Effective::NeedsPrompt => "ask each time",
@@ -3515,7 +3707,7 @@ fn refresh_ai_room_panel(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
         };
         let line = |perm: Permission| {
             let count = state.permissions.use_count(&subject, perm);
-            let mut s = format!("{} — {}", perm.title(), perm_word(perm));
+            let mut s = format!("{} — {}", ai_panel_title(perm), perm_word(perm));
             if count > 0 {
                 s.push_str(&format!(" · {count} use{}", if count == 1 { "" } else { "s" }));
                 if let Some(at) = state.permissions.last_access(&subject, perm) {
@@ -3535,21 +3727,68 @@ fn refresh_ai_room_panel(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
             }
             s
         };
-        // Kept in the same order as the panel's rows (read / info / generate
-        // / apps / other rooms / room list); `ai_room_declares_perm` filters
-        // to what this room's AI actually offers.
-        let managed: Vec<Permission> = [
-            Permission::MatrixRoomRead,
-            Permission::MatrixRoomInfo,
-            Permission::AppGeneration,
-            Permission::AppLaunch,
-            Permission::MatrixRoomsRead,
-            Permission::MatrixRoomsList,
-        ]
-        .into_iter()
-        .filter(|p| ai_room_declares_perm(*p))
-        .collect();
-        let rows: Vec<String> = managed.iter().map(|p| line(*p)).collect();
+        // Every group this room's AI can be asked about, so a prompt's Deny
+        // is always undoable here. The panel maps each line to a fixed row,
+        // so a group this AI does not offer yields an empty line (which hides
+        // that row) rather than shifting every row after it.
+        let rows: Vec<String> = AI_PANEL_PERMS
+            .iter()
+            .map(|p| if ai_room_declares_perm(*p) { line(*p) } else { String::new() })
+            .collect();
+        let managed: Vec<Permission> = AI_PANEL_PERMS
+            .into_iter()
+            .filter(|p| ai_room_declares_perm(*p))
+            .collect();
+        // The one-at-a-time grants, which no group row covers: without this
+        // there is no way back from an "allow this room / this site" answer.
+        let extras = {
+            let name_of = |id: &str| {
+                rooms
+                    .as_ref()
+                    .and_then(|r| room_display_name(r, id))
+                    .unwrap_or_else(|| id.to_string())
+            };
+            let names = |ids: Vec<String>| {
+                ids.iter().map(|id| name_of(id)).collect::<Vec<_>>().join(", ")
+            };
+            let mut parts: Vec<String> = Vec::new();
+            let send = state.permissions.room_send_grants(&subject);
+            if !send.is_empty() {
+                parts.push(format!("post into {}", names(send)));
+            }
+            let read = state.permissions.room_read_grants(&subject);
+            if !read.is_empty() {
+                parts.push(format!("read {}", names(read)));
+            }
+            let hosts = state.permissions.host_grants(&subject);
+            if !hosts.is_empty() {
+                parts.push(format!("reach {}", hosts.join(", ")));
+            }
+            let tools = state.permissions.tool_grants(&subject).len();
+            if tools > 0 {
+                parts.push(format!(
+                    "call {tools} mini-app tool{}",
+                    if tools == 1 { "" } else { "s" }
+                ));
+            }
+            let mut line = if parts.is_empty() {
+                String::new()
+            } else {
+                format!("Also allowed, one at a time: {}.", parts.join(" · "))
+            };
+            // An "Allow once" / "Don't allow" answer is listed nowhere else,
+            // and forgetting it is the only way back, so it has to bring the
+            // row (and its button) up on its own.
+            if state.permissions.has_session_answers(&subject)
+                || state.once_rooms.iter().any(|(s, _, _)| s == &subject)
+            {
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str("Some one-time answers still apply for this session.");
+            }
+            (!line.is_empty()).then_some(line)
+        };
         let usage = {
             let parts: Vec<String> = managed
                 .iter()
@@ -3573,6 +3812,7 @@ fn refresh_ai_room_panel(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
             room_name,
             powered_on: info.session_on,
             rows,
+            extras,
             usage,
             restriction,
         })
@@ -3611,6 +3851,32 @@ fn apply_ai_room_panel_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomPanelAc
                 state.permissions.set(&subject, perm, GrantState::Denied);
                 state.perms_dirty = true;
             });
+        }
+        (None, AiRoomPanelCommand::ForgetExtras) => {
+            with_a2app(|state| {
+                let store = &mut state.permissions;
+                for room in store.room_send_grants(&subject) {
+                    store.disallow_room_send(&subject, &room);
+                }
+                for room in store.room_read_grants(&subject) {
+                    store.disallow_room_read(&subject, &room);
+                }
+                for host in store.host_grants(&subject) {
+                    store.disallow_host(&subject, &host);
+                }
+                store.clear_tool_grants_for(&subject);
+                // The one-time answers go too: a host or group allowed once is
+                // checked before any durable grant, so leaving it would make
+                // the confirmation a lie.
+                store.clear_once_for(&subject);
+                state.once_rooms.retain(|(s, _, _)| s != &subject);
+                state.perms_dirty = true;
+            });
+            enqueue_popup_notification(
+                "Forgotten. This room's AI asks again before it uses any of them.",
+                PopupKind::Info,
+                Some(4.0),
+            );
         }
         (None, AiRoomPanelCommand::Unrestrict) => {
             with_a2app(|state| {
@@ -4144,7 +4410,7 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
         }
     }
     for (room_id, text) in to_post {
-        post_ai_reply(&room_id, text);
+        post_ai_reply(&room_id, text, None);
     }
     for msg in errors {
         log!("AI Rooms: showing session error popup: {msg}");
@@ -4854,20 +5120,23 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
     record_tool_call_detail(room_id, &ai_job_tool_name(&job), detail);
     match job {
         SessionJob::SendRoomMessage { text, answer } => {
-            // Remember this turn already spoke to the room through the tool,
-            // so its eventual trailing text (octos requires a non-empty
-            // end-of-turn response) is dropped as redundant rather than
-            // posted as a second `ai_reply`.
-            with_a2app(|state| {
-                if let Some(info) = state.ai_rooms.get_mut(room_id) {
-                    info.posted_by_tool_this_turn = true;
-                }
-            });
-            // The call's state row finishes when its message is posted; the
-            // receipt chip rides the same `ai_reply` card below.
+            // The call's state row finishes when its message is on its way;
+            // the receipt chip rides the same `ai_reply` card below. A failed
+            // write rewrites both (see `AiRoomAction::PostReplyResult`).
             note_ai_tool_call(room_id, "send_message", true, "");
-            post_ai_reply(room_id, text);
-            let _ = answer.send(Ok(String::from("Posted to the room.")));
+            // The tool is answered only once the write lands: the room can
+            // refuse an `ai_reply` (the account needs state power), and the
+            // model must hear that instead of "posted" — it is still inside
+            // this call, so it can tell the user or try another way.
+            let id = NEXT_AI_TOOL_ID.fetch_add(1, Ordering::Relaxed);
+            with_a2app(|state| {
+                let turn = state
+                    .ai_rooms
+                    .get(room_id)
+                    .and_then(|info| info.active_turn.as_ref().map(|t| t.key.clone()));
+                state.ai_replies.insert(id, (room_id.clone(), turn, answer, Vec::new()));
+            });
+            post_ai_reply(room_id, text, Some(id));
         }
         SessionJob::PostRoomMessage { room_id: target, text, answer } => {
             run_ai_room_post(cx, ui, room_id, target, text, answer);
@@ -5071,6 +5340,13 @@ fn run_app_tool_invocation(
         let _ = answer.send(Err(format!("the mini-app tool `{tool}` is no longer registered")));
         return;
     };
+    // The owning app's kill switch gates each call, not just registration: a
+    // Deny made between calls stops this one and takes its tools back.
+    if !app_tools_allowed(&app_id) {
+        withdraw_app_tools(&app_id);
+        let _ = answer.send(Err(format!("the mini-app tool `{tool}` is no longer allowed")));
+        return;
+    }
     let call_id = NEXT_APP_TOOL_CALL_ID.fetch_add(1, Ordering::Relaxed);
     with_a2app(|state| {
         state.app_tool_calls.insert(
@@ -5640,7 +5916,7 @@ fn post_ai_state_event(
 /// and the `send_message` tool call reach the room. The turn's pending tool
 /// receipts are consumed onto this one card.
 #[cfg(unix)]
-fn post_ai_reply(room_id: &OwnedRoomId, text: String) {
+fn post_ai_reply(room_id: &OwnedRoomId, text: String, answer_id: Option<u64>) {
     // Best-effort traceability, not a precise per-turn link: under queueing,
     // a reply may technically answer an earlier message than the most
     // recently forwarded one.
@@ -5648,12 +5924,19 @@ fn post_ai_reply(room_id: &OwnedRoomId, text: String) {
         state.ai_rooms.get(room_id).and_then(|info| info.cursor.as_ref()).map(ToString::to_string)
     }).flatten();
     let tool_calls = with_a2app(|state| {
-        state
+        let taken = state
             .ai_rooms
             .get_mut(room_id)
             .map(|info| std::mem::take(&mut info.pending_tool_calls))
+            .unwrap_or_default();
+        // Kept with the parked call so a refused write can hand them back.
+        if let Some(id) = answer_id
+            && let Some(pending) = state.ai_replies.get_mut(&id)
+        {
+            pending.3 = taken.clone();
+        }
+        taken
     })
-    .flatten()
     .unwrap_or_default();
     log!("AI Rooms: posting ai_reply to room {room_id} (in_reply_to: {in_reply_to:?}).");
     let created_at = std::time::SystemTime::now()
@@ -5662,6 +5945,7 @@ fn post_ai_reply(room_id: &OwnedRoomId, text: String) {
         .unwrap_or(0);
     submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::PostReply {
         room_id: room_id.clone(),
+        answer_id,
         content: AiReplyContent {
             v: 1,
             text: text.clone(),

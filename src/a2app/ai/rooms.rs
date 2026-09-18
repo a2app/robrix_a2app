@@ -72,8 +72,14 @@ pub enum AiRoomRequest {
     /// just means a restart re-forwards a few already-answered messages.
     SaveCursor { room_id: OwnedRoomId, cursor: OwnedEventId },
     /// Writes one agent turn (a completed reply, or a `send_message` tool
-    /// call) as an `ai_reply` state event.
-    PostReply { room_id: OwnedRoomId, content: AiReplyContent },
+    /// call) as an `ai_reply` state event. `answer_id` is set when a tool
+    /// call is parked on the write: the room may refuse it (too little state
+    /// power), and the model must be told that rather than "posted".
+    PostReply {
+        room_id: OwnedRoomId,
+        content: AiReplyContent,
+        answer_id: Option<u64>,
+    },
     /// Posts one agent turn into ANOTHER joined room as an `m.notice`
     /// message (the `post_room_message` tool). Unlike an `ai_reply` state
     /// event, this needs no state-power privilege — it's an ordinary message
@@ -116,9 +122,13 @@ pub enum AiRoomAction {
     Attached { room_id: OwnedRoomId, name: Option<String>, cursor: Option<OwnedEventId> },
     /// The room has no marker: it's an ordinary room.
     NotAiRoom { room_id: OwnedRoomId },
-    /// An `ai_reply` failed to post; the turn's text is otherwise lost, same
-    /// as any other failed send.
-    PostReplyFailed { error: String },
+    /// An `ai_reply` write finished. `answer_id` carries the parked
+    /// `send_message` tool call, if one is waiting on it.
+    PostReplyResult {
+        room_id: OwnedRoomId,
+        answer_id: Option<u64>,
+        result: Result<(), String>,
+    },
     /// A granted [`AiRoomRequest::PostToRoom`] finished; `result` is the text
     /// (or the error) the waiting tool call must be answered with.
     PostToRoomResult { id: u64, result: Result<String, String> },
@@ -206,15 +216,18 @@ pub async fn handle_ai_room_request(request: AiRoomRequest) {
                 log!("AI Rooms worker: saved forwarding cursor {cursor} for {room_id}.");
             }
         }
-        AiRoomRequest::PostReply { room_id, content } => {
+        AiRoomRequest::PostReply { room_id, content, answer_id } => {
             let Some(room) = get_client().and_then(|c| c.get_room(&room_id)) else {
-                log!("AI Rooms worker: can't post ai_reply to {room_id}: room not found in client.");
+                let msg = format!("room {room_id} not found in client");
+                log!("AI Rooms worker: can't post ai_reply to {room_id}: {msg}");
+                Cx::post_action(AiRoomAction::PostReplyResult { room_id, answer_id, result: Err(msg) });
                 return;
             };
-            if let Err(e) = post_reply(&room, &content).await {
+            let result = post_reply(&room, &content).await;
+            if let Err(e) = &result {
                 log!("AI Rooms worker: FAILED to post ai_reply to {room_id}: {e}");
-                Cx::post_action(AiRoomAction::PostReplyFailed { error: e });
             }
+            Cx::post_action(AiRoomAction::PostReplyResult { room_id, answer_id, result });
         }
         AiRoomRequest::PostToRoom { id, target, content } => {
             let Some(room) = get_client().and_then(|c| c.get_room(&target)) else {

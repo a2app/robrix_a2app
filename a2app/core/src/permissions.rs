@@ -794,6 +794,17 @@ impl PermissionStore {
         self.tool_denied.contains(&(subject.to_string(), tool.to_string()))
     }
 
+    /// Whether `subject` holds any answer that lasts only for this session —
+    /// a one-time allow (group, host or tool) or a one-time refusal. A UI
+    /// offering to forget them needs to know they exist: nothing else lists
+    /// them, and a session refusal has no other way back.
+    pub fn has_session_answers(&self, subject: &str) -> bool {
+        self.once.iter().any(|(s, _)| s == subject)
+            || self.net_once.iter().any(|(s, _)| s == subject)
+            || self.tool_once.keys().any(|(s, _)| s == subject)
+            || self.tool_denied.iter().any(|(s, _)| s == subject)
+    }
+
     /// Every tool `subject` has a durable grant for.
     pub fn tool_grants(&self, subject: &str) -> Vec<String> {
         self.tool_grants
@@ -1488,6 +1499,28 @@ mod tests {
         assert!(store.clear_once_for(subject));
         assert!(!store.has_tool_once(subject, play));
         assert_eq!(store.tool_effective(subject, play, Some("h1")), Effective::NeedsPrompt);
+    }
+
+    /// The AI panel offers to forget one-time answers, so it has to be able
+    /// to see that any exist: they are listed by no other accessor.
+    #[test]
+    fn session_answers_are_visible_to_the_ui() {
+        let mut store = PermissionStore::default();
+        let subject = "ai-room:!a:example.org";
+        assert!(!store.has_session_answers(subject));
+        store.allow_host_once(subject, "example.com");
+        assert!(store.has_session_answers(subject));
+        assert!(!store.has_session_answers("other"));
+        store.clear_once_for(subject);
+        assert!(!store.has_session_answers(subject));
+        // A one-time REFUSAL counts too: forgetting it is the only way back.
+        store.deny_tool(subject, "app_x_play");
+        assert!(store.has_session_answers(subject));
+        store.clear_tool_grants_for(subject);
+        assert!(!store.has_session_answers(subject));
+        // A durable grant is not a session answer.
+        store.allow_host(subject, "durable.example");
+        assert!(!store.has_session_answers(subject));
     }
 
     /// A one-time host grant is session-only like the others, so it must die
