@@ -99,7 +99,7 @@ impl Widget for MiniAppTimelineCard {
                 if self.bundle_text.is_empty() {
                     enqueue_popup_notification("This shared mini-app has no bundle content.", PopupKind::Error, Some(4.0));
                 } else {
-                    cx.action(A2AppOp::ImportText(self.bundle_text.clone()));
+                    cx.action(A2AppOp::ImportRoomBundle { text: self.bundle_text.clone(), room_id: self.room_id.clone() });
                 }
             }
             if self.view.button(cx, ids!(card_run_button)).clicked(actions)

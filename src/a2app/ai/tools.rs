@@ -75,6 +75,9 @@ pub trait AiHost: Send + Sync {
     /// room).
     fn post_room_message(&self, room: &str, text: &str) -> Result<String, String>;
 
+    /// Fetch a URL through Robrix's HTTP broker and source-sharing checks.
+    fn fetch_url(&self, url: &str) -> Result<String, String>;
+
     /// One capability-gated attached-room read. The host hands it to the UI
     /// thread, where the runtime decides whether this session's room subject
     /// may exercise the mapped capability (prompting the user on first use)
@@ -251,8 +254,8 @@ pub const AI_ROOM_SESSION_CAP_IDS: &[&str] = &[
     // incoming hook puts the `mcp-tools` group in the room's AI panel so the
     // user can see and revoke it there.
     "on_tool_call",
-    // Internet access (the agent's own web_search / web_fetch / browser
-    // tools), gated per host so nothing reaches the network until the user
+    // Internet access through the host-owned web_fetch tool, gated by URL
+    // and source-sharing policy so nothing reaches the network until the user
     // has allowed that host for this room's AI.
     "network.http",
 ];
@@ -1020,6 +1023,31 @@ impl Tool for SendMessageTool {
     }
 }
 
+/// Fetches a page through the host; the agent never resolves DNS or opens a socket.
+pub struct WebFetchTool {
+    host: Arc<dyn AiHost>,
+}
+
+impl WebFetchTool {
+    pub fn new(host: Arc<dyn AiHost>) -> Self { Self { host } }
+}
+
+impl Tool for WebFetchTool {
+    fn name(&self) -> &str { "web_fetch" }
+    fn description(&self) -> &str {
+        "Fetch an HTTP(S) URL through Robrix. URL access and sharing of private context require user approval. Returns the host's bounded HTTP response."
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type":"object","properties":{"url":{"type":"string","description":"The complete HTTP(S) URL to fetch."}},"required":["url"],"additionalProperties":false})
+    }
+    fn call(&self, arguments: &Map<String, Value>) -> Result<String, String> {
+        if arguments.len() != 1 { return Err("`web_fetch` accepts only a URL; custom headers and credentials are not supported.".into()); }
+        let url = arguments.get("url").and_then(Value::as_str).map(str::trim)
+            .filter(|url| !url.is_empty()).ok_or("`web_fetch` needs a non-empty string `url`.")?;
+        self.host.fetch_url(url)
+    }
+}
+
 /// `post_room_message` — post an agent-authored message into another joined
 /// room as an `m.notice` message.
 ///
@@ -1120,6 +1148,7 @@ pub fn register_session_tools(server: &mut a2app_agent::mcp::McpServer, host: Ar
     // Ungated native tools (the agent's own room plumbing).
     server.add_tool(ReadRoomMemoryTool::new(host.clone()));
     server.add_tool(SendMessageTool::new(host.clone()));
+    server.add_tool(WebFetchTool::new(host.clone()));
     server.add_tool(PostRoomMessageTool::new(host));
 }
 

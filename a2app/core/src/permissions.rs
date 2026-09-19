@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::manifest::{MiniAppId, MiniAppManifest};
 
+mod scoped;
+pub use scoped::*;
+
 /// Every capability a mini-app can declare. Kebab-case ids are the manifest /
 /// wire form; keep them stable, exported bundles carry them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -49,13 +52,13 @@ pub enum Permission {
     MatrixUsers,
     /// Be told as messages, edits, reactions, typing, receipts, joins and mentions happen in this
     MatrixRoomWatch,
-    /// React, show typing, and mark this room read as you. Off unless "Mini-apps can write to rooms" is on.
+    /// React, show typing, and mark this room read as you, subject to room write rules.
     MatrixRoomInteract,
     /// Store and read this app's own data as events in this room so everyone using it sees the sa
     MatrixRoomAppData,
     /// Pin messages, favorite this room, flag it unread, or change its settings. Writes are off u
     MatrixRoomManage,
-    /// Invite people to this room as you. Asks every time and is off unless 'Apps may change room
+    /// Invite people to this room as you, subject to room and space write rules.
     MatrixRoomInvite,
     /// Fetch images and files from this room, get link previews, and upload files to your homeser
     MatrixMedia,
@@ -63,7 +66,7 @@ pub enum Permission {
     MatrixRoomsList,
     /// Read rooms you pick beyond the one this app is attached to.
     MatrixRoomsRead,
-    /// Post to rooms you pick, as you. Asks every time and is off unless "Mini-apps can write to rooms" is on.
+    /// Post to rooms you pick, as you, subject to room and space write rules.
     MatrixRoomsSend,
     /// Join rooms, answer invites, open direct messages, or leave this room as you. Asks every ti
     MatrixMembership,
@@ -336,13 +339,13 @@ impl Permission {
     /// and under the app's permission rows.
     pub fn blurb(self) -> &'static str {
         match self {
-            Permission::Network => "Connect to the internet to fetch and send data.",
+            Permission::Network => "Allowing internet access means this mini-app or agent may send room messages, files, or other local data it can access off this device to websites or online services, depending on what it does.",
             Permission::Location => "See your approximate location.",
             Permission::Notifications => "Show popup notifications from this app.",
             Permission::ClipboardRead => "Read whatever is on your clipboard.",
             Permission::Ipc => "Send messages to your other mini-apps.",
             Permission::MatrixRoomRead => "Read this room's messages, members, pins, and threads.",
-            Permission::MatrixRoomSend => "Send messages to this room as you. Asks the first time, and only while \"Mini-apps can write to rooms\" is on.",
+            Permission::MatrixRoomSend => "Send messages to this room as you. Your room and space write rules always apply.",
             Permission::ClipboardWrite => "Put text on your clipboard.",
             Permission::OpenUrl => "Open web links in your browser.",
             Permission::Files => "Open and save files you pick in the system dialog.",
@@ -357,15 +360,15 @@ impl Permission {
             Permission::MatrixAccountWrite => "Change your display name or avatar, block people, or store app settings on your account. Asks every time and is off unless 'Apps may change your account' is on.",
             Permission::MatrixUsers => "Fetch other Matrix users' public profiles and find existing chats with them.",
             Permission::MatrixRoomWatch => "Be told as messages, edits, reactions, typing, receipts, joins and mentions happen in this room.",
-            Permission::MatrixRoomInteract => "React, show typing, and mark this room read as you. Off unless \"Mini-apps can write to rooms\" is on.",
-            Permission::MatrixRoomAppData => "Store and read this app's own data as events in this room so everyone using it sees the same state. Saving is off unless \"Mini-apps can write to rooms\" is on.",
-            Permission::MatrixRoomManage => "Pin messages, favorite this room, flag it unread, or change its settings. Writes are off unless \"Mini-apps can write to rooms\" is on.",
-            Permission::MatrixRoomInvite => "Invite people to this room as you. Asks every time and is off unless 'Apps may change room membership' is on.",
+            Permission::MatrixRoomInteract => "React, show typing, and mark this room read as you. Your room and space write rules always apply.",
+            Permission::MatrixRoomAppData => "Store and read this app's own data as events in this room so everyone using it sees the same state. Your room and space read/write rules always apply.",
+            Permission::MatrixRoomManage => "Pin messages, favorite this room, flag it unread, or change its settings. Your room and space write rules always apply.",
+            Permission::MatrixRoomInvite => "Invite people to this room as you. Your room and space write rules always apply.",
             Permission::MatrixMedia => "Fetch images and files from this room, get link previews, and upload files to your homeserver.",
             Permission::MatrixRoomsList => "See which rooms, DMs and invites you have with unread counts, and be told when that changes.",
             Permission::MatrixRoomsRead => "Read rooms you pick beyond the one this app is attached to.",
-            Permission::MatrixRoomsSend => "Post to rooms you pick, as you. Asks every time and is off unless \"Mini-apps can write to rooms\" is on.",
-            Permission::MatrixMembership => "Join rooms, answer invites, open direct messages, or leave this room as you. Asks every time and is off unless 'Apps may change room membership' is on.",
+            Permission::MatrixRoomsSend => "Post to rooms you pick, as you. Your room and space write rules always apply.",
+            Permission::MatrixMembership => "Join rooms, answer invites, open direct messages, or leave this room as you. Your room and space write rules always apply.",
             Permission::MatrixSpaces => "See your spaces and the rooms inside them.",
             Permission::RobrixNavigation => "Take you to a room, message, thread, person, space, screen or another mini-app.",
             Permission::RobrixComposer => "Put a draft in this room's message box for you to review and send. Nothing is sent by the app.",
@@ -418,7 +421,7 @@ pub const MAX_ACCESS_RECORDS: usize = 240;
 
 /// The current [`PermissionStore`] schema. Bump it when a stored grant's
 /// meaning changes, and extend [`PermissionStore::migrate`].
-pub const PERMISSIONS_SCHEMA: u32 = 1;
+pub const PERMISSIONS_SCHEMA: u32 = 2;
 
 /// All grants, keyed app id -> permission id. Owned by the host, persisted
 /// whole-file on every change (it is tiny, and a lost file just re-asks).
@@ -456,6 +459,30 @@ pub struct PermissionStore {
     /// switch-gated write is refused without a prompt until the user turns it on.
     #[serde(default)]
     matrix_write: bool,
+    /// Explicit global and room/space policies supersede the legacy switch.
+    #[serde(default)]
+    room_policies: Option<RoomPolicies>,
+    #[serde(default)]
+    scoped: Vec<ScopedGrant>,
+    #[serde(skip)]
+    session_scoped: Vec<ScopedGrant>,
+    /// A narrowed normal-tier grant must not fall back to a global automatic
+    /// grant when its last scoped allowance expires or is removed.
+    #[serde(default)]
+    scoped_ask: BTreeMap<String, BTreeSet<String>>,
+    #[serde(default)]
+    network: Vec<NetworkGrant>,
+    #[serde(skip)]
+    session_network: Vec<NetworkGrant>,
+    /// Host-supplied ancestor spaces, never trusted from app arguments.
+    #[serde(skip)]
+    room_spaces: BTreeMap<String, BTreeSet<String>>,
+    #[serde(default)]
+    grant_serial: u64,
+    /// IDs authorizing one already-approved replay, captured by its worker
+    /// consent proof. Distinct from revocable room/Robrix session grants.
+    #[serde(skip)]
+    request_once: BTreeSet<u64>,
     /// Persisted schema version, bumped when a stored grant's *meaning*
     /// changes so [`Self::migrate`] can rewrite old files. Defaults to 0 for
     /// files written before the field existed (and for a fresh store).
@@ -584,8 +611,9 @@ impl PermissionStore {
     }
 
     pub fn set(&mut self, app_id: &str, perm: Permission, state: GrantState) {
-        // A durable answer supersedes any one-time grant for the same pair.
+        // A new answer supersedes any one-time or timed grant for this pair.
         self.once.remove(&(app_id.to_string(), perm));
+        if let Some(until) = self.until.get_mut(app_id) { until.remove(perm.as_str()); }
         self.grants
             .entry(app_id.to_string())
             .or_default()
@@ -601,11 +629,12 @@ impl PermissionStore {
     }
 
     pub fn matrix_write(&self) -> bool {
-        self.matrix_write
+        self.global_policy(RoomAccess::Write) != PolicyDecision::Deny
     }
 
     pub fn set_matrix_write(&mut self, on: bool) {
         self.matrix_write = on;
+        self.set_global_policy(RoomAccess::Write, if on { PolicyDecision::Ask } else { PolicyDecision::Deny });
     }
 
     /// Rewrites grants whose *meaning* changed across schema versions.
@@ -617,16 +646,22 @@ impl PermissionStore {
     /// re-asks. Only agent subjects are touched: a mini-app's group grant
     /// still means what it always did. A post-upgrade panel “allow all rooms”
     /// is written at schema 1 and kept.
+    ///
+    /// Schema 2 replaces the write switch with explicit room policies: off
+    /// becomes global write Deny, on becomes Ask, and reads remain Ask.
     pub fn migrate(&mut self) {
         if self.schema >= PERMISSIONS_SCHEMA {
             return;
         }
-        let key = Permission::MatrixRoomsRead.as_str();
-        for (subject, grants) in self.grants.iter_mut() {
-            if is_agent_subject(subject) && grants.get(key).copied() == Some(GrantState::Granted) {
-                grants.insert(key.to_string(), GrantState::Ask);
+        if self.schema < 1 {
+            let key = Permission::MatrixRoomsRead.as_str();
+            for (subject, grants) in self.grants.iter_mut() {
+                if is_agent_subject(subject) && grants.get(key).copied() == Some(GrantState::Granted) {
+                    grants.insert(key.to_string(), GrantState::Ask);
+                }
             }
         }
+        self.ensure_room_policies();
         self.schema = PERMISSIONS_SCHEMA;
     }
 
@@ -813,6 +848,11 @@ impl PermissionStore {
             .unwrap_or_default()
     }
 
+    /// Revoke older saved tool allowances without changing explicit refusals.
+    pub fn clear_persistent_tool_grants_for(&mut self, subject: &str) {
+        self.tool_grants.remove(subject);
+    }
+
     /// Drops every tool grant and session denial for `subject` (the room's AI
     /// session ending, an app restart, or an uninstall). Reports whether
     /// anything changed.
@@ -917,6 +957,12 @@ impl PermissionStore {
         self.tool_grants.clear();
         self.tool_once.clear();
         self.tool_denied.clear();
+        self.scoped.clear();
+        self.session_scoped.clear();
+        self.scoped_ask.clear();
+        self.network.clear();
+        self.session_network.clear();
+        self.request_once.clear();
     }
 
     /// Bars an app from running after it abused the host bridge. This is the
@@ -990,6 +1036,11 @@ impl PermissionStore {
         self.send_rooms.remove(app_id);
         self.read_rooms.remove(app_id);
         self.net_hosts.remove(app_id);
+        self.scoped.retain(|g| g.subject != app_id);
+        self.session_scoped.retain(|g| g.subject != app_id);
+        self.scoped_ask.remove(app_id);
+        self.network.retain(|g| g.subject != app_id);
+        self.session_network.retain(|g| g.subject != app_id);
         self.clear_once_for(app_id);
         self.access.retain(|r| r.app_id != app_id);
     }
@@ -1163,7 +1214,7 @@ impl PermissionStore {
         if self.is_restricted(subject) {
             return Effective::Denied;
         }
-        if cap.status == crate::capabilities::Status::RefusedBySwitch && !self.matrix_write {
+        if cap.status == crate::capabilities::Status::RefusedBySwitch && !self.matrix_write() {
             return Effective::Denied;
         }
         let Some(group) = cap.group else { return Effective::Granted };

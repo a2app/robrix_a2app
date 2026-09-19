@@ -1,0 +1,54 @@
+// name: Public Web
+// icon: 🌐
+// tint: #2A7F92
+// description: Fetch a fixed public example page without reading room or account data. Open in public mode from Mini Apps.
+// permissions: network
+// why-network: Fetches https://example.com/ when you press the button.
+
+let busy = false
+
+fn fetch_example(){
+    if busy { return nil }
+    busy = true
+    ui.status.set_text("Requesting https://example.com/…")
+    ui.result.set_text("")
+    host.request("network.http", {url: "https://example.com/"}, fn(r){
+        busy = false
+        if !r.is_ok {
+            ui.status.set_text(r.error)
+            return nil
+        }
+        ui.status.set_text("https://example.com/ · HTTP " + r.data.status)
+        if r.data.body.len() > 4096 {
+            ui.result.set_text("The response is larger than this preview's 4096-character limit.")
+            return nil
+        }
+        ui.result.set_text(r.data.body)
+    })
+}
+
+View{
+    width: Fill height: Fill flow: Down align: Align{x: 0.5}
+    ScrollYView{
+        width: Fill{max: 620.0} height: Fill flow: Down spacing: 12 padding: 16
+        Label{
+            text: "Public Web" width: Fill
+            draw_text +: {color: #x1C274C text_style: theme.font_bold{font_size: 22}}
+        }
+        Label{
+            text: "Open this stock app in public mode from Mini Apps. It requests only the fixed example page below and does not read Matrix data or accept private text."
+            width: Fill
+            draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 12}}
+        }
+        Button{text: "Fetch example.com" on_click: || fetch_example()}
+        status := Label{
+            text: "Internet permission is required. No request is made until you press Fetch."
+            width: Fill
+            draw_text +: {color: #x2A7F92 text_style: theme.font_regular{font_size: 12}}
+        }
+        result := Label{
+            text: "" width: Fill
+            draw_text +: {color: #x333333 text_style: theme.font_regular{font_size: 11}}
+        }
+    }
+}

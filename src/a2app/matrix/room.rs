@@ -84,15 +84,31 @@ fn add_row_context(
     row
 }
 
+/// Read cached relations without sending an app-selected event id. A cache
+/// miss may fetch only after every source permits the homeserver origin.
+async fn protected_event_with_relations(
+    room: &matrix_sdk::Room,
+    event_id: &matrix_sdk::ruma::EventId,
+    filter: Option<Vec<matrix_sdk::ruma::events::relation::RelationType>>,
+) -> Result<(TimelineEvent, Vec<TimelineEvent>), String> {
+    if let Ok((cache, _guard)) = room.event_cache().await
+        && let Ok(Some(cached)) = cache.find_event_with_relations(event_id, filter.clone()).await
+    {
+        // The SDK's load-or-fetch helper fetches even a cached event when its
+        // relations are empty. Keep that network fallback explicit here.
+        return Ok(cached);
+    }
+    super::policy::ensure_server_output(room.client().homeserver().as_str())?;
+    room.load_or_fetch_event_with_relations(event_id, filter, None).await
+        .map_err(|e| format!("couldn't load the event: {e}"))
+}
+
 pub(super) async fn thread_replies(room_id: OwnedRoomId, event_id: OwnedEventId, limit: u32) -> Result<String, String> {
     use matrix_sdk::ruma::events::relation::RelationType;
+    super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Read)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
-    // Cache and store first; only a thread Robrix hasn't seen asks the homeserver.
-    let (root, related) = room
-        .load_or_fetch_event_with_relations(&event_id, Some(vec![RelationType::Thread]), None)
-        .await
-        .map_err(|e| format!("couldn't load the thread: {e}"))?;
+    let (root, related) = protected_event_with_relations(&room, &event_id, Some(vec![RelationType::Thread])).await?;
     // The two sources order relations differently, so sort by time ourselves.
     let mut replies: Vec<OriginalSyncRoomMessageEvent> = related.iter().filter_map(as_message).collect();
     replies.sort_by_key(|m| m.origin_server_ts);
@@ -106,12 +122,14 @@ pub(super) async fn thread_replies(room_id: OwnedRoomId, event_id: OwnedEventId,
 
 pub(crate) async fn older_messages(room_id: OwnedRoomId, before: Option<OwnedEventId>, limit: u32, full_body: bool) -> Result<String, String> {
     use matrix_sdk::room::MessagesOptions;
+    super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Read)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
     let limit = limit as usize;
     let me = current_user_id().ok_or("not logged in")?;
     let my_read_ts = my_read_receipt_ts(&room).await;
     // No anchor means "older than the cached window", i.e. where read_messages stops.
+    let caller_selected_anchor = before.is_some();
     let mut anchor = before;
     if anchor.is_none()
         && let Ok((cache, _guard)) = client.event_cache().room(&room_id).await
@@ -123,6 +141,8 @@ pub(crate) async fn older_messages(room_id: OwnedRoomId, before: Option<OwnedEve
     let mut from: Option<String> = None;
     if let Some(anchor) = &anchor {
         // /context splits its budget across both sides of the anchor.
+        super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Read)?;
+        if caller_selected_anchor { super::policy::ensure_server_output(client.homeserver().as_str())?; }
         let context = room.event_with_context(anchor, true, (limit as u32 * 2).into(), None).await
             .map_err(|e| format!("couldn't load older messages: {e}"))?;
         out.extend(context.events_before.iter().filter_map(as_message).map(|m| {
@@ -132,6 +152,7 @@ pub(crate) async fn older_messages(room_id: OwnedRoomId, before: Option<OwnedEve
     }
     // Top up from /messages when the page was mostly state events, or had no anchor.
     for _ in 0..4 {
+        super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Read)?;
         if out.len() >= limit || (anchor.is_some() && from.is_none()) {
             break;
         }
@@ -157,12 +178,12 @@ pub(crate) async fn older_messages(room_id: OwnedRoomId, before: Option<OwnedEve
 
 pub(super) async fn event(room_id: OwnedRoomId, event_id: OwnedEventId) -> Result<String, String> {
     use matrix_sdk::ruma::events::relation::RelationType;
+    super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Read)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
     let me = current_user_id().ok_or("not logged in")?;
     let filter = Some(vec![RelationType::Annotation, RelationType::Replacement]);
-    let (event, related) = room.load_or_fetch_event_with_relations(&event_id, filter, None).await
-        .map_err(|e| format!("couldn't load the event: {e}"))?;
+    let (event, related) = protected_event_with_relations(&room, &event_id, filter).await?;
     let msg = as_message(&event).ok_or("that event isn't a message")?;
     // Start from the server's bundled edit; a later synced edit wins on time.
     let mut latest_edit = msg.unsigned.relations.replace.as_deref().cloned();
@@ -217,6 +238,7 @@ pub(super) async fn read_receipts(room_id: OwnedRoomId, user_id: Option<OwnedUse
     if !crate::settings::app_preferences::show_read_receipts() {
         return Ok(serde_json::json!({ "receipts": [] }).to_string());
     }
+    super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Read)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
     let members = match user_id {
@@ -259,6 +281,7 @@ pub(super) async fn read_receipts(room_id: OwnedRoomId, user_id: Option<OwnedUse
 }
 
 pub(super) async fn unread(room_id: OwnedRoomId) -> Result<String, String> {
+    super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Read)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
     Ok(serde_json::json!({
@@ -271,6 +294,7 @@ pub(super) async fn unread(room_id: OwnedRoomId) -> Result<String, String> {
 pub(super) async fn power_levels(room_id: OwnedRoomId) -> Result<String, String> {
     use matrix_sdk::ruma::events::room::power_levels::UserPowerLevel;
     use matrix_sdk::ruma::events::{MessageLikeEventType, StateEventType};
+    super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Read)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
     let me = current_user_id().ok_or("not logged in")?;
@@ -298,6 +322,7 @@ pub(super) async fn power_levels(room_id: OwnedRoomId) -> Result<String, String>
 }
 
 pub(super) async fn permalink(room_id: OwnedRoomId, event_id: Option<OwnedEventId>, use_matrix_scheme: bool) -> Result<String, String> {
+    super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Read)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
     let url = match (use_matrix_scheme, event_id) {
@@ -310,6 +335,7 @@ pub(super) async fn permalink(room_id: OwnedRoomId, event_id: Option<OwnedEventI
 }
 
 pub(super) async fn successor(room_id: OwnedRoomId) -> Result<String, String> {
+    super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Read)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
     let Some(successor) = room.successor_room() else {
@@ -317,6 +343,7 @@ pub(super) async fn successor(room_id: OwnedRoomId) -> Result<String, String> {
             "upgraded": false, "room_id": null, "name": null, "reason": null,
         }).to_string());
     };
+    super::policy::ensure_room_access(successor.room_id.as_str(), a2app_core::permissions::RoomAccess::Read)?;
     let name = match client.get_room(&successor.room_id) {
         Some(next) => match next.cached_display_name() {
             Some(name) => Some(name.to_string()),
@@ -336,6 +363,7 @@ pub(super) async fn successor(room_id: OwnedRoomId) -> Result<String, String> {
 pub(crate) async fn info(room_id: matrix_sdk::ruma::OwnedRoomId) -> Result<String, String> {
     use matrix_sdk::RoomState;
     use crate::sliding_sync::get_client;
+    super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Read)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
     if room.state() != RoomState::Joined {
@@ -392,6 +420,7 @@ pub(crate) async fn read_messages(room_id: matrix_sdk::ruma::OwnedRoomId, limit:
     use matrix_sdk::RoomState;
     use matrix_sdk::room::MessagesOptions;
     use crate::sliding_sync::get_client;
+    super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Read)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
     if room.state() != RoomState::Joined {
@@ -426,6 +455,7 @@ pub(crate) async fn read_messages(room_id: matrix_sdk::ruma::OwnedRoomId, limit:
         edits.clear();
         let mut from: Option<String> = None;
         for _ in 0..4 {
+            super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Read)?;
             let mut options = MessagesOptions::backward();
             options.limit = 50u32.into();
             options.from = from;

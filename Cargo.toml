@@ -132,16 +132,16 @@ tsp = ["dep:tsp_sdk", "dep:quinn", "dep:aws-lc-rs", "dep:percent-encoding", "dep
 
 ## Enables Splash mini-apps: AI-generated sandboxed apps that run in isolates,
 ## managed via the Mini Apps pane and shareable into rooms.
-## The default agent backend spawns `octos acp` as a child process.
+## Private-data agents and generation also require a2app-embedded-agent.
 a2app = ["dep:a2app-core", "dep:a2app-agent"]
-## Links the octos agent into Robrix itself instead of spawning `octos acp`
-## as a child process. Required on iOS, where exec() is prohibited.
+## Runs the agent with Robrix's guarded model transport and host tools.
+## Required for protected contexts and on iOS, where exec() is prohibited.
 a2app-embedded-agent = ["a2app", "a2app-agent/embedded"]
 ## Installs the Splash dialect guide on the agent once (as a bootstrap file or
 ## system prompt) so each generation prompt can point at it instead of inlining it.
 a2app-persistent-guide = ["a2app", "a2app-agent/persistent-guide"]
-## Lets the agent research with its tools (web search/fetch) before generating,
-## baking found data into the generated app as constants.
+## Enables research for standalone agents. Protected Robrix generation keeps
+## external research disabled until its inputs can be individually attributed.
 a2app-research = ["a2app", "a2app-agent/research"]
 
 ## Hides the command prompt console/log window on Windows.
@@ -176,8 +176,8 @@ members = ["a2app/core", "a2app/agent"]
 [workspace.dependencies]
 # makepad-widgets = { git = "https://github.com/makepad/makepad", branch = "dev", features = ["serde"] }
 # makepad-code-editor = { git = "https://github.com/makepad/makepad", branch = "dev" }
-makepad-widgets = { git = "https://github.com/kevinaboos/makepad", branch = "cancel-trace", features = ["serde"] }
-makepad-code-editor = { git = "https://github.com/kevinaboos/makepad", branch = "cancel-trace" }
+makepad-widgets = { git = "https://github.com/kevinaboos/makepad", branch = "splash-host-io-cancel", features = ["serde"] }
+makepad-code-editor = { git = "https://github.com/kevinaboos/makepad", branch = "splash-host-io-cancel" }
 
 
 [patch.crates-io]

@@ -25,15 +25,6 @@ const MAX_REPAIRS: u32 = 2;
 /// the wild when models reach for ✕-style icons.
 const TOFU_GLYPHS: &[char] = &['✕', '✗', '✘', '⤡', '⤢', '➜', '↻', '⟳'];
 
-/// Truncates streamed agent text for a log line, with an ellipsis when cut.
-fn clip_for_log(text: &str, max_chars: usize) -> String {
-    let mut out: String = text.chars().take(max_chars).collect();
-    if text.chars().count() > max_chars {
-        out.push('…');
-    }
-    out
-}
-
 /// A generation with NO agent events for this long is declared stalled. LLM
 /// turns legitimately take a while, so this is generous — it only catches an
 /// agent that is alive but silent (hung provider, dead network) which would
@@ -151,8 +142,9 @@ impl Generation {
         taken_ids: Vec<MiniAppId>,
         scope: A2AppScope,
         prefs: AgentPrefs,
+        model_context: Option<a2app_core::information_flow::ContextId>,
     ) -> Result<Self, String> {
-        Self::start_with_mode(request, taken_ids, scope, GenMode::Create, prefs)
+        Self::start_with_mode(request, taken_ids, scope, GenMode::Create, prefs, model_context)
     }
 
     /// Starts a refine of an existing app: same machinery, but the prompt
@@ -161,10 +153,11 @@ impl Generation {
         request: String,
         base: MiniAppManifest,
         prefs: AgentPrefs,
+        model_context: Option<a2app_core::information_flow::ContextId>,
     ) -> Result<Self, String> {
         let scope = base.scope.clone();
         let mode = GenMode::Refine { base: Box::new(base) };
-        Self::start_with_mode(request, Vec::new(), scope, mode, prefs)
+        Self::start_with_mode(request, Vec::new(), scope, mode, prefs, model_context)
     }
 
     fn start_with_mode(
@@ -173,12 +166,13 @@ impl Generation {
         scope: A2AppScope,
         mode: GenMode,
         prefs: AgentPrefs,
+        model_context: Option<a2app_core::information_flow::ContextId>,
     ) -> Result<Self, String> {
         let workspace = agent_workspace_dir();
         // Persist the dialect guide on the agent side so prompts can go slim.
         #[cfg(feature = "persistent-guide")]
         crate::skills::deploy_guide(&workspace);
-        let client = crate::start_backend(&workspace, &prefs)?;
+        let client = crate::start_backend_with_mcp(&workspace, &prefs, &[], false, None, model_context)?;
         // Slim prompts only for backends known to carry the persistent guide:
         // the default octos spawn / the in-process agent. An explicit
         // ROBRIX_AGENT_CMD may be any ACP agent, which likely ignores
@@ -335,7 +329,7 @@ impl Generation {
                     }
                 }
                 AcpEvent::ToolCall { title, .. } => {
-                    makepad_widgets::log!("app generation: agent tool call: {title}");
+                    makepad_widgets::log!("app generation: agent tool call started");
                     self.status = format!("Agent: {title}…");
                     self.log(format!("🔧 {title}"));
                 }
@@ -350,10 +344,7 @@ impl Generation {
                     // to the live tail, where it's replaced by the code as soon
                     // as the agent starts writing.
                     if self.thought.is_empty() {
-                        makepad_widgets::log!(
-                            "app generation: agent thinking… (head: {})",
-                            clip_for_log(&text, 160)
-                        );
+                        makepad_widgets::log!("app generation: agent thinking…");
                         self.log("💭 Thinking…");
                     }
                     self.thought.push_str(&text);
@@ -392,17 +383,7 @@ impl Generation {
                 // No content, but it moved the stall clock (see `advance`).
                 AcpEvent::Tick => {}
                 AcpEvent::TurnDone { stop_reason, text } => {
-                    makepad_widgets::log!(
-                        "app generation: turn done ({stop_reason}) — {} chars written, \
-                         {} chars thinking{}",
-                        self.stream.len(),
-                        self.thought.len(),
-                        if text.trim().is_empty() {
-                            String::new()
-                        } else {
-                            format!("; text head: {}", clip_for_log(&text, 160))
-                        }
-                    );
+                    makepad_widgets::log!("app generation: turn done ({stop_reason})");
                     if stop_reason == "cancelled" {
                         return GenOutcome::Failed("Cancelled".to_string());
                     }
@@ -412,8 +393,7 @@ impl Generation {
                     match self.finish_turn(cx, &text) {
                         TurnVerdict::Installed(manifest) => {
                             makepad_widgets::log!(
-                                "app generation: validated clean — \"{}\" ready (attempt {})",
-                                manifest.name,
+                                "app generation: validated clean (attempt {})",
                                 self.repairs
                             );
                             self.phase = GenPhase::Done;
@@ -895,12 +875,12 @@ pub fn unique_id(name: &str, taken: &[MiniAppId]) -> MiniAppId {
 // ---------------------------------------------------------------------------
 
 /// Evaluates `source` the exact way the Splash widget will (same prelude
-/// prefix, no network) in a throwaway isolate, and returns the formatted
+/// prefix, host-only I/O) in a throwaway isolate, and returns the formatted
 /// errors. Empty == the script parses and its root evaluates. Runtime errors
 /// inside handlers can still happen later — this catches the compile/eval
 /// class that octos-one's lint+repair loop targets, but with the real parser.
 pub fn validate_splash(cx: &mut Cx, source: &str) -> Vec<String> {
-    makepad_widgets::splash::validate_splash_body(cx, source, false)
+    makepad_widgets::splash::validate_splash_body_with_host_io(cx, source)
 }
 
 // ---------------------------------------------------------------------------

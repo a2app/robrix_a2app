@@ -19,14 +19,14 @@ cargo run --features a2app
   picker of apps relevant to that context. Room apps run in the room's pane;
   space apps open in a modal attached to that space. A footer links to the
   main Mini Apps screen to see all apps or generate new ones.
-- A **create bar**: describe an app ("a pomodoro timer") and an ACP agent
-  (`octos acp` by default; Claude Code and any other ACP agent work too)
-  writes it in the Splash dialect, validated with the real parser and
-  auto-repaired for up to two turns.
+- A **create bar**: describe an app ("a pomodoro timer") and the embedded
+  agent writes it in the Splash dialect, validated with the real parser and
+  auto-repaired for up to two turns. Generation uses the guarded model
+  transport described below; external ACP agents cannot receive its context.
 - **Per-app isolation**: each app runs in its own Splash isolate with nothing
   by default: no filesystem beyond its private jail, no network, no host access.
   Capabilities are declared in the app's manifest, prompted at first use
-  (Allow / Allow Once / Don't Allow / Not Now), revocable at any time, and a
+  (Allow selected / Allow Once / Block everywhere / Not Now), revocable at any time, and a
   request-flooding app gets stopped and restricted.
 - **Matrix services**, each behind its own permission group: the attached
   room (info, messages, older history, one event, threads and replies,
@@ -34,7 +34,7 @@ cargo run --features a2app
   permalinks, upgrades), rooms and spaces (list, search, invites, previews,
   cross-room read and search, space trees), the account (profile, device,
   homeserver, ignored users, other users' profiles, DM lookup), and, behind
-  the write switch, sends, replies, reactions, typing, read receipts, pins,
+  the room and space write rules, sends, replies, reactions, typing, read receipts, pins,
   room flags, invites, joins and DMs.
 - **Live updates instead of polling**: room hooks (messages, edits and
   redactions, reactions, typing, read receipts, members, pins, room details,
@@ -48,8 +48,9 @@ cargo run --features a2app
   not do, or whose action fails, gets a Robrix warning naming the app and the
   reason; it never depends on the app surfacing its own error. Deleting a
   provider key, an app's data, or an app asks first.
-- **Writes are off by default**: the "Mini-apps can write to rooms" switch on
-  the Mini Apps screen gates every send, on top of per-app permissions.
+- **Room protection is above app permissions**: the Mini Apps screen has
+  separate read/write defaults and room/space allow/block lists. Writes are
+  blocked by default; a block always wins over an allowance.
 - **Version history**: every AI change, hand edit (there is a source editor),
   and version switch is kept; switch back and forth freely, diff any version
   against the current source, and reset a built-in to stock.
@@ -59,7 +60,8 @@ cargo run --features a2app
   it with `/miniapp share <name>`, where it renders as a card other Robrix
   users can install and run. "Open in room…" docks an app into any room you
   pick, straight from the Mini Apps screen.
-- Fifteen built-in apps: **Room Peek** (room info + recent messages + send),
+- Sixteen built-in apps: **Public Web** (a fixed public example.com fetch),
+  **Room Peek** (room info + recent messages + send),
   **Roll Call** (dice roller that can post its roll), **Room Info**,
   **Room Members**, **Pinned Messages**, **Room Threads**, **Search**
   (messages across one room or many), **Watcher** (keyword rules that notify
@@ -82,38 +84,44 @@ shared DSL names.
 
 ## Agent setup (once)
 
-1. Install the octos CLI: `cargo install --git https://github.com/octos-org/octos octos-cli`
-2. Give it an LLM provider, whichever is least effort:
-   - the **AI Providers** page in the Mini Apps screen (pick a provider, paste a key),
-   - a key already exported in your shell (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …),
-   - `octos auth login -p <provider>`,
-   - or a local [Ollama](https://ollama.com) with a code model pulled — detected
-     automatically, no key needed.
+Robrix's AI rooms and app generation require `a2app-embedded-agent`; a separate
+octos CLI installation is not required. Configure an OpenAI-compatible or
+Anthropic provider through **AI Providers**, an existing Octos configuration,
+or that provider's supported environment/auth-store credentials. Supported
+provider IDs are `openai`, `anthropic`, `deepseek`, `moonshot`,
+`moonshot-coding`, `groq`, `openrouter`, `ollama`, and `custom`; other backends
+are refused. A local Ollama endpoint can use an already installed model
+without an API key.
 
-Any other ACP agent works via `ROBRIX_AGENT_CMD`, e.g. a Claude Code
-subscription: `ROBRIX_AGENT_CMD="claude-code-acp" cargo run --features a2app`
-(stdio composes, so `ROBRIX_AGENT_CMD="ssh myserver octos acp"` works too).
-`ROBRIX_AGENT_MODEL=<model>` is forwarded to that agent as `ANTHROPIC_MODEL`
-(the Claude-based agents read it); use `opus` when testing generation.
+Run with `cargo run --features a2app-embedded-agent`, then use **Manage data
+sharing rules** to allow the configured model recipient for the sources the
+agent or generator needs. A local endpoint also needs explicit source consent;
+Robrix cannot guarantee that the service itself will not forward data.
+
+The standalone ACP client remains in `a2app/agent` for legacy integrations and
+tests. `ROBRIX_AGENT_CMD` overrides, including Claude Code or remote SSH ACP
+commands, are rejected by Robrix's guarded workflows because they cannot
+mediate each model request. Unset that override when using the embedded
+provider. Select its model in AI Providers or the Octos configuration.
 
 ## Makepad pin
 
-Mini-app hosting needs three fixes to Makepad's Splash isolate host that are
-not upstream yet: inserted subtrees staying reachable across a widget-tree
-refresh, the script GC surviving a foreign-heap value, and panic containment
-at every isolate entry point (without which a mini-app can lose its renders
-or take Robrix down with it). They are up as makepad/makepad#1208, and the
-`makepad-widgets` pin points at the branch behind that PR
-(`kevinaboos/makepad` `splash_host_fixes`, which is Makepad `dev` plus those
-three commits). Move back to Robrix's shared pin once the PR lands.
+The workspace dependencies in `Cargo.toml` use `kevinaboos/makepad`'s
+`splash-host-io-cancel` branch for both widgets and the code editor.
+`Cargo.lock` currently resolves it to
+`a8a210f20822936d502727a8295fb06217609a6b`. The pin includes the Splash host
+I/O boundary, isolated validation, and cancellation integration required by
+this feature. The host I/O changes are tracked in
+[Makepad PR #1243](https://github.com/makepad/makepad/pull/1243).
+Keep the workspace dependency entries and lockfile aligned when updating it.
 
 ## Extra cargo features
 
 | Feature | Effect |
 |---|---|
-| `a2app-embedded-agent` | Link the octos agent **in-process** instead of spawning `octos acp` (required on iOS, where `exec()` is prohibited). |
+| `a2app-embedded-agent` | Link the octos agent **in-process** with the guarded model transport required by Robrix's AI rooms and generation. Also avoids subprocess execution on iOS. |
 | `a2app-persistent-guide` | Install the Splash dialect guide on the agent once, so per-turn prompts shrink to a pointer line. |
-| `a2app-research` | Let the agent research with its tools (web search/fetch) before generating, baking found data into the app as constants. |
+| `a2app-research` | Legacy pipeline research support. Guarded Robrix generation disables research tools; this feature does not bypass that restriction. |
 
 ## AI Rooms (agent chat sessions per Matrix room)
 
@@ -220,14 +228,168 @@ text plus the concrete arguments. Durable registration grants store the
 content hash; refusals are session-scoped. See `a2app/core/src/permissions.rs`
 (`tool_effective`) and `src/a2app/ai/tools.rs` (`MiniAppTool`).
 
-**octos's own web tools are kept too.** Sessions run under Robrix's octos
-profile (`a2app_agent::robrix_session_profile`), which is the built-in
-`hosted` envelope (no shell/files/search/memory/spawn) plus `group:web`:
-`web_search` (Tavily/Exa/DuckDuckGo/Brave/You.com/Perplexity, free fallback),
-`web_fetch` (read a page), and `browser`. These are octos-native, so Robrix
-does not execute or capability-gate them; the agent closes their live cards
-itself from the ACP `tool_call_update`. Everything Robrix registers above
-remains mediated and gated.
+**Web fetching goes through Robrix.** Room sessions use Robrix's host-owned
+`web_fetch` MCP tool; the octos native allowlist is empty. Native browsing,
+search, shell, files, memory and spawned agents cannot bypass the host's
+permission and information-flow checks. Redirects are refused; fetching a
+redirect destination requires a separate approved request.
+
+### Permission scopes and room protection
+
+Consent can cover all rooms or selected rooms and spaces, for the current
+room session, until Robrix closes, or persistently. A room session ends when
+that room is closed; restarting a mini-app isolate does not end a Robrix
+session grant. Session allowances never reach disk. Allow Once authorizes
+only the pending request, including its asynchronous completion. Subscriptions
+and requests to enable a permission use a selected duration instead.
+
+Global, room and ancestor-space blocks always override allowlists and app
+grants. Read and write are independent. Set the global write rule to Ask
+before allowing writes in selected testing rooms; leaving it Block prevents
+all room writes. Allowlists skip prompts for declared capabilities, while
+explicit per-app denials and restrictions still apply. Collection queries
+filter each actual room, and unresolved space ancestry fails closed when a
+space block might apply. Configured spaces and their nested subspaces must
+remain joined so sync events can invalidate membership changes; inaccessible
+or unjoined branches keep protection unresolved and visible in the editor.
+
+Internet consent supports an exact URL, an origin (scheme/host/port),
+an exact hostname, a hostname with subdomains, or all HTTP(S) sites. URL
+matching uses parsed URLs and DNS label boundaries. Mini-apps use the
+host's `network.http` service; raw Splash networking remains disabled.
+
+### Private data and information flow
+
+**Reading private data restricts all later output from that context.** The
+host joins account and room sources before delivering data, and checks that
+every source permits the actual recipient before output. Labels only grow;
+encoding, paraphrasing, model summaries, IPC and app-tool calls cannot remove
+them. An empty label is public. A room source permits return to that same
+room in the same account by default; other recipients require explicit
+source sharing rules. Account data requires its own rule even when the room
+already allows a recipient.
+
+Matrix room permission does not implicitly permit plaintext disclosure to
+its homeserver. App-selected API fields (such as search strings, event IDs,
+invite targets and state metadata) require a separate allowance for the
+actual homeserver origin before a request is sent, even in encrypted rooms.
+Cached event reads stay local; ordinary messages use the destination room's
+normal encryption and sharing checks.
+
+Mini Apps → **Manage data sharing rules** manages source-to-recipient allowances
+for a configured model service, an exact HTTP(S) origin, or a Matrix room.
+Choose one app in the current account, one exact app/room or agent context,
+or explicitly all readers. Rules can last for a room session, until Robrix
+closes, or persistently. Session rules stay in memory; closing the selected
+room or signing out expires them. These checks are additional to ordinary
+capability/URL permissions. Older source-wide rules retain their original
+scope until removed. Changing a rule applies to existing contexts; revocation cannot recall
+data already transmitted. Blocking a room's read access prevents new reads;
+it does not erase data, labels or agent history already retained. To stop
+future sharing of previously read data, remove its source sharing rules too.
+There is no selected-payload release, label reset or automatic declassification.
+
+The design follows the established floating-label approach described by
+[LIO's authors](https://www.scs.stanford.edu/~deian/pubs/stefan%3A2011%3Aflexible.pdf)
+and source/reader policy composition in [Jif](https://www.cs.cornell.edu/jif/doc/jif-3.0.0/overview.html).
+Robrix enforces labels dynamically at host boundaries, rather than adding a
+static type system to Splash or relying on model instructions or secret
+scanners. This is an implementation of those design principles, not a claim
+that their formal proofs establish the security of Robrix.
+
+**The host is the only route to external effects.** Makepad's opt-in
+`host_io_only` mode disables direct native networking, shared IPC and native
+exports in mini-app isolates, including nested isolates. Robrix's broker
+mediates network, Matrix operations, clipboard/export, app IPC and tool
+arguments/results. Uncontrolled exports and navigation are refused once
+private data is present; source restrictions transfer across app/agent
+boundaries before delivery. Normal app navigation transfers provenance to
+the opened app. Each account/app/room combination has a separate filesystem
+jail and persistent provenance. An app's source code and version history are
+still shared, so their provenance remains an inherited floor for every
+instance. Generating or editing private source cannot be laundered by opening
+it in another compartment.
+
+`information_flow.json`, outside app jails, records app/agent provenance,
+integrity influences, clearance bounds and permanent sharing rules. The host writes and syncs a replacement atomically before
+delivering newly labelled input. Write failures and corrupt/unsupported
+metadata block access instead of resetting labels. Old nonempty app storage
+or old private source with no recorded provenance receives `UnknownPrivate`,
+which cannot be released by a sharing rule. Closing, clearing a sandbox,
+restarting or reinstalling the same app does not erase its retained label.
+Migration preserves older app-wide labels as a conservative inherited floor.
+Old `app_data/<app>` files remain in their original directory; they are not
+automatically mounted in new compartments. App Info explains this and counts
+them in storage usage. Clear data removes both old files and new compartment
+files, while retaining provenance.
+
+**Public instances have an immutable empty clearance.** App Info → **Open
+public instance** creates separate storage and refuses room/account reads,
+private source code and private IPC input. Native text/paste/drop input is
+private account input, so it is also refused. The stock **Public Web** app
+provides a fixed public example.com fetch without text input. Ordinary internet
+consent still applies. Public workers can deliver public results through
+`ipc.post`; its fixed acknowledgement reveals no receiver existence or
+delivery status. `ipc.send` keeps its delivery receipt and therefore requires
+account read clearance. All delivered messages transfer both label dimensions
+before the receiver runs. Broader clearances are host-owned upper bounds on
+which sources a compartment may read; lowering a bound never removes taint.
+
+**Untrusted influence is separate from confidentiality.** Room content,
+internet/model responses, pasted/imported content and app/tool messages carry
+persistent integrity provenance. Sensitive operations require an additional
+user-issued authority for the exact context, operation and target after
+untrusted influence is present. Examples include room writes, app launches,
+tool invocation and non-GET/HEAD HTTP methods (scoped to that method and origin).
+The trusted sharing screen shows blocked operations, their influences, and
+room-session or Robrix-session approval options. It also shows accumulated
+private sources, actual recipients, and all sources blocking a disclosure,
+with direct access to the relevant sharing rule.
+
+Action approval captures the reviewed influence set and live activation.
+New influence, a closed context, a closed room session or explicit revocation
+can invalidate it. No app can endorse its own content or reset these labels.
+This constrains actions influenced by prompt injection; it does not classify
+instructions as malicious or make remote content trustworthy. Diagnostic
+history is bounded, local and metadata-only; request/response bodies are not
+recorded there.
+
+Every implemented broker service and incoming hook has an explicit source,
+destination and effect contract in `capabilities/flow.rs`. Unclassified
+services/hooks fail closed. Persistent context identities are distinct from
+live activation epochs: queued Matrix work, model requests and response
+delivery cannot regain authority when the same context is reopened.
+
+The headless adversarial tests execute actual Splash code through the host
+broker, including encoding, IPC, storage/restart, public workers, native I/O
+denial and queued revocation. Socket tests exercise real HTTP/model transports
+with controlled loopback peers. These tests do not replace live Matrix,
+provider or device end-to-end verification.
+
+**Cloud inference is also an external disclosure.** Protected room agents
+and generators require the embedded, host-controlled model transport.
+Each model request checks the current label, including tool feedback and
+compaction; subprocess ACP backends and provider fallback cannot receive a
+protected context. Model recipients identify the configured endpoint, model
+and a private credential fingerprint, so an allowance cannot silently move
+to a different service or account. A loopback endpoint still needs consent:
+the service may itself forward the data elsewhere.
+
+The initial guarded model transport supports text/tool requests to
+OpenAI-compatible and Anthropic APIs. It currently delivers the completed
+response rather than streaming tokens and refuses media inputs. Protected
+app generation runs without tools; it cannot use external research, shell or
+filesystem tools during generation.
+
+The stateless HTTP service checks source rules before DNS, immediately before
+the request, and before returning response data. It rejects ambient
+credentials, redirects, private/local addresses and unbounded payloads, pins
+the checked DNS addresses, and uses no shared cookie jar or automatic proxy.
+This boundary protects against explicit data flows through the mediated
+interfaces. It does not defend against a compromised Robrix/OS/VM, malicious
+changes to host-owned metadata, timing/resource side channels, or a recipient
+misusing information after the user permits disclosure. New host services
+must identify private inputs and output recipients before being exposed.
 
 ### Registering AI tools from an app
 
@@ -246,26 +408,39 @@ The app side (all on one group, `mcp-tools`):
   prompted per tool. The guide (`a2app/agent/src/splash_guide.md`, section
   "Letting the AI call your app") is the generator-facing reference.
 
-### Trying it offline (no API key)
+### Offline and keyless testing
 
-The octos `scenario` provider (`octos/crates/octos-llm/src/registry/`
-`scenario.rs`) is a deterministic, key-less model built for exactly this. After
-`sh a2app/dev/offline-ai-setup.sh` (writes `provider: "scenario"` to
-`~/.octos/config.json`), run the app and chat in an AI room:
+Existing mini-apps can run without a model or API key. For keyless AI testing,
+use the embedded feature with a running local OpenAI-compatible service and
+an already installed model. For example, these fields in the selected Octos
+configuration use Ollama's compatible API:
 
-```sh
-cargo run --features a2app-embedded-agent
+```json
+{
+  "provider": "ollama",
+  "base_url": "http://127.0.0.1:11434/v1",
+  "model": "your-installed-model",
+  "api_type": "openai"
+}
 ```
 
-- 1st message → `send_message` tool → a "pong" `ai_reply` card.
-- 2nd message → `launch_splash_app` → the offline demo installs a minimal
-  "this is a mini-app" app (the writer role's canned source — deliberately
-  free of `glass.*` widgets and `Fill` heights, both of which render blank in
-  the host's `Fit`-mounted Splash).
-- 3rd+ message → "pong" again.
+Replace the model name with one installed in that service, and select the
+same provider/model in AI Providers if a saved selection overrides the config.
+For a keyless compatible service, use `ollama` or `custom` and omit
+`api_key_env`; selecting a provider that requires a key still requires its
+credential even at a loopback URL. HTTP model endpoints must use a literal
+loopback address; other endpoints require HTTPS.
+Source sharing rules still apply, including for loopback. A local address
+identifies the recipient, not a guarantee that its processing stays offline.
 
-The sequence is tracked inside the session's scenario provider, not by
-scanning message history, because a failed turn makes octos drop history.
+The deterministic Octos `scenario` provider and
+`a2app/dev/offline-ai-setup.sh` belong to the earlier ACP demo. They are **not
+supported by the guarded Robrix transport** and no longer provide a working
+AI-room demo. The helper sets `provider: "scenario"` and a placeholder key;
+if previously used, replace that provider configuration and remove its
+`sk-dummy-testing` placeholder before testing a supported service. The
+headless transport and broker tests provide deterministic testing without
+live provider credentials.
 
 ### Notes for maintainers
 

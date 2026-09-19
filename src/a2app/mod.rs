@@ -25,6 +25,9 @@ pub mod host_pane;
 pub mod host_set;
 /// The registry of live (app, room) instances that surfaces adopt and release.
 pub mod instances;
+pub mod information_flow;
+pub mod data_sharing;
+pub mod network;
 /// The Mini Apps management screen (a top-level navigation tab page).
 pub mod mini_apps_screen;
 /// Selects an installed mini-app for a particular room or space.
@@ -48,6 +51,7 @@ pub mod timeline_card;
 pub fn script_mod(vm: &mut ScriptVm) {
     host_set::script_mod(vm);
     permission_prompt::script_mod(vm);
+    data_sharing::script_mod(vm);
     ai_room_events::script_mod(vm);
     ai_room_panel::script_mod(vm);
     host_pane::script_mod(vm);

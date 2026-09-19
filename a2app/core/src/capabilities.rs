@@ -9,6 +9,9 @@
 
 use crate::permissions::Permission;
 
+mod flow;
+pub use flow::{FlowContract, FlowOutput, FlowPeer, FlowSource};
+
 /// Whether the ability only observes, changes something durable, does
 /// both in one call, or just triggers a transient host/OS side effect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -230,7 +233,7 @@ pub const CATALOG: &[Capability] = &[
     cap!("on_quit", "Quit", "Best-effort before teardown (close, restart on caps change); skipped on force stop and Restrict; capped to one event pass; fs writes are the only sane use.", Read, Incoming, Instance, None, PlannedNewPlumbing, Low, []),
     cap!("on_low_memory", "Memory pressure", "Called when the host is about to collect harder; drop caches or be stopped.", Read, Incoming, Instance, None, PlannedNewPlumbing, Low, []),
     // ----- network -----
-    cap!("network.http", "HTTP requests", "mod.net.http_request from the isolate; traps in a netless isolate, which is why a grant change restarts the app.", ReadWrite, Outgoing, Device, Some(P::Network), Available, High, []),
+    cap!("network.http", "HTTP requests", "Host-mediated HTTP requests; every destination must pass internet and data-sharing rules.", ReadWrite, Outgoing, Device, Some(P::Network), Available, High, ["network.http"]),
     // ----- location -----
     cap!("device.location.read", "Current location", "One fix: CoreLocation first, city-level IP geolocation on failure; waiting requests share one fix.", Read, Outgoing, Device, Some(P::Location), Available, High, ["location.get"]),
     cap!("on_location", "Location updates", "A fix stream after events.subscribe('on_location', {min_interval_secs}); stops while suspended.", Read, Incoming, Device, Some(P::Location), PlannedNewPlumbing, High, []),
@@ -243,6 +246,7 @@ pub const CATALOG: &[Capability] = &[
     cap!("device.clipboard.read", "Read clipboard", "Clipboard text, 64KB cap; macOS only today (pbpaste off-thread), other platforms answer an error.", Read, Outgoing, Device, Some(P::ClipboardRead), Available, High, ["clipboard.read"]),
     // ----- ipc -----
     cap!("ipc.send", "Message another app", "Fire-and-forget JSON to another installed app's running isolates; refused unless the target declares ipc and is not denied.", Write, Outgoing, Apps, Some(P::Ipc), Available, Medium, ["ipc.send"]),
+    cap!("ipc.post", "Post without a receipt", "One-way JSON delivery with a fixed acknowledgement. Does not reveal whether the target exists, accepts messages or received it; suitable for public fetch compartments.", Write, Outgoing, Apps, Some(P::Ipc), Available, Medium, ["ipc.post"]),
     cap!("on_ipc_message", "Receive app messages", "Called when another app or a sibling instance sends to this one. Opted into by declaring ipc and defining the hook; a Denied ipc shuts the inbox. No queue bound today.", Read, Incoming, Apps, Some(P::Ipc), Available, Low, ["on_ipc_message"]),
     cap!("ipc.request", "Ask another app", "Send and await one reply with a timeout; the target's on_ipc_request returns the answer. A pending table keyed (heap, req_id) means a dead target cannot hang the caller.", ReadWrite, Outgoing, Apps, Some(P::Ipc), PlannedNewPlumbing, Medium, []),
     cap!("on_ipc_request", "Answer another app", "Called with a request from another app; the return value is the reply.", Read, Incoming, Apps, Some(P::Ipc), PlannedNewPlumbing, Low, []),
@@ -485,6 +489,49 @@ mod tests {
         assert_eq!(for_service("matrix.room_members").unwrap().id, "matrix.room.members.read");
         assert_eq!(for_hook("on_ipc_message").unwrap().group, Some(Permission::Ipc));
         assert!(for_service("nope").is_none());
+    }
+
+    #[test]
+    fn every_implemented_capability_has_an_explicit_flow_contract() {
+        for capability in CATALOG.iter().filter(|capability| capability.is_available()) {
+            assert!(capability.flow_contract().is_some(), "{} has no information-flow contract", capability.id);
+        }
+        assert!(flow::contract("matrix.room.new_unclassified_read").is_none());
+        assert!(flow::contract("on_new_unclassified_hook").is_none());
+        assert!(flow::contract("host.composer.get").is_none());
+    }
+
+    #[test]
+    fn flow_contracts_do_not_infer_authority_from_read_or_write_names() {
+        assert_eq!(for_service("network.http").unwrap().flow_contract().unwrap().output, FlowOutput::Network);
+        assert_eq!(for_service("matrix.event").unwrap().flow_contract().unwrap().output, FlowOutput::MatrixServer);
+        assert_eq!(for_service("matrix.rooms_search").unwrap().flow_contract().unwrap().output, FlowOutput::Local);
+        assert_eq!(for_service("composer.insert").unwrap().flow_contract().unwrap().output, FlowOutput::TargetRoom);
+        assert!(for_service("matrix.send_message").unwrap().flow_contract().unwrap().privileged_effect);
+        assert_eq!(for_hook("on_tool_call").unwrap().flow_contract().unwrap().source, FlowSource::Peer);
+    }
+
+    #[test]
+    fn every_builtin_host_request_and_hook_has_a_contract() {
+        for app in crate::builtin::builtin_apps() {
+            // Stock scripts use literal service/hook names. Check their real
+            // source so adding a service to a sample cannot skip classification.
+            for remainder in app.source.split("host.request(").skip(1) {
+                let remainder = remainder.trim_start();
+                let Some(remainder) = remainder.strip_prefix('"') else { continue };
+                let service = remainder.split('"').next().unwrap();
+                let capability = for_service(service).unwrap_or_else(|| panic!("{} calls unknown service {service}", app.id));
+                assert!(capability.flow_contract().is_some(), "{} calls unclassified {service}", app.id);
+            }
+            for remainder in app.source.split("fn on_").skip(1) {
+                let name = format!("on_{}", remainder.split('(').next().unwrap().trim());
+                // Apps may also name ordinary callback functions on_results,
+                // on_watch, etc.; only registered host hooks are authority.
+                if let Some(capability) = for_hook(&name) {
+                    assert!(capability.flow_contract().is_some(), "{} defines unclassified {name}", app.id);
+                }
+            }
+        }
     }
 
     /// The mini-app tool bridge resolves: registration/invocation are gated by

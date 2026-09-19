@@ -9,6 +9,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 use makepad_widgets::*;
 use makepad_widgets::widget_async::gc_dead_splash_isolates;
@@ -42,6 +43,9 @@ impl Surface {
 struct MiniAppInstance {
     host: WidgetRef,
     heap_key: Option<usize>,
+    flow_context: a2app_core::information_flow::ContextId,
+    flow_epoch: u64,
+    alive: Arc<AtomicBool>,
     /// Content size the script was last told about.
     last_size: Vec2d,
     pending_resize: Option<Vec2d>,
@@ -60,6 +64,13 @@ impl MiniAppInstance {
             Some(_) => true,
             None => false,
         }
+    }
+}
+
+impl Drop for MiniAppInstance {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+        let _ = a2app_core::information_flow::remove_context_for_activation(&self.flow_context, self.flow_epoch);
     }
 }
 
@@ -115,7 +126,42 @@ fn splash_of(cx: &mut Cx, host: &WidgetRef) -> WidgetRef {
 
 /// Instantiates a host and evals the app into a fresh isolate, parked
 /// under the tree root. All isolate config lands BEFORE the source evals.
-fn spawn(cx: &mut Cx, manifest: &MiniAppManifest, grants: &[String], key: &InstanceKey) -> Option<(WidgetRef, Option<usize>)> {
+fn spawn(cx: &mut Cx, manifest: &MiniAppManifest, _grants: &[String], key: &InstanceKey, public: bool) -> Option<(WidgetRef, Option<usize>, a2app_core::information_flow::ContextId)> {
+    let context = if public {
+        super::information_flow::account().map(|account| a2app_core::information_flow::ContextId::PublicApp { account, app: manifest.id.clone() })
+    } else {
+        super::information_flow::app_context(&manifest.id, key.1.as_deref().map(|r| r.as_str()))
+    };
+    let flow_context = match context
+        .and_then(|context| {
+            a2app_core::information_flow::register_context_with_legacy_data(&context, super::information_flow::manifest_has_private_source(manifest))?;
+            if public {
+                // Public code and storage are checked before evaluating a
+                // single instruction. Its empty clearance cannot be raised.
+                a2app_core::information_flow::set_clearance(&context, Some(Default::default()))?;
+            } else if let Some(room) = &key.1 {
+                a2app_core::information_flow::add_sources(&context, [super::information_flow::room_source(&context, room.as_str())])?;
+            } else {
+                a2app_core::information_flow::add_sources(&context, [super::information_flow::account_source(&context)])?;
+            }
+            Ok(context)
+        })
+    {
+        Ok(context) => context,
+        Err(error) => {
+            crate::shared::popup_list::enqueue_popup_notification(error, crate::shared::popup_list::PopupKind::Error, Some(8.0));
+            return None;
+        }
+    };
+    let sandbox = match a2app_core::information_flow::context_storage_path(&flow_context) {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = a2app_core::information_flow::remove_context(&flow_context);
+            crate::shared::popup_list::enqueue_popup_notification(error, crate::shared::popup_list::PopupKind::Error, Some(8.0));
+            return None;
+        }
+    };
+    let grants = super::runtime::grants_in_room(&manifest.id, key.1.as_deref().map(|r| r.as_str()));
     let Some(template) = with_registry(|r| r.host_template.clone()) else {
         error!("BUG: no mini-app host template registered");
         return None;
@@ -128,8 +174,9 @@ fn spawn(cx: &mut Cx, manifest: &MiniAppManifest, grants: &[String], key: &Insta
 
     let tag = tag_of(key);
     if let Some(mut splash) = splash_of(cx, &host).borrow_mut::<Splash>() {
-        splash.set_allow_net(grants.iter().any(|g| g == "network"));
-        splash.set_sandbox_dir(cx, Some(a2app_core::app_sandbox_dir(&manifest.id)));
+        splash.set_host_io_only(true);
+        splash.set_allow_net(false);
+        splash.set_sandbox_dir(cx, Some(sandbox));
         splash.set_host_tag(cx, Some(tag));
         splash.set_host_caps(cx, grants.to_vec());
         splash.set_host_prompts(cx, true);
@@ -138,7 +185,7 @@ fn spawn(cx: &mut Cx, manifest: &MiniAppManifest, grants: &[String], key: &Insta
     splash_of(cx, &host).set_text(cx, &manifest.source);
     let heap_key = splash_of(cx, &host).borrow_mut::<Splash>()
         .and_then(|mut splash| splash.isolate_heap_key(cx));
-    Some((host, heap_key))
+    Some((host, heap_key, flow_context))
 }
 
 /// The host for `key`, creating its isolate if it isn't running yet.
@@ -150,14 +197,29 @@ pub fn ensure(
     grants: &[String],
     seed: PaneLayout,
 ) -> Option<WidgetRef> {
+    ensure_mode(cx, key, manifest, grants, seed, false)
+}
+
+/// Starts an isolated public worker with no room/account read clearance.
+///
+/// Callers must release an existing standalone private instance first.
+pub fn ensure_public(cx: &mut Cx, manifest: &MiniAppManifest, grants: &[String], seed: PaneLayout) -> Option<WidgetRef> {
+    ensure_mode(cx, &(manifest.id.clone(), None), manifest, grants, seed, true)
+}
+
+fn ensure_mode(cx: &mut Cx, key: &InstanceKey, manifest: &MiniAppManifest, grants: &[String], seed: PaneLayout, public: bool) -> Option<WidgetRef> {
     if let Some(host) = host_of(key) {
         return Some(host);
     }
-    let (host, heap_key) = spawn(cx, manifest, grants, key)?;
+    let (host, heap_key, flow_context) = spawn(cx, manifest, grants, key, public)?;
+    let flow_epoch = a2app_core::information_flow::context_epoch(&flow_context).ok()?;
     with_registry(|r| {
         r.instances.insert(key.clone(), MiniAppInstance {
             host: host.clone(),
             heap_key,
+            flow_context,
+            flow_epoch,
+            alive: Arc::new(AtomicBool::new(true)),
             last_size: Vec2d::default(),
             pending_resize: None,
             layout: seed,
@@ -281,6 +343,23 @@ pub fn key_of_heap(heap_key: usize) -> Option<InstanceKey> {
             .find(|(_, i)| i.heap_key == Some(heap_key))
             .map(|(k, _)| k.clone())
     })
+}
+
+pub fn context_of_heap(heap_key: usize) -> Option<a2app_core::information_flow::ContextId> {
+    with_registry(|r| r.instances.values().find(|i| i.heap_key == Some(heap_key)).map(|i| i.flow_context.clone()))
+}
+
+pub fn context_of_host(host: &WidgetRef) -> Option<a2app_core::information_flow::ContextId> {
+    with_registry(|r| r.instances.values().find(|instance| instance.host.widget_uid() == host.widget_uid())
+        .map(|instance| instance.flow_context.clone()))
+}
+
+pub fn lifetime_of_heap(heap_key: usize) -> Option<Arc<AtomicBool>> {
+    with_registry(|r| r.instances.values().find(|i| i.heap_key == Some(heap_key)).map(|i| i.alive.clone()))
+}
+
+pub fn context_of_key(key: &InstanceKey) -> Option<a2app_core::information_flow::ContextId> {
+    with_registry(|r| r.instances.get(key).map(|i| i.flow_context.clone()))
 }
 
 pub fn layout(key: &InstanceKey) -> PaneLayout {
@@ -429,6 +508,7 @@ pub fn flush_pending(cx: &mut Cx) {
     }
     let trace = std::env::var_os("ROBRIX_A2APP_TRACE_SERVICES").is_some();
     for (host, size) in resizes {
+        if !hook_allowed(&host, live_id!(on_app_resize), &[]) { continue; }
         if let Some(mut splash) = splash_of(cx, &host).borrow_mut::<Splash>() {
             let called = splash.call_script_fn(cx, live_id!(on_app_resize), &[size.x.into(), size.y.into()]);
             if trace {
@@ -439,6 +519,7 @@ pub fn flush_pending(cx: &mut Cx) {
         }
     }
     for (host, hook, payload) in hooks {
+        if !hook_allowed(&host, hook, &[&payload]) { continue; }
         if let Some(mut splash) = splash_of(cx, &host).borrow_mut::<Splash>() {
             let called = splash.call_script_fn_with_strings(cx, hook, &[&payload]);
             if trace {
@@ -465,15 +546,17 @@ pub fn handle_network_responses(cx: &mut Cx, event: &Event, scope: &mut Scope) {
 
 /// Pushes a new caps list into every instance of the app and invokes its
 /// optional `on_permissions_changed(caps)` hook.
-pub fn update_app_caps(cx: &mut Cx, app_id: &str, grants: Vec<String>) {
-    let caps_json = serde_json::to_string(&grants).unwrap_or_else(|_| String::from("[]"));
-    let hosts: Vec<WidgetRef> = with_registry(|r| {
+pub fn update_app_caps(cx: &mut Cx, app_id: &str, _grants: Vec<String>) {
+    let hosts: Vec<(Option<OwnedRoomId>, WidgetRef)> = with_registry(|r| {
         r.instances.iter()
             .filter(|((app, _), _)| app == app_id)
-            .map(|(_, i)| i.host.clone())
+            .map(|((_, room), i)| (room.clone(), i.host.clone()))
             .collect()
     });
-    for host in hosts {
+    for (room, host) in hosts {
+        let grants = super::runtime::grants_in_room(app_id, room.as_deref().map(|r| r.as_str()));
+        let caps_json = serde_json::to_string(&grants).unwrap_or_else(|_| String::from("[]"));
+        if !hook_allowed(&host, live_id!(on_permissions_changed), &[&caps_json]) { continue; }
         if let Some(mut splash) = splash_of(cx, &host).borrow_mut::<Splash>() {
             splash.set_host_caps(cx, grants.clone());
             splash.call_script_fn_with_strings(cx, live_id!(on_permissions_changed), &[&caps_json]);
@@ -484,14 +567,19 @@ pub fn update_app_caps(cx: &mut Cx, app_id: &str, grants: Vec<String>) {
 /// Delivers an IPC message to every instance of `to` except the sender's
 /// own isolate. Returns whether anything received it.
 pub fn deliver_ipc(cx: &mut Cx, from_heap: usize, from: &str, to: &str, data_json: &str) -> bool {
-    let hosts: Vec<WidgetRef> = with_registry(|r| {
+    let Ok(sender) = super::information_flow::context_for_heap(from_heap) else { return false };
+    let hosts: Vec<_> = with_registry(|r| {
         r.instances.iter()
             .filter(|((app, _), i)| app == to && i.heap_key != Some(from_heap))
-            .map(|(_, i)| i.host.clone())
+            .map(|(_, i)| (i.host.clone(), i.flow_context.clone()))
             .collect()
     });
     let mut delivered = false;
-    for host in hosts {
+    for (host, receiver) in hosts {
+        if super::information_flow::current_context(&receiver).is_err()
+            || a2app_core::information_flow::transfer(&sender, &receiver).is_err()
+        { continue; }
+        if !hook_allowed(&host, live_id!(on_ipc_message), &[from, data_json]) { continue; }
         if let Some(mut splash) = splash_of(cx, &host).borrow_mut::<Splash>() {
             delivered |= splash.call_script_fn_with_strings(cx, live_id!(on_ipc_message), &[from, data_json]);
         }
@@ -499,9 +587,17 @@ pub fn deliver_ipc(cx: &mut Cx, from_heap: usize, from: &str, to: &str, data_jso
     delivered
 }
 
+fn hook_allowed(host: &WidgetRef, hook: LiveId, args: &[&str]) -> bool {
+    let heap = with_registry(|registry| registry.instances.values()
+        .find(|instance| instance.host == *host).and_then(|instance| instance.heap_key));
+    heap.is_some_and(|heap| super::information_flow::record_hook(heap, hook, args).is_ok())
+}
+
 /// Calls an optional top-level script hook with string arguments.
 /// Returns whether the script defined it.
 pub fn call_hook(cx: &mut Cx, key: &InstanceKey, hook: LiveId, args: &[&str]) -> bool {
+    let Some(heap) = heap_of(key) else { return false };
+    if super::information_flow::record_hook(heap, hook, args).is_err() { return false; }
     let Some(host) = host_of(key) else { return false };
     let called = splash_of(cx, &host).borrow_mut::<Splash>()
         .is_some_and(|mut splash| splash.call_script_fn_with_strings(cx, hook, args));

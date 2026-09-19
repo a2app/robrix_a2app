@@ -302,7 +302,7 @@ and scope (this room, account, device, app-local). Available today:
 | notifications | `notifications.post`, `notifications.clear` | write · device |
 | clipboard-read | `device.clipboard.read` | read · device |
 | clipboard-write | `device.clipboard.write` | write · device |
-| ipc | `ipc.send` (write), `ipc.apps.list` (read), `on_ipc_message` (Robrix→app hook) | app-local |
+| ipc | `ipc.send` / `ipc.post` (write), `ipc.apps.list` (read), `on_ipc_message` (Robrix→app hook) | app-local |
 | mcp-tools | `mcp.tools.register` (write), `mcp.tools.unregister` (write), `on_tool_call` (Robrix→app hook) | app-local · high risk |
 | open-url | `device.url.open` | write · device |
 | share | `device.share` | write · device |
@@ -536,7 +536,7 @@ back to sensible demo content, keep every screen populated, and never leave
 a button that silently does nothing. An app that only works when granted is
 a broken app.
 
-Two doorways:
+All I/O goes through the host:
 
 - `host.request(service, args_or_nil, fn(r){ ... })` — async broker call;
   `r.is_ok` / `r.data` (parsed JSON) / `r.error`. NOTE it is `r.is_ok`, not
@@ -553,10 +553,39 @@ Two doorways:
   `"permissions.query"`, `"permissions.request"`, the `"nav.*"` and
   `"composer.*"` services (see Acting inside Robrix below).
   `host.capabilities()` / `host.has("network")` report current grants.
-- `mod.net.http_request(mod.net.HttpRequest{url: u}, mod.net.HttpEvents{
-  on_response: fn(res){ ... res.body.parse_json() ... }, on_error: fn(e){}})`
-  — ONLY inside a `host.has("network")` check; the call traps in a netless
-  isolate. `res.body` can be nil; guard before parsing.
+- HTTP uses `host.request("network.http", {url: u}, fn(r){ ... })`.
+  A success returns `r.data.status`, `r.data.headers`, and a UTF-8 string
+  `r.data.body`; parse the body only when the HTTP status and content fit
+  your app. Supported arguments are `url`, optional `method` (GET by default),
+  optional string `headers`, and optional text `body`. The host bounds request
+  and response sizes. Handle refusal and non-success HTTP status with useful
+  fallback content. Native `mod.net` and socket calls are unavailable.
+
+```splash
+fn fetch_data(url){
+    host.request("network.http", {url: url}, fn(r){
+        if !r.is_ok { ui.status.set_text("Network unavailable — showing saved data") return nil }
+        if r.data.status < 200 || r.data.status >= 300 {
+            ui.status.set_text("The site did not return data") return nil
+        }
+        let result = r.data.body.parse_json()
+        if result.is_object() { ui.status.set_text("Data received") }
+    })
+}
+```
+
+The user may allow one URL, origin, hostname/domain, or all sites, for
+selected rooms and a chosen lifetime. A generic network capability is never
+an instruction to bypass those destination rules. Redirects are not followed;
+request a new destination separately. Authorization/cookie headers, ambient
+credentials, proxies and local network addresses are not supported.
+
+Permission to read data is separate from permission to send it. Once an app
+has private room/account data (including its own persisted or derived data),
+the user's source-sharing rules must allow the destination of every outgoing
+request. The app cannot remove that restriction by sending only a summary,
+encoding text, restarting, or choosing a constant URL. It must handle that
+refusal without trying another route.
 
 A grant can also be taken away WHILE the app runs. Three rules:
 - Check `host.has("x")` right before you use it, never once at boot and
@@ -564,8 +593,7 @@ A grant can also be taken away WHILE the app runs. Three rules:
 - Define `fn on_permissions_changed(caps)` (top level) to re-sync anything
   that depends on a capability: `caps` is a JSON array string, so
   `caps.parse_json()` gives you the current list. Hide the affordance, or
-  show why it failed. (A NETWORK change restarts the app instead, so boot
-  code re-runs.)
+  show why it failed. Every host HTTP request checks current permissions.
 - Never leave stale UI claiming something you can no longer do — a label
   saying "live" over data you can't refresh is worse than the fallback.
 
@@ -904,13 +932,24 @@ be `nil`.
 Needs `ipc`: `"ipc.apps_list"` -> `{apps: [{app_id, name, running}]}`, the
 installed apps that accept `ipc.send`.
 
+For fetching public web data without exposing private room data, the user can
+launch a separate public instance from Mini Apps. Its storage and memory are
+isolated, and private inputs are blocked. It can fetch through `network.http`
+and send public results one way with `host.request("ipc.post", {to: app_id,
+data: result}, callback)`. The recipient may combine the result with private
+data; it also inherits the website and sender influences. `ipc.post` always
+returns `{accepted: true}` and does not reveal whether a receiver exists or
+accepted the message. No private reply can return to the public instance.
+Normal `ipc.send` remains a request/reply path with source checks both ways.
+Opening a public instance never clears existing private provenance.
+
 ## Hard rules
 
 1. Reply with the COMPLETE script; it must be self-contained and runnable.
 2. Exactly one root `View{` as the last expression.
 3. Never use: `use`, `import`, `Root`, `Window`, `live_design`, `sys.`,
    `fetch`, `Image{`, `<` JSX `>`, CSS, or HTML. Network only through
-   `mod.net` gated on `host.has("network")` as above.
+   `host.request("network.http", ...)` as above; ambient `mod.net` is disabled.
 4. Every interactive element updates the UI through `ui.<name>.set_*` /
    `.render()` calls — never assume a mutation redraws by itself.
 5. Keep it small: under ~150 lines. Polished and readable at ANY host size:

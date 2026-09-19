@@ -8,19 +8,10 @@
 //! (only `~/.octos/config.json` — an `octos init` from any machine — is
 //! needed for the provider).
 //!
-//! The agent itself is built by octos, not by us: `AcpCommand::factory()` is
-//! the same factory `octos acp` serves over stdio, so this backend gets
-//! provider fallback routing, the auth store, `keychain:` markers, MCP,
-//! plugins, skills, memory-bank tools and the config precedence rules
-//! identically — and keeps getting them as octos changes.
-//!
-//! It used to reimplement that assembly by hand against octos-llm/-memory,
-//! which meant a subset that drifted: a key in the auth store or behind a
-//! `keychain:` marker was invisible, and the backend reported "no provider"
-//! where the child process would have run fine. What is left here is only the
-//! parts octos does NOT own — the thread and its runtime, the command loop,
-//! the reporter that reduces octos's progress events to the pipeline's
-//! vocabulary, and the per-turn history rules.
+//! Protected sessions assemble a minimal agent with Robrix's guarded provider.
+//! They do not import Octos plugins, fallback providers, persistent history,
+//! embeddings, bootstrap files, or shell tools. Unprotected standalone callers
+//! retain the upstream ACP factory.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,17 +91,15 @@ impl EmbeddedOctos {
     /// (`build_with_mcp`) instead, which connects them per session; on iOS the
     /// caller passes none (the agent cannot exec the relay child there).
     ///
-    /// `host_managed` scopes octos's own toolset: `true` applies the built-in
-    /// `hosted` profile (zero octos-native tools), so the only tools the model
-    /// can call are the ones this session advertises through `mcp_servers`.
-    /// The one-shot app-generation agent passes `false` and keeps octos's
-    /// default `coding` surface.
+    /// With a model context, room sessions get only host MCP tools; generation sessions have no tools. Unprotected standalone
+    /// calls use the upstream factory and its normal coding surface.
     pub fn start(
         workspace: &Path,
         prefs: &AgentPrefs,
         mcp_servers: &[RobrixMcpServerConfig],
         host_managed: bool,
         network_approval: Option<Arc<dyn crate::NetworkApproval>>,
+        model_context: Option<a2app_core::information_flow::ContextId>,
     ) -> Result<Self, String> {
         std::fs::create_dir_all(workspace).ok();
         let (evt_tx, events) = std::sync::mpsc::channel();
@@ -121,7 +110,7 @@ impl EmbeddedOctos {
         let sd = shutdown.clone();
         let servers = mcp_servers.to_vec();
         std::thread::spawn(move || {
-            agent_thread(ws, prefs, servers, host_managed, network_approval, cmd_rx, evt_tx, sd)
+            agent_thread(ws, prefs, servers, host_managed, network_approval, model_context, cmd_rx, evt_tx, sd)
         });
         Ok(Self { events, cmd_tx, shutdown })
     }
@@ -178,6 +167,7 @@ fn agent_thread(
     mcp_servers: Vec<RobrixMcpServerConfig>,
     host_managed: bool,
     network_approval: Option<Arc<dyn crate::NetworkApproval>>,
+    model_context: Option<a2app_core::information_flow::ContextId>,
     cmd_rx: Receiver<Cmd>,
     evt_tx: Sender<AcpEvent>,
     shutdown: Arc<Shutdown>,
@@ -187,7 +177,7 @@ fn agent_thread(
     // in the `cargo run` console instead of vanishing into a dead subscriber.
     // Robrix itself doesn't use tracing, so this prints octos lines only.
     #[cfg(debug_assertions)]
-    {
+    if model_context.is_none() {
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)
             .with_writer(std::io::stderr)
@@ -200,7 +190,17 @@ fn agent_thread(
             .try_init();
     }
 
+    // Dependency diagnostics may contain model content. Keep protected tasks
+    // off global tracing subscribers, including spawned runtime worker tasks.
+    let protected = model_context.is_some();
+    let _private_trace = protected.then(|| tracing::subscriber::set_default(tracing::subscriber::NoSubscriber::default()));
     let rt = match tokio::runtime::Builder::new_multi_thread()
+        .on_thread_start(move || {
+            if protected {
+                PRIVATE_TRACE.with(|guard| *guard.borrow_mut() = Some(tracing::subscriber::set_default(tracing::subscriber::NoSubscriber::default())));
+            }
+        })
+        .on_thread_stop(|| { PRIVATE_TRACE.with(|guard| { guard.borrow_mut().take(); }); })
         .worker_threads(2)
         // Deep agent futures; octos's own entrypoints use an 8MB stack.
         .thread_stack_size(8 * 1024 * 1024)
@@ -214,12 +214,24 @@ fn agent_thread(
         }
     };
 
+    let empty_memory = if protected {
+        match tempfile::Builder::new().prefix("guarded_empty_").tempdir_in(&workspace) {
+            Ok(directory) => Some(directory),
+            Err(_) => {
+                send(&evt_tx, AcpEvent::ProcessGone("Could not create isolated agent memory.".into()));
+                return;
+            }
+        }
+    } else { None };
+
     let agent = match rt.block_on(build_agent(
         &workspace,
         &prefs,
         &shutdown,
         &mcp_servers,
         host_managed,
+        model_context,
+        empty_memory.as_ref().map(|directory| directory.path()),
     )) {
         Ok(agent) => agent,
         Err(e) => {
@@ -248,36 +260,19 @@ fn agent_thread(
     }
 }
 
-/// Builds the agent through octos's own ACP factory.
-///
-/// Everything that used to live here by hand — reading config.json, resolving
-/// the provider and its key, constructing the tool registry and episode store
-/// — is octos's job now, done exactly as `octos acp` does it.
-///
-/// Note what is NOT overridden: the data dir. It is tempting to point the
-/// episode store at a private scratch dir so a user running their own
-/// octos can't contend for the redb lock — this code used to. But an explicit
-/// `data_dir` also makes octos treat the context as explicit and moves
-/// `config_home` to that same dir (`resolve_config_context`), so it looks for
-/// `config.json` in the scratch dir, finds none, and reports "no LLM provider
-/// configured" no matter how the user actually set octos up. That isolation is
-/// for tenants, and we are not one.
-///
-/// Sharing `~/.octos` is what the child process does anyway — `octos acp` is
-/// spawned without `--data-dir` — so this is parity, not a regression. It is
-/// also safe to share now: the episode store's redb lock is exclusive, and
-/// octos degrades to a memory-less handle rather than failing when someone
-/// else holds it (octos-org/octos#1914). Before that it failed outright, and
-/// the holder was usually us — an agent's thread only releases the store when
-/// it reaches a checkpoint and drops, so Stop-then-Send landed inside that
-/// window and died.
+/// Uses the guarded assembly for private contexts, otherwise the ACP factory.
 async fn build_agent(
     workspace: &Path,
     prefs: &AgentPrefs,
     shutdown: &Arc<Shutdown>,
     mcp_servers: &[RobrixMcpServerConfig],
     host_managed: bool,
+    model_context: Option<a2app_core::information_flow::ContextId>,
+    empty_memory: Option<&Path>,
 ) -> Result<Arc<octos_agent::Agent>, String> {
+    if let Some(context) = model_context {
+        return build_protected_agent(prefs, shutdown, mcp_servers, host_managed, context, empty_memory.ok_or("Missing isolated agent memory.")?).await;
+    }
     let cwd = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     let command = AcpCommand {
         cwd: Some(cwd.clone()),
@@ -295,9 +290,8 @@ async fn build_agent(
         provider: crate::providers::session_provider(),
         model: crate::prefs::Backend::detect().model_override(prefs),
         // Host-managed sessions (the room's long-lived agent) run Robrix's
-        // session profile: octos's registry is emptied of native tools except
-        // `group:web`, so the model can look things up / read pages and
-        // otherwise only call the tools Robrix advertised in `mcp_servers` —
+        // session profile: octos's registry is emptied of native tools, so
+        // it can only call tools Robrix advertised in `mcp_servers` —
         // every one mediated by Robrix. The one-shot app-generation agent
         // (host_managed = false) keeps the default `coding` surface.
         profile: if host_managed {
@@ -339,6 +333,57 @@ async fn build_agent(
         .await
         .map_err(|e| e.to_string())?;
     finish_agent(built, shutdown)
+}
+
+thread_local! {
+    static PRIVATE_TRACE: std::cell::RefCell<Option<tracing::subscriber::DefaultGuard>> = const { std::cell::RefCell::new(None) };
+}
+
+async fn build_protected_agent(
+    prefs: &AgentPrefs,
+    shutdown: &Arc<Shutdown>,
+    mcp_servers: &[RobrixMcpServerConfig],
+    host_managed: bool,
+    context: a2app_core::information_flow::ContextId,
+    empty_memory: &Path,
+) -> Result<Arc<octos_agent::Agent>, String> {
+    let flag = Arc::new(AtomicBool::new(false));
+    shutdown.adopt(flag.clone());
+    let provider = crate::model_transport::provider(prefs, context, flag.clone())?;
+    let mut tools = octos_agent::ToolRegistry::new();
+    if host_managed {
+        // Native web_fetch resolves DNS before host approval and owns its
+        // socket. Protected sessions may only use host-mediated MCP tools.
+        let servers: Vec<_> = mcp_servers.iter().map(|server| octos_agent::McpServerConfig {
+            command: Some(server.command.clone()), args: server.args.clone(),
+            env: std::collections::HashMap::new(), url: None, headers: std::collections::HashMap::new(),
+            oauth: false, scopes: Vec::new(), concurrency_class: None, tool_call_timeout_secs: Some(600),
+        }).collect();
+        if !servers.is_empty() {
+            octos_agent::McpClient::start(&servers).await
+                .map_err(|_| "Could not connect the host's agent tools.")?.register_tools(&mut tools);
+        }
+    }
+    // Octos requires an EpisodeStore handle even with history disabled. A
+    // fresh per-session directory prevents reading anyone else's old memory;
+    // save_episodes=false and no embedder prevent storing private content.
+    let memory = octos_memory::EpisodeStore::open(empty_memory).await
+        .map_err(|_| "Could not initialize isolated agent memory.")?;
+    let config = octos_agent::AgentConfig {
+        max_iterations: MAX_ITERATIONS, save_episodes: false, suppress_auto_send_files: true,
+        format_after_edit: false, ..Default::default()
+    };
+    let prompt = if host_managed {
+        "You are the room's assistant. Use only the host's advertised tools. Private data may be shared only where the host allows it."
+    } else {
+        "You create Robrix mini-apps. Return the complete app in a fenced splash code block as requested. You have no filesystem or research tools."
+    };
+    let agent = octos_agent::Agent::new(octos_core::AgentId::new("robrix-protected"), provider, tools, Arc::new(memory))
+        .with_config(config).with_shutdown(flag).with_system_prompt(prompt.into());
+    let agent = Arc::new(agent);
+    #[cfg(feature = "persistent-guide")]
+    agent.append_system_prompt(crate::SPLASH_GUIDE);
+    Ok(agent)
 }
 
 /// Adopts the agent's shutdown flag and applies our own additions.
@@ -402,7 +447,7 @@ impl octos_agent::ProgressReporter for Reporter {
                 send(&self.evt_tx, AcpEvent::ToolCall { id: tool_id, title: name });
             }
             // The terminal status of a tool call. Needed to close the live
-            // card for octos's own tools (web_search/web_fetch/browser),
+            // card for tools executed by the agent,
             // which Robrix does not itself execute and so cannot resolve.
             E::ToolCompleted { tool_id, success, output_preview, .. } => {
                 send(
@@ -481,10 +526,9 @@ async fn run_turn(
 
     let snapshot = history.clone();
     let process = agent.process_message(text, &snapshot, vec![]);
-    // Gate the agent's OWN web tools (web_search / web_fetch / browser) on the
-    // same permission system the Robrix MCP tools use: every host they reach
-    // must have been allowed for this room's AI. With no approval wired
-    // (the child `octos acp` backend), the tools fail closed inside octos.
+    // The legacy standalone factory can supply a native network callback.
+    // Protected sessions instead execute every tool through the host MCP
+    // server and pass None here.
     let outcome = match network_approval {
         Some(approval) => {
             let requester: Arc<dyn octos_agent::tools::NetworkAccessRequester> =

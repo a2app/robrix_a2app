@@ -2093,6 +2093,22 @@ impl RoomsListRef {
             .collect()
     }
 
+    /// Named room and space choices for the host's permission editors.
+    #[cfg(feature = "a2app")]
+    pub fn permission_targets(&self) -> Vec<(String, String, bool)> {
+        let mut targets: Vec<_> = crate::sliding_sync::get_client()
+            .map(|client| client.joined_rooms().into_iter().map(|room| {
+                let id = room.room_id().to_string();
+                let name = room.name().filter(|name| !name.is_empty())
+                    .or_else(|| self.get_room_name(&room.room_id().to_owned()).map(|r| r.display_name().to_string()))
+                    .unwrap_or_else(|| id.clone());
+                (id, name, room.is_space())
+            }).collect())
+            .unwrap_or_default();
+        targets.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase())));
+        targets
+    }
+
     /// Returns the currently-selected space (the one selected in the SpacesBar).
     pub fn get_selected_space(&self) -> Option<RoomNameId> {
         self.borrow()?.selected_space.clone()

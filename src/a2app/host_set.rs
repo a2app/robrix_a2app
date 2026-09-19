@@ -77,6 +77,27 @@ impl Widget for MiniAppHostArea {
         if let Some(host) = self.host.clone()
             && !matches!(event, Event::NetworkResponses(_))
         {
+            // Native input can carry pasted or dragged account data. Label
+            // before the isolate sees it, including keyboard-derived values.
+            if matches!(event, Event::TextInput(_) | Event::TextRangeReplace(_)
+                | Event::KeyDown(_) | Event::KeyUp(_) | Event::Drag(_) | Event::Drop(_))
+            {
+                let recorded = super::instances::context_of_host(&host)
+                    .ok_or("Mini-app input context is unavailable.".to_string())
+                    .and_then(|context| {
+                        super::information_flow::current_context(&context)?;
+                        a2app_core::information_flow::add_sources(&context,
+                            [super::information_flow::account_source(&context)])?;
+                        if matches!(event, Event::TextInput(input) if input.was_paste)
+                            || matches!(event, Event::TextRangeReplace(_) | Event::Drop(_))
+                        {
+                            a2app_core::information_flow::add_influences(&context,
+                                [a2app_core::information_flow::Influence::Unknown])?;
+                        }
+                        Ok(())
+                    });
+                if recorded.is_err() { return; }
+            }
             host.handle_event(cx, event, scope);
         }
     }

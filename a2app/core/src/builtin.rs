@@ -63,6 +63,7 @@ pub fn union_stock_declarations(manifest: &mut MiniAppManifest) {
 /// on purpose — don't add "just in case" entries.
 fn permissions_for(id: &str) -> Vec<String> {
     let p: &[&str] = match id {
+        "public-web" => &["network"],
         "room-peek" => &["matrix-room-info", "matrix-room-read", "matrix-room-send", "robrix-navigation", "matrix-room-watch"],
         "roll-call" => &["matrix-profile", "matrix-room-send"],
         "room-info" => &["matrix-room-info"],
@@ -87,6 +88,7 @@ fn permissions_for(id: &str) -> Vec<String> {
 /// `.splash` header.
 fn reasons_for(id: &str) -> std::collections::BTreeMap<String, String> {
     let r: &[(&str, &str)] = match id {
+        "public-web" => &[("network", "Fetches https://example.com/ when you press the button.")],
         "room-peek" => &[
             ("matrix-room-info", "Shows this room's name and member count."),
             ("matrix-room-read", "Lists the latest messages in this room and their reactions."),
@@ -181,6 +183,7 @@ pub fn stock(id: &str) -> Option<MiniAppManifest> {
 /// The pre-installed apps: always present, can't be uninstalled.
 pub fn builtin_apps() -> Vec<MiniAppManifest> {
     vec![
+        app("public-web", "Public Web", "🌐", 0x2A7F92, app_source!("public_web.splash")),
         app("room-peek", "Room Peek", "👀", 0x4A90D9, app_source!("room_peek.splash")),
         app("roll-call", "Roll Call", "🎲", 0x7C6CF0, app_source!("roll_call.splash")),
         app("room-info", "Room Info", "🏷", 0x2E86AB, app_source!("room_info.splash")),
@@ -208,7 +211,7 @@ mod tests {
     #[test]
     fn catalog_matches_the_splash_headers() {
         let apps = builtin_apps();
-        assert_eq!(apps.len(), 15);
+        assert_eq!(apps.len(), 16);
         for m in &apps {
             assert!(m.builtin);
             assert!(m.widget.is_none());
@@ -232,6 +235,7 @@ mod tests {
         assert_eq!(runs_in("spaces"), RunsIn::Spaces);
         assert_eq!(runs_in("account"), RunsIn::Account);
         assert_eq!(runs_in("inspector"), RunsIn::Account);
+        assert_eq!(runs_in("public-web"), RunsIn::Account);
     }
 
     /// Every stock app must parse with the real Splash parser, or it would

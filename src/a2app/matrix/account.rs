@@ -9,6 +9,7 @@ use crate::sliding_sync::{current_user_id, get_blocked_users, get_client, is_use
 
 pub(super) async fn user_profile(user_id: OwnedUserId) -> Result<String, String> {
     let client = get_client().ok_or("not logged in")?;
+    super::policy::ensure_server_output(client.homeserver().as_str())?;
     let profile = client.account().fetch_user_profile_of(&user_id).await
         .map_err(|e| format!("couldn't fetch the profile: {e}"))?;
     let display_name = profile.get_static::<DisplayName>().ok().flatten()
@@ -26,6 +27,7 @@ pub(super) async fn dm_find(user_id: OwnedUserId) -> Result<String, String> {
     let Some(room) = client.get_dm_room(&user_id) else {
         return Ok(serde_json::json!({ "room_id": null, "name": null }).to_string());
     };
+    super::policy::ensure_room_access(room.room_id().as_str(), a2app_core::permissions::RoomAccess::Read)?;
     Ok(serde_json::json!({
         "room_id": room.room_id(),
         "name": room_name(&room).await,

@@ -52,7 +52,7 @@ fn cost_of(service: &str) -> f64 {
         "env" | "permissions.query" | "events.subscribe" | "events.unsubscribe"
         | "ui.pane.read" | "host.prefs" | "device.info" | "ipc.apps_list" => 1.0,
         // Touch host state or another isolate.
-        "notify.post" | "notify.clear" | "clipboard.write" | "ipc.send" => 1.0,
+        "notify.post" | "notify.clear" | "clipboard.write" | "ipc.send" | "ipc.post" => 1.0,
         // Leave the process: network, a child process, the OS.
         "location.get" | "clipboard.read" | "permissions.request" | "storage.quota" => 5.0,
         // Priced by domain where the services live.

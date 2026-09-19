@@ -10,6 +10,7 @@ use crate::home::rooms_list::{enqueue_rooms_list_update, RoomsListUpdate};
 use crate::sliding_sync::get_client;
 
 pub(super) async fn message(room_id: OwnedRoomId, body: String) -> Result<String, String> {
+    super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
     room.send(RoomMessageEventContent::text_plain(body)).await
@@ -25,8 +26,10 @@ pub(super) async fn reply(
 ) -> Result<String, String> {
     use matrix_sdk::room::reply::{EnforceThread, Reply};
     use matrix_sdk::ruma::events::room::message::{AddMentions, ReplyWithinThread, RoomMessageEventContentWithoutRelation};
+    super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
+    super::policy::ensure_server_output(client.homeserver().as_str())?;
     // A thread post isn't a reply to the root, so it gets no mention; a plain
     // reply mentions its target the way the composer does.
     let reply = if in_thread {
@@ -36,6 +39,8 @@ pub(super) async fn reply(
     };
     let content = room.make_reply_event(RoomMessageEventContentWithoutRelation::text_plain(body), reply).await
         .map_err(|e| format!("couldn't build the reply: {e}"))?;
+    super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
+    super::policy::ensure_server_output(client.homeserver().as_str())?;
     let sent = room.send(content).await
         .map_err(|e| format!("couldn't send the reply: {e}"))?;
     Ok(serde_json::json!({ "event_id": sent.response.event_id }).to_string())
@@ -46,8 +51,10 @@ pub(super) async fn react(room_id: OwnedRoomId, event_id: OwnedEventId, key: Str
     use matrix_sdk::ruma::events::reaction::ReactionEventContent;
     use matrix_sdk::ruma::events::relation::{Annotation, RelationType};
     use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent};
+    super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
+    super::policy::ensure_server_output(client.homeserver().as_str())?;
     // Page through the event's reactions until we find our own with this key.
     let mut from = None;
     let mine = loop {
@@ -56,6 +63,7 @@ pub(super) async fn react(room_id: OwnedRoomId, event_id: OwnedEventId, key: Str
             include_relations: IncludeRelations::RelationsOfType(RelationType::Annotation),
             ..Default::default()
         };
+        super::policy::ensure_server_output(client.homeserver().as_str())?;
         let page = room.relations(event_id.clone(), opts).await
             .map_err(|e| format!("couldn't load the reactions: {e}"))?;
         let found = page.chunk.iter().find_map(|event| {
@@ -70,6 +78,8 @@ pub(super) async fn react(room_id: OwnedRoomId, event_id: OwnedEventId, key: Str
         }
         from = page.prev_batch_token;
     };
+    super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
+    super::policy::ensure_server_output(client.homeserver().as_str())?;
     let added = match mine {
         Some(reaction_id) => {
             room.redact(&reaction_id, None, None).await
@@ -86,8 +96,10 @@ pub(super) async fn react(room_id: OwnedRoomId, event_id: OwnedEventId, key: Str
 }
 
 pub(super) async fn typing(room_id: OwnedRoomId, typing: bool) -> Result<String, String> {
+    super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
+    super::policy::ensure_server_output(client.homeserver().as_str())?;
     room.typing_notice(typing).await
         .map_err(|e| format!("couldn't send the typing notice: {e}"))?;
     Ok(String::from("{}"))
@@ -99,8 +111,10 @@ pub(super) async fn read_receipt(room_id: OwnedRoomId, event_id: Option<OwnedEve
     use matrix_sdk::ruma::events::receipt::ReceiptThread;
     use matrix_sdk_base::latest_event::LatestEventValue;
     use crate::settings::app_preferences::preferred_receipt_type;
+    super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
+    super::policy::ensure_server_output(client.homeserver().as_str())?;
     let receipt_type = preferred_receipt_type();
     if let Some(event_id) = event_id {
         room.send_single_receipt(receipt_type, ReceiptThread::Unthreaded, event_id).await
@@ -126,14 +140,18 @@ pub(super) async fn read_receipt(room_id: OwnedRoomId, event_id: Option<OwnedEve
     } else {
         receipts.public_read_receipt(latest)
     };
+    super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
+    super::policy::ensure_server_output(client.homeserver().as_str())?;
     room.send_multiple_receipts(receipts).await
         .map_err(|e| format!("couldn't mark the room as read: {e}"))?;
     Ok(String::from("{}"))
 }
 
 pub(super) async fn pin(room_id: OwnedRoomId, event_id: OwnedEventId, pinned: bool) -> Result<String, String> {
+    super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
+    super::policy::ensure_server_output(client.homeserver().as_str())?;
     let result = if pinned {
         room.pin_event(&event_id).await
     } else {
@@ -144,8 +162,10 @@ pub(super) async fn pin(room_id: OwnedRoomId, event_id: OwnedEventId, pinned: bo
 }
 
 pub(super) async fn room_flag(room_id: OwnedRoomId, flag: RoomFlag, on: bool) -> Result<String, String> {
+    super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
+    super::policy::ensure_server_output(client.homeserver().as_str())?;
     let result = match flag {
         RoomFlag::Favorite => room.set_is_favourite(on, None).await,
         RoomFlag::LowPriority => room.set_is_low_priority(on, None).await,

@@ -98,6 +98,9 @@ async fn member_name(room: &Room, user_id: &UserId) -> String {
 /// Runs on the matrix worker's tokio runtime, so `start_watch` is the normal entry point.
 pub async fn watch_room(room_id: OwnedRoomId) {
     let post = |kind| {
+        if !matches!(kind, RoomWatchKind::Closed)
+            && !crate::a2app::matrix::policy::global_room_access_allowed(room_id.as_str(), a2app_core::permissions::RoomAccess::Read)
+        { return; }
         Cx::post_action(A2AppRoomWatchEvent { room_id: room_id.clone(), kind });
         SignalToUI::set_ui_signal();
     };

@@ -25,20 +25,28 @@ serde_json = "1.0"
 octos-agent = { git = "https://github.com/gterzian/octos", branch = "acp-embedding-seam", default-features = false, optional = true }
 octos-core  = { git = "https://github.com/gterzian/octos", branch = "acp-embedding-seam", optional = true }
 octos-cli   = { git = "https://github.com/gterzian/octos", branch = "acp-embedding-seam", optional = true }
-## Debug-only: surface octos's tracing (MCP connect, provider resolution) on
-## stderr in debug builds of the embedded backend. Not used in release builds.
+octos-llm   = { git = "https://github.com/gterzian/octos", branch = "acp-embedding-seam", optional = true }
+octos-memory = { git = "https://github.com/gterzian/octos", branch = "acp-embedding-seam", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+eyre = { version = "0.6", optional = true }
+sha2 = { version = "0.10", optional = true }
+getrandom = { version = "0.3", optional = true }
+tempfile = { version = "3", optional = true }
+url = { version = "2.5", optional = true }
+## Unprotected standalone agents can expose Octos diagnostics in debug builds.
+## Protected session threads suppress dependency tracing.
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 tracing = { version = "0.1", optional = true }
-tokio  = { version = "1", features = ["rt-multi-thread"], optional = true }
+tokio  = { version = "1", features = ["rt-multi-thread", "time", "macros"], optional = true }
 chrono = { version = "0.4", optional = true }
 async-trait = { version = "0.1", optional = true }
 
 [features]
 ## Link the octos agent INTO the host binary and run it on a thread, instead of
-## spawning `octos acp` as a child process. Same agent either way; this picks
-## how it runs, not what it is. The only local option on iOS, where exec() is
-## prohibited. ROBRIX_AGENT_CMD still wins over it.
-embedded = ["dep:octos-agent", "dep:octos-core", "dep:octos-cli", "dep:tokio", "dep:chrono", "dep:tracing-subscriber", "dep:tracing", "dep:async-trait"]
+## spawning `octos acp` as a child process. Required for private contexts,
+## whose model requests use Robrix's guarded transport and restricted tools.
+## External ACP overrides are refused for protected sessions.
+embedded = ["dep:octos-agent", "dep:octos-core", "dep:octos-cli", "dep:octos-llm", "dep:octos-memory", "dep:reqwest", "dep:eyre", "dep:sha2", "dep:getrandom", "dep:tempfile", "dep:url", "dep:tokio", "dep:chrono", "dep:tracing-subscriber", "dep:tracing", "dep:async-trait"]
 
 ## Install the Splash dialect guide ON THE AGENT once, so each prompt can
 ## point at it instead of inlining ~6KB of guide per generation.

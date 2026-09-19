@@ -15,6 +15,7 @@ use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedRoomOrAliasId, OwnedServe
 
 use a2app_core::services::{MatrixServiceCall, Reply, SearchScope};
 use a2app_core::services::matrix::RoomFlag;
+use a2app_core::permissions::{PermissionStore, PolicyDecision, RoomAccess};
 
 use crate::a2app::{account_watch, room_watch};
 use crate::shared::popup_list::{enqueue_popup_notification, PopupKind};
@@ -25,10 +26,16 @@ pub mod room;
 pub mod rooms;
 pub mod send;
 pub mod spaces;
+pub mod policy;
+pub use policy::{MatrixAuthorization, publish_permission_policy, publish_permission_policy_at_revision, filter_read_result};
 
 /// Matrix work requested by a mini-app (or a share), run on the worker.
 #[derive(Debug)]
 pub enum A2AppMatrixRequest {
+    /// Carries the original subject through async work and returned rows.
+    Authorized { authorization: MatrixAuthorization, request: Box<A2AppMatrixRequest> },
+    /// Rebuild the policy ancestry from SDK state, including unopened spaces.
+    RefreshPolicySpaces,
     RoomInfo { room_id: OwnedRoomId, reply: Reply },
     ReadMessages { room_id: OwnedRoomId, limit: u32, reply: Reply },
     SendMessage { room_id: OwnedRoomId, body: String, reply: Reply },
@@ -101,10 +108,104 @@ pub enum SearchRooms {
 
 /// A finished matrix service call, posted back to the UI thread so the
 /// result can re-enter the requesting isolate.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct A2AppMatrixResult {
     pub reply: Reply,
     pub result: Result<String, String>,
+    pub authorization: Option<MatrixAuthorization>,
+    pub target: Option<(String, RoomAccess)>,
+    pub reads_rooms: bool,
+}
+
+impl A2AppMatrixResult {
+    pub fn checked_result(&self, store: &PermissionStore) -> Result<String, String> {
+        let result = self.result.as_ref().map_err(Clone::clone)?;
+        if let Some(authorization) = &self.authorization {
+            authorization.check_flow(None, RoomAccess::Read)?;
+        }
+        if let Some((room, access)) = &self.target {
+            if store.room_policy(Some(room), *access) == PolicyDecision::Deny
+                || self.authorization.as_ref().is_some_and(|auth| !auth.permits(store, Some(room)))
+            {
+                return Err(policy::ROOM_ACCESS_DENIED.to_string());
+            }
+        }
+        if self.reads_rooms {
+            policy::filter_read_result(result, store, self.authorization.as_ref())
+        } else {
+            Ok(result.clone())
+        }
+    }
+}
+
+impl A2AppMatrixRequest {
+    pub fn authorized(self, subject: String, capability: &str, origin_room: Option<String>, consent: Box<PermissionStore>, flow_context: a2app_core::information_flow::ContextId) -> Self {
+        let flow_epoch = a2app_core::information_flow::context_epoch(&flow_context).ok();
+        Self::Authorized {
+            authorization: MatrixAuthorization { subject, capability: capability.to_string(), origin_room, consent, flow_context: Some(flow_context), flow_epoch },
+            request: Box::new(self),
+        }
+    }
+
+    fn reply(&self) -> Option<Reply> {
+        use A2AppMatrixRequest::*;
+        match self {
+            RoomInfo { reply, .. } | ReadMessages { reply, .. } | SendMessage { reply, .. }
+            | Profile { reply } | Members { reply, .. } | PinnedEvents { reply, .. }
+            | Threads { reply, .. } | RoomsList { reply } | Search { reply, .. }
+            | ThreadReplies { reply, .. } | OlderMessages { reply, .. } | Event { reply, .. }
+            | ReadReceipts { reply, .. } | Unread { reply, .. } | PowerLevels { reply, .. }
+            | Permalink { reply, .. } | Successor { reply, .. } | RoomsSearch { reply, .. }
+            | Invites { reply } | RoomPreview { reply, .. } | RoomsInfo { reply, .. }
+            | RoomsMessages { reply, .. } | Spaces { reply } | SpaceInfo { reply, .. }
+            | SpaceRooms { reply, .. } | UserProfile { reply, .. } | DmFind { reply, .. }
+            | Device { reply } | AccountInfo { reply } | IgnoredUsers { reply }
+            | Reply { reply, .. } | React { reply, .. } | Typing { reply, .. }
+            | ReadReceipt { reply, .. } | Pin { reply, .. } | RoomFlag { reply, .. }
+            | Invite { reply, .. } | Join { reply, .. } | InviteRespond { reply, .. }
+            | DmOpen { reply, .. } => Some(*reply),
+            Authorized { request, .. } => request.reply(),
+            RefreshPolicySpaces | WatchRoom { .. } | UnwatchRoom { .. }
+            | WatchAccount { .. } | ShareApp { .. } => None,
+        }
+    }
+
+    fn room_target(&self) -> Option<(String, RoomAccess, Option<Reply>)> {
+        use A2AppMatrixRequest::*;
+        let (room, access, reply) = match self {
+            RoomInfo { room_id, reply } | ReadMessages { room_id, reply, .. }
+            | Members { room_id, reply, .. } | PinnedEvents { room_id, reply }
+            | Threads { room_id, reply, .. } | ThreadReplies { room_id, reply, .. }
+            | OlderMessages { room_id, reply, .. } | Event { room_id, reply, .. }
+            | ReadReceipts { room_id, reply, .. } | Unread { room_id, reply }
+            | PowerLevels { room_id, reply } | Permalink { room_id, reply, .. }
+            | Successor { room_id, reply } | RoomsInfo { room_id, reply }
+            | RoomsMessages { room_id, reply, .. } => (room_id, RoomAccess::Read, Some(*reply)),
+            SpaceInfo { space_id, reply } => (space_id, RoomAccess::Read, Some(*reply)),
+            SendMessage { room_id, reply, .. } | Reply { room_id, reply, .. }
+            | React { room_id, reply, .. } | Typing { room_id, reply, .. }
+            | ReadReceipt { room_id, reply, .. } | Pin { room_id, reply, .. }
+            | RoomFlag { room_id, reply, .. } | Invite { room_id, reply, .. }
+            | InviteRespond { room_id, reply, .. } => (room_id, RoomAccess::Write, Some(*reply)),
+            WatchRoom { room_id } => (room_id, RoomAccess::Read, None),
+            ShareApp { room_id, .. } => (room_id, RoomAccess::Write, None),
+            Search { rooms: SearchRooms::One(room_id), reply, .. } => (room_id, RoomAccess::Read, Some(*reply)),
+            _ => return None,
+        };
+        Some((room.to_string(), access, reply))
+    }
+
+    fn reads_rooms(&self) -> bool {
+        use A2AppMatrixRequest::*;
+        matches!(self,
+            RoomInfo { .. } | ReadMessages { .. } | Members { .. } | PinnedEvents { .. }
+            | Threads { .. } | RoomsList { .. } | Search { .. } | ThreadReplies { .. }
+            | OlderMessages { .. } | Event { .. } | ReadReceipts { .. } | Unread { .. }
+            | PowerLevels { .. } | Permalink { .. } | Successor { .. } | RoomsSearch { .. }
+            | Invites { .. } | RoomPreview { .. } | RoomsInfo { .. } | RoomsMessages { .. }
+            | Spaces { .. } | SpaceInfo { .. } | SpaceRooms { .. } | DmFind { .. }
+        )
+    }
 }
 
 /// Maps a validated broker call onto the worker request that runs it.
@@ -304,9 +405,47 @@ pub(crate) fn clip_chars(s: &mut String, max: usize) {
 /// Runs one mini-app matrix operation on the worker's async runtime and
 /// posts the result back to the UI thread.
 pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
+    match request {
+        A2AppMatrixRequest::Authorized { authorization, request } => {
+            policy::with_authorization(authorization.clone(), run_matrix_request(*request, Some(authorization))).await;
+        }
+        request => run_matrix_request(request, None).await,
+    }
+}
+
+async fn run_matrix_request(request: A2AppMatrixRequest, authorization: Option<MatrixAuthorization>) {
     use crate::sliding_sync::{current_user_id, get_client};
 
+    let target = request.room_target();
+    let reads_rooms = request.reads_rooms();
+    if let Some(error) = authorization.as_ref().and_then(|authorization| authorization.check_flow(None, RoomAccess::Read).err()) {
+        if let Some(reply) = request.reply() {
+            Cx::post_action(A2AppMatrixResult { reply, result: Err(error), authorization,
+                target: target.map(|(room, access, _)| (room, access)), reads_rooms });
+            SignalToUI::set_ui_signal();
+        }
+        return;
+    }
+    if let Some((room, access, reply)) = &target {
+        if let Err(error) = policy::ensure_room_access(room, *access) {
+            if let Some(reply) = reply {
+                Cx::post_action(A2AppMatrixResult {
+                    reply: *reply, result: Err(error), authorization,
+                    target: Some((room.clone(), *access)), reads_rooms,
+                });
+                SignalToUI::set_ui_signal();
+            } else if matches!(&request, A2AppMatrixRequest::ShareApp { .. }) {
+                enqueue_popup_notification(error, PopupKind::Error, Some(5.0));
+            }
+            return;
+        }
+    }
     let (reply, result) = match request {
+        A2AppMatrixRequest::Authorized { .. } => unreachable!("authorization wrapper already removed"),
+        A2AppMatrixRequest::RefreshPolicySpaces => {
+            spaces::refresh_policy_spaces().await;
+            return;
+        }
         A2AppMatrixRequest::RoomInfo { room_id, reply } => (reply, room::info(room_id).await),
         A2AppMatrixRequest::ReadMessages { room_id, limit, reply } =>
             (reply, room::read_messages(room_id, limit, false).await),
@@ -414,32 +553,13 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
             }.await;
             (reply, result)
         }
-        A2AppMatrixRequest::RoomsList { reply } => {
-            let result: Result<String, String> = async {
-                let client = get_client().ok_or("not logged in")?;
-                let mut out: Vec<serde_json::Value> = Vec::new();
-                for room in client.joined_rooms() {
-                    out.push(serde_json::json!({
-                        "room_id": room.room_id(),
-                        "name": rooms::room_name(&room).await,
-                        "is_direct": room.is_direct().await.unwrap_or(false),
-                        "is_space": room.is_space(),
-                        "member_count": room.joined_members_count(),
-                        "is_encrypted": room.encryption_state().is_encrypted(),
-                        "unread": room.num_unread_messages(),
-                        "mentions": room.num_unread_mentions(),
-                    }));
-                }
-                Ok(serde_json::json!({ "rooms": out }).to_string())
-            }.await;
-            (reply, result)
-        }
+        A2AppMatrixRequest::RoomsList { reply } => (reply, rooms::joined_rooms_list().await),
         A2AppMatrixRequest::Search { rooms, query, limit, server, reply } => {
             use matrix_sdk::ruma::events::room::message::sanitize::remove_plain_reply_fallback;
             let result: Result<String, String> = async {
                 use matrix_sdk::ruma::events::{AnyMessageLikeEvent, AnySyncMessageLikeEvent, AnySyncTimelineEvent, AnyTimelineEvent, MessageLikeEvent, SyncMessageLikeEvent};
                 let client = get_client().ok_or("not logged in")?;
-                let targets: Vec<matrix_sdk::Room> = match rooms {
+                let mut targets: Vec<matrix_sdk::Room> = match rooms {
                     SearchRooms::One(id) => vec![client.get_room(&id).ok_or("room not found")?],
                     SearchRooms::AllJoined => client.joined_rooms().into_iter().filter(|r| !r.is_space()).collect(),
                     SearchRooms::Some(ids) => ids.iter()
@@ -447,10 +567,12 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
                         .filter(|r| r.state() == RoomState::Joined && !r.is_space())
                         .collect(),
                 };
+                targets.retain(|room| policy::room_access_allowed(room.room_id().as_str(), RoomAccess::Read));
                 let needle = query.to_lowercase();
                 let mut seen: HashSet<OwnedEventId> = HashSet::new();
                 let mut hits: Vec<(u64, serde_json::Value)> = Vec::new();
                 for room in &targets {
+                    if !policy::room_access_allowed(room.room_id().as_str(), RoomAccess::Read) { continue }
                     let room_name = room.cached_display_name()
                         .map(|n| n.to_string())
                         .unwrap_or_else(|| room.room_id().to_string());
@@ -496,6 +618,7 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
                 let mut server_used = false;
                 let unencrypted: Vec<OwnedRoomId> = targets.iter()
                     .filter(|r| !r.encryption_state().is_encrypted())
+                    .filter(|r| policy::room_access_allowed(r.room_id().as_str(), RoomAccess::Read))
                     .map(|r| r.room_id().to_owned())
                     .collect();
                 if server && !unencrypted.is_empty() {
@@ -509,6 +632,10 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
                     criteria.filter = filter;
                     let mut categories = Categories::new();
                     categories.room_events = Some(criteria);
+                    // Search terms are plaintext to the homeserver even when
+                    // their source was an encrypted room. Room output consent
+                    // does not authorize this distinct network recipient.
+                    policy::ensure_server_output(client.homeserver().as_str())?;
                     let response = client.send(Request::new(categories)).await
                         .map_err(|e| format!("server search failed: {e}"))?;
                     server_used = true;
@@ -517,6 +644,9 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
                         let Ok(AnyTimelineEvent::MessageLike(
                             AnyMessageLikeEvent::RoomMessage(MessageLikeEvent::Original(msg))
                         )) = raw.deserialize() else { continue };
+                        if !targets.iter().any(|room| room.room_id() == msg.room_id)
+                            || !policy::room_access_allowed(msg.room_id.as_str(), RoomAccess::Read)
+                        { continue }
                         if !seen.insert(msg.event_id.clone()) {
                             continue;
                         }
@@ -663,6 +793,15 @@ pub async fn handle_matrix_request(request: A2AppMatrixRequest) {
         A2AppMatrixRequest::DmOpen { user_id, reply } =>
             (reply, membership::dm_open(user_id).await),
     };
-    Cx::post_action(A2AppMatrixResult { reply, result });
+    let result = result.and_then(|result| {
+        if let Some((room, access, _)) = &target {
+            policy::ensure_room_access(room, *access)?;
+        }
+        if reads_rooms { policy::filter_current_read_result(&result) } else { Ok(result) }
+    });
+    Cx::post_action(A2AppMatrixResult {
+        reply, result, authorization,
+        target: target.map(|(room, access, _)| (room, access)), reads_rooms,
+    });
     SignalToUI::set_ui_signal();
 }

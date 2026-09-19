@@ -62,7 +62,9 @@ async fn watch_account() {
     let ended: Result<(), String> = async {
         let client = get_client().ok_or("not logged in")?;
         let mut updates = client.subscribe_to_all_room_updates();
-        let totals = || client.joined_rooms().iter().fold((0, 0), |(unread, mentions), room| {
+        let totals = || client.joined_rooms().iter()
+            .filter(|room| crate::a2app::matrix::policy::global_room_access_allowed(room.room_id().as_str(), a2app_core::permissions::RoomAccess::Read))
+            .fold((0, 0), |(unread, mentions), room| {
             (unread + room.num_unread_messages(), mentions + room.num_unread_mentions())
         });
         // What the room list shows per room; a sync that changes none of it
@@ -105,10 +107,15 @@ async fn watch_account() {
                 }
             }
             if !newly_joined.is_empty() || !left.is_empty() || !changed.is_empty() {
+                let allowed = |room: &OwnedRoomId| crate::a2app::matrix::policy::global_room_access_allowed(room.as_str(), a2app_core::permissions::RoomAccess::Read);
+                newly_joined.retain(&allowed);
+                left.retain(&allowed);
+                changed.retain(&allowed);
                 post(AccountWatchKind::RoomsChanged { joined: newly_joined, left, changed });
             }
             for room_id in update.invited.into_keys() {
                 if !invited.insert(room_id.clone()) { continue }
+                if !crate::a2app::matrix::policy::global_room_access_allowed(room_id.as_str(), a2app_core::permissions::RoomAccess::Read) { continue }
                 let Some(room) = client.get_room(&room_id) else { continue };
                 let Ok(invite) = room.invite_details().await else { continue };
                 let inviter_name = invite.inviter.as_ref()

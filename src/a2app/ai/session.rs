@@ -94,11 +94,14 @@ pub enum SessionJob {
     /// parking it behind a permission prompt on first use — then fetches the
     /// data on the async worker and answers here when the result lands.
     ReadTool { kind: ReadToolKind, answer: Sender<Result<String, String>> },
-    /// The agent's OWN internet tool (`web_search`, `web_fetch`, `browser`)
-    /// wants to reach `host`/`url`. The runtime decides against the room's
-    /// per-host allowlist — prompting the user the first time each host is
-    /// reached — and answers here when the user has decided. Blocks the
-    /// agent's web tool until then.
+    /// Host-owned HTTP GET. All DNS, redirects, and response delivery stay
+    /// behind the host's current permissions and private-data sharing rules.
+    FetchUrl {
+        url: String,
+        answer: Sender<Result<String, String>>,
+    },
+    /// Legacy permission-only callback. Protected sessions use FetchUrl,
+    /// whose transport stays inside Robrix, and never construct this job.
     NetworkAccess {
         tool: String,
         host: String,
@@ -220,6 +223,12 @@ impl AiHost for SessionHost {
             .map_err(|_| "this session ended before the message was posted".to_string())?
     }
 
+    fn fetch_url(&self, url: &str) -> Result<String, String> {
+        let (answer_tx, answer_rx) = channel();
+        self.submit(SessionJob::FetchUrl { url: url.to_string(), answer: answer_tx })?;
+        answer_rx.recv().map_err(|_| "this session ended before the URL fetch completed".to_string())?
+    }
+
     fn read_tool(&self, kind: ReadToolKind) -> Result<String, String> {
         let (answer_tx, answer_rx) = channel();
         self.submit(SessionJob::ReadTool { kind, answer: answer_tx })?;
@@ -285,8 +294,8 @@ pub enum SessionUpdate {
     /// turns this into the tool call's `Started` state event and matches its
     /// eventual outcome back to the same row.
     ToolCallStarted { name: String },
-    /// The agent finished one of its OWN tools (octos's `web_search`,
-    /// `web_fetch`, `browser`), which Robrix does not itself execute, so it
+    /// The agent finished executing a tool (host MCP tools in room
+    /// sessions), which Robrix does not itself execute, so it
     /// never sees the tool result through the MCP host. The runtime rewrites
     /// the call's live row `Done` with this outcome. A Robrix-registered tool
     /// is resolved by the host instead, so its late ACP completion finds no
@@ -338,6 +347,8 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 /// agent spawned sees EOF and exits.
 pub struct AiSession {
     room_id: OwnedRoomId,
+    flow_context: a2app_core::information_flow::ContextId,
+    flow_epoch: u64,
     transport: Box<dyn AgentTransport>,
     /// The live tool server: owns the socket and the shared, mutable registry
     /// that mini-app tools are added to and removed from. Dropping it closes
@@ -384,12 +395,20 @@ impl AiSession {
     ///
     /// The session agent is *host-managed* (`host_managed = true`): an octos
     /// backend runs Robrix's session profile, so octos's native tools
-    /// (shell/bash, file tools, memory, …) are absent — except its own web
-    /// tools (`web_search`, `web_fetch`, `browser`), which the profile keeps
-    /// so the agent can research or read a page on request. Everything else
+    /// (shell/bash, file tools, memory, and native internet tools) are absent.
+    /// The host supplies web_fetch through the same MCP bridge. Everything else
     /// the model can call is registered on `server` below and mediated by
     /// Robrix, mapping to capabilities shared with mini-apps.
-    pub fn start(room_id: OwnedRoomId, prefs: AgentPrefs) -> Result<Self, String> {
+    pub fn start(room_id: OwnedRoomId, prefs: AgentPrefs, model_context: a2app_core::information_flow::ContextId) -> Result<Self, String> {
+        let flow_epoch = a2app_core::information_flow::context_epoch(&model_context)?;
+        let result = Self::start_with_epoch(room_id, prefs, model_context.clone(), flow_epoch);
+        if result.is_err() {
+            let _ = a2app_core::information_flow::remove_context_for_activation(&model_context, flow_epoch);
+        }
+        result
+    }
+
+    fn start_with_epoch(room_id: OwnedRoomId, prefs: AgentPrefs, model_context: a2app_core::information_flow::ContextId, flow_epoch: u64) -> Result<Self, String> {
         // The rendezvous: serve threads send jobs here, the UI thread drains.
         let (jobs_tx, jobs_rx) = channel::<SessionJob>();
         let host = Arc::new(SessionHost { jobs: jobs_tx });
@@ -445,11 +464,15 @@ impl AiSession {
                 &prefs,
                 &[tool_server],
                 true,
-                Some(host as Arc<dyn a2app_agent::NetworkApproval>),
+                None,
+                Some(model_context.clone()),
             )?;
+        a2app_core::information_flow::ensure_context_epoch(&model_context, flow_epoch)?;
 
         Ok(Self {
             room_id,
+            flow_context: model_context,
+            flow_epoch,
             transport,
             server,
             mini_app_bridge,
@@ -741,6 +764,9 @@ impl AiSession {
 
 impl Drop for AiSession {
     fn drop(&mut self) {
+        // Direct removals from the runtime must invalidate queued work too.
+        // A late drop after replacement cannot retire the new activation.
+        let _ = a2app_core::information_flow::remove_context_for_activation(&self.flow_context, self.flow_epoch);
         // Unblock a serve thread still waiting on a launch_splash_app whose
         // generation the runtime was running: the socket is about to close,
         // so the tool must not hang. Dropping `transport` (kills the agent)

@@ -9,6 +9,7 @@
 pub mod acp_client;
 pub mod intent;
 pub mod mcp;
+pub mod model_transport;
 #[cfg(feature = "embedded")]
 mod octos_embedded;
 pub mod pipeline;
@@ -54,17 +55,11 @@ impl AgentTransport for AcpClient {
     }
 }
 
-/// A host-side gate for the agent's OWN internet tools (`web_search`,
-/// `web_fetch`, `browser`), which run inside octos rather than as Robrix MCP
-/// tools, so the capability broker never sees them.
+/// Legacy standalone callback for Octos-native internet tools.
 ///
-/// The in-process backend installs one of these per turn: before any of those
-/// tools opens a socket it calls [`NetworkApproval::approve`] with the host it
-/// means to reach, and the implementation blocks until the user has allowed
-/// or refused that host (via the same prompt the MCP tools use). Returning
-/// `Err(reason)` refuses the call and the reason is shown to the model. The
-/// child `octos acp` backend has no in-process callback channel today, so it
-/// wires no approval and the web tools fail closed there.
+/// Protected room sessions do not use this callback: their web_fetch tool
+/// runs entirely through Robrix's MCP HTTP broker. Permission-only callbacks
+/// cannot protect DNS, ambient proxy behavior, and the socket lifetime.
 pub trait NetworkApproval: Send + Sync {
     /// Decide whether the agent's web tool may reach `host`/`url`. Blocks
     /// until the UI answers. `Ok(())` allows; `Err(reason)` refuses with the
@@ -230,19 +225,20 @@ mod tests {
     }
 
     /// The profile Robrix hands octos must parse against octos's own schema,
-    /// keep the web tools, and evict every shell/file/search/memory tool. A
+    /// evict native internet tools and every shell/file/search/memory
+    /// tool plus browser/web_search whose redirects bypass URL approval. A
     /// typo here would make every AI-room session fail to start, and a too-wide
     /// allow list would silently re-open the native toolset.
     #[cfg(feature = "embedded")]
     #[test]
-    fn session_profile_parses_and_scopes_to_web_tools() {
+    fn session_profile_parses_and_disables_all_native_tools() {
         let def = octos_agent::profile::ProfileDefinition::from_json_str(
             super::ROBRIX_SESSION_PROFILE,
         )
         .expect("octos parses the session profile");
-        assert!(def.tools.allows("web_search"));
-        assert!(def.tools.allows("web_fetch"));
-        assert!(def.tools.allows("browser"));
+        assert!(!def.tools.allows("web_search"));
+        assert!(!def.tools.allows("web_fetch"));
+        assert!(!def.tools.allows("browser"));
         assert!(!def.tools.allows("shell"));
         assert!(!def.tools.allows("read_file"));
         assert!(!def.tools.allows("write_file"));
@@ -568,30 +564,17 @@ pub fn start_backend(
         "app-generation agent: extended thinking forced OFF for this run \
          (model pick kept, effort cleared, thinking=off)"
     );
-    start_backend_with_mcp(workspace, &prefs, &[], false, None)
+    start_backend_with_mcp(workspace, &prefs, &[], false, None, None)
 }
 
 /// Robrix's octos profile for its long-lived AI-room sessions, written to
 /// Robrix's own data root and returned as an absolute path for octos's
 /// `--profile` / `AcpCommand::profile`.
 ///
-/// octos's built-in `hosted` profile empties the native tool registry, so the
-/// only tools a session can call are the ones Robrix advertises over ACP
-/// `mcpServers` (every one capability-gated). Sessions want that envelope
-/// *plus* octos's own web tools — `web_search`, `web_fetch`, `browser`
-/// (`group:web`) — so the room agent can look something up or read a page when
-/// the user asks. octos resolves a profile by built-in name, by
-/// `~/.octos/profiles/<id>/`, or by an absolute path; writing the JSON under
-/// our own data root and passing the path keeps the user's `~/.octos`
-/// untouched.
-///
-/// Kept to `group:web`: shell, files, search, memory and sub-agent spawn stay
-/// out, exactly as `hosted` leaves them. The web tools are octos-native, but
-/// they are gated by Robrix's permission system too: the in-process backend
-/// installs a per-turn [`NetworkApproval`] bridge, so every host they reach
-/// must have been allowed for this room's AI (see [`NetworkApproval`]). The
-/// child `octos acp` backend has no in-process bridge and fails closed there.
-/// Everything Robrix registers is capability-gated as before.
+/// The native allowlist is empty. All tools, including web_fetch, are
+/// supplied by Robrix's MCP server so the host owns their I/O. The protected
+/// embedded assembly enforces the same restriction directly and does not
+/// import any global Octos profile or tool configuration.
 ///
 /// The file is rewritten only when its content changes, so a long-running app
 /// does not churn it while still picking up an edit on the next session start.
@@ -615,8 +598,8 @@ pub fn robrix_session_profile() -> Result<String, String> {
 const ROBRIX_SESSION_PROFILE: &str = r#"{
   "name": "robrix-session",
   "version": 1,
-  "description": "Robrix AI-room session: octos's own web tools only (group:web), with every other tool call mediated by Robrix's MCP server. Mirrors the built-in `hosted` profile plus web lookup/fetch so the room agent can research on request.",
-  "tools": { "mode": "allow_list", "tools": ["group:web"] },
+  "description": "Robrix AI-room session: all tools are mediated by Robrix's MCP server; native tools are unavailable.",
+  "tools": { "mode": "none" },
   "agents": []
 }
 "#;
@@ -635,23 +618,34 @@ const ROBRIX_SESSION_PROFILE: &str = r#"{
 /// all, so the config is dropped there; on desktop the embedded agent honors
 /// it exactly like the child process does.
 ///
-/// `host_managed` scopes the agent's own toolset. When `true`, the agent
-/// runs as a *host-managed* session: octos backends apply Robrix's session
-/// profile ([`robrix_session_profile`]) — the built-in `hosted` envelope
-/// (zero native shell/files/search/memory/spawn tools) plus `group:web`, so
-/// the only non-web tools the model can call are the ones Robrix advertises
-/// through `mcp_servers`, each mediated by Robrix and mapped to a mini-app
-/// capability. When `false` the backend keeps its own default toolset.
-/// Honored by the octos backends (embedded and `octos acp` child); a
-/// `ROBRIX_AGENT_CMD` override or the claude-code bridge brings its own
-/// tools and is left unchanged.
+/// A `model_context` selects the host-owned provider transport and requires
+/// the embedded backend. Protected room sessions (`host_managed=true`) get
+/// only the host's MCP tools; protected generation has no tools. Opaque ACP
+/// backends are refused because the host cannot enforce each model request.
+/// Standalone callers without a private context retain their default tools.
 pub fn start_backend_with_mcp(
     workspace: &std::path::Path,
     prefs: &prefs::AgentPrefs,
     mcp_servers: &[crate::mcp::McpServerConfig],
     host_managed: bool,
     network_approval: Option<std::sync::Arc<dyn NetworkApproval>>,
+    model_context: Option<a2app_core::information_flow::ContextId>,
 ) -> Result<Box<dyn AgentTransport>, String> {
+    if host_managed && model_context.is_none() {
+        return Err("A room agent needs a registered private-data context.".into());
+    }
+    if model_context.is_some() && (providers::agent_command().is_some() || !cfg!(feature = "embedded")) {
+        return Err("Private room data requires Robrix's embedded model transport. External ACP agents cannot enforce its sharing rules.".into());
+    }
+    #[cfg(feature = "embedded")]
+    if model_context.is_some() {
+        // Resolve without autodetection probes or factory config mutation.
+        model_transport::current_recipient(prefs)?;
+        let servers = if cfg!(target_os = "ios") { &[][..] } else { mcp_servers };
+        return Ok(Box::new(octos_embedded::EmbeddedOctos::start(
+            workspace, prefs, servers, host_managed, network_approval, model_context,
+        )?));
+    }
     // Used only by the in-process backend; the child-process backends have no
     // channel for it today and fail closed inside octos.
     let _ = &network_approval;
@@ -723,6 +717,7 @@ pub fn start_backend_with_mcp(
             mcp_servers,
             host_managed,
             network_approval,
+            model_context,
         )?));
     }
     #[cfg(not(feature = "embedded"))]
@@ -827,4 +822,3 @@ pub fn runtime(prefs: &prefs::AgentPrefs) -> Runtime {
         Runtime::Child(octos_acp_command(prefs))
     }
 }
-

@@ -5,15 +5,23 @@
 //! ```text
 //! <data_root>/
 //!   a2app_state.json          archived apps, recents
-//!   permissions.json          the user's grants
+//!   permissions.json         persistent capability grants and room/space rules
+//!   information_flow.json    retained provenance and permanent sharing rules
 //!   apps/<id>/manifest.json   one user/generated app's metadata
 //!   apps/<id>/app.splash      ...its source code, a real editable file
 //!   apps/<id>/widget.splash   ...its widget's source, if a bundle carried one
 //!   apps/<id>/versions/       ...every version it has been, timestamped
-//!   app_data/<id>/            ...its private storage (the Splash fs jail)
+//!   app_compartments/<hash>/  separate account/app/room or public-context jail
+//!   app_data/<id>/            retained legacy shared storage, not an active jail
 //! ```
 //!
-//! Built-in apps live in the binary/repo (`apps/*.splash`), never here.
+//! A compartment hash identifies the complete context, including public/private
+//! mode. Legacy files remain available for storage accounting and explicit
+//! deletion, but are never automatically mounted in a new compartment. Clearing
+//! data removes compartment and legacy files while retaining host provenance.
+//!
+//! Stock built-in apps live in the binary/repo (`apps/*.splash`); user-modified
+//! built-in overrides may also have manifests and source in this data root.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -42,7 +50,8 @@ pub fn save_permissions(store: &crate::permissions::PermissionStore) -> Result<(
     Ok(())
 }
 
-/// Saved grants, or the empty (all-Ask) store on a first run or unreadable file.
+/// Saved grants, or the default store on a first run or unreadable file.
+/// The default global write policy blocks room writes.
 pub fn load_permissions() -> crate::permissions::PermissionStore {
     let mut store: crate::permissions::PermissionStore = std::fs::read(data_root().join(PERMISSIONS_FILE_NAME))
         .ok()
@@ -325,15 +334,15 @@ pub fn ensure_current_version(
     save_user_app(manifest)
 }
 
-/// Bytes an app has stored in its private jail (`app_data/<id>/`), for the
-/// app info storage line.
+/// Bytes in an app's isolated compartments and retained legacy storage.
 pub fn app_data_bytes(id: &str) -> u64 {
     fn walk(dir: &std::path::Path) -> u64 {
         let Ok(read) = std::fs::read_dir(dir) else {
             return 0;
         };
         read.flatten()
-            .map(|e| match e.metadata() {
+            .map(|e| match std::fs::symlink_metadata(e.path()) {
+                Ok(m) if m.file_type().is_symlink() => 0,
                 Ok(m) if m.is_dir() => walk(&e.path()),
                 Ok(m) => m.len(),
                 Err(_) => 0,
@@ -343,22 +352,29 @@ pub fn app_data_bytes(id: &str) -> u64 {
     if !is_safe_app_id(id) {
         return 0;
     }
-    walk(&crate::app_sandbox_dir(id))
+    crate::information_flow::app_storage_paths(id)
+        .unwrap_or_else(|_| vec![crate::app_sandbox_dir(id)])
+        .iter().map(|path| walk(path)).sum()
 }
 
-/// Empties an app's private storage but keeps the app installed — the
-/// "Clear data" of a phone's app-info page.
-pub fn clear_app_data(id: &str) {
+/// Empties an app's compartment and retained legacy storage, keeping the app
+/// installed and its information-flow provenance intact.
+pub fn clear_app_data(id: &str) -> Result<(), String> {
     if !is_safe_app_id(id) {
-        return;
+        return Err("Invalid app identity.".into());
     }
-    let dir = crate::app_sandbox_dir(id);
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::create_dir_all(&dir);
+    for dir in crate::information_flow::app_storage_paths(id)? {
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Couldn't clear app storage: {error}")),
+        }
+    }
+    Ok(())
 }
 
-/// Removes an uninstalled app's code directory AND its private data — the OS
-/// convention: uninstalling an app deletes its storage.
+/// Removes an uninstalled app's code directory and retained legacy data.
+/// This does not remove compartment storage or information-flow provenance.
 pub fn remove_user_app(id: &str) {
     if !is_safe_app_id(id) {
         return;

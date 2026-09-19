@@ -33,6 +33,9 @@ use crate::a2app::ai_room_events::{
     AiReplyContent, AiRoomMarkerContent, AiSessionCursorContent,
 };
 use crate::utils::RoomNameId;
+use crate::a2app::matrix::{MatrixAuthorization, policy};
+use a2app_core::permissions::RoomAccess;
+use a2app_core::information_flow::{self as flow, ContextId, Recipient};
 
 /// Counter backing [`next_ai_state_key`], so two rows minted in the same
 /// nanosecond never collide.
@@ -70,7 +73,7 @@ pub enum AiRoomRequest {
     CheckMarker { room_id: OwnedRoomId },
     /// Persists the last-forwarded event id, best-effort: a failure here
     /// just means a restart re-forwards a few already-answered messages.
-    SaveCursor { room_id: OwnedRoomId, cursor: OwnedEventId },
+    SaveCursor { room_id: OwnedRoomId, cursor: OwnedEventId, flow_epoch: u64, flow_context: ContextId },
     /// Writes one agent turn (a completed reply, or a `send_message` tool
     /// call) as an `ai_reply` state event. `answer_id` is set when a tool
     /// call is parked on the write: the room may refuse it (too little state
@@ -79,6 +82,7 @@ pub enum AiRoomRequest {
         room_id: OwnedRoomId,
         content: AiReplyContent,
         answer_id: Option<u64>,
+        flow_epoch: u64, flow_context: ContextId,
     },
     /// Posts one agent turn into ANOTHER joined room as an `m.notice`
     /// message (the `post_room_message` tool). Unlike an `ai_reply` state
@@ -89,6 +93,7 @@ pub enum AiRoomRequest {
         id: u64,
         target: OwnedRoomId,
         content: AiReplyContent,
+        flow_epoch: u64, flow_context: ContextId,
     },
     /// Writes one raw AI-session activity state event (an `ai_activity`
     /// marker or an `ai_tool_call` row). The caller supplies the state key:
@@ -101,13 +106,14 @@ pub enum AiRoomRequest {
         event_type: String,
         state_key: String,
         content: serde_json::Value,
+        flow_epoch: u64, flow_context: ContextId,
     },
     /// A capability-gated attached-room read the session's agent asked for
     /// (already decided Granted by the runtime against the room's permission
     /// subject). Fetches the data and posts the result back as
     /// [`AiRoomAction::ToolReadResult`] under `id`, which the runtime uses to
     /// answer the parked tool call.
-    ToolRead { id: u64, room_id: OwnedRoomId, tool: ReadToolKind },
+    ToolRead { id: u64, room_id: OwnedRoomId, tool: ReadToolKind, authorization: Option<MatrixAuthorization>, flow_epoch: u64, flow_context: ContextId },
 }
 
 /// What [`handle_ai_room_request`] reports back to the UI thread.
@@ -134,7 +140,7 @@ pub enum AiRoomAction {
     PostToRoomResult { id: u64, result: Result<String, String> },
     /// A granted [`AiRoomRequest::ToolRead`] finished; `result` is the JSON
     /// text (or the error) the waiting tool call must be answered with.
-    ToolReadResult { id: u64, result: Result<String, String> },
+    ToolReadResult { id: u64, result: Result<String, String>, authorization: Option<MatrixAuthorization> },
     /// A state-event write finished (succeeded or failed). The runtime uses
     /// this to release the room's `ai_turn` in-flight flag — and to widen or
     /// narrow its write spacing — so the next coalesced turn snapshot can go
@@ -142,18 +148,35 @@ pub enum AiRoomAction {
     StateEventPosted { room_id: OwnedRoomId, event_type: String, success: bool },
 }
 
-/// Sends one best-effort AI state row with a capped retry policy. The SDK's
-/// default is to retry a rate-limited request without bound, which turns a
-/// single `429 M_LIMIT_EXCEEDED` into a long storm that competes with the
-/// reply and everything else in the room. These rows are advisory — the
-/// coalescing runtime re-sends the latest snapshot afterwards — so a few
-/// attempts are enough.
+/// Raw Matrix state remains plaintext even in encrypted rooms.
+///
+/// Room-output consent alone does not release private content to the
+/// homeserver. Check its exact origin separately, using captured provenance.
+fn ensure_ai_state_output(room: &Room, flow_context: &ContextId, action: &str) -> Result<(), String> {
+    policy::ensure_room_flow_output(flow_context, room.room_id().as_str())?;
+    policy::ensure_flow_action(flow_context, &flow::SensitiveAction {
+        kind: action.into(), target: room.room_id().to_string(),
+    })?;
+    let homeserver = room.client().homeserver();
+    let recipient = Recipient::network_origin(homeserver.as_str())?;
+    let origin = homeserver.origin().ascii_serialization();
+    policy::ensure_flow_output(flow_context, &recipient).map_err(|error| format!(
+        "{error} AI reply and activity cards are unencrypted Matrix state; their source sharing rules must also allow the homeserver origin {origin}."
+    ))
+}
+
+/// Sends one best-effort AI state row without HTTP retry/backoff.
+///
+/// The coalescing runtime submits later snapshots through a fresh policy
+/// check instead of retaining an unbounded rate-limit retry.
 async fn send_ai_state_event(
     room: &Room,
     event_type: &str,
     state_key: &str,
     content: serde_json::Value,
+    flow_context: &ContextId,
 ) -> Result<(), String> {
+    policy::ensure_room_access(room.room_id().as_str(), RoomAccess::Write)?;
     use matrix_sdk::ruma::api::client::state::send_state_event;
     use matrix_sdk::utils::IntoRawStateEventContent;
     let request = send_state_event::v3::Request::new_raw(
@@ -162,9 +185,8 @@ async fn send_ai_state_event(
         state_key.to_owned(),
         content.into_raw_state_event_content(),
     );
-    // Start from the client's config (keeping its 60s timeout and any
-    // concurrency cap) and only tighten the retry limit.
-    let config = room.client().request_config().retry_limit(3);
+    let config = room.client().request_config().disable_retry();
+    ensure_ai_state_output(room, flow_context, "ai.activity.write")?;
     room.client()
         .send(request)
         .with_request_config(config)
@@ -175,6 +197,22 @@ async fn send_ai_state_event(
 
 /// Runs one AI-room Matrix operation on the async worker.
 pub async fn handle_ai_room_request(request: AiRoomRequest) {
+    let activation = match &request {
+        AiRoomRequest::SaveCursor { flow_context, flow_epoch, .. }
+        | AiRoomRequest::PostReply { flow_context, flow_epoch, .. }
+        | AiRoomRequest::PostToRoom { flow_context, flow_epoch, .. }
+        | AiRoomRequest::PostAiStateEvent { flow_context, flow_epoch, .. }
+        | AiRoomRequest::ToolRead { flow_context, flow_epoch, .. } => Some((flow_context.clone(), *flow_epoch)),
+        AiRoomRequest::Create { .. } | AiRoomRequest::Mark { .. } | AiRoomRequest::CheckMarker { .. } => None,
+    };
+    if let Some((context, epoch)) = activation {
+        policy::with_flow_activation(context, epoch, handle_ai_room_request_inner(request)).await;
+    } else {
+        handle_ai_room_request_inner(request).await;
+    }
+}
+
+async fn handle_ai_room_request_inner(request: AiRoomRequest) {
     use crate::sliding_sync::get_client;
     match request {
         AiRoomRequest::Create { name } => {
@@ -205,38 +243,38 @@ pub async fn handle_ai_room_request(request: AiRoomRequest) {
                 Cx::post_action(action);
             }
         }
-        AiRoomRequest::SaveCursor { room_id, cursor } => {
+        AiRoomRequest::SaveCursor { room_id, cursor, flow_context, .. } => {
             let Some(room) = get_client().and_then(|c| c.get_room(&room_id)) else {
                 log!("AI Rooms worker: can't save cursor for {room_id}: room not found in client.");
                 return;
             };
-            if let Err(e) = save_cursor(&room, &cursor).await {
+            if let Err(e) = save_cursor(&room, &cursor, &flow_context).await {
                 warning!("Failed to save AI session cursor for room {room_id}: {e}");
             } else {
                 log!("AI Rooms worker: saved forwarding cursor {cursor} for {room_id}.");
             }
         }
-        AiRoomRequest::PostReply { room_id, content, answer_id } => {
+        AiRoomRequest::PostReply { room_id, content, answer_id, flow_context, .. } => {
             let Some(room) = get_client().and_then(|c| c.get_room(&room_id)) else {
                 let msg = format!("room {room_id} not found in client");
                 log!("AI Rooms worker: can't post ai_reply to {room_id}: {msg}");
                 Cx::post_action(AiRoomAction::PostReplyResult { room_id, answer_id, result: Err(msg) });
                 return;
             };
-            let result = post_reply(&room, &content).await;
+            let result = post_reply(&room, &content, &flow_context).await;
             if let Err(e) = &result {
                 log!("AI Rooms worker: FAILED to post ai_reply to {room_id}: {e}");
             }
             Cx::post_action(AiRoomAction::PostReplyResult { room_id, answer_id, result });
         }
-        AiRoomRequest::PostToRoom { id, target, content } => {
+        AiRoomRequest::PostToRoom { id, target, content, flow_context, .. } => {
             let Some(room) = get_client().and_then(|c| c.get_room(&target)) else {
                 let msg = format!("room {target} not found in client (are you still joined?)");
                 log!("AI Rooms worker: can't post a notice to {target}: {msg}");
                 Cx::post_action(AiRoomAction::PostToRoomResult { id, result: Err(msg) });
                 return;
             };
-            match post_notice(&room, &content).await {
+            match post_notice(&room, &content, &flow_context).await {
                 Ok(_) => {
                     Cx::post_action(AiRoomAction::PostToRoomResult {
                         id,
@@ -249,7 +287,7 @@ pub async fn handle_ai_room_request(request: AiRoomRequest) {
                 }
             }
         }
-        AiRoomRequest::PostAiStateEvent { room_id, event_type, state_key, content } => {
+        AiRoomRequest::PostAiStateEvent { room_id, event_type, state_key, content, flow_context, .. } => {
             let Some(room) = get_client().and_then(|c| c.get_room(&room_id)) else {
                 log!("AI Rooms worker: can't post {event_type} to {room_id}: room not found in client.");
                 // Still release the runtime's in-flight flag; the row is lost
@@ -257,7 +295,7 @@ pub async fn handle_ai_room_request(request: AiRoomRequest) {
                 Cx::post_action(AiRoomAction::StateEventPosted { room_id, event_type, success: false });
                 return;
             };
-            let success = match send_ai_state_event(&room, &event_type, &state_key, content).await {
+            let success = match send_ai_state_event(&room, &event_type, &state_key, content, &flow_context).await {
                 Ok(()) => true,
                 Err(e) => {
                     // Best-effort rows: a failure must not derail the turn (the
@@ -268,8 +306,33 @@ pub async fn handle_ai_room_request(request: AiRoomRequest) {
             };
             Cx::post_action(AiRoomAction::StateEventPosted { room_id, event_type, success });
         }
-        AiRoomRequest::ToolRead { id, room_id, tool } => {
-            let result = read_tool(&room_id, tool.clone()).await;
+        AiRoomRequest::ToolRead { id, room_id, tool, authorization, flow_context, .. } => {
+            let read = async {
+                policy::ensure_live_activation()?;
+                crate::a2app::information_flow::current_context(&flow_context)?;
+                let target = match &tool {
+                    ReadToolKind::OtherRoom { room, .. } => Some(room.as_str()),
+                    ReadToolKind::SpaceInfo { space } | ReadToolKind::SpaceRooms { space } => Some(space.as_str()),
+                    ReadToolKind::ListRooms | ReadToolKind::ListSpaces => None,
+                    _ => Some(room_id.as_str()),
+                };
+                if let Some(target) = target {
+                    policy::ensure_room_flow_output(&flow_context, target)?;
+                    policy::ensure_room_access(target, RoomAccess::Read)?;
+                }
+                let result = read_tool(&room_id, tool.clone(), &flow_context).await?;
+                policy::ensure_live_activation()?;
+                crate::a2app::information_flow::current_context(&flow_context)?;
+                if let Some(target) = target {
+                    policy::ensure_room_flow_output(&flow_context, target)?;
+                    policy::ensure_room_access(target, RoomAccess::Read)?;
+                }
+                policy::filter_current_read_result(&result)
+            };
+            let result = match &authorization {
+                Some(authorization) => policy::with_authorization(authorization.clone(), read).await,
+                None => read.await,
+            };
             match &result {
                 Ok(text) => log!(
                     "AI Rooms worker: {} for {} returned OK ({} chars).",
@@ -284,7 +347,7 @@ pub async fn handle_ai_room_request(request: AiRoomRequest) {
                     e
                 ),
             }
-            Cx::post_action(AiRoomAction::ToolReadResult { id, result });
+            Cx::post_action(AiRoomAction::ToolReadResult { id, result, authorization });
         }
     }
 }
@@ -292,7 +355,7 @@ pub async fn handle_ai_room_request(request: AiRoomRequest) {
 /// Runs one granted attached-room read against the same matrix machinery the
 /// mini-app services use (`matrix::room::*`), returning the same JSON text
 /// shapes a mini-app's `host.request` would get.
-async fn read_tool(room_id: &OwnedRoomId, tool: ReadToolKind) -> Result<String, String> {
+async fn read_tool(room_id: &OwnedRoomId, tool: ReadToolKind, flow_context: &ContextId) -> Result<String, String> {
     use crate::a2app::matrix::room as matrix_room;
     use crate::a2app::matrix::rooms as matrix_rooms;
     use crate::a2app::matrix::spaces as matrix_spaces;
@@ -328,7 +391,7 @@ async fn read_tool(room_id: &OwnedRoomId, tool: ReadToolKind) -> Result<String, 
             matrix_spaces::rooms(space).await
         }
         // Ungated plumbing (no capability): the agent recalling its own turns.
-        ReadToolKind::Memory { limit } => room_memory(room_id, limit).await,
+        ReadToolKind::Memory { limit } => room_memory(room_id, limit, flow_context).await,
     }
 }
 
@@ -340,7 +403,7 @@ async fn read_tool(room_id: &OwnedRoomId, tool: ReadToolKind) -> Result<String, 
 /// timeline, so both sources carry them. The text is deliberately NOT
 /// clipped: this is the agent's memory of its own work, and continuing that
 /// work needs it whole.
-async fn room_memory(room_id: &OwnedRoomId, limit: u32) -> Result<String, String> {
+async fn room_memory(room_id: &OwnedRoomId, limit: u32, flow_context: &ContextId) -> Result<String, String> {
     use matrix_sdk::room::MessagesOptions;
     use matrix_sdk::deserialized_responses::TimelineEvent;
 
@@ -399,6 +462,8 @@ async fn room_memory(room_id: &OwnedRoomId, limit: u32) -> Result<String, String
         out.clear();
         let mut from: Option<String> = None;
         for _ in 0..4 {
+            policy::ensure_room_access(room_id.as_str(), RoomAccess::Read)?;
+            policy::ensure_room_flow_output(flow_context, room_id.as_str())?;
             let mut options = MessagesOptions::backward();
             options.limit = 50u32.into();
             options.from = from;
@@ -661,11 +726,13 @@ async fn read_cursor(room: &Room) -> Option<AiSessionCursorContent> {
 }
 
 /// Persists the last-forwarded event id as room account data.
-async fn save_cursor(room: &Room, cursor: &OwnedEventId) -> Result<(), String> {
+async fn save_cursor(room: &Room, cursor: &OwnedEventId, flow_context: &ContextId) -> Result<(), String> {
+    policy::ensure_room_access(room.room_id().as_str(), RoomAccess::Write)?;
     let content = AiSessionCursorContent { cursor: Some(cursor.to_string()), last_turn: None };
     let raw_content: Raw<AnyRoomAccountDataEventContent> = Raw::new(&content)
         .map_err(|e| e.to_string())?
         .cast_unchecked();
+    policy::ensure_room_flow_output(flow_context, room.room_id().as_str())?;
     room.set_account_data_raw(RoomAccountDataEventType::from(AI_SESSION_DATA_EVENT_TYPE), raw_content)
         .await
         .map(|_| ())
@@ -707,16 +774,27 @@ fn friendly_state_post_error(e: &matrix_sdk::Error) -> String {
 
 /// Writes one agent turn as an `ai_reply` state event with a fresh state key
 /// (so it never overwrites a previous turn's reply).
-async fn post_reply(room: &Room, content: &AiReplyContent) -> Result<(), String> {
+async fn post_reply(room: &Room, content: &AiReplyContent, flow_context: &ContextId) -> Result<(), String> {
+    policy::ensure_room_access(room.room_id().as_str(), RoomAccess::Write)?;
     let json = serde_json::to_value(content).map_err(|e| e.to_string())?;
     let key = next_reply_state_key();
-    match room.send_state_event_raw(AI_REPLY_EVENT_TYPE, &key, json).await {
+    use matrix_sdk::ruma::api::client::state::send_state_event;
+    use matrix_sdk::utils::IntoRawStateEventContent;
+    if room.state() != matrix_sdk::RoomState::Joined {
+        return Err("The target room is no longer joined.".into());
+    }
+    let request = send_state_event::v3::Request::new_raw(
+        room.room_id().to_owned(), AI_REPLY_EVENT_TYPE.into(), key.clone(), json.into_raw_state_event_content(),
+    );
+    let config = room.client().request_config().disable_retry();
+    ensure_ai_state_output(room, flow_context, "ai.reply.write")?;
+    match room.client().send(request).with_request_config(config).await {
         Ok(response) => {
             log!("AI Rooms worker: wrote ai_reply state event key {key} -> {} in room {}.", response.event_id, room.room_id());
             Ok(())
         }
         Err(e) => {
-            let friendly = friendly_state_post_error(&e);
+            let friendly = friendly_state_post_error(&e.into());
             log!("AI Rooms worker: ai_reply write to room {} failed: {friendly}", room.room_id());
             Err(friendly)
         }
@@ -748,7 +826,8 @@ const NOTICE_PROVENANCE_PREFIX: &str = "🤖 Robrix AI: ";
 /// with `msgtype` `m.notice`) into ANOTHER joined room. Notices need no
 /// state-power privilege, so a cross-room post works with an ordinary
 /// `events_default` power level instead of `state_default` (50 = Moderator).
-async fn post_notice(room: &Room, content: &AiReplyContent) -> Result<(), String> {
+async fn post_notice(room: &Room, content: &AiReplyContent, flow_context: &ContextId) -> Result<(), String> {
+    policy::ensure_room_access(room.room_id().as_str(), RoomAccess::Write)?;
     let message = match content.formatted.as_deref().filter(|html| !html.is_empty()) {
         Some(html) => {
             let body = format!("{NOTICE_PROVENANCE_PREFIX}{}", content.text);
@@ -757,6 +836,10 @@ async fn post_notice(room: &Room, content: &AiReplyContent) -> Result<(), String
         }
         None => RoomMessageEventContent::notice_plain(format!("{NOTICE_PROVENANCE_PREFIX}{}", content.text)),
     };
+    policy::ensure_room_flow_output(flow_context, room.room_id().as_str())?;
+    policy::ensure_flow_action(flow_context, &flow::SensitiveAction {
+        kind: "matrix.rooms.message.send".into(), target: room.room_id().to_string(),
+    })?;
     match room.send(message).await {
         Ok(response) => {
             log!("AI Rooms worker: posted a notice -> {} in room {}.", response.response.event_id, room.room_id());

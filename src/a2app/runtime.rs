@@ -20,6 +20,7 @@ use a2app_core::bundle;
 use a2app_core::manifest::{A2AppScope, AppRegistry, MiniAppId, MiniAppManifest};
 use a2app_core::permissions::{
     Effective, GrantState, Permission, PermissionStore, agent_subject, is_agent_subject,
+    GrantDuration, NetworkScope, PermissionContext, PolicyDecision, RoomAccess, RoomScope,
 };
 #[cfg(unix)]
 use a2app_core::permissions::agent_room_of;
@@ -167,6 +168,7 @@ pub struct AppToolRegistration {
 pub struct AppToolPending {
     pub room_id: OwnedRoomId,
     pub app_id: MiniAppId,
+    pub heap_key: usize,
     /// The namespaced name the runtime routes by (also the app-tool key).
     pub full_name: String,
     /// The name the agent's turn card used for this call: the namespaced name
@@ -396,6 +398,7 @@ pub struct A2AppState {
     /// refuse every other host for the rest of the session.
     pub dismissed_net_hosts: HashSet<(String, String)>,
     pub generation: Option<Generation>,
+    pub generation_context: Option<a2app_core::information_flow::ContextId>,
     pub console: GenConsole,
     /// The request text of a failed generation, offered for Retry.
     pub failed_request: Option<String>,
@@ -446,6 +449,8 @@ pub struct A2AppState {
     /// [`AiRoomAction::PostToRoomResult`] lands.
     #[cfg(unix)]
     pub ai_posts: HashMap<u64, AiPostPending>,
+    #[cfg(unix)]
+    ai_fetches: HashMap<u64, (OwnedRoomId, Sender<Result<String, String>>, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
     /// `send_message` writes in flight, keyed by request id; see
     /// [`AiReplyPending`].
     #[cfg(unix)]
@@ -466,6 +471,12 @@ pub struct A2AppState {
     registry_dirty: bool,
     last_persist: Instant,
     last_timed_check: Instant,
+    policy_spaces_pending: bool,
+    policy_spaces_ready: bool,
+    pub policy_spaces_status: Option<String>,
+    policy_spaces_last: Option<Instant>,
+    policy_spaces_revision: u64,
+    policy_space_roots: std::collections::BTreeSet<String>,
     /// A slow heartbeat kept alive only while a generation runs, so the
     /// stall watchdog in [`advance_generation`] fires even when a hung agent
     /// stops producing events (see [`crate::a2app_agent::pipeline`]'s
@@ -492,6 +503,9 @@ impl A2AppState {
 /// One-time startup: loads all persisted a2app state into the thread-local.
 pub fn init() {
     a2app_core::set_data_root(crate::app_data_dir().join("a2app"));
+    if let Err(error) = a2app_core::information_flow::init(a2app_core::data_root()) {
+        error!("Mini-app information-flow protection: {error}");
+    }
 
     let mut registry = AppRegistry::new(builtin::builtin_apps());
     // A user's saved copy shadows the stock one; a built-in updated in this
@@ -515,6 +529,7 @@ pub fn init() {
     let permissions = persistence::load_permissions();
     let persisted = persistence::load_registry_state();
     a2app_core::permissions::publish_snapshot(permissions.snapshot(&registry));
+    crate::a2app::matrix::publish_permission_policy(&permissions);
 
     A2APP.with(|state| {
         *state.borrow_mut() = Some(A2AppState {
@@ -527,6 +542,7 @@ pub fn init() {
             dismissed_prompts: HashSet::new(),
             dismissed_net_hosts: HashSet::new(),
             generation: None,
+            generation_context: None,
             console: GenConsole::default(),
             failed_request: None,
             agent_prefs: a2app_agent::prefs::load_agent_prefs(),
@@ -549,6 +565,8 @@ pub fn init() {
             #[cfg(unix)]
             ai_posts: HashMap::new(),
             #[cfg(unix)]
+            ai_fetches: HashMap::new(),
+            #[cfg(unix)]
             ai_replies: HashMap::new(),
             #[cfg(unix)]
             once_rooms: HashSet::new(),
@@ -560,6 +578,12 @@ pub fn init() {
             registry_dirty: false,
             last_persist: Instant::now(),
             last_timed_check: Instant::now(),
+            policy_spaces_pending: false,
+            policy_spaces_ready: false,
+            policy_spaces_status: None,
+            policy_spaces_last: None,
+            policy_spaces_revision: matrix::spaces::policy_spaces_revision(),
+            policy_space_roots: Default::default(),
             generation_timer: None,
             #[cfg(unix)]
             ai_turn_flush_timer: None,
@@ -574,12 +598,15 @@ pub enum A2AppOp {
     /// (`None` falls back to the app's own scope); `in_room_pane` docks it
     /// into that room's RoomScreen pane instead of the generic host modal.
     OpenApp { app_id: MiniAppId, room_id: Option<OwnedRoomId>, in_room_pane: bool },
+    OpenPublicApp(MiniAppId),
+    OpenAppFromContext { context: a2app_core::information_flow::ContextId, flow_epoch: u64, app_id: MiniAppId, room_id: OwnedRoomId },
     CloseHostPane,
     ForceStop(MiniAppId),
     Uninstall(MiniAppId),
     ClearData(MiniAppId),
     Export(MiniAppId),
     ImportText(String),
+    ImportRoomBundle { text: String, room_id: Option<OwnedRoomId> },
     ImportFile(PathBuf),
     /// Makes an archived version the working copy; every other version stays.
     SwitchVersion { app_id: MiniAppId, stamp: String },
@@ -596,6 +623,31 @@ pub enum A2AppOp {
     SetPermission { app_id: MiniAppId, perm: Permission, state: GrantState },
     /// A single ability's own answer under its group (`Ask` = follow group).
     SetCapability { app_id: MiniAppId, cap_id: String, state: GrantState },
+    GrantScoped { app_id: MiniAppId, perm: Permission, cap_id: Option<String>, scope: RoomScope, duration: GrantDuration, origin_room: Option<String> },
+    GrantNetwork { app_id: MiniAppId, network: NetworkScope, scope: RoomScope, duration: GrantDuration, origin_room: Option<String> },
+    RevokeScopedGrant(u64),
+    RevokeNetworkGrant(u64),
+    ClearLegacyGrants { subject: String, perm: Permission },
+    SetGlobalPolicy { access: RoomAccess, decision: PolicyDecision },
+    SetRoomPolicy { room_id: String, access: RoomAccess, decision: PolicyDecision },
+    SetSpacePolicy { space_id: String, access: RoomAccess, decision: PolicyDecision },
+    SetFlowPolicy { source: a2app_core::information_flow::Source, policy: a2app_core::information_flow::FlowPolicy },
+    GrantFlowSharing {
+        source: a2app_core::information_flow::Source,
+        recipient: a2app_core::information_flow::Recipient,
+        reader: a2app_core::information_flow::ReaderScope,
+        duration: a2app_core::information_flow::SharingDuration,
+    },
+    RevokeFlowSharing(u64),
+    GrantFlowAuthority {
+        context: a2app_core::information_flow::ContextId,
+        action: a2app_core::information_flow::SensitiveAction,
+        session: a2app_core::information_flow::AuthoritySession,
+        expected_influences: a2app_core::information_flow::Influences,
+        expected_epoch: u64,
+    },
+    RevokeFlowAuthority(u64),
+    RoomClosed(OwnedRoomId),
     Unrestrict(MiniAppId),
     /// Starts a generation; `Modify` intent is classified from the text.
     StartGeneration { request: String, room_id: Option<OwnedRoomId> },
@@ -609,8 +661,6 @@ pub enum A2AppOp {
     NewPrompt,
     /// Posts an app's bundle into a room as a custom event.
     ShareToRoom { app_id: MiniAppId, room_id: OwnedRoomId },
-    /// The user's "Mini-apps can write to rooms" switch.
-    SetMatrixWrite(bool),
     /// Opens the "AI in this room" management panel for an AI room.
     #[cfg(unix)]
     AiRoomPanel(OwnedRoomId),
@@ -653,10 +703,72 @@ pub enum A2AppRuntimeAction {
     None,
 }
 
+#[derive(Clone, Debug)]
+struct HostNetworkResult {
+    reply: Reply,
+    context: a2app_core::information_flow::ContextId,
+    result: Result<String, String>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct AgentNetworkResult {
+    id: u64,
+    context: a2app_core::information_flow::ContextId,
+    result: Result<String, String>,
+}
+
 struct PendingRoomAction {
     room_id: OwnedRoomId,
     action: RoomAction,
     since: Instant,
+    authorization: Option<matrix::policy::MatrixAuthorization>,
+    close_after: Option<instances::InstanceKey>,
+}
+
+impl PendingRoomAction {
+    /// Replacing a request from the same activation keeps its deferred
+    /// teardown attached to the new request.
+    fn inherit_requester(&mut self, previous: &mut Self) {
+        let (Some(current), Some(old)) = (&self.authorization, &previous.authorization) else { return };
+        if current.flow_context.is_some() && current.flow_epoch.is_some()
+            && current.flow_context == old.flow_context && current.flow_epoch == old.flow_epoch
+        {
+            self.close_after = previous.close_after.take();
+        }
+    }
+
+    fn permitted(&self, permissions: &PermissionStore) -> bool {
+        self.authorization.as_ref().is_none_or(|authorization| authorization.permits(permissions, Some(self.room_id.as_str())))
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if self.since.elapsed() > ROOM_ACTION_TTL {
+            return Err("The queued room action expired.".into());
+        }
+        if let Some(authorization) = &self.authorization {
+            let permitted = with_a2app(|state| self.permitted(&state.permissions)).unwrap_or(false);
+            if !permitted { return Err("Permission for the queued room action was revoked.".into()); }
+            authorization.check_flow(Some(self.room_id.as_str()), RoomAccess::Write)?;
+        }
+        Ok(())
+    }
+
+    /// Retire a modal requester after consumption or cancellation, without
+    /// touching a replacement instance or one the user has shown again.
+    fn close_requester(&self, cx: &mut Cx) {
+        let Some(key) = &self.close_after else { return };
+        let Some(authorization) = &self.authorization else { return };
+        let Some(context) = &authorization.flow_context else { return };
+        let Some(epoch) = authorization.flow_epoch else { return };
+        if instances::context_of_key(key).as_ref() == Some(context)
+            && instances::surface_of(key).is_none()
+            && a2app_core::information_flow::ensure_context_epoch(context, epoch).is_ok()
+            && instances::quit(cx, key)
+        {
+            app_stopped(cx, &key.0);
+        }
+    }
 }
 
 /// Pokes the RoomScreen showing `room_id` to take its pending [`RoomAction`].
@@ -669,15 +781,23 @@ pub enum A2AppRoomAction {
 
 /// Hands the pending action for `room_id` to the one RoomScreen that asks
 /// first; a stale one (its room never opened) is dropped instead.
-pub fn take_room_action(room_id: &RoomId) -> Option<RoomAction> {
-    with_a2app(|state| {
+pub fn take_room_action(cx: &mut Cx, room_id: &RoomId) -> Option<RoomAction> {
+    let pending = with_a2app(|state| {
         let pending = state.room_action.as_ref()?;
         if pending.room_id != room_id {
             return None;
         }
-        let fresh = pending.since.elapsed() <= ROOM_ACTION_TTL;
-        state.room_action.take().filter(|_| fresh).map(|p| p.action)
-    }).flatten()
+        state.room_action.take()
+    }).flatten()?;
+    let result = pending.check();
+    pending.close_requester(cx);
+    match result {
+        Ok(()) => Some(pending.action),
+        Err(error) => {
+            enqueue_popup_notification(error, PopupKind::Warning, Some(6.0));
+            None
+        }
+    }
 }
 
 
@@ -686,8 +806,10 @@ pub fn take_room_action(room_id: &RoomId) -> Option<RoomAction> {
 /// `App::handle_event` on every event; cheap early-outs keep it off the
 /// hot path for events it doesn't care about.
 pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
+    let expired = with_a2app(|state| state.room_action.take_if(|pending| pending.since.elapsed() > ROOM_ACTION_TTL)).flatten();
+    if let Some(pending) = expired { pending.close_requester(cx); }
     if let Event::NetworkResponses(e) = event {
-        with_a2app(|state| state.broker.handle_network(cx, e));
+        with_a2app(|state| state.broker.handle_network(cx, e, &super::information_flow::check_response));
         instances::handle_network_responses(cx, event, &mut Scope::empty());
         return;
     }
@@ -699,7 +821,8 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
 
     let mut ops: Vec<A2AppOp> = Vec::new();
     let mut prompt_answers: Vec<PermissionPromptAction> = Vec::new();
-    let mut matrix_results: Vec<(Reply, Result<String, String>)> = Vec::new();
+    let mut matrix_results: Vec<A2AppMatrixResult> = Vec::new();
+    let mut network_results: Vec<HostNetworkResult> = Vec::new();
     let mut pane_actions: Vec<MiniAppHostPaneAction> = Vec::new();
     let mut stopped: Vec<MiniAppId> = Vec::new();
     let mut watch_events: Vec<A2AppRoomWatchEvent> = Vec::new();
@@ -708,9 +831,49 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     #[cfg(unix)]
     let mut ai_room_actions: Vec<AiRoomAction> = Vec::new();
     #[cfg(unix)]
+    let mut agent_network_results: Vec<AgentNetworkResult> = Vec::new();
+    #[cfg(unix)]
     let mut ai_panel_actions: Vec<AiRoomPanelAction> = Vec::new();
     if let Event::Actions(actions) = event {
         for action in actions {
+            if matches!(action.downcast_ref(), Some(crate::logout::logout_confirm_modal::LogoutAction::ClearAppState { .. })) {
+                let _ = a2app_core::information_flow::end_session();
+                stop_private_contexts(cx, ui);
+                matrix::spaces::stop_policy_space_watch();
+                invalidate_policy_spaces(cx);
+            }
+            if matches!(action.downcast_ref(), Some(crate::login::login_screen::LoginAction::LoginSuccess)) {
+                let _ = a2app_core::information_flow::end_session();
+                stop_private_contexts(cx, ui);
+                matrix::spaces::stop_policy_space_watch();
+                with_a2app(|state| state.policy_spaces_pending = false);
+                invalidate_policy_spaces(cx);
+            }
+            if action.downcast_ref::<matrix::spaces::A2AppPolicySpacesInvalidated>().is_some() {
+                invalidate_policy_spaces(cx);
+                continue;
+            }
+            if let Some(update) = action.downcast_ref::<matrix::spaces::A2AppPolicySpaces>() {
+                let current = matrix::spaces::policy_spaces_revision();
+                with_a2app(|state| {
+                    state.policy_spaces_pending = false;
+                    state.policy_spaces_ready = update.error.is_none() && update.revision == current;
+                    state.policy_spaces_status = update.error.clone();
+                    state.permissions.clear_room_spaces();
+                    if update.error.is_none() && update.revision == current {
+                        for (room, spaces) in &update.rooms {
+                            state.permissions.set_room_spaces(room, spaces.clone());
+                        }
+                        state.policy_spaces_revision = current;
+                    } else if update.revision != current {
+                        state.policy_spaces_last = None;
+                    }
+                });
+                if let Some(error) = &update.error { warning!("Mini-app space permissions: {error}"); }
+                publish_grants(cx);
+                ui.redraw(cx);
+                continue;
+            }
             if let Some(watch_event) = action.downcast_ref::<A2AppRoomWatchEvent>() {
                 watch_events.push(watch_event.clone());
                 continue;
@@ -724,11 +887,15 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
                 continue;
             }
             if let Some(answer) = action.downcast_ref::<PermissionPromptAction>() {
-                prompt_answers.push(*answer);
+                prompt_answers.push(answer.clone());
                 continue;
             }
             if let Some(result) = action.downcast_ref::<A2AppMatrixResult>() {
-                matrix_results.push((result.reply, result.result.clone()));
+                matrix_results.push(result.clone());
+                continue;
+            }
+            if let Some(result) = action.downcast_ref::<HostNetworkResult>() {
+                network_results.push(result.clone());
                 continue;
             }
             if let Some(pane_action) = action.downcast_ref::<MiniAppHostPaneAction>() {
@@ -775,6 +942,11 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
                 host_events.push(("on_prefs_changed", prefs_json(cx)));
             }
             #[cfg(unix)]
+            if let Some(result) = action.downcast_ref::<AgentNetworkResult>() {
+                agent_network_results.push(result.clone());
+                continue;
+            }
+            #[cfg(unix)]
             if let Some(ai_room_action) = action.downcast_ref::<AiRoomAction>() {
                 ai_room_actions.push(ai_room_action.clone());
             }
@@ -785,14 +957,52 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
         }
     }
 
+    if with_a2app(|state| state.policy_spaces_revision != matrix::spaces::policy_spaces_revision()).unwrap_or(false) {
+        invalidate_policy_spaces(cx);
+    }
+    request_policy_spaces();
     // Deliver finished matrix calls back into their isolates. The callback
     // typically updates the app's UI, so schedule a repaint.
-    let any_results = !matrix_results.is_empty();
-    for (reply, result) in matrix_results {
+    let any_results = !matrix_results.is_empty() || !network_results.is_empty();
+    for op in ops.drain(..) { apply_op(cx, ui, op); }
+    for result in matrix_results {
+        let reply = result.reply;
+        let requested_context = result.authorization.as_ref().and_then(|auth| auth.flow_context.clone());
+        let activation_check = result.authorization.as_ref().ok_or("Missing Matrix authorization.".to_string())
+            .and_then(|authorization| authorization.check_context());
+        let result = with_a2app(|state| result.checked_result(&state.permissions))
+            .unwrap_or_else(|| Err("Permissions are unavailable.".into()))
+            .and_then(|data| {
+                activation_check?;
+                let context = super::information_flow::context_for_heap(reply.heap_key)?;
+                if requested_context.as_ref() != Some(&context) {
+                    return Err("The requesting Matrix context changed.".into());
+                }
+                let value = serde_json::from_str(&data).map_err(|_| "Invalid service response.")?;
+                super::information_flow::record_response(&context, &value)?;
+                Ok(data)
+            });
         match &result {
             Ok(data) => services::respond(cx, reply, Ok(data.as_str())),
             Err(e) => services::respond(cx, reply, Err(e.as_str())),
         }
+    }
+    #[cfg(unix)]
+    for response in agent_network_results {
+        if let Some((room, answer, alive)) = with_a2app(|state| state.ai_fetches.remove(&response.id)).flatten() {
+            alive.store(false, std::sync::atomic::Ordering::SeqCst);
+            let result = super::information_flow::current_context(&response.context).and(response.result);
+            note_ai_tool_call(&room, "web_fetch", result.is_ok(), "");
+            let _ = answer.send(result);
+        }
+    }
+    for response in network_results {
+        let result = response.result.and_then(|data| {
+            let current = super::information_flow::context_for_heap(response.reply.heap_key)?;
+            if current != response.context { return Err("The requesting instance changed.".into()); }
+            Ok(data)
+        });
+        services::respond(cx, response.reply, result.as_deref().map_err(String::as_str));
     }
     if any_results {
         // A callback's ui.X.render() output only commits on the NEXT event
@@ -929,7 +1139,16 @@ fn prune_hook_subs() {
             let Some(manifest) = registry.get(&sub.app_id) else { return false };
             sub.hooks.retain(|hook| {
                 a2app_core::capabilities::for_hook(hook)
-                    .is_some_and(|cap| permissions.effective_capability(manifest, cap) == Effective::Granted)
+                    .is_some_and(|cap| {
+                        let context = PermissionContext {
+                            origin_room: sub.room_id.as_deref().map(|r| r.as_str()),
+                            target_room: sub.room_id.as_deref().map(|r| r.as_str()),
+                        };
+                        let effective = if services::is_room_collection(cap) {
+                            permissions.effective_collection_capability_in_context(manifest, cap, context)
+                        } else { permissions.effective_capability_in_context(manifest, cap, context) };
+                        effective == Effective::Granted
+                    })
             });
             !sub.hooks.is_empty()
         });
@@ -1083,12 +1302,13 @@ fn deliver_room_hooks(
     for (hook, payload) in host_events {
         latest.insert((None, hook), payload);
     }
-    let subs: Vec<(usize, Option<OwnedRoomId>, HashSet<&'static str>)> = with_a2app(|state| {
-        state.hook_subs.iter().map(|(heap, s)| (*heap, s.room_id.clone(), s.hooks.clone())).collect()
+    let subs: Vec<(usize, String, Option<OwnedRoomId>, HashSet<&'static str>)> = with_a2app(|state| {
+        state.hook_subs.iter().map(|(heap, s)| (*heap, s.app_id.clone(), s.room_id.clone(), s.hooks.clone())).collect()
     }).unwrap_or_default();
     let mut delivered = false;
-    for (heap, room_id, hooks) in subs {
+    for (heap, app_id, room_id, hooks) in subs {
         if let Some(room_id) = &room_id {
+            if !room_policy_allows(room_id.as_str(), RoomAccess::Read) { continue; }
             if hooks.contains("on_room_message")
                 && let Some(batch) = messages.get(room_id)
             {
@@ -1108,10 +1328,14 @@ fn deliver_room_hooks(
             (room.is_none() || *room == room_id) && hooks.contains(hook)
         };
         for (_, hook, payload) in each.iter().filter(|(room, hook, _)| mine(room, hook)) {
-            delivered |= instances::call_hook_by_heap(cx, heap, LiveId::from_str(hook), &[&payload.to_string()]);
+            if let Some(payload) = permission_filtered_hook(&app_id, room_id.as_deref(), hook, payload) {
+                delivered |= instances::call_hook_by_heap(cx, heap, LiveId::from_str(hook), &[&payload]);
+            }
         }
         for ((_, hook), payload) in latest.iter().filter(|((room, hook), _)| mine(room, hook)) {
-            delivered |= instances::call_hook_by_heap(cx, heap, LiveId::from_str(hook), &[&payload.to_string()]);
+            if let Some(payload) = permission_filtered_hook(&app_id, room_id.as_deref(), hook, payload) {
+                delivered |= instances::call_hook_by_heap(cx, heap, LiveId::from_str(hook), &[&payload]);
+            }
         }
     }
     if !closed.is_empty() {
@@ -1130,6 +1354,37 @@ fn deliver_room_hooks(
     }
 }
 
+/// Live events use the same target-room boundary as requested data. Even
+/// navigation and account hooks must not disclose a protected room's name.
+fn permission_filtered_hook(app_id: &str, origin: Option<&RoomId>, hook: &str, payload: &serde_json::Value) -> Option<String> {
+    with_a2app(|state| {
+        let manifest = state.registry.get(app_id)?;
+        let cap = a2app_core::capabilities::for_hook(hook)?;
+        let allowed = |room: &str| {
+            state.permissions.room_policy(Some(room), RoomAccess::Read) != PolicyDecision::Deny
+                && state.permissions.effective_capability_in_context(manifest, cap, PermissionContext {
+                    origin_room: origin.map(|r| r.as_str()), target_room: Some(room),
+                }) == Effective::Granted
+        };
+        let mut payload = payload.clone();
+        if payload.get("room_id").or_else(|| payload.get("space_id")).and_then(serde_json::Value::as_str)
+            .is_some_and(|room| !allowed(room)) { return None; }
+        for key in ["joined", "left", "changed"] {
+            if let Some(rooms) = payload.get_mut(key).and_then(serde_json::Value::as_array_mut) {
+                rooms.retain(|room| room.as_str().is_some_and(&allowed));
+            }
+        }
+        // Totals computed for the entire account cannot be safely attributed
+        // to a subject with access to only selected rooms.
+        if hook == "on_unread_totals_changed"
+            && (state.permissions.effective_capability(manifest, cap) != Effective::Granted
+                || state.permissions.room_rules().values().any(|rule| rule.read == PolicyDecision::Deny)
+                || state.permissions.space_rules().values().any(|rule| rule.read == PolicyDecision::Deny))
+        { return None; }
+        Some(payload.to_string())
+    }).flatten()
+}
+
 /// Drops every instance of the app, on every surface.
 fn stop_app_everywhere(cx: &mut Cx, ui: &WidgetRef, app_id: &str) {
     host_pane(cx, ui).drop_app(cx, app_id);
@@ -1139,6 +1394,18 @@ fn stop_app_everywhere(cx: &mut Cx, ui: &WidgetRef, app_id: &str) {
 
 fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
     match op {
+        A2AppOp::OpenAppFromContext { context, flow_epoch, app_id, room_id } => {
+            let result = super::information_flow::current_context(&context).and_then(|()| {
+                a2app_core::information_flow::ensure_action_allowed_for_activation(&context, flow_epoch, &a2app_core::information_flow::SensitiveAction {
+                    kind: "apps.launch".into(), target: app_id.clone(),
+                })
+            });
+            if let Err(error) = result {
+                enqueue_popup_notification(error, PopupKind::Error, Some(6.0));
+                return;
+            }
+            apply_op(cx, ui, A2AppOp::OpenApp { app_id, room_id: Some(room_id), in_room_pane: true });
+        }
         A2AppOp::OpenApp { app_id, room_id, in_room_pane } => {
             let Some((manifest, grants, restricted, room)) = with_a2app(|state| {
                 let manifest = state.registry.get(&app_id).cloned();
@@ -1160,6 +1427,11 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 );
                 return;
             }
+            let key = (app_id.clone(), room.clone());
+            if matches!(instances::context_of_key(&key), Some(a2app_core::information_flow::ContextId::PublicApp { .. })) {
+                host_pane(cx, ui).drop_app(cx, &app_id);
+                instances::quit(cx, &key);
+            }
             match (in_room_pane, room) {
                 // One isolate per (app, room): the target room's dock opens
                 // (or restores) ITS OWN instance, independent of any other.
@@ -1175,6 +1447,28 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                         cx.action(DockCmd::Open { app_id, room_id });
                     }
                 }
+            }
+        }
+        A2AppOp::OpenPublicApp(app_id) => {
+            let Some((manifest, restricted)) = with_a2app(|state| state.registry.get(&app_id)
+                .map(|manifest| (manifest.clone(), state.permissions.is_restricted(&app_id)))).flatten()
+            else { return };
+            if restricted {
+                enqueue_popup_notification("Allow this stopped app to run before opening a public instance.", PopupKind::Error, Some(5.0));
+                return;
+            }
+            let key = (app_id.clone(), None);
+            host_pane(cx, ui).drop_app(cx, &app_id);
+            instances::quit(cx, &key);
+            let grants = grants_in_room(&app_id, None);
+            let seed = saved_layout(&instances::tag_of(&key));
+            if instances::ensure_public(cx, &manifest, &grants, seed).is_none() { return; }
+            let mut display = manifest;
+            display.scope = A2AppScope::Account;
+            display.name = format!("{} · Public instance", display.name);
+            if host_pane(cx, ui).open_app(cx, &display, grants, None) {
+                with_a2app(|state| state.foreground_app = Some(app_id));
+                ui.modal(cx, ids!(mini_app_host_modal)).open(cx);
             }
         }
         A2AppOp::CloseHostPane => {
@@ -1219,7 +1513,9 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 state.registry_dirty = true;
             });
             persistence::remove_user_app(&app_id);
-            persistence::clear_app_data(&app_id);
+            if let Err(error) = persistence::clear_app_data(&app_id) {
+                enqueue_popup_notification(error, PopupKind::Error, Some(6.0));
+            }
             publish_grants(cx);
             cx.action(A2AppRuntimeAction::Uninstalled(app_id.clone()));
             enqueue_popup_notification(
@@ -1229,7 +1525,11 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             ui.redraw(cx);
         }
         A2AppOp::ClearData(app_id) => {
-            persistence::clear_app_data(&app_id);
+            stop_app_everywhere(cx, ui, &app_id);
+            if let Err(error) = persistence::clear_app_data(&app_id) {
+                enqueue_popup_notification(error, PopupKind::Error, Some(6.0));
+                return;
+            }
             enqueue_popup_notification("Cleared this mini-app's saved data.", PopupKind::Success, Some(3.0));
             ui.redraw(cx);
         }
@@ -1248,12 +1548,13 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 ),
             }
         }
-        A2AppOp::ImportText(text) => install_import(cx, ui, bundle::parse(&text)),
+        A2AppOp::ImportText(text) => install_import(cx, ui, bundle::parse(&text), None),
+        A2AppOp::ImportRoomBundle { text, room_id } => install_import(cx, ui, bundle::parse(&text), room_id.as_deref()),
         A2AppOp::ImportFile(path) => {
             let parsed = std::fs::read_to_string(&path)
                 .map_err(|e| format!("Couldn't read that file: {e}"))
                 .and_then(|text| bundle::parse(&text));
-            install_import(cx, ui, parsed);
+            install_import(cx, ui, parsed, None);
         }
         A2AppOp::SwitchVersion { app_id, stamp } => {
             let switched = with_a2app(|state| {
@@ -1272,21 +1573,22 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             }
         }
         A2AppOp::SaveSource { app_id, source } => {
-            let saved = with_a2app(|state| {
-                let mut base = state.registry.get(&app_id).cloned()?;
-                if base.source == source {
-                    return Some(None);
-                }
-                archive_current(&mut base);
-                let mut updated = a2app_core::manifest::rewritten(&base, source);
-                commit_version(&mut updated, VersionOrigin::Manual, "Edited by hand");
-                Some(Some(updated))
-            }).flatten();
-            match saved {
-                Some(Some(updated)) => install_version(cx, ui, updated, String::from("Saved your edit as a new version.")),
-                Some(None) => enqueue_popup_notification("Nothing changed.", PopupKind::Info, Some(3.0)),
-                None => enqueue_popup_notification("That mini-app no longer exists.", PopupKind::Error, Some(4.0)),
+            let Some(mut base) = with_a2app(|state| state.registry.get(&app_id).cloned()).flatten() else {
+                enqueue_popup_notification("That mini-app no longer exists.", PopupKind::Error, Some(4.0));
+                return;
+            };
+            if base.source == source {
+                enqueue_popup_notification("Nothing changed.", PopupKind::Info, Some(3.0));
+                return;
             }
+            if let Err(error) = super::information_flow::record_source_edit(&base) {
+                enqueue_popup_notification(error, PopupKind::Error, Some(6.0));
+                return;
+            }
+            archive_current(&mut base);
+            let mut updated = a2app_core::manifest::rewritten(&base, source);
+            commit_version(&mut updated, VersionOrigin::Manual, "Edited by hand");
+            install_version(cx, ui, updated, String::from("Saved your edit as a new version."));
         }
         A2AppOp::ResetToStock(app_id) => {
             let reset = with_a2app(|state| {
@@ -1353,6 +1655,161 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             }
             ui.redraw(cx);
         }
+        A2AppOp::GrantScoped { app_id, perm, cap_id, scope, duration, origin_room } => {
+            let result = with_a2app(|state| {
+                if cap_id.is_some() && state.permissions.state(&app_id, perm) == GrantState::Denied {
+                    return Err("This permission group is blocked. Change the group to Ask before allowing one ability.".to_string());
+                }
+                let result = state.permissions.grant_scoped(&app_id, perm, cap_id.as_deref(), scope, duration, origin_room.as_deref());
+                if result.is_ok() {
+                    // A scoped choice replaces a previous blanket Allow.
+                    state.permissions.set(&app_id, perm, GrantState::Ask);
+                    if let Some(cap) = cap_id.as_deref() {
+                        state.permissions.set_capability(&app_id, cap, GrantState::Ask);
+                    } else {
+                        for cap in a2app_core::capabilities::CATALOG.iter().filter(|cap| cap.group == Some(perm)) {
+                            if state.permissions.capability_state(&app_id, cap.id) == GrantState::Granted {
+                                state.permissions.set_capability(&app_id, cap.id, GrantState::Ask);
+                            }
+                        }
+                    }
+                    state.perms_dirty = true;
+                }
+                result
+            });
+            if let Some(Err(error)) = result {
+                enqueue_popup_notification(error, PopupKind::Error, Some(5.0));
+            }
+            publish_grants(cx);
+            apply_permission_to_running(cx, ui, &app_id, perm);
+            ui.redraw(cx);
+        }
+        A2AppOp::GrantNetwork { app_id, network, scope, duration, origin_room } => {
+            let result = with_a2app(|state| {
+                let result = state.permissions.allow_network(&app_id, network, scope, duration, origin_room.as_deref());
+                if result.is_ok() {
+                    state.permissions.set(&app_id, Permission::Network, GrantState::Ask);
+                    state.permissions.set_capability(&app_id, "network.http", GrantState::Ask);
+                }
+                state.perms_dirty = true;
+                result
+            });
+            if let Some(Err(error)) = result {
+                enqueue_popup_notification(error, PopupKind::Error, Some(5.0));
+            }
+            publish_grants(cx);
+            ui.redraw(cx);
+        }
+        A2AppOp::RevokeScopedGrant(id) => {
+            with_a2app(|state| { state.permissions.revoke_scoped_grant(id); state.perms_dirty = true; });
+            refresh_permission_policy(cx, ui);
+        }
+        A2AppOp::RevokeNetworkGrant(id) => {
+            with_a2app(|state| { state.permissions.revoke_network_grant(id); state.perms_dirty = true; });
+            refresh_permission_policy(cx, ui);
+        }
+        A2AppOp::ClearLegacyGrants { subject, perm } => {
+            with_a2app(|state| {
+                let store = &mut state.permissions;
+                match perm {
+                    Permission::Network => { for host in store.host_grants(&subject) { store.disallow_host(&subject, &host); } }
+                    Permission::MatrixRoomsRead => { for room in store.room_read_grants(&subject) { store.disallow_room_read(&subject, &room); } }
+                    Permission::MatrixRoomsSend => { for room in store.room_send_grants(&subject) { store.disallow_room_send(&subject, &room); } }
+                    Permission::McpTools => { store.clear_persistent_tool_grants_for(&subject); }
+                    _ => {}
+                }
+                state.perms_dirty = true;
+            });
+            refresh_permission_policy(cx, ui);
+        }
+        A2AppOp::SetGlobalPolicy { access, decision } => {
+            with_a2app(|state| { state.permissions.set_global_policy(access, decision); state.perms_dirty = true; });
+            refresh_permission_policy(cx, ui);
+        }
+        A2AppOp::SetRoomPolicy { room_id, access, decision } => {
+            with_a2app(|state| { state.permissions.set_room_policy(&room_id, access, decision); state.perms_dirty = true; });
+            refresh_permission_policy(cx, ui);
+        }
+        A2AppOp::SetSpacePolicy { space_id, access, decision } => {
+            with_a2app(|state| { state.permissions.set_space_policy(&space_id, access, decision); state.perms_dirty = true; });
+            refresh_permission_policy(cx, ui);
+        }
+        A2AppOp::SetFlowPolicy { source, policy } => {
+            if let Err(error) = ensure_source_owner(&source).and_then(|()| a2app_core::information_flow::set_policy(source, policy)) {
+                enqueue_popup_notification(error, PopupKind::Error, Some(6.0));
+                return;
+            }
+            with_a2app(|state| { state.generation = None; });
+            #[cfg(unix)]
+            {
+                let rooms = with_a2app(|state| state.ai_sessions.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
+                for room in rooms {
+                    abort_ai_room_work(cx, ui, &room);
+                    stop_ai_session(&room);
+                }
+            }
+            refresh_permission_policy(cx, ui);
+        }
+        A2AppOp::GrantFlowSharing { source, recipient, reader, duration } => {
+            let checked = (|| {
+                use a2app_core::information_flow::{ReaderScope, SharingDuration, Recipient};
+                ensure_source_owner(&source)?;
+                let account = super::information_flow::account()?;
+                let reader_account = match &reader {
+                    ReaderScope::AllReaders => None,
+                    ReaderScope::App { account, .. } => Some(account.as_str()),
+                    ReaderScope::Context(context) => Some(context.account()),
+                };
+                if reader_account.is_some_and(|owner| owner != account)
+                    || matches!(&duration, SharingDuration::RoomSession { account: owner, .. } if owner != &account)
+                    || matches!(&recipient, Recipient::MatrixRoom { account: owner, .. } if owner != &account)
+                { return Err("The account changed. Review this sharing rule again.".into()); }
+                a2app_core::information_flow::grant_sharing(source, recipient, reader, duration)
+            })();
+            if let Err(error) = checked {
+                enqueue_popup_notification(error, PopupKind::Error, Some(6.0));
+            }
+            ui.redraw(cx);
+        }
+        A2AppOp::RevokeFlowSharing(id) => {
+            if let Err(error) = a2app_core::information_flow::revoke_sharing(id) {
+                enqueue_popup_notification(error, PopupKind::Error, Some(6.0));
+                return;
+            }
+            stop_private_contexts(cx, ui);
+            ui.redraw(cx);
+        }
+        A2AppOp::GrantFlowAuthority { context, action, session, expected_influences, expected_epoch } => {
+            let result = super::information_flow::current_context(&context)
+                .and_then(|()| a2app_core::information_flow::grant_authority_for_activation(&context, action, session, &expected_influences, expected_epoch));
+            if let Err(error) = result {
+                enqueue_popup_notification(error, PopupKind::Error, Some(6.0));
+            }
+            ui.redraw(cx);
+        }
+        A2AppOp::RevokeFlowAuthority(id) => {
+            if let Err(error) = a2app_core::information_flow::revoke_authority(id) {
+                enqueue_popup_notification(error, PopupKind::Error, Some(6.0));
+                return;
+            }
+            stop_private_contexts(cx, ui);
+            ui.redraw(cx);
+        }
+        A2AppOp::RoomClosed(room_id) => {
+            if let Ok(account) = super::information_flow::account() {
+                if let Err(error) = a2app_core::information_flow::close_room_session(&account, room_id.as_str()) {
+                    enqueue_popup_notification(error, PopupKind::Error, Some(6.0));
+                }
+            }
+            with_a2app(|state| { state.permissions.clear_room_session(room_id.as_str()); });
+            #[cfg(unix)]
+            {
+                abort_ai_room_work(cx, ui, &room_id);
+                refuse_room_prompts(cx, ui, &room_id);
+                stop_ai_session(&room_id);
+            }
+            refresh_permission_policy(cx, ui);
+        }
         A2AppOp::Unrestrict(app_id) => {
             with_a2app(|state| {
                 state.permissions.unrestrict(&app_id);
@@ -1391,28 +1848,8 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             });
             ui.redraw(cx);
         }
-        A2AppOp::SetMatrixWrite(on) => {
-            let senders: Vec<MiniAppId> = with_a2app(|state| {
-                state.permissions.set_matrix_write(on);
-                state.perms_dirty = true;
-                state.registry.iter()
-                    .filter(|m| m.declares(Permission::MatrixRoomSend) && instances::is_running(&m.id))
-                    .map(|m| m.id.clone())
-                    .collect()
-            }).unwrap_or_default();
-            publish_grants(cx);
-            for app_id in senders {
-                apply_permission_to_running(cx, ui, &app_id, Permission::MatrixRoomSend);
-            }
-            enqueue_popup_notification(
-                if on { "Mini-apps may now write to rooms. Each one still asks you first." }
-                else { "Mini-apps can no longer write to rooms." },
-                PopupKind::Info, Some(4.0),
-            );
-            ui.redraw(cx);
-        }
         A2AppOp::ShareToRoom { app_id, room_id } => {
-            if !with_a2app(|state| state.permissions.matrix_write()).unwrap_or(false) {
+            if !room_policy_allows(room_id.as_str(), RoomAccess::Write) {
                 enqueue_popup_notification(
                     format!("Sharing an app into a room is blocked: {MATRIX_WRITE_OFF_MSG}."),
                     PopupKind::Warning, Some(5.0),
@@ -1437,18 +1874,41 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
     }
 }
 
-fn install_import(cx: &mut Cx, ui: &WidgetRef, parsed: Result<MiniAppManifest, String>) {
-    match parsed {
-        Ok(mut manifest) => {
-            with_a2app(|state| {
-                // An import can never overwrite an app you already have.
-                let taken: Vec<MiniAppId> = state.registry.iter().map(|a| a.id.clone()).collect();
-                manifest.id = unique_import_id(&manifest.id, &taken);
-                if let Err(e) = persistence::save_user_app(&manifest) {
-                    error!("Failed to save imported mini-app: {e}");
-                }
-                state.registry.insert(manifest.clone());
-            });
+fn ensure_source_owner(source: &a2app_core::information_flow::Source) -> Result<(), String> {
+    use a2app_core::information_flow::Source;
+    let owner = match source {
+        Source::Account { account } | Source::Room { account, .. } => account,
+        Source::UnknownPrivate => return Err("Unknown private data cannot be released.".into()),
+    };
+    if super::information_flow::account()? == *owner { Ok(()) }
+    else { Err("Switch to the source's account before changing its sharing rules.".into()) }
+}
+
+fn install_import(cx: &mut Cx, ui: &WidgetRef, parsed: Result<MiniAppManifest, String>, source_room: Option<&RoomId>) {
+    let installed = parsed.and_then(|mut manifest| {
+        with_a2app(|state| {
+            // New identity never overwrites another app or its provenance.
+            let taken: Vec<MiniAppId> = state.registry.iter().map(|a| a.id.clone()).collect();
+            manifest.id = unique_import_id(&manifest.id, &taken);
+            let context = super::information_flow::app_context(&manifest.id, None)?;
+            a2app_core::information_flow::register_context(&context)?;
+            // Selecting a unique installed id also depends on account inventory.
+            let mut sources = vec![super::information_flow::account_source(&context)];
+            if let Some(room) = source_room {
+                sources.push(super::information_flow::room_source(&context, room.as_str()));
+            }
+            a2app_core::information_flow::add_sources(&context, sources)?;
+            a2app_core::information_flow::add_influences(&context, [a2app_core::information_flow::Influence::MiniApp {
+                account: super::information_flow::context_account(&context).into(), app: manifest.id.clone(),
+            }])?;
+            a2app_core::information_flow::record_app_code_from(&manifest.id, &context)?;
+            persistence::save_user_app(&manifest).map_err(|error| error.to_string())?;
+            state.registry.insert(manifest.clone());
+            Ok(manifest)
+        }).unwrap_or_else(|| Err("Mini-app state is unavailable.".into()))
+    });
+    match installed {
+        Ok(manifest) => {
             publish_grants(cx);
             enqueue_popup_notification(
                 format!("Installed \"{}\".", manifest_name_for_popup(&manifest)),
@@ -1458,6 +1918,19 @@ fn install_import(cx: &mut Cx, ui: &WidgetRef, parsed: Result<MiniAppManifest, S
         }
         Err(e) => enqueue_popup_notification(format!("Import failed: {e}"), PopupKind::Error, Some(5.0)),
     }
+}
+
+fn manifest_flow_context(manifest: &MiniAppManifest) -> Result<a2app_core::information_flow::ContextId, String> {
+    let context = super::information_flow::app_context(&manifest.id, None)?;
+    a2app_core::information_flow::register_context_with_legacy_data(&context, super::information_flow::manifest_has_private_source(manifest))?;
+    Ok(context)
+}
+
+/// Reading an app listing or source does not read its room compartments.
+fn join_manifest_code(manifest: &MiniAppManifest, receiver: &a2app_core::information_flow::ContextId) -> Result<(), String> {
+    manifest_flow_context(manifest)?;
+    a2app_core::information_flow::add_sources(receiver, a2app_core::information_flow::code_labels(&manifest.id)?)?;
+    a2app_core::information_flow::add_influences(receiver, a2app_core::information_flow::code_influences(&manifest.id)?)
 }
 
 fn manifest_name_for_popup(manifest: &MiniAppManifest) -> String {
@@ -1493,6 +1966,7 @@ fn start_generation(
         enqueue_popup_notification(blocker.headline(), PopupKind::Warning, Some(6.0));
         return;
     }
+    let mut failed = None;
     with_a2app(|state| {
         if state.generation.is_some() {
             enqueue_popup_notification("A generation is already running.", PopupKind::Warning, Some(3.0));
@@ -1519,18 +1993,44 @@ fn start_generation(
             Some(target) => format!("Connecting to the agent to rewrite \"{}\"…", target.name),
             None => String::from("Connecting to the agent to create a new app…"),
         };
+        let context = (|| -> Result<_, String> {
+            let context = match room_id.as_ref() {
+                Some(room) => super::information_flow::prepare_agent(room.as_str())?,
+                None => {
+                    let context = super::information_flow::app_context("__generation", None)?;
+                    a2app_core::information_flow::register_context(&context)?;
+                    a2app_core::information_flow::add_sources(&context, [super::information_flow::account_source(&context)])?;
+                    context
+                }
+            };
+            if let Some(base) = refine_target.as_ref().and_then(|id| state.registry.get(id)) {
+                join_manifest_code(base, &context)?;
+            }
+            Ok(context)
+        })();
+        let context = match context {
+            Ok(context) => context,
+            Err(error) => {
+                state.console.status = error.clone();
+                state.console.active = true;
+                enqueue_popup_notification(error.clone(), PopupKind::Error, Some(6.0));
+                failed = Some(error);
+                return;
+            }
+        };
         let generation = match refine_target.and_then(|id| state.registry.get(&id).cloned()) {
             Some(mut base) => {
                 // The state being rewritten stays reachable as a version.
                 archive_current(&mut base);
                 state.registry.insert(base.clone());
-                Generation::start_refine(request.clone(), base, state.agent_prefs.clone())
+                Generation::start_refine(request.clone(), base, state.agent_prefs.clone(), Some(context.clone()))
             }
-            None => Generation::start(request.clone(), taken, scope, state.agent_prefs.clone()),
+            None => Generation::start(request.clone(), taken, scope, state.agent_prefs.clone(), Some(context.clone())),
         };
         match generation {
             Ok(generation) => {
                 state.generation = Some(generation);
+                state.generation_context = Some(context);
                 state.console = GenConsole {
                     status,
                     lines: Vec::new(),
@@ -1542,10 +2042,15 @@ fn start_generation(
             Err(e) => {
                 state.console.status = e.clone();
                 state.console.active = true;
+                failed = Some(e.clone());
                 enqueue_popup_notification(e, PopupKind::Error, Some(6.0));
             }
         }
     });
+    #[cfg(unix)]
+    if let Some(error) = failed {
+        resolve_session_generation(cx, ui, None, Err(format!("The build could not start: {error}")));
+    }
     ui.redraw(cx);
 }
 
@@ -1587,12 +2092,30 @@ fn advance_generation(cx: &mut Cx, ui: &WidgetRef) {
     match done {
         Some(Done::Ready { manifest, refine_of }) => {
             let mut manifest = *manifest;
-            with_a2app(|state| {
+            let installed = with_a2app(|state| -> Result<(), String> {
                 if refine_of.is_none() {
                     if let Some(room) = state.create_room.take() {
                         manifest.scope = A2AppScope::Room { room_id: room.to_string() };
                     }
                 }
+                // Provenance must reach the new source before versioning,
+                // persistence, installation, or any subsequent evaluation.
+                let from = state.generation_context.as_ref().ok_or("Missing generated-source provenance.")?;
+                super::information_flow::current_context(from)?;
+                #[cfg(unix)]
+                if let Some(room) = &state.ai_generation_room {
+                    a2app_core::information_flow::ensure_action_allowed(from, &a2app_core::information_flow::SensitiveAction {
+                        kind: "apps.generate".into(), target: room.to_string(),
+                    })?;
+                }
+                // The chosen id can reveal a collision in the app inventory.
+                a2app_core::information_flow::add_sources(from, [super::information_flow::account_source(from)])?;
+                let room = match &manifest.scope { A2AppScope::Room { room_id } => Some(room_id.as_str()), A2AppScope::Account => None };
+                let to = super::information_flow::app_context(&manifest.id, room)?;
+                let legacy = state.registry.get(&manifest.id).is_some_and(super::information_flow::manifest_has_private_source);
+                a2app_core::information_flow::register_context_with_legacy_data(&to, legacy)?;
+                a2app_core::information_flow::transfer(from, &to)?;
+                a2app_core::information_flow::record_app_code_from(&manifest.id, from)?;
                 let request = state.generation.as_ref().map(|g| g.request().to_string()).unwrap_or_default();
                 commit_version(&mut manifest, VersionOrigin::Ai, &request);
                 if let Err(e) = persistence::save_user_app(&manifest) {
@@ -1600,13 +2123,27 @@ fn advance_generation(cx: &mut Cx, ui: &WidgetRef) {
                 }
                 state.registry.insert(manifest.clone());
                 state.generation = None;
+                state.generation_context = None;
                 state.failed_request = None;
                 state.console.status = match refine_of {
                     Some(_) => format!("Updated \"{}\".", manifest.name),
                     None => format!("Created \"{}\".", manifest.name),
                 };
                 state.registry_dirty = true;
-            });
+                Ok(())
+            }).unwrap_or_else(|| Err("Mini-app state is unavailable.".into()));
+            if let Err(reason) = installed {
+                with_a2app(|state| {
+                    state.generation = None;
+                    state.generation_context = None;
+                    state.console.status = format!("Failed: {reason}");
+                });
+                #[cfg(unix)]
+                resolve_session_generation(cx, ui, None, Err(format!("The build could not be installed: {reason}")));
+                enqueue_popup_notification(reason, PopupKind::Error, Some(6.0));
+                ui.redraw(cx);
+                return;
+            }
             publish_grants(cx);
             // If the old version was running, quit it so the next open boots
             // the new source (the reopen_hint below says so); then, if a
@@ -1630,7 +2167,10 @@ fn advance_generation(cx: &mut Cx, ui: &WidgetRef) {
             ui.redraw(cx);
         }
         Some(Done::Failed(reason)) => {
-            with_a2app(|state| state.generation = None);
+            with_a2app(|state| {
+                state.generation = None;
+                state.generation_context = None;
+            });
             #[cfg(unix)]
             resolve_session_generation(cx, ui, None, Err(format!("The build failed: {reason}")));
             ui.redraw(cx);
@@ -1663,6 +2203,11 @@ fn refresh_console(state: &mut A2AppState, force: bool) {
 // Broker + permission prompts
 // -----------------------------------------------------------------------
 
+fn compartment_storage_path(heap: usize) -> Result<PathBuf, String> {
+    let context = super::information_flow::context_for_heap(heap)?;
+    a2app_core::information_flow::context_storage_path(&context)
+}
+
 fn process_broker(cx: &mut Cx, ui: &WidgetRef) {
     let asks = with_a2app(|state| {
         let A2AppState { broker, registry, permissions, foreground_app, .. } = state;
@@ -1677,8 +2222,11 @@ fn process_broker(cx: &mut Cx, ui: &WidgetRef) {
             is_docked: &is_docked,
             is_running: &instances::is_running,
             pane_state: &instances::pane_state,
+            storage_path: &compartment_storage_path,
             room_name: &room_name,
             desktop_view,
+            check_flow: &super::information_flow::check_request,
+            check_response: &super::information_flow::check_response,
         })
     }).unwrap_or_default();
 
@@ -1730,15 +2278,35 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
             );
             ui.redraw(cx);
         }
-        BrokerAsk::IpcDeliver { reply, from, from_heap, to, data_json } => {
+        BrokerAsk::IpcDeliver { reply, from, from_heap, to, data_json, receipt } => {
             let delivered = instances::deliver_ipc(cx, from_heap, &from, &to, &data_json);
-            let body = format!("{{\"delivered\":{delivered}}}");
-            services::respond(cx, reply, Ok(&body));
+            if receipt {
+                let body = format!("{{\"delivered\":{delivered}}}");
+                services::respond(cx, reply, Ok(&body));
+            }
         }
-        BrokerAsk::Matrix { reply, app_id, room, call } => {
+        BrokerAsk::Network { reply, app_id, room, args, consent } => {
+            let prepared = super::information_flow::context_for_heap(reply.heap_key)
+                .and_then(|context| super::network::Request::parse(&args).map(|request| (context, request)));
+            let lifetime = instances::lifetime_of_heap(reply.heap_key);
+            if lifetime.is_none() { return services::respond(cx, reply, Err("The requesting app stopped.")); }
+            match prepared {
+                Ok((context, request)) => crate::sliding_sync::spawn_async_task(async move {
+                    let result = super::network::run(request, context.clone(), app_id, room, *consent, lifetime).await;
+                    Cx::post_action(HostNetworkResult { reply, context, result });
+                }),
+                Err(error) => services::respond(cx, reply, Err(&error)),
+            }
+        }
+        BrokerAsk::Matrix { reply, app_id, room, call, capability, consent } => {
+            let flow_context = match super::information_flow::context_for_heap(reply.heap_key) {
+                Ok(context) => context,
+                Err(error) => return services::respond(cx, reply, Err(&error)),
+            };
+            let origin = room.clone();
             let room = room.and_then(|r| OwnedRoomId::try_from(r.as_str()).ok());
             match matrix::request_for(call, room, reply) {
-                Ok(request) => submit_async_request(MatrixRequest::A2App(request)),
+                Ok(request) => submit_async_request(MatrixRequest::A2App(request.authorized(app_id, capability, origin, consent, flow_context))),
                 Err(e) => {
                     with_a2app(|state| state.broker.note(reply, &app_id));
                     services::respond(cx, reply, Err(e));
@@ -1789,8 +2357,9 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
             services::respond(cx, reply, Ok(&data.to_string()));
         }
         BrokerAsk::HostAction { reply, app_id, action } => {
-            // Only the modal's own isolate has to get out of the way when it
-            // sends the user elsewhere; closing quits it, like its Close button.
+            // Queued composer actions retain their requester until the room
+            // checks its live authority. Other modal departures quit now.
+            let queued_composer = matches!(action, HostAction::ComposerInsert { .. } | HostAction::ComposerReplyTo { .. });
             let leaves_modal = !matches!(action, HostAction::OpenApp { .. })
                 && host_pane(cx, ui).active().is_some_and(|key| {
                     key.0 == app_id && instances::heap_of(&key) == Some(reply.heap_key)
@@ -1803,7 +2372,17 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
                 }
             }
             if leaves_modal {
-                apply_op(cx, ui, A2AppOp::CloseHostPane);
+                if queued_composer {
+                    let key = host_pane(cx, ui).close_active(cx, true);
+                    with_a2app(|state| {
+                        state.foreground_app = None;
+                        if let Some(pending) = state.room_action.as_mut() { pending.close_after = key; }
+                    });
+                    ui.modal(cx, ids!(mini_app_host_modal)).close(cx);
+                    ui.redraw(cx);
+                } else {
+                    apply_op(cx, ui, A2AppOp::CloseHostPane);
+                }
             }
         }
         #[cfg(unix)]
@@ -1846,6 +2425,11 @@ fn register_app_tool(cx: &mut Cx, reply: Reply, request: AppToolRequest) {
             Err("this app is not attached to a room with an AI session"),
         );
     };
+    let flow_result = super::information_flow::context_for_heap(request.heap_key).and_then(|from| {
+        let to = super::information_flow::prepare_agent(room_id.as_str())?;
+        a2app_core::information_flow::transfer(&from, &to)
+    });
+    if let Err(error) = flow_result { return services::respond(cx, reply, Err(&error)); }
     let result = with_a2app(|state| {
         // A name already owned by another instance is a shadowing attempt.
         // The SAME instance may re-register (a change was re-reviewed, or it
@@ -1903,6 +2487,31 @@ fn register_app_tool(cx: &mut Cx, reply: Reply, request: AppToolRequest) {
     }
 }
 
+/// Transfers the latest app provenance before changing an agent's tools.
+///
+/// Tool availability is app-controlled output too: a removal or timeout can
+/// depend on private data read after the original registration.
+#[cfg(unix)]
+fn transfer_app_tool_provenance(state: &A2AppState, app_id: &str, heap_key: usize, room: &OwnedRoomId) -> Result<(), String> {
+    let live_context = instances::context_of_heap(heap_key).filter(|context| matches!(context,
+        a2app_core::information_flow::ContextId::App { app, .. } if app == app_id));
+    let from = if let Some(context) = live_context {
+        super::information_flow::current_context(&context)?;
+        context
+    } else if let Some(manifest) = state.registry.get(app_id) {
+        let context = super::information_flow::app_context(app_id, Some(room.as_str()))?;
+        a2app_core::information_flow::register_context_with_legacy_data(&context, super::information_flow::manifest_has_private_source(manifest))?;
+        context
+    } else {
+        // Uninstall removes the manifest, not the persistent provenance.
+        let context = super::information_flow::app_context(app_id, Some(room.as_str()))?;
+        a2app_core::information_flow::register_context_with_legacy_data(&context, true)?;
+        context
+    };
+    let to = super::information_flow::prepare_agent(room.as_str())?;
+    a2app_core::information_flow::transfer(&from, &to)
+}
+
 /// Withdraws one tool, but only for the instance that registered it.
 #[cfg(unix)]
 fn unregister_app_tool(
@@ -1912,6 +2521,7 @@ fn unregister_app_tool(
     heap_key: usize,
     full_name: &str,
 ) {
+    let mut failed_rooms = Vec::new();
     let removed = with_a2app(|state| {
         let owner = state
             .app_tools
@@ -1919,6 +2529,10 @@ fn unregister_app_tool(
             .map(|reg| (reg.heap_key, reg.app_id.clone(), reg.room_id.clone()));
         match owner {
             Some((reg_heap, reg_app, room)) if reg_heap == heap_key && reg_app == app_id => {
+                if transfer_app_tool_provenance(state, app_id, heap_key, &room).is_err() {
+                    state.ai_sessions.remove(&room);
+                    failed_rooms.push(room.clone());
+                }
                 state.app_tools.remove(full_name);
                 if let Some(session) = state.ai_sessions.get(&room) {
                     session.unregister_miniapp_tool(full_name);
@@ -1929,6 +2543,7 @@ fn unregister_app_tool(
         }
     })
     .unwrap_or(false);
+    for room in failed_rooms { stop_ai_session(&room); }
     if removed {
         services::respond(cx, reply, Ok("{}"));
     } else {
@@ -1949,13 +2564,21 @@ fn complete_app_tool_call(
     text: &str,
 ) {
     let pending = with_a2app(|state| match state.app_tool_calls.get(&call_id) {
-        Some(p) if p.app_id == app_id => state.app_tool_calls.remove(&call_id),
+        Some(p) if p.app_id == app_id && p.heap_key == reply.heap_key => state.app_tool_calls.remove(&call_id),
         _ => None,
     })
     .flatten();
     let Some(pending) = pending else {
         return services::respond(cx, reply, Err("no matching tool call for this app"));
     };
+    let transfer = super::information_flow::context_for_heap(reply.heap_key).and_then(|from| {
+        let to = super::information_flow::prepare_agent(pending.room_id.as_str())?;
+        a2app_core::information_flow::transfer(&from, &to)
+    });
+    if let Err(error) = transfer {
+        let _ = pending.answer.send(Err(error.clone()));
+        return services::respond(cx, reply, Err(&error));
+    }
     let summary: String = text.chars().take(200).collect();
     let detail = finish_ai_tool_call(&pending.room_id, &pending.display_name, ok, &summary);
     push_ai_tool_receipt(&pending.room_id, &pending.display_name, detail, ok, &summary);
@@ -1989,18 +2612,45 @@ fn joined_room_name(cx: &mut Cx, room_id: &OwnedRoomId) -> Result<RoomNameId, St
 /// Parks `action` for `room_id`'s RoomScreen and navigates there. The
 /// caller may be on the Mini Apps tab; the room lives on Home.
 fn queue_room_action(cx: &mut Cx, room_id: OwnedRoomId, action: RoomAction) -> Result<(), String> {
+    queue_authorized_room_action(cx, room_id, action, None)
+}
+
+fn queue_authorized_room_action(
+    cx: &mut Cx,
+    room_id: OwnedRoomId,
+    action: RoomAction,
+    authorization: Option<matrix::policy::MatrixAuthorization>,
+) -> Result<(), String> {
     let destination_room = BasicRoomDetails::Name(joined_room_name(cx, &room_id)?);
-    with_a2app(|state| {
-        state.room_action = Some(PendingRoomAction {
+    let previous = with_a2app(|state| {
+        let mut pending = PendingRoomAction {
             room_id: room_id.clone(),
             action,
             since: Instant::now(),
-        });
-    });
+            authorization,
+            close_after: None,
+        };
+        if let Some(previous) = state.room_action.as_mut() { pending.inherit_requester(previous); }
+        state.room_action.replace(pending)
+    }).flatten();
+    if let Some(previous) = previous { previous.close_requester(cx); }
     cx.action(NavigationBarAction::GoToHome);
     cx.action(AppStateAction::NavigateToRoom { room_to_close: None, destination_room });
     cx.action(A2AppRoomAction::Pending { room_id });
     Ok(())
+}
+
+fn queue_composer_action(cx: &mut Cx, heap: usize, room_id: OwnedRoomId, action: RoomAction, capability: &str) -> Result<(), String> {
+    let context = super::information_flow::context_for_heap(heap)?;
+    let (app, origin_room) = match &context {
+        a2app_core::information_flow::ContextId::App { app, room, .. } => (app, room.as_deref()),
+        a2app_core::information_flow::ContextId::PublicApp { app, .. } => (app, None),
+        _ => return Err("Invalid mini-app context.".into()),
+    };
+    let authorization = with_a2app(|state| matrix::policy::MatrixAuthorization::new(app, capability, origin_room, &state.permissions))
+        .ok_or("Mini Apps is unavailable.")?.with_flow(context);
+    authorization.check_flow(Some(room_id.as_str()), RoomAccess::Write)?;
+    queue_authorized_room_action(cx, room_id, action, Some(authorization))
 }
 
 /// Brings `room_id` forward (navigating to it if needed) and, once its
@@ -2079,6 +2729,18 @@ fn install_version(cx: &mut Cx, ui: &WidgetRef, updated: MiniAppManifest, done: 
 }
 
 fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, heap: usize, action: HostAction) -> Result<(), String> {
+    let context = super::information_flow::context_for_heap(heap)?;
+    let sensitive = match &action {
+        HostAction::ComposerInsert { room, .. } => Some(("host.composer.insert", room.as_deref().unwrap_or("host"))),
+        HostAction::ComposerReplyTo { room, .. } => Some(("host.composer.reply_to", room.as_deref().unwrap_or("host"))),
+        HostAction::OpenApp { app_id, .. } => Some(("host.nav.app", app_id.as_str())),
+        _ => None,
+    };
+    if let Some((kind, target)) = sensitive {
+        a2app_core::information_flow::ensure_action_allowed(&context, &a2app_core::information_flow::SensitiveAction {
+            kind: kind.into(), target: target.into(),
+        })?;
+    }
     let room_of = |room: Option<String>| -> Result<OwnedRoomId, String> {
         let room = room.ok_or("this mini-app is not attached to a room; pass {room_id}")?;
         OwnedRoomId::try_from(room.as_str()).map_err(|_| String::from("not a valid room id"))
@@ -2135,6 +2797,16 @@ fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, heap: usize, action: HostAct
             return perform_host_action(cx, ui, heap, action);
         }
         HostAction::OpenApp { room, app_id } => {
+            let from = super::information_flow::context_for_heap(heap)?;
+            let manifest = with_a2app(|state| state.registry.get(&app_id).cloned()).flatten()
+                .ok_or("The requested mini-app is not installed.")?;
+            let target = room.as_deref().or_else(|| match &manifest.scope {
+                A2AppScope::Room { room_id } => Some(room_id.as_str()), A2AppScope::Account => None,
+            });
+            let to = super::information_flow::app_context(&manifest.id, target)?;
+            a2app_core::information_flow::register_context_with_legacy_data(&to, super::information_flow::manifest_has_private_source(&manifest))?;
+            a2app_core::information_flow::transfer(&from, &to)?;
+            a2app_core::information_flow::transfer(&to, &from)?;
             let installed = with_a2app(|state| {
                 state.registry.get(&app_id).map(|_| state.permissions.is_restricted(&app_id))
             }).flatten();
@@ -2159,11 +2831,11 @@ fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, heap: usize, action: HostAct
         }
         HostAction::ComposerInsert { room, text } => {
             let room_id = room_of(room)?;
-            queue_room_action(cx, room_id, RoomAction::InsertDraft(text))?;
+            queue_composer_action(cx, heap, room_id, RoomAction::InsertDraft(text), "host.composer.insert")?;
         }
         HostAction::ComposerReplyTo { room, event_id } => {
             let room_id = room_of(room)?;
-            queue_room_action(cx, room_id, RoomAction::ReplyTo(event_of(&event_id)?))?;
+            queue_composer_action(cx, heap, room_id, RoomAction::ReplyTo(event_of(&event_id)?), "host.composer.reply_to")?;
         }
         HostAction::ClosePane | HostAction::SetSide { .. } | HostAction::Minimize | HostAction::BreakOut => {
             let key = instances::key_of_heap(heap).ok_or("this instance has no pane")?;
@@ -2237,36 +2909,6 @@ fn queue_permission_prompt(
         return;
     }
     with_a2app(|state| {
-        // Merge into an already-active or queued prompt for the same pair.
-        // Network prompts are per HOST and tool prompts per TOOL: two
-        // different hosts/tools must never share a prompt, or one answer
-        // would decide for both.
-        let new_host = match &parked {
-            #[cfg(unix)]
-            ParkedRequest::NetworkAccess { host, .. } => Some(host.clone()),
-            _ => None,
-        };
-        let new_tool = tool.as_ref().map(|t| t.full_name.clone());
-        let same = |p: &PermissionPrompt| {
-            if p.subject != subject || p.perm != perm {
-                return false;
-            }
-            let existing_host = p.parked.iter().find_map(|q| match q {
-                #[cfg(unix)]
-                ParkedRequest::NetworkAccess { host, .. } => Some(host.clone()),
-                _ => None,
-            });
-            let existing_tool = p.tool.as_ref().map(|t| t.full_name.clone());
-            existing_host == new_host && existing_tool == new_tool
-        };
-        if let Some(active) = state.active_prompt.as_mut().filter(|p| same(p)) {
-            active.parked.push(parked);
-            return;
-        }
-        if let Some(queued) = state.prompts.iter_mut().find(|p| same(p)) {
-            queued.parked.push(parked);
-            return;
-        }
         state.prompts.push_back(PermissionPrompt {
             subject,
             perm,
@@ -2290,6 +2932,7 @@ fn ai_job_tool_name(job: &SessionJob) -> String {
         // Not a tool call: the agent's web tool is already shown by its ACP
         // events; this job only asks whether a host may be reached.
         SessionJob::NetworkAccess { .. } => String::from("network_access"),
+        SessionJob::FetchUrl { .. } => String::from("web_fetch"),
         // A tool a mini-app registered; its name is already namespaced.
         SessionJob::InvokeMiniAppTool { tool, .. } => tool.clone(),
         SessionJob::CallMiniAppTool { .. } => String::from("call_mini_app_tool"),
@@ -2331,7 +2974,7 @@ fn session_job_detail(rooms: Option<&RoomsListRef>, job: &SessionJob) -> Option<
         // No target of its own: the ACP `tool_call` event names the web tool,
         // and the turn card is reposted with that name; this job carries only
         // the host the user is being asked about.
-        SessionJob::NetworkAccess { .. } => None,
+        SessionJob::NetworkAccess { .. } | SessionJob::FetchUrl { .. } => None,
         // The tool name already names it; no extra target to add.
         SessionJob::InvokeMiniAppTool { .. } => None,
         // A bridged call still targets one app tool; name it for the card.
@@ -2533,7 +3176,7 @@ fn ai_prompt_action(
                 SessionJob::SendRoomMessage { .. } => continue,
                 // A network-access job never reaches this arm (it parks as
                 // `ParkedRequest::NetworkAccess` and is handled above).
-                SessionJob::NetworkAccess { .. } => continue,
+                SessionJob::NetworkAccess { .. } | SessionJob::FetchUrl { .. } => continue,
                 // An app-tool invocation names its tool directly.
                 SessionJob::InvokeMiniAppTool { tool, .. } => {
                     format!("use the mini-app tool \"{tool}\"")
@@ -2569,8 +3212,8 @@ fn ai_prompt_reason(
     for p in parked {
         if let ParkedRequest::NetworkAccess { host, .. } = p {
             return format!(
-                "The AI wants to fetch from “{host}”. Allowing covers exactly this site; \
-                 it will ask again before reaching any other."
+                "The AI wants to fetch from “{host}”. Choose which internet destinations \
+                 it may reach and for how long."
             );
         }
         if let ParkedRequest::AiTool { room_id: _room_id, job } = p {
@@ -2605,7 +3248,7 @@ fn ai_prompt_reason(
                 }
                 SessionJob::SendRoomMessage { .. } => continue,
                 // A network-access job never reaches this arm (handled above).
-                SessionJob::NetworkAccess { .. } => continue,
+                SessionJob::NetworkAccess { .. } | SessionJob::FetchUrl { .. } => continue,
                 SessionJob::InvokeMiniAppTool { tool, .. } => format!(
                     "You allowed this app to register \"{tool}\". The description you reviewed is \
                      the text the model sees; the app's answer is returned to the model."
@@ -2634,6 +3277,81 @@ fn ai_prompt_reason(
     }
 }
 
+/// The host, not the requester, supplies the origin. A cross-room request
+/// shows its actual target so consent cannot silently spread to other rooms.
+fn parked_rooms(parked: &ParkedRequest) -> (Option<String>, Option<String>) {
+    match parked {
+        ParkedRequest::Bridge(Some(request)) => {
+            let (_, room) = a2app_core::manifest::split_instance_tag(&request.app_tag);
+            let origin = room.map(str::to_string);
+            let args: serde_json::Value = serde_json::from_str(&request.args_json).unwrap_or_default();
+            let target = services::permission_context(&request.service, &args, origin.as_deref()).target_room.map(str::to_string);
+            (origin, target)
+        }
+        ParkedRequest::Bridge(None) => (None, None),
+        #[cfg(unix)]
+        ParkedRequest::AiTool { room_id, job } => {
+            let target = match job {
+                SessionJob::PostRoomMessage { room_id, .. } => room_id.clone(),
+                SessionJob::ReadTool { kind: ReadToolKind::OtherRoom { room, .. }, .. } => room.clone(),
+                SessionJob::ReadTool { kind: ReadToolKind::SpaceInfo { space } | ReadToolKind::SpaceRooms { space }, .. } => space.clone(),
+                _ => room_id.to_string(),
+            };
+            (Some(room_id.to_string()), Some(target))
+        }
+        #[cfg(unix)]
+        ParkedRequest::NetworkAccess { room_id, .. } => (Some(room_id.to_string()), Some(room_id.to_string())),
+    }
+}
+
+fn parked_capability(parked: &ParkedRequest) -> Option<&'static a2app_core::capabilities::Capability> {
+    match parked {
+        ParkedRequest::Bridge(Some(request)) => {
+            if request.service == "permissions.request" { return None; }
+            if request.service == "events.subscribe" {
+                let args: serde_json::Value = serde_json::from_str(&request.args_json).ok()?;
+                return a2app_core::capabilities::for_hook(args["event"].as_str()?);
+            }
+            a2app_core::capabilities::for_service(&request.service)
+        }
+        ParkedRequest::Bridge(None) => None,
+        #[cfg(unix)]
+        ParkedRequest::NetworkAccess { .. } => a2app_core::capabilities::by_id("network.http"),
+        #[cfg(unix)]
+        ParkedRequest::AiTool { job, .. } => match job {
+            SessionJob::ReadTool { kind, .. } => kind.capability(),
+            SessionJob::PostRoomMessage { .. } => a2app_core::capabilities::by_id("matrix.rooms.message.send"),
+            SessionJob::ListApps { .. } => a2app_core::capabilities::by_id(LIST_APPS_CAP_ID),
+            SessionJob::LaunchApp { .. } => a2app_core::capabilities::by_id(LAUNCH_APP_CAP_ID),
+            SessionJob::LaunchSplashApp { .. } => a2app_core::capabilities::by_id("apps.generate"),
+            _ => None,
+        },
+    }
+}
+
+fn parked_network_url(parked: &ParkedRequest) -> Option<String> {
+    match parked {
+        #[cfg(unix)]
+        ParkedRequest::AiTool { job: SessionJob::FetchUrl { url, .. }, .. } => Some(url.clone()),
+        ParkedRequest::Bridge(Some(request)) if request.service == "network.http" => {
+            serde_json::from_str::<serde_json::Value>(&request.args_json).ok()?
+                .get("url")?.as_str().map(str::to_owned)
+        }
+        #[cfg(unix)]
+        ParkedRequest::NetworkAccess { url, .. } => Some(url.clone()),
+        _ => None,
+    }
+}
+
+fn parked_can_allow_once(parked: &ParkedRequest) -> bool {
+    match parked {
+        ParkedRequest::Bridge(None) => false,
+        ParkedRequest::Bridge(Some(request)) => !matches!(request.service.as_str(), "permissions.request" | "events.subscribe"),
+        #[cfg(unix)]
+        ParkedRequest::AiTool { .. } | ParkedRequest::NetworkAccess { .. } => true,
+    }
+}
+
 /// Builds what the prompt modal shows for one (subject, group, parked) tuple.
 /// An AI room's agent subject is presented as the room's AI with the concrete
 /// read it asked for; a mini-app keeps its registry identity and the app's own
@@ -2647,6 +3365,9 @@ fn prompt_info_for(
     parked: &[ParkedRequest],
     tool: Option<&PromptToolGrant>,
 ) -> PromptInfo {
+    let (origin_room_id, room_id) = parked.first().map(parked_rooms).unwrap_or_default();
+    let network_url = parked.iter().find_map(parked_network_url);
+    let can_allow_once = parked.first().is_some_and(parked_can_allow_once);
     let tool_preview = tool.map(|t| ToolPreview {
         name: t.name.clone(),
         description: t.description.clone(),
@@ -2665,6 +3386,7 @@ fn prompt_info_for(
             capability: Some(ai_prompt_action(rooms, perm, parked)),
             agent: true,
             tool: tool_preview,
+            room_id, origin_room_id, network_url, can_allow_once,
         };
     }
     let (app_name, app_icon, reason) = state.registry.get(subject)
@@ -2698,7 +3420,7 @@ fn prompt_info_for(
         })
         .map(|c| c.title.to_string())
     };
-    PromptInfo { app_name, app_icon, perm, reason, capability, agent: false, tool: tool_preview }
+    PromptInfo { app_name, app_icon, perm, reason, capability, agent: false, tool: tool_preview, room_id, origin_room_id, network_url, can_allow_once }
 }
 
 /// Answers one session tool call with a finished result, whatever variant it
@@ -2714,6 +3436,7 @@ fn answer_session_job(job: SessionJob, result: Result<String, String>) {
         | SessionJob::ReadTool { answer, .. }
         | SessionJob::PostRoomMessage { answer, .. }
         | SessionJob::NetworkAccess { answer, .. }
+        | SessionJob::FetchUrl { answer, .. }
         | SessionJob::InvokeMiniAppTool { answer, .. }
         | SessionJob::CallMiniAppTool { answer, .. }
         | SessionJob::ListMiniAppTools { answer } => {
@@ -2738,160 +3461,92 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
     ui.modal(cx, ids!(a2app_permission_modal)).close(cx);
     let Some(Some(prompt)) = with_a2app(|state| state.active_prompt.take()) else { return };
 
-    // Internet-access prompts are answered per HOST, not per group: an Allow
-    // records only that host (or a session-only version of it), and a Deny
-    // refuses this host without turning the whole internet off (or setting a
-    // durable group Denied that would silently block every other host).
-    let network_hosts: Vec<String> = prompt
-        .parked
-        .iter()
-        .filter_map(|p| match p {
-            #[cfg(unix)]
-            ParkedRequest::NetworkAccess { host, .. } => Some(host.clone()),
-            _ => None,
-        })
-        .collect();
-
-    // A prompt for a cross-room post/read decides ONE room: its answer must
-    // not write the group grant, or one Allow would unlock every room (the
-    // group `Granted` is the panel's explicit "all rooms").
-    #[cfg(unix)]
-    let per_room = !prompt.parked.is_empty()
-        && prompt.parked.iter().all(|p| matches!(p,
-            ParkedRequest::AiTool {
-                job: SessionJob::PostRoomMessage { .. }
-                    | SessionJob::ReadTool { kind: ReadToolKind::OtherRoom { .. }, .. },
-                ..
-            }));
-    #[cfg(not(unix))]
-    let per_room = false;
-    let granted = if !network_hosts.is_empty() {
-        match answer {
-            PermissionPromptAction::Allow => {
-                with_a2app(|state| {
-                    for host in &network_hosts {
-                        state.permissions.allow_host(&prompt.subject, host);
-                    }
-                    state.perms_dirty = true;
-                });
-                true
-            }
-            PermissionPromptAction::AllowOnce => {
-                with_a2app(|state| {
-                    for host in &network_hosts {
-                        state.permissions.allow_host_once(&prompt.subject, host);
-                    }
-                });
-                true
-            }
-            // A refusal covers exactly this host, so the group is left as it
-            // was: the next host is asked about on its own terms.
-            PermissionPromptAction::Deny => false,
-            // "Not Now" also stops at this host for the session: it must not
-            // dismiss the whole Network group, or every other URL would be
-            // silently refused without a prompt.
-            PermissionPromptAction::NotNow => {
-                with_a2app(|state| {
-                    for host in &network_hosts {
-                        state.dismissed_net_hosts.insert((
-                            prompt.subject.clone(),
-                            host.trim().trim_end_matches('.').to_ascii_lowercase(),
-                        ));
-                    }
-                });
-                false
-            }
-            PermissionPromptAction::None => {
-                with_a2app(|state| state.active_prompt = Some(prompt));
-                return;
+    if matches!(answer, PermissionPromptAction::None) {
+        with_a2app(|state| state.active_prompt = Some(prompt));
+        return;
+    }
+    let (origin, target) = prompt.parked.first().map(parked_rooms).unwrap_or_default();
+    let network_url = prompt.parked.iter().find_map(parked_network_url);
+    let capability = prompt.parked.iter().find_map(parked_capability).map(|cap| cap.id);
+    let once = matches!(answer, PermissionPromptAction::AllowOnce);
+    let mut temporary_grant = None;
+    let mut temporary_network = None;
+    let granted = match answer {
+        PermissionPromptAction::AllowScoped { scope, duration, network } => {
+            let result = with_a2app(|state| {
+                let result = if let Some(url) = &network_url {
+                    state.permissions.allow_network(&prompt.subject,
+                        network.unwrap_or_else(|| NetworkScope::ExactUrl(url.clone())),
+                        scope, duration, origin.as_deref())
+                } else if let Some(tool) = &prompt.tool {
+                    state.permissions.grant_scoped_tool(&prompt.subject, &tool.full_name,
+                        &tool.content_hash, scope, duration, origin.as_deref())
+                } else {
+                    state.permissions.grant_scoped(&prompt.subject, prompt.perm, capability,
+                        scope, duration, origin.as_deref())
+                };
+                state.perms_dirty = true;
+                result
+            }).unwrap_or_else(|| Err("Permissions are unavailable.".into()));
+            match result {
+                Ok(_) => true,
+                Err(error) => { enqueue_popup_notification(error, PopupKind::Error, Some(5.0)); false }
             }
         }
-    } else if prompt.perm == Permission::McpTools {
-        // An mcp-tools prompt grants ONE tool, not the whole group. A durable
-        // group Deny would kill every tool this app/AI might use, which is a
-        // broader decision than this prompt asks for, so an Allow records the
-        // specific tool (with the description's content hash for a
-        // registration) and a refusal is session-scoped.
-        match (answer, prompt.tool.clone()) {
-            (PermissionPromptAction::Allow, Some(tool)) => {
-                with_a2app(|state| {
-                    state.permissions.allow_tool(
-                        &prompt.subject,
-                        &tool.full_name,
-                        &tool.content_hash,
-                    );
-                    // Keep the group "on" for App Info; it is a kill switch
-                    // now, not the per-tool gate.
-                    state.permissions.set(
-                        &prompt.subject,
-                        Permission::McpTools,
-                        GrantState::Granted,
-                    );
-                    state.perms_dirty = true;
-                });
-                true
-            }
-            (PermissionPromptAction::AllowOnce, Some(tool)) => {
-                with_a2app(|state| {
-                    state.permissions.allow_tool_once(
-                        &prompt.subject,
-                        &tool.full_name,
-                        &tool.content_hash,
-                    )
-                });
-                true
-            }
-            (PermissionPromptAction::Deny | PermissionPromptAction::NotNow, Some(tool)) => {
-                with_a2app(|state| state.permissions.deny_tool(&prompt.subject, &tool.full_name));
-                false
-            }
-            (PermissionPromptAction::None, _) => {
-                with_a2app(|state| state.active_prompt = Some(prompt));
-                return;
-            }
-            // No tool attached (shouldn't happen): refuse rather than grant a
-            // whole group on an ambiguous answer.
-            (_, None) => false,
+        PermissionPromptAction::AllowOnce => {
+            // Temporarily authorize exactly this replay. No durable or
+            // session grant survives it, and queued requests have separate prompts.
+            let scope = target.as_ref().map(|room| RoomScope::Selection {
+                rooms: vec![room.clone()], spaces: Vec::new(),
+            }).unwrap_or(RoomScope::AllRooms);
+            prompt.parked.first().is_some_and(parked_can_allow_once) && with_a2app(|state| {
+                if let Some(url) = &network_url {
+                    temporary_network = state.permissions.allow_network(&prompt.subject,
+                        NetworkScope::ExactUrl(url.clone()), scope, GrantDuration::RobrixSession,
+                        origin.as_deref()).ok();
+                    temporary_network.is_some()
+                } else if let Some(tool) = &prompt.tool {
+                    temporary_grant = state.permissions.grant_scoped_tool(&prompt.subject,
+                        &tool.full_name, &tool.content_hash, scope, GrantDuration::RobrixSession,
+                        origin.as_deref()).ok();
+                    temporary_grant.is_some()
+                } else {
+                    temporary_grant = state.permissions.grant_scoped(&prompt.subject,
+                        prompt.perm, capability, scope, GrantDuration::RobrixSession,
+                        origin.as_deref()).ok();
+                    temporary_grant.is_some()
+                }
+            }).unwrap_or(false)
         }
-    } else {
-        match answer {
-            PermissionPromptAction::Allow => {
-                if !per_room {
-                    with_a2app(|state| {
-                        state.permissions.set(&prompt.subject, prompt.perm, GrantState::Granted);
-                        state.perms_dirty = true;
-                    });
-                }
-                true
-            }
-            PermissionPromptAction::AllowOnce => {
-                // Session-only: never touches disk, dropped on isolate/session
-                // teardown.
-                if !per_room {
-                    with_a2app(|state| state.permissions.grant_once(&prompt.subject, prompt.perm));
-                }
-                true
-            }
-            PermissionPromptAction::Deny => {
-                with_a2app(|state| {
-                    state.permissions.set(&prompt.subject, prompt.perm, GrantState::Denied);
-                    state.perms_dirty = true;
-                });
-                false
-            }
-            PermissionPromptAction::NotNow => {
-                with_a2app(|state| {
+        PermissionPromptAction::Deny => {
+            with_a2app(|state| {
+                state.permissions.set(&prompt.subject, prompt.perm, GrantState::Denied);
+                state.perms_dirty = true;
+            });
+            false
+        }
+        PermissionPromptAction::NotNow => {
+            with_a2app(|state| {
+                if let Some(url) = &network_url {
+                    if let Ok(url) = url::Url::parse(url)
+                        && let Some(host) = url.host_str()
+                    {
+                        state.dismissed_net_hosts.insert((prompt.subject.clone(), host.to_string()));
+                    }
+                } else {
                     state.dismissed_prompts.insert((prompt.subject.clone(), prompt.perm));
-                });
-                false
-            }
-            PermissionPromptAction::None => {
-                // Shouldn't happen; put the prompt back.
-                with_a2app(|state| state.active_prompt = Some(prompt));
-                return;
-            }
+                }
+            });
+            false
         }
+        PermissionPromptAction::None => unreachable!(),
     };
+    if let Some(id) = temporary_grant {
+        with_a2app(|state| state.permissions.mark_request_once(id));
+    }
+    if let Some(id) = temporary_network {
+        with_a2app(|state| state.permissions.mark_network_request_once(id));
+    }
     publish_grants(cx);
 
     let subject = prompt.subject.clone();
@@ -2915,8 +3570,11 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
                                 is_docked: &is_docked,
                                 is_running: &instances::is_running,
                                 pane_state: &instances::pane_state,
+                                storage_path: &compartment_storage_path,
                                 room_name: &room_name,
                                 desktop_view,
+                                check_flow: &super::information_flow::check_request,
+                                check_response: &super::information_flow::check_response,
                             }, request)
                         }).unwrap_or_default();
                         for ask in asks {
@@ -2931,57 +3589,18 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
             #[cfg(unix)]
             ParkedRequest::AiTool { room_id, job } => {
                 if granted {
-                    // Per-room grants for cross-room posts and reads: an Allow
-                    // unlocks exactly the target room (durably; an Allow Once
-                    // for this session only), recorded before re-running the
-                    // job so its gate now lets it through.
-                    let durable = matches!(answer, PermissionPromptAction::Allow);
-                    let target = match &job {
-                        SessionJob::PostRoomMessage { room_id: target, .. } => Some((target.clone(), true)),
-                        SessionJob::ReadTool { kind: ReadToolKind::OtherRoom { room, .. }, .. } => Some((room.clone(), false)),
-                        _ => None,
-                    };
-                    if let Some((target, is_post)) = target {
-                        with_a2app(|state| {
-                            if durable && is_post {
-                                state.permissions.allow_room_send(&subject, &target);
-                                state.perms_dirty = true;
-                            } else if durable {
-                                state.permissions.allow_room_read(&subject, &target);
-                                state.perms_dirty = true;
-                            } else {
-                                state.once_rooms.insert((subject.clone(), perm, target));
-                            }
-                        });
-                    }
-                    // The grant is stored above; re-run the session job so its
-                    // own gate now lets it through to the real work.
                     execute_session_job(cx, ui, &room_id, job);
                 } else {
-                    // Denied: the call is refused with a receipt naming it, so
-                    // the turn's card shows the AI was stopped from doing it
-                    // (and its live tool row is rewritten Done). Cross-room
-                    // posts and reads are denied PER ROOM: reset the group to
-                    // Ask so one room's refusal does not silently block every
-                    // other room the agent might name later.
-                    if matches!(
-                        job,
-                        SessionJob::PostRoomMessage { .. }
-                            | SessionJob::ReadTool { kind: ReadToolKind::OtherRoom { .. }, .. }
-                    ) {
-                        with_a2app(|state| {
-                            state.permissions.set(&subject, perm, GrantState::Ask);
-                            state.perms_dirty = true;
-                        });
-                    }
                     let reason = ai_tool_refused_text(perm);
                     note_ai_tool_call(&room_id, &ai_job_tool_name(&job), false, &reason);
                     answer_session_job(job, Err(reason));
                 }
             }
             #[cfg(unix)]
-            ParkedRequest::NetworkAccess { host, answer, .. } => {
-                let _ = if granted {
+            ParkedRequest::NetworkAccess { room_id, host, url, answer, .. } => {
+                let allowed = granted && with_a2app(|state| state.permissions.is_url_allowed(&subject, &url,
+                    PermissionContext { origin_room: Some(room_id.as_str()), target_room: Some(room_id.as_str()) })).unwrap_or(false);
+                let _ = if allowed {
                     answer.send(Ok(String::from("allowed")))
                 } else {
                     answer.send(Err(format!(
@@ -2993,6 +3612,13 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
         }
     }
 
+    if once {
+        with_a2app(|state| {
+            if let Some(id) = temporary_grant { state.permissions.remove_scoped_grant(id); }
+            if let Some(id) = temporary_network { state.permissions.remove_network_grant(id); }
+        });
+        publish_grants(cx);
+    }
     if !is_agent_subject(&subject) {
         apply_permission_to_running(cx, ui, &subject, perm);
     }
@@ -3049,6 +3675,7 @@ fn app_tools_allowed(app_id: &str) -> bool {
 /// app's permission to offer them.
 #[cfg(unix)]
 fn withdraw_app_tools(app_id: &str) {
+    let mut failed_rooms = Vec::new();
     let withdrawn = with_a2app(|state| {
         let names: Vec<String> = state
             .app_tools
@@ -3057,10 +3684,14 @@ fn withdraw_app_tools(app_id: &str) {
             .map(|(name, _)| name.clone())
             .collect();
         for name in &names {
-            if let Some(reg) = state.app_tools.remove(name)
-                && let Some(session) = state.ai_sessions.get(&reg.room_id)
-            {
-                session.unregister_miniapp_tool(name);
+            if let Some(reg) = state.app_tools.remove(name) {
+                if transfer_app_tool_provenance(state, &reg.app_id, reg.heap_key, &reg.room_id).is_err() {
+                    state.ai_sessions.remove(&reg.room_id);
+                    failed_rooms.push(reg.room_id.clone());
+                }
+                if let Some(session) = state.ai_sessions.get(&reg.room_id) {
+                    session.unregister_miniapp_tool(name);
+                }
             }
         }
         let ids: Vec<u64> = state
@@ -3079,6 +3710,7 @@ fn withdraw_app_tools(app_id: &str) {
         names
     })
     .unwrap_or_default();
+    for room in failed_rooms { stop_ai_session(&room); }
     if withdrawn.is_empty() {
         return;
     }
@@ -3145,10 +3777,128 @@ fn expire_timed_grants(cx: &mut Cx, ui: &WidgetRef) {
     }
 }
 
+fn invalidate_policy_spaces(cx: &mut Cx) {
+    with_a2app(|state| {
+        state.permissions.clear_room_spaces();
+        state.policy_spaces_last = None;
+        state.policy_spaces_ready = false;
+        state.policy_spaces_revision = matrix::spaces::policy_spaces_revision();
+    });
+    publish_grants(cx);
+}
+
+fn request_policy_spaces() {
+    if crate::sliding_sync::get_client().is_none() { return; }
+    let refresh = with_a2app(|state| {
+        if state.policy_spaces_ready || state.policy_spaces_pending || state.policy_spaces_last.is_some_and(|last| last.elapsed() < Duration::from_secs(60)) {
+            return false;
+        }
+        state.policy_spaces_pending = true;
+        state.policy_spaces_status = Some("Refreshing space membership; rooms with unresolved protection remain blocked.".into());
+        state.policy_spaces_last = Some(Instant::now());
+        true
+    }).unwrap_or(false);
+    if refresh {
+        submit_async_request(MatrixRequest::A2App(matrix::A2AppMatrixRequest::RefreshPolicySpaces));
+    }
+}
+
+/// Ends room-session consent when the room's last tab/mobile screen closes.
+pub fn on_room_closed(cx: &mut Cx, room_id: &OwnedRoomId) {
+    if let Ok(account) = super::information_flow::account() {
+        let _ = a2app_core::information_flow::close_room_session(&account, room_id.as_str());
+    }
+    with_a2app(|state| { state.permissions.clear_room_session(room_id.as_str()); });
+    publish_grants(cx);
+    cx.action(A2AppOp::RoomClosed(room_id.clone()));
+}
+
+/// Context-specific capabilities advertised to one isolate.
+pub fn grants_in_room(app_id: &str, room: Option<&str>) -> Vec<String> {
+    with_a2app(|state| {
+        let Some(manifest) = state.registry.get(app_id) else { return Vec::new() };
+        let context = PermissionContext { origin_room: room, target_room: room };
+        let mut grants: Vec<String> = Permission::ALL.into_iter().filter(|permission| {
+            state.permissions.effective_for_in_context(app_id, |p| manifest.declares(p), *permission, context) == Effective::Granted
+        }).map(|permission| permission.as_str().to_string()).collect();
+        for cap in a2app_core::capabilities::CATALOG.iter() {
+            let effective = if services::is_room_collection(cap) {
+                state.permissions.effective_collection_capability_in_context(manifest, cap, context)
+            } else { state.permissions.effective_capability_in_context(manifest, cap, context) };
+            if effective == Effective::Granted {
+                grants.push(cap.id.to_string());
+                if let Some(group) = cap.group { grants.push(group.as_str().to_string()); }
+            }
+        }
+        grants.sort();
+        grants.dedup();
+        grants
+    }).unwrap_or_default()
+}
+
+/// Hard room protections apply even to automatic agent input/output.
+fn room_policy_allows(room: &str, access: RoomAccess) -> bool {
+    with_a2app(|state| state.permissions.room_policy(Some(room), access) != PolicyDecision::Deny)
+        .unwrap_or(false)
+}
+
+fn stop_private_contexts(cx: &mut Cx, ui: &WidgetRef) {
+    with_a2app(|state| { state.generation = None; state.generation_context = None; });
+    #[cfg(unix)]
+    {
+        let rooms = with_a2app(|state| state.ai_sessions.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
+        for room in rooms {
+            abort_ai_room_work(cx, ui, &room);
+            refuse_room_prompts(cx, ui, &room);
+            stop_ai_session(&room);
+        }
+    }
+    let apps = with_a2app(|state| state.registry.iter().map(|m| m.id.clone()).collect::<Vec<_>>()).unwrap_or_default();
+    for app in apps { stop_app_everywhere(cx, ui, &app); }
+}
+
+fn refresh_permission_policy(cx: &mut Cx, ui: &WidgetRef) {
+    publish_grants(cx);
+    prune_hook_subs();
+    let apps = with_a2app(|state| state.registry.iter().map(|m| m.id.clone()).collect::<Vec<_>>()).unwrap_or_default();
+    for app in apps {
+        // Restart affected app state after policy changes. Host requests also
+        // recheck live permissions, including requests already queued.
+        if instances::is_running(&app) {
+            stop_app_everywhere(cx, ui, &app);
+        }
+    }
+    #[cfg(unix)]
+    {
+        let blocked = with_a2app(|state| state.ai_sessions.keys()
+            .filter(|room| state.permissions.room_policy(Some(room.as_str()), RoomAccess::Read) == PolicyDecision::Deny)
+            .cloned().collect::<Vec<_>>()).unwrap_or_default();
+        for room in blocked {
+            abort_ai_room_work(cx, ui, &room);
+            refuse_room_prompts(cx, ui, &room);
+            stop_ai_session(&room);
+        }
+    }
+    ui.redraw(cx);
+}
+
 /// Republishes the grant snapshot that isolate-creation sites read.
 fn publish_grants(_cx: &mut Cx) {
     with_a2app(|state| {
+        let roots = state.permissions.configured_space_ids();
+        if roots != state.policy_space_roots {
+            state.policy_space_roots = roots;
+            matrix::spaces::invalidate_policy_spaces();
+        }
+        let revision = matrix::spaces::policy_spaces_revision();
+        if state.policy_spaces_revision != revision {
+            state.permissions.clear_room_spaces();
+            state.policy_spaces_ready = false;
+            state.policy_spaces_last = None;
+            state.policy_spaces_revision = revision;
+        }
         a2app_core::permissions::publish_snapshot(state.permissions.snapshot(&state.registry));
+        crate::a2app::matrix::publish_permission_policy_at_revision(&state.permissions, state.policy_spaces_revision);
     });
 }
 
@@ -3211,6 +3961,7 @@ const AI_SHUTDOWN_GRACE: Duration = Duration::from_millis(2000);
 /// immediately when nothing is running.
 #[cfg(unix)]
 pub fn shutdown() {
+    matrix::spaces::stop_policy_space_watch();
     // Take the generation out of state and cancel its agent. It is held here
     // (rather than dropped) for the grace below: dropping kills the child
     // immediately, which can race the cancel that was just written to it.
@@ -3450,7 +4201,7 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
                 let _ = answer.send(result);
             }
         }
-        AiRoomAction::ToolReadResult { id, result } => {
+        AiRoomAction::ToolReadResult { id, result, authorization } => {
             // A read finished on the worker; answer the tool call that has
             // been waiting on it. A granted read's outcome is recorded on the
             // turn's receipt; ungated memory reads (recalling its own past
@@ -3461,6 +4212,25 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
             if let Some((room_id, kind, answer)) =
                 with_a2app(|state| state.ai_reads.remove(&id)).flatten()
             {
+                let result = result.and_then(|result| with_a2app(|state| {
+                    let auth = authorization;
+                    let target = match &kind {
+                        ReadToolKind::OtherRoom { room, .. } => room.as_str(),
+                        ReadToolKind::SpaceInfo { space } | ReadToolKind::SpaceRooms { space } => space.as_str(),
+                        _ => room_id.as_str(),
+                    };
+                    if state.permissions.room_policy(Some(target), RoomAccess::Read) == PolicyDecision::Deny
+                        || (!matches!(kind, ReadToolKind::ListRooms | ReadToolKind::ListSpaces | ReadToolKind::SpaceRooms { .. })
+                            && auth.as_ref().is_some_and(|auth| !auth.permits(&state.permissions, Some(target))))
+                    { return Err("Reading this room is now blocked in Mini Apps permissions.".into()); }
+                    matrix::policy::filter_read_result(&result, &state.permissions, auth.as_ref())
+                }).unwrap_or_else(|| Err("Permissions are unavailable.".into())));
+                let result = result.and_then(|text| {
+                    let context = super::information_flow::agent_context(room_id.as_str())?;
+                    let value = serde_json::from_str(&text).map_err(|_| "Invalid tool response.")?;
+                    super::information_flow::record_response(&context, &value)?;
+                    Ok(text)
+                });
                 let (summary, ok) = match &result {
                     Ok(_) => (String::new(), true),
                     Err(e) => (e.clone(), false),
@@ -3527,6 +4297,10 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
 /// used by the panel's power switch.
 #[cfg(unix)]
 fn stop_ai_session(room_id: &OwnedRoomId) {
+    cancel_ai_fetches(room_id);
+    if let Ok(context) = super::information_flow::agent_context(room_id.as_str()) {
+        let _ = a2app_core::information_flow::remove_context(&context);
+    }
     with_a2app(|state| {
         state.ai_sessions.remove(room_id);
         state.ai_reads.retain(|_, (r, _, _)| r != room_id);
@@ -3694,7 +4468,9 @@ fn refresh_ai_room_panel(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
         let info = state.ai_rooms.get(room_id)?;
         let perm_word = |perm: Permission| match state
             .permissions
-            .effective_for(&subject, ai_room_declares_perm, perm)
+            .effective_for_in_context(&subject, ai_room_declares_perm, perm, PermissionContext {
+                origin_room: Some(room_id.as_str()), target_room: Some(room_id.as_str()),
+            })
         {
             // These groups only ever act as a kill switch: what the AI may
             // actually do is decided per room, per tool or per site, so a
@@ -3770,6 +4546,10 @@ fn refresh_ai_room_panel(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
                     "call {tools} mini-app tool{}",
                     if tools == 1 { "" } else { "s" }
                 ));
+            }
+            let scoped = state.permissions.scoped_grants(&subject).len() + state.permissions.network_grants(&subject).len();
+            if scoped > 0 {
+                parts.push(format!("{scoped} scoped permission rules (manage them in Mini Apps)"));
             }
             let mut line = if parts.is_empty() {
                 String::new()
@@ -3865,6 +4645,10 @@ fn apply_ai_room_panel_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomPanelAc
                     store.disallow_host(&subject, &host);
                 }
                 store.clear_tool_grants_for(&subject);
+                let grants: Vec<_> = store.scoped_grants(&subject).iter().map(|g| g.id).collect();
+                for id in grants { store.remove_scoped_grant(id); }
+                let grants: Vec<_> = store.network_grants(&subject).iter().map(|g| g.id).collect();
+                for id in grants { store.remove_network_grant(id); }
                 // The one-time answers go too: a host or group allowed once is
                 // checked before any durable grant, so leaving it would make
                 // the confirmation a lie.
@@ -3903,6 +4687,7 @@ fn apply_ai_room_panel_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomPanelAc
 /// replayed transcript and sends it as one prompt.
 #[cfg(unix)]
 fn attach_ai_session(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, _name: Option<String>) {
+    if !room_policy_allows(room_id.as_str(), RoomAccess::Read) { return; }
     // Turned off from the panel: don't (re)start the agent.
     let powered_off = with_a2app(|state| {
         state.ai_rooms.get(room_id).map(|info| !info.session_on).unwrap_or(false)
@@ -3919,7 +4704,13 @@ fn attach_ai_session(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, _name: 
     let prefs = with_a2app(|state| state.agent_prefs.clone())
         .unwrap_or_else(a2app_agent::prefs::load_agent_prefs);
     let started = with_a2app(|state| {
-        let started = AiSession::start(room_id.clone(), prefs).map(|session| {
+        let started = super::information_flow::prepare_agent(room_id.as_str())
+            .and_then(|context| {
+                for reg in state.app_tools.values().filter(|reg| &reg.room_id == room_id) {
+                    transfer_app_tool_provenance(state, &reg.app_id, reg.heap_key, room_id)?;
+                }
+                AiSession::start(room_id.clone(), prefs, context)
+            }).map(|session| {
             state.ai_sessions.insert(room_id.clone(), session);
         });
         if let Some(info) = state.ai_rooms.get_mut(room_id) {
@@ -3938,18 +4729,24 @@ fn attach_ai_session(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, _name: 
         // Re-install app tools this room already had. Their descriptions were
         // reviewed when first registered, so a session restart does not ask
         // again; a tool whose isolate is gone is pruned by `sweep_app_tools`.
-        with_a2app(|state| {
-            let Some(session) = state.ai_sessions.get(room_id) else { return };
-            let tools: Vec<(String, String, serde_json::Value)> = state
+        let restored = with_a2app(|state| {
+            let Some(session) = state.ai_sessions.get(room_id) else { return Ok(()) };
+            let tools: Vec<(String, String, serde_json::Value, String, usize)> = state
                 .app_tools
                 .values()
                 .filter(|reg| &reg.room_id == room_id)
-                .map(|reg| (reg.full_name.clone(), reg.description.clone(), reg.schema.clone()))
+                .map(|reg| (reg.full_name.clone(), reg.description.clone(), reg.schema.clone(), reg.app_id.clone(), reg.heap_key))
                 .collect();
-            for (name, description, schema) in tools {
-                let _ = session.register_miniapp_tool(name, description, schema);
+            for (name, description, schema, app_id, heap_key) in tools {
+                transfer_app_tool_provenance(state, &app_id, heap_key, room_id)?;
+                session.register_miniapp_tool(name, description, schema)?;
             }
+            Ok::<(), String>(())
         });
+        if let Some(Err(error)) = restored {
+            stop_ai_session(room_id);
+            enqueue_popup_notification(format!("Couldn't restore this agent's protected app tools: {error}"), PopupKind::Error, Some(7.0));
+        }
     }
     ui.redraw(cx);
 }
@@ -4041,6 +4838,7 @@ pub fn ai_room_active_turn(_room_id: &OwnedRoomId) -> Option<String> {
 /// (or another room) started keeps running.
 #[cfg(unix)]
 fn abort_ai_room_work(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
+    cancel_ai_fetches(room_id);
     // Cancel the room's own generation first, if one is running. Exactly the
     // Mini Apps screen's Stop, but scoped to this room's build.
     let cancels_generation = with_a2app(|state| {
@@ -4093,10 +4891,11 @@ pub fn forward_ai_room_texts(
     if new_texts.is_empty() {
         return;
     }
-    log!("AI Rooms: forwarding {} new message(s) to room {room_id}'s session...", new_texts.len());
-    for (event_id, text) in &new_texts {
-        log!("AI Rooms:   -> forwarding {event_id}: {}", text.chars().take(120).collect::<String>());
+    if !room_policy_allows(room_id.as_str(), RoomAccess::Read) {
+        return;
     }
+    log!("AI Rooms: forwarding {} new message(s) to room {room_id}'s session...", new_texts.len());
+
     // A start that just failed is not retried (with its popup) on every
     // timeline update; the messages stay unforwarded until the cooldown ends.
     let cooling = with_a2app(|state| {
@@ -4118,7 +4917,8 @@ pub fn forward_ai_room_texts(
     for (event_id, text) in new_texts {
         let outcome: Result<PromptOutcome, String> = with_a2app(|state| {
             if !state.ai_sessions.contains_key(room_id) {
-                let started = AiSession::start(room_id.clone(), prefs.clone());
+                let started = super::information_flow::prepare_agent(room_id.as_str())
+                    .and_then(|context| AiSession::start(room_id.clone(), prefs.clone(), context));
                 if let Some(info) = state.ai_rooms.get_mut(room_id) {
                     info.start_failed_at = started.is_err().then(Instant::now);
                 }
@@ -4156,7 +4956,10 @@ pub fn forward_ai_room_texts(
         last_cursor = Some(event_id);
     }
     if let Some(cursor) = last_cursor {
+        let Ok(flow_context) = super::information_flow::agent_context(room_id.as_str()) else { return };
         submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::SaveCursor {
+            flow_epoch: a2app_core::information_flow::context_epoch(&flow_context).unwrap_or(0),
+            flow_context,
             room_id: room_id.clone(),
             cursor,
         }));
@@ -4184,14 +4987,20 @@ fn sweep_app_tools() {
         state
             .app_tools
             .iter()
-            .filter(|(_, reg)| instances::key_of_heap(reg.heap_key).is_none())
+            .filter(|(_, reg)| instances::key_of_heap(reg.heap_key)
+                .is_none_or(|(app, room)| app != reg.app_id || room.as_ref() != Some(&reg.room_id)))
             .map(|(name, _)| name.clone())
             .collect()
     })
     .unwrap_or_default();
+    let mut failed_rooms = Vec::new();
     for name in dead {
         with_a2app(|state| {
             if let Some(reg) = state.app_tools.remove(&name) {
+                if transfer_app_tool_provenance(state, &reg.app_id, reg.heap_key, &reg.room_id).is_err() {
+                    state.ai_sessions.remove(&reg.room_id);
+                    failed_rooms.push(reg.room_id.clone());
+                }
                 if let Some(session) = state.ai_sessions.get(&reg.room_id) {
                     session.unregister_miniapp_tool(&name);
                 }
@@ -4211,6 +5020,7 @@ fn sweep_app_tools() {
             }
         });
     }
+    for room in failed_rooms { stop_ai_session(&room); }
     // Timeouts: an app that got the hook but never replied must not hold the
     // model's serve thread past the bound.
     let expired: Vec<u64> = with_a2app(|state| {
@@ -4225,6 +5035,13 @@ fn sweep_app_tools() {
     .unwrap_or_default();
     for id in expired {
         if let Some(p) = with_a2app(|state| state.app_tool_calls.remove(&id)).flatten() {
+            let protected = with_a2app(|state| transfer_app_tool_provenance(state, &p.app_id, p.heap_key, &p.room_id))
+                .unwrap_or_else(|| Err("Mini-app state is unavailable.".into()));
+            if let Err(error) = protected {
+                stop_ai_session(&p.room_id);
+                let _ = p.answer.send(Err(error));
+                continue;
+            }
             let reason = format!("the mini-app did not answer `{}` in time", p.full_name);
             note_ai_tool_call(&p.room_id, &p.display_name, false, &reason);
             let _ = p.answer.send(Err(reason));
@@ -4520,7 +5337,10 @@ fn ai_capability_verdict(
     cap: &a2app_core::capabilities::Capability,
 ) -> Effective {
     let subject = agent_subject(room_id.as_str());
-    state.permissions.effective_capability_for(&subject, ai_room_declares_perm, ai_room_declares_cap, cap)
+    state.permissions.effective_capability_for_in_context(
+        &subject, ai_room_declares_perm, ai_room_declares_cap, cap,
+        PermissionContext { origin_room: Some(room_id.as_str()), target_room: Some(room_id.as_str()) },
+    )
 }
 
 /// Executes one capability-gated attached-room read for a session. Decides
@@ -4538,6 +5358,32 @@ fn run_ai_read_tool(
     kind: ReadToolKind,
     answer: Sender<Result<String, String>>,
 ) {
+    let target = match &kind {
+        ReadToolKind::OtherRoom { room, .. } => room.as_str(),
+        ReadToolKind::SpaceInfo { space } | ReadToolKind::SpaceRooms { space } => space.as_str(),
+        _ => room_id.as_str(),
+    };
+    let flow_context = match super::information_flow::prepare_agent(room_id.as_str()).and_then(|context| {
+        // Caller-controlled identifiers and pagination can be sent to the server.
+        if !matches!(kind, ReadToolKind::ListRooms | ReadToolKind::ListSpaces) {
+            super::information_flow::ensure_room_output(&context, target)?;
+        }
+        let source = if matches!(kind, ReadToolKind::ListRooms | ReadToolKind::ListSpaces | ReadToolKind::SpaceRooms { .. }) {
+            super::information_flow::account_source(&context)
+        } else { super::information_flow::room_source(&context, target) };
+        a2app_core::information_flow::add_sources(&context, [source])?;
+        a2app_core::information_flow::add_influences(&context, [a2app_core::information_flow::Influence::RoomContent {
+            account: super::information_flow::context_account(&context).into(), room: target.into(),
+        }])?;
+        Ok(context)
+    }) {
+        Ok(context) => context,
+        Err(error) => { let _ = answer.send(Err(error)); return; }
+    };
+    if !room_policy_allows(target, RoomAccess::Read) {
+        let _ = answer.send(Err("Reading this room is blocked in Mini Apps permissions.".into()));
+        return;
+    }
     // `read_room_memory` is ungated room plumbing — the agent recalling its
     // OWN past replies — not a catalog capability, so it never floods, asks,
     // records, or gets refused. Park it on the same id map the granted reads
@@ -4551,6 +5397,9 @@ fn run_ai_read_tool(
             id,
             room_id: room_id.clone(),
             tool: kind,
+            authorization: None,
+            flow_epoch: a2app_core::information_flow::context_epoch(&flow_context).unwrap_or(0),
+            flow_context,
         }));
         return;
     }
@@ -4589,7 +5438,9 @@ fn run_ai_read_tool(
     // unit, but a group `Granted` alone must not unlock every room the agent
     // names. Only the agent's own-room reads keep the ordinary group gate.
     let target_room = match &kind {
-        ReadToolKind::OtherRoom { room, .. } => match OwnedRoomId::try_from(room.as_str()) {
+        ReadToolKind::OtherRoom { room, .. }
+        | ReadToolKind::SpaceInfo { space: room }
+        | ReadToolKind::SpaceRooms { space: room } => match OwnedRoomId::try_from(room.as_str()) {
             Ok(target) => Some(target),
             Err(_) => {
                 let err = format!("`{room}` is not a valid matrix room id");
@@ -4600,29 +5451,25 @@ fn run_ai_read_tool(
         },
         _ => None,
     };
-    let verdict = match &target_room {
-        Some(target) => with_a2app(|state| {
-            let store = &state.permissions;
-            let group_state = cap.group.map(|g| store.state(&subject, g));
-            let once = cap
-                .group
-                .is_some_and(|g| state.once_rooms.contains(&(subject.clone(), g, target.to_string())));
-            if group_state == Some(GrantState::Denied) {
-                Effective::Denied
-            } else if group_state == Some(GrantState::Granted) {
-                // The AI panel's explicit "allow all rooms" grant.
-                Effective::Granted
-            } else if once || store.is_room_read_allowed(&subject, target.as_str()) {
-                Effective::Granted
-            } else {
-                Effective::NeedsPrompt
-            }
-        })
-        .unwrap_or(Effective::Denied),
-        None => {
-            with_a2app(|state| ai_capability_verdict(state, room_id, cap)).unwrap_or(Effective::Denied)
-        }
-    };
+    let verdict = with_a2app(|state| {
+        let target = target_room.as_deref().map(|r| r.as_str()).unwrap_or(room_id.as_str());
+        let context = PermissionContext { origin_room: Some(room_id.as_str()), target_room: Some(target) };
+        let verdict = if services::is_room_collection(cap) {
+            state.permissions.effective_collection_capability_for_in_context(
+                &subject, ai_room_declares_perm, ai_room_declares_cap, cap, context,
+            )
+        } else {
+            state.permissions.effective_capability_for_in_context(
+                &subject, ai_room_declares_perm, ai_room_declares_cap, cap, context,
+            )
+        };
+        if verdict == Effective::NeedsPrompt && target_room.is_some()
+            && (state.permissions.is_room_read_allowed(&subject, target)
+                || cap.group.is_some_and(|group| state.once_rooms.contains(&(subject.clone(), group, target.to_string()))))
+        {
+            Effective::Granted
+        } else { verdict }
+    }).unwrap_or(Effective::Denied);
     log!(
         "AI Rooms: room {}'s {} tool verdict: {:?}",
         room_id,
@@ -4646,10 +5493,17 @@ fn run_ai_read_tool(
             with_a2app(|state| {
                 state.ai_reads.insert(id, (room_id.clone(), kind.clone(), answer));
             });
+            let authorization = with_a2app(|state| {
+                let auth = matrix::policy::MatrixAuthorization::new(&subject, cap.id, Some(room_id.as_str()), &state.permissions).with_flow(flow_context.clone());
+                auth
+            });
             submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::ToolRead {
                 id,
                 room_id: room_id.clone(),
                 tool: kind,
+                authorization,
+                flow_epoch: a2app_core::information_flow::context_epoch(&flow_context).unwrap_or(0),
+                flow_context,
             }));
         }
         Effective::Denied | Effective::Undeclared => {
@@ -4715,35 +5569,23 @@ fn run_ai_room_post(
     let subject = agent_subject(session_room.as_str());
     // The per-room decision lives in the store: a durable group Denied is the
     // kill switch; otherwise the allowlist decides room by room.
-    let (verdict, write_off) = with_a2app(|state| {
-        let store = &state.permissions;
-        let verdict = if store.state(&subject, group) == GrantState::Denied {
-            Some(false)
-        } else if store.is_room_send_allowed(&subject, &target)
-            || state.once_rooms.contains(&(subject.clone(), group, target.to_string()))
-        {
-            Some(true)
-        } else {
-            None
-        };
-        (verdict, !store.matrix_write())
-    })
-    .unwrap_or((Some(false), false));
+    let verdict = with_a2app(|state| {
+        let verdict = state.permissions.effective_capability_for_in_context(
+            &subject, ai_room_declares_perm, ai_room_declares_cap, cap,
+            PermissionContext { origin_room: Some(session_room.as_str()), target_room: Some(&target) },
+        );
+        if verdict == Effective::NeedsPrompt
+            && (state.permissions.is_room_send_allowed(&subject, &target)
+                || state.once_rooms.contains(&(subject.clone(), group, target.clone())))
+        { Effective::Granted } else { verdict }
+    }).unwrap_or(Effective::Denied);
     let job = SessionJob::PostRoomMessage {
         room_id: target,
         text,
         answer,
     };
-    // The global write switch covers the agent's cross-room posts like any
-    // other switch-gated write.
-    if write_off {
-        let text = format!("The AI can't post: {MATRIX_WRITE_OFF_MSG}.");
-        note_ai_tool_call(session_room, "post_room_message", false, &text);
-        answer_session_job(job, Err(text));
-        return;
-    }
     match verdict {
-        Some(true) => {
+        Effective::Granted => {
             // Allowed for this room: record the group use and post on the
             // async worker (the tool call waits, answered when the write
             // lands).
@@ -4753,12 +5595,12 @@ fn run_ai_room_post(
             });
             post_ai_room_message(session_room, &target_room, job);
         }
-        Some(false) => {
+        Effective::Denied | Effective::Undeclared => {
             let text = ai_tool_refused_text(group);
             note_ai_tool_call(session_room, "post_room_message", false, &text);
             answer_session_job(job, Err(text));
         }
-        None => {
+        Effective::NeedsPrompt => {
             // First time into this room: park the call behind the prompt.
             // The room's name shows on the prompt (see `ai_prompt_action` /
             // `ai_prompt_reason`); an Allow grants exactly this room.
@@ -4787,6 +5629,13 @@ fn post_ai_room_message(
     job: SessionJob,
 ) {
     let SessionJob::PostRoomMessage { room_id, text, answer } = job else { return };
+    let flow_context = match super::information_flow::agent_context(session_room.as_str()).and_then(|context| {
+        super::information_flow::ensure_room_output(&context, target.as_str())?;
+        Ok(context)
+    }) {
+        Ok(context) => context,
+        Err(error) => { let _ = answer.send(Err(error)); return; }
+    };
     let id = NEXT_AI_TOOL_ID.fetch_add(1, Ordering::Relaxed);
     with_a2app(|state| {
         state.ai_posts.insert(id, (session_room.clone(), answer));
@@ -4798,6 +5647,8 @@ fn post_ai_room_message(
     submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::PostToRoom {
         id,
         target: OwnedRoomId::try_from(room_id).unwrap_or_else(|_| target.clone()),
+        flow_epoch: a2app_core::information_flow::context_epoch(&flow_context).unwrap_or(0),
+        flow_context,
         content: AiReplyContent {
             v: 1,
             text: text.clone(),
@@ -4856,7 +5707,17 @@ fn run_ai_list_apps(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-            let text = serde_json::json!({ "apps": apps }).to_string();
+            let value = serde_json::json!({ "apps": apps });
+            let manifests = with_a2app(|state| state.registry.iter().cloned().collect::<Vec<_>>()).unwrap_or_default();
+            let record = super::information_flow::agent_context(room_id.as_str()).and_then(|context| {
+                for manifest in manifests {
+                    join_manifest_code(&manifest, &context)?;
+                }
+                a2app_core::information_flow::add_sources(&context, [super::information_flow::account_source(&context)])?;
+                super::information_flow::record_response(&context, &value)
+            });
+            if let Err(error) = record { let _ = answer.send(Err(error)); return; }
+            let text = value.to_string();
             note_ai_tool_call(room_id, "list_apps", true, "");
             let _ = answer.send(Ok(text));
         }
@@ -4968,13 +5829,22 @@ fn run_ai_launch_app_granted(
 
     match outcome {
         Ok(manifest) => {
+            let transfer = super::information_flow::agent_context(room_id.as_str()).and_then(|from| {
+                let to = super::information_flow::app_context(&manifest.id, Some(room_id.as_str()))?;
+                a2app_core::information_flow::register_context_with_legacy_data(&to, super::information_flow::manifest_has_private_source(&manifest))?;
+                a2app_core::information_flow::transfer(&from, &to)?;
+                a2app_core::information_flow::transfer(&to, &from)
+            });
+            if let Err(error) = transfer { let _ = answer.send(Err(error)); return; }
             // Dock it into this room exactly as a freshly built app is docked
             // (`resolve_session_generation`), so "launch" lands where the
             // conversation is.
-            cx.action(A2AppOp::OpenApp {
+            let Ok(context) = super::information_flow::agent_context(room_id.as_str()) else { return };
+            cx.action(A2AppOp::OpenAppFromContext {
+                flow_epoch: a2app_core::information_flow::context_epoch(&context).unwrap_or(0),
+                context,
                 app_id: manifest.id.clone(),
-                room_id: Some(room_id.clone()),
-                in_room_pane: true,
+                room_id: room_id.clone(),
             });
             let summary = serde_json::json!({
                 "app_id": manifest.id,
@@ -5112,6 +5982,43 @@ fn run_ai_generation(
 /// result back to the serve thread that called the tool.
 #[cfg(unix)]
 fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: SessionJob) {
+    // Deriving tool-card details reads host metadata too. Label that input
+    // before any description or result can be written back to the room.
+    let recorded = super::information_flow::agent_context(room_id.as_str()).and_then(|context| {
+        super::information_flow::current_context(&context)?;
+        match &job {
+            SessionJob::ReadTool { kind: ReadToolKind::OtherRoom { room, .. }, .. }
+            | SessionJob::ReadTool { kind: ReadToolKind::SpaceInfo { space: room }, .. }
+            | SessionJob::ReadTool { kind: ReadToolKind::SpaceRooms { space: room }, .. } => {
+                a2app_core::information_flow::add_sources(&context, [super::information_flow::room_source(&context, room)])?;
+            }
+            SessionJob::LaunchApp { app_id, .. } => {
+                let manifest = with_a2app(|state| state.registry.get(app_id).cloned()).flatten();
+                a2app_core::information_flow::add_sources(&context, [super::information_flow::account_source(&context)])?;
+                if let Some(manifest) = manifest {
+                    join_manifest_code(&manifest, &context)?;
+                }
+            }
+            SessionJob::CallMiniAppTool { tool, .. } | SessionJob::InvokeMiniAppTool { tool, .. } => {
+                with_a2app(|state| {
+                    if let Some(reg) = state.app_tools.get(tool) {
+                        transfer_app_tool_provenance(state, &reg.app_id, reg.heap_key, room_id)?;
+                    }
+                    Ok::<(), String>(())
+                }).unwrap_or_else(|| Err("Tool registry is unavailable.".into()))?;
+            }
+            _ => {}
+        }
+        Ok(())
+    });
+    if let Err(error) = recorded { answer_session_job(job, Err(error)); return; }
+    if let Some(action) = session_job_sensitive_action(&job, room_id.as_str()) {
+        let checked = super::information_flow::agent_context(room_id.as_str()).and_then(|context| {
+            a2app_core::information_flow::ensure_action_allowed(&context, &action)
+        });
+        if let Err(error) = checked { answer_session_job(job, Err(error)); return; }
+    }
+
     // The job is the only place the call's arguments exist, so this is where
     // the human-readable target detail is computed and pinned to the call's
     // live row (reposted with it) and, later, its receipt chip.
@@ -5153,6 +6060,7 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
         SessionJob::ReadTool { kind, answer } => {
             run_ai_read_tool(cx, ui, room_id, kind, answer);
         }
+        SessionJob::FetchUrl { url, answer } => run_ai_fetch(cx, ui, room_id, url, answer),
         SessionJob::NetworkAccess { tool, host, url, answer } => {
             run_network_access(cx, ui, room_id, &tool, &host, &url, answer);
         }
@@ -5166,6 +6074,22 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
             run_ai_list_mini_app_tools(room_id, answer);
         }
     }
+}
+
+/// Only host-defined action kinds and exact targets can receive authority.
+#[cfg(unix)]
+fn session_job_sensitive_action(job: &SessionJob, room: &str) -> Option<a2app_core::information_flow::SensitiveAction> {
+    let (kind, target) = match job {
+        SessionJob::SendRoomMessage { .. } => ("ai.reply.write", room),
+        SessionJob::PostRoomMessage { room_id, .. } => ("matrix.rooms.message.send", room_id.as_str()),
+        SessionJob::LaunchSplashApp { .. } => ("apps.generate", room),
+        SessionJob::LaunchApp { app_id, .. } => ("apps.launch", app_id.as_str()),
+        SessionJob::CallMiniAppTool { tool, .. } | SessionJob::InvokeMiniAppTool { tool, .. } => ("mcp.tools.call", tool.as_str()),
+        SessionJob::ListApps { .. } | SessionJob::ListMiniAppTools { .. }
+        | SessionJob::ReadTool { .. } | SessionJob::FetchUrl { .. }
+        | SessionJob::NetworkAccess { .. } => return None,
+    };
+    Some(a2app_core::information_flow::SensitiveAction { kind: kind.into(), target: target.into() })
 }
 
 /// Gate 2 for a mini-app tool: an invocation — whether the model called the
@@ -5225,7 +6149,9 @@ fn run_mini_app_tool_call(
         if state.permissions.state(&subject, Permission::McpTools) == GrantState::Denied {
             return Effective::Denied;
         }
-        state.permissions.tool_effective(&subject, &tool, None)
+        if state.permissions.has_scoped_tool_grant(&subject, &tool, "", PermissionContext {
+            origin_room: Some(room_id.as_str()), target_room: Some(room_id.as_str()),
+        }) { Effective::Granted } else { state.permissions.tool_effective(&subject, &tool, None) }
     })
     .unwrap_or(Effective::NeedsPrompt);
     match decided {
@@ -5312,6 +6238,13 @@ fn run_ai_list_mini_app_tools(
             .collect::<Vec<_>>()
     })
     .unwrap_or_default();
+    let transfer = with_a2app(|state| {
+        for reg in state.app_tools.values().filter(|reg| &reg.room_id == room_id) {
+            transfer_app_tool_provenance(state, &reg.app_id, reg.heap_key, room_id)?;
+        }
+        Ok::<(), String>(())
+    }).unwrap_or_else(|| Err("Tool registry is unavailable.".into()));
+    if let Err(error) = transfer { let _ = answer.send(Err(error)); return; }
     let text = serde_json::json!({ "tools": tools }).to_string();
     note_ai_tool_call(room_id, "list_mini_app_tools", true, "");
     let _ = answer.send(Ok(text));
@@ -5347,6 +6280,19 @@ fn run_app_tool_invocation(
         let _ = answer.send(Err(format!("the mini-app tool `{tool}` is no longer allowed")));
         return;
     }
+    let transfer = super::information_flow::prepare_agent(room_id.as_str()).and_then(|from| {
+        let to = super::information_flow::context_for_heap(heap_key)?;
+        if !matches!(&to, a2app_core::information_flow::ContextId::App { app, room: Some(room), .. }
+            if app == &app_id && room == room_id.as_str())
+        { return Err("The mini-app tool's owning instance changed.".into()); }
+        a2app_core::information_flow::transfer(&from, &to)?;
+        // Tool metadata and the fact of invocation are observable to the agent too.
+        a2app_core::information_flow::transfer(&to, &from)?;
+        a2app_core::information_flow::ensure_action_allowed(&from, &a2app_core::information_flow::SensitiveAction {
+            kind: "mcp.tools.call".into(), target: tool.clone(),
+        })
+    });
+    if let Err(error) = transfer { let _ = answer.send(Err(error)); return; }
     let call_id = NEXT_APP_TOOL_CALL_ID.fetch_add(1, Ordering::Relaxed);
     with_a2app(|state| {
         state.app_tool_calls.insert(
@@ -5354,6 +6300,7 @@ fn run_app_tool_invocation(
             AppToolPending {
                 room_id: room_id.clone(),
                 app_id,
+                heap_key,
                 full_name: tool.clone(),
                 display_name,
                 answer,
@@ -5382,6 +6329,63 @@ fn run_app_tool_invocation(
     }
 }
 
+#[cfg(unix)]
+fn cancel_ai_fetches(room_id: &OwnedRoomId) {
+    with_a2app(|state| {
+        state.ai_fetches.retain(|_, (room, _, alive)| {
+            if room != room_id { return true; }
+            alive.store(false, std::sync::atomic::Ordering::SeqCst);
+            false
+        });
+    });
+}
+
+/// The model's internet tool uses the same transport as mini-apps.
+#[cfg(unix)]
+fn run_ai_fetch(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, url: String, answer: Sender<Result<String, String>>) {
+    let prepared = super::information_flow::agent_context(room_id.as_str()).and_then(|context| {
+        super::information_flow::current_context(&context)?;
+        let recipient = a2app_core::information_flow::Recipient::network_origin(&url)?;
+        a2app_core::information_flow::ensure_allowed(&context, &recipient)?;
+        let request = super::network::Request::parse(&serde_json::json!({ "url": url }))?;
+        Ok((context, request))
+    });
+    let (context, request) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => { let _ = answer.send(Err(error)); return; }
+    };
+    let subject = agent_subject(room_id.as_str());
+    let consent = with_a2app(|state| {
+        let permissions = &state.permissions;
+        let denied = permissions.is_restricted(&subject)
+            || permissions.state(&subject, Permission::Network) == GrantState::Denied
+            || permissions.capability_state(&subject, "network.http") == GrantState::Denied
+            || url::Url::parse(&url).ok().and_then(|url| url.host_str().map(str::to_owned))
+                .is_some_and(|host| state.dismissed_net_hosts.contains(&(subject.clone(), host)));
+        if denied { return Err("Internet permission is blocked for this agent."); }
+        Ok(permissions.is_url_allowed(&subject, &url, PermissionContext {
+            origin_room: Some(room_id.as_str()), target_room: Some(room_id.as_str()),
+        }).then(|| permissions.clone()))
+    }).unwrap_or(Err("Permissions are unavailable."));
+    let consent = match consent {
+        Ok(Some(consent)) => consent,
+        Ok(None) => {
+            queue_permission_prompt(cx, ui, subject, Permission::Network,
+                ParkedRequest::AiTool { room_id: room_id.clone(), job: SessionJob::FetchUrl { url, answer } }, None);
+            return;
+        }
+        Err(error) => { let _ = answer.send(Err(error.into())); return; }
+    };
+    let id = NEXT_AI_TOOL_ID.fetch_add(1, Ordering::Relaxed);
+    let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    with_a2app(|state| { state.ai_fetches.insert(id, (room_id.clone(), answer, alive.clone())); });
+    let origin = Some(room_id.to_string());
+    crate::sliding_sync::spawn_async_task(async move {
+        let result = super::network::run(request, context.clone(), subject, origin, consent, Some(alive)).await;
+        Cx::post_action(AgentNetworkResult { id, context, result });
+    });
+}
+
 /// Executes one internet-access request from the agent's own web tool: the
 /// same permission store the MCP tools use decides, but PER HOST. An already
 /// allowed host (durable or this session) passes immediately; a group `Denied`
@@ -5399,6 +6403,12 @@ fn run_network_access(
     url: &str,
     answer: Sender<Result<String, String>>,
 ) {
+    let allowed = super::information_flow::prepare_agent(room_id.as_str()).and_then(|context| {
+        super::information_flow::current_context(&context)?;
+        let recipient = a2app_core::information_flow::Recipient::network_origin(url)?;
+        a2app_core::information_flow::ensure_allowed(&context, &recipient)
+    });
+    if let Err(error) = allowed { let _ = answer.send(Err(error)); return; }
     let subject = agent_subject(room_id.as_str());
     let verdict = with_a2app(|state| {
         if state.permissions.is_restricted(&subject) {
@@ -5408,7 +6418,9 @@ fn run_network_access(
         if state.permissions.state(&subject, Permission::Network) == GrantState::Denied {
             return NetworkVerdict::Denied;
         }
-        if state.permissions.is_host_allowed(&subject, host) {
+        if state.permissions.is_url_allowed(&subject, url, PermissionContext {
+            origin_room: Some(room_id.as_str()), target_room: Some(room_id.as_str()),
+        }) {
             return NetworkVerdict::Granted;
         }
         // "Not Now" for THIS host this session: refuse without re-asking, so
@@ -5505,11 +6517,12 @@ fn resolve_session_generation(
     let _ = answer.send(outcome.clone());
     if outcome.is_ok() {
         if let Some(manifest) = manifest {
-            cx.action(A2AppOp::OpenApp {
-                app_id: manifest.id.clone(),
-                room_id: Some(room_id),
-                in_room_pane: true,
-            });
+            if let Ok(context) = super::information_flow::agent_context(room_id.as_str()) {
+                cx.action(A2AppOp::OpenAppFromContext {
+                    flow_epoch: a2app_core::information_flow::context_epoch(&context).unwrap_or(0),
+                    context, app_id: manifest.id.clone(), room_id,
+                });
+            }
         }
     }
     ui.redraw(cx);
@@ -5897,6 +6910,30 @@ fn post_ai_state_event(
     state_key: &str,
     content: &impl serde::Serialize,
 ) {
+    if !room_policy_allows(room_id.as_str(), RoomAccess::Write) {
+        with_a2app(|state| {
+            if let Some(info) = state.ai_rooms.get_mut(room_id) {
+                info.ai_turn_in_flight = false;
+                info.pending_ai_turns.clear();
+            }
+        });
+        return;
+    }
+    let flow_context = match super::information_flow::agent_context(room_id.as_str()).and_then(|context| {
+        super::information_flow::ensure_room_output(&context, room_id.as_str())?;
+        Ok(context)
+    }) {
+        Ok(context) => context,
+        Err(_) => {
+            with_a2app(|state| {
+                if let Some(info) = state.ai_rooms.get_mut(room_id) {
+                    info.ai_turn_in_flight = false;
+                    info.pending_ai_turns.clear();
+                }
+            });
+            return;
+        }
+    };
     match serde_json::to_value(content) {
         Ok(json) => {
             submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::PostAiStateEvent {
@@ -5904,6 +6941,8 @@ fn post_ai_state_event(
                 event_type: event_type.to_string(),
                 state_key: state_key.to_string(),
                 content: json,
+                flow_epoch: a2app_core::information_flow::context_epoch(&flow_context).unwrap_or(0),
+                flow_context,
             }));
         }
         Err(e) => log!("AI Rooms: couldn't serialize an {event_type} state row: {e}"),
@@ -5917,6 +6956,18 @@ fn post_ai_state_event(
 /// receipts are consumed onto this one card.
 #[cfg(unix)]
 fn post_ai_reply(room_id: &OwnedRoomId, text: String, answer_id: Option<u64>) {
+    let flow_context = super::information_flow::agent_context(room_id.as_str()).and_then(|context| {
+        super::information_flow::ensure_room_output(&context, room_id.as_str())?;
+        Ok(context)
+    });
+    if flow_context.is_err() || !room_policy_allows(room_id.as_str(), RoomAccess::Write) {
+        if let Some(id) = answer_id
+            && let Some((_, _, answer, _)) = with_a2app(|state| state.ai_replies.remove(&id)).flatten()
+        {
+            let _ = answer.send(Err("Writing to this room is blocked in Mini Apps permissions.".into()));
+        }
+        return;
+    }
     // Best-effort traceability, not a precise per-turn link: under queueing,
     // a reply may technically answer an earlier message than the most
     // recently forwarded one.
@@ -5946,6 +6997,8 @@ fn post_ai_reply(room_id: &OwnedRoomId, text: String, answer_id: Option<u64>) {
     submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::PostReply {
         room_id: room_id.clone(),
         answer_id,
+        flow_epoch: flow_context.as_ref().ok().and_then(|context| a2app_core::information_flow::context_epoch(context).ok()).unwrap_or(0),
+        flow_context: flow_context.expect("checked above"),
         content: AiReplyContent {
             v: 1,
             text: text.clone(),
@@ -5959,4 +7012,195 @@ fn post_ai_reply(room_id: &OwnedRoomId, text: String, answer_id: Option<u64>) {
             in_reply_to,
         },
     }));
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    const SOURCE: &str = "!source:example.org";
+    const TARGET: &str = "!target:example.org";
+    const SPACE: &str = "!space:example.org";
+
+    fn bridge(service: &str, args: serde_json::Value, room: Option<&str>) -> ParkedRequest {
+        ParkedRequest::Bridge(Some(SplashHostRequest {
+            app_tag: a2app_core::manifest::instance_tag("permission-test", room),
+            heap_key: 0,
+            req_id: 1,
+            service: service.to_string(),
+            args_json: args.to_string(),
+            may_prompt: true,
+        }))
+    }
+
+    #[test]
+    fn attached_bridge_requests_cannot_spoof_the_prompt_target() {
+        let args = serde_json::json!({
+            "room_id": TARGET, "space_id": SPACE, "origin_room": TARGET,
+        });
+        for service in ["matrix.read_messages", "matrix.room_members", "matrix.room_info"] {
+            let request = bridge(service, args.clone(), Some(SOURCE));
+            assert_eq!(parked_rooms(&request), (Some(SOURCE.into()), Some(SOURCE.into())), "{service}");
+        }
+        let unattached = bridge("matrix.read_messages", args, None);
+        assert_eq!(parked_rooms(&unattached), (None, None));
+        assert_eq!(parked_rooms(&ParkedRequest::Bridge(None)), (None, None));
+    }
+
+    #[test]
+    fn cross_room_bridge_requests_show_the_actual_room_or_space() {
+        for service in ["matrix.rooms_info", "matrix.rooms_messages", "matrix.rooms_send"] {
+            let request = bridge(service, serde_json::json!({ "room_id": format!(" {TARGET} "), "space_id": SPACE }), Some(SOURCE));
+            assert_eq!(parked_rooms(&request), (Some(SOURCE.into()), Some(TARGET.into())), "{service}");
+        }
+        for service in ["matrix.space_info", "matrix.space_rooms"] {
+            let request = bridge(service, serde_json::json!({ "space_id": SPACE, "room_id": TARGET }), Some(SOURCE));
+            assert_eq!(parked_rooms(&request), (Some(SOURCE.into()), Some(SPACE.into())), "{service}");
+        }
+        let missing_target = bridge("matrix.rooms_messages", serde_json::json!({ "room_id": " " }), Some(SOURCE));
+        assert_eq!(parked_rooms(&missing_target), (Some(SOURCE.into()), None));
+    }
+
+    #[test]
+    fn prompt_capability_grant_stays_with_that_ability_room_and_session() {
+        let request = bridge("matrix.room_members", serde_json::json!({ "room_id": TARGET }), Some(SOURCE));
+        let capability = parked_capability(&request).unwrap();
+        assert_eq!(capability.id, "matrix.room.members.read");
+        let sibling = a2app_core::capabilities::by_id("matrix.room.messages.read").unwrap();
+        assert_eq!(capability.group, sibling.group);
+        let (origin, target) = parked_rooms(&request);
+        let mut permissions = PermissionStore::default();
+        permissions.grant_scoped("permission-test", capability.group.unwrap(), Some(capability.id),
+            RoomScope::room(target.as_deref().unwrap()), GrantDuration::RoomSession, origin.as_deref()).unwrap();
+        let context = PermissionContext { origin_room: origin.as_deref(), target_room: target.as_deref() };
+        let verdict = |store: &PermissionStore, cap, context| store.effective_capability_for_in_context(
+            "permission-test", |_| true, |_| true, cap, context,
+        );
+        assert_eq!(verdict(&permissions, capability, context), Effective::Granted);
+        assert_eq!(verdict(&permissions, sibling, context), Effective::NeedsPrompt);
+        assert_eq!(verdict(&permissions, capability, PermissionContext { target_room: Some(TARGET), ..context }), Effective::NeedsPrompt);
+        assert_eq!(verdict(&permissions, capability, PermissionContext { origin_room: Some(TARGET), ..context }), Effective::NeedsPrompt);
+        permissions.clear_room_session(SOURCE);
+        assert_eq!(verdict(&permissions, capability, context), Effective::NeedsPrompt);
+    }
+
+    #[test]
+    fn subscriptions_identify_the_hook_while_explicit_group_requests_stay_broad() {
+        let hook = bridge("events.subscribe", serde_json::json!({ "event": "on_room_message" }), Some(SOURCE));
+        assert_eq!(parked_capability(&hook).unwrap().id, "on_room_message");
+        let malformed_hook = bridge("events.subscribe", serde_json::json!({ "event": "not_a_real_hook" }), Some(SOURCE));
+        assert!(parked_capability(&malformed_hook).is_none());
+        let group = bridge("permissions.request", serde_json::json!({ "permission": "matrix-room-read", "capability": "matrix.room.members.read" }), Some(SOURCE));
+        assert!(parked_capability(&group).is_none());
+        assert!(parked_capability(&ParkedRequest::Bridge(None)).is_none());
+    }
+
+    #[test]
+    fn allow_once_requires_a_concrete_request_without_a_subscription() {
+        assert!(parked_can_allow_once(&bridge("matrix.read_messages", serde_json::json!({}), Some(SOURCE))));
+        for service in ["permissions.request", "events.subscribe"] {
+            assert!(!parked_can_allow_once(&bridge(service, serde_json::json!({}), Some(SOURCE))));
+        }
+        assert!(!parked_can_allow_once(&ParkedRequest::Bridge(None)));
+    }
+
+    #[test]
+    fn queued_composer_rechecks_revocation_and_hard_room_protection() {
+        let mut permissions = PermissionStore::default();
+        permissions.set_global_policy(RoomAccess::Write, PolicyDecision::Ask);
+        let capability = a2app_core::capabilities::by_id("host.composer.insert").unwrap();
+        let grant = permissions.grant_scoped("composer-test", capability.group.unwrap(), Some(capability.id),
+            RoomScope::room(TARGET), GrantDuration::RobrixSession, Some(TARGET)).unwrap();
+        permissions.mark_request_once(grant);
+        let authorization = matrix::policy::MatrixAuthorization::new("composer-test", capability.id, Some(TARGET), &permissions);
+        let pending = PendingRoomAction {
+            room_id: TARGET.try_into().unwrap(), action: RoomAction::InsertDraft("fixture".into()),
+            since: Instant::now(), authorization: Some(authorization), close_after: None,
+        };
+        assert!(pending.permitted(&permissions));
+        permissions.remove_scoped_grant(grant);
+        assert!(pending.permitted(&permissions), "consuming Allow once does not cancel its already queued action");
+        permissions.set_room_policy(TARGET, RoomAccess::Write, PolicyDecision::Deny);
+        assert!(!pending.permitted(&permissions), "hard protection overrides the queued receipt");
+        permissions.set_room_policy(TARGET, RoomAccess::Write, PolicyDecision::Ask);
+        permissions.set("composer-test", capability.group.unwrap(), GrantState::Denied);
+        assert!(!pending.permitted(&permissions), "explicit revocation overrides the queued receipt");
+    }
+
+    #[test]
+    fn native_room_navigation_does_not_need_an_app_context_but_still_expires() {
+        let mut pending = PendingRoomAction {
+            room_id: TARGET.try_into().unwrap(), action: RoomAction::JumpToEvent("$event:s".try_into().unwrap()),
+            since: Instant::now(), authorization: None, close_after: None,
+        };
+        assert!(pending.check().is_ok());
+        pending.since = Instant::now() - ROOM_ACTION_TTL - Duration::from_secs(1);
+        assert!(pending.check().is_err());
+    }
+
+    #[test]
+    fn replacing_queued_composer_keeps_only_the_same_activation_alive() {
+        let context = a2app_core::information_flow::ContextId::App {
+            account: "alice".into(), app: "composer-test".into(), room: Some(TARGET.into()),
+        };
+        let key = ("composer-test".to_string(), Some(TARGET.try_into().unwrap()));
+        let pending = |epoch| {
+            let mut authorization = matrix::policy::MatrixAuthorization::new("composer-test", "host.composer.insert", Some(TARGET), &PermissionStore::default());
+            authorization.flow_context = Some(context.clone());
+            authorization.flow_epoch = Some(epoch);
+            PendingRoomAction {
+                room_id: TARGET.try_into().unwrap(), action: RoomAction::InsertDraft("fixture".into()),
+                since: Instant::now(), authorization: Some(authorization), close_after: None,
+            }
+        };
+        let mut previous = pending(1);
+        previous.close_after = Some(key.clone());
+        let mut replacement = pending(1);
+        replacement.inherit_requester(&mut previous);
+        assert!(previous.close_after.is_none());
+        assert_eq!(replacement.close_after, Some(key.clone()));
+        let mut reopened = pending(2);
+        reopened.inherit_requester(&mut replacement);
+        assert!(reopened.close_after.is_none());
+        assert_eq!(replacement.close_after, Some(key));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_read_write_and_space_prompts_keep_source_and_target_distinct() {
+        for (kind, target, capability) in [
+            (ReadToolKind::Messages { limit: 10 }, SOURCE, "matrix.room.messages.read"),
+            (ReadToolKind::OtherRoom { room: TARGET.into(), limit: 10 }, TARGET, "matrix.rooms.messages.read"),
+            (ReadToolKind::SpaceInfo { space: SPACE.into() }, SPACE, "matrix.space.info.read"),
+            (ReadToolKind::SpaceRooms { space: SPACE.into() }, SPACE, "matrix.space.rooms.list"),
+        ] {
+            let (answer, _) = std::sync::mpsc::channel();
+            let parked = ParkedRequest::AiTool {
+                room_id: SOURCE.try_into().unwrap(),
+                job: SessionJob::ReadTool { kind, answer },
+            };
+            assert_eq!(parked_rooms(&parked), (Some(SOURCE.into()), Some(target.into())));
+            assert_eq!(parked_capability(&parked).unwrap().id, capability);
+        }
+        let (answer, _) = std::sync::mpsc::channel();
+        let write = ParkedRequest::AiTool {
+            room_id: SOURCE.try_into().unwrap(),
+            job: SessionJob::PostRoomMessage { room_id: TARGET.into(), text: "fixture".into(), answer },
+        };
+        assert_eq!(parked_rooms(&write), (Some(SOURCE.into()), Some(TARGET.into())));
+        assert_eq!(parked_capability(&write).unwrap().id, "matrix.rooms.message.send");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn network_prompt_retains_the_full_destination_and_source_room() {
+        let (answer, _) = std::sync::mpsc::channel();
+        let url = "https://example.org:8443/path?query=1";
+        let parked = ParkedRequest::NetworkAccess {
+            room_id: SOURCE.try_into().unwrap(), host: "example.org".into(), url: url.into(), answer,
+        };
+        assert_eq!(parked_network_url(&parked).as_deref(), Some(url));
+        assert_eq!(parked_rooms(&parked), (Some(SOURCE.into()), Some(SOURCE.into())));
+        assert_eq!(parked_capability(&parked).unwrap().id, "network.http");
+    }
 }

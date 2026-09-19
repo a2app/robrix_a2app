@@ -1312,7 +1312,7 @@ impl Widget for RoomScreen {
                     if let Some(room_id) = poked_room
                         && self.tl_state.is_some()
                         && self.timeline_kind.as_ref().is_some_and(|k| matches!(k, TimelineKind::MainRoom { room_id: r } if r == room_id))
-                        && let Some(room_action) = crate::a2app::runtime::take_room_action(room_id)
+                        && let Some(room_action) = crate::a2app::runtime::take_room_action(cx, room_id)
                     {
                         self.apply_mini_app_room_action(cx, room_action, &portal_list, &loading_pane, &user_profile_sliding_pane);
                         continue;
@@ -3834,7 +3834,7 @@ impl RoomScreen {
         #[cfg(feature = "a2app")]
         if self.tl_state.is_some()
             && let TimelineKind::MainRoom { room_id } = &timeline_kind
-            && let Some(room_action) = crate::a2app::runtime::take_room_action(room_id)
+            && let Some(room_action) = crate::a2app::runtime::take_room_action(cx, room_id)
         {
             let RoomScreenWidgetRefs { portal_list, user_profile_sliding_pane, loading_pane, .. } =
                 self.cached_widget_refs(cx);

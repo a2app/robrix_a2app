@@ -3,8 +3,13 @@
 //!
 //! The host app (Robrix) injects a data root via [`set_data_root`] before
 //! using anything else; all on-disk state lives under it:
-//! `apps/<id>/` (manifest + source + versions), `app_data/<id>/` (the app's
-//! private fs jail), `permissions.json`, `a2app_state.json`, `exchange/`.
+//! `apps/<id>/` holds manifests, source and versions. Active filesystem jails
+//! live in `app_compartments/<context-hash>/`, separated by account, app,
+//! room and public/private context. `app_data/<id>/` is a retained legacy
+//! archive, never automatically mounted in a new context. Host-owned
+//! `information_flow.json` keeps provenance and permanent sharing rules
+//! outside those jails; `permissions.json`, `a2app_state.json` and `exchange/`
+//! hold the remaining grants, registry state and exchange files.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -24,6 +29,8 @@ pub mod versions;
 pub mod diff;
 /// The permission model: declarations, grants, prompts, restrictions.
 pub mod permissions;
+/// Host-owned information-flow labels and source-to-recipient sharing rules.
+pub mod information_flow;
 /// The tagged catalog of every ability, layered over the permission groups.
 pub mod capabilities;
 /// Built-in sample apps.
@@ -49,8 +56,8 @@ pub fn data_root() -> &'static Path {
     })
 }
 
-/// The private storage jail for one mini-app, enforced by the Splash layer
-/// via `Splash::set_sandbox_dir`.
+/// The retained legacy shared jail. New instances use the IFC registry's
+/// `context_storage_path`, partitioned by account, app and room.
 pub fn app_sandbox_dir(app_id: &str) -> PathBuf {
     data_root().join("app_data").join(app_id)
 }

@@ -998,6 +998,14 @@ impl HomeScreen {
                 stack_nav.pop_to_root(cx);
             }
         }
+        #[cfg(feature = "a2app")]
+        if !app_state.selected_room.iter().chain(&self.mobile_screen_history)
+            .any(|room| room.room_id() == current_screen.room_id())
+        {
+            // Closing a thread keeps consent while its room remains in the
+            // navigation stack. View recycling and layout changes never close it.
+            crate::a2app::runtime::on_room_closed(cx, current_screen.room_id());
+        }
         self.view.redraw(cx);
     }
 }

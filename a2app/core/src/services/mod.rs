@@ -28,7 +28,7 @@ use makepad_widgets::*;
 
 use crate::layout::PaneSide;
 use crate::manifest::{AppRegistry, MiniAppId};
-use crate::permissions::{Effective, Permission, PermissionStore};
+use crate::permissions::{Effective, Permission, PermissionContext, PermissionStore, PolicyDecision, RoomAccess};
 
 pub const PLATFORM: &str = if cfg!(target_os = "macos") {
     "macos"
@@ -99,18 +99,12 @@ pub fn respond(cx: &mut Cx, reply: Reply, result: Result<&str, &str>) {
     ANSWERS.with(|a| a.borrow_mut().push((reply, result.err().map(str::to_string))));
     let outcome = splash_host_respond(cx, reply.heap_key, reply.req_id, result);
     if trace_on() {
-        let mut preview = match result {
-            Ok(data) => data.to_string(),
-            Err(e) => format!("ERR {e}"),
-        };
-        preview.truncate(200);
         trace_line(&format!(
-            "respond heap={} req={} ok={} outcome={:?} data={}\n",
+            "respond heap={} req={} ok={} outcome={:?}\n",
             reply.heap_key,
             reply.req_id,
             result.is_ok(),
             outcome,
-            preview
         ));
     }
 }
@@ -300,6 +294,8 @@ pub fn parse_app_tool_request(
 
 /// Work only the host can do, returned from [`Broker::process`].
 pub enum BrokerAsk {
+    /// HTTP is executed by the host after checking the current source labels.
+    Network { reply: Reply, app_id: MiniAppId, room: Option<String>, args: serde_json::Value, consent: Box<PermissionStore> },
     /// Queue a runtime-permission prompt. `request`, when present, is parked
     /// until the user answers (re-dispatch on allow, deny-respond on deny).
     Prompt {
@@ -321,6 +317,8 @@ pub enum BrokerAsk {
         from_heap: usize,
         to: MiniAppId,
         data_json: String,
+        /// False for ipc.post: its fixed acknowledgement was already sent.
+        receipt: bool,
     },
     /// Show a popup notification for this app. The request is already
     /// answered; `summary` is the popup text, clamped broker-side.
@@ -339,6 +337,8 @@ pub enum BrokerAsk {
         app_id: MiniAppId,
         /// The room this instance is bound to (from its host tag).
         room: Option<String>,
+        capability: &'static str,
+        consent: Box<PermissionStore>,
         call: MatrixServiceCall,
     },
     /// Steer the host UI (navigate, or touch the composer), then answer
@@ -454,14 +454,78 @@ pub struct BrokerCtx<'a> {
     pub is_running: &'a dyn Fn(&str) -> bool,
     /// The calling isolate's pane, by heap key.
     pub pane_state: &'a dyn Fn(usize) -> Option<PaneState>,
+    /// Actual live compartment storage, never the legacy shared app directory.
+    pub storage_path: &'a dyn Fn(usize) -> Result<std::path::PathBuf, String>,
     /// A room's display name, for `env`.
     pub room_name: &'a dyn Fn(&str) -> Option<String>,
     pub desktop_view: bool,
+    /// Host-trusted provenance and output checks, before service side effects.
+    pub check_flow: &'a dyn Fn(&SplashHostRequest, &crate::capabilities::Capability, &serde_json::Value, &AppRegistry) -> Result<(), String>,
+    /// Revalidate the live context and record returned sources before callbacks.
+    pub check_response: &'a dyn Fn(Reply, &str) -> Result<(), String>,
 }
 
 /// The refusal every switch-gated write gets while the user keeps writes off.
 pub const MATRIX_WRITE_OFF_MSG: &str =
-    "writing to rooms is switched off for all mini-apps. Turn on \"Mini-apps can write to rooms\" in the Mini Apps screen";
+    "room access is blocked by the safety rules in Mini Apps";
+
+/// The actual target of a bridge request. Attached-room services ignore an
+/// unrecognized `room_id` argument, so their policy check must ignore it too.
+pub fn permission_context<'a>(
+    service: &str,
+    args: &'a serde_json::Value,
+    origin_room: Option<&'a str>,
+) -> PermissionContext<'a> {
+    let arg = |key: &str| args[key].as_str().map(str::trim).filter(|s| !s.is_empty());
+    let target_room = match service {
+        "matrix.rooms_info" | "matrix.rooms_messages" | "matrix.rooms_send"
+        | "matrix.invite_respond" | "nav.room" => arg("room_id"),
+        "matrix.space_info" | "matrix.space_rooms" | "nav.space" => arg("space_id"),
+        "matrix.room_preview" | "matrix.join" => arg("room"),
+        "nav.event" | "nav.thread" | "nav.user" | "nav.app"
+        | "composer.insert" | "composer.reply_to" => arg("room_id").or(origin_room),
+        _ => origin_room,
+    };
+    PermissionContext { origin_room, target_room }
+}
+
+/// Collection consent starts the request; individual returned rooms must
+/// independently pass the ordinary target-specific gate.
+pub fn is_room_collection(capability: &crate::capabilities::Capability) -> bool {
+    matches!(capability.id,
+        "matrix.rooms.list" | "matrix.rooms.search" | "matrix.rooms.invites.list"
+        | "matrix.rooms.messages.search" | "matrix.spaces.list" | "matrix.space.rooms.list"
+        | "on_rooms_changed" | "on_invite_received" | "on_unread_totals_changed"
+    )
+}
+
+/// A group query describes whether this instance can already use a declared
+/// capability. It does not create a group grant: every subsequent operation
+/// still checks its own capability and actual room target.
+fn permission_request_status(
+    store: &PermissionStore,
+    manifest: &crate::manifest::MiniAppManifest,
+    permission: Permission,
+    context: PermissionContext<'_>,
+) -> Effective {
+    let base = store.effective_for_in_context(&manifest.id, |p| manifest.declares(p), permission, context);
+    if matches!(base, Effective::Denied | Effective::Undeclared) { return base; }
+    let mut any = false;
+    let mut all_denied = true;
+    for capability in crate::capabilities::in_group(permission)
+        .filter(|cap| cap.is_available() && manifest.declares_capability(cap))
+    {
+        any = true;
+        let effective = if is_room_collection(capability) {
+            store.effective_collection_capability_in_context(manifest, capability, context)
+        } else {
+            store.effective_capability_in_context(manifest, capability, context)
+        };
+        if effective == Effective::Granted { return Effective::Granted; }
+        all_denied &= effective == Effective::Denied;
+    }
+    if any && all_denied { Effective::Denied } else { base }
+}
 
 pub struct Broker {
     tx: Sender<Completion>,
@@ -587,7 +651,7 @@ impl Broker {
                 }
             }
         }
-        self.drain_completions(cx);
+        self.drain_completions(cx, ctx.check_response);
         asks
     }
 
@@ -632,16 +696,12 @@ impl Broker {
     ) {
         if trace_on() {
             trace_line(&format!(
-                "dispatch app={} svc={} heap={} req={} prompt={} grants={:?} args={}\n",
+                "dispatch app={} svc={} heap={} req={} prompt={}\n",
                 req.app_tag,
                 req.service,
                 req.heap_key,
                 req.req_id,
                 req.may_prompt,
-                crate::permissions::snapshot_grants_for(
-                    crate::manifest::split_instance_tag(&req.app_tag).0
-                ),
-                req.args_json
             ));
         }
         let reply = Reply::of(&req);
@@ -708,7 +768,7 @@ impl Broker {
             serde_json::from_str(&req.args_json).unwrap_or(serde_json::Value::Null);
 
         // Same-app IPC is inside one sandbox: no permission involved.
-        let ipc_target = (req.service == "ipc.send").then(|| {
+        let ipc_target = (matches!(req.service.as_str(), "ipc.send" | "ipc.post")).then(|| {
             let to = args["to"].as_str().unwrap_or_default().to_string();
             if to.is_empty() || to == "self" { manifest.id.clone() } else { to }
         });
@@ -724,14 +784,22 @@ impl Broker {
         if !capability.is_available() {
             return respond(cx, reply, Err(&format!("'{}' is not available in this Robrix", req.service)));
         }
-        // A write behind the user's switch: refused without a prompt.
-        if capability.status == crate::capabilities::Status::RefusedBySwitch
-            && !ctx.permissions.matrix_write()
+        if capability.flow_contract().is_none() {
+            return respond(cx, reply, Err("This service has no information-flow contract."));
+        }
+        let context = permission_context(&req.service, &args, instance_room.as_deref());
+        let collection = is_room_collection(capability);
+        let denied = if collection && req.service != "matrix.space_rooms" {
+            ctx.permissions.global_policy(RoomAccess::Read) == PolicyDecision::Deny
+        } else {
+            ctx.permissions.capability_room_policy(capability, context) == PolicyDecision::Deny
+        };
+        if denied
         {
             return respond(cx, reply, Err(MATRIX_WRITE_OFF_MSG));
         }
         // Same-app IPC is inside one sandbox: no permission involved.
-        let self_ipc = req.service == "ipc.send"
+        let self_ipc = matches!(req.service.as_str(), "ipc.send" | "ipc.post")
             && ipc_target.as_deref() == Some(manifest.id.as_str());
         // mcp.tools.* carry their own per-tool consent (the registration
         // prompt shows the app's exact description), so they bypass the
@@ -741,7 +809,19 @@ impl Broker {
         if let Some(perm) = needs {
             // The group answers the prompt; the user can still block this
             // single capability underneath it.
-            let effective = ctx.permissions.effective_capability(&manifest, capability);
+            let effective = if perm == Permission::Network && req.service == "network.http" {
+                if !manifest.declares(perm) { Effective::Undeclared }
+                else if ctx.permissions.is_restricted(&manifest.id)
+                    || ctx.permissions.state(&manifest.id, perm) == crate::permissions::GrantState::Denied
+                    || ctx.permissions.capability_state(&manifest.id, capability.id) == crate::permissions::GrantState::Denied
+                { Effective::Denied }
+                else if ctx.permissions.is_url_allowed(&manifest.id, args["url"].as_str().unwrap_or(""), context) { Effective::Granted }
+                else { Effective::NeedsPrompt }
+            } else if collection {
+                ctx.permissions.effective_collection_capability_in_context(&manifest, capability, context)
+            } else {
+                ctx.permissions.effective_capability_in_context(&manifest, capability, context)
+            };
             match effective {
                 // A capability actually being exercised — the only place a
                 // "used" record can honestly come from.
@@ -778,15 +858,26 @@ impl Broker {
             self.notable.remove(&(reply.heap_key, reply.req_id));
         }
 
+        if let Err(error) = (ctx.check_flow)(&req, capability, &args, ctx.registry) {
+            return respond(cx, reply, Err(&error));
+        }
+
         match req.service.as_str() {
+            "network.http" => asks.push(BrokerAsk::Network {
+                reply, app_id: manifest.id.clone(), room: instance_room, args,
+                consent: Box::new(ctx.permissions.clone()),
+            }),
             "env" => {
                 let pane = (ctx.pane_state)(req.heap_key);
+                let visible_room = instance_room.as_deref().filter(|room| {
+                    ctx.permissions.room_policy(Some(room), RoomAccess::Read) != PolicyDecision::Deny
+                });
                 let data = serde_json::json!({
                     "app_id": manifest.id,
                     "room_attached": instance_room.is_some(),
-                    "room_id": instance_room,
-                    "room_name": instance_room.as_deref().and_then(|r| (ctx.room_name)(r)),
-                    "instance_tag": req.app_tag,
+                    "room_id": visible_room,
+                    "room_name": visible_room.and_then(|r| (ctx.room_name)(r)),
+                    "instance_tag": if visible_room.is_some() { &req.app_tag } else { &manifest.id },
                     "surface": pane.as_ref().map_or("parked", |p| p.surface),
                     "platform": PLATFORM,
                     "view_mode": if ctx.desktop_view { "desktop" } else { "mobile" },
@@ -826,7 +917,10 @@ impl Broker {
             }
             "storage.quota" => {
                 // Walks the jail off-thread; there is no byte cap today.
-                let dir = crate::app_sandbox_dir(&manifest.id);
+                let dir = match (ctx.storage_path)(req.heap_key) {
+                    Ok(dir) => dir,
+                    Err(error) => return respond(cx, reply, Err(&error)),
+                };
                 let tx = self.tx.clone();
                 std::thread::spawn(move || {
                     let data = serde_json::json!({ "used": dir_bytes(&dir), "cap": serde_json::Value::Null });
@@ -837,7 +931,7 @@ impl Broker {
             "permissions.query" => {
                 let mut map = serde_json::Map::new();
                 for (perm, _) in ctx.permissions.declared_states(&manifest) {
-                    let s = match ctx.permissions.effective(&manifest, perm) {
+                    let s = match permission_request_status(ctx.permissions, &manifest, perm, context) {
                         Effective::Granted => "granted",
                         Effective::Denied => "denied",
                         _ => "ask",
@@ -850,15 +944,7 @@ impl Broker {
                 let Some(perm) = args["perm"].as_str().and_then(Permission::from_str) else {
                     return respond(cx, reply, Err("unknown permission"));
                 };
-                // No point prompting for a group the write switch refuses anyway.
-                let switched_off = !ctx.permissions.matrix_write()
-                    && crate::capabilities::in_group(perm)
-                        .filter(|c| c.is_available())
-                        .all(|c| c.status == crate::capabilities::Status::RefusedBySwitch);
-                if switched_off {
-                    return respond(cx, reply, Ok("{\"granted\": false}"));
-                }
-                match ctx.permissions.effective(&manifest, perm) {
+                match permission_request_status(ctx.permissions, &manifest, perm, context) {
                     Effective::Granted => respond(cx, reply, Ok("{\"granted\": true}")),
                     Effective::Denied => respond(cx, reply, Ok("{\"granted\": false}")),
                     Effective::Undeclared => {
@@ -992,22 +1078,28 @@ impl Broker {
                     self.dialog_launched(&manifest.id, reply);
                 }
             }
-            "ipc.send" => {
+            "ipc.send" | "ipc.post" => {
+                if args.get("to").is_some_and(|value| !value.is_string()) {
+                    return respond(cx, reply, Err("IPC needs a string destination."));
+                }
                 let to = ipc_target.unwrap_or_default();
                 let data_json = args["data"].to_string();
+                let receipt = req.service == "ipc.send";
+                // Post acknowledges syntax/consent only. Neither absent targets
+                // nor denied/closed receivers may become a public data source.
+                if !receipt { respond(cx, reply, Ok("{\"accepted\":true}")); }
                 if to != manifest.id {
-                    // Cross-app consent is asymmetric on purpose: SENDING is
-                    // the privileged act (prompted, sender-side). RECEIVING is
-                    // opted into by declaring ipc + defining the hook, and the
-                    // user can still shut a receiver off by denying its ipc.
                     let Some(target) = ctx.registry.get(&to) else {
-                        return respond(cx, reply, Err("no such app"));
+                        if receipt { respond(cx, reply, Err("no such app")); }
+                        return;
                     };
                     let blocked = !target.declares(Permission::Ipc)
+                        || ctx.permissions.is_restricted(&to)
                         || ctx.permissions.state(&to, Permission::Ipc)
                             == crate::permissions::GrantState::Denied;
                     if blocked {
-                        return respond(cx, reply, Err("that app doesn't accept messages"));
+                        if receipt { respond(cx, reply, Err("that app doesn't accept messages")); }
+                        return;
                     }
                 }
                 asks.push(BrokerAsk::IpcDeliver {
@@ -1016,6 +1108,7 @@ impl Broker {
                     from_heap: req.heap_key,
                     to,
                     data_json,
+                    receipt,
                 });
             }
             "mcp.tools.register" => match parse_app_tool_request(&manifest, &req, &args) {
@@ -1026,7 +1119,7 @@ impl Broker {
                     // per-capability row can block registration underneath
                     // it: the same gate every other service gets, minus the
                     // prompt, which is per tool below.
-                    match ctx.permissions.effective_capability(&manifest, capability) {
+                    match ctx.permissions.effective_capability_in_context(&manifest, capability, context) {
                         Effective::Undeclared => {
                             return respond(cx, reply, Err(&format!(
                                 "permission not declared: {}", Permission::McpTools.as_str()
@@ -1035,11 +1128,15 @@ impl Broker {
                         Effective::Denied => return Self::respond_denied(cx, &req),
                         Effective::Granted | Effective::NeedsPrompt => {}
                     }
-                    match ctx.permissions.tool_effective(
+                    let tool_effective = ctx.permissions.tool_effective(
                         &manifest.id,
                         &tool.full_name,
                         Some(&tool.content_hash),
-                    ) {
+                    );
+                    let tool_effective = if tool_effective == Effective::NeedsPrompt
+                        && ctx.permissions.has_scoped_tool_grant(&manifest.id, &tool.full_name, &tool.content_hash, context)
+                    { Effective::Granted } else { tool_effective };
+                    match tool_effective {
                         Effective::Granted => {
                             asks.push(BrokerAsk::Used {
                                 app_id: manifest.id.clone(),
@@ -1101,6 +1198,8 @@ impl Broker {
                         reply,
                         app_id: manifest.id.clone(),
                         room: instance_room.clone(),
+                        capability: capability.id,
+                        consent: Box::new(ctx.permissions.clone()),
                         call,
                     }),
                     Err(e) => respond(cx, reply, Err(&e)),
@@ -1110,7 +1209,7 @@ impl Broker {
                 let Some(name) = args["event"].as_str() else {
                     return respond(cx, reply, Err("events.subscribe needs {event}"));
                 };
-                let Some(hook) = crate::capabilities::for_hook(name).filter(|c| c.is_available()) else {
+                let Some(hook) = crate::capabilities::for_hook(name).filter(|c| c.is_available() && c.flow_contract().is_some()) else {
                     return respond(cx, reply, Err(&format!("unknown event '{name}'")));
                 };
                 let room = instance_room.clone();
@@ -1118,7 +1217,12 @@ impl Broker {
                     return respond(cx, reply, Err("this mini-app is not attached to a room"));
                 }
                 // The hook's own group answers, exactly like an outgoing call.
-                match ctx.permissions.effective_capability(&manifest, hook) {
+                let effective = if is_room_collection(hook) {
+                    ctx.permissions.effective_collection_capability_in_context(&manifest, hook, context)
+                } else {
+                    ctx.permissions.effective_capability_in_context(&manifest, hook, context)
+                };
+                match effective {
                     Effective::Granted => {
                         if let Some(perm) = hook.group {
                             asks.push(BrokerAsk::Used { app_id: manifest.id.clone(), perm });
@@ -1196,7 +1300,7 @@ impl Broker {
                     Err(e) => respond(cx, reply, Err(&e)),
                 }
             }
-            _ => unreachable!("service list checked above"),
+            _ => respond(cx, reply, Err("This service has no broker implementation.")),
         }
     }
 
@@ -1275,7 +1379,7 @@ impl Broker {
         true
     }
 
-    fn drain_completions(&mut self, cx: &mut Cx) {
+    fn drain_completions(&mut self, cx: &mut Cx, check_response: &dyn Fn(Reply, &str) -> Result<(), String>) {
         while let Ok(done) = self.rx.try_recv() {
             // Any answer to a modal service means its dialog is off screen,
             // whether the user accepted, cancelled, or it failed outright.
@@ -1285,7 +1389,7 @@ impl Broker {
                 }
             }
             match done {
-                Completion::Respond(reply, Ok(json)) => respond(cx, reply, Ok(&json)),
+                Completion::Respond(reply, Ok(json)) => respond_checked(cx, reply, &json, check_response),
                 Completion::Respond(reply, Err(e)) => respond(cx, reply, Err(&e)),
                 Completion::LocationFix { lat, lon } => {
                     let data = serde_json::json!({
@@ -1293,7 +1397,7 @@ impl Broker {
                     })
                     .to_string();
                     for reply in std::mem::take(&mut self.pending_locations) {
-                        respond(cx, reply, Ok(&data));
+                        respond_checked(cx, reply, &data, check_response);
                     }
                 }
                 Completion::LocationFailed => self.start_ip_geolocation(cx),
@@ -1303,7 +1407,7 @@ impl Broker {
 
     /// Host-side network completions (the IP-geolocation fallback). Call from
     /// `Event::NetworkResponses`; unrelated request ids are left alone.
-    pub fn handle_network(&mut self, cx: &mut Cx, responses: &NetworkResponsesEvent) {
+    pub fn handle_network(&mut self, cx: &mut Cx, responses: &NetworkResponsesEvent, check_response: &dyn Fn(Reply, &str) -> Result<(), String>) {
         for response in responses {
             let request_id = match response {
                 NetworkResponse::HttpResponse { request_id, .. }
@@ -1320,13 +1424,20 @@ impl Broker {
                         .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
                         .and_then(|v| geo_json_to_location(&v));
                     match parsed {
-                        Some(data) => respond(cx, reply, Ok(&data)),
+                        Some(data) => respond_checked(cx, reply, &data, check_response),
                         None => respond(cx, reply, Err("couldn't determine your location")),
                     }
                 }
                 _ => respond(cx, reply, Err("couldn't determine your location")),
             }
         }
+    }
+}
+
+fn respond_checked(cx: &mut Cx, reply: Reply, data: &str, check_response: &dyn Fn(Reply, &str) -> Result<(), String>) {
+    match check_response(reply, data) {
+        Ok(()) => respond(cx, reply, Ok(data)),
+        Err(error) => respond(cx, reply, Err(&error)),
     }
 }
 
@@ -1432,6 +1543,77 @@ fn read_clipboard() -> Result<String, String> {
     #[cfg(not(target_os = "macos"))]
     {
         Err("clipboard read is not available on this platform".to_string())
+    }
+}
+
+#[cfg(test)]
+mod room_context_tests {
+    use super::*;
+
+    fn permission_manifest(permissions: &[Permission], capabilities: &[&str]) -> crate::manifest::MiniAppManifest {
+        serde_json::from_value(serde_json::json!({
+            "id": "test-app", "name": "Test", "icon": "t", "tint": 0,
+            "source": "", "allow_net": false, "builtin": false,
+            "permissions": permissions.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+            "capabilities": capabilities,
+        })).unwrap()
+    }
+
+    #[test]
+    fn attached_services_cannot_spoof_policy_target_with_ignored_room_argument() {
+        let args = serde_json::json!({ "room_id": "!allowed:s" });
+        let context = permission_context("matrix.read_messages", &args, Some("!protected:s"));
+        assert_eq!(context.target_room, Some("!protected:s"));
+        assert_eq!(context.origin_room, Some("!protected:s"));
+        let context = permission_context("matrix.rooms_messages", &args, Some("!origin:s"));
+        assert_eq!(context.target_room, Some("!allowed:s"));
+        assert_eq!(context.origin_room, Some("!origin:s"));
+    }
+
+    #[test]
+    fn space_and_alias_services_use_the_target_the_worker_will_resolve() {
+        let args = serde_json::json!({ "space_id": " !space:s ", "room": "#alias:s" });
+        assert_eq!(permission_context("matrix.space_rooms", &args, Some("!origin:s")).target_room, Some("!space:s"));
+        assert_eq!(permission_context("matrix.room_preview", &args, Some("!origin:s")).target_room, Some("#alias:s"));
+    }
+
+    #[test]
+    fn permission_requests_in_a_whitelisted_room_do_not_prompt_or_grant_other_rooms() {
+        let manifest = permission_manifest(&[Permission::MatrixRoomRead, Permission::MatrixRoomSend], &[]);
+        let mut store = PermissionStore::default();
+        store.set_global_policy(RoomAccess::Write, PolicyDecision::Ask);
+        store.set_room_policy("!testing:s", RoomAccess::Read, PolicyDecision::Allow);
+        store.set_room_policy("!testing:s", RoomAccess::Write, PolicyDecision::Allow);
+        let testing = PermissionContext { origin_room: Some("!testing:s"), target_room: Some("!testing:s") };
+        let elsewhere = PermissionContext { origin_room: Some("!testing:s"), target_room: Some("!elsewhere:s") };
+        for (permission, capability) in [
+            (Permission::MatrixRoomRead, "matrix.room.messages.read"),
+            (Permission::MatrixRoomSend, "matrix.room.message.send"),
+        ] {
+            assert_eq!(permission_request_status(&store, &manifest, permission, testing), Effective::Granted);
+            assert_eq!(store.state(&manifest.id, permission), crate::permissions::GrantState::Ask);
+            let capability = crate::capabilities::by_id(capability).unwrap();
+            assert_eq!(store.effective_capability_in_context(&manifest, capability, elsewhere), Effective::NeedsPrompt);
+        }
+        store.set(&manifest.id, Permission::MatrixRoomRead, crate::permissions::GrantState::Denied);
+        assert_eq!(permission_request_status(&store, &manifest, Permission::MatrixRoomRead, testing), Effective::Denied);
+        assert_eq!(permission_request_status(&store, &manifest, Permission::Location, testing), Effective::Undeclared);
+    }
+
+    #[test]
+    fn request_reports_only_declared_capabilities_and_preserves_individual_denials() {
+        let manifest = permission_manifest(&[Permission::MatrixRoomRead], &["matrix.room.messages.read"]);
+        let mut store = PermissionStore::default();
+        let context = PermissionContext { origin_room: Some("!testing:s"), target_room: Some("!testing:s") };
+        store.set_room_policy("!testing:s", RoomAccess::Read, PolicyDecision::Allow);
+        store.set_capability(&manifest.id, "matrix.room.messages.read", crate::permissions::GrantState::Denied);
+        assert_eq!(permission_request_status(&store, &manifest, Permission::MatrixRoomRead, context), Effective::Denied);
+        let manifest = permission_manifest(&[Permission::MatrixRoomRead], &[]);
+        assert_eq!(permission_request_status(&store, &manifest, Permission::MatrixRoomRead, context), Effective::Granted);
+        let denied = crate::capabilities::by_id("matrix.room.messages.read").unwrap();
+        assert_eq!(store.effective_capability_in_context(&manifest, denied, context), Effective::Denied);
+        store.set_global_policy(RoomAccess::Read, PolicyDecision::Deny);
+        assert_eq!(permission_request_status(&store, &manifest, Permission::MatrixRoomRead, context), Effective::Denied);
     }
 }
 

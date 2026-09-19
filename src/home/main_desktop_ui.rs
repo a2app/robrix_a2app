@@ -321,6 +321,10 @@ impl MainDesktopUI {
 
         dock.close_tab(cx, tab_id);
         self.open_rooms.remove(&tab_id);
+        #[cfg(feature = "a2app")]
+        if !self.open_rooms.values().any(|r| r.room_id() == room_being_closed.room_id()) {
+            crate::a2app::runtime::on_room_closed(cx, room_being_closed.room_id());
+        }
 
         // Makepad's dock chooses an adjacent tab by itself, so we have to override that.
         self.select_room(cx, room_to_select);
@@ -332,6 +336,8 @@ impl MainDesktopUI {
     pub fn close_all_tabs(&mut self, cx: &mut Cx) {
         let dock = self.view.dock(cx, ids!(dock));
         for (tab_id, room) in self.open_rooms.iter() {
+            #[cfg(feature = "a2app")]
+            crate::a2app::runtime::on_room_closed(cx, room.room_id());
             room.close_thread_timeline(cx);
             dock.close_tab(cx, *tab_id);
         }
