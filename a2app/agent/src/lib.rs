@@ -10,6 +10,7 @@ pub mod acp_client;
 pub mod intent;
 pub mod mcp;
 pub mod model_transport;
+mod host_broker;
 #[cfg(feature = "embedded")]
 mod octos_embedded;
 pub mod pipeline;
@@ -111,32 +112,7 @@ pub(crate) fn provider_from_env() -> Option<&'static str> {
 /// key into `auth.json` without writing a config), so logged-in users need no
 /// further setup either. Prefers anthropic, else the first stored provider.
 pub(crate) fn provider_from_auth_store() -> Option<String> {
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(dir) = std::env::var_os("OCTOS_CONFIG_DIR") {
-        candidates.push(std::path::PathBuf::from(dir).join("auth.json"));
-    }
-    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
-        candidates.push(home.join(".config").join("octos").join("auth.json"));
-        candidates.push(home.join(".octos").join("auth.json"));
-    }
-    for path in candidates {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-            continue;
-        };
-        let Some(creds) = value.get("credentials").and_then(|c| c.as_object()) else {
-            continue;
-        };
-        if creds.contains_key("anthropic") {
-            return Some("anthropic".to_string());
-        }
-        if let Some(name) = creds.keys().next() {
-            return Some(name.clone());
-        }
-    }
-    None
+    model_transport::auth_store_provider()
 }
 
 fn provider_from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
@@ -423,7 +399,7 @@ fn anthropic_compatible_bridge() -> Option<(String, Vec<(String, String)>)> {
 /// The exact commands that install octos, kept in one place so the console,
 /// the Providers page and the docs can't drift apart.
 pub const OCTOS_INSTALL_CMD: &str =
-    "cargo install --git https://github.com/octos-org/octos octos-cli";
+    "cargo install --git https://github.com/project-robius/octos --branch host-managed-ifc --locked octos-cli";
 
 /// Why a generation cannot start — worked out BEFORE anything is spawned.
 ///
@@ -466,9 +442,9 @@ impl Blocker {
             Self::NoProvider => {
                 "Pick a provider below and paste its API key to start making apps.".to_string()
             }
-            Self::OctosMissing => "octos is the program that turns your API key into a \
-                 running agent. It isn't installed, so a key saved here has nothing to \
-                 run it.\n\nInstall it once, then restart Robrix:"
+            Self::OctosMissing => "octos runs the agent in a confined process. Robrix \
+                 keeps your credentials and checks every model request and tool call. \
+                 Install the host-managed version, then restart Robrix:"
                 .to_string(),
         }
     }
@@ -512,6 +488,16 @@ pub fn advisory() -> Option<(String, String, &'static str)> {
 /// and so an unusable setup is reported when the user reaches for the prompt
 /// rather than sixty seconds into a run that was never going to work.
 pub fn blocker() -> Option<Blocker> {
+    // A local worker override still uses Robrix's selected model provider.
+    #[cfg(not(feature = "embedded"))]
+    if providers::agent_command().is_none() && !on_path("octos") {
+        return Some(Blocker::OctosMissing);
+    }
+    (!providers::any_configured()).then_some(Blocker::NoProvider)
+}
+
+/// Standalone legacy ACP integrations retain their own backend selection.
+fn standalone_blocker() -> Option<Blocker> {
     // An explicit agent command is the user's own choice of backend; octos is
     // not consulted at all in that case (see `start_backend`).
     if providers::agent_command().is_some() {
@@ -520,7 +506,7 @@ pub fn blocker() -> Option<Blocker> {
     // Compiled in — there is no binary to be missing.
     #[cfg(feature = "embedded")]
     {
-        return (!providers::any_configured()).then_some(Blocker::NoProvider);
+        return (!(providers::any_configured() || ollama_model().is_some())).then_some(Blocker::NoProvider);
     }
     #[cfg(not(feature = "embedded"))]
     {
@@ -531,7 +517,7 @@ pub fn blocker() -> Option<Blocker> {
         if !on_path("octos") {
             return Some(Blocker::OctosMissing);
         }
-        (!providers::any_configured()).then_some(Blocker::NoProvider)
+        (!(providers::any_configured() || ollama_model().is_some())).then_some(Blocker::NoProvider)
     }
 }
 
@@ -564,7 +550,7 @@ pub fn start_backend(
         "app-generation agent: extended thinking forced OFF for this run \
          (model pick kept, effort cleared, thinking=off)"
     );
-    start_backend_with_mcp(workspace, &prefs, &[], false, None, None)
+    start_backend_with_mcp(workspace, &prefs, &[], false, None, None, None)
 }
 
 /// Robrix's octos profile for its long-lived AI-room sessions, written to
@@ -618,10 +604,10 @@ const ROBRIX_SESSION_PROFILE: &str = r#"{
 /// all, so the config is dropped there; on desktop the embedded agent honors
 /// it exactly like the child process does.
 ///
-/// A `model_context` selects the host-owned provider transport and requires
-/// the embedded backend. Protected room sessions (`host_managed=true`) get
-/// only the host's MCP tools; protected generation has no tools. Opaque ACP
-/// backends are refused because the host cannot enforce each model request.
+/// A `model_context` selects the host-owned provider transport. Protected room
+/// sessions (`host_managed=true`) get only the host's tools; protected generation
+/// has no tools. The default child must implement the confined host broker.
+/// `host_tools` supplies its shared live registry directly, without an MCP relay.
 /// Standalone callers without a private context retain their default tools.
 pub fn start_backend_with_mcp(
     workspace: &std::path::Path,
@@ -630,28 +616,30 @@ pub fn start_backend_with_mcp(
     host_managed: bool,
     network_approval: Option<std::sync::Arc<dyn NetworkApproval>>,
     model_context: Option<a2app_core::information_flow::ContextId>,
+    host_tools: Option<mcp::McpServer>,
 ) -> Result<Box<dyn AgentTransport>, String> {
     if host_managed && model_context.is_none() {
         return Err("A room agent needs a registered private-data context.".into());
     }
-    if model_context.is_some() && (providers::agent_command().is_some() || !cfg!(feature = "embedded")) {
-        return Err("Private room data requires Robrix's embedded model transport. External ACP agents cannot enforce its sharing rules.".into());
-    }
-    #[cfg(feature = "embedded")]
     if model_context.is_some() {
-        // Resolve without autodetection probes or factory config mutation.
-        model_transport::current_recipient(prefs)?;
-        let servers = if cfg!(target_os = "ios") { &[][..] } else { mcp_servers };
-        return Ok(Box::new(octos_embedded::EmbeddedOctos::start(
-            workspace, prefs, servers, host_managed, network_approval, model_context,
-        )?));
+        #[cfg(feature = "embedded")]
+        if providers::agent_command().is_none() {
+            // Resolve without autodetection probes or factory config mutation.
+            model_transport::current_recipient(prefs)?;
+            let servers = if cfg!(target_os = "ios") { &[][..] } else { mcp_servers };
+            return Ok(Box::new(octos_embedded::EmbeddedOctos::start(
+                workspace, prefs, servers, host_managed, network_approval, model_context,
+            )?));
+        }
+        let context = model_context.ok_or("Missing private-data context.")?;
+        return host_broker::start(prefs, context, host_managed, host_tools);
     }
     // Used only by the in-process backend; the child-process backends have no
     // channel for it today and fail closed inside octos.
     let _ = &network_approval;
     // Refuse before spawning rather than translating an errno afterwards: the
     // check knows WHICH program is missing, so it can name it and the install.
-    if let Some(blocked) = blocker() {
+    if let Some(blocked) = standalone_blocker() {
         return Err(blocked.headline());
     }
     let backend = prefs::Backend::detect();
@@ -804,7 +792,7 @@ impl Runtime {
     }
 }
 
-/// Worked out exactly the way `start_backend` decides, in the same order.
+/// The runtime used by Robrix's protected rooms and app generation.
 pub fn runtime(prefs: &prefs::AgentPrefs) -> Runtime {
     if let Some(cmd) = providers::agent_command() {
         return Runtime::Override(cmd);
@@ -816,9 +804,7 @@ pub fn runtime(prefs: &prefs::AgentPrefs) -> Runtime {
     }
     #[cfg(not(feature = "embedded"))]
     {
-        if let Some((cmd, _)) = anthropic_compatible_bridge() {
-            return Runtime::Child(cmd);
-        }
-        Runtime::Child(octos_acp_command(prefs))
+        let _ = prefs;
+        Runtime::Child("octos acp --host-managed".into())
     }
 }

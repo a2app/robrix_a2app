@@ -1052,7 +1052,7 @@ script_mod! {
                     text_style: REGULAR_TEXT {font_size: 9.5},
                     color: (MESSAGE_TEXT_COLOR)
                 }
-                text: "Keys are stored in octos's own config file; switching providers is a one-field edit. An Ollama server running locally is detected automatically and needs no key."
+                text: "Robrix selects the model and keeps its credentials, including when a separate Octos process runs the agent. Configure a local Ollama provider and model explicitly in octos's config file."
             }
         }
 
@@ -2096,21 +2096,14 @@ impl MiniAppsScreen {
             .into_iter()
             .find(|p| p.id == provider_id);
         let Some(p) = known else { return };
-        if p.external() {
-            enqueue_popup_notification(
-                "That one is chosen by how Robrix was started (ROBRIX_AGENT_CMD).",
-                PopupKind::Info, Some(4.0),
-            );
-        } else if !p.active {
+        if !p.active {
             match a2app_agent::providers::set_active(&provider_id) {
                 Ok(()) => {
-                    let in_use = a2app_agent::providers::in_use_id().as_deref() == Some(provider_id.as_str());
-                    let note = if in_use {
-                        format!("Now using {}.", p.label)
-                    } else {
-                        format!("{} is the saved default; this session still uses the agent chosen at launch.", p.label)
-                    };
-                    enqueue_popup_notification(note, PopupKind::Success, Some(4.0));
+                    a2app_agent::providers::clear_session();
+                    enqueue_popup_notification(
+                        format!("{} selected for new AI sessions. Restart existing agents to use it.", p.label),
+                        PopupKind::Success, Some(5.0),
+                    );
                 }
                 Err(e) => enqueue_popup_notification(e, PopupKind::Error, Some(5.0)),
             }

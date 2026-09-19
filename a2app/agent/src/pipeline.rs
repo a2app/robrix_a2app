@@ -172,7 +172,7 @@ impl Generation {
         // Persist the dialect guide on the agent side so prompts can go slim.
         #[cfg(feature = "persistent-guide")]
         crate::skills::deploy_guide(&workspace);
-        let client = crate::start_backend_with_mcp(&workspace, &prefs, &[], false, None, model_context)?;
+        let client = crate::start_backend_with_mcp(&workspace, &prefs, &[], false, None, model_context, None)?;
         // Slim prompts only for backends known to carry the persistent guide:
         // the default octos spawn / the in-process agent. An explicit
         // ROBRIX_AGENT_CMD may be any ACP agent, which likely ignores

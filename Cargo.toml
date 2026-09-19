@@ -132,10 +132,10 @@ tsp = ["dep:tsp_sdk", "dep:quinn", "dep:aws-lc-rs", "dep:percent-encoding", "dep
 
 ## Enables Splash mini-apps: AI-generated sandboxed apps that run in isolates,
 ## managed via the Mini Apps pane and shareable into rooms.
-## Private-data agents and generation also require a2app-embedded-agent.
+## Protected desktop agents run in a confined Octos process by default.
 a2app = ["dep:a2app-core", "dep:a2app-agent"]
-## Runs the agent with Robrix's guarded model transport and host tools.
-## Required for protected contexts and on iOS, where exec() is prohibited.
+## Runs the agent in-process with the same guarded model transport and host tools.
+## Required on iOS, where exec() is prohibited.
 a2app-embedded-agent = ["a2app", "a2app-agent/embedded"]
 ## Installs the Splash dialect guide on the agent once (as a bootstrap file or
 ## system prompt) so each generation prompt can point at it instead of inlining it.
@@ -216,10 +216,9 @@ askar-storage = { git = "https://github.com/openwallet-foundation/askar.git" }
 [patch."https://github.com/ruma/ruma"]
 ruma = { git = "https://github.com/project-robius/ruma.git", branch = "tsp" }
 
-## The octos agent crates a2app links (octos-agent/-core/-cli) are consumed
-## directly from gterzian/octos `acp-embedding-seam`; see
-## `a2app/agent/Cargo.toml`. The branch carries the per-URL network-access
-## seam the AI-room web tools are gated through (commit ce2add26).
+## Octos dependencies share project-robius/octos's `host-managed-ifc` branch;
+## see `a2app/agent/Cargo.toml`. It extends the original `acp-embedding-seam`
+## revision with a confined ACP worker and parent-owned model/tool protocol.
 
 [build-dependencies]
 toml = "1"

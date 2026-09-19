@@ -3,16 +3,16 @@
 //! the tools ([`super::tools`]) on one side, and a spawned ACP agent on the
 //! other.
 //!
-//! One [`AiSession`] belongs to one room and lives for as long as that room's
-//! conversation does. It owns three things:
+//! One [`AiSession`] belongs to one room until it stops. Explicit Stop drops
+//! the session; the next prompt starts a new activation. It owns three things:
 //!
-//! 1. the session-scoped [`ToolServer`] (the socket the tools answer on),
+//! 1. the shared [`McpServer`] registry (plus a socket [`ToolServer`] for the
+//!    embedded backend),
 //! 2. the tools, backed by a real [`AiHost`] ([`SessionHost`]) that marshals
 //!    tool calls from the server's serve threads onto the UI thread and back,
-//! 3. the long-lived ACP agent itself ([`a2app_agent::AgentTransport`]),
-//!    spawned with a [`McpServerConfig`] that tells it to connect to (1) —
-//!    when its model decides to call a tool it spawns `robrix --mcp-bridge`
-//!    and its calls land here.
+//! 3. the agent transport ([`a2app_agent::AgentTransport`]). The confined child
+//!    reaches (1) through the parent broker; embedded sessions use the socket
+//!    bridge described by [`McpServerConfig`].
 //!
 //! The UI thread drives the session from the a2app runtime's event pass:
 //! [`AiSession::advance`] drains agent events (whose `Reply`/`Error`/`Gone`
@@ -341,19 +341,18 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 /// One room's live AI agent session: the agent process, its tool server, and
 /// the marshaling host connecting them.
 ///
-/// Owned by the UI thread (the a2app runtime). Dropping it kills the agent
-/// child (via [`AgentTransport`]'s own drop) and tears down the socket
-/// ([`ToolServer`]'s drop closes live connections), so a relay child the
-/// agent spawned sees EOF and exits.
+/// Owned by the UI thread (the a2app runtime). Dropping it retires its exact
+/// activation, stops the transport, and closes any embedded socket bridge.
 pub struct AiSession {
     room_id: OwnedRoomId,
     flow_context: a2app_core::information_flow::ContextId,
     flow_epoch: u64,
     transport: Box<dyn AgentTransport>,
-    /// The live tool server: owns the socket and the shared, mutable registry
-    /// that mini-app tools are added to and removed from. Dropping it closes
-    /// the socket and live connections.
-    server: ToolServer,
+    /// Shared with the parent broker and, when present, the socket server.
+    tools: McpServer,
+    /// Only the embedded backend needs a socket bridge. The confined child
+    /// calls this process's registry directly through its ACP connection.
+    server: Option<ToolServer>,
     /// The bridge an app-registered tool uses to reach its isolate; a clone of
     /// the same [`SessionHost`] the built-in tools use.
     mini_app_bridge: Arc<dyn MiniAppToolBridge>,
@@ -386,12 +385,11 @@ pub struct AiSession {
 }
 
 impl AiSession {
-    /// Binds this room's tool server and spawns the agent pointed at it.
+    /// Starts this room's agent with a private registry of host tools.
     ///
-    /// The agent is told (through `session/new` `mcpServers`) to treat the
-    /// Robrix binary — this very process — as an MCP server whose socket is
-    /// the freshly bound one. `Err` names why a session can't start (no
-    /// provider, agent missing, socket bind failure).
+    /// The confined child uses its parent broker; embedded sessions get a
+    /// socket bridge through `session/new` `mcpServers`. `Err` names why a
+    /// session cannot start (provider, agent, or embedded socket failure).
     ///
     /// The session agent is *host-managed* (`host_managed = true`): an octos
     /// backend runs Robrix's session profile, so octos's native tools
@@ -415,57 +413,64 @@ impl AiSession {
 
         let mut template = McpServer::new();
         register_session_tools(&mut template, host.clone() as Arc<dyn AiHost>);
-        let server = ToolServer::bind(template)?;
-        server.start()?;
         // `host` is also the bridge an app tool calls through; keep an
         // `Arc<dyn MiniAppToolBridge>` view of the same object.
         let mini_app_bridge: Arc<dyn MiniAppToolBridge> = host.clone();
 
-        // A dedicated workspace per session: the agent's tools are rooted at
-        // its cwd, and a chat session lives far longer than a generation, so
-        // it must not share the pipeline's scratch dir (files a stale run
-        // left there would leak into unrelated work). The id counter restarts
-        // each process, so a directory a killed run left behind is cleared
-        // before the id is reused.
-        let workspace_root = a2app_core::data_root().join("ai_sessions");
-        std::fs::create_dir_all(&workspace_root)
-            .map_err(|e| format!("couldn't create {}: {e}", workspace_root.display()))?;
-        let workspace =
-            workspace_root.join(format!("session-{}", NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)));
-        if let Err(e) = std::fs::create_dir(&workspace) {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                // Left over from a killed process; a fresh session must not
-                // inherit its files.
-                std::fs::remove_dir_all(&workspace).map_err(|e| {
-                    format!("couldn't clear stale workspace {}: {e}", workspace.display())
-                })?;
-                std::fs::create_dir(&workspace)
-                    .map_err(|e| format!("couldn't create {}: {e}", workspace.display()))?;
-            } else {
-                return Err(format!("couldn't create {}: {e}", workspace.display()));
+        let embedded = matches!(a2app_agent::runtime(&prefs), a2app_agent::Runtime::Embedded);
+        let (server, workspace, tool_servers) = if embedded {
+            let server = ToolServer::bind(template.clone())?;
+            server.start()?;
+            // A dedicated workspace per session: the agent's tools are rooted at
+            // its cwd, and a chat session lives far longer than a generation, so
+            // it must not share the pipeline's scratch dir (files a stale run
+            // left there would leak into unrelated work). The id counter restarts
+            // each process, so a directory a killed run left behind is cleared
+            // before the id is reused.
+            let workspace_root = a2app_core::data_root().join("ai_sessions");
+            std::fs::create_dir_all(&workspace_root)
+                .map_err(|e| format!("couldn't create {}: {e}", workspace_root.display()))?;
+            let workspace =
+                workspace_root.join(format!("session-{}", NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)));
+            if let Err(e) = std::fs::create_dir(&workspace) {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    // Left over from a killed process; a fresh session must not
+                    // inherit its files.
+                    std::fs::remove_dir_all(&workspace).map_err(|e| {
+                        format!("couldn't clear stale workspace {}: {e}", workspace.display())
+                    })?;
+                    std::fs::create_dir(&workspace)
+                        .map_err(|e| format!("couldn't create {}: {e}", workspace.display()))?;
+                } else {
+                    return Err(format!("couldn't create {}: {e}", workspace.display()));
+                }
             }
-        }
 
-        let exe = std::env::current_exe()
-            .map_err(|e| format!("couldn't find this process's binary: {e}"))?;
-        let tool_server = McpServerConfig::new(
-            SERVER_NAME,
-            exe.to_string_lossy().into_owned(),
-            vec![
-                "--mcp-bridge".to_string(),
-                "--socket".to_string(),
-                server.socket_path().to_string_lossy().into_owned(),
-            ],
-        );
+            let exe = std::env::current_exe()
+                .map_err(|e| format!("couldn't find this process's binary: {e}"))?;
+            let tool_server = McpServerConfig::new(
+                SERVER_NAME,
+                exe.to_string_lossy().into_owned(),
+                vec![
+                    "--mcp-bridge".to_string(),
+                    "--socket".to_string(),
+                    server.socket_path().to_string_lossy().into_owned(),
+                ],
+            );
+            (Some(server), workspace, vec![tool_server])
+        } else {
+            (None, std::path::PathBuf::from("/"), Vec::new())
+        };
 
         let transport =
             a2app_agent::start_backend_with_mcp(
                 &workspace,
                 &prefs,
-                &[tool_server],
+                &tool_servers,
                 true,
                 None,
                 Some(model_context.clone()),
+                Some(template.clone()),
             )?;
         a2app_core::information_flow::ensure_context_epoch(&model_context, flow_epoch)?;
 
@@ -474,6 +479,7 @@ impl AiSession {
             flow_context: model_context,
             flow_epoch,
             transport,
+            tools: template,
             server,
             mini_app_bridge,
             jobs: jobs_rx,
@@ -495,8 +501,8 @@ impl AiSession {
     }
 
     /// Installs (or replaces) a mini-app's reviewed tool on this session's
-    /// live MCP server and pushes `notifications/tools/list_changed`, so the
-    /// connected agent refreshes its tool list without a new session.
+    /// live registry. Embedded connections receive `tools/list_changed`;
+    /// the confined child refreshes the shared registry between turns.
     ///
     /// Replacing is deliberate: a re-registration after a changed description
     /// was re-reviewed must update what the model sees, and a re-install after
@@ -508,20 +514,22 @@ impl AiSession {
         description: String,
         schema: Value,
     ) -> Result<(), String> {
-        self.server.remove_tool(&full_name);
-        let tool = MiniAppTool::new(full_name, description, schema, self.mini_app_bridge.clone());
-        self.server.add_tool(Arc::new(tool));
+        self.unregister_miniapp_tool(&full_name);
+        let tool = Arc::new(MiniAppTool::new(full_name, description, schema, self.mini_app_bridge.clone()));
+        if let Some(server) = &self.server { server.add_tool(tool); }
+        else { self.tools.add_tool_arc(tool); }
         Ok(())
     }
 
     /// Withdraws one mini-app tool and notifies the connected agents.
     pub fn unregister_miniapp_tool(&self, full_name: &str) -> bool {
-        self.server.remove_tool(full_name)
+        if let Some(server) = &self.server { server.remove_tool(full_name) }
+        else { self.tools.remove_tool(full_name) }
     }
 
     /// Whether a tool name is already taken on this session.
     pub fn has_tool(&self, full_name: &str) -> bool {
-        self.server.has_tool(full_name)
+        self.tools.has_tool(full_name)
     }
 
     /// Whether the agent finished its handshake and can take a prompt.
@@ -739,25 +747,13 @@ impl AiSession {
         }
     }
 
-    /// Aborts the session's current work: asks the agent to abandon its
-    /// in-flight turn (`session/cancel`) and drops member prompts queued
-    /// behind it, so nothing fires after the abort. Returns whether there was
-    /// any work to stop (a turn in flight, or queued prompts). The cancelled
-    /// turn ends with a `cancelled` stop reason, which [`Self::advance`]
-    /// reports as no reply — the room simply returns to idle. The session
-    /// itself stays alive for the room's next message.
-    pub fn abort(&mut self) -> bool {
-        if self.dead() {
-            return false;
-        }
+    /// Retire authority while giving the transport its shutdown grace period.
+    /// The app must drop this session afterwards; it cannot resume a new turn.
+    pub fn cancel_for_shutdown(&mut self) -> bool {
         let had_work = self.busy || !self.queued.is_empty();
+        let _ = a2app_core::information_flow::remove_context_for_activation(&self.flow_context, self.flow_epoch);
         self.queued.clear();
-        if self.busy {
-            // No-op inside the transport if the handshake hasn't finished
-            // (`session/cancel` needs a session id); the queued prompts were
-            // the only thing pending then, and they are gone now.
-            self.transport.cancel();
-        }
+        if !self.dead() { self.transport.cancel(); }
         had_work
     }
 }
@@ -770,7 +766,7 @@ impl Drop for AiSession {
         // Unblock a serve thread still waiting on a launch_splash_app whose
         // generation the runtime was running: the socket is about to close,
         // so the tool must not hang. Dropping `transport` (kills the agent)
-        // and `_server` (closes the socket) happens right after.
+        // and the optional server (closes its socket) happens right after.
         if let Some(answer) = self.generation_answer.take() {
             let _ = answer.send(Err(
                 "this room's AI session ended before the app finished building".to_string()
@@ -863,5 +859,55 @@ mod tests {
 
         let err = caller.join().unwrap().unwrap_err();
         assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn retired_session_queue_and_activation_cannot_reach_its_replacement() {
+        use a2app_core::information_flow::{Registry, ContextId, Source, SensitiveAction, AuthoritySession};
+        let root = std::env::temp_dir().join(format!("robrix-session-stop-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut registry = Registry::open(&root).unwrap();
+        let context = ContextId::Agent { account: "alice".into(), room: "!same:example.org".into() };
+        let other_account = ContextId::Agent { account: "bob".into(), room: "!same:example.org".into() };
+        let source = Source::Room { account: "alice".into(), room: "!private:example.org".into() };
+        let action = SensitiveAction { kind: "ai.reply.write".into(), target: "!same:example.org".into() };
+        registry.register_context(&context).unwrap();
+        registry.register_context(&other_account).unwrap();
+        registry.add_sources(&context, [source.clone()]).unwrap();
+        registry.grant_authority(&context, action.clone(), AuthoritySession::RobrixSession).unwrap();
+        let old_epoch = registry.context_epoch(&context).unwrap();
+        let other_epoch = registry.context_epoch(&other_account).unwrap();
+        let (jobs_tx, jobs_rx) = channel();
+        let old_host = SessionHost { jobs: jobs_tx };
+        let (answer, result) = channel();
+        old_host.submit(SessionJob::SendRoomMessage { text: "queued before Stop".into(), answer }).unwrap();
+
+        // Session Drop retires its captured activation and drops this queue.
+        // The old host may still be owned by an already-running tool thread.
+        registry.remove_context_for_activation(&context, old_epoch).unwrap();
+        drop(jobs_rx);
+        assert!(matches!(result.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected)));
+        assert!(old_host.send_room_message("late blocking tool").is_err());
+
+        registry.register_context(&context).unwrap();
+        let new_epoch = registry.context_epoch(&context).unwrap();
+        assert_ne!(new_epoch, old_epoch);
+        assert!(registry.labels(&context).unwrap().contains(&source), "Stop never clears source history");
+        assert!(registry.ensure_action_allowed_for_activation(&context, new_epoch, &action).is_err(), "the previous authority is retired");
+        registry.grant_authority(&context, action.clone(), AuthoritySession::RobrixSession).unwrap();
+        assert!(registry.ensure_action_allowed_for_activation(&context, old_epoch, &action).is_err(), "new consent cannot revive queued Matrix work");
+        assert!(registry.remove_context_for_activation(&context, old_epoch).is_err(), "late old teardown cannot remove the replacement");
+        assert!(registry.ensure_context_epoch(&context, new_epoch).is_ok());
+        assert!(registry.ensure_context_epoch(&other_account, other_epoch).is_ok());
+
+        let (new_tx, new_rx) = channel();
+        let new_host = SessionHost { jobs: new_tx };
+        let (answer, result) = channel();
+        new_host.submit(SessionJob::SendRoomMessage { text: "new prompt".into(), answer }).unwrap();
+        let SessionJob::SendRoomMessage { text, answer } = new_rx.try_recv().unwrap() else { panic!("wrong job") };
+        assert_eq!(text, "new prompt");
+        answer.send(Ok("fresh session".into())).unwrap();
+        assert_eq!(result.try_recv().unwrap().unwrap(), "fresh session");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -7,10 +7,100 @@ use octos_llm::{ChatConfig, ChatResponse, LlmProvider, StopReason, TokenUsage, T
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::{AgentPrefs, ModelRecipient};
+use super::{AgentPrefs, ModelRecipient, stored_api_key};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Protocol { OpenAi, Anthropic }
+
+/// The model configuration fields consumed by the host transport.
+///
+/// Keep credential resolution compatible with Octos without linking its CLI,
+/// tool implementations, or agent runtime into the subprocess-only host.
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct ModelConfig {
+    provider: Option<String>,
+    model: Option<String>,
+    base_url: Option<String>,
+    api_key_env: Option<String>,
+    env_vars: std::collections::HashMap<String, String>,
+    model_hints: Option<octos_llm::openai::ModelHints>,
+    api_type: Option<String>,
+}
+
+impl ModelConfig {
+    fn api_key(&self, provider: &str) -> Option<String> {
+        let entry = octos_llm::registry::lookup(provider);
+        let default_name = entry.and_then(|entry| entry.api_key_env).map(str::to_string)
+            .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase()));
+        let name = self.api_key_env.as_deref().unwrap_or(&default_name);
+        let known = entry.map_or(name == default_name, |entry| entry.is_known_key_env(name));
+        // An explicit custom variable is exclusive: an ambient provider login
+        // must never substitute a different credential for a proxy endpoint.
+        let provider_chain = self.api_key_env.is_none() || known;
+        let mut candidates = vec![name];
+        if known {
+            if let Some(entry) = entry {
+                for sibling in entry.key_env_names() {
+                    if !candidates.contains(&sibling) { candidates.push(sibling); }
+                }
+            }
+        }
+        if provider_chain {
+            if let Some(key) = stored_api_key(provider) { return Some(key); }
+        }
+        for name in &candidates {
+            if let Some(value) = self.env_vars.get(*name).and_then(|value| resolve_config_secret(name, value)) {
+                if !value.is_empty() { return Some(value); }
+            }
+        }
+        candidates.into_iter().find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+    }
+}
+
+fn resolve_config_secret(name: &str, value: &str) -> Option<String> {
+    let Some(account) = value.strip_prefix("keychain:") else { return Some(value.into()); };
+    let account = if account.is_empty() { name } else { account };
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Read;
+        use std::process::Stdio;
+        let mut child = std::process::Command::new("/usr/bin/security")
+            .args(["find-generic-password", "-s", "octos", "-a", account, "-w"])
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null())
+            .spawn().ok()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        // Keep ownership until reaped: a timed-out keychain lookup must not
+        // leave a detached process/thread behind on every model request.
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => break,
+                Ok(Some(_)) => return None,
+                Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                _ => { let _ = child.kill(); let _ = child.wait(); return None; }
+            }
+        }
+        let mut bytes = Vec::new();
+        child.stdout.take()?.take(64 * 1024).read_to_end(&mut bytes).ok()?;
+        if bytes.len() == 64 * 1024 { return None; }
+        let value = String::from_utf8(bytes).ok()?.trim().to_string();
+        Some(decode_keychain_hex(&value).unwrap_or(value))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = account;
+        None
+    }
+}
+
+// macOS prints multiline secrets as hex; ordinary hex-shaped keys stay literal.
+#[cfg(any(target_os = "macos", test))]
+fn decode_keychain_hex(value: &str) -> Option<String> {
+    if value.len() < 2 || value.len() % 2 != 0 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) { return None; }
+    let bytes: Option<Vec<u8>> = (0..value.len()).step_by(2).map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok()).collect();
+    let decoded = String::from_utf8(bytes?).ok()?;
+    decoded.contains('\n').then_some(decoded)
+}
 
 // Deliberately no Debug: the credential never belongs in diagnostics.
 pub(super) struct Resolved {
@@ -81,18 +171,15 @@ fn identity_salt() -> Result<Vec<u8>, String> {
 }
 
 pub(super) fn resolve(prefs: &AgentPrefs) -> Result<Resolved, String> {
-    if crate::providers::agent_command().is_some() {
-        return Err("External ACP agents cannot enforce private-data sharing. Select an embedded provider.".into());
-    }
-    let config: octos_cli::config::Config = match crate::octos_config_candidates().into_iter().find(|path| path.exists()) {
+    let config: ModelConfig = match crate::octos_config_candidates().into_iter().find(|path| path.exists()) {
         Some(path) => serde_json::from_str(&std::fs::read_to_string(path).map_err(|_| "Cannot read model configuration.")?)
             .map_err(|_| "Cannot parse model configuration.")?,
-        None => serde_json::from_value(json!({})).map_err(|_| "Cannot initialize model configuration.")?,
+        None => ModelConfig::default(),
     };
     let selected = crate::providers::session_provider().or_else(|| config.provider.clone())
         .or_else(|| crate::provider_from_env().map(str::to_string))
         .or_else(crate::provider_from_auth_store)
-        .ok_or("Choose an embedded model provider before sharing private data.")?;
+        .ok_or("Choose a model provider before sharing private data.")?;
     let entry = octos_llm::registry::lookup(&selected);
     let name = entry.map(|entry| entry.name).or_else(|| selected.eq_ignore_ascii_case("custom").then_some("custom"))
         .ok_or("This model backend cannot enforce private-data sharing. Select an OpenAI-compatible or Anthropic provider.")?;
@@ -115,7 +202,7 @@ pub(super) fn resolve(prefs: &AgentPrefs) -> Result<Resolved, String> {
     let model = crate::prefs::Backend::Octos { provider: name.into() }.model_override(prefs)
         .or_else(|| config.model.clone()).or_else(|| entry.and_then(|entry| entry.default_model).map(str::to_string))
         .ok_or("Choose a model for the configured provider.")?;
-    let key = if entry.is_some_and(|entry| entry.requires_api_key) || config.api_key_env.is_some() { config.get_api_key_with_env(&selected, config.api_key_env.as_deref()).map_err(|_| "Configure the API credential for this model provider.")? } else { String::new() };
+    let key = if entry.is_some_and(|entry| entry.requires_api_key) || config.api_key_env.is_some() { config.api_key(&selected).ok_or("Configure the API credential for this model provider.")? } else { String::new() };
     let protocol_name = if protocol == Protocol::OpenAi { "openai" } else { "anthropic" };
     let id = identity(&identity_salt()?, &[name, &endpoint, &model, protocol_name, &key]);
     let hints = config.model_hints.unwrap_or_else(|| octos_llm::openai::ModelHints::detect(&model));
@@ -380,6 +467,83 @@ mod tests {
     }
 
     #[test]
+    fn minimal_config_preserves_credential_precedence_aliases_and_expiry() {
+        let _guard = crate::CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (name, value) in &self.0 {
+                    unsafe { match value { Some(value) => std::env::set_var(name, value), None => std::env::remove_var(name) } }
+                }
+            }
+        }
+        let names = ["OCTOS_CONFIG_DIR", "OPENAI_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY", "kimi_api_key", "ROBRIX_TRANSPORT_CUSTOM_KEY"];
+        let _restore = Restore(names.into_iter().map(|name| (name, std::env::var_os(name))).collect());
+        let directory = tempfile::tempdir().unwrap();
+        unsafe {
+            for name in names { std::env::remove_var(name); }
+            std::env::set_var("OCTOS_CONFIG_DIR", directory.path());
+            std::env::set_var("OPENAI_API_KEY", "process-openai");
+            std::env::set_var("MOONSHOT_API_KEY", "process-moonshot");
+        }
+        let check = |provider: &str, value: Value, expected: Option<&str>| {
+            let config: ModelConfig = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(config.api_key(provider).as_deref(), expected);
+            #[cfg(feature = "embedded")]
+            {
+                let canonical: octos_cli::config::Config = serde_json::from_value(value).unwrap();
+                assert_eq!(config.api_key(provider), canonical.get_api_key_with_env(provider, canonical.api_key_env.as_deref()).ok());
+            }
+        };
+        let write_auth = |expiry: Value| std::fs::write(directory.path().join("auth.json"), json!({"credentials":{
+            "openai":{"access_token":"stored-openai","expires_at":expiry,"provider":"openai","auth_method":"paste_token"},
+            "moonshot":{"access_token":"stored-moonshot","provider":"moonshot","auth_method":"paste_token"}
+        }}).to_string()).unwrap();
+        write_auth(Value::Null);
+        check("openai", json!({"env_vars":{"OPENAI_API_KEY":"config-openai"}}), Some("stored-openai"));
+        check("openai", json!({"api_key_env":"OPENAI_API_KEY"}), Some("stored-openai"));
+        check("moonshot", json!({"api_key_env":"KIMI_API_KEY"}), Some("stored-moonshot"));
+        check("moonshot", json!({"api_key_env":"kimi_api_key"}), None);
+        check("openai", json!({"api_key_env":"ROBRIX_TRANSPORT_CUSTOM_KEY"}), None);
+        check("openai", json!({"api_key_env":"ROBRIX_TRANSPORT_CUSTOM_KEY","env_vars":{"ROBRIX_TRANSPORT_CUSTOM_KEY":"proxy-key"}}), Some("proxy-key"));
+        write_auth(json!("2000-01-01T00:00:00Z"));
+        check("openai", json!({"env_vars":{"OPENAI_API_KEY":"config-openai"}}), Some("config-openai"));
+        check("openai", json!({"env_vars":{"OPENAI_API_KEY":""}}), Some("process-openai"));
+        std::fs::remove_file(directory.path().join("auth.json")).unwrap();
+        check("moonshot", json!({"api_key_env":"KIMI_API_KEY"}), Some("process-moonshot"));
+        check("moonshot", json!({"api_key_env":"KIMI_API_KEY","env_vars":{"MOONSHOT_API_KEY":"profile-moonshot"}}), Some("profile-moonshot"));
+        check("custom", json!({"api_key_env":"ROBRIX_TRANSPORT_CUSTOM_KEY","env_vars":{"ROBRIX_TRANSPORT_CUSTOM_KEY":""}}), None);
+    }
+
+    #[test]
+    fn minimal_config_preserves_model_fields_and_keychain_encoding() {
+        let value = json!({"provider":"custom","model":"selected-model","base_url":"https://service.example/v1",
+            "api_type":"anthropic","api_key_env":"PRIVATE_KEY","env_vars":{"PRIVATE_KEY":"fixture"},
+            "model_hints":{"uses_completion_tokens":true,"fixed_temperature":true},
+            "mcp_servers":[],"sandbox":{},"unrelated_future_field":true});
+        let config: ModelConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(config.provider.as_deref(), Some("custom"));
+        assert_eq!(config.model.as_deref(), Some("selected-model"));
+        assert_eq!(config.base_url.as_deref(), Some("https://service.example/v1"));
+        assert_eq!(config.api_type.as_deref(), Some("anthropic"));
+        assert!(config.model_hints.as_ref().unwrap().uses_completion_tokens);
+        #[cfg(feature = "embedded")]
+        {
+            let canonical: octos_cli::config::Config = serde_json::from_value(value).unwrap();
+            assert_eq!(config.provider, canonical.provider);
+            assert_eq!(config.model, canonical.model);
+            assert_eq!(config.base_url, canonical.base_url);
+            assert_eq!(config.api_type, canonical.api_type);
+            assert_eq!(config.api_key_env, canonical.api_key_env);
+            assert_eq!(config.env_vars, canonical.env_vars);
+            assert_eq!(config.model_hints, canonical.model_hints);
+        }
+        assert_eq!(decode_keychain_hex("610a62"), Some("a\nb".into()));
+        assert_eq!(decode_keychain_hex("41424344"), None);
+        assert_eq!(decode_keychain_hex("deadbeef"), None);
+    }
+
+    #[test]
     fn identity_changes_for_endpoint_credential_model_and_protocol() {
         let fields = ["openai", "https://example.com/v1/chat/completions", "model-a", "openai", "secret-a"];
         let expected = identity(b"private-salt", &fields);
@@ -404,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_recipient_tracks_real_key_endpoint_model_and_rejects_opaque_backends() {
+    fn configured_recipient_tracks_real_key_endpoint_model_independently_of_agent_backend() {
         let _guard = crate::CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         struct Restore {
             config: Option<std::ffi::OsString>, command: Option<std::ffi::OsString>, provider: Option<String>,
@@ -450,9 +614,8 @@ mod tests {
         let custom = resolve(&prefs).unwrap();
         assert!(custom.recipient.local);
         assert!(custom.key.is_empty(), "custom endpoints do not inherit an arbitrary provider credential");
-        config["provider"] = json!("openai"); write(&config);
         unsafe { std::env::set_var("ROBRIX_AGENT_CMD", "opaque-test-agent"); }
-        assert!(resolve(&prefs).is_err());
+        assert_eq!(resolve(&prefs).unwrap().recipient, custom.recipient, "backend selection does not change the host-owned model recipient");
     }
 
     #[tokio::test]

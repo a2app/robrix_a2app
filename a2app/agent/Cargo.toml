@@ -16,37 +16,33 @@ makepad-widgets = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-## The in-process octos agent backend (feature `embedded`).
-## TEMPORARY: the fork/branch of octos-org/octos#1914, which exposes
-## `AcpCommand::factory()`, the agent factory `octos acp` serves.
-## Consumed straight from gterzian/octos `acp-embedding-seam` (ahead of
-## project-robius/octos) as a normal git dependency; no local path patch.
-## Repin to an upstream rev once that lands.
-octos-agent = { git = "https://github.com/gterzian/octos", branch = "acp-embedding-seam", default-features = false, optional = true }
-octos-core  = { git = "https://github.com/gterzian/octos", branch = "acp-embedding-seam", optional = true }
-octos-cli   = { git = "https://github.com/gterzian/octos", branch = "acp-embedding-seam", optional = true }
-octos-llm   = { git = "https://github.com/gterzian/octos", branch = "acp-embedding-seam", optional = true }
-octos-memory = { git = "https://github.com/gterzian/octos", branch = "acp-embedding-seam", optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
-eyre = { version = "0.6", optional = true }
-sha2 = { version = "0.10", optional = true }
-getrandom = { version = "0.3", optional = true }
-tempfile = { version = "3", optional = true }
-url = { version = "2.5", optional = true }
+## Both agent backends use the same host-owned model transport and types.
+## Only the in-process backend links the Octos agent, CLI, and memory crates.
+## Keep all Octos dependencies on one revision for their shared protocol types.
+octos-agent = { git = "https://github.com/project-robius/octos", branch = "host-managed-ifc", default-features = false, optional = true }
+octos-core  = { git = "https://github.com/project-robius/octos", branch = "host-managed-ifc" }
+octos-cli   = { git = "https://github.com/project-robius/octos", branch = "host-managed-ifc", optional = true }
+octos-llm   = { git = "https://github.com/project-robius/octos", branch = "host-managed-ifc" }
+octos-memory = { git = "https://github.com/project-robius/octos", branch = "host-managed-ifc", optional = true }
+octos-sandbox = { git = "https://github.com/project-robius/octos", branch = "host-managed-ifc" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+eyre = { version = "0.6" }
+sha2 = { version = "0.10" }
+getrandom = { version = "0.3" }
+tempfile = "3"
+url = { version = "2.5" }
 ## Unprotected standalone agents can expose Octos diagnostics in debug builds.
 ## Protected session threads suppress dependency tracing.
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 tracing = { version = "0.1", optional = true }
-tokio  = { version = "1", features = ["rt-multi-thread", "time", "macros"], optional = true }
-chrono = { version = "0.4", optional = true }
-async-trait = { version = "0.1", optional = true }
+tokio  = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync"] }
+chrono = { version = "0.4" }
+async-trait = { version = "0.1" }
 
 [features]
-## Link the octos agent INTO the host binary and run it on a thread, instead of
-## spawning `octos acp` as a child process. Required for private contexts,
-## whose model requests use Robrix's guarded transport and restricted tools.
-## External ACP overrides are refused for protected sessions.
-embedded = ["dep:octos-agent", "dep:octos-core", "dep:octos-cli", "dep:octos-llm", "dep:octos-memory", "dep:reqwest", "dep:eyre", "dep:sha2", "dep:getrandom", "dep:tempfile", "dep:url", "dep:tokio", "dep:chrono", "dep:tracing-subscriber", "dep:tracing", "dep:async-trait"]
+## Link the Octos agent into Robrix instead of using the protected ACP child.
+## Both paths route model calls through Robrix's guarded transport.
+embedded = ["dep:octos-agent", "dep:octos-cli", "dep:octos-memory", "dep:tracing-subscriber", "dep:tracing"]
 
 ## Install the Splash dialect guide ON THE AGENT once, so each prompt can
 ## point at it instead of inlining ~6KB of guide per generation.

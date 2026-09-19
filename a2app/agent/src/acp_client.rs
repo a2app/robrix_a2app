@@ -14,28 +14,30 @@
 //! `session/cancel` (and ultimately a kill on drop).
 //!
 //! Threading: THREE threads touch the child, and none of them may block
-//! another. All stdin writes go through a dedicated writer thread fed by an
-//! unbounded channel — the UI thread and the reader thread only ever
-//! `send()`, which cannot block, so a stalled/wedged child can never freeze
+//! another. All stdin writes go through a dedicated writer thread fed by a
+//! bounded channel — the UI thread and the reader thread only ever
+//! `try_send()`, so a stalled/wedged child can never freeze
 //! the UI (or deadlock the reader against its own refusal replies). `Drop`
 //! kills the child FIRST (kill takes no locks), which closes the pipes and
 //! unblocks any thread stuck mid-write/mid-read.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
 use makepad_widgets::SignalToUI;
 use serde_json::{json, Value};
 
 use crate::mcp::McpServerConfig;
+use crate::host_broker::HostBroker;
 
 /// Cap on one incoming NDJSON line. A frame past this is not a protocol we
 /// can parse anyway (real replies are a few KB) — treat it as a dead agent
 /// rather than buffering without bound.
-const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_LINE_BYTES: usize = octos_llm::host::MAX_FRAME_BYTES;
+const MAX_QUEUED_BYTES: usize = 2 * MAX_LINE_BYTES;
 
 /// Events surfaced to the UI thread, already reduced from raw JSON-RPC to what
 /// the generation pipeline cares about.
@@ -87,6 +89,17 @@ pub struct PlanStep {
     pub status: String,
 }
 
+fn event_size(event: &AcpEvent) -> usize {
+    match event {
+        AcpEvent::Chunk(text) | AcpEvent::Thought(text) | AcpEvent::Error(text) | AcpEvent::ProcessGone(text) => text.len(),
+        AcpEvent::ToolCall { id, title } => id.len() + title.len(),
+        AcpEvent::ToolCallDone { id, summary, .. } => id.len() + summary.len(),
+        AcpEvent::Plan(steps) => steps.iter().map(|step| step.content.len() + step.status.len()).sum(),
+        AcpEvent::TurnDone { stop_reason, text } => stop_reason.len() + text.len(),
+        AcpEvent::SessionReady | AcpEvent::Tick => 0,
+    }
+}
+
 /// Which JSON-RPC request an outstanding id belongs to. The pipeline runs
 /// strictly one request at a time (initialize → session/new → prompt → ...),
 /// so a single pending slot replaces a request table.
@@ -101,8 +114,14 @@ enum Pending {
 /// thread advances the handshake itself (initialize reply → send session/new)
 /// so the UI only ever sees `SessionReady`.
 struct Shared {
-    /// Feed to the writer thread; `send` never blocks. `None` after shutdown.
-    write_tx: Mutex<Option<Sender<String>>>,
+    /// Feed to the writer thread; admission never blocks. `None` after shutdown.
+    write_tx: Mutex<Option<SyncSender<String>>>,
+    queued_bytes: AtomicUsize,
+    queued_event_bytes: AtomicUsize,
+    turn_bytes: AtomicUsize,
+    closed: AtomicBool,
+    failure: Mutex<Option<String>>,
+    broker: Option<Arc<HostBroker>>,
     next_id: AtomicU64,
     /// The id and kind of the single in-flight request, if any.
     pending: Mutex<Option<(u64, Pending)>>,
@@ -121,8 +140,26 @@ struct Shared {
 
 impl Shared {
     fn write_line(&self, line: String) {
+        if self.closed.load(Ordering::Acquire) { return; }
+        let bytes = line.len();
+        if bytes >= MAX_LINE_BYTES || self.queued_bytes.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+            |queued| queued.checked_add(bytes).filter(|total| *total <= MAX_QUEUED_BYTES)).is_err()
+        {
+            self.fail("Agent exceeded the protocol output limit.");
+            return;
+        }
         if let Some(tx) = self.write_tx.lock().unwrap().as_ref() {
-            let _ = tx.send(line);
+            if tx.try_send(line).is_ok() { return; }
+        }
+        self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        self.fail("Agent stopped reading its protocol requests.");
+    }
+
+    fn fail(&self, error: &str) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            *self.failure.lock().unwrap() = Some(error.into());
+            if let Some(broker) = &self.broker { broker.stop(); }
+            SignalToUI::set_ui_signal();
         }
     }
 
@@ -138,7 +175,7 @@ impl Shared {
 /// A live connection to a spawned ACP agent process.
 pub struct AcpClient {
     child: Child,
-    events: Receiver<AcpEvent>,
+    events: Receiver<(usize, AcpEvent)>,
     shared: Arc<Shared>,
     /// Human-readable command line, for diagnostics.
     cmd_desc: String,
@@ -165,8 +202,8 @@ impl AcpClient {
         args.extend(extra_args.iter().cloned());
 
         std::fs::create_dir_all(workspace).ok();
-        let mut child = Command::new(bin)
-            .args(&args)
+        let mut command = Command::new(bin);
+        command.args(&args)
             .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             // Robrix may itself be running from inside a Claude Code
             // session (dev workflows); the claude-code-acp adapter refuses to
@@ -174,21 +211,34 @@ impl AcpClient {
             // isn't Claude Code — drop the marker for the child (the
             // adapter's own documented bypass).
             .env_remove("CLAUDECODE")
-            .current_dir(workspace)
-            .stdin(Stdio::piped())
+            .current_dir(workspace);
+        Self::spawn_command(command, cmd_line, workspace, mcp_servers, None)
+    }
+
+    pub(crate) fn spawn_protected(executable: &std::path::Path, broker: Arc<HostBroker>) -> Result<Self, String> {
+        let mut command = octos_sandbox::host_managed_command(executable).map_err(|error| format!("Could not confine Octos: {error}"))?;
+        command.args(["acp", "--host-managed"]);
+        Self::spawn_command(command, "confined Octos host broker", std::path::Path::new("/"), &[], Some(broker))
+    }
+
+    fn spawn_command(mut command: Command, cmd_desc: &str, workspace: &std::path::Path, mcp_servers: &[McpServerConfig], broker: Option<Arc<HostBroker>>) -> Result<Self, String> {
+        let mut child = command.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("couldn't start `{cmd_line}`: {e}"))?;
+            .map_err(|e| format!("couldn't start `{cmd_desc}`: {e}"))?;
 
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         let mut stdin = child.stdin.take().expect("piped stdin");
 
-        let (tx, events) = std::sync::mpsc::channel::<AcpEvent>();
-        let (write_tx, write_rx) = std::sync::mpsc::channel::<String>();
+        let (tx, events) = std::sync::mpsc::sync_channel::<(usize, AcpEvent)>(128);
+        let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<String>(16);
         let shared = Arc::new(Shared {
             write_tx: Mutex::new(Some(write_tx)),
+            queued_bytes: AtomicUsize::new(0), closed: AtomicBool::new(false),
+            queued_event_bytes: AtomicUsize::new(0), turn_bytes: AtomicUsize::new(0),
+            failure: Mutex::new(None), broker,
             next_id: AtomicU64::new(1),
             pending: Mutex::new(None),
             session_id: Mutex::new(None),
@@ -199,14 +249,18 @@ impl AcpClient {
 
         // Writer thread: sole owner of the child's stdin. Exits when every
         // Sender is gone (client dropped) or the pipe breaks (child died).
+        let writer_shared = Arc::downgrade(&shared);
         std::thread::spawn(move || {
             for line in write_rx {
-                if stdin
+                let result = stdin
                     .write_all(line.as_bytes())
                     .and_then(|_| stdin.write_all(b"\n"))
-                    .and_then(|_| stdin.flush())
-                    .is_err()
-                {
+                    .and_then(|_| stdin.flush());
+                if let Some(shared) = writer_shared.upgrade() {
+                    shared.queued_bytes.fetch_sub(line.len(), Ordering::AcqRel);
+                    if result.is_err() { shared.fail("Agent protocol input closed."); }
+                }
+                if result.is_err() {
                     break;
                 }
             }
@@ -218,10 +272,12 @@ impl AcpClient {
         let err_tail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let stderr_done = {
             let err_tail = err_tail.clone();
+            let protected = shared.broker.is_some();
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(stderr);
                 let mut buf = Vec::new();
-                while read_capped_line(&mut reader, &mut buf) {
+                while crate::mcp::read_frame(&mut reader, 4096, &mut buf) {
+                    if protected { continue; }
                     let line = String::from_utf8_lossy(&buf);
                     let line = line.trim_end_matches(['\r', '\n']);
                     let mut tail = err_tail.lock().unwrap();
@@ -249,10 +305,7 @@ impl AcpClient {
                         break;
                     }
                     if buf.len() >= MAX_LINE_BYTES {
-                        let _ = tx.send(AcpEvent::ProcessGone(
-                            "agent sent an oversized protocol frame".to_string(),
-                        ));
-                        SignalToUI::set_ui_signal();
+                        shared.fail("Agent sent an oversized protocol frame.");
                         return;
                     }
                     let line = String::from_utf8_lossy(&buf);
@@ -260,12 +313,25 @@ impl AcpClient {
                         continue;
                     }
                     for event in reduce_line(&shared, &line) {
-                        if tx.send(event).is_err() {
+                        let size = event_size(&event);
+                        if shared.queued_event_bytes.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+                            |queued| queued.checked_add(size).filter(|total| *total <= MAX_QUEUED_BYTES)).is_err()
+                        {
+                            shared.fail("Agent exceeded the pending event byte limit.");
+                            return;
+                        }
+                        if tx.try_send((size, event)).is_err() {
+                            shared.queued_event_bytes.fetch_sub(size, Ordering::AcqRel);
+                            shared.fail("Agent exceeded the pending event limit.");
                             return; // client dropped; stop reading
                         }
                         SignalToUI::set_ui_signal();
                     }
+                    if shared.closed.load(Ordering::Acquire) { return; }
                 }
+                // EOF revokes broker work immediately. Diagnostic draining
+                // must not extend a disconnected child's active turn.
+                if let Some(broker) = &shared.broker { broker.stop(); }
                 // Stdout closed: the process died or shut down. Wait briefly
                 // for the stderr drain to finish flushing the reason (bounded:
                 // stderr may stay open in exotic cases, so don't join blindly).
@@ -275,13 +341,17 @@ impl AcpClient {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
-                let tail = err_tail.lock().unwrap().join("\n");
+                let tail = if shared.broker.is_some() { String::new() } else { err_tail.lock().unwrap().join("\n") };
                 let msg = if tail.trim().is_empty() {
                     "agent process exited".to_string()
                 } else {
                     format!("agent process exited: {}", tail.trim())
                 };
-                let _ = tx.send(AcpEvent::ProcessGone(msg));
+                if tx.try_send((0, AcpEvent::ProcessGone(msg.clone()))).is_err() {
+                    // Failure is stored outside the bounded event queue, so
+                    // EOF cannot disappear behind a full queue of updates.
+                    shared.fail(&msg);
+                }
                 SignalToUI::set_ui_signal();
             });
         }
@@ -293,19 +363,27 @@ impl AcpClient {
             "initialize",
             json!({
                 "protocolVersion": 1,
-                "clientCapabilities": {},
+                "clientCapabilities": shared.broker.as_ref().map_or(json!({}), |broker| json!({"_meta": {
+                    octos_llm::host::CAPABILITY_KEY: broker.config(),
+                }})),
                 "clientInfo": {"name": "robrix", "version": env!("CARGO_PKG_VERSION")},
             }),
         );
 
-        Ok(Self { child, events, shared, cmd_desc: cmd_line.to_string() })
+        Ok(Self { child, events, shared, cmd_desc: cmd_desc.to_string() })
     }
 
     /// Drains every event queued by the reader thread. Call from the UI
     /// thread's event handler (a `SignalToUI` wakeup guarantees one fires).
     pub fn drain_events(&mut self) -> Vec<AcpEvent> {
+        let failure = self.shared.failure.lock().unwrap().take();
+        if let Some(error) = failure {
+            let _ = self.child.kill();
+            return vec![AcpEvent::ProcessGone(error)];
+        }
         let mut out = Vec::new();
-        while let Ok(e) = self.events.try_recv() {
+        while let Ok((size, e)) = self.events.try_recv() {
+            self.shared.queued_event_bytes.fetch_sub(size, Ordering::AcqRel);
             out.push(e);
         }
         out
@@ -318,7 +396,11 @@ impl AcpClient {
         let Some(session_id) = self.shared.session_id.lock().unwrap().clone() else {
             return;
         };
+        if let Some(broker) = &self.shared.broker {
+            if let Err(error) = broker.begin_turn() { self.shared.fail(&error); return; }
+        }
         self.shared.turn_text.lock().unwrap().clear();
+        self.shared.turn_bytes.store(0, Ordering::Release);
         self.shared.send_request(
             Pending::Prompt,
             "session/prompt",
@@ -332,6 +414,7 @@ impl AcpClient {
     /// Requests cancellation of the in-flight turn (`session/cancel`). The
     /// turn still ends with a `TurnDone{stop_reason:"cancelled"}` reply.
     pub fn cancel(&mut self) {
+        if let Some(broker) = &self.shared.broker { broker.cancel(); }
         let Some(session_id) = self.shared.session_id.lock().unwrap().clone() else {
             return;
         };
@@ -353,6 +436,7 @@ impl AcpClient {
 
 impl Drop for AcpClient {
     fn drop(&mut self) {
+        if let Some(broker) = &self.shared.broker { broker.stop(); }
         // Kill FIRST: it takes no locks and closes the pipes, so any thread
         // blocked on the child (reader mid-read, writer mid-write) unwedges.
         let _ = self.child.kill();
@@ -500,6 +584,10 @@ fn read_capped_line(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> bool {
     match limited.read_until(b'\n', buf) {
         Ok(0) => false,
         Ok(_) => {
+            // Preserve the cap marker even when its last byte is whitespace.
+            // Otherwise a frame ending this chunk with CR could be split and
+            // accepted as several independently bounded protocol frames.
+            if buf.len() >= MAX_LINE_BYTES { return true; }
             while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
                 buf.pop();
             }
@@ -512,6 +600,54 @@ fn read_capped_line(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    fn protected_state(session_id: Option<&str>, pending: Option<(u64, Pending)>) -> Arc<Shared> {
+        Arc::new(Shared {
+            write_tx: Mutex::new(None), queued_bytes: AtomicUsize::new(0),
+            queued_event_bytes: AtomicUsize::new(0), turn_bytes: AtomicUsize::new(0),
+            closed: AtomicBool::new(false), failure: Mutex::new(None),
+            broker: Some(HostBroker::for_protocol_test()), next_id: AtomicU64::new(1),
+            pending: Mutex::new(pending), session_id: Mutex::new(session_id.map(str::to_string)),
+            turn_text: Mutex::new(String::new()), workspace: "/".into(), mcp_servers: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn protected_protocol_rejects_malformed_frames_and_unknown_sessions() {
+        for line in [
+            "{broken",
+            r#"{"jsonrpc":"1.0","method":"session/update","params":{"sessionId":"room"}}"#,
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"other"}}"#,
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{}}"#,
+        ] {
+            let shared = protected_state(Some("room"), None);
+            assert!(reduce_line(&shared, line).is_empty());
+            assert!(shared.closed.load(Ordering::Acquire));
+        }
+        let before_session = protected_state(None, None);
+        assert!(reduce_line(&before_session, r#"{"jsonrpc":"2.0","method":"session/update","params":{}}"#).is_empty());
+        assert!(before_session.closed.load(Ordering::Acquire), "two absent session IDs are not a valid identity match");
+    }
+
+    #[test]
+    fn protected_session_handshake_rejects_missing_empty_or_oversized_ids() {
+        for result in [json!({}), json!({"sessionId":""}), json!({"sessionId":"x".repeat(129)})] {
+            let shared = protected_state(None, Some((1, Pending::NewSession)));
+            let reply = json!({"jsonrpc":"2.0","id":1,"result":result});
+            assert!(reduce_line(&shared, &reply.to_string()).is_empty());
+            assert!(shared.closed.load(Ordering::Acquire));
+            assert!(shared.session_id.lock().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn capped_frame_cannot_hide_its_limit_with_trailing_carriage_return() {
+        let mut input = vec![b'x'; MAX_LINE_BYTES];
+        input[MAX_LINE_BYTES - 1] = b'\r';
+        let mut buffer = Vec::new();
+        assert!(read_capped_line(&mut std::io::Cursor::new(input), &mut buffer));
+        assert_eq!(buffer.len(), MAX_LINE_BYTES);
+    }
 
     /// Regression test for the review-confirmed deadlock: an agent that
     /// floods client-bound requests WITHOUT reading its stdin used to wedge
@@ -576,13 +712,29 @@ fn tool_call_output_preview(update: &Value) -> String {
 /// Reduces one incoming JSON-RPC line to zero or more `AcpEvent`s, advancing
 /// the handshake as a side effect. Runs on the reader thread; only touches
 /// `Shared`, never the UI.
-fn reduce_line(shared: &Shared, line: &str) -> Vec<AcpEvent> {
+fn reduce_line(shared: &Arc<Shared>, line: &str) -> Vec<AcpEvent> {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
+        if shared.broker.is_some() { shared.fail("The protected agent sent invalid JSON."); }
         return vec![];
     };
+    if shared.broker.is_some() && value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        shared.fail("The protected agent sent an invalid JSON-RPC version.");
+        return vec![];
+    }
 
     // Notifications: session/update carries the streamed turn content.
     if value.get("method").and_then(Value::as_str) == Some("session/update") {
+        if shared.broker.is_some() {
+            let session_id = shared.session_id.lock().unwrap();
+            if session_id.is_none() || value.pointer("/params/sessionId").and_then(Value::as_str) != session_id.as_deref() {
+                shared.fail("Agent update used an unknown session.");
+                return vec![];
+            }
+        }
+        if shared.turn_bytes.fetch_add(line.len(), Ordering::AcqRel).saturating_add(line.len()) > MAX_LINE_BYTES {
+            shared.fail("Agent exceeded the turn output limit.");
+            return vec![];
+        }
         let Some(update) = value.pointer("/params/update") else {
             return vec![];
         };
@@ -679,6 +831,21 @@ fn reduce_line(shared: &Shared, line: &str) -> Vec<AcpEvent> {
     if value.get("method").is_some() {
         if let Some(id) = value.get("id").filter(|id| !id.is_null()) {
             let method = value.get("method").and_then(Value::as_str).unwrap_or("?");
+            if let Some(broker) = &shared.broker {
+                let responder = shared.clone();
+                let response_id = id.clone();
+                let reply = Box::new(move |result: Result<Value, String>| {
+                    let response = match result {
+                        Ok(result) => json!({"jsonrpc":"2.0", "id":response_id, "result":result}),
+                        Err(error) => json!({"jsonrpc":"2.0", "id":response_id, "error":{"code":-32000,"message":error}}),
+                    };
+                    responder.write_line(response.to_string());
+                });
+                if let Err(error) = broker.submit(id, method, value.get("params").cloned().unwrap_or(json!({})), line.len(), reply) {
+                    shared.write_line(json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32000,"message":error}}).to_string());
+                }
+                return vec![];
+            }
             shared.write_line(
                 json!({
                     "jsonrpc": "2.0",
@@ -709,6 +876,10 @@ fn reduce_line(shared: &Shared, line: &str) -> Vec<AcpEvent> {
     let Some(pending) = pending else { return vec![] };
 
     if let Some(err) = value.get("error") {
+        if let Some(broker) = &shared.broker {
+            if pending == Pending::Prompt { broker.cancel(); }
+            else { shared.fail("The protected agent handshake failed."); return vec![]; }
+        }
         // Forward the WHOLE error object, not just `message`. JSON-RPC's
         // `message` is the transport's own generic string — octos sends
         // "Internal error" — while the provider's actual sentence ("You've
@@ -729,6 +900,12 @@ fn reduce_line(shared: &Shared, line: &str) -> Vec<AcpEvent> {
 
     match pending {
         Pending::Initialize => {
+            if let Some(broker) = &shared.broker {
+                if let Err(error) = broker.accept_handshake(&value["result"]) {
+                    shared.fail(&error);
+                    return vec![];
+                }
+            }
             // Handshake step 2, driven from here so the UI needn't care.
             shared.send_request(
                 Pending::NewSession,
@@ -741,13 +918,19 @@ fn reduce_line(shared: &Shared, line: &str) -> Vec<AcpEvent> {
             let Some(sid) = value
                 .pointer("/result/sessionId")
                 .and_then(Value::as_str)
+                .filter(|sid| shared.broker.is_none() || (!sid.is_empty() && sid.len() <= 128))
             else {
+                if shared.broker.is_some() {
+                    shared.fail("The protected agent returned an invalid session ID.");
+                    return vec![];
+                }
                 return vec![AcpEvent::Error("session/new reply had no sessionId".into())];
             };
             *shared.session_id.lock().unwrap() = Some(sid.to_string());
             vec![AcpEvent::SessionReady]
         }
         Pending::Prompt => {
+            if let Some(broker) = &shared.broker { broker.cancel(); }
             let stop_reason = value
                 .pointer("/result/stopReason")
                 .and_then(Value::as_str)

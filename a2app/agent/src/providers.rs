@@ -61,10 +61,8 @@ pub enum KeySource {
     AuthStore,
     /// Needs no key at all (a local Ollama).
     None,
-    /// An ACP agent chosen by `ROBRIX_AGENT_CMD` — a Claude Code
-    /// subscription, or any other agent binary. It overrides octos entirely,
-    /// so it isn't a credential this page can manage: it's decided by how the
-    /// app was started.
+    /// A legacy standalone ACP command. Protected Robrix provider lists never
+    /// return this source: the worker executable does not select the model.
     AgentCommand,
 }
 
@@ -124,17 +122,6 @@ impl ConfiguredProvider {
 /// The ACP agent command the app was started with, if any.
 pub fn agent_command() -> Option<String> {
     std::env::var("ROBRIX_AGENT_CMD").ok().filter(|c| !c.trim().is_empty())
-}
-
-/// Display name for that agent. A Claude Code subscription via
-/// `claude-code-acp` is the common case and deserves to be recognised by name
-/// rather than shown as a path.
-fn agent_command_label(cmd: &str) -> String {
-    if cmd.contains("claude-code-acp") {
-        "Claude Code (your subscription)".to_string()
-    } else {
-        "Custom ACP agent".to_string()
-    }
 }
 
 /// The config file octos will actually read (its first existing candidate), or
@@ -207,58 +194,31 @@ pub fn key_for(id: &str) -> Option<String> {
         .filter(|k| !k.trim().is_empty())
 }
 
-/// The pseudo-id for the row representing `ROBRIX_AGENT_CMD`.
+/// Legacy standalone ACP pseudo-id; protected provider lists do not use it.
 pub const AGENT_COMMAND_ID: &str = "agent-command";
 
 /// What a generation started RIGHT NOW would actually use.
 ///
-/// Mirrors `start_backend`'s selection order exactly, and is the single source
-/// of truth for which row the page marks "In use". Anything that overrides the
-/// saved choice at runtime — an agent command, an exported key, the Claude Code
-/// bridge, a pick made this session — has to appear here, or the page shows a
-/// tick next to something that isn't running.
+/// Mirrors the guarded model transport's selection order. A worker executable
+/// override changes where the agent runs, while Robrix still selects its model.
 pub fn in_use_id() -> Option<String> {
-    if agent_command().is_some() {
-        return Some(AGENT_COMMAND_ID.to_string());
-    }
     if let Some(id) = session_provider() {
-        return Some(id);
-    }
-    if let Some(id) = super::bridged_provider() {
         return Some(id);
     }
     super::provider_from_octos_config()
         .or_else(|| super::provider_from_env().map(str::to_string))
         .or_else(super::provider_from_auth_store)
-        .or_else(|| super::ollama_model().map(|_| "ollama".to_string()))
 }
 
 /// Every provider that could be used right now, the one in use first-class.
 ///
 /// Merged from all the places a credential can live, so the list matches what
 /// a generation would actually find rather than only what this app wrote — and
-/// runtime overrides get a row of their own rather than silently winning
-/// behind a page that claims something else is selected.
+/// the page marks the model provider independently of the worker runtime.
 pub fn list() -> Vec<ConfiguredProvider> {
     let in_use = in_use_id();
     let saved_default = super::provider_from_octos_config();
-    let mut found: Vec<ConfiguredProvider> = Vec::new();
-    // An explicit agent command wins over everything: octos is not consulted
-    // at all in that case (see `start_backend`), so it is THE provider, and
-    // any keys below it are dormant until the app runs without it. It
-    // still gets listed ALONGSIDE them, so the saved default stays visible as
-    // "what you'd get without this override" instead of vanishing.
-    if let Some(cmd) = agent_command() {
-        found.push(ConfiguredProvider {
-            id: AGENT_COMMAND_ID.to_string(),
-            label: agent_command_label(&cmd),
-            source: KeySource::AgentCommand,
-            active: true,
-            is_default: false,
-        });
-    }
-    found.extend(octos_providers_marked(in_use, saved_default));
-    found
+    octos_providers_marked(in_use, saved_default)
 }
 
 /// The providers octos itself could use, with `in_use` and `saved_default`
@@ -278,14 +238,18 @@ fn octos_providers_marked(
     if let Some(id) = super::provider_from_auth_store() {
         candidates.push((id, KeySource::AuthStore));
     }
-    if super::ollama_model().is_some() {
-        candidates.push(("ollama".to_string(), KeySource::None));
-    }
     // A provider named in the config whose key lives somewhere we can't see
     // (a keychain marker, say) is still selected — list it rather than
     // showing an empty picker next to a working setup.
     if let Some(id) = saved_default.clone() {
-        candidates.push((id, KeySource::AuthStore));
+        let source = if id == "ollama" { KeySource::None } else { KeySource::AuthStore };
+        candidates.push((id, source));
+    }
+    if let Some(id) = active.clone() {
+        if !candidates.iter().any(|(candidate, _)| candidate == &id) {
+            let source = if id == "ollama" { KeySource::None } else { KeySource::AuthStore };
+            candidates.push((id, source));
+        }
     }
 
     let mut found: Vec<ConfiguredProvider> = Vec::new();
@@ -317,13 +281,10 @@ pub fn config_display_path() -> String {
     }
 }
 
-/// Whether anything at all is set up. The create UI asks this before letting
-/// someone type a request that could only fail — so it MUST count the
-/// `ROBRIX_AGENT_CMD` path, which needs no key and no octos config and
-/// is how a Claude subscription is used. Nagging that setup for a provider
-/// would be nagging a working app.
+/// Whether the guarded transport has a model provider to select. Choosing a
+/// worker executable alone supplies neither a provider nor its credentials.
 pub fn any_configured() -> bool {
-    agent_command().is_some() || !list().is_empty()
+    in_use_id().is_some()
 }
 
 /// The provider picked for THIS SESSION only, overriding the saved default.
@@ -355,7 +316,7 @@ pub fn default_provider() -> Option<String> {
 
 /// What a generation started right now would actually use.
 pub fn effective_provider() -> Option<String> {
-    session_provider().or_else(default_provider)
+    in_use_id()
 }
 
 /// Robrix's intended default model for DeepSeek setups it writes. octos's own
@@ -482,6 +443,29 @@ mod tests {
         let _guard = super::super::CONFIG_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        struct Restore {
+            env: Vec<(&'static str, Option<std::ffi::OsString>)>,
+            provider: Option<String>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (name, value) in &self.env {
+                    unsafe { match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    } }
+                }
+                match &self.provider { Some(id) => set_session(id), None => clear_session() }
+            }
+        }
+        let names = ["OCTOS_CONFIG_DIR", "ROBRIX_AGENT_CMD"].into_iter()
+            .chain(super::super::PROVIDER_KEY_ENVS.iter().map(|(name, _)| *name));
+        let restore = Restore {
+            env: names.map(|name| (name, std::env::var_os(name))).collect(),
+            provider: session_provider(),
+        };
+        for (name, _) in &restore.env { unsafe { std::env::remove_var(name) }; }
+        clear_session();
         let dir = std::env::temp_dir().join(format!(
             "hl_providers_test_{}_{:?}",
             std::process::id(),
@@ -500,7 +484,6 @@ mod tests {
             resolved.display()
         );
         let out = body();
-        unsafe { std::env::remove_var("OCTOS_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
         out
     }
@@ -707,21 +690,52 @@ mod tests {
         });
     }
 
-    /// An app started with an ACP agent command is fully set up: no key,
-    /// no octos config. Reporting otherwise made the create UI offer provider
-    /// setup on every click for exactly the Claude-subscription setup.
+    /// The protected worker executable supplies no model or credential.
+    /// Legacy standalone ACP callers still accept their own command setup.
     #[test]
-    fn an_agent_command_counts_as_configured() {
+    fn a_worker_command_alone_needs_a_model_provider() {
         with_temp_config(|| {
             assert!(!any_configured(), "empty config, no agent command");
-            unsafe { std::env::set_var("ROBRIX_AGENT_CMD", "claude-code-acp") };
-            assert!(any_configured());
-            let list = list();
-            assert!(list[0].external(), "the agent command is the provider in use");
-            assert!(list[0].active);
-            assert!(!list[0].editable(), "it's chosen by how the app was started");
-            assert!(list[0].label.contains("Claude Code"));
-            unsafe { std::env::remove_var("ROBRIX_AGENT_CMD") };
+            unsafe { std::env::set_var("ROBRIX_AGENT_CMD", "/fixture/octos acp") };
+            assert!(!any_configured());
+            assert!(list().is_empty());
+            assert!(matches!(super::super::blocker(), Some(super::super::Blocker::NoProvider)));
+            assert!(super::super::standalone_blocker().is_none(), "standalone command behavior is unchanged");
+            assert_eq!(super::super::runtime(&super::super::prefs::AgentPrefs::default()),
+                super::super::Runtime::Override("/fixture/octos acp".into()));
+        });
+    }
+
+    #[test]
+    fn a_worker_override_does_not_override_the_selected_model() {
+        with_temp_config(|| {
+            unsafe { std::env::set_var("ROBRIX_AGENT_CMD", "/fixture/octos acp") };
+            save_key("anthropic", "sk-ant-one").unwrap();
+            save_key("openai", "sk-two").unwrap();
+            for selected in ["anthropic", "openai"] {
+                set_active(selected).unwrap();
+                assert_eq!(in_use_id().as_deref(), Some(selected));
+                let rows = list();
+                assert!(!rows.iter().any(|row| row.external()));
+                assert_eq!(rows.iter().filter(|row| row.active).map(|row| row.id.as_str()).collect::<Vec<_>>(), vec![selected]);
+                assert!(any_configured());
+                assert!(super::super::blocker().is_none());
+            }
+            set_session("anthropic");
+            assert_eq!(in_use_id().as_deref(), Some("anthropic"));
+            assert_eq!(default_provider().as_deref(), Some("openai"));
+        });
+    }
+
+    #[test]
+    fn an_explicit_local_provider_is_available_without_a_probe() {
+        with_temp_config(|| {
+            set_active("ollama").unwrap();
+            assert_eq!(in_use_id().as_deref(), Some("ollama"));
+            let rows = list();
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].active);
+            assert_eq!(rows[0].source, KeySource::None);
         });
     }
 

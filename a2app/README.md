@@ -19,10 +19,10 @@ cargo run --features a2app
   picker of apps relevant to that context. Room apps run in the room's pane;
   space apps open in a modal attached to that space. A footer links to the
   main Mini Apps screen to see all apps or generate new ones.
-- A **create bar**: describe an app ("a pomodoro timer") and the embedded
+- A **create bar**: describe an app ("a pomodoro timer") and the
   agent writes it in the Splash dialect, validated with the real parser and
   auto-repaired for up to two turns. Generation uses the guarded model
-  transport described below; external ACP agents cannot receive its context.
+  transport described below in both the confined and embedded agent modes.
 - **Per-app isolation**: each app runs in its own Splash isolate with nothing
   by default: no filesystem beyond its private jail, no network, no host access.
   Capabilities are declared in the app's manifest, prompted at first use
@@ -84,8 +84,22 @@ shared DSL names.
 
 ## Agent setup (once)
 
-Robrix's AI rooms and app generation require `a2app-embedded-agent`; a separate
-octos CLI installation is not required. Configure an OpenAI-compatible or
+Robrix's AI rooms and app generation use a confined Octos process by default
+on macOS and supported Linux systems. Install the matching worker:
+
+```sh
+cargo install --git https://github.com/project-robius/octos --branch host-managed-ifc --locked octos-cli
+```
+
+Linux additionally requires bubblewrap, enabled user namespaces, and the
+kernel confinement facilities described in Octos's
+[`octos-sandbox` documentation](https://github.com/project-robius/octos/blob/host-managed-ifc/crates/octos-sandbox/HOST_MANAGED.md).
+Missing confinement support stops startup; it never falls back to an ordinary
+ACP process. Alternatively, `a2app-embedded-agent` links Octos into Robrix and
+needs no CLI installation. Use the embedded feature on iOS and platforms
+without a supported process sandbox.
+
+Configure an OpenAI-compatible or
 Anthropic provider through **AI Providers**, an existing Octos configuration,
 or that provider's supported environment/auth-store credentials. Supported
 provider IDs are `openai`, `anthropic`, `deepseek`, `moonshot`,
@@ -93,16 +107,18 @@ provider IDs are `openai`, `anthropic`, `deepseek`, `moonshot`,
 are refused. A local Ollama endpoint can use an already installed model
 without an API key.
 
-Run with `cargo run --features a2app-embedded-agent`, then use **Manage data
+Run with `cargo run --features a2app` (or `a2app-embedded-agent`), then use **Manage data
 sharing rules** to allow the configured model recipient for the sources the
 agent or generator needs. A local endpoint also needs explicit source consent;
 Robrix cannot guarantee that the service itself will not forward data.
 
-The standalone ACP client remains in `a2app/agent` for legacy integrations and
-tests. `ROBRIX_AGENT_CMD` overrides, including Claude Code or remote SSH ACP
-commands, are rejected by Robrix's guarded workflows because they cannot
-mediate each model request. Unset that override when using the embedded
-provider. Select its model in AI Providers or the Octos configuration.
+`ROBRIX_AGENT_CMD` can select a local compatible Octos executable (optionally
+followed by `acp`); Robrix still applies confinement and requires host-broker
+negotiation before sending a prompt. Shell commands, SSH workers and ordinary
+ACP adapters cannot provide this protected mode. Unset the override to use the
+embedded backend when compiled in. Select the model in AI Providers or the
+Octos configuration; the child receives no credentials or provider endpoint.
+The standalone ACP client remains available for legacy integrations and tests.
 
 ## Makepad pin
 
@@ -119,7 +135,7 @@ Keep the workspace dependency entries and lockfile aligned when updating it.
 
 | Feature | Effect |
 |---|---|
-| `a2app-embedded-agent` | Link the octos agent **in-process** with the guarded model transport required by Robrix's AI rooms and generation. Also avoids subprocess execution on iOS. |
+| `a2app-embedded-agent` | Link Octos **in-process**, using the same guarded model transport as the confined child. Also avoids subprocess execution on iOS. |
 | `a2app-persistent-guide` | Install the Splash dialect guide on the agent once, so per-turn prompts shrink to a pointer line. |
 | `a2app-research` | Legacy pipeline research support. Guarded Robrix generation disables research tools; this feature does not bypass that restriction. |
 
@@ -133,8 +149,10 @@ cards, and it survives restarts. The code lives in `src/a2app/ai/` (room
 creation + marker/cursor bookkeeping: `rooms.rs`), `src/a2app/runtime.rs`
 (session attach, message forwarding, reply posting) and
 `src/a2app/ai_room_events.rs` (event wire types + the timeline card). Unix-only:
-a session is an `a2app_agent::AgentTransport`, spawned per room with a
-session-scoped MCP tool server (`src/a2app/ai/server.rs` + `bridge.rs`).
+a session is an `a2app_agent::AgentTransport`, with a tool registry owned by
+Robrix for that room. Confined children access it directly through the ACP
+broker; the embedded backend uses the session-scoped MCP server
+(`src/a2app/ai/server.rs` + `bridge.rs`).
 
 ### How it works
 
@@ -158,7 +176,7 @@ session-scoped MCP tool server (`src/a2app/ai/server.rs` + `bridge.rs`).
 
 ### Tools the agent can call
 
-The session registers exactly these on its MCP server (`ai::tools::
+The session registers these in its host tool registry (`ai::tools::
 register_session_tools`), and every one is executed by Robrix. The
 gated ones map onto the mini-app capability catalog, so the first use prompts
 the user and the choice is shared with mini-apps. Message reads return full
@@ -196,9 +214,10 @@ mini-app “a pomodoro timer”`.
 
 **A mini-app can register its own tools at runtime.** With the `mcp-tools`
 permission, an app calls `host.request("mcp.tools.register", {name,
-description, args})`; Robrix installs a `MiniAppTool` on the room session's
-live MCP server and pushes `notifications/tools/list_changed`, so a client
-that honours that notification can refresh its list without a new session.
+description, args})`; Robrix installs a `MiniAppTool` in the room session's
+live registry. Confined Octos refreshes its tool definitions between turns,
+preserving conversation history. Embedded MCP connections receive
+`notifications/tools/list_changed` for clients that support it.
 When the model calls the tool, the runtime delivers
 `on_tool_call({call_id, tool, name, arguments})` into the own isolate; the app
 answers `host.request("mcp.tools.result", {call_id, ok, result})` and that
@@ -207,11 +226,11 @@ it timed out). Tools are namespaced `app_<id>_<name>` so an app can never
 shadow a built-in, and an instance's tools are withdrawn when it quits or its
 session stops.
 
-**The stable bridge is what makes registration work under octos.** octos's MCP
+**The stable bridge also supports embedded clients.** Octos's embedded MCP
 client discovers a server's tools once, at session start, and does not act on
 `notifications/tools/list_changed` (or re-list afterwards), so a tool added to
-the live server can never enter the model's toolset on its own. Every session
-therefore also advertises two tools that are present from the start:
+the live server cannot enter that client's toolset on its own. Every session
+also advertises two tools that are present from the start:
 `list_mini_app_tools` (the registered tools — id, name, description, args) and
 `call_mini_app_tool` (`{tool, arguments}`). The model lists with the first and
 calls through the second, and the runtime validates the id, applies the same
@@ -367,10 +386,15 @@ with controlled loopback peers. These tests do not replace live Matrix,
 provider or device end-to-end verification.
 
 **Cloud inference is also an external disclosure.** Protected room agents
-and generators require the embedded, host-controlled model transport.
+and generators use the host-controlled model transport in both agent modes.
 Each model request checks the current label, including tool feedback and
-compaction; subprocess ACP backends and provider fallback cannot receive a
-protected context. Model recipients identify the configured endpoint, model
+compaction. A confined Octos child requests completions and host tools over its
+ACP connection; direct network, private files, subprocess tools and persistent
+history are unavailable to it. Each connection belongs to one activation, and
+explicitly stopping a room agent retires that activation and its queued work.
+The next prompt starts a fresh session, preserving durable IFC labels.
+Unmediated ACP backends and provider fallback cannot receive a protected
+context. Model recipients identify the configured endpoint, model
 and a private credential fingerprint, so an allowance cannot silently move
 to a different service or account. A loopback endpoint still needs consent:
 the service may itself forward the data elsewhere.
@@ -411,7 +435,7 @@ The app side (all on one group, `mcp-tools`):
 ### Offline and keyless testing
 
 Existing mini-apps can run without a model or API key. For keyless AI testing,
-use the embedded feature with a running local OpenAI-compatible service and
+use either agent mode with a running local OpenAI-compatible service and
 an already installed model. For example, these fields in the selected Octos
 configuration use Ollama's compatible API:
 
@@ -444,6 +468,12 @@ live provider credentials.
 
 ### Notes for maintainers
 
+- `cargo test -p a2app-agent --lib` covers broker limits, cancellation,
+  protocol validation and guarded HTTP transport. Run it with `--features
+  embedded` to cover both backends. With a compatible Octos binary built,
+  `ROBRIX_TEST_OCTOS=/absolute/path/to/octos cargo test -p a2app-agent --lib
+  confined_octos_uses_parent_model_tools_and_cancellation -- --ignored`
+  exercises a real confined child with synthetic model and tool responses.
 - The `robrix --mcp-bridge` relay + tool server are exercised headlessly by
   `tests/mcp_transport.rs` (hand-written client) and `tests/mcp_rmcp.rs` (the
   real rmcp client octos uses). `mcp_rmcp` is the regression test for a

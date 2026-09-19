@@ -379,6 +379,18 @@ impl AiRoomInfo {
             start_failed_at: None,
         }
     }
+
+    /// Discard stopped work so a later activation cannot publish its snapshots.
+    fn discard_session_work(&mut self) {
+        self.posted_by_tool_this_turn = false;
+        self.pending_tool_calls.clear();
+        self.active_turn = None;
+        self.pending_ai_turns.clear();
+        self.ai_turn_in_flight = false;
+        self.anchor_in_flight = None;
+        self.status_busy = false;
+        self.status_queued = 0;
+    }
 }
 
 /// All a2app state, owned by the UI thread.
@@ -1745,7 +1757,6 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 let rooms = with_a2app(|state| state.ai_sessions.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
                 for room in rooms {
                     abort_ai_room_work(cx, ui, &room);
-                    stop_ai_session(&room);
                 }
             }
             refresh_permission_policy(cx, ui);
@@ -1805,8 +1816,6 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             #[cfg(unix)]
             {
                 abort_ai_room_work(cx, ui, &room_id);
-                refuse_room_prompts(cx, ui, &room_id);
-                stop_ai_session(&room_id);
             }
             refresh_permission_policy(cx, ui);
         }
@@ -3052,7 +3061,11 @@ fn refuse_parked_request(cx: &mut Cx, perm: Permission, parked: ParkedRequest) {
             // (with a receipt, so the user sees the AI was stopped from it —
             // and its live tool row rewritten Done).
             let reason = ai_tool_refused_text(perm);
-            note_ai_tool_call(&room_id, &ai_job_tool_name(&job), false, &reason);
+            // Teardown also withdraws prompts, but their receipts must not
+            // carry over into a replacement session's first reply.
+            if with_a2app(|state| state.ai_sessions.contains_key(&room_id)).unwrap_or(false) {
+                note_ai_tool_call(&room_id, &ai_job_tool_name(&job), false, &reason);
+            }
             answer_session_job(job, Err(reason));
         }
         #[cfg(unix)]
@@ -3849,8 +3862,6 @@ fn stop_private_contexts(cx: &mut Cx, ui: &WidgetRef) {
         let rooms = with_a2app(|state| state.ai_sessions.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
         for room in rooms {
             abort_ai_room_work(cx, ui, &room);
-            refuse_room_prompts(cx, ui, &room);
-            stop_ai_session(&room);
         }
     }
     let apps = with_a2app(|state| state.registry.iter().map(|m| m.id.clone()).collect::<Vec<_>>()).unwrap_or_default();
@@ -3875,8 +3886,6 @@ fn refresh_permission_policy(cx: &mut Cx, ui: &WidgetRef) {
             .cloned().collect::<Vec<_>>()).unwrap_or_default();
         for room in blocked {
             abort_ai_room_work(cx, ui, &room);
-            refuse_room_prompts(cx, ui, &room);
-            stop_ai_session(&room);
         }
     }
     ui.redraw(cx);
@@ -3972,7 +3981,7 @@ pub fn shutdown() {
     let had_work = with_a2app(|state| {
         let mut had = generation.is_some();
         for session in state.ai_sessions.values_mut() {
-            had |= session.abort();
+            had |= session.cancel_for_shutdown();
         }
         had
     })
@@ -4294,15 +4303,17 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
 /// Stops an AI room's session and resets what a restart needs (one-time
 /// grants, in-flight reads). Grants and restrictions — the user's durable
 /// answers — are kept. Mirrors what the death path does, minus the popups;
-/// used by the panel's power switch.
+/// used by the panel's power switch and explicit Stop. The next prompt starts
+/// a fresh activation with the same durable provenance.
 #[cfg(unix)]
 fn stop_ai_session(room_id: &OwnedRoomId) {
     cancel_ai_fetches(room_id);
-    if let Ok(context) = super::information_flow::agent_context(room_id.as_str()) {
-        let _ = a2app_core::information_flow::remove_context(&context);
-    }
+    // Drop the exact session before waking tool callers or processing more
+    // UI work. Its Drop retires only its captured account and activation;
+    // deriving a fresh context here could revoke an unrelated replacement.
+    let session = with_a2app(|state| state.ai_sessions.remove(room_id)).flatten();
+    drop(session);
     with_a2app(|state| {
-        state.ai_sessions.remove(room_id);
         state.ai_reads.retain(|_, (r, _, _)| r != room_id);
         state.ai_posts.retain(|_, (r, _)| r != room_id);
         state.ai_replies.retain(|_, (r, _, _, _)| r != room_id);
@@ -4327,11 +4338,11 @@ fn stop_ai_session(room_id: &OwnedRoomId) {
         // The turn died with the session: nothing of it may leak into the
         // next session's first reply.
         if let Some(info) = state.ai_rooms.get_mut(room_id) {
-            info.posted_by_tool_this_turn = false;
-            info.pending_tool_calls.clear();
+            info.discard_session_work();
         }
     });
-    close_active_turn(room_id);
+    // The timeline settles any card that is no longer the active turn. Do
+    // not queue a final snapshot that could outlive this retired activation.
 }
 
 /// The panel's power switch: on (re)attaches the agent, off stops it and the
@@ -4349,7 +4360,6 @@ fn set_ai_room_power(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, on: boo
     } else {
         log!("AI Rooms: powering off room {room_id}'s AI.");
         abort_ai_room_work(cx, ui, room_id);
-        stop_ai_session(room_id);
     }
     ui.redraw(cx);
 }
@@ -4704,13 +4714,7 @@ fn attach_ai_session(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, _name: 
     let prefs = with_a2app(|state| state.agent_prefs.clone())
         .unwrap_or_else(a2app_agent::prefs::load_agent_prefs);
     let started = with_a2app(|state| {
-        let started = super::information_flow::prepare_agent(room_id.as_str())
-            .and_then(|context| {
-                for reg in state.app_tools.values().filter(|reg| &reg.room_id == room_id) {
-                    transfer_app_tool_provenance(state, &reg.app_id, reg.heap_key, room_id)?;
-                }
-                AiSession::start(room_id.clone(), prefs, context)
-            }).map(|session| {
+        let started = start_ai_session(state, room_id, prefs).map(|session| {
             state.ai_sessions.insert(room_id.clone(), session);
         });
         if let Some(info) = state.ai_rooms.get_mut(room_id) {
@@ -4726,29 +4730,31 @@ fn attach_ai_session(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, _name: 
         );
     } else {
         log!("AI Rooms: started the agent session for AI room {room_id}.");
-        // Re-install app tools this room already had. Their descriptions were
-        // reviewed when first registered, so a session restart does not ask
-        // again; a tool whose isolate is gone is pruned by `sweep_app_tools`.
-        let restored = with_a2app(|state| {
-            let Some(session) = state.ai_sessions.get(room_id) else { return Ok(()) };
-            let tools: Vec<(String, String, serde_json::Value, String, usize)> = state
-                .app_tools
-                .values()
-                .filter(|reg| &reg.room_id == room_id)
-                .map(|reg| (reg.full_name.clone(), reg.description.clone(), reg.schema.clone(), reg.app_id.clone(), reg.heap_key))
-                .collect();
-            for (name, description, schema, app_id, heap_key) in tools {
-                transfer_app_tool_provenance(state, &app_id, heap_key, room_id)?;
-                session.register_miniapp_tool(name, description, schema)?;
-            }
-            Ok::<(), String>(())
-        });
-        if let Some(Err(error)) = restored {
-            stop_ai_session(room_id);
-            enqueue_popup_notification(format!("Couldn't restore this agent's protected app tools: {error}"), PopupKind::Error, Some(7.0));
-        }
     }
     ui.redraw(cx);
+}
+
+/// Restore reviewed tools and their current provenance on every fresh session,
+/// including the next member prompt after an explicit Stop.
+#[cfg(unix)]
+fn start_ai_session(state: &A2AppState, room_id: &OwnedRoomId, prefs: AgentPrefs) -> Result<AiSession, String> {
+    let context = super::information_flow::prepare_agent(room_id.as_str())?;
+    let epoch = a2app_core::information_flow::context_epoch(&context)?;
+    let result = (|| {
+        for reg in state.app_tools.values().filter(|reg| &reg.room_id == room_id) {
+            transfer_app_tool_provenance(state, &reg.app_id, reg.heap_key, room_id)?;
+        }
+        let session = AiSession::start(room_id.clone(), prefs, context.clone())?;
+        for reg in state.app_tools.values().filter(|reg| &reg.room_id == room_id) {
+            transfer_app_tool_provenance(state, &reg.app_id, reg.heap_key, room_id)?;
+            session.register_miniapp_tool(reg.full_name.clone(), reg.description.clone(), reg.schema.clone())?;
+        }
+        Ok(session)
+    })();
+    if result.is_err() {
+        let _ = a2app_core::information_flow::remove_context_for_activation(&context, epoch);
+    }
+    result
 }
 
 /// What `room_screen.rs` needs to scan an AI room's currently-loaded
@@ -4828,19 +4834,20 @@ pub fn ai_room_active_turn(_room_id: &OwnedRoomId) -> Option<String> {
     None
 }
 
-/// Aborts what an AI room's agent is currently doing, in the order that lets
-/// every piece settle: the app build its `launch_splash_app` tool call is
-/// waiting on is cancelled first (dropping the [`Generation`] kills its agent
-/// and resolves the waiting tool call, so the room's own session cannot stay
-/// parked on it), then the session itself is asked to abandon its turn and
-/// drop queued prompts. The session survives, idle, for the next message.
+/// Stops this room's agent activation and its pending work.
+///
+/// Retiring the session closes its tool queue and invalidates requests already
+/// sent to workers. A later prompt starts a fresh session; durable source
+/// labels remain. Effects already committed while allowed cannot be recalled.
 /// Only the room's own generation is touched — a build the Mini Apps screen
 /// (or another room) started keeps running.
 #[cfg(unix)]
 fn abort_ai_room_work(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
-    cancel_ai_fetches(room_id);
-    // Cancel the room's own generation first, if one is running. Exactly the
-    // Mini Apps screen's Stop, but scoped to this room's build.
+    // Retire before answering any parked tool: a still-running blocking
+    // caller must not enqueue a new UI job after we drain the old queue.
+    stop_ai_session(room_id);
+    // Cancel the room's own generation, if one is running. Exactly the Mini
+    // Apps screen's Stop, but scoped to this room's build.
     let cancels_generation = with_a2app(|state| {
         state.ai_generation_room.as_ref().is_some_and(|r| r == room_id)
             && state.generation.is_some()
@@ -4850,6 +4857,7 @@ fn abort_ai_room_work(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
         with_a2app(|state| {
             // Dropping the Generation kills its agent child process.
             state.generation = None;
+            state.generation_context = None;
             state.console.status = String::from("Cancelled.");
         });
         resolve_session_generation(
@@ -4859,20 +4867,9 @@ fn abort_ai_room_work(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
             Err(String::from("The generation was cancelled.")),
         );
     }
-    // Then abandon the session's turn (and drop anything queued behind it).
-    // A no-op when the session is idle or already gone.
-    with_a2app(|state| {
-        if let Some(session) = state.ai_sessions.get_mut(room_id) {
-            session.abort();
-        }
-    });
     // A prompt parked by the cancelled turn would run its tool call (post,
     // build, launch) whenever it was answered; withdraw it.
     refuse_room_prompts(cx, ui, room_id);
-    // Settle the turn card immediately: a cancelled turn emits no `Reply`, and
-    // if the turn is blocked on a tool/permission it may take a moment to end,
-    // so the room's card would otherwise sit "running" after the user aborts.
-    close_active_turn(room_id);
     ui.redraw(cx);
 }
 
@@ -4917,8 +4914,7 @@ pub fn forward_ai_room_texts(
     for (event_id, text) in new_texts {
         let outcome: Result<PromptOutcome, String> = with_a2app(|state| {
             if !state.ai_sessions.contains_key(room_id) {
-                let started = super::information_flow::prepare_agent(room_id.as_str())
-                    .and_then(|context| AiSession::start(room_id.clone(), prefs.clone(), context));
+                let started = start_ai_session(state, room_id, prefs.clone());
                 if let Some(info) = state.ai_rooms.get_mut(room_id) {
                     info.start_failed_at = started.is_err().then(Instant::now);
                 }
@@ -7163,6 +7159,36 @@ mod permission_tests {
         reopened.inherit_requester(&mut replacement);
         assert!(reopened.close_after.is_none());
         assert_eq!(replacement.close_after, Some(key));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopped_session_discards_pending_turn_data_but_keeps_room_enabled() {
+        let cursor: OwnedEventId = "$handled:example.org".try_into().unwrap();
+        let mut info = AiRoomInfo::new(Some(cursor.clone()));
+        info.posted_by_tool_this_turn = true;
+        info.status_busy = true;
+        info.status_queued = 3;
+        info.ai_turn_in_flight = true;
+        info.anchor_in_flight = Some("old-turn".into());
+        info.active_turn = Some(ActiveTurn {
+            key: "old-turn".into(), tool_calls: Vec::new(), thinking: true, seq: 1, created_at: 1,
+        });
+        info.pending_tool_calls.push(AiReplyToolCall {
+            name: "post_room_message".into(), detail: Some("old private target".into()), ok: false, summary: "waiting".into(),
+        });
+        info.pending_ai_turns.push_back(("old-turn".into(), AiTurnContent {
+            v: 1, turn: "old-turn".into(), first: Some(true), status: AiTurnStatus::Running,
+            seq: 1, thinking: true, tool_calls: Vec::new(), created_at: 1,
+        }));
+        info.discard_session_work();
+        assert!(info.active_turn.is_none(), "the timeline must settle the old card locally");
+        assert!(info.pending_ai_turns.is_empty(), "a new activation cannot publish old snapshots");
+        assert!(info.pending_tool_calls.is_empty());
+        assert!(!info.ai_turn_in_flight && info.anchor_in_flight.is_none());
+        assert!(!info.posted_by_tool_this_turn && !info.status_busy && info.status_queued == 0);
+        assert!(info.session_on, "the next member prompt may start a fresh session");
+        assert_eq!(info.cursor, Some(cursor), "already forwarded messages must not be replayed");
     }
 
     #[cfg(unix)]
