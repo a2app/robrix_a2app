@@ -33,6 +33,7 @@ pub mod permissions;
 pub mod information_flow;
 /// Bounded, local metadata about protection decisions and actual request outcomes.
 pub mod protection_audit;
+pub mod background;
 /// The tagged catalog of every ability, layered over the permission groups.
 pub mod capabilities;
 /// Built-in sample apps.

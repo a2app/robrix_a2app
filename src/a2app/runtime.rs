@@ -592,6 +592,11 @@ pub fn init() {
     a2app_core::permissions::publish_snapshot(permissions.snapshot(&registry));
     crate::a2app::matrix::publish_permission_policy(&permissions);
 
+    initialize_state(registry, permissions, persisted, a2app_agent::prefs::load_agent_prefs());
+    super::background::init();
+}
+
+fn initialize_state(registry: AppRegistry, permissions: PermissionStore, persisted: A2AppPersistedState, agent_prefs: a2app_agent::prefs::AgentPrefs) {
     A2APP.with(|state| {
         *state.borrow_mut() = Some(A2AppState {
             registry,
@@ -608,7 +613,7 @@ pub fn init() {
             generation_epoch: None,
             console: GenConsole::default(),
             failed_request: None,
-            agent_prefs: a2app_agent::prefs::load_agent_prefs(),
+            agent_prefs,
             create_room: None,
             foreground_app: None,
             room_action: None,
@@ -654,6 +659,14 @@ pub fn init() {
     });
 }
 
+#[cfg(test)]
+pub(super) fn initialize_background_test(manifest: MiniAppManifest) {
+    initialize_state(AppRegistry::new(vec![manifest]), PermissionStore::default(), A2AppPersistedState::default(), Default::default());
+}
+
+#[cfg(test)]
+pub(super) fn process_background_test_broker(cx: &mut Cx) { process_broker(cx, &WidgetRef::empty()); }
+
 /// Operations that a2app widgets request; applied centrally in [`process`].
 #[derive(Clone, Debug)]
 pub enum A2AppOp {
@@ -667,6 +680,10 @@ pub enum A2AppOp {
     ForceStop(MiniAppId),
     Uninstall(MiniAppId),
     ClearData(MiniAppId),
+    SaveBackgroundTask { binding: a2app_core::background::JobBinding, trigger: a2app_core::background::Trigger, expected_fingerprint: String },
+    SetBackgroundTaskEnabled { id: u64, enabled: bool, expected_fingerprint: String },
+    RunBackgroundTask(u64),
+    RemoveBackgroundTask(u64),
     Export(MiniAppId),
     ImportText(String),
     ImportRoomBundle { text: String, room_id: Option<OwnedRoomId> },
@@ -778,6 +795,7 @@ pub enum A2AppRuntimeAction {
 struct HostNetworkResult {
     reply: Reply,
     context: a2app_core::information_flow::ContextId,
+    flow_epoch: u64,
     result: Result<String, String>,
 }
 
@@ -883,6 +901,11 @@ pub fn take_room_action(cx: &mut Cx, room_id: &RoomId) -> Option<RoomAction> {
 /// `App::handle_event` on every event; cheap early-outs keep it off the
 /// hot path for events it doesn't care about.
 pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
+    match event {
+        Event::Background | Event::Pause | Event::Shutdown => { super::background::lifecycle(cx, false); return; }
+        Event::Foreground | Event::Resume => { super::background::lifecycle(cx, true); super::background::process(cx, &Event::Signal); return; }
+        _ => {}
+    }
     let expired = with_a2app(|state| state.room_action.take_if(|pending| pending.since.elapsed() > ROOM_ACTION_TTL)).flatten();
     if let Some(pending) = expired { pending.close_requester(cx); }
     if let Event::NetworkResponses(e) = event {
@@ -914,12 +937,18 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     if let Event::Actions(actions) = event {
         for action in actions {
             if matches!(action.downcast_ref(), Some(crate::logout::logout_confirm_modal::LogoutAction::ClearAppState { .. })) {
+                super::background::suspend(cx, true);
+                super::room_watch::stop_all();
+                with_a2app(|state| state.watched_rooms.clear());
                 let _ = a2app_core::information_flow::end_session();
                 stop_private_contexts(cx, ui);
                 matrix::spaces::stop_policy_space_watch();
                 invalidate_policy_spaces(cx);
             }
             if matches!(action.downcast_ref(), Some(crate::login::login_screen::LoginAction::LoginSuccess)) {
+                super::background::suspend(cx, false);
+                super::room_watch::stop_all();
+                with_a2app(|state| state.watched_rooms.clear());
                 let _ = a2app_core::information_flow::end_session();
                 stop_private_contexts(cx, ui);
                 matrix::spaces::stop_policy_space_watch();
@@ -952,7 +981,7 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
                 continue;
             }
             if let Some(watch_event) = action.downcast_ref::<A2AppRoomWatchEvent>() {
-                watch_events.push(watch_event.clone());
+                if watch_event.is_current() { watch_events.push(watch_event.clone()); }
                 continue;
             }
             if let Some(watch_event) = action.downcast_ref::<A2AppAccountWatchEvent>() {
@@ -1074,12 +1103,12 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
         }
     }
     for response in network_results {
-        let result = response.result.and_then(|data| {
-            let current = super::information_flow::context_for_heap(response.reply.heap_key)?;
-            if current != response.context { return Err("The requesting instance changed.".into()); }
-            Ok(data)
-        });
-        services::respond(cx, response.reply, result.as_deref().map_err(String::as_str));
+        // A stopped worker's heap address may be reused. Never answer even an
+        // error into a replacement activation's unrelated callback.
+        if a2app_core::information_flow::ensure_context_epoch(&response.context, response.flow_epoch).is_err()
+            || super::information_flow::context_for_heap(response.reply.heap_key).as_ref() != Ok(&response.context)
+        { continue; }
+        services::respond(cx, response.reply, response.result.as_deref().map_err(String::as_str));
     }
     if any_results {
         // A callback's ui.X.render() output only commits on the NEXT event
@@ -1153,7 +1182,10 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
 
     // An action the user took that was refused or failed gets a popup that
     // says why, on top of the script's own error handling.
-    for (app_id, error) in with_a2app(|state| state.broker.failures()).unwrap_or_default() {
+    for failure in with_a2app(|state| state.broker.failures()).unwrap_or_default() {
+        super::background::record_failure(failure.heap_key, &failure.error);
+        if !failure.show_popup { continue; }
+        let services::ServiceFailure { app_id, error, .. } = failure;
         let name = with_a2app(|state| state.registry.get(&app_id).map(|a| a.name.clone()))
             .flatten()
             .unwrap_or(app_id);
@@ -1168,7 +1200,9 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
         }
         enqueue_popup_notification(text, PopupKind::Warning, Some(15.0));
     }
+    super::background::finish_failure_drain();
     expire_timed_grants(cx, ui);
+    super::background::process(cx, event);
     persist_if_dirty();
 }
 
@@ -1177,7 +1211,7 @@ fn host_pane(cx: &mut Cx, ui: &WidgetRef) -> crate::a2app::host_pane::MiniAppHos
 }
 
 /// One-time grants die with the app's last isolate.
-fn app_stopped(cx: &mut Cx, app_id: &str) {
+pub(super) fn app_stopped(cx: &mut Cx, app_id: &str) {
     prune_hook_subs();
     if instances::is_running(app_id) {
         return;
@@ -1204,9 +1238,18 @@ pub fn remember_layout(tag: &str, layout: PaneLayout) {
     });
 }
 
+/// Invalidate queued watch events when the OS suspends the app.
+pub(super) fn stop_background_watches() {
+    super::room_watch::stop_all();
+    with_a2app(|state| state.watched_rooms.clear());
+}
+
+pub(super) fn refresh_background_watches() { prune_hook_subs(); }
+
 /// Forgets subscriptions whose isolate is gone or whose grant was pulled,
 /// and starts or stops the worker's watches to match what's left.
 fn prune_hook_subs() {
+    let background_rooms = super::background::watched_rooms();
     with_a2app(|state| {
         let A2AppState { hook_subs, registry, permissions, watched_rooms, account_watched, .. } = state;
         hook_subs.retain(|heap, sub| {
@@ -1229,7 +1272,7 @@ fn prune_hook_subs() {
             });
             !sub.hooks.is_empty()
         });
-        let wanted: HashSet<OwnedRoomId> = hook_subs.values().filter_map(|s| s.room_id.clone()).collect();
+        let wanted: HashSet<OwnedRoomId> = hook_subs.values().filter_map(|s| s.room_id.clone()).chain(background_rooms).collect();
         for room_id in watched_rooms.difference(&wanted) {
             submit_async_request(MatrixRequest::A2App(A2AppMatrixRequest::UnwatchRoom { room_id: room_id.clone() }));
         }
@@ -1263,6 +1306,7 @@ fn deliver_room_hooks(
     let mut latest: HashMap<(Option<OwnedRoomId>, &'static str), serde_json::Value> = HashMap::new();
     let mut closed: Vec<OwnedRoomId> = Vec::new();
     for event in events {
+        if !event.is_current() { continue; }
         let room_id = event.room_id;
         match event.kind {
             RoomWatchKind::Message { event_id, sender, sender_name, body, msgtype, ts, is_own } => {
@@ -1382,11 +1426,13 @@ fn deliver_room_hooks(
     let subs: Vec<(usize, String, Option<OwnedRoomId>, HashSet<&'static str>)> = with_a2app(|state| {
         state.hook_subs.iter().map(|(heap, s)| (*heap, s.app_id.clone(), s.room_id.clone(), s.hooks.clone())).collect()
     }).unwrap_or_default();
+    for (room, batch) in &messages { super::background::room_messages(cx, room, batch); }
     let mut delivered = false;
     for (heap, app_id, room_id, hooks) in subs {
         if let Some(room_id) = &room_id {
             if !room_policy_allows(room_id.as_str(), RoomAccess::Read) { continue; }
             if hooks.contains("on_room_message")
+                && !super::background::handles_messages(heap)
                 && let Some(batch) = messages.get(room_id)
             {
                 let payload = serde_json::Value::Array(batch.clone()).to_string();
@@ -1537,7 +1583,7 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             }
             let key = (app_id.clone(), None);
             host_pane(cx, ui).drop_app(cx, &app_id);
-            instances::quit(cx, &key);
+            if instances::terminate(cx, &key) { app_stopped(cx, &app_id); }
             let grants = grants_in_room(&app_id, None);
             let seed = saved_layout(&instances::tag_of(&key));
             if instances::ensure_public(cx, &manifest, &grants, seed).is_none() { return; }
@@ -1558,7 +1604,28 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             ui.modal(cx, ids!(mini_app_host_modal)).close(cx);
             ui.redraw(cx);
         }
+        A2AppOp::SaveBackgroundTask { binding, trigger, expected_fingerprint } => {
+            if let Err(error) = super::background::save(cx, binding, trigger, expected_fingerprint) {
+                enqueue_popup_notification(error, PopupKind::Error, Some(8.0));
+            }
+            ui.redraw(cx);
+        }
+        A2AppOp::SetBackgroundTaskEnabled { id, enabled, expected_fingerprint } => {
+            if let Err(error) = super::background::set_enabled(cx, id, enabled, expected_fingerprint) {
+                enqueue_popup_notification(error, PopupKind::Error, Some(8.0));
+            }
+            ui.redraw(cx);
+        }
+        A2AppOp::RunBackgroundTask(id) => {
+            if let Err(error) = super::background::run_now(cx, id) { enqueue_popup_notification(error, PopupKind::Error, Some(8.0)); }
+            ui.redraw(cx);
+        }
+        A2AppOp::RemoveBackgroundTask(id) => {
+            if let Err(error) = super::background::remove(cx, id) { enqueue_popup_notification(error, PopupKind::Error, Some(8.0)); }
+            ui.redraw(cx);
+        }
         A2AppOp::ForceStop(app_id) => {
+            super::background::disable_app(cx, &app_id);
             stop_app_everywhere(cx, ui, &app_id);
             let was_foreground = with_a2app(|state| {
                 // One-time grants die with the isolate.
@@ -1573,6 +1640,7 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             ui.redraw(cx);
         }
         A2AppOp::Uninstall(app_id) => {
+            super::background::disable_app(cx, &app_id);
             let Some(Some(manifest)) = with_a2app(|state| state.registry.get(&app_id).cloned()) else { return };
             if manifest.builtin {
                 enqueue_popup_notification("Built-in mini-apps can't be uninstalled.", PopupKind::Warning, Some(4.0));
@@ -1897,6 +1965,7 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             ui.redraw(cx);
         }
         A2AppOp::RoomClosed(room_id) => {
+            super::background::room_closed(cx, room_id.as_str());
             if let Ok(account) = super::information_flow::account() {
                 if let Err(error) = a2app_core::information_flow::close_room_session(&account, room_id.as_str()) {
                     enqueue_popup_notification(error, PopupKind::Error, Some(6.0));
@@ -2343,7 +2412,7 @@ fn compartment_storage_path(heap: usize) -> Result<PathBuf, String> {
 fn process_broker(cx: &mut Cx, ui: &WidgetRef) {
     let asks = with_a2app(|state| {
         let A2AppState { broker, registry, permissions, foreground_app, .. } = state;
-        let is_docked = |app_id: &str| instances::is_docked(app_id);
+        let is_docked = |app_id: &str| instances::is_foreground(app_id);
         let desktop_view = effective_is_desktop(cx);
         let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
         let room_name = |id: &str| room_display_name(rooms.as_ref()?, id);
@@ -2419,13 +2488,16 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
         }
         BrokerAsk::Network { reply, app_id, room, args, consent } => {
             let prepared = super::information_flow::context_for_heap(reply.heap_key)
-                .and_then(|context| super::network::Request::parse(&args).map(|request| (context, request)));
+                .and_then(|context| {
+                    let epoch = a2app_core::information_flow::context_epoch(&context)?;
+                    super::network::Request::parse(&args).map(|request| (context, epoch, request))
+                });
             let lifetime = instances::lifetime_of_heap(reply.heap_key);
             if lifetime.is_none() { return services::respond(cx, reply, Err("The requesting app stopped.")); }
             match prepared {
-                Ok((context, request)) => crate::sliding_sync::spawn_async_task(async move {
+                Ok((context, flow_epoch, request)) => crate::sliding_sync::spawn_async_task(async move {
                     let result = super::network::run(request, context.clone(), app_id, room, *consent, lifetime).await;
-                    Cx::post_action(HostNetworkResult { reply, context, result });
+                    Cx::post_action(HostNetworkResult { reply, context, flow_epoch, result });
                 }),
                 Err(error) => services::respond(cx, reply, Err(&error)),
             }
@@ -2444,6 +2516,11 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
                     services::respond(cx, reply, Err(e));
                 }
             }
+        }
+        BrokerAsk::BackgroundComplete { reply, run_id, success } => {
+            let result = super::background::complete(cx, reply.heap_key, run_id, success);
+            services::respond(cx, reply, result.as_ref().map(|_| "{}").map_err(String::as_str));
+            if result.is_ok() { super::background::retire_completed(cx, reply.heap_key); }
         }
         BrokerAsk::Subscribe { reply, app_id, heap_key, room, hook } => {
             let Ok(room_id) = room.as_deref().map(OwnedRoomId::try_from).transpose() else {
@@ -3688,7 +3765,7 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
                     if let Some(request) = request {
                         let asks = with_a2app(|state| {
                             let A2AppState { broker, registry, permissions, foreground_app, .. } = state;
-                            let is_docked = |app_id: &str| instances::is_docked(app_id);
+                            let is_docked = |app_id: &str| instances::is_foreground(app_id);
                             let desktop_view = effective_is_desktop(cx);
                             let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
                             let room_name = |id: &str| room_display_name(rooms.as_ref()?, id);
@@ -4012,6 +4089,7 @@ fn refresh_permission_policy(cx: &mut Cx, ui: &WidgetRef) {
 
 /// Republishes the grant snapshot that isolate-creation sites read.
 fn publish_grants(_cx: &mut Cx) {
+    super::background::changed();
     with_a2app(|state| {
         let roots = state.permissions.configured_space_ids();
         if roots != state.policy_space_roots {

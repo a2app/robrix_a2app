@@ -1,0 +1,131 @@
+// name: Website Watch
+// icon: 🌐
+// tint: #2A7F92
+// description: Check a website for a keyword on a saved schedule, then notify you or post to this room.
+// background: true
+// permissions: network, notifications, matrix-room-send
+// why-network: Fetches the URL you save when your background task runs.
+// why-notifications: Shows a popup when the keyword first appears.
+// why-matrix-room-send: Optionally reports a match to this task's attached room.
+
+let config = {url: "https://example.com/", keyword: "Example Domain", post: false}
+let matched = false
+let draft_post = false
+let busy = false
+let initialized = false
+let status = "Ready. Configure and run this app from Background tasks."
+
+fn show_status(text){
+    status = text
+    if initialized { ui.status.set_text(text) }
+}
+
+fn load(){
+    if fs.exists("/website_watch.json") {
+        let saved = fs.read("/website_watch.json").parse_json()
+        if saved.is_object() {
+            if saved.url.is_string() && saved.keyword.is_string() && (saved.post == true || saved.post == false) {
+                config = saved
+            }
+        }
+    }
+    if fs.exists("/website_match.json") {
+        matched = (fs.read("/website_match.json") == "true")
+    }
+}
+
+fn toggle_post(){
+    if busy { return nil }
+    draft_post = !draft_post
+    ui.post_button.set_text(if draft_post { "Report: room message" } else { "Report: Robrix popup" })
+}
+
+fn save(){
+    if busy { show_status("Wait for the current check to finish before changing it.") return nil }
+    let url = ui.url_input.text().trim()
+    let keyword = ui.keyword_input.text().trim()
+    if url == "" || keyword == "" || url.len() > 2048 || keyword.len() > 200 {
+        show_status("Enter an HTTP(S) URL up to 2048 characters and a keyword up to 200 characters.")
+        return nil
+    }
+    config = {url: url, keyword: keyword, post: draft_post}
+    fs.write("/website_watch.json", config.to_json())
+    matched = false
+    fs.write("/website_match.json", "false")
+    show_status("Saved. In Mini Apps > Background tasks, add this app in this same room and choose every 12 hours.")
+}
+
+fn finish(run, success, text){
+    busy = false
+    show_status(text)
+    host.request("background.complete", {run_id: run, success: success})
+}
+
+fn on_background(json){
+    let run = json.parse_json().run_id
+    if busy { finish(run, false, "A website check is already running.") return nil }
+    busy = true
+    show_status("Checking the saved website…")
+    host.request("network.http", {url: config.url, method: "GET"}, fn(r){
+        if !r.is_ok { finish(run, false, r.error) return nil }
+        if r.data.status < 200 || r.data.status >= 300 {
+            finish(run, false, "The website returned HTTP " + r.data.status)
+            return nil
+        }
+        if r.data.body.len() > 65536 {
+            finish(run, false, "The response exceeds this example's 64 KiB text limit. Use a smaller page or feed.")
+            return nil
+        }
+        let found = r.data.body.split(config.keyword).len() > 1
+        if !found {
+            matched = false
+            fs.write("/website_match.json", "false")
+            finish(run, true, "Keyword is absent. The next new match will be reported.")
+            return nil
+        }
+        if matched { finish(run, true, "Keyword is still present; already reported.") return nil }
+        let message = "Website Watch found '" + config.keyword + "' at " + config.url
+        if config.post {
+            host.request("matrix.send_message", {body: message}, fn(out){
+                if !out.is_ok { finish(run, false, out.error) return nil }
+                matched = true
+                fs.write("/website_match.json", "true")
+                finish(run, true, "Match posted to this room.")
+            })
+        } else {
+            host.request("notify.post", {body: message}, fn(out){
+                if !out.is_ok { finish(run, false, out.error) return nil }
+                matched = true
+                fs.write("/website_match.json", "true")
+                finish(run, true, "Match reported in a Robrix popup.")
+            })
+        }
+    })
+}
+
+fn on_app_resize(width, height){
+    if initialized { return nil }
+    initialized = true
+    ui.status.set_text(status)
+    ui.url_input.set_text(config.url)
+    ui.keyword_input.set_text(config.keyword)
+    draft_post = config.post
+    ui.post_button.set_text(if draft_post { "Report: room message" } else { "Report: Robrix popup" })
+}
+
+let _load = load()
+
+View{
+    width: Fill height: Fill flow: Down
+    ScrollYView{
+        width: Fill height: Fill flow: Down spacing: 12 padding: 16
+        Label{text: "Website Watch" width: Fill draw_text +: {color: #x1C274C text_style: theme.font_bold{font_size: 20}}}
+        Label{text: "Configure this room's watcher here, then enable it in Mini Apps > Background tasks. Try an interval of 12 hours. Matching is literal and case-sensitive; it reports only when a keyword changes from absent to present." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 12}}}
+        url_input := TextInput{width: Fill empty_text: "https://example.com/"}
+        keyword_input := TextInput{width: Fill empty_text: "Keyword or phrase"}
+        post_button := Button{text: "Report: Robrix popup" on_click: || toggle_post()}
+        Button{text: "Save configuration" on_click: || save()}
+        status := Label{text: "Default: example.com, keyword Example Domain, popup. Run now from Background tasks to test permissions." width: Fill draw_text +: {color: #x2A7F92 text_style: theme.font_regular{font_size: 12}}}
+        Label{text: "Internet access can share this instance's room data with the website. Review internet and data-sharing permissions first. For room posting, keep this app open, Run now, review the current blocked action, then retry. Action approvals do not survive a stopped worker. Use popups for unattended checks. Saving settings does not grant permissions. Robrix must be running for checks and popups." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
+    }
+}

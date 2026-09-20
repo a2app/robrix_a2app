@@ -9,7 +9,12 @@ use a2app_core::information_flow::{self as flow, ContextId, Label, Recipient, So
 use a2app_core::services;
 use makepad_widgets::splash_host::SplashHostRequest;
 
+#[cfg(test)]
+thread_local! { pub(super) static TEST_ACCOUNT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) }; }
+
 pub fn account() -> Result<String, String> {
+    #[cfg(test)]
+    if let Some(account) = TEST_ACCOUNT.with(|account| account.borrow().clone()) { return Ok(account); }
     crate::sliding_sync::get_client().and_then(|client| client.user_id().map(ToString::to_string))
         .ok_or_else(|| "Sign in before running mini-apps or agents.".into())
 }

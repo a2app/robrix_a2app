@@ -28,7 +28,9 @@ pub mod instances;
 pub mod information_flow;
 pub mod data_sharing;
 pub mod protection_inspector;
+pub mod background_tasks;
 pub mod network;
+pub mod background;
 /// The Mini Apps management screen (a top-level navigation tab page).
 pub mod mini_apps_screen;
 /// Selects an installed mini-app for a particular room or space.
@@ -54,6 +56,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
     permission_prompt::script_mod(vm);
     data_sharing::script_mod(vm);
     protection_inspector::script_mod(vm);
+    background_tasks::script_mod(vm);
     ai_room_events::script_mod(vm);
     ai_room_panel::script_mod(vm);
     host_pane::script_mod(vm);

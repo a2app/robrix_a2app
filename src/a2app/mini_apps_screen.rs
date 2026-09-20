@@ -18,6 +18,7 @@ use a2app_core::permissions::{Effective, GrantState, Permission, RoomScope, Room
 use crate::a2app::permission_prompt::{PermissionScopeEditorWidgetExt, duration_label, network_scope_label};
 use crate::a2app::data_sharing::DataSharingWidgetExt;
 use crate::a2app::protection_inspector::{ProtectionInspectorAction, ProtectionInspectorWidgetExt};
+use crate::a2app::background_tasks::{BackgroundTasksAction, BackgroundTasksWidgetExt};
 use a2app_core::persistence;
 use a2app_core::versions::AppVersion;
 
@@ -459,6 +460,11 @@ script_mod! {
                     padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
                     text: "Manage data sharing rules"
                 }
+            }
+
+            background_tasks_button := RobrixNeutralIconButton {
+                padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                text: "Background tasks"
             }
 
             create_section := RoundedView {
@@ -978,6 +984,19 @@ script_mod! {
                 width: Fill, height: Fit, flow: Down, spacing: 5
                 access_rule := mod.widgets.MiniAppAccessRuleRow {}
             }
+        }
+
+        background_pane := View {
+            visible: false
+            width: Fill, height: Fill, flow: Down
+            View {
+                width: Fill, height: Fit, flow: Right, spacing: 10, padding: 15
+                background_back := RobrixNeutralIconButton {
+                    padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Back"
+                }
+                TitleLabel { width: Fill, text: "Background tasks" }
+            }
+            background_tasks := mod.widgets.BackgroundTasks {}
         }
 
         inspector_pane := View {
@@ -1588,6 +1607,7 @@ enum Pane {
     Access,
     Sharing,
     Inspector,
+    Background,
 }
 
 #[derive(Script, ScriptHook, Widget)]
@@ -1653,6 +1673,13 @@ impl Widget for MiniAppsScreen {
         if self.view.button(cx, ids!(inspector_back)).clicked(actions) {
             self.set_pane(cx, Pane::List);
         }
+        if self.view.button(cx, ids!(background_tasks_button)).clicked(actions) {
+            self.view.background_tasks(cx, ids!(background_tasks)).configure(cx);
+            self.set_pane(cx, Pane::Background);
+        }
+        if self.view.button(cx, ids!(background_back)).clicked(actions) {
+            self.set_pane(cx, Pane::List);
+        }
         if self.view.button(cx, ids!(sharing_button)).clicked(actions) {
             self.view.data_sharing(cx, ids!(sharing_editor)).configure(cx);
             self.set_pane(cx, Pane::Sharing);
@@ -1682,6 +1709,26 @@ impl Widget for MiniAppsScreen {
         }
 
         for action in actions {
+            if let Some(action) = action.downcast_ref::<BackgroundTasksAction>() {
+                match action {
+                    BackgroundTasksAction::OpenApp(binding) => {
+                        if crate::a2app::information_flow::account().ok().as_deref() != Some(binding.account.as_str()) {
+                            enqueue_popup_notification("The signed-in account changed. Reopen Background tasks before opening this app.", PopupKind::Warning, Some(5.0));
+                            continue;
+                        }
+                        match background_app_open_action(binding) {
+                            Ok(action) => cx.action(action),
+                            Err(error) => enqueue_popup_notification(error, PopupKind::Warning, Some(5.0)),
+                        }
+                    }
+                    BackgroundTasksAction::AppPermissions(app) => self.show_info(cx, app.clone()),
+                    BackgroundTasksAction::Sharing => {
+                        self.view.data_sharing(cx, ids!(sharing_editor)).configure(cx);
+                        self.set_pane(cx, Pane::Sharing);
+                    }
+                }
+                continue;
+            }
             if let Some(action) = action.downcast_ref::<ProtectionInspectorAction>() {
                 match action {
                     ProtectionInspectorAction::Global => self.set_pane(cx, Pane::List),
@@ -2035,6 +2082,7 @@ impl MiniAppsScreen {
         self.view.widget(cx, ids!(access_pane)).set_visible(cx, show(Pane::Access));
         self.view.widget(cx, ids!(sharing_pane)).set_visible(cx, show(Pane::Sharing));
         self.view.widget(cx, ids!(inspector_pane)).set_visible(cx, show(Pane::Inspector));
+        self.view.widget(cx, ids!(background_pane)).set_visible(cx, show(Pane::Background));
         self.view.redraw(cx);
     }
 
@@ -2327,7 +2375,7 @@ impl MiniAppsScreen {
                     self.view.label(cx, ids!(access_baseline)).set_text(cx, baseline);
                 }
             }
-            Pane::Source | Pane::Diff | Pane::Edit | Pane::Sharing | Pane::Inspector => {}
+            Pane::Source | Pane::Diff | Pane::Edit | Pane::Sharing | Pane::Inspector | Pane::Background => {}
         }
     }
 
@@ -2448,7 +2496,7 @@ impl MiniAppsScreen {
                     draw_row(cx, list, &p.id, &p.label, &p.detail(), true, p.active, p.editable());
                 }
             }
-            Pane::Source | Pane::Diff | Pane::Edit | Pane::Sharing | Pane::Inspector => {}
+            Pane::Source | Pane::Diff | Pane::Edit | Pane::Sharing | Pane::Inspector | Pane::Background => {}
         }
     }
 
@@ -2901,9 +2949,60 @@ impl MiniAppsScreen {
     }
 }
 
+fn background_app_open_action(binding: &a2app_core::background::JobBinding) -> Result<A2AppOp, String> {
+    use a2app_core::background::JobContext;
+    let room_id = binding.context.room_id().map(|room| OwnedRoomId::try_from(room)
+        .map_err(|_| "The task's room or space identity is invalid.".to_string())).transpose()?;
+    match (&binding.context, room_id) {
+        (JobContext::Room { .. }, Some(room_id)) => Ok(A2AppOp::OpenInRoom { app_id: binding.app_id.clone(), room_id }),
+        (_, room_id) => Ok(A2AppOp::OpenApp { app_id: binding.app_id.clone(), room_id, in_room_pane: false }),
+    }
+}
+
 #[cfg(test)]
 mod access_tests {
     use super::*;
+
+    #[test]
+    fn background_task_configuration_opens_the_exact_context_and_preserves_room_review_surface() {
+        use a2app_core::background::{JobBinding, JobContext};
+        let mut binding = JobBinding { account: "@alice:example.org".into(), app_id: "reminder".into(), context: JobContext::Room { room_id: "!room:example.org".into() } };
+        assert!(matches!(background_app_open_action(&binding).unwrap(), A2AppOp::OpenInRoom { app_id, room_id }
+            if app_id == "reminder" && room_id.as_str() == "!room:example.org"));
+        binding.context = JobContext::Space { space_id: "!space:example.org".into() };
+        assert!(matches!(background_app_open_action(&binding).unwrap(), A2AppOp::OpenApp { app_id, room_id: Some(room_id), in_room_pane: false }
+            if app_id == "reminder" && room_id.as_str() == "!space:example.org"));
+        binding.context = JobContext::Account;
+        assert!(matches!(background_app_open_action(&binding).unwrap(), A2AppOp::OpenApp { room_id: None, in_room_pane: false, .. }));
+        binding.context = JobContext::Room { room_id: "invalid".into() };
+        assert!(background_app_open_action(&binding).is_err(), "an invalid target must not fall back to the account context");
+    }
+
+    #[test]
+    fn background_tasks_open_from_main_screen_and_return_without_activation() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
+        let uid = screen.view.button(&cx, ids!(background_tasks_button)).widget_uid();
+        let click = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+        let emitted = cx.capture_actions(|cx| screen.handle_event(cx, &Event::Actions(click), &mut Scope::empty()));
+        assert!(screen.view.widget(&cx, ids!(background_pane)).visible());
+        assert!(!screen.view.widget(&cx, ids!(list_pane)).visible());
+        assert!(screen.view.background_tasks(&cx, ids!(background_tasks)).borrow().is_some());
+        assert!(!emitted.iter().any(|action| matches!(action.downcast_ref::<A2AppOp>(), Some(A2AppOp::SaveBackgroundTask { .. }))));
+        let uid = screen.view.button(&cx, ids!(background_back)).widget_uid();
+        let click = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+        screen.handle_event(&mut cx, &Event::Actions(click), &mut Scope::empty());
+        assert!(screen.view.widget(&cx, ids!(list_pane)).visible());
+        assert!(!screen.view.widget(&cx, ids!(background_pane)).visible());
+    }
 
     #[test]
     fn miniapp_network_settings_require_a_destination_scope() {

@@ -17,7 +17,7 @@ pub mod matrix;
 pub use matrix::{MatrixServiceCall, SearchScope};
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Mutex;
 
@@ -52,6 +52,15 @@ const GEO_URL: &str = "https://ipapi.co/json/";
 pub struct Reply {
     pub heap_key: usize,
     pub req_id: u64,
+}
+
+/// A host-observed failure, attributed to the exact requesting isolate.
+pub struct ServiceFailure {
+    pub app_id: MiniAppId,
+    pub heap_key: usize,
+    pub error: String,
+    /// Repeated identical errors still update task status, without popup spam.
+    pub show_popup: bool,
 }
 
 impl Reply {
@@ -294,6 +303,8 @@ pub fn parse_app_tool_request(
 
 /// Work only the host can do, returned from [`Broker::process`].
 pub enum BrokerAsk {
+    /// Finish only the run belonging to this requesting isolate/activation.
+    BackgroundComplete { reply: Reply, run_id: u64, success: bool },
     /// HTTP is executed by the host after checking the current source labels.
     Network { reply: Reply, app_id: MiniAppId, room: Option<String>, args: serde_json::Value, consent: Box<PermissionStore> },
     /// Queue a runtime-permission prompt. `request`, when present, is parked
@@ -578,12 +589,12 @@ impl Broker {
     }
 
     /// The refusals and failed actions answered since the last call, as
-    /// `(app, message)`, for the host to put in front of the user. The same
-    /// message from the same app repeats at most every 30 seconds.
-    pub fn failures(&mut self) -> Vec<(MiniAppId, String)> {
+    /// exact isolate, for task status and host notifications. The same
+    /// message from the same app gets a popup at most every 30 seconds.
+    pub fn failures(&mut self) -> Vec<ServiceFailure> {
         let answers = ANSWERS.with(|a| std::mem::take(&mut *a.borrow_mut()));
         let now = std::time::Instant::now();
-        let mut failed: Vec<(MiniAppId, String)> = Vec::new();
+        let mut failed = Vec::new();
         for (reply, error) in answers {
             let app = self.notable.remove(&(reply.heap_key, reply.req_id));
             let (Some(app), Some(error)) = (app, error) else { continue };
@@ -591,10 +602,23 @@ impl Broker {
             let fresh = self.shown.get(&key).is_none_or(|at| now.duration_since(*at).as_secs() >= 30);
             if fresh {
                 self.shown.insert(key.clone(), now);
-                failed.push(key);
             }
+            failed.push(ServiceFailure { app_id: key.0, heap_key: reply.heap_key, error: key.1, show_popup: fresh });
         }
         failed
+    }
+
+    /// Drop pending bookkeeping for a retired isolate, keeping answered errors
+    /// until the host has attributed them to their completed background run.
+    pub fn forget_instance(&mut self, heap_key: usize) {
+        let answered = ANSWERS.with(|answers| answers.borrow().iter()
+            .map(|(reply, _)| (reply.heap_key, reply.req_id)).collect::<HashSet<_>>());
+        self.notable.retain(|key, _| key.0 != heap_key || answered.contains(key));
+        self.pending_locations.retain(|reply| reply.heap_key != heap_key);
+        self.pending_geo.retain(|_, reply| reply.heap_key != heap_key);
+        // An OS dialog, if one exists, retains its guard until it actually
+        // closes. Splash request IDs are unique across isolates; a late answer
+        // cannot find a new worker's callback with a reused heap address.
     }
 
     /// Drops an app's rate-limit budget, strikes and dialog guard. Called when
@@ -604,7 +628,9 @@ impl Broker {
     pub fn forget_app(&mut self, app_id: &str) {
         self.limits.forget(app_id);
         self.dialog_owner.retain(|_, owner| owner != app_id);
-        self.notable.retain(|_, owner| owner != app_id);
+        let answered = ANSWERS.with(|answers| answers.borrow().iter()
+            .map(|(reply, _)| (reply.heap_key, reply.req_id)).collect::<HashSet<_>>());
+        self.notable.retain(|key, owner| owner != app_id || answered.contains(key));
         self.shown.retain(|(owner, _), _| owner != app_id);
     }
 
@@ -742,8 +768,11 @@ impl Broker {
         // Abuse control comes BEFORE the permission check, because refusing a
         // request is itself work and an app in a tight loop must not be able
         // to make the host do it forever.
-        let on_screen = ctx.foreground_app == Some(manifest.id.as_str())
-            || (ctx.is_docked)(&manifest.id);
+        let on_screen = (ctx.pane_state)(req.heap_key).map_or_else(
+            || ctx.foreground_app == Some(manifest.id.as_str()) || (ctx.is_docked)(&manifest.id),
+            |pane| pane.foreground,
+        );
+        let may_prompt = on_screen && req.may_prompt;
         if charge == Charge::Yes {
             let foreground = on_screen;
             let verdict = self.limits.check(&manifest.id, &req.service, foreground);
@@ -789,8 +818,8 @@ impl Broker {
         // Any refusal from here on is the host's to show; an act (what a
         // button does) stays notable until its answer, so a failure shows too.
         self.note(reply, &manifest.id);
-        let acts = matches!(capability.access, crate::capabilities::Access::Write | crate::capabilities::Access::Act)
-            && !matches!(req.service.as_str(), "events.subscribe" | "events.unsubscribe" | "permissions.request" | "notify.clear");
+        let acts = matches!(capability.access, crate::capabilities::Access::Write | crate::capabilities::Access::ReadWrite | crate::capabilities::Access::Act)
+            && !matches!(req.service.as_str(), "events.subscribe" | "events.unsubscribe" | "permissions.request" | "notify.clear" | "background.complete");
         if !capability.is_available() {
             return respond(cx, reply, Err(&format!("'{}' is not available in this Robrix", req.service)));
         }
@@ -850,7 +879,7 @@ impl Broker {
                     // Surfaces that may not prompt never pop consent dialogs:
                     // their Ask-state requests fail cleanly and the script
                     // falls back.
-                    if !req.may_prompt {
+                    if !may_prompt {
                         return Self::respond_policy_denied(cx, &req, ctx.permissions, &manifest, capability, context);
                     }
                     asks.push(BrokerAsk::Prompt {
@@ -873,6 +902,15 @@ impl Broker {
         }
 
         match req.service.as_str() {
+            "background.complete" => {
+                let Some(run_id) = args["run_id"].as_u64().filter(|id| *id > 0) else {
+                    return respond(cx, reply, Err("background.complete needs a positive {run_id} from on_background"));
+                };
+                let Some(success) = args["success"].as_bool() else {
+                    return respond(cx, reply, Err("background.complete needs {success: true} or {success: false}"));
+                };
+                asks.push(BrokerAsk::BackgroundComplete { reply, run_id, success });
+            }
             "network.http" => asks.push(BrokerAsk::Network {
                 reply, app_id: manifest.id.clone(), room: instance_room, args,
                 consent: Box::new(ctx.permissions.clone()),
@@ -960,7 +998,7 @@ impl Broker {
                     Effective::Undeclared => {
                         respond(cx, reply, Err(&format!("permission not declared: {}", perm.as_str())));
                     }
-                    Effective::NeedsPrompt if !req.may_prompt => {
+                    Effective::NeedsPrompt if !may_prompt => {
                         respond(cx, reply, Ok("{\"granted\": false}"));
                     }
                     Effective::NeedsPrompt => {
@@ -1154,7 +1192,7 @@ impl Broker {
                             });
                             asks.push(BrokerAsk::McpRegisterTool { reply, request: tool });
                         }
-                        Effective::NeedsPrompt if req.may_prompt => {
+                        Effective::NeedsPrompt if may_prompt => {
                             asks.push(BrokerAsk::Prompt {
                                 app_id: manifest.id.clone(),
                                 perm: Permission::McpTools,
@@ -1250,7 +1288,7 @@ impl Broker {
                         let group = hook.group.map_or("", |g| g.as_str());
                         respond(cx, reply, Err(&format!("permission not declared: {group}")));
                     }
-                    Effective::NeedsPrompt if !req.may_prompt => {
+                    Effective::NeedsPrompt if !may_prompt => {
                         respond(cx, reply, Err(&format!("\"{}\" is denied for this app. Allow it in App Info", hook.title)));
                     }
                     Effective::NeedsPrompt => {
@@ -1756,5 +1794,34 @@ mod app_tool_tests {
             "args": [{"name": "n", "type": "wat"}],
         });
         assert!(parse_app_tool_request(&m, &req, &bad).is_err());
+    }
+}
+
+#[cfg(test)]
+mod failure_context_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_errors_retain_each_context_while_popups_are_coalesced() {
+        let mut broker = Broker::new();
+        let one = Reply { heap_key: 1, req_id: 1 };
+        let two = Reply { heap_key: 2, req_id: 1 };
+        broker.note(one, "watcher");
+        broker.note(two, "watcher");
+        ANSWERS.with(|answers| *answers.borrow_mut() = vec![
+            (one, Some("Room writes are disabled.".into())),
+            (two, Some("Room writes are disabled.".into())),
+        ]);
+        broker.note(Reply { heap_key: 1, req_id: 2 }, "watcher");
+        broker.forget_instance(1);
+        assert!(!broker.notable.contains_key(&(1, 2)), "abandoned requests must not accumulate");
+        broker.forget_app("watcher");
+        let failures = broker.failures();
+        assert_eq!(failures.len(), 2);
+        assert_eq!((failures[0].heap_key, failures[1].heap_key), (1, 2));
+        assert!(failures[0].show_popup);
+        assert!(!failures[1].show_popup);
+        assert_eq!(failures[0].error, failures[1].error);
+        assert!(broker.failures().is_empty());
     }
 }

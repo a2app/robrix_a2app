@@ -60,7 +60,7 @@ cargo run --features a2app
   it with `/miniapp share <name>`, where it renders as a card other Robrix
   users can install and run. "Open in room…" docks an app into any room you
   pick, straight from the Mini Apps screen.
-- Sixteen built-in apps: **Public Web** (a fixed public example.com fetch),
+- Built-in apps: **Public Web** (a fixed public example.com fetch),
   **Room Peek** (room info + recent messages + send),
   **Roll Call** (dice roller that can post its roll), **Room Info**,
   **Room Members**, **Pinned Messages**, **Room Threads**, **Search**
@@ -69,7 +69,13 @@ cargo run --features a2app
   Tools** (favorite, low priority, unread, pins, links), **Room Stats** (who
   posts when), **Spaces** (explore and join), **Inbox** (invites and unread
   rooms), **Account** (you, this device, look up a user), and **Inspector**
-  (what Robrix tells an app about its pane, settings and device).
+  (what Robrix tells an app about its pane, settings and device). Background
+  examples add **Website Watch**, **Reminder**, and **Keyword Alert**.
+- **Background tasks**: explicitly enable an interval, one-time alarm, or live
+  room-message condition. Tasks retain their original room/space and saved app
+  state across launches, while all permissions and IFC checks remain active.
+  See [Background mini-apps](BACKGROUND_TASKS.md) for setup, examples, and recovery
+  semantics. Tasks run only while Robrix is running and signed in.
 
 ## Crates
 

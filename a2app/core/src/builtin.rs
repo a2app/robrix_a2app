@@ -64,6 +64,9 @@ pub fn union_stock_declarations(manifest: &mut MiniAppManifest) {
 fn permissions_for(id: &str) -> Vec<String> {
     let p: &[&str] = match id {
         "public-web" => &["network"],
+        "website-watch" => &["network", "notifications", "matrix-room-send"],
+        "reminder" => &["notifications"],
+        "keyword-alert" => &["matrix-room-watch", "notifications"],
         "room-peek" => &["matrix-room-info", "matrix-room-read", "matrix-room-send", "robrix-navigation", "matrix-room-watch"],
         "roll-call" => &["matrix-profile", "matrix-room-send"],
         "room-info" => &["matrix-room-info"],
@@ -89,6 +92,16 @@ fn permissions_for(id: &str) -> Vec<String> {
 fn reasons_for(id: &str) -> std::collections::BTreeMap<String, String> {
     let r: &[(&str, &str)] = match id {
         "public-web" => &[("network", "Fetches https://example.com/ when you press the button.")],
+        "website-watch" => &[
+            ("network", "Fetches the URL you save when your background task runs."),
+            ("notifications", "Shows a popup when the keyword first appears."),
+            ("matrix-room-send", "Optionally reports a match to this task's attached room."),
+        ],
+        "reminder" => &[("notifications", "Shows the reminder text you save when your task is due.")],
+        "keyword-alert" => &[
+            ("matrix-room-watch", "Tests new messages in this task's attached room for your keyword."),
+            ("notifications", "Shows one popup for each matching batch of messages."),
+        ],
         "room-peek" => &[
             ("matrix-room-info", "Shows this room's name and member count."),
             ("matrix-room-read", "Lists the latest messages in this room and their reactions."),
@@ -184,6 +197,9 @@ pub fn stock(id: &str) -> Option<MiniAppManifest> {
 pub fn builtin_apps() -> Vec<MiniAppManifest> {
     vec![
         app("public-web", "Public Web", "🌐", 0x2A7F92, app_source!("public_web.splash")),
+        app("website-watch", "Website Watch", "🌐", 0x2A7F92, app_source!("website_watch.splash")),
+        app("reminder", "Reminder", "⏰", 0x8A5FB0, app_source!("reminder.splash")),
+        app("keyword-alert", "Keyword Alert", "🔔", 0xD9822B, app_source!("keyword_alert.splash")),
         app("room-peek", "Room Peek", "👀", 0x4A90D9, app_source!("room_peek.splash")),
         app("roll-call", "Roll Call", "🎲", 0x7C6CF0, app_source!("roll_call.splash")),
         app("room-info", "Room Info", "🏷", 0x2E86AB, app_source!("room_info.splash")),
@@ -211,7 +227,7 @@ mod tests {
     #[test]
     fn catalog_matches_the_splash_headers() {
         let apps = builtin_apps();
-        assert_eq!(apps.len(), 16);
+        assert_eq!(apps.len(), 19);
         for m in &apps {
             assert!(m.builtin);
             assert!(m.widget.is_none());
@@ -236,6 +252,26 @@ mod tests {
         assert_eq!(runs_in("account"), RunsIn::Account);
         assert_eq!(runs_in("inspector"), RunsIn::Account);
         assert_eq!(runs_in("public-web"), RunsIn::Account);
+    }
+
+    #[test]
+    fn background_contexts_preserve_room_requirements_and_bound_scopes() {
+        let reminder = stock("reminder").unwrap();
+        assert!(reminder.can_run_background_in_context(None, false));
+        assert!(reminder.can_run_background_in_context(Some("!room:test"), false));
+        assert!(reminder.can_run_background_in_context(Some("!space:test"), true));
+        for id in ["website-watch", "keyword-alert"] {
+            let app = stock(id).unwrap();
+            assert!(!app.can_run_background_in_context(None, false));
+            assert!(!app.can_run_background_in_context(Some("!space:test"), true));
+            assert!(app.can_run_background_in_context(Some("!room:test"), false));
+        }
+        let mut bound = reminder;
+        bound.scope = crate::manifest::A2AppScope::Room { room_id: "!original:test".into() };
+        assert!(bound.can_run_background_in_context(Some("!original:test"), false));
+        assert!(!bound.can_run_background_in_context(None, false));
+        assert!(!bound.can_run_background_in_context(Some("!other:test"), false));
+        assert!(!stock("room-peek").unwrap().can_run_background_in_context(Some("!room:test"), false));
     }
 
     /// Every stock app must parse with the real Splash parser, or it would

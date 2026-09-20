@@ -1,0 +1,78 @@
+// name: Keyword Alert
+// icon: 🔔
+// tint: #D9822B
+// description: Notify when a new room message contains a saved keyword, including while its pane is closed.
+// background: true
+// permissions: matrix-room-watch, notifications
+// why-matrix-room-watch: Tests new messages in this task's attached room for your keyword.
+// why-notifications: Shows one popup for each matching batch of messages.
+
+let keyword = "release"
+let initialized = false
+let status = "Ready. Configure and run this app from Background tasks."
+
+fn show_status(text){
+    status = text
+    if initialized { ui.status.set_text(text) }
+}
+
+fn load(){
+    if fs.exists("/keyword.txt") {
+        let saved = fs.read("/keyword.txt")
+        if saved.len() > 0 && saved.len() <= 100 { keyword = saved }
+    }
+}
+
+fn save(){
+    let next = ui.keyword_input.text().trim()
+    if next == "" || next.len() > 100 {
+        show_status("Enter a keyword between 1 and 100 characters.")
+        return nil
+    }
+    keyword = next
+    fs.write("/keyword.txt", keyword)
+    show_status("Saved. Choose New room messages in Mini Apps > Background tasks for this room.")
+}
+
+fn on_background(json){
+    let trigger = json.parse_json()
+    let count = 0
+    if trigger.messages.is_array() {
+        for message in trigger.messages {
+            if !message.is_own && message.body.is_string() {
+                if message.body.split(keyword).len() > 1 { count = count + 1 }
+            }
+        }
+    }
+    if count == 0 {
+        show_status("No new messages matched '" + keyword + "'.")
+        host.request("background.complete", {run_id: trigger.run_id, success: true})
+        return nil
+    }
+    host.request("notify.post", {title: "Keyword Alert", body: "'" + keyword + "' matched " + count + " new messages."}, fn(r){
+        if r.is_ok { show_status("Match reported.") } else { show_status(r.error) }
+        host.request("background.complete", {run_id: trigger.run_id, success: r.is_ok})
+    })
+}
+
+fn on_app_resize(width, height){
+    if initialized { return nil }
+    initialized = true
+    ui.status.set_text(status)
+    ui.keyword_input.set_text(keyword)
+}
+
+let _load = load()
+
+View{
+    width: Fill height: Fill flow: Down
+    ScrollYView{
+        width: Fill height: Fill flow: Down spacing: 12 padding: 16
+        Label{text: "Keyword Alert" width: Fill draw_text +: {color: #x1C274C text_style: theme.font_bold{font_size: 20}}}
+        Label{text: "Watch for a project release, an incident tag, or any literal case-sensitive phrase. Your own messages are ignored. One popup summarizes each matching batch." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 12}}}
+        keyword_input := TextInput{width: Fill empty_text: "release"}
+        Button{text: "Save keyword" on_click: || save()}
+        status := Label{text: "Default keyword: release. Enable New room messages in Background tasks for this same room." width: Fill draw_text +: {color: #xD9822B text_style: theme.font_regular{font_size: 12}}}
+        Label{text: "Uses new messages delivered by Robrix's live room timeline, with bounded message previews. It does not replay offline history, edits or messages dropped while a run is busy. Read protection and notification permissions always apply." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
+    }
+}

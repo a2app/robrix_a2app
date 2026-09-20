@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 /// The header comments, all optional.
 #[derive(Default)]
 pub struct Header {
+    /// Opts into host-managed background triggers; never enables a task.
+    pub background: bool,
     pub name: Option<String>,
     pub icon: Option<String>,
     pub tint: Option<u32>,
@@ -37,7 +39,9 @@ pub fn parse_app_header(source: &str) -> Header {
             continue;
         };
         let rest = rest.trim();
-        if let Some(v) = rest.strip_prefix("name:") {
+        if let Some(v) = rest.strip_prefix("background:") {
+            header.background = v.trim() == "true";
+        } else if let Some(v) = rest.strip_prefix("name:") {
             let v = v.trim();
             if !v.is_empty() {
                 header.name = Some(v.chars().take(18).collect::<String>().trim().to_string());
@@ -133,6 +137,14 @@ mod tests {
         let h = parse_app_header("// name: Tip\nView{}");
         assert!(h.permissions.is_empty());
         assert!(h.permission_reasons.is_empty());
+        assert!(!h.background);
+    }
+
+    #[test]
+    fn background_support_requires_explicit_header_opt_in() {
+        assert!(parse_app_header("// background: true\nView{}").background);
+        assert!(!parse_app_header("// background: yes\nView{}").background);
+        assert!(!parse_app_header("fn on_background(json){}\nView{}").background);
     }
 
     #[test]

@@ -55,6 +55,7 @@ struct MiniAppInstance {
     surface: Option<Surface>,
     /// False after its surface died without a `Cx` to re-anchor it.
     anchored: bool,
+    background_running: bool,
 }
 
 impl MiniAppInstance {
@@ -80,6 +81,7 @@ struct Registry {
     instances: HashMap<InstanceKey, MiniAppInstance>,
     needs_anchor: bool,
     has_pending_resize: bool,
+    pending_prompt_updates: Vec<InstanceKey>,
     /// Surface and focus hooks owed to instances; payloads are built at
     /// flush time, so a burst of changes is one call with the final state.
     pending_hooks: Vec<(InstanceKey, LiveId)>,
@@ -114,7 +116,10 @@ fn tree_name(key: &InstanceKey) -> LiveId {
 /// `on_after_apply` may register it.
 pub fn set_host_template(obj: ScriptObjectRef) {
     with_registry(|r| r.host_template = Some(obj));
+    super::background::changed();
 }
+
+pub fn host_template_ready() -> bool { with_registry(|r| r.host_template.is_some()) }
 
 pub fn clear_host_template() {
     with_registry(|r| r.host_template = None);
@@ -126,7 +131,7 @@ fn splash_of(cx: &mut Cx, host: &WidgetRef) -> WidgetRef {
 
 /// Instantiates a host and evals the app into a fresh isolate, parked
 /// under the tree root. All isolate config lands BEFORE the source evals.
-fn spawn(cx: &mut Cx, manifest: &MiniAppManifest, _grants: &[String], key: &InstanceKey, public: bool) -> Option<(WidgetRef, Option<usize>, a2app_core::information_flow::ContextId)> {
+fn spawn(cx: &mut Cx, manifest: &MiniAppManifest, _grants: &[String], key: &InstanceKey, public: bool, background: bool) -> Option<(WidgetRef, Option<usize>, a2app_core::information_flow::ContextId)> {
     let context = if public {
         super::information_flow::account().map(|account| a2app_core::information_flow::ContextId::PublicApp { account, app: manifest.id.clone() })
     } else {
@@ -179,7 +184,7 @@ fn spawn(cx: &mut Cx, manifest: &MiniAppManifest, _grants: &[String], key: &Inst
         splash.set_sandbox_dir(cx, Some(sandbox));
         splash.set_host_tag(cx, Some(tag));
         splash.set_host_caps(cx, grants.to_vec());
-        splash.set_host_prompts(cx, true);
+        splash.set_host_prompts(cx, !background);
         splash.set_debug_name(&manifest.id);
     }
     splash_of(cx, &host).set_text(cx, &manifest.source);
@@ -197,21 +202,50 @@ pub fn ensure(
     grants: &[String],
     seed: PaneLayout,
 ) -> Option<WidgetRef> {
-    ensure_mode(cx, key, manifest, grants, seed, false)
+    ensure_mode(cx, key, manifest, grants, seed, false, false)
 }
 
 /// Starts an isolated public worker with no room/account read clearance.
 ///
 /// Callers must release an existing standalone private instance first.
 pub fn ensure_public(cx: &mut Cx, manifest: &MiniAppManifest, grants: &[String], seed: PaneLayout) -> Option<WidgetRef> {
-    ensure_mode(cx, &(manifest.id.clone(), None), manifest, grants, seed, true)
+    let account = super::information_flow::account().ok()?;
+    let expected = a2app_core::information_flow::ContextId::PublicApp { account, app: manifest.id.clone() };
+    if context_of_key(&(manifest.id.clone(), None)).is_some_and(|context| context != expected) { return None; }
+    ensure_mode(cx, &(manifest.id.clone(), None), manifest, grants, seed, true, false)
 }
 
-fn ensure_mode(cx: &mut Cx, key: &InstanceKey, manifest: &MiniAppManifest, grants: &[String], seed: PaneLayout, public: bool) -> Option<WidgetRef> {
+/// Background creation configures prompt suppression before evaluating source.
+/// Existing foreground instances are reused without resetting their state.
+pub fn ensure_background(cx: &mut Cx, key: &InstanceKey, manifest: &MiniAppManifest, grants: &[String], seed: PaneLayout) -> Option<WidgetRef> {
+    ensure_mode(cx, key, manifest, grants, seed, false, true)
+}
+
+pub fn set_background_running(cx: &mut Cx, key: &InstanceKey, running: bool) {
+    let update = with_registry(|registry| {
+        let instance = registry.instances.get_mut(key)?;
+        instance.background_running = running;
+        Some((instance.host.clone(), instance.foreground() && !running))
+    });
+    if let Some((host, prompts)) = update
+        && let Some(mut splash) = splash_of(cx, &host).borrow_mut::<Splash>()
+    { splash.set_host_prompts(cx, prompts); }
+}
+
+pub fn is_foreground(app_id: &str) -> bool {
+    with_registry(|registry| registry.instances.iter().any(|((app, _), instance)| app == app_id && instance.foreground()))
+}
+
+fn refresh_prompt_state(cx: &mut Cx, key: &InstanceKey) {
+    let running = with_registry(|registry| registry.instances.get(key).map(|instance| instance.background_running));
+    if let Some(running) = running { set_background_running(cx, key, running); }
+}
+
+fn ensure_mode(cx: &mut Cx, key: &InstanceKey, manifest: &MiniAppManifest, grants: &[String], seed: PaneLayout, public: bool, background: bool) -> Option<WidgetRef> {
     if let Some(host) = host_of(key) {
         return Some(host);
     }
-    let (host, heap_key, flow_context) = spawn(cx, manifest, grants, key, public)?;
+    let (host, heap_key, flow_context) = spawn(cx, manifest, grants, key, public, background)?;
     let flow_epoch = a2app_core::information_flow::context_epoch(&flow_context).ok()?;
     with_registry(|r| {
         r.instances.insert(key.clone(), MiniAppInstance {
@@ -226,6 +260,7 @@ fn ensure_mode(cx: &mut Cx, key: &InstanceKey, manifest: &MiniAppManifest, grant
             shown_by: None,
             surface: None,
             anchored: true,
+            background_running: false,
         });
     });
     Some(host)
@@ -244,6 +279,7 @@ pub fn adopt(cx: &mut Cx, key: &InstanceKey, surface_uid: WidgetUid, surface: Su
         inst.anchored = true;
         Some(inst.host.clone())
     })?;
+    refresh_prompt_state(cx, key);
     cx.widget_tree_insert_child_deep(surface_uid, tree_name(key), host.clone());
     note_hook(key, live_id!(on_surface_changed));
     note_hook(key, live_id!(on_focus_changed));
@@ -263,6 +299,7 @@ pub fn release(cx: &mut Cx, key: &InstanceKey, surface_uid: WidgetUid) {
         Some(inst.host.clone())
     });
     if let Some(host) = host {
+        refresh_prompt_state(cx, key);
         let root = cx.widget_tree().root_uid();
         cx.widget_tree_insert_child_deep(root, tree_name(key), host);
         note_hook(key, live_id!(on_focus_changed));
@@ -370,6 +407,7 @@ pub fn set_layout(key: &InstanceKey, layout: PaneLayout) {
     with_registry(|r| {
         if let Some(inst) = r.instances.get_mut(key) {
             inst.layout = layout;
+            if !r.pending_prompt_updates.contains(key) { r.pending_prompt_updates.push(key.clone()); }
         }
     });
 }
@@ -403,30 +441,40 @@ pub fn is_docked(app_id: &str) -> bool {
 /// Drops the instance and reclaims its isolate. Returns true when that was
 /// the app's last instance.
 pub fn quit(cx: &mut Cx, key: &InstanceKey) -> bool {
-    let removed = with_registry(|r| r.instances.remove(key).is_some());
-    if !removed {
+    if super::background::retains_instance(key) {
+        if let Some(owner) = shown_by(key) { release(cx, key, owner); }
         return false;
     }
+    terminate(cx, key)
+}
+
+/// Unconditionally retire this activation, including references held by a UI.
+/// Background pause/timeout calls this before releasing its persisted claim.
+pub fn terminate(cx: &mut Cx, key: &InstanceKey) -> bool {
+    let removed = with_registry(|r| r.instances.remove(key));
+    let Some(instance) = removed else { return false };
+    instance.alive.store(false, Ordering::Release);
+    let _ = a2app_core::information_flow::remove_context_for_activation(&instance.flow_context, instance.flow_epoch);
+    if let Some(heap) = instance.heap_key {
+        super::runtime::with_a2app(|state| state.broker.forget_instance(heap));
+    }
+    splash_of(cx, &instance.host).set_text(cx, "");
+    drop(instance);
     gc(cx);
+    super::background::changed();
     !is_running(&key.0)
 }
 
 /// Drops every instance of the app. Returns whether any existed.
 pub fn quit_app(cx: &mut Cx, app_id: &str) -> bool {
-    let removed = with_registry(|r| {
-        let before = r.instances.len();
-        r.instances.retain(|(app, _), _| app != app_id);
-        before != r.instances.len()
-    });
-    if removed {
-        gc(cx);
-    }
-    removed
+    let keys = keys_of_app(app_id);
+    for key in &keys { terminate(cx, key); }
+    !keys.is_empty()
 }
 
 pub fn quit_everything(cx: &mut Cx) {
-    with_registry(|r| r.instances.clear());
-    gc(cx);
+    let keys = with_registry(|r| r.instances.keys().cloned().collect::<Vec<_>>());
+    for key in keys { terminate(cx, &key); }
 }
 
 /// Reclaims isolates whose last reference just dropped; surfaces call it
@@ -467,6 +515,8 @@ pub fn note_size(key: &InstanceKey, size: Vec2d) {
 /// Event-time housekeeping: re-anchors hosts whose surface died and
 /// delivers queued `on_app_resize` calls.
 pub fn flush_pending(cx: &mut Cx) {
+    let prompt_updates = with_registry(|registry| std::mem::take(&mut registry.pending_prompt_updates));
+    for key in prompt_updates { refresh_prompt_state(cx, &key); }
     let (to_anchor, resizes, hooks) = with_registry(|r| {
         if !r.needs_anchor && !r.has_pending_resize && r.pending_hooks.is_empty() {
             return (Vec::new(), Vec::new(), Vec::new());
@@ -503,6 +553,7 @@ pub fn flush_pending(cx: &mut Cx) {
     if !to_anchor.is_empty() {
         let root = cx.widget_tree().root_uid();
         for (key, host) in to_anchor {
+            refresh_prompt_state(cx, &key);
             cx.widget_tree_insert_child_deep(root, tree_name(&key), host);
         }
     }

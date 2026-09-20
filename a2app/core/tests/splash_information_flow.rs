@@ -9,7 +9,7 @@ use a2app_core::{
     information_flow::{ContextId, FlowPolicy, Influence, Recipient, Registry, Source},
     manifest::{AppRegistry, instance_tag},
     permissions::{GrantDuration, GrantState, NetworkScope, Permission, PermissionStore, RoomScope},
-    services::{self, Broker, BrokerAsk, BrokerCtx, Reply},
+    services::{self, Broker, BrokerAsk, BrokerCtx, HostAction, PaneState, Reply},
 };
 use makepad_widgets::{*, splash::Splash, splash_host::SplashHostRequest, widget_async::CxSplashVmExt};
 
@@ -25,6 +25,8 @@ struct Harness {
     permissions: PermissionStore,
     flow: RefCell<Registry>,
     contexts: HashMap<usize, ContextId>,
+    panes: HashMap<usize, PaneState>,
+    foreground_app: Option<String>,
     splashes: Vec<Splash>,
     attempted_bodies: RefCell<Vec<String>>,
     root: PathBuf,
@@ -38,7 +40,8 @@ impl Harness {
         cx.with_vm(makepad_widgets::script_mod);
         Self {
             cx, broker: Broker::new(), apps: AppRegistry::default(), permissions: PermissionStore::default(),
-            flow: RefCell::new(Registry::open(&root).unwrap()), contexts: HashMap::new(), splashes: Vec::new(),
+            flow: RefCell::new(Registry::open(&root).unwrap()), contexts: HashMap::new(), panes: HashMap::new(), foreground_app: None,
+            splashes: Vec::new(),
             attempted_bodies: RefCell::new(Vec::new()), root,
         }
     }
@@ -46,6 +49,10 @@ impl Harness {
     fn launch(&mut self, app: &str, public: bool, source: &str) -> (usize, ContextId) {
         let context = if public { ContextId::PublicApp { account: ACCOUNT.into(), app: app.into() } }
             else { ContextId::App { account: ACCOUNT.into(), app: app.into(), room: Some(ROOM.into()) } };
+        self.launch_context(app, context, source)
+    }
+
+    fn launch_context(&mut self, app: &str, context: ContextId, source: &str) -> (usize, ContextId) {
         self.flow.borrow_mut().register_context(&context).unwrap();
         let mut manifest = a2app_core::builtin::stock("room-peek").unwrap();
         manifest.id = app.into();
@@ -61,7 +68,7 @@ impl Harness {
         });
         splash.set_host_io_only(true);
         splash.set_allow_net(false);
-        splash.set_host_tag(&mut self.cx, Some(instance_tag(app, if public { None } else { Some(ROOM) })));
+        splash.set_host_tag(&mut self.cx, Some(instance_tag(app, context.room())));
         let jail = self.flow.borrow().context_storage_path(&context).unwrap();
         std::fs::create_dir_all(&jail).unwrap();
         splash.set_sandbox_dir(&mut self.cx, Some(jail));
@@ -104,8 +111,8 @@ impl Harness {
             flow.borrow().context_storage_path(contexts.get(&heap).ok_or("Unknown test context")?)
         };
         self.broker.process(&mut self.cx, BrokerCtx {
-            registry: &self.apps, permissions: &self.permissions, foreground_app: None,
-            is_docked: &|_| true, is_running: &|_| true, pane_state: &|_| None, storage_path: &storage_path,
+            registry: &self.apps, permissions: &self.permissions, foreground_app: self.foreground_app.as_deref(),
+            is_docked: &|_| true, is_running: &|_| true, pane_state: &|heap| self.panes.get(&heap).cloned(), storage_path: &storage_path,
             room_name: &|_| Some("Private room".into()), desktop_view: true,
             check_flow: &check_flow, check_response: &check_response,
         })
@@ -379,4 +386,52 @@ fn quota_reports_only_the_requesting_compartments_files() {
     }
     results.sort();
     assert_eq!(results, ["19", "2"]);
+}
+
+
+#[test]
+fn hidden_instance_cannot_navigate_through_another_foreground_instance_of_the_same_app() {
+    let mut host = Harness::new();
+    let source = r#"
+        fn navigate() {
+            host.request("nav.room", {room_id:"!destination:test"}, fn(r) {
+                host.request("notify.post", {body:if r.is_ok {"navigation accepted"} else {r.error}})
+            })
+        }
+        Label{text:"fixture"}
+    "#;
+    let app = "shared-navigation";
+    let (hidden, hidden_context) = host.launch(app, false, source);
+    let (visible, visible_context) = host.launch_context(app, ContextId::App {
+        account: ACCOUNT.into(), app: app.into(), room: Some("!visible:test".into()),
+    }, source);
+    assert_ne!(hidden, visible);
+    assert_ne!(hidden_context, visible_context);
+    // Both app-wide signals claim this app is visible: the modal foreground
+    // ID below and Harness::process's is_docked=true. The calling heap wins.
+    host.foreground_app = Some(app.into());
+    host.panes.insert(hidden, PaneState {
+        surface: "parked", side: None, minimized: false, foreground: false, width: 0.0, height: 0.0,
+    });
+    host.panes.insert(visible, PaneState {
+        surface: "modal", side: None, minimized: false, foreground: true, width: 400.0, height: 300.0,
+    });
+    for splash in &mut host.splashes {
+        assert!(splash.call_script_fn(&mut host.cx, id!(navigate), &[]));
+    }
+    let navigation = host.process().into_iter().filter_map(|ask| match ask {
+        BrokerAsk::HostAction { reply, app_id, action } => Some((reply, app_id, action)),
+        _ => None,
+    }).collect::<Vec<_>>();
+    assert_eq!(navigation.len(), 1, "only the visible isolate may ask the host to navigate");
+    let (reply, app_id, action) = navigation.into_iter().next().unwrap();
+    assert_eq!(reply.heap_key, visible);
+    assert_eq!(app_id, app);
+    assert!(matches!(action, HostAction::OpenRoom { room } if room == "!destination:test"));
+    // A fixture acknowledgement exercises the real callback without opening
+    // a room or performing any external UI/network operation.
+    host.reply(reply, "{}");
+    let mut notifications = host.notifications();
+    notifications.sort();
+    assert_eq!(notifications, ["navigation accepted", "this needs the app to be on screen"]);
 }

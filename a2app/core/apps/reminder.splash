@@ -1,0 +1,64 @@
+// name: Reminder
+// icon: ⏰
+// tint: #8A5FB0
+// description: A recurring reminder or one-time alarm, attached to an account, room or space.
+// background: true
+// permissions: notifications
+// why-notifications: Shows the reminder text you save when your task is due.
+
+let message = "Time for a break."
+let initialized = false
+let status = "Ready. Configure and run this app from Background tasks."
+
+fn show_status(text){
+    status = text
+    if initialized { ui.status.set_text(text) }
+}
+
+fn load(){
+    if fs.exists("/reminder.txt") {
+        let saved = fs.read("/reminder.txt")
+        if saved.len() > 0 && saved.len() <= 200 { message = saved }
+    }
+}
+
+fn save(){
+    let next = ui.message_input.text().trim()
+    if next == "" || next.len() > 200 {
+        show_status("Enter a reminder between 1 and 200 characters.")
+        return nil
+    }
+    message = next
+    fs.write("/reminder.txt", message)
+    show_status("Saved in this context. Set its schedule or alarm in Mini Apps > Background tasks.")
+}
+
+fn on_background(json){
+    let run = json.parse_json().run_id
+    host.request("notify.post", {title: "Reminder", body: message}, fn(r){
+        if r.is_ok { show_status("Reminder shown.") } else { show_status(r.error) }
+        host.request("background.complete", {run_id: run, success: r.is_ok})
+    })
+}
+
+fn on_app_resize(width, height){
+    if initialized { return nil }
+    initialized = true
+    ui.status.set_text(status)
+    ui.message_input.set_text(message)
+}
+
+let _load = load()
+
+View{
+    width: Fill height: Fill flow: Down
+    ScrollYView{
+        width: Fill height: Fill flow: Down spacing: 12 padding: 16
+        Label{text: "Reminder" width: Fill draw_text +: {color: #x1C274C text_style: theme.font_bold{font_size: 20}}}
+        Label{text: "Use an interval for a regular check-in or break, or a one-time alarm for a deadline. Each account, room or space keeps its own reminder." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 12}}}
+        message_input := TextInput{width: Fill empty_text: "Time for a break."}
+        Button{text: "Save reminder" on_click: || save()}
+        status := Label{text: "Set a schedule in Mini Apps > Background tasks. Default reminder: Time for a break." width: Fill draw_text +: {color: #x8A5FB0 text_style: theme.font_regular{font_size: 12}}}
+        Label{text: "Reminders appear as Robrix popups while Robrix is running. An overdue alarm runs once after reopening; missed recurring intervals are combined into one run. This is not an OS alarm and cannot wake a closed or suspended app." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
+    }
+}

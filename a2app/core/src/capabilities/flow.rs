@@ -66,7 +66,8 @@ pub fn contract(id: &str) -> Option<FlowContract> {
         | "ui.pane.close" | "ui.pane.set_side" | "ui.pane.minimize"
         | "ui.pane.break_out" | "notifications.post" | "notifications.clear"
         | "on_app_resize" | "on_permissions_changed" | "on_focus_changed"
-        | "on_surface_changed" => (S::None, O::Local, false, false),
+        | "on_surface_changed" | "background.complete" | "on_background"
+            => (S::None, O::Local, false, false),
         "host.env.read" => (S::AttachedRoom, O::Local, false, false),
         "network.http" => (S::None, O::Network, false, false),
         "device.location.read" | "device.info.read" | "host.prefs.read"

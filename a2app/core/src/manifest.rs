@@ -71,6 +71,31 @@ pub enum RunsIn {
 }
 
 impl MiniAppManifest {
+    /// Whether the source opts into user-configured background tasks.
+    pub fn supports_background(&self) -> bool {
+        crate::header::parse_app_header(&self.source).background
+    }
+
+    /// A background utility may be pinned to a room or space without reading it.
+    ///
+    /// Attached-room services and event hooks still require a real room;
+    /// an app scoped to one room can never be restored somewhere else.
+    pub fn can_run_background_in_context(&self, room_id: Option<&str>, is_space: bool) -> bool {
+        if !self.supports_background() { return false; }
+        if let A2AppScope::Room { room_id: bound } = &self.scope
+            && room_id != Some(bound.as_str()) { return false; }
+        let needs_room = crate::capabilities::CATALOG.iter().any(|cap|
+            cap.is_available() && cap.scope == crate::capabilities::Scope::Room
+                && cap.group.is_some() && self.declares_capability(cap));
+        if needs_room { return room_id.is_some() && !is_space; }
+        match self.runs_in() {
+            RunsIn::Spaces => room_id.is_some() && is_space,
+            RunsIn::Room => room_id.is_some() && !is_space,
+            RunsIn::Rooms => !is_space,
+            RunsIn::Account => true,
+        }
+    }
+
     pub fn runs_in(&self) -> RunsIn {
         let mut rooms = false;
         let mut spaces = false;

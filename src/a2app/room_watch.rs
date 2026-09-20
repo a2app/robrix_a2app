@@ -2,11 +2,11 @@
 //! the UI thread as `A2AppRoomWatchEvent`s for hook delivery.
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, atomic::{AtomicBool, Ordering}};
 
 use makepad_widgets::{log, Cx, SignalToUI};
 use eyeball_im::VectorDiff;
-use matrix_sdk::{Room, RoomInfo, RoomState};
+use matrix_sdk::{Client, Room, RoomInfo, RoomState};
 use matrix_sdk::event_cache::{EventsOrigin, RoomEventCacheUpdate, TimelineVectorDiffs};
 use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
 use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent, SyncMessageLikeEvent};
@@ -63,28 +63,60 @@ pub struct RoomReceipt {
 pub struct A2AppRoomWatchEvent {
     pub room_id: OwnedRoomId,
     pub kind: RoomWatchKind,
+    identity: WatchIdentity,
 }
 
-static ROOM_WATCHES: LazyLock<Mutex<HashMap<OwnedRoomId, JoinHandle<()>>>> = LazyLock::new(Default::default);
+impl A2AppRoomWatchEvent {
+    /// Reject queued input from a retired watch or another account.
+    pub fn is_current(&self) -> bool {
+        self.identity.is_current(current_user_id().as_deref())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct WatchIdentity {
+    account: OwnedUserId,
+    alive: Arc<AtomicBool>,
+}
+
+impl WatchIdentity {
+    fn is_current(&self, account: Option<&UserId>) -> bool {
+        self.alive.load(Ordering::Acquire) && account == Some(self.account.as_ref())
+    }
+}
+
+struct RoomWatch {
+    identity: WatchIdentity,
+    task: JoinHandle<()>,
+}
+
+impl Drop for RoomWatch {
+    fn drop(&mut self) {
+        // Invalidate already-posted events before requesting async cancellation.
+        self.identity.alive.store(false, Ordering::Release);
+        self.task.abort();
+    }
+}
+
+static ROOM_WATCHES: LazyLock<Mutex<HashMap<OwnedRoomId, RoomWatch>>> = LazyLock::new(Default::default);
 
 /// Spawns a watch for `room_id` on the current tokio runtime, replacing any existing one.
 pub fn start_watch(room_id: OwnedRoomId) {
-    let task = Handle::current().spawn(watch_room(room_id.clone()));
-    if let Some(old) = ROOM_WATCHES.lock().unwrap().insert(room_id, task) {
-        old.abort();
-    }
+    let mut watches = ROOM_WATCHES.lock().unwrap();
+    watches.remove(&room_id);
+    let Some(client) = get_client() else { return };
+    let Some(account) = client.user_id().map(ToOwned::to_owned) else { return };
+    let identity = WatchIdentity { account, alive: Arc::new(AtomicBool::new(true)) };
+    let task = Handle::current().spawn(watch_room(client, room_id.clone(), identity.clone()));
+    watches.insert(room_id, RoomWatch { identity, task });
 }
 
 pub fn stop_watch(room_id: &RoomId) {
-    if let Some(task) = ROOM_WATCHES.lock().unwrap().remove(room_id) {
-        task.abort();
-    }
+    ROOM_WATCHES.lock().unwrap().remove(room_id);
 }
 
 pub fn stop_all() {
-    for (_, task) in ROOM_WATCHES.lock().unwrap().drain() {
-        task.abort();
-    }
+    ROOM_WATCHES.lock().unwrap().clear();
 }
 
 async fn member_name(room: &Room, user_id: &UserId) -> String {
@@ -96,16 +128,16 @@ async fn member_name(room: &Room, user_id: &UserId) -> String {
 
 /// Watches one room until it's left or its event cache closes; every exit posts `Closed`.
 /// Runs on the matrix worker's tokio runtime, so `start_watch` is the normal entry point.
-pub async fn watch_room(room_id: OwnedRoomId) {
+async fn watch_room(client: Client, room_id: OwnedRoomId, identity: WatchIdentity) {
     let post = |kind| {
+        if !identity.is_current(current_user_id().as_deref()) { return; }
         if !matches!(kind, RoomWatchKind::Closed)
             && !crate::a2app::matrix::policy::global_room_access_allowed(room_id.as_str(), a2app_core::permissions::RoomAccess::Read)
         { return; }
-        Cx::post_action(A2AppRoomWatchEvent { room_id: room_id.clone(), kind });
+        Cx::post_action(A2AppRoomWatchEvent { room_id: room_id.clone(), kind, identity: identity.clone() });
         SignalToUI::set_ui_signal();
     };
     let ended: Result<(), String> = async {
-        let client = get_client().ok_or("not logged in")?;
         let room = client.get_room(&room_id).ok_or("room not found")?;
         let (cache, _guard) = client.event_cache().room(&room_id).await
             .map_err(|e| format!("event cache unavailable: {e}"))?;
@@ -114,7 +146,7 @@ pub async fn watch_room(room_id: OwnedRoomId) {
         let mut info = room.subscribe_info();
         let (_typing_guard, mut typing) = room.subscribe_to_typing_notifications();
         let watch_start = MilliSecondsSinceUnixEpoch::now();
-        let own = current_user_id();
+        let own = &identity.account;
         let info_snapshot = |room_info: &RoomInfo| RoomWatchKind::InfoChanged {
             name: room.cached_display_name().map(|n| n.to_string()).unwrap_or_else(|| room_id.to_string()),
             topic: room_info.topic().unwrap_or_default().to_string(),
@@ -173,7 +205,7 @@ pub async fn watch_room(room_id: OwnedRoomId) {
                                             let sender_name = member_name(&room, &msg.sender).await;
                                             let mut body = msg.content.body().to_string();
                                             clip_chars(&mut body, 500);
-                                            let is_own = own.as_ref() == Some(&msg.sender);
+                                            let is_own = own == &msg.sender;
                                             post(RoomWatchKind::Message {
                                                 event_id: msg.event_id,
                                                 sender: msg.sender,
@@ -293,4 +325,24 @@ pub async fn watch_room(room_id: OwnedRoomId) {
         log!("Room watch for {room_id} ended: {e}");
     }
     post(RoomWatchKind::Closed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queued_room_events_are_fenced_by_account_and_watch_lifetime() {
+        let alice = OwnedUserId::try_from("@alice:example.org").unwrap();
+        let bob = OwnedUserId::try_from("@bob:example.org").unwrap();
+        let watch = WatchIdentity { account: alice.clone(), alive: Arc::new(AtomicBool::new(true)) };
+        let queued = watch.clone();
+        assert!(queued.is_current(Some(&alice)));
+        assert!(!queued.is_current(Some(&bob)));
+        assert!(!queued.is_current(None));
+        watch.alive.store(false, Ordering::Release);
+        let replacement = WatchIdentity { account: alice.clone(), alive: Arc::new(AtomicBool::new(true)) };
+        assert!(!queued.is_current(Some(&alice)), "reopening the same room/account must not revive queued events");
+        assert!(replacement.is_current(Some(&alice)));
+    }
 }

@@ -943,6 +943,39 @@ accepted the message. No private reply can return to the public instance.
 Normal `ipc.send` remains a request/reply path with source checks both ways.
 Opening a public instance never clears existing private provenance.
 
+## Background tasks
+
+Opt in with `// background: true` in the first 20 source lines and define
+`fn on_background(json)`. Only the user can enable and schedule a task in
+Mini Apps > Background tasks; scripts cannot enable their own autostart.
+The same app/context instance is used when its UI is open or parked. It resumes
+in that account and room/space on later Robrix launches, restoring files from
+its private jail, not VM memory. Save configuration and progress as they change.
+
+The JSON has `run_id`, `job_id`, `reason` (`interval`, `alarm`, `manual`,
+`room_messages`), UTC millisecond `scheduled_at`, `started_at`, `deadline_at`,
+and `messages` (an array, empty except for room-message triggers).
+Room-message input requires declared/granted `matrix-room-watch`, is bounded,
+and represents live timeline updates only; no offline backfill or space-wide
+message stream. Handle an empty array for Run now. Conditions are ordinary
+script logic over that input (e.g. a literal keyword match).
+
+After ALL async callbacks, effects and checkpoints finish, call
+`host.request("background.complete", {run_id: task.run_id, success: true})`,
+or `success: false` on failure. A run has a two-minute deadline; missing
+completion pauses the task and stops the old instance. Never acknowledge early
+or start independent repeating timers for scheduled work. Keep background work
+independent of `ui.*` until the app has been drawn; save status and display it
+when `on_app_resize` initializes the UI.
+
+Tasks run while Robrix is open and signed in, not as OS wakeup alarms. Missed
+intervals coalesce, alarms finish once, and uncertain interrupted alarms require
+review. All read/write/network/sharing/action-review rules still apply, and
+background tasks cannot open permission dialogs. Session approvals expire
+normally. A source change requires user review before autostart resumes.
+No exactly-once external-effect guarantee: checkpoint after success and use
+idempotency where the destination supports it.
+
 ## Hard rules
 
 1. Reply with the COMPLETE script; it must be self-contained and runnable.
