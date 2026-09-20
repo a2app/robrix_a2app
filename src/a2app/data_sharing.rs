@@ -189,9 +189,13 @@ impl Widget for DataSharing {
         {
             self.update_recipient_form(cx);
         }
+        let action_changed = self.view.drop_down(cx, ids!(action_choice)).changed(actions).is_some();
+        if action_changed {
+            self.view.drop_down(cx, ids!(action_session)).set_selected_item(cx, 0);
+        }
         if self.view.drop_down(cx, ids!(context_choice)).changed(actions).is_some()
             || self.view.drop_down(cx, ids!(decision_choice)).changed(actions).is_some()
-            || self.view.drop_down(cx, ids!(action_choice)).changed(actions).is_some()
+            || action_changed
             || self.view.drop_down(cx, ids!(action_session)).changed(actions).is_some()
         {
             self.update_diagnostic_details(cx);
@@ -234,6 +238,7 @@ impl Widget for DataSharing {
 impl DataSharing {
     fn configure(&mut self, cx: &mut Cx) {
         self.activity_key = None;
+        self.view.drop_down(cx, ids!(action_session)).set_selected_item(cx, 0);
         self.account = super::information_flow::account().unwrap_or_default();
         self.rooms = if cx.has_global::<RoomsListRef>() {
             cx.get_global::<RoomsListRef>().permission_targets().into_iter()
@@ -567,6 +572,7 @@ mod tests {
         editor.view.drop_down(&cx, ids!(action_choice)).set_selected_item(&mut cx, 1);
         editor.update_diagnostic_details(&mut cx);
         assert!(editor.view.label(&cx, ids!(action_details)).text().contains("The exact reviewed message"));
+        assert!(!editor.view.widget(&cx, ids!(authority_button)).disabled(&cx));
         match editor.authority_action(&cx).unwrap() {
             A2AppOp::GrantExactFlowAuthority { request_id, context, expected_epoch, expected_influences } => {
                 assert_eq!(request_id, 42);
@@ -577,9 +583,43 @@ mod tests {
             _ => panic!("Once must use the exact captured request"),
         }
         editor.action_decisions[0].request = None;
+        editor.update_diagnostic_details(&mut cx);
+        assert!(editor.view.widget(&cx, ids!(authority_button)).disabled(&cx));
+        assert!(!editor.view.button(&cx, ids!(authority_button)).borrow().unwrap().enabled());
         assert!(editor.authority_action(&cx).is_err());
+        editor.view.drop_down(&cx, ids!(action_session)).set_selected_item(&mut cx, 2);
+        editor.update_diagnostic_details(&mut cx);
+        assert!(!editor.view.widget(&cx, ids!(authority_button)).disabled(&cx),
+            "an explicit session choice may review an operation without exact contents");
         editor.snapshots[0].epoch += 1;
+        editor.update_diagnostic_details(&mut cx);
+        assert!(editor.view.widget(&cx, ids!(authority_button)).disabled(&cx));
         assert!(editor.authority_action(&cx).is_err());
+    }
+
+    #[test]
+    fn selecting_another_action_resets_session_approval_to_once() {
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+        let snapshot = context_fixture();
+        editor.snapshots.push(snapshot.clone());
+        editor.action_decisions = [42, 43].into_iter().map(|id| ActionDecision {
+            context: snapshot.context.clone(), epoch: snapshot.epoch,
+            action: flow::SensitiveAction { kind: "matrix.message.send".into(), target: "!target:example.org".into() },
+            influences: snapshot.influences.clone(), allowed: false,
+            request: Some(flow::ActionRequest { id, payload: format!("{{\"body\":\"Message {id}\"}}").into() }),
+        }).collect();
+        editor.view.drop_down(&cx, ids!(action_choice)).set_labels(&mut cx, vec!["Select action".into(), "First action".into(), "Second action".into()]);
+        editor.view.drop_down(&cx, ids!(action_choice)).set_selected_item(&mut cx, 1);
+        editor.view.drop_down(&cx, ids!(action_session)).set_selected_item(&mut cx, 2);
+        assert!(matches!(editor.authority_action(&cx).unwrap(), A2AppOp::GrantFlowAuthority { session: AuthoritySession::RobrixSession, .. }));
+        editor.view.drop_down(&cx, ids!(action_choice)).set_selected_item(&mut cx, 2);
+        let uid = editor.view.drop_down(&cx, ids!(action_choice)).widget_uid();
+        let changed = cx.capture_actions(|cx| cx.widget_action(uid, DropDownAction::Select(2)));
+        editor.handle_event(&mut cx, &Event::Actions(changed), &mut Scope::empty());
+        assert_eq!(editor.view.drop_down(&cx, ids!(action_session)).selected_item(), 0);
+        assert!(matches!(editor.authority_action(&cx).unwrap(), A2AppOp::GrantExactFlowAuthority { request_id: 43, .. }));
+        assert_eq!(editor.view.button(&cx, ids!(authority_button)).text(), "Allow this exact action once");
     }
 
     #[test]

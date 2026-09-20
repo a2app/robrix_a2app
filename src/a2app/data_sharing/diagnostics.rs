@@ -195,6 +195,8 @@ impl DataSharing {
             let labels = influences.iter().map(|influence| self.influence_label(influence)).collect::<Vec<_>>();
             let warning = if self.view.drop_down(cx, ids!(action_session)).selected_item() == 0 {
                 "Once authorizes only one unchanged retry of the complete request shown below. Other requests, paths, contents and targets need their own approval."
+            } else if self.view.drop_down(cx, ids!(action_session)).selected_item() == 1 && decision.context.room().is_none() {
+                "This context has no room to close. Choose This exact action once or Until Robrix closes before approving it."
             } else if decision.action.kind.starts_with("network.") {
                 "This HTTP method permission covers every path on this exact origin. Internet and source sharing rules still apply."
             } else { "Session permission covers repeated actions of this kind to this target, including different contents. Room permissions and source sharing rules still apply." };
@@ -217,6 +219,17 @@ impl DataSharing {
         }).unwrap_or_else(|| "No blocked sensitive actions for this account.".into());
         self.view.label(cx, ids!(action_details)).set_text(cx, &details);
         self.view.widget(cx, ids!(authority_button)).set_visible(cx, action.is_some());
+        let can_approve = action.is_some_and(|decision| {
+            self.snapshots.iter().any(|snapshot| snapshot.context == decision.context && snapshot.epoch == decision.epoch)
+                && match self.view.drop_down(cx, ids!(action_session)).selected_item() {
+                    0 => decision.request.is_some(),
+                    1 => decision.context.room().is_some(),
+                    2 => true,
+                    _ => false,
+                }
+        });
+        self.view.button(cx, ids!(authority_button)).set_enabled(cx, can_approve);
+        self.view.widget(cx, ids!(authority_button)).set_disabled(cx, !can_approve);
         self.view.widget(cx, ids!(action_session)).set_visible(cx, action.is_some());
         self.view.button(cx, ids!(authority_button)).set_text(cx,
             if self.view.drop_down(cx, ids!(action_session)).selected_item() == 0 { "Allow this exact action once" } else { "Allow actions to this target for the session" });
