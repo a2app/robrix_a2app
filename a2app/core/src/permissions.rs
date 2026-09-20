@@ -421,7 +421,7 @@ pub const MAX_ACCESS_RECORDS: usize = 240;
 
 /// The current [`PermissionStore`] schema. Bump it when a stored grant's
 /// meaning changes, and extend [`PermissionStore::migrate`].
-pub const PERMISSIONS_SCHEMA: u32 = 2;
+pub const PERMISSIONS_SCHEMA: u32 = 3;
 
 /// All grants, keyed app id -> permission id. Owned by the host, persisted
 /// whole-file on every change (it is tiny, and a lost file just re-asks).
@@ -633,8 +633,13 @@ impl PermissionStore {
     }
 
     pub fn set_matrix_write(&mut self, on: bool) {
+        let enabled = self.matrix_write();
+        let restore = self.write_policy_when_enabled();
+        let policies = self.ensure_room_policies();
+        if !on && enabled { policies.write_when_enabled = Some(policies.global.write); }
+        if on && !enabled { policies.global.write = restore; }
+        if !on { policies.global.write = PolicyDecision::Deny; }
         self.matrix_write = on;
-        self.set_global_policy(RoomAccess::Write, if on { PolicyDecision::Ask } else { PolicyDecision::Deny });
     }
 
     /// Rewrites grants whose *meaning* changed across schema versions.
@@ -649,6 +654,9 @@ impl PermissionStore {
     ///
     /// Schema 2 replaces the write switch with explicit room policies: off
     /// becomes global write Deny, on becomes Ask, and reads remain Ask.
+    /// Schema 3 adds opt-in whitelist modes and a restorable write default.
+    /// Existing Deny defaults remain hard blocks; they are never interpreted
+    /// as whitelist mode, even when the old store contains room allowances.
     pub fn migrate(&mut self) {
         if self.schema >= PERMISSIONS_SCHEMA {
             return;

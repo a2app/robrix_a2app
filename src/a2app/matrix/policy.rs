@@ -98,12 +98,14 @@ impl MatrixAuthorization {
         } else if access == RoomAccess::Write {
             return Err("Missing output room.".into());
         }
-        if access == RoomAccess::Write {
-            flow::ensure_action_allowed_for_activation(context, epoch, &SensitiveAction {
-                kind: self.capability.clone(), target: room.unwrap_or("host").into(),
-            })?;
-        }
         Ok(())
+    }
+
+    pub fn commit_action(&self, target: &str, payload: &serde_json::Value) -> Result<(), String> {
+        self.check_context()?;
+        let context = self.flow_context.as_ref().ok_or("Missing host information-flow context.")?;
+        flow::commit_exact_action_for_activation(context, self.flow_epoch.ok_or("Missing information-flow activation.")?,
+            &SensitiveAction { kind: self.capability.clone(), target: target.into() }, payload)
     }
 
     pub fn permits(&self, store: &PermissionStore, room: Option<&str>) -> bool {
@@ -132,6 +134,34 @@ pub async fn with_authorization<T>(authorization: MatrixAuthorization, future: i
 
 pub async fn with_flow_activation<T>(context: ContextId, epoch: u64, future: impl std::future::Future<Output = T>) -> T {
     FLOW_ACTIVATION.scope((context, epoch), future).await
+}
+
+fn operation_context() -> Option<ContextId> {
+    AUTHORIZATION.try_with(|authorization| authorization.flow_context.clone()).ok().flatten()
+        .or_else(|| FLOW_ACTIVATION.try_with(|(context, _)| context.clone()).ok())
+}
+
+/// Record the actual SDK operation after its final authorization check.
+///
+/// A failed or cancelled request may already have transmitted data.
+pub async fn audit_flow_operation<T, E>(context: &ContextId, recipient: Option<Recipient>, operation: impl std::future::IntoFuture<Output = Result<T, E>>) -> Result<T, E> {
+    let attempt = a2app_core::protection_audit::Attempt::start(context, recipient, a2app_core::protection_audit::ActivityKind::MatrixOperation);
+    let result = operation.into_future().await;
+    attempt.finish(result.is_ok());
+    result
+}
+
+pub async fn audit_room_operation<T, E>(room: &str, operation: impl std::future::IntoFuture<Output = Result<T, E>>) -> Result<T, E> {
+    if let Some(context) = operation_context() {
+        let recipient = Recipient::MatrixRoom { account: context.account().into(), room: room.into() };
+        audit_flow_operation(&context, Some(recipient), operation).await
+    } else { operation.into_future().await }
+}
+
+pub async fn audit_server_operation<T, E>(url: &str, operation: impl std::future::IntoFuture<Output = Result<T, E>>) -> Result<T, E> {
+    if let Some(context) = operation_context() {
+        audit_flow_operation(&context, Recipient::network_origin(url).ok(), operation).await
+    } else { operation.into_future().await }
 }
 
 pub fn ensure_live_activation() -> Result<(), String> {
@@ -165,9 +195,9 @@ pub fn ensure_room_flow_output(context: &ContextId, room: &str) -> Result<(), St
 }
 
 /// A newly granted authority cannot authorize an older worker activation.
-pub fn ensure_flow_action(context: &ContextId, action: &SensitiveAction) -> Result<(), String> {
+pub fn commit_flow_action(context: &ContextId, action: &SensitiveAction, payload: &serde_json::Value) -> Result<(), String> {
     crate::a2app::information_flow::current_context(context)?;
-    flow::ensure_action_allowed_for_activation(context, captured_flow_epoch(context)?, action)
+    flow::commit_exact_action_for_activation(context, captured_flow_epoch(context)?, action, payload)
 }
 
 /// Matrix query parameters are plaintext output to the homeserver even when
@@ -221,15 +251,15 @@ pub fn ensure_room_access(room: &str, access: RoomAccess) -> Result<(), String> 
 }
 
 /// Recheck a host-defined sensitive target immediately before its effect.
-pub fn ensure_sensitive_target(target: &str) -> Result<(), String> {
+pub fn commit_sensitive_target(target: &str, payload: &serde_json::Value) -> Result<(), String> {
     ensure_live_activation()?;
     AUTHORIZATION.try_with(|auth| {
         let context = auth.flow_context.as_ref().ok_or("Missing host information-flow context.")?;
         auth.check_context()?;
-        flow::ensure_action_allowed_for_activation(context,
+        flow::commit_exact_action_for_activation(context,
             auth.flow_epoch.ok_or("Missing information-flow activation.")?, &SensitiveAction {
             kind: auth.capability.clone(), target: target.into(),
-        })
+        }, payload)
     }).map_err(|_| "Missing host information-flow authorization.".to_string())?
 }
 

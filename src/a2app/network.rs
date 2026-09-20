@@ -42,6 +42,15 @@ impl Request {
         Ok(Some(SensitiveAction { kind: format!("network.{}", self.method), target: origin }))
     }
 
+    fn review_payload(&self) -> Result<serde_json::Value, String> {
+        let headers = self.headers.iter().map(|(name, value)| {
+            value.to_str().map(|value| (name.as_str().to_owned(), value.to_owned()))
+                .map_err(|_| "HTTP headers cannot be reviewed safely.".to_string())
+        }).collect::<Result<BTreeMap<_, _>, _>>()?;
+        Ok(serde_json::json!({ "url": self.url.as_str(), "method": self.method.as_str(),
+            "headers": headers, "body": self.body }))
+    }
+
     pub fn parse(value: &serde_json::Value) -> Result<Self, String> {
         let args: Arguments = serde_json::from_value(value.clone())
             .map_err(|_| "HTTP requests accept url, method, string headers, and an optional text body.".to_string())?;
@@ -90,6 +99,8 @@ pub async fn run(
         return Err("This mini-app instance is no longer running.".into());
     }
     let epoch = flow::context_epoch(&context)?;
+    let action = request.sensitive_action()?;
+    let payload = request.review_payload()?;
     let authorize = || {
         if lifetime.as_ref().is_some_and(|alive| !alive.load(Ordering::Acquire)) {
             return Err("This mini-app instance is no longer running.".into());
@@ -97,9 +108,6 @@ pub async fn run(
         super::information_flow::current_context(&context)?;
         let recipient = Recipient::network_origin(request.url.as_str())?;
         flow::ensure_allowed_for_activation(&context, epoch, &recipient)?;
-        if let Some(action) = request.sensitive_action()? {
-            flow::ensure_action_allowed_for_activation(&context, epoch, &action)?;
-        }
         if !super::matrix::policy::network_allowed(&subject, origin_room.as_deref(), request.url.as_str(), &consent) {
             return Err("Internet permission is no longer granted for this request.".into());
         }
@@ -112,10 +120,24 @@ pub async fn run(
     // influence before any lookup; a write may now need explicit action review.
     flow::add_influences_for_activation(&context, epoch, [Influence::InternetOrigin(origin)])?;
     authorize()?;
+    if let Some(action) = &action {
+        flow::check_exact_action_for_activation(&context, epoch, action, &payload)?;
+    }
     let _permit = REQUESTS.try_acquire().map_err(|_| "Too many active mini-app HTTP requests.".to_string())?;
     let addresses = tokio::time::timeout(Duration::from_secs(5), public_addresses(&request.url)).await
         .map_err(|_| "DNS resolution timed out.".to_string())??;
-    let response = send(&request, &addresses, &authorize).await;
+    let mut attempt = None;
+    let commit = || {
+        authorize()?;
+        if let Some(action) = &action {
+            flow::commit_exact_action_for_activation(&context, epoch, action, &payload)?;
+        }
+        attempt = Some(a2app_core::protection_audit::Attempt::start(&context,
+            Some(Recipient::network_origin(request.url.as_str())?), a2app_core::protection_audit::ActivityKind::HttpRequest));
+        Ok(())
+    };
+    let response = send(&request, &addresses, &authorize, commit).await;
+    if let Some(attempt) = attempt { attempt.finish(response.is_ok()); }
     authorize()?;
     response
 }
@@ -189,6 +211,7 @@ async fn send(
     request: &Request,
     addresses: &[SocketAddr],
     authorize: impl Fn() -> Result<(), String>,
+    commit: impl FnOnce() -> Result<(), String>,
 ) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -207,6 +230,7 @@ async fn send(
     authorize()?;
     let mut outgoing = client.request(request.method.clone(), request.url.clone()).headers(request.headers.clone());
     if let Some(body) = &request.body { outgoing = outgoing.body(body.clone()); }
+    commit()?;
     let mut response = outgoing.send().await.map_err(|_| "The HTTP request failed.".to_string())?;
     authorize()?;
     if response.status().is_redirection() {
@@ -306,11 +330,11 @@ mod tests {
     async fn pinned_transport_returns_text_without_following_redirects() {
         let (address, thread) = server("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/leak\r\nContent-Length: 0\r\n\r\n");
         let request = Request::parse(&serde_json::json!({"url":format!("http://example.invalid:{}/",address.port())})).unwrap();
-        assert!(send(&request, &[address], || Ok(())).await.unwrap_err().contains("Redirects"));
+        assert!(send(&request, &[address], || Ok(()), || Ok(())).await.unwrap_err().contains("Redirects"));
         thread.join().unwrap();
         let (address, thread) = server("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nSet-Cookie: hidden=secret\r\n\r\nhello");
         let request = Request::parse(&serde_json::json!({"url":format!("http://example.invalid:{}/",address.port())})).unwrap();
-        let response: serde_json::Value = serde_json::from_str(&send(&request, &[address], || Ok(())).await.unwrap()).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&send(&request, &[address], || Ok(()), || Ok(())).await.unwrap()).unwrap();
         assert_eq!(response["body"], "hello");
         assert!(response["headers"].get("set-cookie").is_none());
         thread.join().unwrap();
@@ -324,7 +348,7 @@ mod tests {
         let result = send(&request, &[address], || {
             calls.set(calls.get()+1);
             if calls.get() > 1 { Err("revoked".into()) } else { Ok(()) }
-        }).await;
+        }, || Ok(())).await;
         assert_eq!(result.unwrap_err(), "revoked");
         thread.join().unwrap();
     }
@@ -334,7 +358,7 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let request = Request::parse(&serde_json::json!({"url":format!("http://example.invalid:{}/",address.port())})).unwrap();
-        assert_eq!(send(&request, &[address], || Err("blocked".into())).await.unwrap_err(), "blocked");
+        assert_eq!(send(&request, &[address], || Err("blocked".into()), || Ok(())).await.unwrap_err(), "blocked");
         assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
         let context = ContextId::App { account: "test".into(), app: "test".into(), room: None };
         let dead = Arc::new(AtomicBool::new(false));
@@ -347,7 +371,7 @@ mod tests {
         let body = "x".repeat(MAX_RESPONSE_BODY+1);
         let (address, thread) = server(format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n", body.len(), body));
         let request = Request::parse(&serde_json::json!({"url":format!("http://example.invalid:{}/",address.port())})).unwrap();
-        assert!(send(&request, &[address], || Ok(())).await.unwrap_err().contains("size limit"));
+        assert!(send(&request, &[address], || Ok(()), || Ok(())).await.unwrap_err().contains("size limit"));
         thread.join().unwrap();
     }
 
@@ -359,6 +383,40 @@ mod tests {
         let addresses = resolver.resolve("example.com".parse().unwrap()).await.unwrap().collect::<Vec<_>>();
         assert_eq!(addresses, vec![address]);
         assert!(resolver.resolve("other.example.com".parse().unwrap()).await.is_err());
+    }
+
+    #[test]
+    fn exact_http_review_includes_path_query_headers_method_and_body() {
+        let make = |value| Request::parse(&value).unwrap().review_payload().unwrap();
+        let original = serde_json::json!({ "url": "https://EXAMPLE.org:443/path?to=alice#not-sent", "method": "POST", "headers": { "X-Target": "alice" }, "body": "approved" });
+        let payload = make(original.clone());
+        assert_eq!(payload["url"], "https://example.org/path?to=alice");
+        assert_eq!(payload["headers"]["x-target"], "alice");
+        assert_eq!(payload["body"], "approved");
+        for (field, value) in [("url", "https://example.org/other?to=alice"), ("url", "https://example.org/path?to=bob"), ("method", "PUT"), ("body", "changed")] {
+            let mut changed = original.clone(); changed[field] = value.into();
+            assert_ne!(make(changed), payload);
+        }
+        let mut changed = original.clone(); changed["headers"]["X-Target"] = "bob".into();
+        assert_ne!(make(changed), payload);
+    }
+
+    #[tokio::test]
+    async fn transport_consumes_once_at_send_and_never_on_rechecks() {
+        let (address, thread) = server("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+        let request = Request::parse(&serde_json::json!({ "url": format!("http://example.invalid:{}/", address.port()), "method": "POST", "body": "reviewed" })).unwrap();
+        let probes = std::cell::Cell::new(0);
+        let commits = std::cell::Cell::new(0);
+        send(&request, &[address], || { probes.set(probes.get() + 1); Ok(()) }, || { commits.set(commits.get() + 1); Ok(()) }).await.unwrap();
+        assert_eq!(commits.get(), 1);
+        assert!(probes.get() > 1);
+        thread.join().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let request = Request::parse(&serde_json::json!({ "url": format!("http://example.invalid:{}/", address.port()) })).unwrap();
+        assert_eq!(send(&request, &[address], || Ok(()), || Err("review expired".into())).await.unwrap_err(), "review expired");
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
     }
 
 }

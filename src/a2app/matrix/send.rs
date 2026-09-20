@@ -13,7 +13,9 @@ pub(super) async fn message(room_id: OwnedRoomId, body: String) -> Result<String
     super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
-    room.send(RoomMessageEventContent::text_plain(body)).await
+    let content = RoomMessageEventContent::text_plain(body);
+    super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::to_value(&content).map_err(|_| "Cannot review message content.")?)?;
+    super::policy::audit_room_operation(room_id.as_str(), room.send(content)).await
         .map_err(|e| format!("couldn't send the message: {e}"))?;
     Ok(String::from("{}"))
 }
@@ -37,11 +39,12 @@ pub(super) async fn reply(
     } else {
         Reply { event_id, enforce_thread: EnforceThread::MaybeThreaded, add_mentions: AddMentions::Yes }
     };
-    let content = room.make_reply_event(RoomMessageEventContentWithoutRelation::text_plain(body), reply).await
+    let content = super::policy::audit_server_operation(client.homeserver().as_str(), room.make_reply_event(RoomMessageEventContentWithoutRelation::text_plain(body), reply)).await
         .map_err(|e| format!("couldn't build the reply: {e}"))?;
     super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
     super::policy::ensure_server_output(client.homeserver().as_str())?;
-    let sent = room.send(content).await
+    super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::to_value(&content).map_err(|_| "Cannot review reply content.")?)?;
+    let sent = super::policy::audit_room_operation(room_id.as_str(), room.send(content)).await
         .map_err(|e| format!("couldn't send the reply: {e}"))?;
     Ok(serde_json::json!({ "event_id": sent.response.event_id }).to_string())
 }
@@ -64,7 +67,7 @@ pub(super) async fn react(room_id: OwnedRoomId, event_id: OwnedEventId, key: Str
             ..Default::default()
         };
         super::policy::ensure_server_output(client.homeserver().as_str())?;
-        let page = room.relations(event_id.clone(), opts).await
+        let page = super::policy::audit_server_operation(client.homeserver().as_str(), room.relations(event_id.clone(), opts)).await
             .map_err(|e| format!("couldn't load the reactions: {e}"))?;
         let found = page.chunk.iter().find_map(|event| {
             let Ok(AnySyncTimelineEvent::MessageLike(
@@ -82,12 +85,15 @@ pub(super) async fn react(room_id: OwnedRoomId, event_id: OwnedEventId, key: Str
     super::policy::ensure_server_output(client.homeserver().as_str())?;
     let added = match mine {
         Some(reaction_id) => {
-            room.redact(&reaction_id, None, None).await
+            super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::json!({ "remove_reaction": reaction_id, "event_id": event_id, "key": key }))?;
+            super::policy::audit_server_operation(client.homeserver().as_str(), room.redact(&reaction_id, None, None)).await
                 .map_err(|e| format!("couldn't remove the reaction: {e}"))?;
             false
         }
         None => {
-            room.send(ReactionEventContent::new(Annotation::new(event_id, key))).await
+            let content = ReactionEventContent::new(Annotation::new(event_id, key));
+            super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::to_value(&content).map_err(|_| "Cannot review reaction content.")?)?;
+            super::policy::audit_room_operation(room_id.as_str(), room.send(content)).await
                 .map_err(|e| format!("couldn't send the reaction: {e}"))?;
             true
         }
@@ -100,7 +106,8 @@ pub(super) async fn typing(room_id: OwnedRoomId, typing: bool) -> Result<String,
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
     super::policy::ensure_server_output(client.homeserver().as_str())?;
-    room.typing_notice(typing).await
+    super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::json!({ "typing": typing }))?;
+    super::policy::audit_server_operation(client.homeserver().as_str(), room.typing_notice(typing)).await
         .map_err(|e| format!("couldn't send the typing notice: {e}"))?;
     Ok(String::from("{}"))
 }
@@ -117,7 +124,8 @@ pub(super) async fn read_receipt(room_id: OwnedRoomId, event_id: Option<OwnedEve
     super::policy::ensure_server_output(client.homeserver().as_str())?;
     let receipt_type = preferred_receipt_type();
     if let Some(event_id) = event_id {
-        room.send_single_receipt(receipt_type, ReceiptThread::Unthreaded, event_id).await
+        super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::json!({ "event_id": event_id, "type": receipt_type, "thread": "unthreaded" }))?;
+        super::policy::audit_server_operation(client.homeserver().as_str(), room.send_single_receipt(receipt_type, ReceiptThread::Unthreaded, event_id)).await
             .map_err(|e| format!("couldn't send the read receipt: {e}"))?;
         return Ok(String::from("{}"));
     }
@@ -134,6 +142,7 @@ pub(super) async fn read_receipt(room_id: OwnedRoomId, event_id: Option<OwnedEve
         latest = events.iter().rev().find_map(|e| e.event_id().map(ToOwned::to_owned));
     }
     let latest = latest.ok_or("no messages to mark as read")?;
+    let payload = serde_json::json!({ "fully_read": latest, "receipt_event_id": latest, "receipt_type": receipt_type });
     let receipts = Receipts::new().fully_read_marker(latest.clone());
     let receipts = if matches!(receipt_type, ReceiptType::ReadPrivate) {
         receipts.private_read_receipt(latest)
@@ -142,7 +151,8 @@ pub(super) async fn read_receipt(room_id: OwnedRoomId, event_id: Option<OwnedEve
     };
     super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
     super::policy::ensure_server_output(client.homeserver().as_str())?;
-    room.send_multiple_receipts(receipts).await
+    super::policy::commit_sensitive_target(room_id.as_str(), &payload)?;
+    super::policy::audit_server_operation(client.homeserver().as_str(), room.send_multiple_receipts(receipts)).await
         .map_err(|e| format!("couldn't mark the room as read: {e}"))?;
     Ok(String::from("{}"))
 }
@@ -152,10 +162,11 @@ pub(super) async fn pin(room_id: OwnedRoomId, event_id: OwnedEventId, pinned: bo
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
     super::policy::ensure_server_output(client.homeserver().as_str())?;
+    super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::json!({ "event_id": event_id, "pinned": pinned }))?;
     let result = if pinned {
-        room.pin_event(&event_id).await
+        super::policy::audit_server_operation(client.homeserver().as_str(), room.pin_event(&event_id)).await
     } else {
-        room.unpin_event(&event_id).await
+        super::policy::audit_server_operation(client.homeserver().as_str(), room.unpin_event(&event_id)).await
     };
     result.map_err(|e| format!("couldn't {} the message: {e}", if pinned { "pin" } else { "unpin" }))?;
     Ok(String::from("{}"))
@@ -166,10 +177,12 @@ pub(super) async fn room_flag(room_id: OwnedRoomId, flag: RoomFlag, on: bool) ->
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
     super::policy::ensure_server_output(client.homeserver().as_str())?;
+    let flag_name = match flag { RoomFlag::Favorite => "favorite", RoomFlag::LowPriority => "low_priority", RoomFlag::Unread => "unread" };
+    super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::json!({ "flag": flag_name, "on": on }))?;
     let result = match flag {
-        RoomFlag::Favorite => room.set_is_favourite(on, None).await,
-        RoomFlag::LowPriority => room.set_is_low_priority(on, None).await,
-        RoomFlag::Unread => room.set_unread_flag(on).await,
+        RoomFlag::Favorite => super::policy::audit_server_operation(client.homeserver().as_str(), room.set_is_favourite(on, None)).await,
+        RoomFlag::LowPriority => super::policy::audit_server_operation(client.homeserver().as_str(), room.set_is_low_priority(on, None)).await,
+        RoomFlag::Unread => super::policy::audit_server_operation(client.homeserver().as_str(), room.set_unread_flag(on)).await,
     };
     result.map_err(|e| format!("couldn't update the room flag: {e}"))?;
     if matches!(flag, RoomFlag::Unread) {

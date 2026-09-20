@@ -227,6 +227,7 @@ pub(crate) fn provider(prefs: &AgentPrefs, context: ContextId, shutdown: Arc<Ato
         Ok(())
     });
     let response_context = context.clone();
+    let audit_context = context.clone();
     let response_model = config.recipient.id.clone();
     let approve: Approval = Arc::new(move || {
         if shutdown.load(Ordering::Acquire) { return Err("Model request cancelled.".into()); }
@@ -234,6 +235,7 @@ pub(crate) fn provider(prefs: &AgentPrefs, context: ContextId, shutdown: Arc<Ato
         Ok(())
     });
     let mut provider = GuardedProvider::new(config, approve)?;
+    provider.audit_context = Some(audit_context);
     provider.check_config = Some(check_config);
     provider.on_response = Some(Arc::new(move || {
         information_flow::add_influences_for_activation(&response_context, epoch, [Influence::Model(response_model.clone())])
@@ -241,7 +243,7 @@ pub(crate) fn provider(prefs: &AgentPrefs, context: ContextId, shutdown: Arc<Ato
     Ok(Arc::new(provider))
 }
 
-struct GuardedProvider { config: Resolved, client: reqwest::Client, approve: Approval, check_config: Option<Approval>, on_response: Option<Approval> }
+struct GuardedProvider { config: Resolved, client: reqwest::Client, approve: Approval, check_config: Option<Approval>, on_response: Option<Approval>, audit_context: Option<ContextId> }
 
 impl GuardedProvider {
     fn new(config: Resolved, approve: Approval) -> Result<Self, String> {
@@ -250,7 +252,7 @@ impl GuardedProvider {
             .no_gzip().no_brotli().no_deflate().no_zstd()
             .timeout(Duration::from_secs(180)).build()
             .map_err(|_| "Cannot initialize the guarded model transport.")?;
-        Ok(Self { config, client, approve, check_config: None, on_response: None })
+        Ok(Self { config, client, approve, check_config: None, on_response: None, audit_context: None })
     }
 
     async fn send(&self, body: Value) -> eyre::Result<Value> {
@@ -268,16 +270,22 @@ impl GuardedProvider {
         // Re-check while a request is in flight as well as between model calls.
         // Revocation cannot recall bytes already delivered while authorized.
         let response = async {
-            let mut response = request.send().await.map_err(|_| eyre::eyre!("Model transport failed."))?;
-            if !response.status().is_success() {
-                return Err(eyre::eyre!("Model service returned HTTP {}. Redirects are not followed.", response.status().as_u16()));
-            }
-            let mut bytes = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(|_| eyre::eyre!("Model response could not be read."))? {
-                if bytes.len() + chunk.len() > 16 * 1024 * 1024 { return Err(eyre::eyre!("Model response exceeded the size limit.")); }
-                bytes.extend_from_slice(&chunk);
-            }
-            serde_json::from_slice(&bytes).map_err(|_| eyre::eyre!("Model service returned an invalid response."))
+            let attempt = self.audit_context.as_ref().map(|context| a2app_core::protection_audit::Attempt::start(context,
+                Some(Recipient::ModelProvider(self.config.recipient.id.clone())), a2app_core::protection_audit::ActivityKind::ModelRequest));
+            let result = async {
+                let mut response = request.send().await.map_err(|_| eyre::eyre!("Model transport failed."))?;
+                if !response.status().is_success() {
+                    return Err(eyre::eyre!("Model service returned HTTP {}. Redirects are not followed.", response.status().as_u16()));
+                }
+                let mut bytes = Vec::new();
+                while let Some(chunk) = response.chunk().await.map_err(|_| eyre::eyre!("Model response could not be read."))? {
+                    if bytes.len() + chunk.len() > 16 * 1024 * 1024 { return Err(eyre::eyre!("Model response exceeded the size limit.")); }
+                    bytes.extend_from_slice(&chunk);
+                }
+                serde_json::from_slice(&bytes).map_err(|_| eyre::eyre!("Model service returned an invalid response."))
+            }.await;
+            if let Some(attempt) = attempt { attempt.finish(result.is_ok()); }
+            result
         };
         tokio::pin!(response);
         let mut interval = tokio::time::interval(Duration::from_millis(100));

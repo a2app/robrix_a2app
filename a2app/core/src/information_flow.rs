@@ -27,7 +27,7 @@ mod sharing;
 mod integrity;
 mod storage;
 pub use sharing::{ReaderScope, SharingDuration, SharingGrant, FlowDecision};
-pub use integrity::{Influence, Influences, SensitiveAction, AuthoritySession, ActionAuthority, ActionDecision};
+pub use integrity::{Influence, Influences, SensitiveAction, AuthoritySession, ActionAuthority, ActionDecision, ActionRequest, ACTION_REVIEW_REQUIRED};
 use storage::{Metadata, StoredContext, StoredProvenance};
 
 /// A private source identified by the host, never by an app-supplied argument.
@@ -102,6 +102,7 @@ impl ContextId {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextSnapshot {
     pub context: ContextId,
+    /// Zero denotes retained provenance without a live activation.
     pub epoch: u64,
     pub label: Label,
     pub clearance: Option<Label>,
@@ -129,6 +130,7 @@ pub struct Registry {
     context_epochs: BTreeMap<ContextId, u64>,
     session_grants: Vec<SharingGrant>,
     authorities: Vec<ActionAuthority>,
+    pending_actions: VecDeque<integrity::PendingAction>,
     next_ephemeral_id: u64,
     decisions: RefCell<VecDeque<FlowDecision>>,
     action_decisions: RefCell<VecDeque<ActionDecision>>,
@@ -145,7 +147,7 @@ impl Registry {
         };
         storage::validate_metadata(&metadata)?;
         Ok(Self {
-            root, metadata, contexts: BTreeSet::new(), context_epochs: BTreeMap::new(), session_grants: Vec::new(), authorities: Vec::new(),
+            root, metadata, contexts: BTreeSet::new(), context_epochs: BTreeMap::new(), session_grants: Vec::new(), authorities: Vec::new(), pending_actions: VecDeque::new(),
             next_ephemeral_id: 1 << 63, decisions: RefCell::new(VecDeque::new()),
             action_decisions: RefCell::new(VecDeque::new()), persistence_error: None,
         })
@@ -246,6 +248,20 @@ impl Registry {
         Ok(self.metadata.contexts.iter().filter(|entry| self.contexts.contains(&entry.context)).map(|entry| {
             let provenance = storage::effective_provenance(&self.metadata, entry);
             ContextSnapshot { context: entry.context.clone(), epoch: self.context_epochs[&entry.context], label: provenance.label,
+                clearance: entry.clearance.clone(), influences: provenance.influences }
+        }).collect())
+    }
+
+    /// Inspect durable provenance, including compartments that have stopped.
+    /// Inactive snapshots use epoch zero and never authorize an operation.
+    pub fn retained_contexts(&self) -> Result<Vec<ContextSnapshot>, String> {
+        self.check_healthy()?;
+        Ok(self.metadata.contexts.iter().map(|entry| {
+            let provenance = storage::effective_provenance(&self.metadata, entry);
+            let epoch = if self.contexts.contains(&entry.context) {
+                self.context_epochs.get(&entry.context).copied().unwrap_or(0)
+            } else { 0 };
+            ContextSnapshot { context: entry.context.clone(), epoch, label: provenance.label,
                 clearance: entry.clearance.clone(), influences: provenance.influences }
         }).collect())
     }
@@ -361,6 +377,7 @@ impl Registry {
     }
 
     pub fn remove_context(&mut self, context: &ContextId) {
+        self.forget_exact_actions(context);
         self.contexts.remove(context);
         self.context_epochs.remove(context);
         self.authorities.retain(|grant| &grant.context != context);
@@ -375,6 +392,7 @@ impl Registry {
 
     pub fn close_room_session(&mut self, account: &str, room: &str) -> Result<(), String> {
         self.check_healthy()?;
+        self.close_exact_room(account, room);
         self.session_grants.retain(|grant| !matches!(&grant.duration,
             SharingDuration::RoomSession { account: a, room: r } if a == account && r == room));
         self.authorities.retain(|grant| !matches!(&grant.session,
@@ -386,6 +404,8 @@ impl Registry {
         self.check_healthy()?;
         self.session_grants.clear();
         self.authorities.clear();
+        self.pending_actions.clear();
+        self.action_decisions.borrow_mut().clear();
         self.contexts.clear();
         self.context_epochs.clear();
         Ok(())
@@ -608,6 +628,10 @@ pub fn contexts() -> Result<Vec<ContextSnapshot>, String> {
     with_registry(|registry| registry.contexts())
 }
 
+pub fn retained_contexts() -> Result<Vec<ContextSnapshot>, String> {
+    with_registry(|registry| registry.retained_contexts())
+}
+
 pub fn clearance(context: &ContextId) -> Result<Option<Label>, String> {
     with_registry(|registry| registry.clearance(context))
 }
@@ -694,6 +718,22 @@ pub fn grant_authority_checked(context: &ContextId, action: SensitiveAction, ses
 
 pub fn grant_authority_for_activation(context: &ContextId, action: SensitiveAction, session: AuthoritySession, expected: &Influences, expected_epoch: u64) -> Result<u64, String> {
     with_registry(|registry| registry.grant_authority_for_activation(context, action, session, expected, expected_epoch))
+}
+
+pub fn check_exact_action_for_activation(context: &ContextId, epoch: u64, action: &SensitiveAction, payload: &serde_json::Value) -> Result<(), String> {
+    with_registry(|registry| registry.check_exact_action_for_activation(context, epoch, action, payload))
+}
+
+pub fn commit_exact_action_for_activation(context: &ContextId, epoch: u64, action: &SensitiveAction, payload: &serde_json::Value) -> Result<(), String> {
+    with_registry(|registry| registry.commit_exact_action_for_activation(context, epoch, action, payload))
+}
+
+pub fn grant_exact_action_for_activation(context: &ContextId, request_id: u64, expected: &Influences, epoch: u64) -> Result<u64, String> {
+    with_registry(|registry| registry.grant_exact_action_for_activation(context, request_id, expected, epoch))
+}
+
+pub fn cancel_exact_action(request_id: u64) -> Result<bool, String> {
+    with_registry(|registry| registry.cancel_exact_action(request_id))
 }
 
 pub fn authorities() -> Result<Vec<ActionAuthority>, String> {
@@ -881,6 +921,35 @@ mod tests {
     }
 
     #[test]
+    fn retained_context_inspection_survives_stop_and_restart_without_authority() {
+        let root = TestRoot::new();
+        let context = app("test", "alice", "room-a");
+        let source = room_source("alice", "room-b");
+        let mut registry = root.registry();
+        registry.register_context(&context).unwrap();
+        registry.add_sources(&context, [source.clone()]).unwrap();
+        let active = registry.context_epoch(&context).unwrap();
+        assert_ne!(active, 0);
+        assert_eq!(registry.retained_contexts().unwrap(), registry.contexts().unwrap());
+        registry.remove_context(&context);
+        assert!(registry.contexts().unwrap().is_empty());
+        let retained = registry.retained_contexts().unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].epoch, 0);
+        assert!(retained[0].label.contains(&source));
+        assert!(registry.ensure_context_epoch(&context, 0).is_err());
+        assert!(registry.ensure_allowed_for_activation(&context, active, &room_recipient("alice", "room-b")).is_err());
+        drop(registry);
+        let mut restored = root.registry();
+        assert!(restored.contexts().unwrap().is_empty());
+        assert_eq!(restored.retained_contexts().unwrap(), retained);
+        restored.register_context(&context).unwrap();
+        assert!(restored.ensure_context_epoch(&context, 0).is_err());
+        assert_ne!(restored.context_epoch(&context).unwrap(), active);
+        assert_eq!(restored.retained_contexts().unwrap()[0].label, retained[0].label);
+    }
+
+    #[test]
     fn legacy_app_storage_with_no_provenance_is_unknown_private() {
         let root = TestRoot::new();
         let storage = root.0.join("app_data/test");
@@ -1051,3 +1120,6 @@ mod tests {
 
 #[cfg(test)]
 mod phase2_tests;
+
+#[cfg(test)]
+mod exact_action_tests;

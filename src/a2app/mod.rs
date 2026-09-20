@@ -27,6 +27,7 @@ pub mod host_set;
 pub mod instances;
 pub mod information_flow;
 pub mod data_sharing;
+pub mod protection_inspector;
 pub mod network;
 /// The Mini Apps management screen (a top-level navigation tab page).
 pub mod mini_apps_screen;
@@ -52,6 +53,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
     host_set::script_mod(vm);
     permission_prompt::script_mod(vm);
     data_sharing::script_mod(vm);
+    protection_inspector::script_mod(vm);
     ai_room_events::script_mod(vm);
     ai_room_panel::script_mod(vm);
     host_pane::script_mod(vm);

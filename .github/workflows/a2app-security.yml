@@ -1,0 +1,94 @@
+name: Mini Apps security
+
+on:
+  push:
+    branches: [a2app, main]
+    paths: ['a2app/**', 'src/**', 'Cargo.toml', 'Cargo.lock', 'build.rs', 'rust-toolchain.toml', '.cargo/**', '.github/workflows/a2app-security.yml']
+  pull_request:
+    paths: ['a2app/**', 'src/**', 'Cargo.toml', 'Cargo.lock', 'build.rs', 'rust-toolchain.toml', '.cargo/**', '.github/workflows/a2app-security.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a2app-security-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux dependencies and enable sandbox test prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap libssl-dev libsqlite3-dev pkg-config clang libclang-dev libxcursor-dev libx11-dev libasound2-dev libpulse-dev libwayland-dev libxkbcommon-dev
+          # Only the disposable CI runner is changed. Production fails closed
+          # when namespaces or other required sandbox facilities are disabled.
+          if test -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Check out the exact locked Octos worker revision
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib, subprocess, tomllib
+          packages = tomllib.loads(pathlib.Path('Cargo.lock').read_text())['package']
+          sources = {p['source'] for p in packages if p['name'].startswith('octos-') and p.get('source', '').startswith('git+')}
+          if len(sources) != 1:
+              raise SystemExit('Expected exactly one locked Octos source')
+          source = sources.pop()
+          repository, revision = source[4:].split('#', 1)
+          repository = repository.split('?', 1)[0]
+          if repository != 'https://github.com/project-robius/octos' or len(revision) != 40 or any(c not in '0123456789abcdef' for c in revision):
+              raise SystemExit('Unexpected Octos repository or revision; review this security workflow')
+          subprocess.run(['git', 'init', '.octos-security-worker'], check=True)
+          subprocess.run(['git', '-C', '.octos-security-worker', 'fetch', '--depth=1', repository, revision], check=True)
+          subprocess.run(['git', '-C', '.octos-security-worker', 'checkout', '--detach', 'FETCH_HEAD'], check=True)
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: a2app-security
+          workspaces: |
+            . -> target
+            .octos-security-worker -> target
+      - name: Core policy and adversarial Splash tests
+        run: cargo test -p a2app-core --locked
+      - name: Default and embedded agent tests
+        run: |
+          cargo test -p a2app-agent --lib --locked
+          cargo test -p a2app-agent --lib --features embedded --locked
+      - name: Application policy, transport and UI tests
+        run: |
+          cargo test -p robrix --features a2app --lib a2app:: --locked
+      - name: Embedded application integration
+        run: cargo check -p robrix --features a2app-embedded-agent --locked
+      - name: Build the confined worker and run native escape probes
+        working-directory: .octos-security-worker
+        run: |
+          cargo build -p octos-cli --no-default-features --locked
+          OCTOS_HOST_MANAGED_BINARY="$PWD/target/debug/octos" cargo test -p octos-sandbox --test host_managed --locked
+      - name: Real Robrix to confined Octos model, tool and cancellation test
+        shell: bash
+        run: |
+          set -o pipefail
+          ROBRIX_TEST_OCTOS="$PWD/.octos-security-worker/target/debug/octos" cargo test -p a2app-agent --lib --locked host_broker::tests::confined_octos_uses_parent_model_tools_and_cancellation -- --ignored --exact | tee "$RUNNER_TEMP/robrix-confined-worker-test.log"
+          python3 - <<'PY'
+          import os, pathlib
+          result = pathlib.Path(os.environ['RUNNER_TEMP'], 'robrix-confined-worker-test.log').read_text()
+          if 'test result: ok. 1 passed;' not in result:
+              raise SystemExit('The required confined worker test did not execute exactly once')
+          PY

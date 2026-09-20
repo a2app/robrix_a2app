@@ -172,10 +172,14 @@ pub fn check_request(request: &SplashHostRequest, capability: &Capability, args:
     let contract = capability.flow_contract().ok_or("This service has no information-flow contract.")?;
     let target = services::permission_context(&request.service, args, room).target_room;
     check_output(&context, contract, args, target)?;
-    if let Some(action) = contract.sensitive_action(capability.id, args, target) {
-        flow::ensure_action_allowed(&context, &action)?;
-    }
     record_contract_source(&context, contract, room, target, registry)?;
+    // Deferred Matrix/network/UI effects capture their resolved contents at
+    // the final sink. Immediate platform effects commit this immutable call.
+    let deferred = request.service.starts_with("matrix.")
+        || matches!(capability.id, "host.composer.insert" | "host.composer.reply_to" | "host.nav.app");
+    if !deferred && let Some(action) = contract.sensitive_action(capability.id, args, target) {
+        flow::commit_exact_action_for_activation(&context, flow::context_epoch(&context)?, &action, args)?;
+    }
     Ok(())
 }
 

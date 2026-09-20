@@ -13,7 +13,8 @@ pub(super) async fn invite(room_id: OwnedRoomId, user_id: OwnedUserId) -> Result
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
     super::policy::ensure_server_output(client.homeserver().as_str())?;
-    room.invite_user_by_id(&user_id).await
+    super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::json!({ "user_id": user_id }))?;
+    super::policy::audit_server_operation(client.homeserver().as_str(), room.invite_user_by_id(&user_id)).await
         .map_err(|e| format!("couldn't invite {user_id}: {e}"))?;
     Ok(String::from("{}"))
 }
@@ -27,13 +28,15 @@ pub(super) async fn join(room: OwnedRoomOrAliasId, mut via: Vec<OwnedServerName>
     // request cannot redirect a permitted join into a protected room.
     let room = OwnedRoomOrAliasId::from(target);
     super::policy::ensure_server_output(client.homeserver().as_str())?;
-    let (joined, knocked) = match client.join_room_by_id_or_alias(&room, &via).await {
+    super::policy::commit_sensitive_target(room.as_str(), &serde_json::json!({ "operation": "join", "room_id": room, "via": via }))?;
+    let (joined, knocked) = match super::policy::audit_server_operation(client.homeserver().as_str(), client.join_room_by_id_or_alias(&room, &via)).await {
         Ok(joined) => (joined, false),
         // An invite-only room refuses the join, so knocking is the next best ask.
         Err(e) if matches!(e.client_api_error_kind(), Some(ErrorKind::Forbidden)) => {
             ensure_room_access(room.as_str(), RoomAccess::Write)?;
             super::policy::ensure_server_output(client.homeserver().as_str())?;
-            let knocked = client.knock(room, None, via).await
+            super::policy::commit_sensitive_target(room.as_str(), &serde_json::json!({ "operation": "knock", "room_id": room, "via": via }))?;
+            let knocked = super::policy::audit_server_operation(client.homeserver().as_str(), client.knock(room, None, via)).await
                 .map_err(|e| format!("couldn't knock on the room: {e}"))?;
             (knocked, true)
         }
@@ -54,7 +57,8 @@ pub(super) async fn invite_respond(room_id: OwnedRoomId, accept: bool) -> Result
         return Err("there's no pending invite for that room".into());
     }
     super::policy::ensure_server_output(client.homeserver().as_str())?;
-    let result = if accept { room.join().await } else { room.leave().await };
+    super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::json!({ "accept": accept }))?;
+    let result = if accept { super::policy::audit_server_operation(client.homeserver().as_str(), room.join()).await } else { super::policy::audit_server_operation(client.homeserver().as_str(), room.leave()).await };
     result.map_err(|e| format!("couldn't {} the invite: {e}", if accept { "accept" } else { "decline" }))?;
     Ok(String::from("{}"))
 }
@@ -72,8 +76,8 @@ pub(super) async fn dm_open(user_id: OwnedUserId) -> Result<String, String> {
                 return Err(super::policy::ROOM_ACCESS_DENIED.to_string());
             }
             super::policy::ensure_server_output(client.homeserver().as_str())?;
-            super::policy::ensure_sensitive_target("host")?;
-            let room = client.create_dm(&user_id).await
+            super::policy::commit_sensitive_target("host", &serde_json::json!({ "create_dm_with": user_id }))?;
+            let room = super::policy::audit_server_operation(client.homeserver().as_str(), client.create_dm(&user_id)).await
                 .map_err(|e| format!("couldn't start a chat with {user_id}: {e}"))?;
             (room, true)
         }

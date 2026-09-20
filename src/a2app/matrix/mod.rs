@@ -506,7 +506,7 @@ async fn run_matrix_request(request: A2AppMatrixRequest, authorization: Option<M
                                 return Some(event);
                             }
                         }
-                        room_ref.event(event_id, None).await.ok()
+                        policy::audit_server_operation(room_ref.client().homeserver().as_str(), room_ref.event(event_id, None)).await.ok()
                     })
                 ).await;
                 for event in fetched.into_iter().flatten() {
@@ -533,7 +533,7 @@ async fn run_matrix_request(request: A2AppMatrixRequest, authorization: Option<M
                 let client = get_client().ok_or("not logged in")?;
                 let room = client.get_room(&room_id).ok_or("room not found")?;
                 let opts = ListThreadsOptions::default();
-                let roots = room.list_threads(opts).await
+                let roots = policy::audit_server_operation(client.homeserver().as_str(), room.list_threads(opts)).await
                     .map_err(|e| format!("couldn't list threads: {e}"))?;
                 let mut out: Vec<serde_json::Value> = Vec::new();
                 for event in roots.chunk.iter().take(limit as usize) {
@@ -636,7 +636,7 @@ async fn run_matrix_request(request: A2AppMatrixRequest, authorization: Option<M
                     // their source was an encrypted room. Room output consent
                     // does not authorize this distinct network recipient.
                     policy::ensure_server_output(client.homeserver().as_str())?;
-                    let response = client.send(Request::new(categories)).await
+                    let response = policy::audit_server_operation(client.homeserver().as_str(), client.send(Request::new(categories))).await
                         .map_err(|e| format!("server search failed: {e}"))?;
                     server_used = true;
                     for hit in response.search_categories.room_events.results {
@@ -696,7 +696,7 @@ async fn run_matrix_request(request: A2AppMatrixRequest, authorization: Option<M
             let result: Result<String, String> = async {
                 let client = get_client().ok_or("not logged in")?;
                 let user_id = current_user_id().ok_or("not logged in")?;
-                let display_name = client.account().get_display_name().await
+                let display_name = policy::audit_server_operation(client.homeserver().as_str(), client.account().get_display_name()).await
                     .ok()
                     .flatten()
                     .unwrap_or_else(|| user_id.localpart().to_string());

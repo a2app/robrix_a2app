@@ -20,7 +20,7 @@ use a2app_core::bundle;
 use a2app_core::manifest::{A2AppScope, AppRegistry, MiniAppId, MiniAppManifest};
 use a2app_core::permissions::{
     Effective, GrantState, Permission, PermissionStore, agent_subject, is_agent_subject,
-    GrantDuration, NetworkScope, PermissionContext, PolicyDecision, RoomAccess, RoomScope,
+    GrantDuration, NetworkScope, PermissionContext, PolicyDecision, RoomAccess, RoomPolicyMode, RoomScope,
 };
 #[cfg(unix)]
 use a2app_core::permissions::agent_room_of;
@@ -178,6 +178,7 @@ pub struct AppToolPending {
     pub display_name: String,
     pub answer: Sender<Result<String, String>>,
     pub since: Instant,
+    pub audit: a2app_core::protection_audit::Attempt,
 }
 
 thread_local! {
@@ -393,6 +394,52 @@ impl AiRoomInfo {
     }
 }
 
+/// A completed build waiting for review; Retry installs these captured bytes.
+struct PendingGeneratedApp {
+    manifest: Box<MiniAppManifest>,
+    refine_of: Option<MiniAppId>,
+    context: a2app_core::information_flow::ContextId,
+    epoch: u64,
+    request: String,
+    action_target: Option<String>,
+    review_id: Option<u64>,
+}
+
+impl PendingGeneratedApp {
+    fn action(&self) -> Option<a2app_core::information_flow::SensitiveAction> {
+        self.action_target.as_ref().map(|target| a2app_core::information_flow::SensitiveAction {
+            kind: "apps.generate".into(), target: target.clone(),
+        })
+    }
+
+    fn commit_review(&self, commit: impl FnOnce(&a2app_core::information_flow::ContextId, u64,
+        &a2app_core::information_flow::SensitiveAction, &serde_json::Value) -> Result<(), String>) -> Result<(), String>
+    {
+        let Some(action) = self.action() else { return Ok(()) };
+        let payload = serde_json::to_value(&self.manifest).map_err(|_| "Cannot review generated mini-app content.")?;
+        commit(&self.context, self.epoch, &action, &payload)
+    }
+
+    fn can_retain(&self) -> bool {
+        struct Size(usize);
+        impl std::io::Write for Size {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.checked_add(bytes.len()).filter(|size| *size <= 1024 * 1024)
+                    .ok_or_else(|| std::io::Error::other("Completed build retention limit exceeded"))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        serde_json::to_writer(Size(0), &self.manifest).is_ok()
+    }
+}
+
+impl Drop for PendingGeneratedApp {
+    fn drop(&mut self) {
+        if let Some(id) = self.review_id { let _ = a2app_core::information_flow::cancel_exact_action(id); }
+    }
+}
+
 /// All a2app state, owned by the UI thread.
 pub struct A2AppState {
     pub registry: AppRegistry,
@@ -410,7 +457,9 @@ pub struct A2AppState {
     /// refuse every other host for the rest of the session.
     pub dismissed_net_hosts: HashSet<(String, String)>,
     pub generation: Option<Generation>,
+    pending_generated: Option<PendingGeneratedApp>,
     pub generation_context: Option<a2app_core::information_flow::ContextId>,
+    generation_epoch: Option<u64>,
     pub console: GenConsole,
     /// The request text of a failed generation, offered for Retry.
     pub failed_request: Option<String>,
@@ -554,7 +603,9 @@ pub fn init() {
             dismissed_prompts: HashSet::new(),
             dismissed_net_hosts: HashSet::new(),
             generation: None,
+            pending_generated: None,
             generation_context: None,
+            generation_epoch: None,
             console: GenConsole::default(),
             failed_request: None,
             agent_prefs: a2app_agent::prefs::load_agent_prefs(),
@@ -641,6 +692,8 @@ pub enum A2AppOp {
     RevokeNetworkGrant(u64),
     ClearLegacyGrants { subject: String, perm: Permission },
     SetGlobalPolicy { access: RoomAccess, decision: PolicyDecision },
+    SetPolicyMode { access: RoomAccess, mode: RoomPolicyMode },
+    SetMatrixWrite(bool),
     SetRoomPolicy { room_id: String, access: RoomAccess, decision: PolicyDecision },
     SetSpacePolicy { space_id: String, access: RoomAccess, decision: PolicyDecision },
     SetFlowPolicy { source: a2app_core::information_flow::Source, policy: a2app_core::information_flow::FlowPolicy },
@@ -659,6 +712,12 @@ pub enum A2AppOp {
         expected_epoch: u64,
     },
     RevokeFlowAuthority(u64),
+    GrantExactFlowAuthority {
+        context: a2app_core::information_flow::ContextId,
+        request_id: u64,
+        expected_influences: a2app_core::information_flow::Influences,
+        expected_epoch: u64,
+    },
     RoomClosed(OwnedRoomId),
     Unrestrict(MiniAppId),
     /// Starts a generation; `Modify` intent is classified from the text.
@@ -762,6 +821,12 @@ impl PendingRoomAction {
             let permitted = with_a2app(|state| self.permitted(&state.permissions)).unwrap_or(false);
             if !permitted { return Err("Permission for the queued room action was revoked.".into()); }
             authorization.check_flow(Some(self.room_id.as_str()), RoomAccess::Write)?;
+            let payload = match &self.action {
+                RoomAction::InsertDraft(text) => serde_json::json!({ "text": text }),
+                RoomAction::ReplyTo(event_id) => serde_json::json!({ "event_id": event_id }),
+                _ => return Err("Unsupported protected composer action.".into()),
+            };
+            authorization.commit_action(self.room_id.as_str(), &payload)?;
         }
         Ok(())
     }
@@ -1390,6 +1455,7 @@ fn permission_filtered_hook(app_id: &str, origin: Option<&RoomId>, hook: &str, p
         // to a subject with access to only selected rooms.
         if hook == "on_unread_totals_changed"
             && (state.permissions.effective_capability(manifest, cap) != Effective::Granted
+                || state.permissions.policy_mode(RoomAccess::Read) == RoomPolicyMode::WhitelistOnly
                 || state.permissions.room_rules().values().any(|rule| rule.read == PolicyDecision::Deny)
                 || state.permissions.space_rules().values().any(|rule| rule.read == PolicyDecision::Deny))
         { return None; }
@@ -1408,9 +1474,9 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
     match op {
         A2AppOp::OpenAppFromContext { context, flow_epoch, app_id, room_id } => {
             let result = super::information_flow::current_context(&context).and_then(|()| {
-                a2app_core::information_flow::ensure_action_allowed_for_activation(&context, flow_epoch, &a2app_core::information_flow::SensitiveAction {
+                a2app_core::information_flow::commit_exact_action_for_activation(&context, flow_epoch, &a2app_core::information_flow::SensitiveAction {
                     kind: "apps.launch".into(), target: app_id.clone(),
-                })
+                }, &serde_json::json!({ "app_id": app_id, "room_id": room_id }))
             });
             if let Err(error) = result {
                 enqueue_popup_notification(error, PopupKind::Error, Some(6.0));
@@ -1738,6 +1804,14 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             with_a2app(|state| { state.permissions.set_global_policy(access, decision); state.perms_dirty = true; });
             refresh_permission_policy(cx, ui);
         }
+        A2AppOp::SetPolicyMode { access, mode } => {
+            with_a2app(|state| { state.permissions.set_policy_mode(access, mode); state.perms_dirty = true; });
+            refresh_permission_policy(cx, ui);
+        }
+        A2AppOp::SetMatrixWrite(enabled) => {
+            with_a2app(|state| { state.permissions.set_matrix_write(enabled); state.perms_dirty = true; });
+            refresh_permission_policy(cx, ui);
+        }
         A2AppOp::SetRoomPolicy { room_id, access, decision } => {
             with_a2app(|state| { state.permissions.set_room_policy(&room_id, access, decision); state.perms_dirty = true; });
             refresh_permission_policy(cx, ui);
@@ -1751,7 +1825,7 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 enqueue_popup_notification(error, PopupKind::Error, Some(6.0));
                 return;
             }
-            with_a2app(|state| { state.generation = None; });
+            with_a2app(|state| { state.generation = None; state.pending_generated = None; });
             #[cfg(unix)]
             {
                 let rooms = with_a2app(|state| state.ai_sessions.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
@@ -1779,14 +1853,17 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             })();
             if let Err(error) = checked {
                 enqueue_popup_notification(error, PopupKind::Error, Some(6.0));
+            } else if let Ok(account) = super::information_flow::account() {
+                a2app_core::protection_audit::record_policy_change(&account);
             }
             ui.redraw(cx);
         }
         A2AppOp::RevokeFlowSharing(id) => {
-            if let Err(error) = a2app_core::information_flow::revoke_sharing(id) {
-                enqueue_popup_notification(error, PopupKind::Error, Some(6.0));
-                return;
-            }
+            let revoked = match a2app_core::information_flow::revoke_sharing(id) {
+                Ok(revoked) => revoked,
+                Err(error) => { enqueue_popup_notification(error, PopupKind::Error, Some(6.0)); return; }
+            };
+            if revoked && let Ok(account) = super::information_flow::account() { a2app_core::protection_audit::record_policy_change(&account); }
             stop_private_contexts(cx, ui);
             ui.redraw(cx);
         }
@@ -1795,14 +1872,27 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 .and_then(|()| a2app_core::information_flow::grant_authority_for_activation(&context, action, session, &expected_influences, expected_epoch));
             if let Err(error) = result {
                 enqueue_popup_notification(error, PopupKind::Error, Some(6.0));
+            } else {
+                a2app_core::protection_audit::record_policy_change(context.account());
+            }
+            ui.redraw(cx);
+        }
+        A2AppOp::GrantExactFlowAuthority { context, request_id, expected_influences, expected_epoch } => {
+            let result = super::information_flow::current_context(&context)
+                .and_then(|()| a2app_core::information_flow::grant_exact_action_for_activation(&context, request_id, &expected_influences, expected_epoch));
+            if let Err(error) = result {
+                enqueue_popup_notification(error, PopupKind::Error, Some(6.0));
+            } else {
+                a2app_core::protection_audit::record_policy_change(context.account());
             }
             ui.redraw(cx);
         }
         A2AppOp::RevokeFlowAuthority(id) => {
-            if let Err(error) = a2app_core::information_flow::revoke_authority(id) {
-                enqueue_popup_notification(error, PopupKind::Error, Some(6.0));
-                return;
-            }
+            let revoked = match a2app_core::information_flow::revoke_authority(id) {
+                Ok(revoked) => revoked,
+                Err(error) => { enqueue_popup_notification(error, PopupKind::Error, Some(6.0)); return; }
+            };
+            if revoked && let Ok(account) = super::information_flow::account() { a2app_core::protection_audit::record_policy_change(&account); }
             stop_private_contexts(cx, ui);
             ui.redraw(cx);
         }
@@ -1835,6 +1925,9 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             with_a2app(|state| {
                 // Dropping the Generation kills the agent child process.
                 state.generation = None;
+                state.pending_generated = None;
+                state.generation_context = None; state.generation_epoch = None;
+                state.failed_request = None;
                 state.console.status = String::from("Cancelled.");
             });
             // A session's launch_splash_app tool call may be waiting on this
@@ -1845,6 +1938,10 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             ui.redraw(cx);
         }
         A2AppOp::RetryGeneration => {
+            if let Some(pending) = with_a2app(|state| state.pending_generated.take()).flatten() {
+                finish_generated_app(cx, ui, pending);
+                return;
+            }
             let retry = with_a2app(|state| state.failed_request.take()).flatten();
             if let Some(request) = retry {
                 start_generation(cx, ui, request, None, None);
@@ -1854,6 +1951,7 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             with_a2app(|state| {
                 state.console = GenConsole::default();
                 state.failed_request = None;
+                state.pending_generated = None;
             });
             ui.redraw(cx);
         }
@@ -1981,6 +2079,7 @@ fn start_generation(
             enqueue_popup_notification("A generation is already running.", PopupKind::Warning, Some(3.0));
             return;
         }
+        state.pending_generated = None;
         let apps: Vec<(MiniAppId, String)> = state.registry.iter()
             .map(|a| (a.id.clone(), a.name.clone()))
             .collect();
@@ -2039,6 +2138,7 @@ fn start_generation(
         match generation {
             Ok(generation) => {
                 state.generation = Some(generation);
+                state.generation_epoch = a2app_core::information_flow::context_epoch(&context).ok();
                 state.generation_context = Some(context);
                 state.console = GenConsole {
                     status,
@@ -2099,86 +2199,34 @@ fn advance_generation(cx: &mut Cx, ui: &WidgetRef) {
     }).flatten();
 
     match done {
-        Some(Done::Ready { manifest, refine_of }) => {
-            let mut manifest = *manifest;
-            let installed = with_a2app(|state| -> Result<(), String> {
-                if refine_of.is_none() {
-                    if let Some(room) = state.create_room.take() {
-                        manifest.scope = A2AppScope::Room { room_id: room.to_string() };
-                    }
+        Some(Done::Ready { mut manifest, refine_of }) => {
+            let pending = with_a2app(|state| -> Result<PendingGeneratedApp, String> {
+                if refine_of.is_none() && let Some(room) = state.create_room.take() {
+                    manifest.scope = A2AppScope::Room { room_id: room.to_string() };
                 }
-                // Provenance must reach the new source before versioning,
-                // persistence, installation, or any subsequent evaluation.
-                let from = state.generation_context.as_ref().ok_or("Missing generated-source provenance.")?;
-                super::information_flow::current_context(from)?;
-                #[cfg(unix)]
-                if let Some(room) = &state.ai_generation_room {
-                    a2app_core::information_flow::ensure_action_allowed(from, &a2app_core::information_flow::SensitiveAction {
-                        kind: "apps.generate".into(), target: room.to_string(),
-                    })?;
-                }
-                // The chosen id can reveal a collision in the app inventory.
-                a2app_core::information_flow::add_sources(from, [super::information_flow::account_source(from)])?;
-                let room = match &manifest.scope { A2AppScope::Room { room_id } => Some(room_id.as_str()), A2AppScope::Account => None };
-                let to = super::information_flow::app_context(&manifest.id, room)?;
-                let legacy = state.registry.get(&manifest.id).is_some_and(super::information_flow::manifest_has_private_source);
-                a2app_core::information_flow::register_context_with_legacy_data(&to, legacy)?;
-                a2app_core::information_flow::transfer(from, &to)?;
-                a2app_core::information_flow::record_app_code_from(&manifest.id, from)?;
+                let context = state.generation_context.clone().ok_or("Missing generated-source provenance.")?;
+                let epoch = state.generation_epoch.ok_or("Missing generation activation.")?;
                 let request = state.generation.as_ref().map(|g| g.request().to_string()).unwrap_or_default();
-                commit_version(&mut manifest, VersionOrigin::Ai, &request);
-                if let Err(e) = persistence::save_user_app(&manifest) {
-                    error!("Failed to save generated mini-app: {e}");
-                }
-                state.registry.insert(manifest.clone());
-                state.generation = None;
-                state.generation_context = None;
-                state.failed_request = None;
-                state.console.status = match refine_of {
-                    Some(_) => format!("Updated \"{}\".", manifest.name),
-                    None => format!("Created \"{}\".", manifest.name),
-                };
-                state.registry_dirty = true;
-                Ok(())
-            }).unwrap_or_else(|| Err("Mini-app state is unavailable.".into()));
-            if let Err(reason) = installed {
-                with_a2app(|state| {
-                    state.generation = None;
-                    state.generation_context = None;
-                    state.console.status = format!("Failed: {reason}");
-                });
                 #[cfg(unix)]
-                resolve_session_generation(cx, ui, None, Err(format!("The build could not be installed: {reason}")));
-                enqueue_popup_notification(reason, PopupKind::Error, Some(6.0));
-                ui.redraw(cx);
-                return;
+                let action_target = state.ai_generation_room.as_ref().map(ToString::to_string);
+                #[cfg(not(unix))]
+                let action_target = None;
+                Ok(PendingGeneratedApp { manifest, refine_of, context, epoch, request, action_target, review_id: None })
+            }).unwrap_or_else(|| Err("Mini-app state is unavailable.".into()));
+            match pending {
+                Ok(pending) => finish_generated_app(cx, ui, pending),
+                Err(error) => {
+                    with_a2app(|state| { state.generation = None; state.generation_context = None; state.generation_epoch = None; state.pending_generated = None; });
+                    #[cfg(unix)]
+                    resolve_session_generation(cx, ui, None, Err(error.clone()));
+                    enqueue_popup_notification(error, PopupKind::Error, Some(6.0));
+                }
             }
-            publish_grants(cx);
-            // If the old version was running, quit it so the next open boots
-            // the new source (the reopen_hint below says so); then, if a
-            // session's launch_splash_app tool call started this run, answer
-            // it with the installed summary and dock the app into the room it
-            // was asked for.
-            let was_running = stop_for_restart(cx, ui, &manifest);
-            #[cfg(unix)]
-            {
-                let summary = serde_json::json!({
-                    "app_id": manifest.id,
-                    "name": manifest.name,
-                    "status": "installed_and_running",
-                });
-                resolve_session_generation(cx, ui, Some(&manifest), Ok(summary.to_string()));
-            }
-            enqueue_popup_notification(
-                reopen_hint(format!("Mini-app \"{}\" is ready.", manifest.name), was_running),
-                PopupKind::Success, Some(5.0),
-            );
-            ui.redraw(cx);
         }
         Some(Done::Failed(reason)) => {
             with_a2app(|state| {
                 state.generation = None;
-                state.generation_context = None;
+                state.generation_context = None; state.generation_epoch = None;
             });
             #[cfg(unix)]
             resolve_session_generation(cx, ui, None, Err(format!("The build failed: {reason}")));
@@ -2186,6 +2234,81 @@ fn advance_generation(cx: &mut Cx, ui: &WidgetRef) {
         }
         None => {}
     }
+}
+
+/// Final installation uses the original capture and activation, including on
+/// Retry. It never regenerates or silently substitutes a newly produced app.
+fn finish_generated_app(cx: &mut Cx, ui: &WidgetRef, mut pending: PendingGeneratedApp) {
+    let mut awaiting_review = false;
+    let result = with_a2app(|state| -> Result<(), String> {
+        super::information_flow::current_context(&pending.context)?;
+        a2app_core::information_flow::ensure_context_epoch(&pending.context, pending.epoch)?;
+        if pending.refine_of.is_none() && state.registry.get(&pending.manifest.id).is_some() {
+            return Err("Another app now uses this generated app's ID. Start a new generation; this reviewed build cannot replace it.".into());
+        }
+        if let Some(action) = pending.action() {
+            let approval = pending.commit_review(a2app_core::information_flow::commit_exact_action_for_activation);
+            // Unsupported one-time captures still permit explicit session
+            // review, then Retry of the same bounded retained build.
+            awaiting_review = approval.is_err()
+                && a2app_core::information_flow::recent_action_decisions().is_ok_and(|decisions| decisions.iter().rev()
+                    .any(|decision| decision.context == pending.context && decision.epoch == pending.epoch && decision.action == action && !decision.allowed))
+                && pending.can_retain();
+            approval?;
+        }
+        // Provenance reaches code before any version or source is persisted.
+        a2app_core::information_flow::add_sources(&pending.context, [super::information_flow::account_source(&pending.context)])?;
+        let room = match &pending.manifest.scope { A2AppScope::Room { room_id } => Some(room_id.as_str()), A2AppScope::Account => None };
+        let to = super::information_flow::app_context(&pending.manifest.id, room)?;
+        let legacy = state.registry.get(&pending.manifest.id).is_some_and(super::information_flow::manifest_has_private_source);
+        a2app_core::information_flow::register_context_with_legacy_data(&to, legacy)?;
+        a2app_core::information_flow::transfer(&pending.context, &to)?;
+        a2app_core::information_flow::record_app_code_from(&pending.manifest.id, &pending.context)?;
+        commit_version(&mut pending.manifest, VersionOrigin::Ai, &pending.request);
+        persistence::save_user_app(&pending.manifest).map_err(|_| "Could not save the reviewed mini-app.".to_string())?;
+        state.registry.insert((*pending.manifest).clone());
+        state.generation = None;
+        state.generation_context = None; state.generation_epoch = None;
+        state.failed_request = None;
+        state.console.status = if pending.refine_of.is_some() { format!("Updated \"{}\".", pending.manifest.name) }
+            else { format!("Created \"{}\".", pending.manifest.name) };
+        state.registry_dirty = true;
+        Ok(())
+    }).unwrap_or_else(|| Err("Mini-app state is unavailable.".into()));
+    if let Err(reason) = result {
+        if awaiting_review {
+            let payload = serde_json::to_value(&pending.manifest).ok();
+            pending.review_id = a2app_core::information_flow::recent_action_decisions().ok().and_then(|decisions| {
+                decisions.into_iter().rev().find(|d| d.context == pending.context && d.epoch == pending.epoch
+                    && d.action.kind == "apps.generate" && pending.action_target.as_deref() == Some(d.action.target.as_str())
+                    && d.request.as_ref().is_some_and(|request| serde_json::from_str::<serde_json::Value>(&request.payload).ok() == payload))
+                    .and_then(|d| d.request.map(|request| request.id))
+            });
+        }
+        with_a2app(|state| {
+            state.generation = None;
+            state.generation_context = None; state.generation_epoch = None;
+            if awaiting_review {
+                state.failed_request = Some(pending.request.clone());
+                state.console.status = "Build complete. Review its exact contents in Data sharing and action review, then select Retry to install this saved build.".into();
+                state.pending_generated = Some(pending);
+            } else { state.console.status = format!("Failed: {reason}"); }
+        });
+        #[cfg(unix)]
+        resolve_session_generation(cx, ui, None, Err(format!("The build could not be installed: {reason}")));
+        enqueue_popup_notification(reason, PopupKind::Error, Some(8.0));
+        ui.redraw(cx);
+        return;
+    }
+    publish_grants(cx);
+    let was_running = stop_for_restart(cx, ui, &pending.manifest);
+    #[cfg(unix)]
+    {
+        let summary = serde_json::json!({ "app_id": pending.manifest.id, "name": pending.manifest.name, "status": "installed_and_running" });
+        resolve_session_generation(cx, ui, Some(&pending.manifest), Ok(summary.to_string()));
+    }
+    enqueue_popup_notification(reopen_hint(format!("Mini-app \"{}\" is ready.", pending.manifest.name), was_running), PopupKind::Success, Some(5.0));
+    ui.redraw(cx);
 }
 
 /// Rebuilds the console's line list from the generation's trail + transcript,
@@ -2580,6 +2703,7 @@ fn complete_app_tool_call(
     let Some(pending) = pending else {
         return services::respond(cx, reply, Err("no matching tool call for this app"));
     };
+    pending.audit.finish(ok);
     let transfer = super::information_flow::context_for_heap(reply.heap_key).and_then(|from| {
         let to = super::information_flow::prepare_agent(pending.room_id.as_str())?;
         a2app_core::information_flow::transfer(&from, &to)
@@ -2738,18 +2862,6 @@ fn install_version(cx: &mut Cx, ui: &WidgetRef, updated: MiniAppManifest, done: 
 }
 
 fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, heap: usize, action: HostAction) -> Result<(), String> {
-    let context = super::information_flow::context_for_heap(heap)?;
-    let sensitive = match &action {
-        HostAction::ComposerInsert { room, .. } => Some(("host.composer.insert", room.as_deref().unwrap_or("host"))),
-        HostAction::ComposerReplyTo { room, .. } => Some(("host.composer.reply_to", room.as_deref().unwrap_or("host"))),
-        HostAction::OpenApp { app_id, .. } => Some(("host.nav.app", app_id.as_str())),
-        _ => None,
-    };
-    if let Some((kind, target)) = sensitive {
-        a2app_core::information_flow::ensure_action_allowed(&context, &a2app_core::information_flow::SensitiveAction {
-            kind: kind.into(), target: target.into(),
-        })?;
-    }
     let room_of = |room: Option<String>| -> Result<OwnedRoomId, String> {
         let room = room.ok_or("this mini-app is not attached to a room; pass {room_id}")?;
         OwnedRoomId::try_from(room.as_str()).map_err(|_| String::from("not a valid room id"))
@@ -2824,6 +2936,10 @@ fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, heap: usize, action: HostAct
                 Some(true) => return Err(String::from("that app is stopped for hammering the host")),
                 Some(false) => {}
             }
+            a2app_core::information_flow::commit_exact_action_for_activation(&from,
+                a2app_core::information_flow::context_epoch(&from)?, &a2app_core::information_flow::SensitiveAction {
+                    kind: "host.nav.app".into(), target: app_id.clone(),
+                }, &serde_json::json!({ "app_id": app_id, "room_id": target }))?;
             let room_id = room.and_then(|r| OwnedRoomId::try_from(r.as_str()).ok());
             let in_room_pane = room_id.is_some();
             apply_op(cx, ui, A2AppOp::OpenApp { app_id, room_id, in_room_pane });
@@ -3856,7 +3972,7 @@ fn room_policy_allows(room: &str, access: RoomAccess) -> bool {
 }
 
 fn stop_private_contexts(cx: &mut Cx, ui: &WidgetRef) {
-    with_a2app(|state| { state.generation = None; state.generation_context = None; });
+    with_a2app(|state| { state.generation = None; state.generation_context = None; state.generation_epoch = None; state.pending_generated = None; });
     #[cfg(unix)]
     {
         let rooms = with_a2app(|state| state.ai_sessions.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
@@ -3869,6 +3985,9 @@ fn stop_private_contexts(cx: &mut Cx, ui: &WidgetRef) {
 }
 
 fn refresh_permission_policy(cx: &mut Cx, ui: &WidgetRef) {
+    if let Ok(account) = super::information_flow::account() {
+        a2app_core::protection_audit::record_policy_change(&account);
+    }
     publish_grants(cx);
     prune_hook_subs();
     let apps = with_a2app(|state| state.registry.iter().map(|m| m.id.clone()).collect::<Vec<_>>()).unwrap_or_default();
@@ -4846,6 +4965,13 @@ fn abort_ai_room_work(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
     // Retire before answering any parked tool: a still-running blocking
     // caller must not enqueue a new UI job after we drain the old queue.
     stop_ai_session(room_id);
+    with_a2app(|state| {
+        if state.pending_generated.as_ref().is_some_and(|pending| pending.context.room() == Some(room_id.as_str())) {
+            state.pending_generated = None;
+            state.failed_request = None;
+            state.console.status = "Cancelled.".into();
+        }
+    });
     // Cancel the room's own generation, if one is running. Exactly the Mini
     // Apps screen's Stop, but scoped to this room's build.
     let cancels_generation = with_a2app(|state| {
@@ -4857,7 +4983,7 @@ fn abort_ai_room_work(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
         with_a2app(|state| {
             // Dropping the Generation kills its agent child process.
             state.generation = None;
-            state.generation_context = None;
+            state.generation_context = None; state.generation_epoch = None;
             state.console.status = String::from("Cancelled.");
         });
         resolve_session_generation(
@@ -5918,6 +6044,13 @@ fn run_ai_generation(
                 let _ = answer.send(Err(reason));
                 return;
             }
+            let approval = super::information_flow::agent_context(room_id.as_str()).and_then(|context| {
+                a2app_core::information_flow::commit_exact_action_for_activation(&context,
+                    a2app_core::information_flow::context_epoch(&context)?, &a2app_core::information_flow::SensitiveAction {
+                        kind: "apps.generate".into(), target: room_id.to_string(),
+                    }, &serde_json::json!({ "description": description, "room_id": room_id }))
+            });
+            if let Err(error) = approval { let _ = answer.send(Err(error)); return; }
             // Record where completion must answer, then start the same
             // generation machinery the Mini Apps screen uses. A tool call
             // may not overlap an already-running build, so refuse early is
@@ -6008,12 +6141,6 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
         Ok(())
     });
     if let Err(error) = recorded { answer_session_job(job, Err(error)); return; }
-    if let Some(action) = session_job_sensitive_action(&job, room_id.as_str()) {
-        let checked = super::information_flow::agent_context(room_id.as_str()).and_then(|context| {
-            a2app_core::information_flow::ensure_action_allowed(&context, &action)
-        });
-        if let Err(error) = checked { answer_session_job(job, Err(error)); return; }
-    }
 
     // The job is the only place the call's arguments exist, so this is where
     // the human-readable target detail is computed and pinned to the call's
@@ -6070,22 +6197,6 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
             run_ai_list_mini_app_tools(room_id, answer);
         }
     }
-}
-
-/// Only host-defined action kinds and exact targets can receive authority.
-#[cfg(unix)]
-fn session_job_sensitive_action(job: &SessionJob, room: &str) -> Option<a2app_core::information_flow::SensitiveAction> {
-    let (kind, target) = match job {
-        SessionJob::SendRoomMessage { .. } => ("ai.reply.write", room),
-        SessionJob::PostRoomMessage { room_id, .. } => ("matrix.rooms.message.send", room_id.as_str()),
-        SessionJob::LaunchSplashApp { .. } => ("apps.generate", room),
-        SessionJob::LaunchApp { app_id, .. } => ("apps.launch", app_id.as_str()),
-        SessionJob::CallMiniAppTool { tool, .. } | SessionJob::InvokeMiniAppTool { tool, .. } => ("mcp.tools.call", tool.as_str()),
-        SessionJob::ListApps { .. } | SessionJob::ListMiniAppTools { .. }
-        | SessionJob::ReadTool { .. } | SessionJob::FetchUrl { .. }
-        | SessionJob::NetworkAccess { .. } => return None,
-    };
-    Some(a2app_core::information_flow::SensitiveAction { kind: kind.into(), target: target.into() })
 }
 
 /// Gate 2 for a mini-app tool: an invocation — whether the model called the
@@ -6284,12 +6395,16 @@ fn run_app_tool_invocation(
         a2app_core::information_flow::transfer(&from, &to)?;
         // Tool metadata and the fact of invocation are observable to the agent too.
         a2app_core::information_flow::transfer(&to, &from)?;
-        a2app_core::information_flow::ensure_action_allowed(&from, &a2app_core::information_flow::SensitiveAction {
+        a2app_core::information_flow::commit_exact_action_for_activation(&from,
+            a2app_core::information_flow::context_epoch(&from)?, &a2app_core::information_flow::SensitiveAction {
             kind: "mcp.tools.call".into(), target: tool.clone(),
-        })
+        }, &serde_json::json!({ "tool": tool, "arguments": arguments, "app_id": app_id,
+            "app_activation": a2app_core::information_flow::context_epoch(&to)? }))?;
+        Ok(from)
     });
-    if let Err(error) = transfer { let _ = answer.send(Err(error)); return; }
+    let context = match transfer { Ok(context) => context, Err(error) => { let _ = answer.send(Err(error)); return; } };
     let call_id = NEXT_APP_TOOL_CALL_ID.fetch_add(1, Ordering::Relaxed);
+    let audit = a2app_core::protection_audit::Attempt::start(&context, None, a2app_core::protection_audit::ActivityKind::ToolCall);
     with_a2app(|state| {
         state.app_tool_calls.insert(
             call_id,
@@ -6301,6 +6416,7 @@ fn run_app_tool_invocation(
                 display_name,
                 answer,
                 since: Instant::now(),
+                audit,
             },
         );
     });
@@ -6318,6 +6434,7 @@ fn run_app_tool_invocation(
         // The app is gone or never defined the hook; answer at once rather
         // than leave the model waiting for the timeout.
         if let Some(pending) = with_a2app(|state| state.app_tool_calls.remove(&call_id)).flatten() {
+            pending.audit.finish(false);
             let _ = pending.answer.send(Err(format!(
                 "the mini-app did not handle the tool call `{tool}`"
             )));
@@ -7027,6 +7144,44 @@ mod permission_tests {
             args_json: args.to_string(),
             may_prompt: true,
         }))
+    }
+
+    #[test]
+    fn completed_generation_retry_uses_saved_source_and_original_activation() {
+        use a2app_core::information_flow as flow;
+        let path = std::env::temp_dir().join(format!("robrix-generation-review-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut registry = flow::Registry::open(&path).unwrap();
+        let context = flow::ContextId::Agent { account: "alice".into(), room: SOURCE.into() };
+        registry.register_context(&context).unwrap();
+        registry.add_influences(&context, [flow::Influence::Model("provider".into())]).unwrap();
+        let mut pending = PendingGeneratedApp {
+            manifest: Box::new(a2app_core::builtin::stock("room-peek").unwrap()), refine_of: None,
+            context: context.clone(), epoch: registry.context_epoch(&context).unwrap(), request: "build fixture".into(),
+            action_target: Some(SOURCE.into()), review_id: None,
+        };
+        assert!(pending.can_retain());
+        let source = pending.manifest.source.clone();
+        assert!(pending.commit_review(|context, epoch, action, payload| registry.commit_exact_action_for_activation(context, epoch, action, payload)).is_err());
+        let decision = registry.recent_action_decisions().unwrap().pop().unwrap();
+        let capture = decision.request.unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&capture.payload).unwrap()["source"], source);
+        registry.grant_exact_action_for_activation(&context, capture.id, &decision.influences, pending.epoch).unwrap();
+        pending.manifest.source.push_str("\nchanged after review");
+        assert!(pending.commit_review(|context, epoch, action, payload| registry.commit_exact_action_for_activation(context, epoch, action, payload)).is_err());
+        pending.manifest.source = source;
+        pending.commit_review(|context, epoch, action, payload| registry.commit_exact_action_for_activation(context, epoch, action, payload)).unwrap();
+        assert!(pending.commit_review(|context, epoch, action, payload| registry.commit_exact_action_for_activation(context, epoch, action, payload)).is_err());
+        let decision = registry.recent_action_decisions().unwrap().pop().unwrap();
+        registry.grant_exact_action_for_activation(&context, decision.request.unwrap().id, &decision.influences, pending.epoch).unwrap();
+        registry.remove_context(&context);
+        registry.register_context(&context).unwrap();
+        registry.grant_authority(&context, pending.action().unwrap(), flow::AuthoritySession::RobrixSession).unwrap();
+        assert!(pending.commit_review(|context, epoch, action, payload| registry.commit_exact_action_for_activation(context, epoch, action, payload)).is_err(),
+            "a restarted agent cannot install an old reviewed build");
+        pending.manifest.source = "x".repeat(1024 * 1024);
+        assert!(!pending.can_retain());
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

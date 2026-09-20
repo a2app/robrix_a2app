@@ -4,6 +4,29 @@ pub(super) fn bullets(labels: &[String]) -> String {
     labels.iter().map(|label| format!("• {label}")).collect::<Vec<_>>().join("\n")
 }
 
+fn review_payload(payload: &str) -> String {
+    // Render direction-changing/invisible controls explicitly. Literal JSON
+    // backslashes are already escaped, so a user can distinguish the contents.
+    let mut displayed = String::with_capacity(payload.len());
+    for character in payload.chars() {
+        if character.is_control() || matches!(character, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}') {
+            use std::fmt::Write;
+            let _ = write!(displayed, "\\u{:04x}", character as u32);
+        } else { displayed.push(character); }
+    }
+    displayed
+}
+
+#[cfg(test)]
+#[test]
+fn exact_review_exposes_direction_controls_without_confusing_literal_escapes() {
+    let raw = serde_json::json!({"body": "invoice\u{202e}exe"}).to_string();
+    let literal = serde_json::json!({"body": "invoice\\u202eexe"}).to_string();
+    assert!(!review_payload(&raw).contains('\u{202e}'));
+    assert!(review_payload(&raw).contains("\\u202e"));
+    assert_ne!(review_payload(&raw), review_payload(&literal));
+}
+
 impl DataSharing {
     fn selected_context(&self, cx: &Cx) -> Result<&ContextId, String> {
         self.view.drop_down(cx, ids!(context_choice)).selected_item().checked_sub(1)
@@ -61,11 +84,18 @@ impl DataSharing {
         let snapshot = self.snapshots.iter().find(|snapshot| snapshot.context == decision.context && snapshot.epoch == decision.epoch)
             .ok_or("This context is no longer active. Restart it and review the new request.")?;
         let session = match self.view.drop_down(cx, ids!(action_session)).selected_item() {
-            0 => AuthoritySession::RoomSession {
+            0 => {
+                let request = decision.request.as_ref().ok_or("This operation has no exact contents to review. Retry it to capture a request, or explicitly choose a session permission.")?;
+                return Ok(A2AppOp::GrantExactFlowAuthority {
+                    context: decision.context.clone(), request_id: request.id,
+                    expected_influences: snapshot.influences.clone(), expected_epoch: snapshot.epoch,
+                });
+            }
+            1 => AuthoritySession::RoomSession {
                 account: decision.context.account().to_string(),
                 room: decision.context.room().ok_or("This context has no room. Choose Until Robrix closes.")?.to_string(),
             },
-            1 => AuthoritySession::RobrixSession,
+            2 => AuthoritySession::RobrixSession,
             _ => return Err("Select a session for this action permission.".into()),
         };
         Ok(A2AppOp::GrantFlowAuthority {
@@ -114,6 +144,7 @@ impl DataSharing {
             let labels = authorities.iter().map(|grant| format!("{} · {} → {} · {}",
                 self.context_label(&grant.context), grant.action.kind, grant.action.target,
                 match &grant.session {
+                    AuthoritySession::Once { .. } => "One unchanged action, once".into(),
                     AuthoritySession::RobrixSession => "Until Robrix closes".into(),
                     AuthoritySession::RoomSession { room, .. } => format!("Until {} closes", self.room_label(room)),
                 })).collect::<Vec<_>>();
@@ -146,7 +177,7 @@ impl DataSharing {
             format!("{}\nActual recipient: {}\n{}",
                 self.context_label(&decision.context), self.recipient_label(&decision.recipient),
                 if decision.allowed { "Every source allowed this recipient when checked.".into() }
-                else { format!("Blocked sources:\n{}", bullets(&blocked)) })
+                else { format!("Blocked sources:\n{}\n\n{}", bullets(&blocked), self.sharing_remedy(&decision.denied_sources, &decision.recipient)) })
         }).unwrap_or_else(|| "No recent sharing decisions for this account.".into());
         self.view.label(cx, ids!(decision_details)).set_text(cx, &details);
         let blocked = decision.map(|decision| decision.denied_sources.iter().cloned().collect::<Vec<_>>()).unwrap_or_default();
@@ -162,16 +193,33 @@ impl DataSharing {
             let snapshot = self.snapshots.iter().find(|snapshot| snapshot.context == decision.context && snapshot.epoch == decision.epoch);
             let influences = snapshot.map(|snapshot| &snapshot.influences).unwrap_or(&decision.influences);
             let labels = influences.iter().map(|influence| self.influence_label(influence)).collect::<Vec<_>>();
-            let warning = if decision.action.kind.starts_with("network.") {
+            let warning = if self.view.drop_down(cx, ids!(action_session)).selected_item() == 0 {
+                "Once authorizes only one unchanged retry of the complete request shown below. Other requests, paths, contents and targets need their own approval."
+            } else if decision.action.kind.starts_with("network.") {
                 "This HTTP method permission covers every path on this exact origin. Internet and source sharing rules still apply."
-            } else { "Only this action and target are authorized. Room permissions and source sharing rules still apply." };
+            } else { "Session permission covers repeated actions of this kind to this target, including different contents. Room permissions and source sharing rules still apply." };
             let activation = if snapshot.is_some() { "Current activation" } else { "Closed activation: this request can no longer be approved" };
-            format!("{}\n{activation}\nAction: {}\nTarget: {}\n{warning}\nCurrent influences to review:\n{}",
-                self.context_label(&decision.context), decision.action.kind, decision.action.target, bullets(&labels))
+            let contents = decision.request.as_ref().map(|request| format!("\nExact request #{} (invisible controls are shown as Unicode escapes):\n{}", request.id, review_payload(&request.payload)))
+                .unwrap_or_else(|| "\nExact contents have not been captured. Retry the operation to capture them before choosing Once.".into());
+            let approved = snapshot.is_some() && self.authorities.iter().any(|grant| {
+                grant.context == decision.context && grant.action == decision.action && match grant.session {
+                    AuthoritySession::Once { request_id } => grant.influences == *influences && decision.request.as_ref().is_some_and(|request| request.id == request_id),
+                    _ => influences.is_subset(&grant.influences),
+                }
+            });
+            let status = if approved {
+                "A matching action approval is now present. Retry the unchanged operation; all other permission and sharing checks still apply."
+            } else {
+                "Blocked control at this check: Sensitive actions. Outside influences required a matching action approval. Review the contents below, choose Once or an explicit session duration, and press Allow."
+            };
+            format!("{}\n{activation}\nAction: {}\nTarget: {}\n{status}\n{warning}\nCurrent influences to review:\n{}{contents}",
+                self.context_label(&decision.context), review_payload(&decision.action.kind), review_payload(&decision.action.target), bullets(&labels))
         }).unwrap_or_else(|| "No blocked sensitive actions for this account.".into());
         self.view.label(cx, ids!(action_details)).set_text(cx, &details);
         self.view.widget(cx, ids!(authority_button)).set_visible(cx, action.is_some());
         self.view.widget(cx, ids!(action_session)).set_visible(cx, action.is_some());
+        self.view.button(cx, ids!(authority_button)).set_text(cx,
+            if self.view.drop_down(cx, ids!(action_session)).selected_item() == 0 { "Allow this exact action once" } else { "Allow actions to this target for the session" });
     }
 
     pub(super) fn review_decision(&mut self, cx: &mut Cx) -> Result<(), String> {
@@ -221,7 +269,7 @@ impl DataSharing {
         self.apps.iter().find(|(id, _)| id == app).map(|(_, name)| format!("{name} ({app})")).unwrap_or_else(|| app.to_owned())
     }
 
-    fn context_label(&self, context: &ContextId) -> String {
+    pub(super) fn context_label(&self, context: &ContextId) -> String {
         match context {
             ContextId::App { account, app, room } => format!("Mini-app {} · {} · {account}", self.app_label(app), room.as_deref().map(|room| self.room_label(room)).unwrap_or_else(|| "Account context".into())),
             ContextId::PublicApp { account, app } => format!("Public mini-app {} · {account}", self.app_label(app)),
@@ -229,7 +277,7 @@ impl DataSharing {
         }
     }
 
-    fn source_label(&self, source: &Source) -> String {
+    pub(super) fn source_label(&self, source: &Source) -> String {
         match source {
             Source::Account { account } => format!("Account data · {account}"),
             Source::Room { account, room } => format!("Room · {} · {account}", self.room_label(room)),

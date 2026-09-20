@@ -263,9 +263,13 @@ only the pending request, including its asynchronous completion. Subscriptions
 and requests to enable a permission use a selected duration instead.
 
 Global, room and ancestor-space blocks always override allowlists and app
-grants. Read and write are independent. Set the global write rule to Ask
-before allowing writes in selected testing rooms; leaving it Block prevents
-all room writes. Allowlists skip prompts for declared capabilities, while
+grants. Read and write are independent. The **Enable room writes for mini-apps and agents** master switch
+pauses all room writes and disables individual write editors, retaining their
+saved rules and the previous write default for when the switch is enabled again.
+Read and write defaults each support **Only allowlisted rooms and spaces**:
+selected room/space allowances work, unlisted rooms are denied, and explicit
+blocks still win. The ordinary Ask default instead prompts for unlisted rooms.
+Allowlists skip prompts for declared capabilities, while
 explicit per-app denials and restrictions still apply. Collection queries
 filter each actual room, and unresolved space ancestry fails closed when a
 space block might apply. Configured spaces and their nested subspaces must
@@ -366,12 +370,35 @@ private sources, actual recipients, and all sources blocking a disclosure,
 with direct access to the relevant sharing rule.
 
 Action approval captures the reviewed influence set and live activation.
+**This exact action once** also captures the complete host-owned request
+contents. The trusted review shows those contents; approval permits one unchanged
+retry and is consumed immediately before the effect starts. It does not replay
+the request automatically. Changed contents, a different target, cancellation,
+revocation or a new activation cannot reuse that approval. Explicit room-session
+and Robrix-session choices remain available for repeated operations of the same
+kind to the same target, including different contents. These approvals authorize
+actions; source-to-recipient sharing rules still independently protect private data.
 New influence, a closed context, a closed room session or explicit revocation
 can invalidate it. No app can endorse its own content or reset these labels.
 This constrains actions influenced by prompt injection; it does not classify
 instructions as malicious or make remote content trustworthy. Diagnostic
 history is bounded, local and metadata-only; request/response bodies are not
-recorded there.
+recorded there. `protection_history.jsonl` retains recent timestamped policy
+checks and actual request attempts/outcomes across restarts. An allowed policy
+check does not imply transmission; a failed or interrupted request may already
+have transmitted data. Exact-action review contents stay in memory and are never
+written to this history.
+
+Mini Apps → **Inspect room protection** explains the effective read/write and
+capability controls for a selected room and app/agent. It identifies global,
+room, ancestor-space and per-app restrictions and links to the responsible
+settings. Retained-source inspection includes closed contexts and generated app
+source that has never been launched, so stopping an app does not imply that its
+stored data or shared code lost provenance. Refresh reloads this snapshot;
+selecting a target or ability rechecks its current permissions. The data-sharing screen
+explains missing source/recipient/reader allowances, unknown-source restrictions,
+changed model recipients and action approvals, with explicit steps to change the
+controls that can be changed.
 
 Every implemented broker service and incoming hook has an explicit source,
 destination and effect contract in `capabilities/flow.rs`. Unclassified
@@ -384,6 +411,12 @@ broker, including encoding, IPC, storage/restart, public workers, native I/O
 denial and queued revocation. Socket tests exercise real HTTP/model transports
 with controlled loopback peers. These tests do not replace live Matrix,
 provider or device end-to-end verification.
+
+The **Mini Apps security** workflow runs core policy and adversarial Splash tests,
+both agent modes, application policy/transport/widget tests, and the embedded
+application check on Linux and macOS. It builds the exact Octos revision from
+Robrix's lockfile and runs native confinement probes plus a real Robrix-to-worker
+model/tool/cancellation round trip. Changes under `a2app/` trigger this workflow.
 
 **Cloud inference is also an external disclosure.** Protected room agents
 and generators use the host-controlled model transport in both agent modes.

@@ -31,6 +31,8 @@ pub mod diff;
 pub mod permissions;
 /// Host-owned information-flow labels and source-to-recipient sharing rules.
 pub mod information_flow;
+/// Bounded, local metadata about protection decisions and actual request outcomes.
+pub mod protection_audit;
 /// The tagged catalog of every ability, layered over the permission groups.
 pub mod capabilities;
 /// Built-in sample apps.

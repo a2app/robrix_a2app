@@ -14,9 +14,10 @@ use matrix_sdk::ruma::OwnedRoomId;
 
 use a2app_core::diff::{line_diff, DiffLine};
 use a2app_core::manifest::{A2AppScope, MiniAppId, MiniAppManifest, RunsIn};
-use a2app_core::permissions::{Effective, GrantState, Permission, RoomScope, RoomAccess, PolicyDecision, agent_subject, agent_room_of, is_agent_subject};
+use a2app_core::permissions::{Effective, GrantState, Permission, RoomScope, RoomAccess, RoomPolicyMode, PolicyDecision, agent_subject, agent_room_of, is_agent_subject};
 use crate::a2app::permission_prompt::{PermissionScopeEditorWidgetExt, duration_label, network_scope_label};
 use crate::a2app::data_sharing::DataSharingWidgetExt;
+use crate::a2app::protection_inspector::{ProtectionInspectorAction, ProtectionInspectorWidgetExt};
 use a2app_core::persistence;
 use a2app_core::versions::AppVersion;
 
@@ -410,12 +411,23 @@ script_mod! {
                     text: "Applies to every mini-app and agent. Blocks always win, including over room or space allowlists. Allow rules skip permission prompts for declared room abilities."
                 }
                 mod.widgets.PermissionOptionLabel { text: "Read access to rooms" }
-                global_read := mod.widgets.PermissionDropDown { labels: ["Ask unless a room or space rule allows", "Allow everywhere", "Block all room reads"] }
+                global_read := mod.widgets.PermissionDropDown { labels: ["Ask unless a room or space rule allows", "Allow everywhere", "Only allowlisted rooms and spaces", "Block all room reads"] }
                 mod.widgets.PermissionOptionLabel {
                     text: "Blocking reads prevents new access. To stop sharing data an app or agent already read, remove that source's data sharing rules too."
                 }
-                mod.widgets.PermissionOptionLabel { text: "Write access to rooms" }
-                global_write := mod.widgets.PermissionDropDown { labels: ["Ask unless a room or space rule allows", "Allow everywhere", "Block all room writes"] }
+                global_write_enabled := ToggleFlat {
+                    width: Fill, height: Fit
+                    padding: Inset{left: 15}
+                    active: false
+                    draw_bg +: { size: 21 }
+                    text: "Enable room writes for mini-apps and agents"
+                    draw_text +: { text_style: REGULAR_TEXT {font_size: 10.5}, color: (COLOR_TEXT) }
+                }
+                mod.widgets.PermissionOptionLabel {
+                    text: "Turning this off blocks every room write and disables write controls below. Your saved write rules are kept for when you turn it on again."
+                }
+                mod.widgets.PermissionOptionLabel { text: "Write access when enabled" }
+                global_write := mod.widgets.PermissionDropDown { labels: ["Ask unless a room or space rule allows", "Allow everywhere", "Only allowlisted rooms and spaces"] }
                 protection_summary := mod.widgets.PermissionOptionLabel {}
                 protection_status := mod.widgets.PermissionOptionLabel { visible: false }
                 View {
@@ -427,6 +439,10 @@ script_mod! {
                     agent_permissions_button := RobrixNeutralIconButton {
                         padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
                         text: "Manage agent permissions"
+                    }
+                    inspect_protection_button := RobrixNeutralIconButton {
+                        padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                        text: "Inspect room protection"
                     }
                 }
             }
@@ -939,6 +955,10 @@ script_mod! {
                 policy_read := mod.widgets.PermissionDropDown { labels: ["Ask / no rule", "Allow", "Block"] }
                 mod.widgets.PermissionOptionLabel { text: "Write access for the selection" }
                 policy_write := mod.widgets.PermissionDropDown { labels: ["Ask / no rule", "Allow", "Block"] }
+                policy_write_disabled := mod.widgets.PermissionOptionLabel {
+                    visible: false
+                    text: "All room writes are disabled on the Mini Apps main screen. Saved write rules are paused and will be kept when you edit read rules."
+                }
             }
             View {
                 width: Fill, height: Fit, flow: Flow.Right{wrap: true}, spacing: 8
@@ -958,6 +978,19 @@ script_mod! {
                 width: Fill, height: Fit, flow: Down, spacing: 5
                 access_rule := mod.widgets.MiniAppAccessRuleRow {}
             }
+        }
+
+        inspector_pane := View {
+            visible: false
+            width: Fill, height: Fill, flow: Down
+            View {
+                width: Fill, height: Fit, flow: Right, spacing: 10, padding: 15
+                inspector_back := RobrixNeutralIconButton {
+                    padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Back"
+                }
+                TitleLabel { width: Fill, text: "Room protection inspector" }
+            }
+            protection_inspector := mod.widgets.ProtectionInspector {}
         }
 
         sharing_pane := View {
@@ -1554,6 +1587,7 @@ enum Pane {
     Edit,
     Access,
     Sharing,
+    Inspector,
 }
 
 #[derive(Script, ScriptHook, Widget)]
@@ -1595,16 +1629,29 @@ impl Widget for MiniAppsScreen {
         let Event::Actions(actions) = event else { return };
 
         if let Some(index) = self.view.drop_down(cx, ids!(global_read)).changed(actions) {
-            cx.action(A2AppOp::SetGlobalPolicy { access: RoomAccess::Read, decision: policy_from_index(index) });
+            cx.action(global_policy_action(RoomAccess::Read, index));
         }
-        if let Some(index) = self.view.drop_down(cx, ids!(global_write)).changed(actions) {
-            cx.action(A2AppOp::SetGlobalPolicy { access: RoomAccess::Write, decision: policy_from_index(index) });
+        if let Some(enabled) = self.view.check_box(cx, ids!(global_write_enabled)).changed(actions) {
+            self.set_write_controls_enabled(cx, enabled);
+            cx.action(A2AppOp::SetMatrixWrite(enabled));
+        }
+        if let Some(index) = self.view.drop_down(cx, ids!(global_write)).changed(actions)
+            && !self.view.widget(cx, ids!(global_write)).disabled(cx)
+        {
+            cx.action(global_policy_action(RoomAccess::Write, index));
         }
         if self.view.button(cx, ids!(protection_button)).clicked(actions) {
             self.show_access_editor(cx, AccessEditor::Protection);
         }
         if self.view.button(cx, ids!(agent_permissions_button)).clicked(actions) {
             self.show_agent_permissions(cx);
+        }
+        if self.view.button(cx, ids!(inspect_protection_button)).clicked(actions) {
+            self.view.protection_inspector(cx, ids!(protection_inspector)).configure(cx);
+            self.set_pane(cx, Pane::Inspector);
+        }
+        if self.view.button(cx, ids!(inspector_back)).clicked(actions) {
+            self.set_pane(cx, Pane::List);
         }
         if self.view.button(cx, ids!(sharing_button)).clicked(actions) {
             self.view.data_sharing(cx, ids!(sharing_editor)).configure(cx);
@@ -1635,6 +1682,30 @@ impl Widget for MiniAppsScreen {
         }
 
         for action in actions {
+            if let Some(action) = action.downcast_ref::<ProtectionInspectorAction>() {
+                match action {
+                    ProtectionInspectorAction::Global => self.set_pane(cx, Pane::List),
+                    ProtectionInspectorAction::Rule(key) => self.edit_access_rule(cx, key),
+                    ProtectionInspectorAction::Ability { subject, permission, capability, scope } => {
+                        self.show_access_editor(cx, AccessEditor::App {
+                            app_id: subject.clone(), perm: *permission, cap_id: capability.clone(),
+                        });
+                        self.view.permission_scope_editor(cx, ids!(access_scope)).set_scope(cx, scope);
+                        self.view.widget(cx, ids!(agent_selector)).set_visible(cx, false);
+                    }
+                    ProtectionInspectorAction::SubjectInfo(subject) => {
+                        if let Some(room) = agent_room_of(subject) {
+                            #[cfg(unix)]
+                            if let Ok(room) = OwnedRoomId::try_from(room) { cx.action(A2AppOp::AiRoomPanel(room)); }
+                        } else { self.show_info(cx, subject.clone()); }
+                    }
+                    ProtectionInspectorAction::Sharing => {
+                        self.view.data_sharing(cx, ids!(sharing_editor)).configure(cx);
+                        self.set_pane(cx, Pane::Sharing);
+                    }
+                }
+                continue;
+            }
             // A /miniapp generation lands on this screen; make sure the
             // console (list pane) is showing, not a leftover info pane.
             if let Some(A2AppOp::StartGeneration { .. }) = action.downcast_ref::<A2AppOp>()
@@ -1963,6 +2034,7 @@ impl MiniAppsScreen {
         self.view.widget(cx, ids!(edit_pane)).set_visible(cx, show(Pane::Edit));
         self.view.widget(cx, ids!(access_pane)).set_visible(cx, show(Pane::Access));
         self.view.widget(cx, ids!(sharing_pane)).set_visible(cx, show(Pane::Sharing));
+        self.view.widget(cx, ids!(inspector_pane)).set_visible(cx, show(Pane::Inspector));
         self.view.redraw(cx);
     }
 
@@ -2139,12 +2211,15 @@ impl MiniAppsScreen {
                     )
                 }).unwrap_or((false, (false, String::new(), false, false)));
                 self.view.widget(cx, ids!(no_apps_label)).set_visible(cx, !any_apps);
-                let (read, write, rooms, spaces) = with_a2app(|state| (
-                    state.permissions.global_policy(RoomAccess::Read), state.permissions.global_policy(RoomAccess::Write),
+                let (read, read_mode, write, write_mode, write_enabled, rooms, spaces) = with_a2app(|state| (
+                    state.permissions.global_policy(RoomAccess::Read), state.permissions.policy_mode(RoomAccess::Read),
+                    state.permissions.write_policy_when_enabled(), state.permissions.policy_mode(RoomAccess::Write),
+                    state.permissions.matrix_write(),
                     state.permissions.room_rules().len(), state.permissions.space_rules().len(),
-                )).unwrap_or((PolicyDecision::Ask, PolicyDecision::Deny, 0, 0));
-                self.view.drop_down(cx, ids!(global_read)).set_selected_item(cx, policy_index(read));
-                self.view.drop_down(cx, ids!(global_write)).set_selected_item(cx, policy_index(write));
+                )).unwrap_or((PolicyDecision::Ask, RoomPolicyMode::Standard, PolicyDecision::Ask, RoomPolicyMode::Standard, false, 0, 0));
+                self.view.drop_down(cx, ids!(global_read)).set_selected_item(cx, global_policy_index(read, read_mode));
+                self.view.drop_down(cx, ids!(global_write)).set_selected_item(cx, global_policy_index(write, write_mode));
+                self.set_write_controls_enabled(cx, write_enabled);
                 self.view.label(cx, ids!(protection_summary)).set_text(cx, &format!("{rooms} room rules · {spaces} space rules. Rules are saved until you change them."));
                 let status = with_a2app(|state| state.policy_spaces_status.clone()).flatten();
                 self.view.widget(cx, ids!(protection_status)).set_visible(cx, spaces > 0 && status.is_some());
@@ -2222,15 +2297,18 @@ impl MiniAppsScreen {
                 }
             }
             Pane::Access => {
+                let write_enabled = with_a2app(|state| state.permissions.matrix_write()).unwrap_or(false);
+                self.set_write_controls_enabled(cx, write_enabled);
                 let empty = self.access_rows(cx).is_empty();
                 self.view.widget(cx, ids!(access_empty)).set_visible(cx, empty);
                 if matches!(self.access_editor, Some(AccessEditor::Protection)) {
                     let (read, write) = with_a2app(|state| (
-                        state.permissions.global_policy(RoomAccess::Read), state.permissions.global_policy(RoomAccess::Write),
-                    )).unwrap_or((PolicyDecision::Ask, PolicyDecision::Deny));
+                        global_policy_label(state.permissions.global_policy(RoomAccess::Read), state.permissions.policy_mode(RoomAccess::Read)),
+                        global_policy_label(state.permissions.global_policy(RoomAccess::Write), state.permissions.policy_mode(RoomAccess::Write)),
+                    )).unwrap_or(("Ask", "All writes disabled"));
                     self.view.label(cx, ids!(access_baseline)).set_text(cx, &format!(
                         "Global read: {} · Global write: {}. Change global defaults on the Mini Apps main screen; a global block overrides every allowance.",
-                        policy_label(read), policy_label(write),
+                        read, write,
                     ));
                 }
                 if let Some(AccessEditor::App { app_id, perm, cap_id }) = &self.access_editor {
@@ -2249,7 +2327,7 @@ impl MiniAppsScreen {
                     self.view.label(cx, ids!(access_baseline)).set_text(cx, baseline);
                 }
             }
-            Pane::Source | Pane::Diff | Pane::Edit | Pane::Sharing => {}
+            Pane::Source | Pane::Diff | Pane::Edit | Pane::Sharing | Pane::Inspector => {}
         }
     }
 
@@ -2332,6 +2410,16 @@ impl MiniAppsScreen {
                         row.key = Some(key.clone());
                         row.view.label(cx, ids!(rule_label)).set_text(cx, &label);
                         row.view.widget(cx, ids!(rule_edit)).set_visible(cx, matches!(key, AccessRuleKey::Room(_) | AccessRuleKey::Space(_)));
+                        let write_enabled = with_a2app(|state| state.permissions.matrix_write()).unwrap_or(false);
+                        let read_only = !write_enabled && matches!(key, AccessRuleKey::Room(_) | AccessRuleKey::Space(_));
+                        let has_read_rule = with_a2app(|state| match &key {
+                            AccessRuleKey::Room(id) => state.permissions.room_rules().get(id),
+                            AccessRuleKey::Space(id) => state.permissions.space_rules().get(id),
+                            _ => None,
+                        }.is_some_and(|policy| policy.read != PolicyDecision::Ask)).unwrap_or(false);
+                        row.view.button(cx, ids!(rule_edit)).set_text(cx, if read_only { "Edit read rule" } else { "Edit" });
+                        row.view.button(cx, ids!(rule_remove)).set_text(cx, if read_only { "Remove read rule" } else { "Remove" });
+                        row.view.button(cx, ids!(rule_remove)).set_enabled(cx, !read_only || has_read_rule);
                     }
                     item.draw_all(cx, &mut Scope::empty());
                 }
@@ -2360,7 +2448,7 @@ impl MiniAppsScreen {
                     draw_row(cx, list, &p.id, &p.label, &p.detail(), true, p.active, p.editable());
                 }
             }
-            Pane::Source | Pane::Diff | Pane::Edit | Pane::Sharing => {}
+            Pane::Source | Pane::Diff | Pane::Edit | Pane::Sharing | Pane::Inspector => {}
         }
     }
 
@@ -2519,6 +2607,28 @@ fn policy_from_index(index: usize) -> PolicyDecision {
     match index { 1 => PolicyDecision::Allow, 2 => PolicyDecision::Deny, _ => PolicyDecision::Ask }
 }
 
+fn global_policy_index(decision: PolicyDecision, mode: RoomPolicyMode) -> usize {
+    if decision == PolicyDecision::Deny { 3 }
+    else if mode == RoomPolicyMode::WhitelistOnly { 2 }
+    else { policy_index(decision) }
+}
+
+fn global_policy_action(access: RoomAccess, index: usize) -> A2AppOp {
+    match index {
+        2 => A2AppOp::SetPolicyMode { access, mode: RoomPolicyMode::WhitelistOnly },
+        _ => A2AppOp::SetGlobalPolicy {
+            access,
+            decision: match index { 1 => PolicyDecision::Allow, 3 => PolicyDecision::Deny, _ => PolicyDecision::Ask },
+        },
+    }
+}
+
+fn global_policy_label(decision: PolicyDecision, mode: RoomPolicyMode) -> &'static str {
+    if decision == PolicyDecision::Deny { "Block all" }
+    else if mode == RoomPolicyMode::WhitelistOnly { "Only allowlisted rooms and spaces" }
+    else { match decision { PolicyDecision::Allow => "Allow everywhere", _ => "Ask unless a rule allows" } }
+}
+
 fn policy_label(decision: PolicyDecision) -> &'static str {
     match decision { PolicyDecision::Ask => "Ask / no rule", PolicyDecision::Allow => "Allow", PolicyDecision::Deny => "Block" }
 }
@@ -2540,11 +2650,21 @@ fn scope_label(cx: &mut Cx, scope: &RoomScope) -> String {
 }
 
 impl MiniAppsScreen {
+    fn set_write_controls_enabled(&mut self, cx: &mut Cx, enabled: bool) {
+        self.view.check_box(cx, ids!(global_write_enabled)).set_active(cx, enabled, Animate::No);
+        self.view.widget(cx, ids!(global_write)).set_disabled(cx, !enabled);
+        self.view.widget(cx, ids!(policy_write)).set_disabled(cx, !enabled);
+        self.view.widget(cx, ids!(policy_write_disabled)).set_visible(cx, !enabled);
+        if matches!(self.access_editor, Some(AccessEditor::Protection)) {
+            self.view.button(cx, ids!(access_save)).set_text(cx, if enabled { "Save rules for selection" } else { "Save read rules for selection" });
+        }
+    }
+
     fn show_access_editor(&mut self, cx: &mut Cx, editor: AccessEditor) {
         let (title, hint, room, protection) = match &editor {
             AccessEditor::Protection => (
                 "Room and space protection".to_string(),
-                "Select one or more rooms or spaces, then save read and write rules. Spaces cover their nested rooms. Any matching block wins, including a global block. Allow skips prompts; Ask removes this rule and follows other rules. These protections apply to all mini-apps and agents.".to_string(),
+                "Select one or more rooms or spaces, then save read and write rules. Spaces cover their nested rooms. Any matching block wins, including a global block. Allow skips prompts; Ask removes this rule and follows other rules. In allowlist-only mode, rooms without a matching Allow are blocked. These protections apply to all mini-apps and agents.".to_string(),
                 None, true,
             ),
             AccessEditor::App { app_id, perm, cap_id } => {
@@ -2579,6 +2699,7 @@ impl MiniAppsScreen {
         self.view.drop_down(cx, ids!(policy_read)).set_selected_item(cx, 0);
         self.view.drop_down(cx, ids!(policy_write)).set_selected_item(cx, 0);
         self.access_editor = Some(editor);
+        self.set_write_controls_enabled(cx, with_a2app(|state| state.permissions.matrix_write()).unwrap_or(false));
         self.set_pane(cx, Pane::Access);
     }
 
@@ -2601,9 +2722,8 @@ impl MiniAppsScreen {
             };
             match &editor {
                 AccessEditor::Protection => {
-                    let read = policy_from_index(self.view.drop_down(cx, ids!(policy_read)).selected_item());
-                    let write = policy_from_index(self.view.drop_down(cx, ids!(policy_write)).selected_item());
-                    self.apply_policy_scope(cx, &selection.scope, read, write);
+                    let write_enabled = with_a2app(|state| state.permissions.matrix_write()).unwrap_or(false);
+                    self.save_policy_selection(cx, &selection.scope, write_enabled);
                 }
                 AccessEditor::App { app_id, perm, cap_id } => {
                     if let Some(network) = selection.network {
@@ -2633,9 +2753,16 @@ impl MiniAppsScreen {
         }
     }
 
-    fn apply_policy_scope(&self, cx: &mut Cx, scope: &RoomScope, read: PolicyDecision, write: PolicyDecision) {
+    fn save_policy_selection(&self, cx: &mut Cx, scope: &RoomScope, write_enabled: bool) {
+        let read = policy_from_index(self.view.drop_down(cx, ids!(policy_read)).selected_item());
+        let write = write_enabled.then(|| policy_from_index(self.view.drop_down(cx, ids!(policy_write)).selected_item()));
+        self.apply_policy_scope(cx, scope, read, write);
+    }
+
+    fn apply_policy_scope(&self, cx: &mut Cx, scope: &RoomScope, read: PolicyDecision, write: Option<PolicyDecision>) {
         let RoomScope::Selection { rooms, spaces } = scope else { return };
-        for (access, decision) in [(RoomAccess::Read, read), (RoomAccess::Write, write)] {
+        for (access, decision) in [(RoomAccess::Read, Some(read)), (RoomAccess::Write, write)] {
+            let Some(decision) = decision else { continue };
             for room_id in rooms {
                 cx.action(A2AppOp::SetRoomPolicy { room_id: room_id.clone(), access, decision });
             }
@@ -2660,9 +2787,10 @@ impl MiniAppsScreen {
     }
 
     fn remove_access_rule(&mut self, cx: &mut Cx, key: &AccessRuleKey) {
+        let write = with_a2app(|state| state.permissions.matrix_write()).unwrap_or(false).then_some(PolicyDecision::Ask);
         match key {
-            AccessRuleKey::Room(id) => self.apply_policy_scope(cx, &RoomScope::room(id), PolicyDecision::Ask, PolicyDecision::Ask),
-            AccessRuleKey::Space(id) => self.apply_policy_scope(cx, &RoomScope::Selection { rooms: Vec::new(), spaces: vec![id.clone()] }, PolicyDecision::Ask, PolicyDecision::Ask),
+            AccessRuleKey::Room(id) => self.apply_policy_scope(cx, &RoomScope::room(id), PolicyDecision::Ask, write),
+            AccessRuleKey::Space(id) => self.apply_policy_scope(cx, &RoomScope::Selection { rooms: Vec::new(), spaces: vec![id.clone()] }, PolicyDecision::Ask, write),
             AccessRuleKey::Grant(id) => cx.action(A2AppOp::RevokeScopedGrant(*id)),
             AccessRuleKey::Network(id) => cx.action(A2AppOp::RevokeNetworkGrant(*id)),
             AccessRuleKey::Legacy { subject, perm } => cx.action(A2AppOp::ClearLegacyGrants { subject: subject.clone(), perm: *perm }),
@@ -2797,7 +2925,7 @@ mod access_tests {
     }
 
     #[test]
-    fn saving_room_and_space_selection_never_changes_global_policy() {
+    fn saving_read_rules_while_writes_are_disabled_preserves_room_and_space_writes() {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
@@ -2809,6 +2937,7 @@ mod access_tests {
         });
         let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
         screen.show_access_editor(&mut cx, AccessEditor::Protection);
+        assert!(screen.view.widget(&cx, ids!(policy_write)).disabled(&cx));
         screen.view.permission_scope_editor(&cx, ids!(access_scope)).set_scope(&mut cx, &RoomScope::Selection {
             rooms: vec!["!room:example.org".into()], spaces: vec!["!space:example.org".into()],
         });
@@ -2818,11 +2947,75 @@ mod access_tests {
         let click = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
         let actions = cx.capture_actions(|cx| screen.handle_access_editor(cx, &click));
         let ops = actions.iter().filter_map(|a| a.downcast_ref::<A2AppOp>()).collect::<Vec<_>>();
-        assert_eq!(ops.len(), 4);
+        assert_eq!(ops.len(), 2);
         assert!(ops.iter().any(|op| matches!(op, A2AppOp::SetRoomPolicy { room_id, access: RoomAccess::Read, decision: PolicyDecision::Allow } if room_id == "!room:example.org")));
-        assert!(ops.iter().any(|op| matches!(op, A2AppOp::SetRoomPolicy { room_id, access: RoomAccess::Write, decision: PolicyDecision::Deny } if room_id == "!room:example.org")));
         assert!(ops.iter().any(|op| matches!(op, A2AppOp::SetSpacePolicy { space_id, access: RoomAccess::Read, decision: PolicyDecision::Allow } if space_id == "!space:example.org")));
-        assert!(ops.iter().any(|op| matches!(op, A2AppOp::SetSpacePolicy { space_id, access: RoomAccess::Write, decision: PolicyDecision::Deny } if space_id == "!space:example.org")));
         assert!(!ops.iter().any(|op| matches!(op, A2AppOp::SetGlobalPolicy { .. })));
+        let mut permissions = a2app_core::permissions::PermissionStore::default();
+        permissions.set_room_policy("!room:example.org", RoomAccess::Write, PolicyDecision::Allow);
+        permissions.set_space_policy("!space:example.org", RoomAccess::Write, PolicyDecision::Deny);
+        for op in ops {
+            match op {
+                A2AppOp::SetRoomPolicy { room_id, access, decision } => permissions.set_room_policy(room_id, *access, *decision),
+                A2AppOp::SetSpacePolicy { space_id, access, decision } => permissions.set_space_policy(space_id, *access, *decision),
+                _ => panic!("saving read rules changed an unrelated setting"),
+            }
+        }
+        let removed = cx.capture_actions(|cx| {
+            screen.remove_access_rule(cx, &AccessRuleKey::Room("!room:example.org".into()));
+            screen.remove_access_rule(cx, &AccessRuleKey::Space("!space:example.org".into()));
+        });
+        for op in removed.iter().filter_map(|action| action.downcast_ref::<A2AppOp>()) {
+            match op {
+                A2AppOp::SetRoomPolicy { room_id, access: RoomAccess::Read, decision } => permissions.set_room_policy(room_id, RoomAccess::Read, *decision),
+                A2AppOp::SetSpacePolicy { space_id, access: RoomAccess::Read, decision } => permissions.set_space_policy(space_id, RoomAccess::Read, *decision),
+                _ => panic!("removing read rules changed a paused write rule"),
+            }
+        }
+        assert_eq!(permissions.room_rules()["!room:example.org"].write, PolicyDecision::Allow);
+        assert_eq!(permissions.space_rules()["!space:example.org"].write, PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn write_master_disables_controls_and_reenables_saved_selection() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
+        screen.show_access_editor(&mut cx, AccessEditor::Protection);
+        screen.view.drop_down(&cx, ids!(global_write)).set_selected_item(&mut cx, 2);
+        screen.view.drop_down(&cx, ids!(policy_read)).set_selected_item(&mut cx, 1);
+        screen.view.drop_down(&cx, ids!(policy_write)).set_selected_item(&mut cx, 2);
+        let master = screen.view.check_box(&cx, ids!(global_write_enabled)).widget_uid();
+        for enabled in [false, true] {
+            let change = cx.capture_actions(|cx| cx.widget_action(master, CheckBoxAction::Change(enabled)));
+            let actions = cx.capture_actions(|cx| screen.handle_event(cx, &Event::Actions(change), &mut Scope::empty()));
+            assert!(actions.iter().any(|action| matches!(action.downcast_ref::<A2AppOp>(), Some(A2AppOp::SetMatrixWrite(value)) if *value == enabled)));
+            assert_eq!(screen.view.widget(&cx, ids!(global_write)).disabled(&cx), !enabled);
+            assert_eq!(screen.view.widget(&cx, ids!(policy_write)).disabled(&cx), !enabled);
+            assert!(!screen.view.widget(&cx, ids!(policy_read)).disabled(&cx));
+            assert_eq!(screen.view.drop_down(&cx, ids!(global_write)).selected_item(), 2);
+            assert_eq!(screen.view.drop_down(&cx, ids!(policy_write)).selected_item(), 2);
+            let default_write = screen.view.drop_down(&cx, ids!(global_write)).widget_uid();
+            let change = cx.capture_actions(|cx| cx.widget_action(default_write, DropDownAction::Select(2)));
+            let actions = cx.capture_actions(|cx| screen.handle_event(cx, &Event::Actions(change), &mut Scope::empty()));
+            assert_eq!(actions.iter().any(|action| matches!(action.downcast_ref::<A2AppOp>(),
+                Some(A2AppOp::SetPolicyMode { access: RoomAccess::Write, mode: RoomPolicyMode::WhitelistOnly }))), enabled,
+                "a disabled default-write control cannot enable writing through a queued selection");
+        }
+        let saved = cx.capture_actions(|cx| screen.save_policy_selection(cx, &RoomScope::Selection {
+            rooms: vec!["!room:example.org".into()], spaces: vec!["!space:example.org".into()],
+        }, true));
+        let ops = saved.iter().filter_map(|action| action.downcast_ref::<A2AppOp>()).collect::<Vec<_>>();
+        assert_eq!(ops.len(), 4);
+        assert!(ops.iter().any(|op| matches!(op, A2AppOp::SetRoomPolicy { access: RoomAccess::Write, decision: PolicyDecision::Deny, .. })));
+        assert!(ops.iter().any(|op| matches!(op, A2AppOp::SetSpacePolicy { access: RoomAccess::Write, decision: PolicyDecision::Deny, .. })));
+        assert!(!ops.iter().any(|op| matches!(op, A2AppOp::SetGlobalPolicy { .. } | A2AppOp::SetPolicyMode { .. })));
     }
 }

@@ -152,11 +152,8 @@ pub enum AiRoomAction {
 ///
 /// Room-output consent alone does not release private content to the
 /// homeserver. Check its exact origin separately, using captured provenance.
-fn ensure_ai_state_output(room: &Room, flow_context: &ContextId, action: &str) -> Result<(), String> {
+fn ensure_ai_state_output(room: &Room, flow_context: &ContextId) -> Result<(), String> {
     policy::ensure_room_flow_output(flow_context, room.room_id().as_str())?;
-    policy::ensure_flow_action(flow_context, &flow::SensitiveAction {
-        kind: action.into(), target: room.room_id().to_string(),
-    })?;
     let homeserver = room.client().homeserver();
     let recipient = Recipient::network_origin(homeserver.as_str())?;
     let origin = homeserver.origin().ascii_serialization();
@@ -179,6 +176,7 @@ async fn send_ai_state_event(
     policy::ensure_room_access(room.room_id().as_str(), RoomAccess::Write)?;
     use matrix_sdk::ruma::api::client::state::send_state_event;
     use matrix_sdk::utils::IntoRawStateEventContent;
+    let payload = serde_json::json!({ "event_type": event_type, "state_key": state_key, "content": content });
     let request = send_state_event::v3::Request::new_raw(
         room.room_id().to_owned(),
         event_type.into(),
@@ -186,10 +184,14 @@ async fn send_ai_state_event(
         content.into_raw_state_event_content(),
     );
     let config = room.client().request_config().disable_retry();
-    ensure_ai_state_output(room, flow_context, "ai.activity.write")?;
-    room.client()
+    ensure_ai_state_output(room, flow_context)?;
+    policy::commit_flow_action(flow_context, &flow::SensitiveAction {
+        kind: "ai.activity.write".into(), target: room.room_id().to_string(),
+    }, &payload)?;
+    let recipient = flow::Recipient::network_origin(room.client().homeserver().as_str()).ok();
+    policy::audit_flow_operation(flow_context, recipient, room.client()
         .send(request)
-        .with_request_config(config)
+        .with_request_config(config))
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())
@@ -467,7 +469,7 @@ async fn room_memory(room_id: &OwnedRoomId, limit: u32, flow_context: &ContextId
             let mut options = MessagesOptions::backward();
             options.limit = 50u32.into();
             options.from = from;
-            let messages = room.messages(options).await
+            let messages = policy::audit_server_operation(client.homeserver().as_str(), room.messages(options)).await
                 .map_err(|e| format!("couldn't load the room's past turns: {e}"))?;
             for event in messages.chunk {
                 if push_turn(&mut out, &event, limit, me.as_str()) {
@@ -750,6 +752,14 @@ fn next_reply_state_key() -> String {
     format!("{nanos:x}-{n:x}")
 }
 
+/// Review authored content exactly while treating the host timestamp as
+/// transport metadata. Retrying never changes the approved text or receipts.
+fn reply_review_payload(content: &AiReplyContent) -> Result<serde_json::Value, String> {
+    let mut content = serde_json::to_value(content).map_err(|_| "Cannot review AI reply content.")?;
+    content["createdAt"] = "Host timestamp assigned when sent".into();
+    Ok(serde_json::json!({ "event_type": AI_REPLY_EVENT_TYPE, "content": content }))
+}
+
 /// Writes one agent turn as an `ai_reply` state event with a fresh state key
 /// (so it never overwrites a previous turn's reply).
 /// Turns a failed `ai_reply` state write into a message the caller (and the
@@ -778,6 +788,7 @@ async fn post_reply(room: &Room, content: &AiReplyContent, flow_context: &Contex
     policy::ensure_room_access(room.room_id().as_str(), RoomAccess::Write)?;
     let json = serde_json::to_value(content).map_err(|e| e.to_string())?;
     let key = next_reply_state_key();
+    let payload = reply_review_payload(content)?;
     use matrix_sdk::ruma::api::client::state::send_state_event;
     use matrix_sdk::utils::IntoRawStateEventContent;
     if room.state() != matrix_sdk::RoomState::Joined {
@@ -787,8 +798,12 @@ async fn post_reply(room: &Room, content: &AiReplyContent, flow_context: &Contex
         room.room_id().to_owned(), AI_REPLY_EVENT_TYPE.into(), key.clone(), json.into_raw_state_event_content(),
     );
     let config = room.client().request_config().disable_retry();
-    ensure_ai_state_output(room, flow_context, "ai.reply.write")?;
-    match room.client().send(request).with_request_config(config).await {
+    ensure_ai_state_output(room, flow_context)?;
+    policy::commit_flow_action(flow_context, &flow::SensitiveAction {
+        kind: "ai.reply.write".into(), target: room.room_id().to_string(),
+    }, &payload)?;
+    let recipient = flow::Recipient::network_origin(room.client().homeserver().as_str()).ok();
+    match policy::audit_flow_operation(flow_context, recipient, room.client().send(request).with_request_config(config)).await {
         Ok(response) => {
             log!("AI Rooms worker: wrote ai_reply state event key {key} -> {} in room {}.", response.event_id, room.room_id());
             Ok(())
@@ -837,10 +852,11 @@ async fn post_notice(room: &Room, content: &AiReplyContent, flow_context: &Conte
         None => RoomMessageEventContent::notice_plain(format!("{NOTICE_PROVENANCE_PREFIX}{}", content.text)),
     };
     policy::ensure_room_flow_output(flow_context, room.room_id().as_str())?;
-    policy::ensure_flow_action(flow_context, &flow::SensitiveAction {
+    policy::commit_flow_action(flow_context, &flow::SensitiveAction {
         kind: "matrix.rooms.message.send".into(), target: room.room_id().to_string(),
-    })?;
-    match room.send(message).await {
+    }, &serde_json::to_value(&message).map_err(|_| "Cannot review AI message content.")?)?;
+    let recipient = flow::Recipient::MatrixRoom { account: flow_context.account().into(), room: room.room_id().to_string() };
+    match policy::audit_flow_operation(flow_context, Some(recipient), room.send(message)).await {
         Ok(response) => {
             log!("AI Rooms worker: posted a notice -> {} in room {}.", response.response.event_id, room.room_id());
             Ok(())
@@ -850,5 +866,33 @@ async fn post_notice(room: &Room, content: &AiReplyContent, flow_context: &Conte
             log!("AI Rooms worker: notice write to room {} failed: {friendly}", room.room_id());
             Err(friendly)
         }
+    }
+}
+
+
+#[cfg(test)]
+mod exact_reply_tests {
+    use super::*;
+
+    #[test]
+    fn reply_review_keeps_authored_contents_and_ignores_only_host_timestamp() {
+        let mut content = AiReplyContent { v: 1, text: "Reviewed text".into(), formatted: Some("<b>Reviewed text</b>".into()),
+            tool_calls: Vec::new(), model: None, created_at: 1, in_reply_to: Some("$reviewed:example.org".into()) };
+        let reviewed = reply_review_payload(&content).unwrap();
+        content.created_at = 2;
+        assert_eq!(reply_review_payload(&content).unwrap(), reviewed);
+        content.text.push_str(" changed");
+        assert_ne!(reply_review_payload(&content).unwrap(), reviewed);
+        content.text = "Reviewed text".into();
+        content.formatted = Some("<b>Different HTML</b>".into());
+        assert_ne!(reply_review_payload(&content).unwrap(), reviewed);
+        content.formatted = Some("<b>Reviewed text</b>".into());
+        content.in_reply_to = Some("$different:example.org".into());
+        assert_ne!(reply_review_payload(&content).unwrap(), reviewed);
+        content.in_reply_to = Some("$reviewed:example.org".into());
+        content.tool_calls.push(crate::a2app::ai_room_events::AiReplyToolCall {
+            name: "extra_tool".into(), detail: None, ok: true, summary: "Additional room content".into(),
+        });
+        assert_ne!(reply_review_payload(&content).unwrap(), reviewed);
     }
 }

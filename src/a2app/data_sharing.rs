@@ -43,6 +43,16 @@ script_mod! {
             mod.widgets.PermissionOptionLabel {
                 text: "This history contains source identities, recipients and decisions only, never message bodies, request payloads, model text or credentials."
             }
+            SubsectionLabel { text: "Protection activity", margin: 0 }
+            activity_filter := mod.widgets.PermissionDropDown {
+                labels: ["All activity in this account", "Selected app or agent context", "Selected data source", "Selected recipient"]
+            }
+            activity_choice := mod.widgets.PermissionDropDown { labels: ["Select an activity record"] }
+            activity_details := mod.widgets.PermissionOptionLabel {}
+            activity_warning := mod.widgets.PermissionOptionLabel { visible: false }
+            mod.widgets.PermissionOptionLabel {
+                text: "Recent metadata is saved on this device across restarts. A policy allowance is not proof that a request was sent. Failed or interrupted requests may already have transmitted data."
+            }
             SubsectionLabel { text: "Data source", margin: 0 }
             source_choice := mod.widgets.PermissionDropDown {}
             source_default := mod.widgets.PermissionOptionLabel {}
@@ -115,11 +125,14 @@ script_mod! {
             action_choice := mod.widgets.PermissionDropDown {labels: ["Select a blocked sensitive action"]}
             action_details := mod.widgets.PermissionOptionLabel {}
             action_session := mod.widgets.PermissionDropDown {
-                labels: ["Until this context's room closes", "Until Robrix closes"]
+                labels: ["This exact action once", "Until this context's room closes", "Until Robrix closes"]
             }
             authority_button := RobrixPositiveIconButton {
                 padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                text: "Allow this action for this context"
+                text: "Allow this exact action once"
+            }
+            mod.widgets.PermissionOptionLabel {
+                text: "Once allows one retry with exactly the reviewed contents. It does not run the action automatically. Session permission allows repeated actions of this kind to this target, including different contents; room and sharing permissions still apply."
             }
             authority_rules := mod.widgets.PermissionOptionLabel {}
             authority_remove_section := View {
@@ -157,6 +170,8 @@ pub struct DataSharing {
     #[rust] blocked_sources: Vec<Source>,
     #[rust] action_decisions: Vec<ActionDecision>,
     #[rust] authorities: Vec<ActionAuthority>,
+    #[rust] activities: Vec<a2app_core::protection_audit::Activity>,
+    #[rust] activity_key: Option<(u64, usize, Option<ContextId>, Option<Source>, Option<Recipient>)>,
 }
 
 impl Widget for DataSharing {
@@ -177,6 +192,7 @@ impl Widget for DataSharing {
         if self.view.drop_down(cx, ids!(context_choice)).changed(actions).is_some()
             || self.view.drop_down(cx, ids!(decision_choice)).changed(actions).is_some()
             || self.view.drop_down(cx, ids!(action_choice)).changed(actions).is_some()
+            || self.view.drop_down(cx, ids!(action_session)).changed(actions).is_some()
         {
             self.update_diagnostic_details(cx);
             self.update_recipient_form(cx);
@@ -210,12 +226,14 @@ impl Widget for DataSharing {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         self.refresh_diagnostics(cx);
         self.refresh_rules(cx);
+        self.refresh_activity(cx);
         self.view.draw_walk(cx, scope, walk)
     }
 }
 
 impl DataSharing {
     fn configure(&mut self, cx: &mut Cx) {
+        self.activity_key = None;
         self.account = super::information_flow::account().unwrap_or_default();
         self.rooms = if cx.has_global::<RoomsListRef>() {
             cx.get_global::<RoomsListRef>().permission_targets().into_iter()
@@ -370,6 +388,7 @@ impl DataSharing {
 }
 
 mod diagnostics;
+mod activity;
 use diagnostics::bullets;
 
 impl DataSharingRef {
@@ -485,9 +504,11 @@ mod tests {
         editor.view.drop_down(&cx, ids!(context_choice)).set_selected_item(&mut cx, 1);
         editor.action_decisions.push(ActionDecision {
             context: snapshot.context.clone(), epoch: snapshot.epoch, action: action.clone(), influences: snapshot.influences.clone(), allowed: false,
+            request: None,
         });
         editor.view.drop_down(&cx, ids!(action_choice)).set_labels(&mut cx, vec!["Select action".into(), "Fixture action".into()]);
         editor.view.drop_down(&cx, ids!(action_choice)).set_selected_item(&mut cx, 1);
+        editor.view.drop_down(&cx, ids!(action_session)).set_selected_item(&mut cx, 1);
         editor.update_diagnostic_details(&mut cx);
         match editor.authority_action(&cx).unwrap() {
             A2AppOp::GrantFlowAuthority { context, action: actual, session, expected_influences, expected_epoch } => {
@@ -528,6 +549,51 @@ mod tests {
         assert_eq!(editor.selected_recipient(&cx).unwrap(), Recipient::NetworkOrigin("https://blocked.example:8443".into()));
         editor.decisions[0].recipient = Recipient::ModelProvider("stale-model-identity".into());
         assert!(editor.review_decision(&mut cx).is_err());
+    }
+
+    #[test]
+    fn exact_action_review_uses_the_displayed_request_and_rejects_a_closed_activation() {
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+        let snapshot = context_fixture();
+        editor.snapshots.push(snapshot.clone());
+        editor.action_decisions.push(ActionDecision {
+            context: snapshot.context.clone(), epoch: snapshot.epoch,
+            action: flow::SensitiveAction { kind: "matrix.message.send".into(), target: "!target:example.org".into() },
+            influences: snapshot.influences.clone(), allowed: false,
+            request: Some(flow::ActionRequest { id: 42, payload: "{\"body\":\"The exact reviewed message\"}".into() }),
+        });
+        editor.view.drop_down(&cx, ids!(action_choice)).set_labels(&mut cx, vec!["Select action".into(), "Fixture action".into()]);
+        editor.view.drop_down(&cx, ids!(action_choice)).set_selected_item(&mut cx, 1);
+        editor.update_diagnostic_details(&mut cx);
+        assert!(editor.view.label(&cx, ids!(action_details)).text().contains("The exact reviewed message"));
+        match editor.authority_action(&cx).unwrap() {
+            A2AppOp::GrantExactFlowAuthority { request_id, context, expected_epoch, expected_influences } => {
+                assert_eq!(request_id, 42);
+                assert_eq!(context, snapshot.context);
+                assert_eq!(expected_epoch, snapshot.epoch);
+                assert_eq!(expected_influences, snapshot.influences);
+            }
+            _ => panic!("Once must use the exact captured request"),
+        }
+        editor.action_decisions[0].request = None;
+        assert!(editor.authority_action(&cx).is_err());
+        editor.snapshots[0].epoch += 1;
+        assert!(editor.authority_action(&cx).is_err());
+    }
+
+    #[test]
+    fn sharing_denials_name_the_blocking_control_and_how_to_change_it() {
+        let (_cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+        editor.account = "@alice:example.org".into();
+        let snapshot = context_fixture();
+        let recipient = Recipient::NetworkOrigin("https://example.org".into());
+        let text = editor.sharing_remedy(&snapshot.label, &recipient);
+        assert!(text.contains("Private data sharing"));
+        assert!(text.contains("Who may share this source"));
+        assert!(text.contains("Allow sharing with this recipient"));
+        assert!(editor.sharing_remedy(&[Source::UnknownPrivate].into(), &recipient).contains("No sharing toggle"));
     }
 
 }

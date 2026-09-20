@@ -58,6 +58,104 @@ pub enum PolicyDecision {
     Deny,
 }
 
+/// Whether unlisted rooms follow the default or are always inaccessible.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoomPolicyMode {
+    #[default]
+    Standard,
+    WhitelistOnly,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct RoomPolicyModes {
+    pub read: RoomPolicyMode,
+    pub write: RoomPolicyMode,
+}
+
+impl RoomPolicyModes {
+    fn get(self, access: RoomAccess) -> RoomPolicyMode {
+        match access { RoomAccess::Read => self.read, RoomAccess::Write => self.write }
+    }
+
+    fn set(&mut self, access: RoomAccess, mode: RoomPolicyMode) {
+        match access { RoomAccess::Read => self.read = mode, RoomAccess::Write => self.write = mode }
+    }
+}
+
+/// The deciding host rule, borrowing IDs instead of allocating per request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoomPolicyReason<'a> {
+    WriteMasterOff,
+    GlobalBlock,
+    GlobalDefault,
+    RoomRule { room: &'a str },
+    SpaceRule { space: &'a str, ancestor: bool },
+    UnresolvedSpaceHierarchy { space: &'a str, rule: PolicyDecision },
+    WhitelistRequired,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoomPolicyEvaluation<'a> {
+    pub decision: PolicyDecision,
+    pub reason: RoomPolicyReason<'a>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapabilityDecisionReason<'a> {
+    Unavailable,
+    Undeclared,
+    SubjectRestricted,
+    RoomPolicy { access: RoomAccess, reason: RoomPolicyReason<'a> },
+    PermissionDenied { permission: Permission },
+    CapabilityDenied,
+    CapabilityGrant,
+    ScopedGrant,
+    RoomGrant,
+    PermissionGrant,
+    NormalPermission,
+    ApprovalRequired,
+    NoPermissionRequired,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapabilityEvaluation<'a> {
+    pub effective: Effective,
+    pub reason: CapabilityDecisionReason<'a>,
+}
+
+impl RoomPolicyReason<'_> {
+    /// Explain the controlling setting without revealing protected IDs.
+    pub fn public_message(self, access: RoomAccess) -> String {
+        let access = if access == RoomAccess::Read { "Read" } else { "Write" };
+        let detail = match self {
+            Self::WriteMasterOff => return "Room writes are turned off. Review the write switch in Mini Apps > Room and space protection.".into(),
+            Self::GlobalBlock => return format!("All room {}s are blocked. Review global access in Mini Apps > Room and space protection.", access.to_ascii_lowercase()),
+            Self::GlobalDefault => "access needs approval under the global default",
+            Self::RoomRule { .. } => "access is blocked by this room's rule",
+            Self::SpaceRule { ancestor: true, .. } => "access is blocked by a containing space's rule",
+            Self::SpaceRule { ancestor: false, .. } => "access is blocked by this space's rule",
+            Self::UnresolvedSpaceHierarchy { rule: PolicyDecision::Deny, .. } => "access is blocked until the room hierarchy is resolved, because a space block cannot yet be ruled out",
+            Self::UnresolvedSpaceHierarchy { .. } => "access is blocked until this room is confirmed to belong to an allowlisted space",
+            Self::WhitelistRequired => "access is limited to allowlisted rooms and spaces; this target is not allowlisted",
+        };
+        format!("{access} {detail}. Open Mini Apps > Inspect protection to review the deciding rule.")
+    }
+}
+
+impl CapabilityEvaluation<'_> {
+    pub fn public_message(self) -> String {
+        match self.reason {
+            CapabilityDecisionReason::Unavailable => "This capability is not available in this Robrix build.".into(),
+            CapabilityDecisionReason::Undeclared => "This app or agent did not declare this capability. Review its manifest or tool profile.".into(),
+            CapabilityDecisionReason::SubjectRestricted => "This app or agent is restricted. Review its restriction in App Info.".into(),
+            CapabilityDecisionReason::RoomPolicy { access, reason } => reason.public_message(access),
+            CapabilityDecisionReason::PermissionDenied { .. } => "This permission group is blocked for this app or agent. Review its permissions in App Info or the AI room panel.".into(),
+            CapabilityDecisionReason::CapabilityDenied => "This capability is blocked for this app or agent. Review its capability setting in App Info or the AI room panel.".into(),
+            _ => "This request needs approval. Open the app in the foreground and review its permission prompt.".into(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccessPolicy {
     pub read: PolicyDecision,
@@ -79,6 +177,11 @@ pub struct RoomPolicies {
     pub global: AccessPolicy,
     pub rooms: BTreeMap<String, AccessPolicy>,
     pub spaces: BTreeMap<String, AccessPolicy>,
+    #[serde(default)]
+    pub modes: RoomPolicyModes,
+    /// Restored by the master switch; absent in older files means Ask.
+    #[serde(default)]
+    pub write_when_enabled: Option<PolicyDecision>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,8 +323,33 @@ impl PermissionStore {
     }
 
     pub fn set_global_policy(&mut self, access: RoomAccess, decision: PolicyDecision) {
+        if access == RoomAccess::Write && decision == PolicyDecision::Deny {
+            self.set_matrix_write(false);
+            return;
+        }
         self.ensure_room_policies().global.set(access, decision);
+        self.ensure_room_policies().modes.set(access, RoomPolicyMode::Standard);
         if access == RoomAccess::Write { self.matrix_write = decision != PolicyDecision::Deny; }
+    }
+
+    pub fn policy_mode(&self, access: RoomAccess) -> RoomPolicyMode {
+        self.room_policies.as_ref().map(|p| p.modes.get(access)).unwrap_or_default()
+    }
+
+    /// Choosing a mode is an explicit replacement for the global block.
+    /// The master switch uses its own setter to preserve this choice.
+    pub fn set_policy_mode(&mut self, access: RoomAccess, mode: RoomPolicyMode) {
+        self.set_global_policy(access, PolicyDecision::Ask);
+        self.ensure_room_policies().modes.set(access, mode);
+    }
+
+    pub fn write_policy_when_enabled(&self) -> PolicyDecision {
+        let current = self.global_policy(RoomAccess::Write);
+        if current != PolicyDecision::Deny { return current; }
+        match self.room_policies.as_ref().and_then(|p| p.write_when_enabled) {
+            Some(PolicyDecision::Allow) => PolicyDecision::Allow,
+            _ => PolicyDecision::Ask,
+        }
     }
 
     pub fn set_room_policy(&mut self, room: &str, access: RoomAccess, decision: PolicyDecision) {
@@ -269,43 +397,100 @@ impl PermissionStore {
     }
 
     pub fn room_policy(&self, room: Option<&str>, access: RoomAccess) -> PolicyDecision {
-        let global = self.global_policy(access);
-        if global == PolicyDecision::Deny { return global; }
-        let mut allow = global == PolicyDecision::Allow;
-        let ancestors = room.and_then(|r| self.room_spaces.get(r));
-        // A missing hierarchy must never bypass a protected space during
-        // startup or reconnect. Once resolved, unrelated rooms stay usable.
-        if ancestors.is_none() && self.space_rules().values().any(|p| p.get(access) == PolicyDecision::Deny) {
-            return PolicyDecision::Deny;
+        self.room_policy_evaluation(room, access).decision
+    }
+
+    /// List every host block for the trusted inspector, without changing
+    /// the allocation-free enforcement path's first deciding rule.
+    pub fn room_policy_blockers<'a>(&'a self, room: Option<&'a str>, access: RoomAccess) -> Vec<RoomPolicyReason<'a>> {
+        use RoomPolicyReason::*;
+        let mut blockers = Vec::new();
+        if self.global_policy(access) == PolicyDecision::Deny {
+            blockers.push(if access == RoomAccess::Write { WriteMasterOff } else { GlobalBlock });
         }
-        if let Some(policy) = room.and_then(|r| self.room_rules().get(r)) {
+        if let Some((room, policy)) = room.and_then(|id| self.room_rules().get_key_value(id)) {
+            if policy.get(access) == PolicyDecision::Deny { blockers.push(RoomRule { room }); }
+        }
+        let ancestors = room.and_then(|id| self.room_spaces.get(id));
+        for (space, policy) in self.space_rules() {
+            if policy.get(access) != PolicyDecision::Deny { continue; }
+            if room == Some(space.as_str()) || ancestors.is_some_and(|set| set.contains(space)) {
+                blockers.push(SpaceRule { space, ancestor: room != Some(space.as_str()) });
+            } else if ancestors.is_none() {
+                blockers.push(UnresolvedSpaceHierarchy { space, rule: PolicyDecision::Deny });
+            }
+        }
+        if blockers.is_empty() {
+            let evaluation = self.room_policy_evaluation(room, access);
+            if evaluation.decision == PolicyDecision::Deny { blockers.push(evaluation.reason); }
+        }
+        blockers
+    }
+
+    /// Use the same evaluation for enforcement and the protection inspector.
+    /// Hard blocks outrank every allowance, including a direct room rule.
+    pub fn room_policy_evaluation<'a>(&'a self, room: Option<&'a str>, access: RoomAccess) -> RoomPolicyEvaluation<'a> {
+        use RoomPolicyReason::*;
+        let result = |decision, reason| RoomPolicyEvaluation { decision, reason };
+        let global = self.global_policy(access);
+        if global == PolicyDecision::Deny {
+            return result(global, if access == RoomAccess::Write { WriteMasterOff } else { GlobalBlock });
+        }
+        let mut allow = None;
+        let ancestors = room.and_then(|r| self.room_spaces.get(r));
+        if let Some((room, policy)) = room.and_then(|r| self.room_rules().get_key_value(r)) {
             match policy.get(access) {
-                PolicyDecision::Deny => return PolicyDecision::Deny,
-                PolicyDecision::Allow => allow = true,
+                PolicyDecision::Deny => return result(PolicyDecision::Deny, RoomRule { room }),
+                PolicyDecision::Allow => allow = Some(RoomRule { room }),
                 PolicyDecision::Ask => {}
             }
         }
+        let mut unresolved_block = None;
+        let mut unresolved_allow = None;
         for (space, policy) in self.space_rules() {
             if room == Some(space.as_str()) || ancestors.is_some_and(|set| set.contains(space)) {
+                let reason = SpaceRule { space, ancestor: room != Some(space.as_str()) };
                 match policy.get(access) {
-                    PolicyDecision::Deny => return PolicyDecision::Deny,
-                    PolicyDecision::Allow => allow = true,
+                    PolicyDecision::Deny => return result(PolicyDecision::Deny, reason),
+                    PolicyDecision::Allow => { if allow.is_none() { allow = Some(reason); } }
+                    PolicyDecision::Ask => {}
+                }
+            } else if ancestors.is_none() {
+                match policy.get(access) {
+                    PolicyDecision::Deny => { if unresolved_block.is_none() { unresolved_block = Some(space); } }
+                    PolicyDecision::Allow => { if unresolved_allow.is_none() { unresolved_allow = Some(space); } }
                     PolicyDecision::Ask => {}
                 }
             }
         }
-        if allow { PolicyDecision::Allow } else { PolicyDecision::Ask }
+        // A missing hierarchy must never bypass a protected space during
+        // startup or reconnect. Once resolved, unrelated rooms stay usable.
+        if let Some(space) = unresolved_block {
+            return result(PolicyDecision::Deny, UnresolvedSpaceHierarchy { space, rule: PolicyDecision::Deny });
+        }
+        if let Some(reason) = allow { return result(PolicyDecision::Allow, reason); }
+        if self.policy_mode(access) == RoomPolicyMode::WhitelistOnly {
+            let reason = unresolved_allow.map(|space| UnresolvedSpaceHierarchy { space, rule: PolicyDecision::Allow })
+                .unwrap_or(WhitelistRequired);
+            return result(PolicyDecision::Deny, reason);
+        }
+        result(global, GlobalDefault)
     }
 
     pub fn capability_room_policy(&self, cap: &Capability, context: PermissionContext<'_>) -> PolicyDecision {
-        let Some(access) = capability_room_access(cap) else { return PolicyDecision::Ask };
+        self.capability_room_evaluation(cap, context).map(|(_, evaluation)| evaluation.decision).unwrap_or(PolicyDecision::Ask)
+    }
+
+    pub fn capability_room_evaluation<'a>(&'a self, cap: &Capability, context: PermissionContext<'a>)
+        -> Option<(RoomAccess, RoomPolicyEvaluation<'a>)>
+    {
+        let access = capability_room_access(cap)?;
         let room = context.target_room.or(context.origin_room);
-        let decision = self.room_policy(room, access);
-        if cap.access != Access::ReadWrite { return decision; }
-        let read = self.room_policy(room, RoomAccess::Read);
-        if decision == PolicyDecision::Deny || read == PolicyDecision::Deny { PolicyDecision::Deny }
-        else if decision == PolicyDecision::Allow && read == PolicyDecision::Allow { PolicyDecision::Allow }
-        else { PolicyDecision::Ask }
+        let decision = self.room_policy_evaluation(room, access);
+        if cap.access != Access::ReadWrite || decision.decision == PolicyDecision::Deny { return Some((access, decision)); }
+        let read = self.room_policy_evaluation(room, RoomAccess::Read);
+        if read.decision != PolicyDecision::Allow { Some((RoomAccess::Read, read)) }
+        else { Some((access, decision)) }
     }
 
     fn scope_matches(&self, scope: &RoomScope, context: PermissionContext<'_>) -> bool {
@@ -461,22 +646,48 @@ impl PermissionStore {
     pub fn effective_capability_for_in_context(&self, subject: &str, declares_perm: impl Fn(Permission) -> bool,
         declares_cap: impl Fn(&Capability) -> bool, cap: &Capability, context: PermissionContext<'_>) -> Effective
     {
-        if !cap.is_available() || !declares_cap(cap) { return Effective::Undeclared; }
-        if self.is_restricted(subject) { return Effective::Denied; }
-        let policy = self.capability_room_policy(cap, context);
-        if policy == PolicyDecision::Deny { return Effective::Denied; }
-        let Some(group) = cap.group else { return Effective::Granted };
+        self.capability_evaluation_for_in_context(subject, declares_perm, declares_cap, cap, context).effective
+    }
+
+    pub fn capability_evaluation_for_in_context<'a>(&'a self, subject: &str, declares_perm: impl Fn(Permission) -> bool,
+        declares_cap: impl Fn(&Capability) -> bool, cap: &Capability, context: PermissionContext<'a>) -> CapabilityEvaluation<'a>
+    {
+        use CapabilityDecisionReason::*;
+        let result = |effective, reason| CapabilityEvaluation { effective, reason };
+        if !cap.is_available() { return result(Effective::Undeclared, Unavailable); }
+        if !declares_cap(cap) { return result(Effective::Undeclared, Undeclared); }
+        if self.is_restricted(subject) { return result(Effective::Denied, SubjectRestricted); }
+        let policy = self.capability_room_evaluation(cap, context);
+        if let Some((access, evaluation)) = policy {
+            if evaluation.decision == PolicyDecision::Deny {
+                return result(Effective::Denied, RoomPolicy { access, reason: evaluation.reason });
+            }
+        }
+        let Some(group) = cap.group else { return result(Effective::Granted, NoPermissionRequired) };
         let base = self.scoped_normal_default(subject, group, Some(cap.id), self.effective_for(subject, &declares_perm, group));
-        if matches!(base, Effective::Undeclared | Effective::Denied) { return base; }
+        if base == Effective::Undeclared { return result(base, Undeclared); }
+        if base == Effective::Denied { return result(base, PermissionDenied { permission: group }); }
         match self.capability_state(subject, cap.id) {
-            GrantState::Denied => Effective::Denied,
-            GrantState::Granted => Effective::Granted,
-            GrantState::Ask if policy == PolicyDecision::Allow || self.has_scoped_grant(subject, group, Some(cap.id), context)
-                || context.target_room.or(context.origin_room).is_some_and(|room| {
+            GrantState::Denied => result(Effective::Denied, CapabilityDenied),
+            GrantState::Granted => result(Effective::Granted, CapabilityGrant),
+            GrantState::Ask => {
+                if let Some((access, evaluation)) = policy {
+                    if evaluation.decision == PolicyDecision::Allow {
+                        return result(Effective::Granted, RoomPolicy { access, reason: evaluation.reason });
+                    }
+                }
+                if self.has_scoped_grant(subject, group, Some(cap.id), context) { return result(Effective::Granted, ScopedGrant); }
+                if context.target_room.or(context.origin_room).is_some_and(|room| {
                     (group == Permission::MatrixRoomsRead && self.is_room_read_allowed(subject, room))
                         || (group == Permission::MatrixRoomsSend && self.is_room_send_allowed(subject, room))
-                }) => Effective::Granted,
-            GrantState::Ask => base,
+                }) { return result(Effective::Granted, RoomGrant); }
+                let reason = if base == Effective::NeedsPrompt { ApprovalRequired }
+                    else if self.state(subject, group) == GrantState::Ask && group.tier() == Tier::Normal
+                        && !self.has_once(subject, group)
+                        && self.timed_until(subject, group, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)).is_none()
+                    { NormalPermission } else { PermissionGrant };
+                result(base, reason)
+            }
         }
     }
 
@@ -505,6 +716,8 @@ impl PermissionStore {
         }
         if !cap.is_available() || !declares_cap(cap) { return Effective::Undeclared; }
         if self.is_restricted(subject) || self.global_policy(RoomAccess::Read) == PolicyDecision::Deny { return Effective::Denied; }
+        let has_allowance = self.room_rules().values().chain(self.space_rules().values()).any(|rule| rule.read == PolicyDecision::Allow);
+        if self.policy_mode(RoomAccess::Read) == RoomPolicyMode::WhitelistOnly && !has_allowance { return Effective::Denied; }
         let Some(group) = cap.group else { return Effective::Granted };
         let base = self.scoped_normal_default(subject, group, Some(cap.id), self.effective_for(subject, &declares_perm, group));
         if matches!(base, Effective::Undeclared | Effective::Denied) { return base; }
@@ -513,7 +726,7 @@ impl PermissionStore {
             GrantState::Granted => Effective::Granted,
             GrantState::Ask => {
                 let whitelist = self.global_policy(RoomAccess::Read) == PolicyDecision::Allow
-                    || self.room_rules().values().chain(self.space_rules().values()).any(|rule| rule.read == PolicyDecision::Allow);
+                    || has_allowance;
                 if whitelist || self.has_scoped_collection_consent(subject, cap, context) { Effective::Granted } else { base }
             }
         }
@@ -613,6 +826,192 @@ mod tests {
         store.set_global_policy(RoomAccess::Write, PolicyDecision::Allow);
         assert_eq!(store.room_policy(Some("!test"), RoomAccess::Write), PolicyDecision::Deny);
         assert_eq!(store.room_policy(Some("!test"), RoomAccess::Read), PolicyDecision::Ask);
+    }
+
+    #[test]
+    fn whitelist_modes_are_independent_and_cannot_be_bypassed_by_subject_grants() {
+        let mut store = PermissionStore::default();
+        store.set_global_policy(RoomAccess::Read, PolicyDecision::Allow);
+        store.set_global_policy(RoomAccess::Write, PolicyDecision::Ask);
+        store.set_policy_mode(RoomAccess::Read, RoomPolicyMode::WhitelistOnly);
+        store.set_room_policy("!selected", RoomAccess::Read, PolicyDecision::Allow);
+        store.set("app", Permission::MatrixRoomsRead, GrantState::Granted);
+        store.set_capability("app", "matrix.rooms.messages.read", GrantState::Granted);
+        store.grant_scoped("app", Permission::MatrixRoomsRead, None, RoomScope::AllRooms, GrantDuration::Always, None).unwrap();
+        assert_eq!(effective(&store, "matrix.rooms.messages.read", context("!selected", "!selected")), Effective::Granted);
+        assert_eq!(effective(&store, "matrix.rooms.messages.read", context("!selected", "!unlisted")), Effective::Denied);
+        assert_eq!(store.room_policy(Some("!unlisted"), RoomAccess::Write), PolicyDecision::Ask);
+        store.set_policy_mode(RoomAccess::Write, RoomPolicyMode::WhitelistOnly);
+        assert_eq!(store.room_policy(Some("!selected"), RoomAccess::Write), PolicyDecision::Deny);
+        store.set_room_policy("!selected", RoomAccess::Write, PolicyDecision::Allow);
+        assert_eq!(store.room_policy(Some("!selected"), RoomAccess::Write), PolicyDecision::Allow);
+        store.set_global_policy(RoomAccess::Read, PolicyDecision::Ask);
+        assert_eq!(store.policy_mode(RoomAccess::Read), RoomPolicyMode::Standard);
+        assert_eq!(store.room_policy(Some("!unlisted"), RoomAccess::Read), PolicyDecision::Ask);
+        assert_eq!(store.policy_mode(RoomAccess::Write), RoomPolicyMode::WhitelistOnly);
+    }
+
+    #[test]
+    fn whitelist_spaces_include_nested_rooms_but_never_override_hard_blocks() {
+        let mut store = PermissionStore::default();
+        store.set_policy_mode(RoomAccess::Read, RoomPolicyMode::WhitelistOnly);
+        store.set_space_policy("!selected-space", RoomAccess::Read, PolicyDecision::Allow);
+        store.set_room_spaces("!nested", vec!["!subspace".into(), "!selected-space".into()]);
+        store.set_room_spaces("!outside", vec![]);
+        assert_eq!(store.room_policy(Some("!selected-space"), RoomAccess::Read), PolicyDecision::Allow);
+        assert_eq!(store.room_policy(Some("!nested"), RoomAccess::Read), PolicyDecision::Allow);
+        assert_eq!(store.room_policy(Some("!outside"), RoomAccess::Read), PolicyDecision::Deny);
+        assert_eq!(store.room_policy(Some("!unresolved"), RoomAccess::Read), PolicyDecision::Deny);
+        store.set_space_policy("!subspace", RoomAccess::Read, PolicyDecision::Deny);
+        store.set_room_policy("!nested", RoomAccess::Read, PolicyDecision::Allow);
+        assert_eq!(store.room_policy(Some("!nested"), RoomAccess::Read), PolicyDecision::Deny);
+        store.set_space_policy("!subspace", RoomAccess::Read, PolicyDecision::Ask);
+        store.set_room_policy("!nested", RoomAccess::Read, PolicyDecision::Deny);
+        assert_eq!(store.room_policy(Some("!nested"), RoomAccess::Read), PolicyDecision::Deny);
+        store.set_global_policy(RoomAccess::Read, PolicyDecision::Deny);
+        assert_eq!(store.room_policy(Some("!selected-space"), RoomAccess::Read), PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn write_master_restores_default_and_mode_after_restart_without_changing_rules() {
+        for (decision, mode) in [
+            (PolicyDecision::Ask, RoomPolicyMode::Standard),
+            (PolicyDecision::Allow, RoomPolicyMode::Standard),
+            (PolicyDecision::Ask, RoomPolicyMode::WhitelistOnly),
+        ] {
+            let mut store = PermissionStore::default();
+            store.set_global_policy(RoomAccess::Write, decision);
+            if mode == RoomPolicyMode::WhitelistOnly { store.set_policy_mode(RoomAccess::Write, mode); }
+            store.set_room_policy("!test", RoomAccess::Write, PolicyDecision::Allow);
+            store.set_space_policy("!protected", RoomAccess::Write, PolicyDecision::Deny);
+            store.set_policy_mode(RoomAccess::Read, RoomPolicyMode::WhitelistOnly);
+            store.set_matrix_write(false);
+            store.set_matrix_write(false);
+            assert!(!store.matrix_write());
+            assert_eq!(store.room_policy(Some("!test"), RoomAccess::Write), PolicyDecision::Deny);
+            assert_eq!(store.write_policy_when_enabled(), decision);
+            let mut restored: PermissionStore = serde_json::from_value(serde_json::to_value(&store).unwrap()).unwrap();
+            restored.migrate();
+            restored.set_matrix_write(true);
+            restored.set_matrix_write(true);
+            assert!(restored.matrix_write());
+            assert_eq!(restored.global_policy(RoomAccess::Write), decision);
+            assert_eq!(restored.policy_mode(RoomAccess::Write), mode);
+            assert_eq!(restored.policy_mode(RoomAccess::Read), RoomPolicyMode::WhitelistOnly);
+            assert_eq!(restored.room_rules(), store.room_rules());
+            assert_eq!(restored.space_rules(), store.space_rules());
+            restored.set_room_spaces("!test", vec![]);
+            assert_eq!(restored.room_policy(Some("!test"), RoomAccess::Write), PolicyDecision::Allow);
+            assert_eq!(restored.room_policy(Some("!protected"), RoomAccess::Write), PolicyDecision::Deny);
+        }
+    }
+
+    #[test]
+    fn old_global_blocks_are_not_reinterpreted_as_whitelists() {
+        let mut store: PermissionStore = serde_json::from_value(serde_json::json!({
+            "schema": 2, "grants": {}, "matrix_write": true,
+            "room_policies": {
+                "global": {"read":"Deny", "write":"Deny"},
+                "rooms": {"!selected": {"read":"Allow", "write":"Allow"}}, "spaces": {}
+            }
+        })).unwrap();
+        store.migrate();
+        for access in [RoomAccess::Read, RoomAccess::Write] {
+            assert_eq!(store.policy_mode(access), RoomPolicyMode::Standard);
+            assert_eq!(store.room_policy(Some("!selected"), access), PolicyDecision::Deny);
+        }
+        assert!(!store.matrix_write());
+        assert_eq!(store.write_policy_when_enabled(), PolicyDecision::Ask);
+        store.set_matrix_write(true);
+        assert_eq!(store.room_policy(Some("!selected"), RoomAccess::Write), PolicyDecision::Allow);
+        assert_eq!(store.room_policy(Some("!other"), RoomAccess::Write), PolicyDecision::Ask);
+        assert_eq!(store.room_policy(Some("!selected"), RoomAccess::Read), PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn policy_explanations_identify_the_enforced_rule_and_unresolved_hierarchy() {
+        let mut store = PermissionStore::default();
+        assert_eq!(store.room_policy_evaluation(Some("!room"), RoomAccess::Write).reason, RoomPolicyReason::WriteMasterOff);
+        store.set_policy_mode(RoomAccess::Read, RoomPolicyMode::WhitelistOnly);
+        assert_eq!(store.room_policy_evaluation(Some("!room"), RoomAccess::Read).reason, RoomPolicyReason::WhitelistRequired);
+        store.set_space_policy("!parent", RoomAccess::Read, PolicyDecision::Allow);
+        assert_eq!(store.room_policy_evaluation(Some("!room"), RoomAccess::Read).reason,
+            RoomPolicyReason::UnresolvedSpaceHierarchy { space: "!parent", rule: PolicyDecision::Allow });
+        store.set_room_spaces("!room", vec!["!parent".into()]);
+        assert_eq!(store.room_policy_evaluation(Some("!room"), RoomAccess::Read), RoomPolicyEvaluation {
+            decision: PolicyDecision::Allow, reason: RoomPolicyReason::SpaceRule { space: "!parent", ancestor: true },
+        });
+        store.set_room_policy("!room", RoomAccess::Read, PolicyDecision::Allow);
+        assert_eq!(store.room_policy_evaluation(Some("!room"), RoomAccess::Read).reason, RoomPolicyReason::RoomRule { room: "!room" });
+        store.set_space_policy("!parent", RoomAccess::Read, PolicyDecision::Deny);
+        assert_eq!(store.room_policy_evaluation(Some("!room"), RoomAccess::Read), RoomPolicyEvaluation {
+            decision: PolicyDecision::Deny, reason: RoomPolicyReason::SpaceRule { space: "!parent", ancestor: true },
+        });
+        store.clear_room_spaces();
+        assert_eq!(store.room_policy_evaluation(Some("!room"), RoomAccess::Read).reason,
+            RoomPolicyReason::UnresolvedSpaceHierarchy { space: "!parent", rule: PolicyDecision::Deny });
+    }
+
+    #[test]
+    fn capability_explanations_keep_app_denials_above_room_allowances() {
+        let mut store = PermissionStore::default();
+        let cap = crate::capabilities::by_id("matrix.room.messages.read").unwrap();
+        let ctx = context("!room", "!room");
+        store.set_room_policy("!room", RoomAccess::Read, PolicyDecision::Allow);
+        store.set("app", Permission::MatrixRoomRead, GrantState::Denied);
+        let decision = store.capability_evaluation_for_in_context("app", |_| true, |_| true, cap, ctx);
+        assert_eq!(decision.effective, Effective::Denied);
+        assert_eq!(decision.reason, CapabilityDecisionReason::PermissionDenied { permission: Permission::MatrixRoomRead });
+        store.set("app", Permission::MatrixRoomRead, GrantState::Ask);
+        store.set_capability("app", cap.id, GrantState::Denied);
+        assert_eq!(store.capability_evaluation_for_in_context("app", |_| true, |_| true, cap, ctx).reason,
+            CapabilityDecisionReason::CapabilityDenied);
+        store.set_capability("app", cap.id, GrantState::Ask);
+        assert_eq!(store.capability_evaluation_for_in_context("app", |_| true, |_| true, cap, ctx).reason,
+            CapabilityDecisionReason::RoomPolicy { access: RoomAccess::Read, reason: RoomPolicyReason::RoomRule { room: "!room" } });
+    }
+
+    #[test]
+    fn inspector_lists_all_hard_blocks_and_public_messages_hide_their_ids() {
+        let mut store = PermissionStore::default();
+        store.set_room_spaces("!private-room", vec!["!secret-one".into(), "!secret-two".into()]);
+        store.set_room_policy("!private-room", RoomAccess::Read, PolicyDecision::Allow);
+        for space in ["!secret-one", "!secret-two"] { store.set_space_policy(space, RoomAccess::Read, PolicyDecision::Deny); }
+        let blockers = store.room_policy_blockers(Some("!private-room"), RoomAccess::Read);
+        assert_eq!(blockers, vec![
+            RoomPolicyReason::SpaceRule { space: "!secret-one", ancestor: true },
+            RoomPolicyReason::SpaceRule { space: "!secret-two", ancestor: true },
+        ]);
+        for reason in blockers {
+            let message = reason.public_message(RoomAccess::Read);
+            assert!(message.contains("Read access") && message.contains("containing space"));
+            assert!(!message.contains("!secret") && !message.contains("!private"));
+        }
+        store.set_space_policy("!secret-one", RoomAccess::Read, PolicyDecision::Ask);
+        assert_eq!(store.room_policy(Some("!private-room"), RoomAccess::Read), PolicyDecision::Deny);
+        assert_eq!(store.room_policy_blockers(Some("!private-room"), RoomAccess::Read).len(), 1);
+        store.set_space_policy("!secret-two", RoomAccess::Read, PolicyDecision::Ask);
+        assert_eq!(store.room_policy(Some("!private-room"), RoomAccess::Read), PolicyDecision::Allow);
+        assert!(store.room_policy_blockers(Some("!private-room"), RoomAccess::Read).is_empty());
+        store.set_global_policy(RoomAccess::Read, PolicyDecision::Deny);
+        store.set_room_policy("!private-room", RoomAccess::Read, PolicyDecision::Deny);
+        assert_eq!(store.room_policy_blockers(Some("!private-room"), RoomAccess::Read),
+            vec![RoomPolicyReason::GlobalBlock, RoomPolicyReason::RoomRule { room: "!private-room" }]);
+    }
+
+    #[test]
+    fn whitelist_collections_admit_only_filterable_allowed_targets() {
+        let mut store = PermissionStore::default();
+        let cap = crate::capabilities::by_id("matrix.rooms.list").unwrap();
+        store.set_policy_mode(RoomAccess::Read, RoomPolicyMode::WhitelistOnly);
+        store.set("app", Permission::MatrixRoomsList, GrantState::Granted);
+        assert_eq!(store.effective_collection_capability_for_in_context("app", |_| true, |_| true, cap, PermissionContext::default()), Effective::Denied);
+        store.set_room_policy("!selected", RoomAccess::Read, PolicyDecision::Allow);
+        assert_eq!(store.effective_collection_capability_for_in_context("app", |_| true, |_| true, cap, PermissionContext::default()), Effective::Granted);
+        assert_eq!(effective(&store, cap.id, context("!origin", "!selected")), Effective::Granted);
+        assert_eq!(effective(&store, cap.id, context("!origin", "!outside")), Effective::Denied);
+        store.set("app", Permission::MatrixRoomsList, GrantState::Denied);
+        assert_eq!(store.effective_collection_capability_for_in_context("app", |_| true, |_| true, cap, PermissionContext::default()), Effective::Denied);
     }
 
     #[test]

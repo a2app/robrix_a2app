@@ -66,6 +66,7 @@ impl Registry {
         if recent.back() != Some(&decision) {
             if recent.len() == 256 { recent.pop_front(); }
             recent.push_back(decision.clone());
+            crate::protection_audit::record_sharing(context, recipient, &decision.sources, &decision.denied_sources);
         }
         Ok(decision)
     }

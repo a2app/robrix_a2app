@@ -680,10 +680,20 @@ impl Broker {
         // Name the exact capability, so an author learns which single
         // ability is blocked rather than just its group.
         let msg = match crate::capabilities::for_service(&req.service) {
-            Some(cap) => format!("\"{}\" is denied for this app. Allow it in App Info", cap.title),
+            Some(cap) => format!("The request to use \"{}\" was not approved.", cap.title),
             None => "permission denied".to_string(),
         };
         respond(cx, Reply::of(req), Err(&msg));
+    }
+
+    fn respond_policy_denied(cx: &mut Cx, req: &SplashHostRequest, store: &PermissionStore,
+        manifest: &crate::manifest::MiniAppManifest, capability: &crate::capabilities::Capability,
+        context: PermissionContext<'_>)
+    {
+        if req.service == "permissions.request" { return Self::respond_denied(cx, req); }
+        let evaluation = store.capability_evaluation_for_in_context(&manifest.id,
+            |permission| manifest.declares(permission), |cap| manifest.declares_capability(cap), capability, context);
+        respond(cx, Reply::of(req), Err(&evaluation.public_message()));
     }
 
     fn dispatch(
@@ -796,7 +806,7 @@ impl Broker {
         };
         if denied
         {
-            return respond(cx, reply, Err(MATRIX_WRITE_OFF_MSG));
+            return Self::respond_policy_denied(cx, &req, ctx.permissions, &manifest, capability, context);
         }
         // Same-app IPC is inside one sandbox: no permission involved.
         let self_ipc = matches!(req.service.as_str(), "ipc.send" | "ipc.post")
@@ -828,7 +838,7 @@ impl Broker {
                 Effective::Granted => {
                     asks.push(BrokerAsk::Used { app_id: manifest.id.clone(), perm });
                 }
-                Effective::Denied => return Self::respond_denied(cx, &req),
+                Effective::Denied => return Self::respond_policy_denied(cx, &req, ctx.permissions, &manifest, capability, context),
                 Effective::Undeclared => {
                     return respond(
                         cx,
@@ -841,7 +851,7 @@ impl Broker {
                     // their Ask-state requests fail cleanly and the script
                     // falls back.
                     if !req.may_prompt {
-                        return Self::respond_denied(cx, &req);
+                        return Self::respond_policy_denied(cx, &req, ctx.permissions, &manifest, capability, context);
                     }
                     asks.push(BrokerAsk::Prompt {
                         app_id: manifest.id.clone(),
@@ -1125,7 +1135,7 @@ impl Broker {
                                 "permission not declared: {}", Permission::McpTools.as_str()
                             )));
                         }
-                        Effective::Denied => return Self::respond_denied(cx, &req),
+                        Effective::Denied => return Self::respond_policy_denied(cx, &req, ctx.permissions, &manifest, capability, context),
                         Effective::Granted | Effective::NeedsPrompt => {}
                     }
                     let tool_effective = ctx.permissions.tool_effective(

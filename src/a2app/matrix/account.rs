@@ -10,7 +10,7 @@ use crate::sliding_sync::{current_user_id, get_blocked_users, get_client, is_use
 pub(super) async fn user_profile(user_id: OwnedUserId) -> Result<String, String> {
     let client = get_client().ok_or("not logged in")?;
     super::policy::ensure_server_output(client.homeserver().as_str())?;
-    let profile = client.account().fetch_user_profile_of(&user_id).await
+    let profile = super::policy::audit_server_operation(client.homeserver().as_str(), client.account().fetch_user_profile_of(&user_id)).await
         .map_err(|e| format!("couldn't fetch the profile: {e}"))?;
     let display_name = profile.get_static::<DisplayName>().ok().flatten()
         .unwrap_or_else(|| user_id.localpart().to_string());
