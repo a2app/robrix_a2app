@@ -216,7 +216,7 @@ askar-storage = { git = "https://github.com/openwallet-foundation/askar.git" }
 [patch."https://github.com/ruma/ruma"]
 ruma = { git = "https://github.com/project-robius/ruma.git", branch = "tsp" }
 
-## Octos dependencies share upstream #2443 plus the SQLite update in #2455;
+## Octos dependencies share upstream main after #2443 and #2455 merged;
 ## see `a2app/agent/Cargo.toml` for the exact confined-worker protocol revision.
 
 [build-dependencies]

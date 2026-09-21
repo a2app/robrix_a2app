@@ -91,20 +91,23 @@ shared DSL names.
 ## Agent setup (once)
 
 Robrix's AI rooms and app generation use a confined Octos process by default
-on macOS and supported Linux systems. The workspace and lockfile pin upstream
-Octos to `bf63797a11b3949f4a726267a91d22bf977e7c01`, which includes
+on macOS and supported Linux systems. The workspace and lockfile pin Octos
+to `dc96b927d25ecfb14cf36d41e61f0e9c3e72aa1e` on upstream `main`.
+This revision includes the merged
 [Octos PR #2443](https://github.com/octos-org/octos/pull/2443) and the
 [SQLite compatibility update #2455](https://github.com/octos-org/octos/pull/2455)
-needed to embed Octos alongside the Matrix SDK. Install that same revision; the `api` feature also supports ordinary ACP integrations:
+needed to embed Octos alongside the Matrix SDK. SQLite-backed builds require
+Rust 1.88 or newer. Install that same revision; the `api` feature also supports
+ordinary ACP integrations:
 
 ```sh
-cargo install --git https://github.com/octos-org/octos --rev bf63797a11b3949f4a726267a91d22bf977e7c01 --locked --no-default-features --features api octos-cli
+cargo install --git https://github.com/octos-org/octos --rev dc96b927d25ecfb14cf36d41e61f0e9c3e72aa1e --locked --no-default-features --features api octos-cli
 ```
 
 Linux requires bubblewrap 0.8 or later, enabled unprivileged namespaces,
 seccomp, and fully enforced Landlock ABI 3 (Linux 6.2 or later). The worker's
 ELF dependencies must be immutable system libraries. See upstream's
-[`octos-sandbox` documentation](https://github.com/octos-org/octos/blob/bf63797a11b3949f4a726267a91d22bf977e7c01/crates/octos-sandbox/HOST_MANAGED.md)
+[`octos-sandbox` documentation](https://github.com/octos-org/octos/blob/dc96b927d25ecfb14cf36d41e61f0e9c3e72aa1e/crates/octos-sandbox/HOST_MANAGED.md)
 for the complete requirements. Self-hosted test machines need these prerequisites
 provisioned by their administrator; CI's AppArmor adjustment is for disposable
 hosted runners only.

@@ -180,7 +180,7 @@ mod tests {
         assert!(!OCTOS_INSTALL_CMD.contains('\n'), "one line, or Copy hands over a script");
         assert!(!OCTOS_INSTALL_CMD.contains("git clone"), "cargo install takes the URL directly");
         assert!(OCTOS_INSTALL_CMD.starts_with("cargo install --git "));
-        assert!(OCTOS_INSTALL_CMD.contains("https://github.com/octos-org/octos --rev bf63797a11b3949f4a726267a91d22bf977e7c01"));
+        assert!(OCTOS_INSTALL_CMD.contains("https://github.com/octos-org/octos --rev dc96b927d25ecfb14cf36d41e61f0e9c3e72aa1e"));
         assert!(OCTOS_INSTALL_CMD.contains("--features api"), "ordinary ACP requires the OUP runtime");
     }
 
@@ -398,7 +398,7 @@ fn anthropic_compatible_bridge() -> Option<(String, Vec<(String, String)>)> {
 /// The exact commands that install octos, kept in one place so the console,
 /// the Providers page and the docs can't drift apart.
 pub const OCTOS_INSTALL_CMD: &str =
-    "cargo install --git https://github.com/octos-org/octos --rev bf63797a11b3949f4a726267a91d22bf977e7c01 --locked --no-default-features --features api octos-cli";
+    "cargo install --git https://github.com/octos-org/octos --rev dc96b927d25ecfb14cf36d41e61f0e9c3e72aa1e --locked --no-default-features --features api octos-cli";
 
 /// Why a generation cannot start — worked out BEFORE anything is spawned.
 ///

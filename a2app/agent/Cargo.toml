@@ -18,13 +18,13 @@ serde_json = "1.0"
 
 ## Both agent backends use the same host-owned model transport and types.
 ## Only the in-process backend links the Octos agent, CLI, and memory crates.
-## Pin upstream #2443 plus the SQLite host compatibility update in #2455.
-octos-agent = { git = "https://github.com/octos-org/octos", rev = "bf63797a11b3949f4a726267a91d22bf977e7c01", default-features = false, optional = true }
-octos-core  = { git = "https://github.com/octos-org/octos", rev = "bf63797a11b3949f4a726267a91d22bf977e7c01" }
-octos-cli   = { git = "https://github.com/octos-org/octos", rev = "bf63797a11b3949f4a726267a91d22bf977e7c01", default-features = false, features = ["api"], optional = true }
-octos-llm   = { git = "https://github.com/octos-org/octos", rev = "bf63797a11b3949f4a726267a91d22bf977e7c01" }
-octos-memory = { git = "https://github.com/octos-org/octos", rev = "bf63797a11b3949f4a726267a91d22bf977e7c01", optional = true }
-octos-sandbox = { git = "https://github.com/octos-org/octos", rev = "bf63797a11b3949f4a726267a91d22bf977e7c01" }
+## Pin upstream main after the confined-worker and SQLite compatibility PRs merged.
+octos-agent = { git = "https://github.com/octos-org/octos", rev = "dc96b927d25ecfb14cf36d41e61f0e9c3e72aa1e", default-features = false, optional = true }
+octos-core  = { git = "https://github.com/octos-org/octos", rev = "dc96b927d25ecfb14cf36d41e61f0e9c3e72aa1e" }
+octos-cli   = { git = "https://github.com/octos-org/octos", rev = "dc96b927d25ecfb14cf36d41e61f0e9c3e72aa1e", default-features = false, features = ["api"], optional = true }
+octos-llm   = { git = "https://github.com/octos-org/octos", rev = "dc96b927d25ecfb14cf36d41e61f0e9c3e72aa1e" }
+octos-memory = { git = "https://github.com/octos-org/octos", rev = "dc96b927d25ecfb14cf36d41e61f0e9c3e72aa1e", optional = true }
+octos-sandbox = { git = "https://github.com/octos-org/octos", rev = "dc96b927d25ecfb14cf36d41e61f0e9c3e72aa1e" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 eyre = { version = "0.6" }
 sha2 = { version = "0.10" }
