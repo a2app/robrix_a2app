@@ -216,9 +216,8 @@ askar-storage = { git = "https://github.com/openwallet-foundation/askar.git" }
 [patch."https://github.com/ruma/ruma"]
 ruma = { git = "https://github.com/project-robius/ruma.git", branch = "tsp" }
 
-## Octos dependencies share project-robius/octos's `host-managed-ifc` branch;
-## see `a2app/agent/Cargo.toml`. It extends the original `acp-embedding-seam`
-## revision with a confined ACP worker and parent-owned model/tool protocol.
+## Octos dependencies share upstream #2443 plus the SQLite update in #2455;
+## see `a2app/agent/Cargo.toml` for the exact confined-worker protocol revision.
 
 [build-dependencies]
 toml = "1"

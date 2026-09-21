@@ -53,7 +53,7 @@ jobs:
           source = sources.pop()
           repository, revision = source[4:].split('#', 1)
           repository = repository.split('?', 1)[0]
-          if repository != 'https://github.com/project-robius/octos' or len(revision) != 40 or any(c not in '0123456789abcdef' for c in revision):
+          if repository != 'https://github.com/octos-org/octos' or len(revision) != 40 or any(c not in '0123456789abcdef' for c in revision):
               raise SystemExit('Unexpected Octos repository or revision; review this security workflow')
           subprocess.run(['git', 'init', '.octos-security-worker'], check=True)
           subprocess.run(['git', '-C', '.octos-security-worker', 'fetch', '--depth=1', repository, revision], check=True)

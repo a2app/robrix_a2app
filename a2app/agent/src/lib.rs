@@ -180,6 +180,8 @@ mod tests {
         assert!(!OCTOS_INSTALL_CMD.contains('\n'), "one line, or Copy hands over a script");
         assert!(!OCTOS_INSTALL_CMD.contains("git clone"), "cargo install takes the URL directly");
         assert!(OCTOS_INSTALL_CMD.starts_with("cargo install --git "));
+        assert!(OCTOS_INSTALL_CMD.contains("https://github.com/octos-org/octos --rev bf63797a11b3949f4a726267a91d22bf977e7c01"));
+        assert!(OCTOS_INSTALL_CMD.contains("--features api"), "ordinary ACP requires the OUP runtime");
     }
 
     /// Every blocker has to name the missing piece in the one-line hint, and
@@ -200,26 +202,23 @@ mod tests {
         assert_eq!(Blocker::NoProvider.command(), None);
     }
 
-    /// The profile Robrix hands octos must parse against octos's own schema,
-    /// evict native internet tools and every shell/file/search/memory
-    /// tool plus browser/web_search whose redirects bypass URL approval. A
-    /// typo here would make every AI-room session fail to start, and a too-wide
-    /// allow list would silently re-open the native toolset.
-    #[cfg(feature = "embedded")]
     #[test]
-    fn session_profile_parses_and_disables_all_native_tools() {
-        let def = octos_agent::profile::ProfileDefinition::from_json_str(
-            super::ROBRIX_SESSION_PROFILE,
-        )
-        .expect("octos parses the session profile");
-        assert!(!def.tools.allows("web_search"));
-        assert!(!def.tools.allows("web_fetch"));
-        assert!(!def.tools.allows("browser"));
-        assert!(!def.tools.allows("shell"));
-        assert!(!def.tools.allows("read_file"));
-        assert!(!def.tools.allows("write_file"));
-        assert!(!def.tools.allows("grep"));
-        assert!(!def.tools.allows("spawn"));
+    fn protected_requirements_cannot_fall_back_to_a_standalone_agent() {
+        struct DenyNetwork;
+        impl NetworkApproval for DenyNetwork {
+            fn approve(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+                panic!("a standalone backend must reject the unsupported callback before starting");
+            }
+        }
+        let prefs = prefs::AgentPrefs::default();
+        let workspace = std::path::Path::new("/unused-agent-guard-fixture");
+        let room = start_backend_with_mcp(workspace, &prefs, &[], true, None, None, None);
+        assert_eq!(room.err().as_deref(), Some("A room agent needs a registered private-data context."));
+        let network = start_backend_with_mcp(workspace, &prefs, &[], false,
+            Some(std::sync::Arc::new(DenyNetwork)), None, None);
+        assert_eq!(network.err().as_deref(), Some("Network approval requires a protected agent context and host-owned tools."));
+        let tools = start_backend_with_mcp(workspace, &prefs, &[], false, None, None, Some(mcp::McpServer::new()));
+        assert_eq!(tools.err().as_deref(), Some("Host-owned tools require a protected agent context."));
     }
 
     #[test]
@@ -399,7 +398,7 @@ fn anthropic_compatible_bridge() -> Option<(String, Vec<(String, String)>)> {
 /// The exact commands that install octos, kept in one place so the console,
 /// the Providers page and the docs can't drift apart.
 pub const OCTOS_INSTALL_CMD: &str =
-    "cargo install --git https://github.com/project-robius/octos --branch host-managed-ifc --locked octos-cli";
+    "cargo install --git https://github.com/octos-org/octos --rev bf63797a11b3949f4a726267a91d22bf977e7c01 --locked --no-default-features --features api octos-cli";
 
 /// Why a generation cannot start — worked out BEFORE anything is spawned.
 ///
@@ -553,56 +552,15 @@ pub fn start_backend(
     start_backend_with_mcp(workspace, &prefs, &[], false, None, None, None)
 }
 
-/// Robrix's octos profile for its long-lived AI-room sessions, written to
-/// Robrix's own data root and returned as an absolute path for octos's
-/// `--profile` / `AcpCommand::profile`.
-///
-/// The native allowlist is empty. All tools, including web_fetch, are
-/// supplied by Robrix's MCP server so the host owns their I/O. The protected
-/// embedded assembly enforces the same restriction directly and does not
-/// import any global Octos profile or tool configuration.
-///
-/// The file is rewritten only when its content changes, so a long-running app
-/// does not churn it while still picking up an edit on the next session start.
-pub fn robrix_session_profile() -> Result<String, String> {
-    use std::io::Write as _;
-    let dir = a2app_core::data_root().join("agent_profiles");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
-    let path = dir.join("robrix-session.json");
-    if std::fs::read_to_string(&path).ok().as_deref() != Some(ROBRIX_SESSION_PROFILE) {
-        let mut file = std::fs::File::create(&path)
-            .map_err(|e| format!("couldn't write {}: {e}", path.display()))?;
-        file.write_all(ROBRIX_SESSION_PROFILE.as_bytes())
-            .map_err(|e| format!("couldn't write {}: {e}", path.display()))?;
-    }
-    Ok(path.to_string_lossy().into_owned())
-}
-
-/// The JSON body of [`robrix_session_profile`]'s file. A constant so the test
-/// below can validate it against octos's schema without touching the disk.
-const ROBRIX_SESSION_PROFILE: &str = r#"{
-  "name": "robrix-session",
-  "version": 1,
-  "description": "Robrix AI-room session: all tools are mediated by Robrix's MCP server; native tools are unavailable.",
-  "tools": { "mode": "none" },
-  "agents": []
-}
-"#;
-
 /// [`start_backend`] plus the stdio MCP servers the spawned agent is told
 /// about in `session/new` (`mcpServers`). A long-lived AI session passes the
 /// one Robrix tool server it bound for itself here; the one-shot create-app
 /// pipeline calls [`start_backend`], which advertises none.
 ///
-/// Which agents honor the advertisement: claude-code-acp (the bridged
-/// backend), any `ROBRIX_AGENT_CMD` override, and octos — whose ACP handler
-/// connects per-session `mcpServers` and registers their tools (the coding
-/// profile is bypassed for client-advertised servers) — all read
-/// `mcpServers` from `session/new`, so the tools reach their models. An
-/// in-process embedded agent on iOS cannot exec the Robrix relay child at
-/// all, so the config is dropped there; on desktop the embedded agent honors
-/// it exactly like the child process does.
+/// Foreign ACP backends receive the advertisement through the standard
+/// protocol. Ordinary upstream Octos ACP does not connect these servers, so
+/// that combination is rejected. Protected room agents use the shared live
+/// host registry directly in both the embedded and confined child backends.
 ///
 /// A `model_context` selects the host-owned provider transport. Protected room
 /// sessions (`host_managed=true`) get only the host's tools; protected generation
@@ -629,14 +587,20 @@ pub fn start_backend_with_mcp(
             let servers = if cfg!(target_os = "ios") { &[][..] } else { mcp_servers };
             return Ok(Box::new(octos_embedded::EmbeddedOctos::start(
                 workspace, prefs, servers, host_managed, network_approval, model_context,
+                host_tools,
             )?));
         }
         let context = model_context.ok_or("Missing private-data context.")?;
         return host_broker::start(prefs, context, host_managed, host_tools);
     }
-    // Used only by the in-process backend; the child-process backends have no
-    // channel for it today and fail closed inside octos.
-    let _ = &network_approval;
+    // Upstream's standalone runtime has no callback for Robrix's network
+    // authority. Never silently run native tools when a caller requires it.
+    if network_approval.is_some() {
+        return Err("Network approval requires a protected agent context and host-owned tools.".into());
+    }
+    if host_tools.is_some() {
+        return Err("Host-owned tools require a protected agent context.".into());
+    }
     // Refuse before spawning rather than translating an errno afterwards: the
     // check knows WHICH program is missing, so it can name it and the install.
     if let Some(blocked) = standalone_blocker() {
@@ -706,6 +670,7 @@ pub fn start_backend_with_mcp(
             host_managed,
             network_approval,
             model_context,
+            host_tools,
         )?));
     }
     #[cfg(not(feature = "embedded"))]
@@ -717,19 +682,12 @@ pub fn start_backend_with_mcp(
             // another provider's endpoint.
             return Ok(Box::new(AcpClient::spawn(&cmd, workspace, &bridge_env, &[], mcp_servers)?));
         }
-        // A host-managed session strips octos's native tools by running
-        // Robrix's session profile (see octos-agent's profile system). The
-        // one-shot generation agent (host_managed = false) keeps the default
-        // `coding` surface.
-        let cmd = octos_acp_command(prefs);
-        let mut extra = extra;
-        if host_managed {
-            // Pass the profile as a REAL argument, not appended to the
-            // shell-like command string: `AcpClient::spawn` splits that string
-            // on whitespace, and the data root can contain spaces.
-            extra.push(String::from("--profile"));
-            extra.push(robrix_session_profile()?);
+        // Ordinary upstream ACP does not connect client-advertised MCP
+        // servers. Room agents have already taken the protected broker path.
+        if !mcp_servers.is_empty() {
+            return Err("Ordinary Octos ACP cannot connect client MCP servers. Use a protected room agent with host-owned tools.".into());
         }
+        let cmd = octos_acp_command(prefs);
         Ok(Box::new(AcpClient::spawn(&cmd, workspace, &env, &extra, mcp_servers)?))
     }
 }

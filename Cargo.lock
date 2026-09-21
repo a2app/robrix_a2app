@@ -9,6 +9,7 @@ dependencies = [
  "a2app-core",
  "async-trait",
  "chrono",
+ "dirs 6.0.0",
  "eyre",
  "getrandom 0.3.3",
  "makepad-widgets",
@@ -738,6 +739,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
  "axum-core",
+ "base64 0.22.1",
  "bytes",
  "form_urlencoded",
  "futures-util",
@@ -750,14 +752,17 @@ dependencies = [
  "matchit",
  "memchr 2.7.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "mime",
+ "multer",
  "percent-encoding",
  "pin-project-lite",
  "serde_core",
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
+ "sha1",
  "sync_wrapper",
  "tokio",
+ "tokio-tungstenite 0.29.0",
  "tower",
  "tower-layer",
  "tower-service",
@@ -2172,6 +2177,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirs"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+dependencies = [
+ "dirs-sys 0.5.0",
+]
+
+[[package]]
 name = "dirs-sys"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2756,6 +2770,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
+name = "futf"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df420e2e84819663797d1ec6544b13c5be84629e7bb00dc960d6917db2987843"
+dependencies = [
+ "mac",
+ "new_debug_unreachable",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3319,8 +3343,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a5a1c7113c831fec68cbd79cd8bf281a84e5b6943f51473dc266b0b88a6a017e"
 dependencies = [
  "html5ever 0.38.0",
- "markup5ever_rcdom",
+ "markup5ever_rcdom 0.38.0+unofficial",
  "phf 0.13.1",
+]
+
+[[package]]
+name = "html5ever"
+version = "0.35.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55d958c2f74b664487a2035fe1dadb032c48718a03b63f3ab0b8537db8549ed4"
+dependencies = [
+ "log 0.4.28",
+ "markup5ever 0.35.0",
+ "match_token",
 ]
 
 [[package]]
@@ -3352,7 +3387,7 @@ dependencies = [
  "memchr 2.7.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "pastey 0.1.1",
  "phf 0.13.1",
- "phf_codegen",
+ "phf_codegen 0.13.1",
  "serde_json",
 ]
 
@@ -3505,7 +3540,7 @@ dependencies = [
  "js-sys",
  "log 0.4.28",
  "wasm-bindgen",
- "windows-core 0.56.0",
+ "windows-core 0.62.1",
 ]
 
 [[package]]
@@ -4288,6 +4323,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "mac"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
+
+[[package]]
 name = "mach2"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4775,13 +4816,24 @@ checksum = "3e2e65a1a2e43cfcb47a895c4c8b10d1f4a61097f9f254f183aee60cad9c651d"
 
 [[package]]
 name = "markup5ever"
+version = "0.35.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "311fe69c934650f8f19652b3946075f0fc41ad8757dbb68f1ca14e7900ecc1c3"
+dependencies = [
+ "log 0.4.28",
+ "tendril 0.4.3",
+ "web_atoms 0.1.3",
+]
+
+[[package]]
+name = "markup5ever"
 version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8983d30f2915feeaaab2d6babdd6bc7e9ed1a00b66b5e6d74df19aa9c0e91862"
 dependencies = [
  "log 0.4.28",
- "tendril",
- "web_atoms",
+ "tendril 0.5.0",
+ "web_atoms 0.2.3",
 ]
 
 [[package]]
@@ -4791,8 +4843,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7122d987ec5f704ee56f6e5b41a7d93722e9aae27ae07cafa4036c4d3f9757de"
 dependencies = [
  "log 0.4.28",
- "tendril",
- "web_atoms",
+ "tendril 0.5.0",
+ "web_atoms 0.2.3",
+]
+
+[[package]]
+name = "markup5ever_rcdom"
+version = "0.35.0+unofficial"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8bcd53df4748257345b8bc156d620340ce0f015ec1c7ef1cff475543888a31d"
+dependencies = [
+ "html5ever 0.35.0",
+ "markup5ever 0.35.0",
+ "tendril 0.4.3",
+ "xml5ever 0.35.0",
 ]
 
 [[package]]
@@ -4803,8 +4867,19 @@ checksum = "333171ccdf66e915257740d44e38ea5b1b19ce7b45d33cc35cb6f118fbd981ff"
 dependencies = [
  "html5ever 0.38.0",
  "markup5ever 0.38.0",
- "tendril",
- "xml5ever",
+ "tendril 0.5.0",
+ "xml5ever 0.38.0",
+]
+
+[[package]]
+name = "match_token"
+version = "0.35.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac84fd3f360fcc43dc5f5d186f02a94192761a080e8bc58621ad4d12296a58cf"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -5190,6 +5265,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "metrics-exporter-prometheus"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd7399781913e5393588a8d8c6a2867bf85fb38eaf2502fdce465aad2dc6f034"
+dependencies = [
+ "base64 0.22.1",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "indexmap 2.14.2",
+ "ipnet",
+ "metrics",
+ "metrics-util",
+ "quanta",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "metrics-util"
+version = "0.19.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8496cc523d1f94c1385dd8f0f0c2c480b2b8aeccb5b7e4485ad6365523ae376"
+dependencies = [
+ "crossbeam-epoch",
+ "crossbeam-utils",
+ "hashbrown 0.15.5",
+ "metrics",
+ "quanta",
+ "rand 0.9.2",
+ "rand_xoshiro",
+ "sketches-ddsketch",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5263,6 +5375,23 @@ checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
 dependencies = [
  "num-traits 0.2.19",
  "pxfm",
+]
+
+[[package]]
+name = "multer"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83e87776546dc87511aa5ee218730c92b666d7264ab6ed41f9d215af9cd5224b"
+dependencies = [
+ "bytes",
+ "encoding_rs",
+ "futures-util",
+ "http",
+ "httparse",
+ "memchr 2.7.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "mime",
+ "spin",
+ "version_check",
 ]
 
 [[package]]
@@ -5449,6 +5578,15 @@ dependencies = [
  "bytecount",
  "memchr 2.7.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "nom 8.0.0",
+]
+
+[[package]]
+name = "ntapi"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3b335231dfd352ffb0f8017f3b6027a4917f7df785ea2143d8af2adc66980ae"
+dependencies = [
+ "winapi",
 ]
 
 [[package]]
@@ -5697,14 +5835,14 @@ dependencies = [
 
 [[package]]
 name = "octos-agent"
-version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=host-managed-ifc#8e4d841dee3ffa6df31a688fdb4aa5c158497d06"
+version = "2.0.3-rc.11"
+source = "git+https://github.com/octos-org/octos?rev=bf63797a11b3949f4a726267a91d22bf977e7c01#bf63797a11b3949f4a726267a91d22bf977e7c01"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chromiumoxide",
  "chrono",
- "dirs",
+ "dirs 5.0.1",
  "dunce",
  "eyre",
  "flate2",
@@ -5713,10 +5851,12 @@ dependencies = [
  "globset",
  "hound",
  "htmd",
+ "html5ever 0.35.0",
  "ignore",
  "keyring",
  "lettre",
  "libc",
+ "markup5ever_rcdom 0.35.0+unofficial",
  "metrics",
  "oauth2",
  "octos-bus",
@@ -5730,6 +5870,7 @@ dependencies = [
  "reqwest 0.12.28",
  "reqwest 0.13.2",
  "rmcp",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5748,11 +5889,12 @@ dependencies = [
 
 [[package]]
 name = "octos-bus"
-version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=host-managed-ifc#8e4d841dee3ffa6df31a688fdb4aa5c158497d06"
+version = "2.0.3-rc.11"
+source = "git+https://github.com/octos-org/octos?rev=bf63797a11b3949f4a726267a91d22bf977e7c01#bf63797a11b3949f4a726267a91d22bf977e7c01"
 dependencies = [
  "aes 0.8.4",
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "cbc 0.1.2",
  "chrono",
@@ -5776,12 +5918,13 @@ dependencies = [
 
 [[package]]
 name = "octos-cli"
-version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=host-managed-ifc#8e4d841dee3ffa6df31a688fdb4aa5c158497d06"
+version = "2.0.3-rc.11"
+source = "git+https://github.com/octos-org/octos?rev=bf63797a11b3949f4a726267a91d22bf977e7c01#bf63797a11b3949f4a726267a91d22bf977e7c01"
 dependencies = [
  "agent-client-protocol",
  "argon2",
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "chacha20poly1305 0.10.1",
  "chrono",
@@ -5790,16 +5933,20 @@ dependencies = [
  "color-eyre",
  "colored",
  "constant_time_eq 0.3.1",
- "dirs",
+ "dirs 5.0.1",
+ "dunce",
  "eyre",
  "flate2",
  "fs2",
+ "futures",
  "getrandom 0.2.16",
  "iana-time-zone",
  "image",
  "keyring",
+ "lettre",
  "libc",
  "metrics",
+ "metrics-exporter-prometheus",
  "octos-agent",
  "octos-bus",
  "octos-core",
@@ -5819,18 +5966,28 @@ dependencies = [
  "percent-encoding",
  "qrcode",
  "quick-xml",
+ "rand 0.8.5",
  "redb",
  "regex",
  "reqwest 0.12.28",
+ "rpassword",
+ "rust-embed",
  "rustix",
+ "rustls",
+ "rustls-native-certs",
  "rustyline",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "subtle",
+ "sysinfo",
  "tar",
  "tempfile",
  "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tokio-util",
  "toml 0.8.23",
+ "tower-http",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -5841,8 +5998,8 @@ dependencies = [
 
 [[package]]
 name = "octos-core"
-version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=host-managed-ifc#8e4d841dee3ffa6df31a688fdb4aa5c158497d06"
+version = "2.0.3-rc.11"
+source = "git+https://github.com/octos-org/octos?rev=bf63797a11b3949f4a726267a91d22bf977e7c01#bf63797a11b3949f4a726267a91d22bf977e7c01"
 dependencies = [
  "chrono",
  "eyre",
@@ -5855,8 +6012,8 @@ dependencies = [
 
 [[package]]
 name = "octos-diagnostics"
-version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=host-managed-ifc#8e4d841dee3ffa6df31a688fdb4aa5c158497d06"
+version = "2.0.3-rc.11"
+source = "git+https://github.com/octos-org/octos?rev=bf63797a11b3949f4a726267a91d22bf977e7c01#bf63797a11b3949f4a726267a91d22bf977e7c01"
 dependencies = [
  "eyre",
  "octos-core",
@@ -5867,22 +6024,24 @@ dependencies = [
 
 [[package]]
 name = "octos-fleet"
-version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=host-managed-ifc#8e4d841dee3ffa6df31a688fdb4aa5c158497d06"
+version = "2.0.3-rc.11"
+source = "git+https://github.com/octos-org/octos?rev=bf63797a11b3949f4a726267a91d22bf977e7c01#bf63797a11b3949f4a726267a91d22bf977e7c01"
 dependencies = [
  "eyre",
  "octos-core",
  "redb",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
 [[package]]
 name = "octos-fleet-worker"
-version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=host-managed-ifc#8e4d841dee3ffa6df31a688fdb4aa5c158497d06"
+version = "2.0.3-rc.11"
+source = "git+https://github.com/octos-org/octos?rev=bf63797a11b3949f4a726267a91d22bf977e7c01#bf63797a11b3949f4a726267a91d22bf977e7c01"
 dependencies = [
  "async-trait",
  "eyre",
@@ -5898,8 +6057,8 @@ dependencies = [
 
 [[package]]
 name = "octos-llm"
-version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=host-managed-ifc#8e4d841dee3ffa6df31a688fdb4aa5c158497d06"
+version = "2.0.3-rc.11"
+source = "git+https://github.com/octos-org/octos?rev=bf63797a11b3949f4a726267a91d22bf977e7c01#bf63797a11b3949f4a726267a91d22bf977e7c01"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5914,14 +6073,15 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "octos-memory"
-version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=host-managed-ifc#8e4d841dee3ffa6df31a688fdb4aa5c158497d06"
+version = "2.0.3-rc.11"
+source = "git+https://github.com/octos-org/octos?rev=bf63797a11b3949f4a726267a91d22bf977e7c01#bf63797a11b3949f4a726267a91d22bf977e7c01"
 dependencies = [
  "bincode",
  "chrono",
@@ -5939,8 +6099,8 @@ dependencies = [
 
 [[package]]
 name = "octos-pipeline"
-version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=host-managed-ifc#8e4d841dee3ffa6df31a688fdb4aa5c158497d06"
+version = "2.0.3-rc.11"
+source = "git+https://github.com/octos-org/octos?rev=bf63797a11b3949f4a726267a91d22bf977e7c01#bf63797a11b3949f4a726267a91d22bf977e7c01"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5961,8 +6121,8 @@ dependencies = [
 
 [[package]]
 name = "octos-plugin"
-version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=host-managed-ifc#8e4d841dee3ffa6df31a688fdb4aa5c158497d06"
+version = "2.0.3-rc.11"
+source = "git+https://github.com/octos-org/octos?rev=bf63797a11b3949f4a726267a91d22bf977e7c01#bf63797a11b3949f4a726267a91d22bf977e7c01"
 dependencies = [
  "eyre",
  "metrics",
@@ -5976,7 +6136,7 @@ dependencies = [
 [[package]]
 name = "octos-sandbox"
 version = "0.1.0"
-source = "git+https://github.com/project-robius/octos?branch=host-managed-ifc#8e4d841dee3ffa6df31a688fdb4aa5c158497d06"
+source = "git+https://github.com/octos-org/octos?rev=bf63797a11b3949f4a726267a91d22bf977e7c01#bf63797a11b3949f4a726267a91d22bf977e7c01"
 dependencies = [
  "clap",
  "eyre",
@@ -5990,11 +6150,11 @@ dependencies = [
 
 [[package]]
 name = "octos-services"
-version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=host-managed-ifc#8e4d841dee3ffa6df31a688fdb4aa5c158497d06"
+version = "2.0.3-rc.11"
+source = "git+https://github.com/octos-org/octos?rev=bf63797a11b3949f4a726267a91d22bf977e7c01#bf63797a11b3949f4a726267a91d22bf977e7c01"
 dependencies = [
  "chrono",
- "dirs",
+ "dirs 5.0.1",
  "eyre",
  "flate2",
  "futures",
@@ -6011,8 +6171,8 @@ dependencies = [
 
 [[package]]
 name = "octos-store"
-version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=host-managed-ifc#8e4d841dee3ffa6df31a688fdb4aa5c158497d06"
+version = "2.0.3-rc.11"
+source = "git+https://github.com/octos-org/octos?rev=bf63797a11b3949f4a726267a91d22bf977e7c01#bf63797a11b3949f4a726267a91d22bf977e7c01"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -6031,8 +6191,8 @@ dependencies = [
 
 [[package]]
 name = "octos-swarm"
-version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=host-managed-ifc#8e4d841dee3ffa6df31a688fdb4aa5c158497d06"
+version = "2.0.3-rc.11"
+source = "git+https://github.com/octos-org/octos?rev=bf63797a11b3949f4a726267a91d22bf977e7c01#bf63797a11b3949f4a726267a91d22bf977e7c01"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6050,8 +6210,8 @@ dependencies = [
 
 [[package]]
 name = "octos-workflows"
-version = "2.0.2"
-source = "git+https://github.com/project-robius/octos?branch=host-managed-ifc#8e4d841dee3ffa6df31a688fdb4aa5c158497d06"
+version = "2.0.3-rc.11"
+source = "git+https://github.com/octos-org/octos?rev=bf63797a11b3949f4a726267a91d22bf977e7c01#bf63797a11b3949f4a726267a91d22bf977e7c01"
 dependencies = [
  "chrono",
  "eyre",
@@ -6320,6 +6480,15 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "phf"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd6780a80ae0c52cc120a26a1a42c1ae51b247a253e4e06113d23d2c2edd078"
+dependencies = [
+ "phf_shared 0.11.3",
+]
+
+[[package]]
+name = "phf"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "913273894cec178f401a31ec4b656318d95473527be05c0752cc41cdc32be8b7"
@@ -6340,12 +6509,32 @@ dependencies = [
 
 [[package]]
 name = "phf_codegen"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aef8048c789fa5e851558d709946d6d79a8ff88c0440c587967f8e94bfb1216a"
+dependencies = [
+ "phf_generator 0.11.3",
+ "phf_shared 0.11.3",
+]
+
+[[package]]
+name = "phf_codegen"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "49aa7f9d80421bca176ca8dbfebe668cc7a2684708594ec9f3c0db0805d5d6e1"
 dependencies = [
- "phf_generator",
+ "phf_generator 0.13.1",
  "phf_shared 0.13.1",
+]
+
+[[package]]
+name = "phf_generator"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c80231409c20246a13fddb31776fb942c38553c51e871f8cbd687a4cfb5843d"
+dependencies = [
+ "phf_shared 0.11.3",
+ "rand 0.8.5",
 ]
 
 [[package]]
@@ -6364,11 +6553,20 @@ version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "812f032b54b1e759ccd5f8b6677695d5268c588701effba24601f6932f8269ef"
 dependencies = [
- "phf_generator",
+ "phf_generator 0.13.1",
  "phf_shared 0.13.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
+dependencies = [
+ "siphasher",
 ]
 
 [[package]]
@@ -6708,6 +6906,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
+name = "quanta"
+version = "0.12.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3ab5a9d756f0d97bdc89019bd2e4ea098cf9cde50ee7564dde6b81ccc8f06c7"
+dependencies = [
+ "crossbeam-utils",
+ "libc",
+ "once_cell 1.21.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "raw-cpuid",
+ "wasi 0.11.1+wasi-snapshot-preview1",
+ "web-sys",
+ "winapi",
+]
+
+[[package]]
 name = "quick-xml"
 version = "0.37.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6917,6 +7130,15 @@ checksum = "11762a6aea3b0a87a51b21cb2085d252f10c01cd0f3f505e1da002cf6e2427da"
 dependencies = [
  "thiserror 2.0.20",
  "windows 0.62.1",
+]
+
+[[package]]
+name = "raw-cpuid"
+version = "11.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
+dependencies = [
+ "bitflags 2.13.1",
 ]
 
 [[package]]
@@ -7483,6 +7705,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpassword"
+version = "7.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2da316a15f47e3d053de9cb2c439650bd8fa4aaeb9365f2e5f27f492ff73c196"
+dependencies = [
+ "libc",
+ "rtoolbox",
+ "windows-sys 0.61.1",
+]
+
+[[package]]
 name = "rsa"
 version = "0.9.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7500,6 +7733,26 @@ dependencies = [
  "spki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rsqlite-vfs"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
+dependencies = [
+ "hashbrown 0.16.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "rtoolbox"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a1efe12a1469752d0e6ff5ebec0b6ef4924cc5c4c71046b0ec730040535819d"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.1",
 ]
 
 [[package]]
@@ -7642,6 +7895,42 @@ dependencies = [
  "hashlink 0.12.2",
  "libsqlite3-sys",
  "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sqlite-wasm-rs",
+]
+
+[[package]]
+name = "rust-embed"
+version = "8.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9e7760e252aaba7b09f4be00e36476cf585bdb68a53552ac954cdf504ab4bc9"
+dependencies = [
+ "rust-embed-impl",
+ "rust-embed-utils",
+ "walkdir",
+]
+
+[[package]]
+name = "rust-embed-impl"
+version = "8.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bcfc4d6f53af43755f7a723e4b6b8794fcce052a178dd8c6c1dadc5f5343097"
+dependencies = [
+ "mime_guess",
+ "proc-macro2",
+ "quote",
+ "rust-embed-utils",
+ "syn 2.0.119",
+ "walkdir",
+]
+
+[[package]]
+name = "rust-embed-utils"
+version = "8.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42ffa149f6aa81b58a5b3011d01a857c4ed12c7a732d2c51947a4c7c692185f0"
+dependencies = [
+ "sha2 0.11.0",
+ "walkdir",
 ]
 
 [[package]]
@@ -8383,6 +8672,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56199f7ddabf13fe5074ce809e7d3f42b42ae711800501b5b16ea82ad029c39d"
 
 [[package]]
+name = "sketches-ddsketch"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c6f73aeb92d671e0cc4dca167e59b2deb6387c375391bc99ee743f326994a2b"
+
+[[package]]
 name = "slab"
 version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8437,6 +8732,18 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "sqlite-wasm-rs"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc3efc0da82635d7e1ced0053bbbfa8c7ab9645d0bf36ceb4f7127bb85315d75"
+dependencies = [
+ "cc",
+ "js-sys",
+ "rsqlite-vfs",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -8651,6 +8958,19 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "string_cache"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf776ba3fa74f83bf4b63c3dcbbf82173db2632ed8452cb2d891d33f459de70f"
+dependencies = [
+ "new_debug_unreachable",
+ "parking_lot",
+ "phf_shared 0.11.3",
+ "precomputed-hash",
+ "serde",
+]
+
+[[package]]
+name = "string_cache"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a18596f8c785a729f2819c0f6a7eae6ebeebdfffbfe4214ae6b087f690e31901"
@@ -8664,11 +8984,23 @@ dependencies = [
 
 [[package]]
 name = "string_cache_codegen"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c711928715f1fe0fe509c53b43e993a9a557babc2d0a3567d0a3006f1ac931a0"
+dependencies = [
+ "phf_generator 0.11.3",
+ "phf_shared 0.11.3",
+ "proc-macro2",
+ "quote",
+]
+
+[[package]]
+name = "string_cache_codegen"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "585635e46db231059f76c5849798146164652513eb9e8ab2685939dd90f29b69"
 dependencies = [
- "phf_generator",
+ "phf_generator 0.13.1",
  "phf_shared 0.13.1",
  "proc-macro2",
  "quote",
@@ -8792,6 +9124,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sysinfo"
+version = "0.34.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4b93974b3d3aeaa036504b8eefd4c039dced109171c1ae973f1dc63b2c7e4b2"
+dependencies = [
+ "libc",
+ "memchr 2.7.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "ntapi",
+ "objc2-core-foundation",
+ "windows 0.56.0",
+]
+
+[[package]]
 name = "system-configuration"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8834,6 +9179,17 @@ dependencies = [
  "once_cell 1.21.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustix",
  "windows-sys 0.61.1",
+]
+
+[[package]]
+name = "tendril"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d24a120c5fc464a3458240ee02c299ebcb9d67b5249c8848b09d639dca8d7bb0"
+dependencies = [
+ "futf",
+ "mac",
+ "utf-8",
 ]
 
 [[package]]
@@ -9055,6 +9411,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-tungstenite"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
+dependencies = [
+ "futures-util",
+ "log 0.4.28",
+ "tokio",
+ "tungstenite 0.29.0",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9197,6 +9565,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -9349,7 +9718,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
- "tokio-tungstenite",
+ "tokio-tungstenite 0.26.2",
  "tokio-util",
  "tracing",
  "typenum",
@@ -9396,6 +9765,22 @@ dependencies = [
  "sha1",
  "thiserror 2.0.20",
  "utf-8",
+]
+
+[[package]]
+name = "tungstenite"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c01152af293afb9c7c2a57e4b559c5620b421f6d133261c60dd2d0cdb38e6b8"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log 0.4.28",
+ "rand 0.9.2",
+ "sha1",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -9888,14 +10273,26 @@ dependencies = [
 
 [[package]]
 name = "web_atoms"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57ffde1dc01240bdf9992e3205668b235e59421fd085e8a317ed98da0178d414"
+dependencies = [
+ "phf 0.11.3",
+ "phf_codegen 0.11.3",
+ "string_cache 0.8.9",
+ "string_cache_codegen 0.5.4",
+]
+
+[[package]]
+name = "web_atoms"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57a9779e9f04d2ac1ce317aee707aa2f6b773afba7b931222bff6983843b1576"
 dependencies = [
  "phf 0.13.1",
- "phf_codegen",
- "string_cache",
- "string_cache_codegen",
+ "phf_codegen 0.13.1",
+ "string_cache 0.9.0",
+ "string_cache_codegen 0.6.1",
 ]
 
 [[package]]
@@ -10750,6 +11147,16 @@ checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
  "rustix",
+]
+
+[[package]]
+name = "xml5ever"
+version = "0.35.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee3f1e41afb31a75aef076563b0ad3ecc24f5bd9d12a72b132222664eb76b494"
+dependencies = [
+ "log 0.4.28",
+ "markup5ever 0.35.0",
 ]
 
 [[package]]

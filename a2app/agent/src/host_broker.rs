@@ -127,7 +127,7 @@ impl HostBroker {
 
     pub(crate) fn accept_handshake(&self, result: &Value) -> Result<(), String> {
         let capabilities: HostCapabilities = serde_json::from_value(result["agentCapabilities"]["_meta"][CAPABILITY_KEY].clone())
-            .map_err(|_| "This agent does not support Octos's protected host broker. Install the host-managed Octos branch.")?;
+            .map_err(|_| "This agent does not support Octos's protected host broker. Install the supported upstream Octos revision shown in Providers.")?;
         if capabilities.version != VERSION || !capabilities.confined || capabilities.sandbox.is_empty() {
             return Err("The agent did not establish the required confined host broker.".into());
         }
@@ -249,7 +249,7 @@ fn executable(command: &str) -> Result<PathBuf, String> {
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).map(|dir| dir.join(path)).collect()
     };
     candidates.into_iter().find_map(|path| path.is_file().then(|| path.canonicalize().ok()).flatten())
-        .ok_or_else(|| "Install Octos's host-managed branch, or set ROBRIX_AGENT_CMD to the local Octos executable followed by acp.".into())
+        .ok_or_else(|| "Install the upstream Octos revision shown in Providers, or set ROBRIX_AGENT_CMD to the local Octos executable followed by acp.".into())
 }
 
 pub(crate) fn start(prefs: &AgentPrefs, context: ContextId, room_agent: bool, tools: Option<McpServer>) -> Result<Box<dyn AgentTransport>, String> {

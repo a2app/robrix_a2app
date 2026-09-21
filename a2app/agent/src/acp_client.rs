@@ -824,10 +824,10 @@ fn reduce_line(shared: &Arc<Shared>, line: &str) -> Vec<AcpEvent> {
         }
     }
 
-    // Requests FROM the agent (e.g. session/request_permission, fs/*) are not
-    // expected from `octos acp` v1; refuse politely so the agent isn't left
-    // waiting forever if one ever arrives. JSON-RPC ids may be numbers OR
-    // strings — echo whichever the agent used.
+    // Protected requests use the host broker. Ordinary ACP can request
+    // permissions or client filesystem access; this client has no approval
+    // UI or filesystem service, so refuse explicitly instead of leaving the
+    // agent waiting. JSON-RPC ids may be numbers OR strings; echo either.
     if value.get("method").is_some() {
         if let Some(id) = value.get("id").filter(|id| !id.is_null()) {
             let method = value.get("method").and_then(Value::as_str).unwrap_or("?");

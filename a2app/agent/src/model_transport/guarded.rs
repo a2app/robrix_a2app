@@ -86,11 +86,34 @@ fn resolve_config_secret(name: &str, value: &str) -> Option<String> {
         let value = String::from_utf8(bytes).ok()?.trim().to_string();
         Some(decode_keychain_hex(&value).unwrap_or(value))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        // Upstream's store is independent of OCTOS_CONFIG_DIR and supports
+        // both bare env-var accounts and scoped ENV::profile accounts.
+        read_linux_secret(&dirs::home_dir()?.join(".octos").join("secrets"), account)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = account;
         None
     }
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn read_linux_secret(root: &std::path::Path, account: &str) -> Option<String> {
+    use std::io::Read;
+    // Keep account validation and byte-preserving UTF-8 decoding compatible
+    // with octos_cli::auth::keychain::linux_file, without linking the CLI.
+    if account.is_empty() || matches!(account, "." | "..") || account.contains(['/', '\\', '\0']) {
+        return None;
+    }
+    let file = std::fs::File::open(root.join(account)).ok()?;
+    if !file.metadata().ok()?.is_file() { return None; }
+    const MAX_SECRET_BYTES: usize = 64 * 1024;
+    let mut bytes = Vec::new();
+    file.take((MAX_SECRET_BYTES + 1) as u64).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > MAX_SECRET_BYTES { return None; }
+    String::from_utf8(bytes).ok()
 }
 
 // macOS prints multiline secrets as hex; ordinary hex-shaped keys stay literal.
@@ -200,7 +223,7 @@ pub(super) fn resolve(prefs: &AgentPrefs) -> Result<Resolved, String> {
     let base = if name == "ollama" && config.base_url.is_none() { "http://127.0.0.1:11434/v1" } else { base };
     let (endpoint, local) = endpoint(base, protocol)?;
     let model = crate::prefs::Backend::Octos { provider: name.into() }.model_override(prefs)
-        .or_else(|| config.model.clone()).or_else(|| entry.and_then(|entry| entry.default_model).map(str::to_string))
+        .or_else(|| config.model.clone()).or_else(|| entry.and_then(|entry| entry.default_model()).map(str::to_string))
         .ok_or("Choose a model for the configured provider.")?;
     let key = if entry.is_some_and(|entry| entry.requires_api_key) || config.api_key_env.is_some() { config.api_key(&selected).ok_or("Configure the API credential for this model provider.")? } else { String::new() };
     let protocol_name = if protocol == Protocol::OpenAi { "openai" } else { "anthropic" };
@@ -549,6 +572,27 @@ mod tests {
         assert_eq!(decode_keychain_hex("610a62"), Some("a\nb".into()));
         assert_eq!(decode_keychain_hex("41424344"), None);
         assert_eq!(decode_keychain_hex("deadbeef"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_secret_store_reads_scoped_accounts_and_rejects_invalid_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("secrets");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("OPENAI_API_KEY"), "plain-key").unwrap();
+        std::fs::write(root.join("PRIVATE_KEY::profile-id"), "first\nsecond\n").unwrap();
+        assert_eq!(read_linux_secret(&root, "OPENAI_API_KEY").as_deref(), Some("plain-key"));
+        assert_eq!(read_linux_secret(&root, "PRIVATE_KEY::profile-id").as_deref(), Some("first\nsecond\n"));
+        for account in ["", ".", "..", "../OPENAI_API_KEY", "nested/key", "nested\\key", "bad\0key", "missing"] {
+            assert!(read_linux_secret(&root, account).is_none());
+        }
+        std::fs::write(root.join("invalid-utf8"), [0xff]).unwrap();
+        std::fs::write(root.join("oversized"), vec![b'x'; 64 * 1024 + 1]).unwrap();
+        std::fs::create_dir(root.join("directory")).unwrap();
+        for account in ["invalid-utf8", "oversized", "directory"] {
+            assert!(read_linux_secret(&root, account).is_none());
+        }
     }
 
     #[test]

@@ -91,19 +91,28 @@ shared DSL names.
 ## Agent setup (once)
 
 Robrix's AI rooms and app generation use a confined Octos process by default
-on macOS and supported Linux systems. Install the matching worker:
+on macOS and supported Linux systems. The workspace and lockfile pin upstream
+Octos to `bf63797a11b3949f4a726267a91d22bf977e7c01`, which includes
+[Octos PR #2443](https://github.com/octos-org/octos/pull/2443) and the
+[SQLite compatibility update #2455](https://github.com/octos-org/octos/pull/2455)
+needed to embed Octos alongside the Matrix SDK. Install that same revision; the `api` feature also supports ordinary ACP integrations:
 
 ```sh
-cargo install --git https://github.com/project-robius/octos --branch host-managed-ifc --locked octos-cli
+cargo install --git https://github.com/octos-org/octos --rev bf63797a11b3949f4a726267a91d22bf977e7c01 --locked --no-default-features --features api octos-cli
 ```
 
-Linux additionally requires bubblewrap, enabled user namespaces, and the
-kernel confinement facilities described in Octos's
-[`octos-sandbox` documentation](https://github.com/project-robius/octos/blob/host-managed-ifc/crates/octos-sandbox/HOST_MANAGED.md).
+Linux requires bubblewrap 0.8 or later, enabled unprivileged namespaces,
+seccomp, and fully enforced Landlock ABI 3 (Linux 6.2 or later). The worker's
+ELF dependencies must be immutable system libraries. See upstream's
+[`octos-sandbox` documentation](https://github.com/octos-org/octos/blob/bf63797a11b3949f4a726267a91d22bf977e7c01/crates/octos-sandbox/HOST_MANAGED.md)
+for the complete requirements. Self-hosted test machines need these prerequisites
+provisioned by their administrator; CI's AppArmor adjustment is for disposable
+hosted runners only.
 Missing confinement support stops startup; it never falls back to an ordinary
 ACP process. Alternatively, `a2app-embedded-agent` links Octos into Robrix and
 needs no CLI installation. Use the embedded feature on iOS and platforms
-without a supported process sandbox.
+without a supported process sandbox. Embedded mode uses the same guarded
+model/tool transport but has no separate OS process compartment.
 
 Configure an OpenAI-compatible or
 Anthropic provider through **AI Providers**, an existing Octos configuration,
@@ -112,6 +121,10 @@ provider IDs are `openai`, `anthropic`, `deepseek`, `moonshot`,
 `moonshot-coding`, `groq`, `openrouter`, `ollama`, and `custom`; other backends
 are refused. A local Ollama endpoint can use an already installed model
 without an API key.
+
+Linux `keychain:` references use Octos's existing `~/.octos/secrets` store,
+including credentials scoped to a profile. Credentials remain in Robrix's
+host process and are never supplied to the confined worker.
 
 Run with `cargo run --features a2app` (or `a2app-embedded-agent`), then use **Manage data
 sharing rules** to allow the configured model recipient for the sources the
@@ -125,6 +138,18 @@ ACP adapters cannot provide this protected mode. Unset the override to use the
 embedded backend when compiled in. Select the model in AI Providers or the
 Octos configuration; the child receives no credentials or provider endpoint.
 The standalone ACP client remains available for legacy integrations and tests.
+
+Install a trusted worker in a location where untrusted code cannot replace
+the executable or its parent directories. Resolving its path does not
+authenticate the binary or prevent replacement between selection and launch.
+Robrix's parent-enforced launcher, not the child's `confined` protocol flag,
+establishes the process boundary.
+
+On macOS, necessary system-runtime reads remain allowed and the Seatbelt
+profile imports Apple's `dyld-support.sb`. Its grants can change with macOS;
+re-run the native confinement probes when qualifying a new OS release.
+Protocol budgets, timeouts and finite turn limits do not impose hard process
+CPU or resident-memory caps, and do not eliminate timing/resource side channels.
 
 ## Makepad pin
 
