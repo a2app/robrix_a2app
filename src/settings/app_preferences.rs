@@ -38,6 +38,12 @@ pub struct AppPreferences {
     /// Only relevant when the `a2app` feature is enabled.
     #[serde(default = "default_true", deserialize_with = "deserialize_or_true")]
     pub show_mini_apps_button: bool,
+    /// Whether to show a notice in a room when other users are typing.
+    #[serde(default = "default_true", deserialize_with = "deserialize_or_true")]
+    pub show_typing_notices: bool,
+    /// Whether to let other users see when we're typing a message.
+    #[serde(default = "default_true", deserialize_with = "deserialize_or_true")]
+    pub send_typing_notices: bool,
 
     // Note: if you add a new preference here, be sure to add a new
     // function `on_<NEW_PREFERENCE>_changed` and update `broadcast_all()`.
@@ -54,6 +60,8 @@ impl Default for AppPreferences {
             mark_as_read_behavior: MarkAsReadBehavior::default(),
             show_read_receipts: true,
             show_mini_apps_button: true,
+            show_typing_notices: true,
+            send_typing_notices: true,
         }
     }
 }
@@ -171,6 +179,19 @@ impl AppPreferences {
         cx.action(AppPreferencesAction::ShowMiniAppsButtonChanged(self.show_mini_apps_button));
     }
 
+    /// Applies the current `show_typing_notices` value.
+    pub fn on_show_typing_notices_changed(&self, cx: &mut Cx) {
+        cx.global::<AppPreferencesGlobal>().0.show_typing_notices = self.show_typing_notices;
+        cx.action(AppPreferencesAction::ShowTypingNoticesChanged(self.show_typing_notices));
+    }
+
+    /// Applies the current `send_typing_notices` value.
+    pub fn on_send_typing_notices_changed(&self, cx: &mut Cx) {
+        cx.global::<AppPreferencesGlobal>().0.send_typing_notices = self.send_typing_notices;
+        SEND_TYPING_NOTICES.store(self.send_typing_notices, Ordering::Relaxed);
+        cx.action(AppPreferencesAction::SendTypingNoticesChanged(self.send_typing_notices));
+    }
+
     /// Broadcasts every preference to listening widgets.
     ///
     /// Used upon app-state restore so every listener picks up the loaded
@@ -186,6 +207,8 @@ impl AppPreferences {
         self.on_mark_as_read_behavior_changed(cx);
         self.on_show_read_receipts_changed(cx);
         self.on_show_mini_apps_button_changed(cx);
+        self.on_show_typing_notices_changed(cx);
+        self.on_send_typing_notices_changed(cx);
     }
 }
 
@@ -336,6 +359,14 @@ pub fn show_read_receipts() -> bool {
     SHOW_READ_RECEIPTS.load(Ordering::Relaxed)
 }
 
+/// A way to allow `send_typing_notices` to be accessed by all threads.
+static SEND_TYPING_NOTICES: AtomicBool = AtomicBool::new(true);
+
+/// Whether other users may see when we're typing.
+pub fn send_typing_notices() -> bool {
+    SEND_TYPING_NOTICES.load(Ordering::Relaxed)
+}
+
 fn default_true() -> bool {
     true
 }
@@ -418,6 +449,8 @@ pub enum AppPreferencesAction {
     SendOnEnterChanged(bool),
     UiZoomChanged(UiZoom),
     ShowMiniAppsButtonChanged(bool),
+    ShowTypingNoticesChanged(bool),
+    SendTypingNoticesChanged(bool),
 }
 
 /// A `Cx` global mirror of the current [`AppPreferences`].

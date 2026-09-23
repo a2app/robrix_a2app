@@ -315,6 +315,8 @@ script_mod! {
                 punctuator: #x24292e,          // Dark gray for punctuation
                 string: #x22863a,              // Green for strings
                 function: #x6f42c1,            // Purple for functions
+                macro_identifier: #x6f42c1,    // Purple: a macro reads as a call
+                attribute: #x6f42c1,           // Purple for #[derive(..)] and friends
                 typename: #xe36209,            // Orange for types
                 comment: #x6a737d,             // Gray for comments
             }
@@ -344,6 +346,8 @@ script_mod! {
                 other_keyword: #x24292e,
                 string: #x24292e,
                 function: #x24292e,
+                macro_identifier: #x24292e,
+                attribute: #x24292e,
                 typename: #x24292e,
                 comment: #x24292e,
             }
@@ -384,6 +388,8 @@ pub const COLOR_UNREAD_BADGE_MARKED:   Vec4 = COLOR_ROBRIX_CYAN;
 pub const COLOR_UNREAD_BADGE_MESSAGES: Vec4 = vec4(0.667, 0.667, 0.667, 1.0);
 /// #FF6e00
 pub const COLOR_UNKNOWN_ROOM_AVATAR:   Vec4 = vec4(1.0, 0.431, 0.0, 1.0);
+/// The same as `COLOR_AVATAR_BG` in the DSL above: #52B2AC
+pub const COLOR_AVATAR_BG:             Vec4 = vec4(0.322, 0.698, 0.675, 1.0);
 /// #888888
 pub const COLOR_MESSAGE_NOTICE_TEXT:   Vec4 = vec4(0.5, 0.5, 0.5, 1.0);
 /// #953800

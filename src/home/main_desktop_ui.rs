@@ -4,8 +4,8 @@ use tokio::sync::Notify;
 use std::{collections::{HashMap, HashSet}, sync::Arc};
 
 use crate::{app::{AppState, AppStateAction, SavedDockState, SelectedRoom}, home::{navigation_tab_bar::{NavigationBarAction, SelectedTab}, rooms_list::RoomsListRef, space_lobby::SpaceLobbyScreenWidgetRefExt}, shared::speech_text_input::cancel_all_dictation, utils::RoomNameId};
-use super::{invite_screen::InviteScreenWidgetRefExt, room_screen::RoomScreenWidgetRefExt, rooms_list::{AcceptedInviteKind, RoomsListAction}, spaces_bar::SpacesBarAction};
-use crate::room::{room_action_bar::RoomActionBarWidgetRefExt, room_tabs::RoomTabs};
+use super::{invite_screen::InviteScreenWidgetRefExt, room_pane_screen::{RoomPaneScreenAction, RoomPaneScreenWidgetRefExt}, room_screen::RoomScreenWidgetRefExt, rooms_list::{AcceptedInviteKind, RoomsListAction}, spaces_bar::SpacesBarAction};
+use crate::room::{room_action_bar::RoomActionBarWidgetRefExt, room_pane, room_tabs::RoomTabs};
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -66,6 +66,7 @@ script_mod! {
             room_screen := mod.widgets.RoomScreen {}
             invite_screen := mod.widgets.InviteScreen {}
             space_lobby_screen := mod.widgets.SpaceLobbyScreen {}
+            room_pane_screen := mod.widgets.RoomPaneScreen {}
             mini_app_tab := mod.widgets.MiniAppTabScreen {}
         }
 
@@ -275,6 +276,9 @@ impl MainDesktopUI {
                         space_name_id,
                     );
                 }
+                SelectedRoom::RoomPane { room_name_id, kind } => {
+                    new_widget.as_room_pane_screen().set_displayed(cx, room_name_id, *kind);
+                }
             }
             cx.action(MainDesktopUiAction::SaveDockIntoAppState);
             self.open_rooms.insert(room_tab_id, room.clone());
@@ -321,8 +325,12 @@ impl MainDesktopUI {
 
         dock.close_tab(cx, tab_id);
         self.open_rooms.remove(&tab_id);
+        // A room's popped-out pane tabs don't keep its a2app session open.
         #[cfg(feature = "a2app")]
-        if !self.open_rooms.values().any(|r| r.room_id() == room_being_closed.room_id()) {
+        if !matches!(room_being_closed, SelectedRoom::RoomPane { .. })
+            && !self.open_rooms.values().any(|r| !matches!(r, SelectedRoom::RoomPane { .. })
+                && r.room_id() == room_being_closed.room_id())
+        {
             crate::a2app::runtime::on_room_closed(cx, room_being_closed.room_id());
         }
 
@@ -552,6 +560,9 @@ impl MainDesktopUI {
                     Some(thread_root_event_id.clone()),
                 );
             }
+            Some(SelectedRoom::RoomPane { room_name_id, kind }) => {
+                widget.as_room_pane_screen().set_displayed(cx, room_name_id, *kind);
+            }
             None => { }
         }
     }
@@ -677,7 +688,7 @@ impl WidgetMatchEvent for MainDesktopUI {
             self.init_tab_if_needed(cx, tab_id);
             let action_bar = self.view.dock(cx, ids!(dock)).item(tab_id)
                 .room_action_bar(cx, ids!(room_actions));
-            action_bar.set_expanded(cx, !action_bar.is_expanded());
+            action_bar.set_expanded(cx, !action_bar.is_expanded(), true);
             self.redraw(cx);
             should_save_dock_action = true;
         }
@@ -863,6 +874,22 @@ impl WidgetMatchEvent for MainDesktopUI {
                 }
                 RoomsListAction::OpenRoomContextMenu { .. } => {}
                 RoomsListAction::None => { }
+            }
+
+            // A popped-out room pane wants to be returned to its room screen,
+            // show that room screen and dock the pane in it, then close the pane's dedicated tab.
+            if let RoomPaneScreenAction::ReturnToRoom { room_name_id, kind } = widget_action.cast() {
+                let timeline_kind = room_pane::popped_out_from(room_name_id.room_id(), kind);
+                let pane_tab_id = SelectedRoom::RoomPane { room_name_id: room_name_id.clone(), kind }.tab_id();
+                let screen = room_pane::timeline_screen(&room_name_id, &timeline_kind);
+                room_pane::dock_when_shown(cx, timeline_kind, kind);
+                // Use the room's existing tab, which has the room's current name.
+                let screen = self.open_rooms.get(&screen.tab_id()).cloned().unwrap_or(screen);
+                self.focus_or_create_tab(cx, screen);
+                self.close_tab(cx, pane_tab_id);
+                self.redraw(cx);
+                should_save_dock_action = true;
+                continue;
             }
 
             // Handle potential changes to room names.

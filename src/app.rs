@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 use makepad_widgets::*;
-use matrix_sdk::{RoomState, ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId}};
+use matrix_sdk::{RoomState, encryption::recovery::RecoveryState, ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId}};
 use serde::{Deserialize, Serialize};
 use crate::{
     block_user_modal::{BlockUserModalAction, BlockUserModalWidgetRefExt},
@@ -17,7 +17,7 @@ use crate::{
         event_source_modal::{EventSourceModalAction, EventSourceModalWidgetRefExt}, invite_modal::{InviteModalAction, InviteModalWidgetRefExt}, main_desktop_ui::MainDesktopUiAction, navigation_tab_bar::{NavigationBarAction, SelectedTab}, new_message_context_menu::NewMessageContextMenuWidgetRefExt, room_context_menu::RoomContextMenuWidgetRefExt, room_screen::{InviteAction, MessageAction, clear_timeline_states, invalidate_single_timeline_state}, rooms_list::{RoomsListAction, RoomsListRef, RoomsListUpdate, clear_all_invited_rooms, enqueue_rooms_list_update}
     }, join_leave_room_modal::{
         JoinLeaveModalKind, JoinLeaveRoomModalAction, JoinLeaveRoomModalWidgetRefExt
-    }, login::login_screen::LoginAction, logout::logout_confirm_modal::{LogoutAction, LogoutConfirmModalAction, LogoutConfirmModalWidgetRefExt}, persistence, profile::user_profile_cache::clear_user_profile_cache, room::BasicRoomDetails, settings::app_preferences::{AppPreferences, UiZoom}, shared::{confirmation_modal::{ConfirmationModalContent, ConfirmationModalWidgetRefExt}, context_menu::{ContextMenuClosed, menu_position_margin}, image_viewer::{ImageViewerAction, LoadState}, popup_list::{PopupKind, enqueue_popup_notification}, room_picker_modal::{RoomPickerModalAction, RoomPickerModalWidgetRefExt}, speech_text_input::cancel_all_dictation}, sliding_sync::{DirectMessageRoomAction, MatrixRequest, TimelineKind, current_user_id, submit_async_request}, utils::RoomNameId, verification::VerificationAction, verification_modal::{
+    }, login::login_screen::LoginAction, logout::logout_confirm_modal::{LogoutAction, LogoutConfirmModalAction, LogoutConfirmModalWidgetRefExt}, persistence::{self, WindowGeomTracker}, profile::user_profile_cache::clear_user_profile_cache, room::{BasicRoomDetails, room_pane::{self, PaneLayout, RoomPaneKind}}, settings::{app_preferences::{AppPreferences, UiZoom}, encryption_settings::{EncryptionModalAction, EncryptionModalWidgetRefExt}}, shared::{confirmation_modal::{ConfirmationModalContent, ConfirmationModalWidgetRefExt}, context_menu::{ContextMenuClosed, menu_position_margin}, image_viewer::{ImageViewerAction, LoadState}, popup_list::{PopupKind, enqueue_popup_notification}, room_picker_modal::{RoomPickerModalAction, RoomPickerModalWidgetRefExt}, speech_text_input::cancel_all_dictation}, sliding_sync::{DirectMessageRoomAction, MatrixRequest, RecoveryAction, TimelineKind, current_user_id, submit_async_request}, utils::RoomNameId, verification::VerificationAction, verification_modal::{
         VerificationModalAction,
         VerificationModalWidgetRefExt,
     }
@@ -125,6 +125,12 @@ script_mod! {
                             content := TspVerificationModal {}
                         }
 
+                        // Modal to deal with recovery key and encryption identity mgmt.
+                        encryption_modal := Modal {
+                            can_dismiss: false,
+                            content := EncryptionModal {}
+                        }
+
                         // A generic modal to confirm any positive action.
                         positive_confirmation_modal := Modal {
                             content := PositiveConfirmationModal {}
@@ -197,6 +203,10 @@ pub struct App {
     /// This can be either a room we're waiting to join, or one we're waiting to be invited to.
     /// Also includes an optional room ID to be closed once the awaited room has been loaded.
     #[rust] waiting_to_navigate_to_room: Option<(BasicRoomDetails, Option<OwnedRoomId>)>,
+    /// The latest known recovery state, used to warn on logout if recovery isn't set up.
+    #[rust(RecoveryState::Unknown)] recovery_state: RecoveryState,
+    /// Latest known window geometry (size, fullscreen/maximized, etc).
+    #[rust] window_geom: WindowGeomTracker,
 }
 
 impl ScriptHook for App {
@@ -250,7 +260,8 @@ impl MatchEvent for App {
         let _app_data_dir = crate::app_data_dir();
         log!("App::handle_startup(): app_data_dir: {:?}", _app_data_dir);
 
-        if let Err(e) = persistence::load_window_state(self.ui.window(cx, ids!(main_window)), cx) {
+        let main_window = self.ui.window(cx, ids!(main_window));
+        if let Err(e) = self.window_geom.restore(cx, main_window) {
             error!("Failed to load window state: {}", e);
         }
 
@@ -292,7 +303,14 @@ impl MatchEvent for App {
         for action in actions {
             match action.downcast_ref() {
                 Some(LogoutConfirmModalAction::Open) => {
-                    self.ui.logout_confirm_modal(cx, ids!(logout_confirm_modal.content)).reset_state(cx);
+                    let logout_confirm_modal = self.ui.logout_confirm_modal(cx, ids!(logout_confirm_modal.content));
+                    logout_confirm_modal.reset_state(cx);
+                    if self.recovery_state == RecoveryState::Disabled {
+                        logout_confirm_modal.set_message(cx, "Are you sure you want to logout?\n\n\
+                            Your encryption keys aren't backed up. If this is your only device, you'll \
+                            lose access to your encrypted messages for good.\n\n\
+                            Set up key backup in Settings before you log out.");
+                    }
                     self.ui.modal(cx, ids!(logout_confirm_modal)).open(cx);
                     continue;
                 },
@@ -321,6 +339,7 @@ impl MatchEvent for App {
                     crate::a2app::instances::quit_everything(cx);
                     self.ui.modal(cx, ids!(verification_modal)).close(cx);
                     self.app_state = Default::default();
+                    self.recovery_state = RecoveryState::Unknown;
                     // We also need to broadcast those default values out,
                     // such that all other widgets can be reset to their default state.
                     self.app_state.app_prefs.broadcast_all(cx);
@@ -467,6 +486,7 @@ impl MatchEvent for App {
                     let logged_in_actual = self.app_state.logged_in;
                     self.app_state = app_state.clone();
                     self.app_state.logged_in = logged_in_actual;
+                    room_pane::restore_saved_layout(self.app_state.room_pane_layout);
                     // Broadcast the restored preferences first so listeners
                     // (e.g. the Dock's captured `room_screen` template) are
                     // refreshed before `LoadDockFromAppState` instantiates
@@ -539,6 +559,22 @@ impl MatchEvent for App {
             }
             if let Some(VerificationModalAction::Close) = action.downcast_ref() {
                 self.ui.modal(cx, ids!(verification_modal)).close(cx);
+                continue;
+            }
+            match action.downcast_ref() {
+                Some(EncryptionModalAction::Show(mode)) => {
+                    self.ui.encryption_modal(cx, ids!(encryption_modal.content)).show(cx, mode.clone());
+                    self.ui.modal(cx, ids!(encryption_modal)).open(cx);
+                    continue;
+                }
+                Some(EncryptionModalAction::Close) => {
+                    self.ui.modal(cx, ids!(encryption_modal)).close(cx);
+                    continue;
+                }
+                _ => {}
+            }
+            if let Some(RecoveryAction::StateChanged(state)) = action.downcast_ref() {
+                self.recovery_state = *state;
                 continue;
             }
             match action.downcast_ref() {
@@ -742,6 +778,7 @@ impl MatchEvent for App {
 /// Clears all thread-local UI caches (user profiles, invited rooms, and timeline states).
 /// The `cx` parameter ensures that these thread-local caches are cleared on the main UI thread, 
 fn clear_all_app_state(cx: &mut Cx) {
+    room_pane::clear_all();
     clear_user_profile_cache(cx);
     clear_all_invited_rooms(cx);
     clear_timeline_states(cx);
@@ -845,8 +882,9 @@ impl AppMain for App {
         }
 
         // Sync up our UI zoom override with the OS's DPI factor when it changes.
-        if let Event::WindowGeomChange(_) = event {
+        if let Event::WindowGeomChange(e) = event {
             self.app_state.app_prefs.refresh_ui_zoom_override(cx);
+            self.window_geom.observe(&e.new_geom);
         }
 
         self.handle_ui_zoom_shortcuts(cx, event);
@@ -1005,7 +1043,7 @@ impl App {
 
     fn persist_runtime_state(&mut self, cx: &mut Cx, reason: &'static str) {
         let window_ref = self.ui.window(cx, ids!(main_window));
-        if let Err(e) = persistence::save_window_state(window_ref, cx) {
+        if let Err(e) = self.window_geom.save(cx, window_ref) {
             error!("Failed to save window state during {reason}. Error: {e}");
         }
 
@@ -1017,6 +1055,7 @@ impl App {
             return;
         };
 
+        self.app_state.room_pane_layout = room_pane::saved_layout();
         let app_state_json = match persistence::serialize_app_state(&self.app_state) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -1198,6 +1237,9 @@ pub struct AppState {
     /// App-wide user preferences/settings.
     #[serde(default, deserialize_with = "crate::utils::deserialize_or_default")]
     pub app_prefs: AppPreferences,
+    /// The layout that the user last chose for docked room panes.
+    #[serde(default, deserialize_with = "crate::utils::deserialize_or_default")]
+    pub room_pane_layout: Option<PaneLayout>,
 }
 
 /// A snapshot of the main dock: all state needed to restore the dock tabs/layout.
@@ -1218,11 +1260,13 @@ pub struct SavedDockState {
 /// Represents a room currently or previously selected by the user.
 ///
 /// ## PartialEq/Eq equality comparison behavior
-/// Room/Space names are ignored for the purpose of equality comparison.
-/// Two `SelectedRoom`s are considered equal if their `room_id`s are equal,
-/// unless they are `Thread`s,` in which case their `thread_root_event_id`s
-/// are also compared for equality.
-/// A `Thread` is never considered equal to a non-`Thread`, even if their `room_id`s are equal.
+/// * Room/Space names are ignored for the purpose of equality comparison.
+/// * Two `SelectedRoom`s are considered equal if their `room_id`s are equal,
+///   for `JoinedRoom`s, `InvitedRoom`s, and `Space`s.
+/// * For `Thread`s, their `thread_root_event_id`s are also compared for equality.
+/// * For `RoomPane`s, their pane `kind`s are also compared for equality.
+/// * A `Thread` is never considered equal to a non-`Thread`, and the same for a `RoomPane`,
+///   even if their `room_id`s are equal.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SelectedRoom {
     JoinedRoom {
@@ -1240,6 +1284,12 @@ pub enum SelectedRoom {
     Space {
         space_name_id: RoomNameId,
     },
+    /// An in-room pane (like its member list) that was popped out of the room screen
+    /// and is now being shown in its own dock tab or mobile stack view.
+    RoomPane {
+        room_name_id: RoomNameId,
+        kind: RoomPaneKind,
+    },
 }
 
 impl SelectedRoom {
@@ -1249,6 +1299,7 @@ impl SelectedRoom {
             SelectedRoom::InvitedRoom { room_name_id } => room_name_id.room_id(),
             SelectedRoom::Space { space_name_id } => space_name_id.room_id(),
             SelectedRoom::Thread { room_name_id, .. } => room_name_id.room_id(),
+            SelectedRoom::RoomPane { room_name_id, .. } => room_name_id.room_id(),
         }
     }
 
@@ -1258,6 +1309,7 @@ impl SelectedRoom {
             SelectedRoom::InvitedRoom { room_name_id } => room_name_id,
             SelectedRoom::Space { space_name_id } => space_name_id,
             SelectedRoom::Thread { room_name_id, .. } => room_name_id,
+            SelectedRoom::RoomPane { room_name_id, .. } => room_name_id,
         }
     }
 
@@ -1288,7 +1340,8 @@ impl SelectedRoom {
         let (SelectedRoom::JoinedRoom { room_name_id }
             | SelectedRoom::Thread { room_name_id, .. }
             | SelectedRoom::InvitedRoom { room_name_id }
-            | SelectedRoom::Space { space_name_id: room_name_id }) = self;
+            | SelectedRoom::Space { space_name_id: room_name_id }
+            | SelectedRoom::RoomPane { room_name_id, .. }) = self;
         if room_name_id.room_id() != new_room_name.room_id()
             || room_name_id.display_name() == new_room_name.display_name()
         {
@@ -1305,6 +1358,9 @@ impl SelectedRoom {
                 LiveId::from_str(
                     &format!("{}##{}", room_name_id.room_id(), thread_root_event_id)
                 )
+            }
+            SelectedRoom::RoomPane { room_name_id, kind } => {
+                LiveId::from_str(&format!("{}##pane:{}", room_name_id.room_id(), kind.as_str()))
             }
             other => LiveId::from_str(other.room_id().as_str()),
         }
@@ -1340,6 +1396,7 @@ impl SelectedRoom {
             SelectedRoom::InvitedRoom { room_name_id } => room_name_id.to_string(),
             SelectedRoom::Space { space_name_id } => format!("[Space] {space_name_id}"),
             SelectedRoom::Thread { room_name_id, .. } => format!("[Thread] {room_name_id}"),
+            SelectedRoom::RoomPane { room_name_id, kind } => format!("[{}] {room_name_id}", kind.title()),
         }
     }
 
@@ -1349,6 +1406,7 @@ impl SelectedRoom {
             SelectedRoom::JoinedRoom { .. } | SelectedRoom::Thread { .. } => id!(room_screen),
             SelectedRoom::InvitedRoom { .. } => id!(invite_screen),
             SelectedRoom::Space { .. } => id!(space_lobby_screen),
+            SelectedRoom::RoomPane { .. } => id!(room_pane_screen),
         }
     }
 }
@@ -1370,6 +1428,13 @@ impl PartialEq for SelectedRoom {
                     && lhs_thread_root_event_id == rhs_thread_root_event_id
             }
             (SelectedRoom::Thread { .. }, _) | (_, SelectedRoom::Thread { .. }) => false,
+            (
+                SelectedRoom::RoomPane { room_name_id: lhs_room_name_id, kind: lhs_kind },
+                SelectedRoom::RoomPane { room_name_id: rhs_room_name_id, kind: rhs_kind },
+            ) => {
+                lhs_room_name_id.room_id() == rhs_room_name_id.room_id() && lhs_kind == rhs_kind
+            }
+            (SelectedRoom::RoomPane { .. }, _) | (_, SelectedRoom::RoomPane { .. }) => false,
             _ => self.room_id() == other.room_id(),
         }
     }

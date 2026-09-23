@@ -23,13 +23,13 @@ script_mod! {
     mod.widgets.MiniAppDock = View {
         width: Fill, height: Fill
         flow: Down
-        body := View {
+        app_body := View {
             width: Fill, height: Fill
             flow: Down
-            mid := View {
+            app_mid := View {
                 width: Fill, height: Fill
                 flow: Right
-                center := View { width: Fill, height: Fill, flow: Down }
+                app_center := View { width: Fill, height: Fill, flow: Down }
             }
         }
     }

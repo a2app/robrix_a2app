@@ -39,11 +39,16 @@ use crate::{
 };
 use crate::home::event_reaction_list::ReactionListWidgetRefExt;
 use crate::home::room_read_receipt::AvatarRowWidgetRefExt;
-use crate::room::room_action_bar::RoomActionBarWidgetExt;
+use crate::room::{
+    pane_dock::{RoomPaneDockWidgetExt, RoomPaneDockWidgetRefExt, SavedRoomPane},
+    room_action_bar::{RoomActionBarAction, RoomActionBarWidgetExt},
+    room_members_list::{RoomMembersChanged, RoomMembersListAction, show_member_profile},
+    room_pane::RoomPaneKind,
+};
 use crate::home::failed_send_banner::{BlockedSend, FailedSendBannerWidgetExt};
 use crate::home::send_status_indicator::{SendStatusIndicatorAction, SendStatusIndicatorRef, SendStatusIndicatorWidgetExt};
 use crate::room::room_input_bar::RoomInputBarWidgetExt;
-use crate::settings::app_preferences::{AppPreferencesGlobal, MarkAsReadBehavior, preferred_receipt_type};
+use crate::settings::app_preferences::{AppPreferencesAction, AppPreferencesGlobal, MarkAsReadBehavior, preferred_receipt_type};
 
 use rangemap::RangeSet;
 
@@ -708,6 +713,9 @@ script_mod! {
             AiTurnTimelineCard := mod.widgets.AiTurnTimelineCard {}
         }
 
+        // The top space is displayed as an overlay at the top of the timeline.
+        top_space := mod.widgets.TopSpace { }
+
         // A jump to bottom button (with an unread message badge) that is shown
         // when the timeline is not at the bottom.
         jump_to_bottom_button := JumpToBottomButton { }
@@ -738,20 +746,15 @@ script_mod! {
                 flow: Down,
 
                 // First, display the timeline of all messages/events,
-                // with the mini-app pane (hidden by default) docked to its right.
-                timeline_row := View {
-                    width: Fill, height: Fill,
-                    flow: Right,
-
-                    mini_app_dock := mod.widgets.MiniAppDock {
-                        body +: {
-                            mid +: {
-                                center +: {
-                                    timeline := mod.widgets.Timeline { }
-                                }
-                            }
+                // surrounded by any of this room's panes that are docked around it.
+                room_pane_dock := mod.widgets.RoomPaneDock {
+                    body +: { mid +: { center +: {
+                        mini_app_dock := mod.widgets.MiniAppDock {
+                            app_body +: { app_mid +: { app_center +: {
+                                timeline := mod.widgets.Timeline { }
+                            }}}
                         }
-                    }
+                    }}}
                 }
 
                 // An AI room's live status pill, just above the input bar:
@@ -791,9 +794,6 @@ script_mod! {
 
             // Note: here, we're within a View that has an Overlay flow,
             // so the order that we define the below views determines which one is on top.
-
-            // The top space should be displayed as an overlay at the top of the timeline.
-            top_space := mod.widgets.TopSpace { }
 
             // The user profile sliding pane should be displayed on top of other "static" subviews
             // (on top of all other views that are always visible).
@@ -1219,10 +1219,19 @@ impl Widget for RoomScreen {
                 // Handle a hover-out action on the reaction list or avatar row.
                 let avatar_row_ref = wr.avatar_row(cx, ids!(avatar_row));
                 if (reaction_list.hovered_out(actions) || avatar_row_ref.hover_out(actions))
-                    // Don't hover out if any current actions are about to hover in and show the tooltip.
-                    && !actions.iter().any(|a| matches!(
-                        a.as_widget_action().and_then(|wa| wa.action.downcast_ref::<TooltipAction>()),
-                        Some(TooltipAction::HoverIn { .. })
+                    // Don't hover out if any current actions are about to hover in and show any tooltip.
+                    // This prevents a brief flicker when hovering out of one tooltip to hovering into another one immediately.
+                    && !actions.iter().any(|a| a.as_widget_action().is_some_and(|wa|
+                        matches!(
+                            wa.action.downcast_ref::<TooltipAction>(),
+                            Some(TooltipAction::HoverIn { .. }),
+                        )
+                        || matches!(
+                            wa.action.downcast_ref::<RoomScreenTooltipActions>(),
+                            Some(RoomScreenTooltipActions::HoverInReactionButton { .. }
+                                | RoomScreenTooltipActions::HoverInReadReceipt { .. }
+                            ),
+                        )
                     ))
                 {
                     cx.widget_action(
@@ -1290,6 +1299,13 @@ impl Widget for RoomScreen {
             }
 
             self.handle_message_actions(cx, actions, &portal_list, &loading_pane);
+
+            // If we're showing the room member pane, refresh this timeline's member list.
+            if actions.iter().any(|a| a.downcast_ref::<RoomMembersChanged>()
+                .is_some_and(|c| self.tl_state.as_ref().is_some_and(|tl| c.room_id == *tl.kind.room_id())))
+            {
+                self.refresh_members_pane(cx);
+            }
 
             for action in actions {
                 // A mini-app asked the screen showing its room to do something.
@@ -1387,6 +1403,26 @@ impl Widget for RoomScreen {
                         tl.link_preview_cache.clear_all_pending_and_failed_requests();
                         tl.content_drawn_since_last_update.clear();
                         self.view.portal_list(cx, ids!(timeline.list)).redraw(cx);
+                        // Retry syncing members that failed to sync while we were offline.
+                        self.refresh_members_pane(cx);
+                    }
+                    continue;
+                }
+
+                if let Some(AppPreferencesAction::ShowTypingNoticesChanged(show)) = action.downcast_ref() {
+                    if !*show {
+                        self.view.typing_notice(cx, ids!(typing_notice)).show_or_hide(cx, &[], Animate::No);
+                    }
+                    // Only change the typing subscription for a loaded main room that we're still in.
+                    if self.is_loaded
+                        && let Some(tl) = self.tl_state.as_ref()
+                        && matches!(tl.kind, TimelineKind::MainRoom { .. })
+                        && !timeline_state_store::is_invalidated(&tl.kind)
+                    {
+                        submit_async_request(MatrixRequest::SubscribeToTypingNotices {
+                            room_id: tl.kind.room_id().clone(),
+                            subscribe: *show,
+                        });
                     }
                     continue;
                 }
@@ -1516,6 +1552,19 @@ impl Widget for RoomScreen {
                         room_member: None,
                     },
                 );
+            }
+
+            // Handle a room pane button being clicked in this room's action bar.
+            if let RoomActionBarAction::TogglePane(kind) = action.as_widget_action().cast() {
+                self.toggle_room_pane(cx, kind);
+                return false;
+            }
+
+            // Handle a member being clicked in the room member pane.
+            if let RoomMembersListAction::MemberClicked { room_name_id, member } = action.as_widget_action().cast() {
+                show_member_profile(cx, &user_profile_sliding_pane, &room_name_id, member);
+                self.redraw(cx);
+                return false;
             }
 
             // Handle a request to jump to a given user's latest read receipt (last-seen event).
@@ -2116,7 +2165,7 @@ impl RoomScreen {
                             log!("process_timeline_updates(): jumping view from event index {curr_item_idx} to new index {new_item_idx}, scroll {new_item_scroll}, event ID {_event_id}");
                             portal_list.set_first_id_and_scroll(new_item_idx, new_item_scroll);
                             // Hide the tooltip when the timeline jumps, as a hover-out event won't occur.
-                            cx.widget_action(ui,  RoomScreenTooltipActions::HoverOut);
+                            cx.widget_action(ui, TooltipAction::HoverOut);
                         }
                     }
                     else if curr_first_id > new_items.len() {
@@ -2360,7 +2409,7 @@ impl RoomScreen {
                     // we need to actually get the new list for use in this room screen.
                     submit_async_request(MatrixRequest::GetRoomMembers {
                         timeline_kind: tl.kind.clone(),
-                        memberships: matrix_sdk::RoomMemberships::JOIN,
+                        memberships: matrix_sdk::RoomMemberships::ACTIVE,
                         local_only: true,
                     });
                     // Here, to be most efficient, we could redraw only the user avatars and names in the timeline,
@@ -2371,7 +2420,15 @@ impl RoomScreen {
                     tl.room_members = Some(Arc::new(members));
                     self.view.room_input_bar(cx, ids!(room_input_bar))
                         .set_room_context(cx, ui, tl.kind.clone(), tl.room_members.clone());
+                    self.view.room_pane_dock(cx, ids!(room_pane_dock))
+                        .set_room_members(cx, tl.room_members.clone());
                 },
+                TimelineUpdate::RoomMembersListFetchFailed { error } => {
+                    // Keep showing any members fetched earlier.
+                    if tl.room_members.is_none() {
+                        self.view.room_pane_dock(cx, ids!(room_pane_dock)).set_room_members_error(cx, error);
+                    }
+                }
                 TimelineUpdate::MediaFetched(_request) => {
                     log!("process_timeline_updates(): media fetched for room {}", tl.kind.room_id());
                     // Here, to be most efficient, we could redraw only the media items in the timeline,
@@ -2570,13 +2627,17 @@ impl RoomScreen {
             top_space.set_visible(cx, false);
         }
 
+
         self.view.failed_send_banner(cx, ids!(failed_send_banner))
             .show_or_hide(cx, blocked_send);
 
-        if let Some(users) = typing_users {
+        // We unsubscribe once typing notices are hidden, but one might've already been in flight.
+        if let Some(users) = typing_users
+            && cx.global::<AppPreferencesGlobal>().0.show_typing_notices
+        {
             self.view
                 .typing_notice(cx, ids!(typing_notice))
-                .show_or_hide(cx, &users);
+                .show_or_hide(cx, &users, Animate::Yes);
         }
 
         if let Some((event_id, searching_for)) = jump_to_read_receipt {
@@ -3522,22 +3583,20 @@ impl RoomScreen {
             });
         }
 
-        // Hide the typing notice view initially.
-        self.view(cx, ids!(typing_notice)).set_visible(cx, false);
         // If the room is loaded, we need to get a few key states:
         // 1. Get the current user's power levels for this room so that we can
         //    show/hide UI elements based on the user's permissions.
         // 2. Get the list of members in this room (from the SDK's local cache).
         // 3. Subscribe to our own user's read receipts so that unread counts
         //    refresh when our read position advances (from any device).
-        // 4. Subscribe to typing notices again, now that the room is being shown.
+        // 4. Subscribe to typing notices again if they're enabled, now that the room is being shown.
         if self.is_loaded {
             submit_async_request(MatrixRequest::GetRoomPowerLevels {
                 timeline_kind: tl_state.kind.clone(),
             });
             submit_async_request(MatrixRequest::GetRoomMembers {
                 timeline_kind: tl_state.kind.clone(),
-                memberships: matrix_sdk::RoomMemberships::JOIN,
+                memberships: matrix_sdk::RoomMemberships::ACTIVE,
                 // Fetch from the local cache, as we already requested to sync
                 // the room members from the homeserver above.
                 local_only: true,
@@ -3545,7 +3604,8 @@ impl RoomScreen {
             // Only main room timelines can subscribe to typing notices, pinned events,
             // and read receipt changes (the SDK has no per-thread unread counts).
             if matches!(tl_state.kind, TimelineKind::MainRoom { .. }) {
-                subscribe_to_room_updates(&tl_state.kind, true);
+                let show_typing_notices = cx.global::<AppPreferencesGlobal>().0.show_typing_notices;
+                subscribe_to_room_updates(&tl_state.kind, true, show_typing_notices);
                 // The matrix spec says that opening a room should clear the marked-as-unread flag.
                 if cx.global::<AppPreferencesGlobal>().0.mark_as_read_behavior != MarkAsReadBehavior::Manual {
                     submit_async_request(MatrixRequest::SetUnreadFlag {
@@ -3572,7 +3632,7 @@ impl RoomScreen {
             tl.request_sender.send_if_modified(|req| !std::mem::replace(&mut req.is_timeline_open, true));
         }
 
-        let list = self.portal_list(cx, ids!(list));
+        let list = self.portal_list(cx, ids!(timeline.list));
         self.read_receipt_state.on_timeline_shown(&list);
 
         // Now that we have restored the TimelineUiState into this RoomScreen widget,
@@ -3645,11 +3705,13 @@ impl RoomScreen {
         tl.request_sender.send_if_modified(|req| !std::mem::replace(&mut req.is_timeline_open, true));
         let reconnected_sender = tl.request_sender.clone();
         let timeline_kind = tl.kind.clone();
+        submit_async_request(MatrixRequest::SyncRoomMemberList { timeline_kind: timeline_kind.clone() });
         // Re-subscribe to things needed for this main room timeline to be properly updated
         // while it's open. The previously-created async tasks for these things are either dead
         // or still running but with the old channel endpoints, so they're useless either way.
         if resubscribe {
-            subscribe_to_room_updates(&timeline_kind, true);
+            let show_typing_notices = cx.global::<AppPreferencesGlobal>().0.show_typing_notices;
+            subscribe_to_room_updates(&timeline_kind, true, show_typing_notices);
         }
         let loading_pane = self.loading_pane(cx, ids!(loading_pane));
         // Also update the loading pane's timeline request sender.
@@ -3698,7 +3760,7 @@ impl RoomScreen {
         //   when a given room isn't visible.
         // * Unsubscribe from updates to this room's pinned events, for the same reason.
         // * Unsubscribe from updates to our own user's read receipts, for the same reason.
-        subscribe_to_room_updates(&timeline_kind, false);
+        subscribe_to_room_updates(&timeline_kind, false, false);
     }
 
     /// Removes the current room's visual UI state from this widget
@@ -3718,6 +3780,7 @@ impl RoomScreen {
             first_index_and_scroll: Some((portal_list.first_id(), portal_list.scroll_position())),
             was_at_end: portal_list.is_at_end(),
             room_input_bar_state: room_input_bar.save_state(),
+            room_panes: self.child_by_path(ids!(room_pane_dock)).as_room_pane_dock().save_state(),
         };
         tl.saved_state = state;
         // Clear room_members to avoid wasting memory (in case this room is never re-opened).
@@ -3735,7 +3798,19 @@ impl RoomScreen {
             first_index_and_scroll,
             was_at_end,
             room_input_bar_state,
+            room_panes,
         } = &mut tl_state.saved_state;
+
+        // 0. Restore this timeline's docked panes.
+        if let Some(room_name_id) = self.room_name_id.as_ref() {
+            self.view.room_pane_dock(cx, ids!(room_pane_dock)).show_timeline(
+                cx,
+                room_name_id,
+                tl_state.kind.clone(),
+                tl_state.room_members.clone(),
+                std::mem::take(room_panes),
+            );
+        }
 
         // 1. Restore the position of the timeline.
         let portal_list = self.portal_list(cx, ids!(timeline.list));
@@ -3767,6 +3842,27 @@ impl RoomScreen {
         );
     }
 
+    /// Re-fetches this timeline's members if they're shown in a docked members pane,
+    /// syncing them from the server if some might be missing locally (which the SDK determines).
+    fn refresh_members_pane(&mut self, cx: &mut Cx) {
+        if self.is_loaded
+            && let Some(tl) = self.tl_state.as_ref()
+            && !timeline_state_store::is_invalidated(&tl.kind)
+            && self.view.room_pane_dock(cx, ids!(room_pane_dock)).has_pane(RoomPaneKind::Members)
+        {
+            submit_async_request(MatrixRequest::GetRoomMembers {
+                timeline_kind: tl.kind.clone(),
+                memberships: matrix_sdk::RoomMemberships::ACTIVE,
+                local_only: false,
+            });
+        }
+    }
+
+    /// Shows or hides the given room pane kind within this RoomScreen.
+    pub fn toggle_room_pane(&mut self, cx: &mut Cx, kind: RoomPaneKind) {
+        self.view.room_pane_dock(cx, ids!(room_pane_dock)).toggle(cx, kind);
+    }
+
     /// Sets this `RoomScreen` widget to display the timeline for the given room.
     pub fn set_displayed_room(
         &mut self,
@@ -3792,19 +3888,25 @@ impl RoomScreen {
             self.focus_input_bar_on_show = true;
         }
 
+
         // If this timeline is already displayed, we don't need to do anything major,
         // but we do need update the `room_name_id` in case it has changed/cleared.
         if self.tl_state.is_some() && self.timeline_kind.as_ref().is_some_and(|k| k == &timeline_kind) {
             self.room_name_id = Some(room_name_id.clone());
+            self.view.room_pane_dock(cx, ids!(room_pane_dock)).set_room_name(cx, room_name_id);
             return;
         }
 
+        // Hiding the previous timeline saves its docked panes, so we can then clear them.
         self.hide_timeline();
+        self.view.room_pane_dock(cx, ids!(room_pane_dock)).clear(cx);
         // Reset the the state of the inner loading pane.
         self.loading_pane(cx, ids!(loading_pane)).hide(cx);
         // Reset the user profile sliding pane so a previous room's open profile
         // pane doesn't remain shown when this RoomScreen is reused for a new room.
         self.user_profile_sliding_pane(cx, ids!(user_profile_sliding_pane)).reset(cx);
+        // Hide any typing notice left over from the previous room.
+        self.view.typing_notice(cx, ids!(typing_notice)).show_or_hide(cx, &[], Animate::No);
 
         self.room_input_popup_menu(cx, ids!(room_input_popup_menu)).close(cx);
 
@@ -3854,6 +3956,7 @@ impl RoomScreen {
         }
 
         // Close all overlay views before this screen is reused for another room.
+        self.view.room_pane_dock(cx, ids!(room_pane_dock)).clear(cx);
         self.loading_pane(cx, ids!(loading_pane)).hide(cx); // also cancels an in-progress search
         self.user_profile_sliding_pane(cx, ids!(user_profile_sliding_pane)).reset(cx);
         self.room_input_popup_menu(cx, ids!(room_input_popup_menu)).close(cx);
@@ -4027,6 +4130,12 @@ impl RoomScreenRef {
         let Some(mut inner) = self.borrow_mut() else { return };
         inner.hide_displayed_room(cx);
     }
+
+    /// See [`RoomScreen::toggle_room_pane()`].
+    pub fn toggle_room_pane(&self, cx: &mut Cx, kind: RoomPaneKind) {
+        let Some(mut inner) = self.borrow_mut() else { return };
+        inner.toggle_room_pane(cx, kind);
+    }
 }
 
 
@@ -4034,7 +4143,7 @@ impl RoomScreenRef {
 /// while a main room's timeline is open and being shown.
 ///
 /// Does nothing for thread-specific timelines.
-fn subscribe_to_room_updates(timeline_kind: &TimelineKind, subscribe: bool) {
+fn subscribe_to_room_updates(timeline_kind: &TimelineKind, subscribe: bool, show_typing_notices: bool) {
     if !matches!(timeline_kind, TimelineKind::MainRoom { .. }) {
         return;
     }
@@ -4045,7 +4154,7 @@ fn subscribe_to_room_updates(timeline_kind: &TimelineKind, subscribe: bool) {
     });
     submit_async_request(MatrixRequest::SubscribeToTypingNotices {
         room_id: room_id.clone(),
-        subscribe,
+        subscribe: subscribe && show_typing_notices,
     });
     submit_async_request(MatrixRequest::SubscribeToPinnedEvents {
         room_id: room_id.clone(),
@@ -4158,6 +4267,10 @@ pub enum TimelineUpdate {
     /// but doesn't provide the actual data.
     RoomMembersListFetched {
         members: Vec<RoomMember>,
+    },
+    /// A notice that the room's member list could not be fetched.
+    RoomMembersListFetchFailed {
+        error: String,
     },
     /// A notice with an option of Media Request Parameters that one or more requested media items (images, videos, etc.)
     /// that should be displayed in this timeline have now been fetched and are available.
@@ -4559,6 +4672,8 @@ struct SavedState {
     was_at_end: bool,
     /// The state of all UI elements in the `RoomInputBar`.
     room_input_bar_state: RoomInputBarState,
+    /// The panes docked around this timeline, e.g., the room's member list.
+    room_panes: Vec<SavedRoomPane>,
 }
 
 /// Returns info about the item in the list of `new_items` that matches the event ID

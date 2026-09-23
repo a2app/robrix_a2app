@@ -12,12 +12,13 @@ use makepad_widgets::makepad_platform::event::finger::TouchState;
 use matrix_sdk::{
     room::RoomMember,
     ruma::{
-        events::Mentions,
+        events::{Mentions, room::member::MembershipState},
         OwnedRoomId, OwnedUserId,
     },
 };
 use crate::{
     home::rooms_list::RoomsListRef,
+    profile::user_profile::member_display_name,
     shared::{mention_popup::{MentionItem, MentionablePopupRef}, slash_commands::{self, SlashCommandOutcome}, speech_text_input::{SpeechTextInputRef, SpeechTextInputWidgetRefExt}},
     sliding_sync::{submit_async_request, MatrixRequest},
     utils::{self, MatchQuality},
@@ -63,6 +64,8 @@ pub struct MentionableTextInput {
     /// Mentions may have been deleted after adding them, so we have to check for them
     /// before sending the message in the textinput.
     #[rust] possible_mentions: Mentions,
+    /// Whether the current mouse press started on the mention popup.
+    #[rust] was_mouse_down_on_popup: bool,
 }
 
 impl Widget for MentionableTextInput {
@@ -139,7 +142,26 @@ impl Widget for MentionableTextInput {
             }
         }
 
-        self.view.handle_event(cx, event, scope);
+        // Don't send presses on the popup to the text input, otherwise it will lose key focus
+        // and hide the soft keyboard / IME, which is super annoying on mobile.
+        // The only exception is when the text input is being dragged.
+        let is_on_popup = |cx: &mut Cx, loc: DVec2| {
+            popup_ref.is_open_for(uid) && popup_ref.content_rect(cx).contains(loc)
+        };
+        let is_popup_press = match event {
+            Event::MouseDown(e) => {
+                self.was_mouse_down_on_popup = is_on_popup(cx, e.abs);
+                self.was_mouse_down_on_popup
+            }
+            // Any mouse up event outside the text input will unfocus it, so don't let that happen.
+            Event::MouseUp(_) => std::mem::take(&mut self.was_mouse_down_on_popup),
+            // Withholding a touch's start is enough, as the text input ignores touches it didn't see start.
+            Event::TouchUpdate(e) => e.touches.iter().any(|t| t.state == TouchState::Start && is_on_popup(cx, t.abs)),
+            _ => false,
+        };
+        if !is_popup_press || cx.fingers.is_area_captured(self.text_input_ref().area()) {
+            self.view.handle_event(cx, event, scope);
+        }
 
         if let Event::Actions(actions) = event {
             for action in actions {
@@ -328,7 +350,7 @@ impl MentionableTextInput {
             Cursor { index: start + text_to_insert.len(), prefer_next_row: false },
             false,
         );
-
+        cx.hide_clipboard_actions();
         self.close_popup(cx);
         // give key focus back to the text input so the user can keep typing
         text_input.set_key_focus(cx);
@@ -573,10 +595,6 @@ fn contains_room_mention(text: &str) -> bool {
     })
 }
 
-fn member_display_name(member: &RoomMember) -> &str {
-    member.display_name().unwrap_or_else(|| member.user_id().as_str())
-}
-
 /// Ranks and builds all matching members.
 ///
 /// Note: run this on a bg thread, as it can be computationally expensive.
@@ -592,6 +610,8 @@ fn rank_members(
         .iter()
         .enumerate()
         .filter(|(_, m)| current_user.as_deref() != Some(m.user_id()))
+        // Invited users can't see the room's messages yet, so exclude them from being mentioned.
+        .filter(|(_, m)| matches!(m.membership(), MembershipState::Join))
         .filter_map(|(i, m)| {
             let display_lower = member_display_name(m).to_lowercase();
             let localpart_lower = m.user_id().localpart().to_lowercase();

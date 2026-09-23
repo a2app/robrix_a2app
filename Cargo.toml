@@ -176,8 +176,8 @@ members = ["a2app/core", "a2app/agent"]
 [workspace.dependencies]
 # makepad-widgets = { git = "https://github.com/makepad/makepad", branch = "dev", features = ["serde"] }
 # makepad-code-editor = { git = "https://github.com/makepad/makepad", branch = "dev" }
-makepad-widgets = { git = "https://github.com/kevinaboos/makepad", branch = "splash-host-io-cancel", features = ["serde"] }
-makepad-code-editor = { git = "https://github.com/kevinaboos/makepad", branch = "splash-host-io-cancel" }
+makepad-widgets = { git = "https://github.com/kevinaboos/makepad", branch = "splash-host-io-radio-focus", features = ["serde"] }
+makepad-code-editor = { git = "https://github.com/kevinaboos/makepad", branch = "splash-host-io-radio-focus" }
 
 
 [patch.crates-io]
@@ -317,11 +317,6 @@ out_dir = "./dist"
 resources = [
     # Makepad resources
     { src = "./dist/resources/makepad_widgets", target = "makepad_widgets" },
-    { src = "./dist/resources/makepad_fonts_chinese_bold", target = "makepad_fonts_chinese_bold" },
-    { src = "./dist/resources/makepad_fonts_chinese_bold_2", target = "makepad_fonts_chinese_bold_2" },
-    { src = "./dist/resources/makepad_fonts_chinese_regular", target = "makepad_fonts_chinese_regular" },
-    { src = "./dist/resources/makepad_fonts_chinese_regular_2", target = "makepad_fonts_chinese_regular_2" },
-    { src = "./dist/resources/makepad_fonts_emoji", target = "makepad_fonts_emoji" },
     # Robrix resources
     { src = "./dist/resources/robrix", target = "robrix" },
 ]

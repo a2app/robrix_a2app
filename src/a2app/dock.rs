@@ -79,18 +79,19 @@ script_mod! {
         width: Fill, height: Fill
         flow: Overlay
 
-        body := View {
+        // These ids differ from RoomPaneDock's, as a lookup by id would find the other dock's edges.
+        app_body := View {
             width: Fill, height: Fill
             flow: Down
-            edge_top := mod.widgets.MiniAppEdge {}
-            mid := View {
+            app_edge_top := mod.widgets.MiniAppEdge {}
+            app_mid := View {
                 width: Fill, height: Fill
                 flow: Right
-                edge_left := mod.widgets.MiniAppEdge {}
-                center := View { width: Fill, height: Fill, flow: Down }
-                edge_right := mod.widgets.MiniAppEdge {}
+                app_edge_left := mod.widgets.MiniAppEdge {}
+                app_center := View { width: Fill, height: Fill, flow: Down }
+                app_edge_right := mod.widgets.MiniAppEdge {}
             }
-            edge_bottom := mod.widgets.MiniAppEdge {}
+            app_edge_bottom := mod.widgets.MiniAppEdge {}
         }
 
         // Floats over the room content: a minimized app must not push the
@@ -460,10 +461,10 @@ enum PaneButton {
 impl MiniAppDock {
     fn edge(&self, cx: &mut Cx, side: PaneSide) -> MiniAppEdgeRef {
         let id = match side {
-            PaneSide::Top => ids!(edge_top),
-            PaneSide::Bottom => ids!(edge_bottom),
-            PaneSide::Left => ids!(edge_left),
-            PaneSide::Right => ids!(edge_right),
+            PaneSide::Top => ids!(app_edge_top),
+            PaneSide::Bottom => ids!(app_edge_bottom),
+            PaneSide::Left => ids!(app_edge_left),
+            PaneSide::Right => ids!(app_edge_right),
         };
         self.view.mini_app_edge(cx, id)
     }
@@ -846,9 +847,9 @@ impl MiniAppEdge {
     fn apply_walk(&mut self) {
         let extent = if self.panes.is_empty() { 0.0 } else { self.size + EDGE_HANDLE };
         let (width, height) = if self.side.is_vertical() {
-            (Size::Fixed(extent), Size::Fill { weight: 1.0, min: None, max: None })
+            (Size::Fixed(extent), Size::fill())
         } else {
-            (Size::Fill { weight: 1.0, min: None, max: None }, Size::Fixed(extent))
+            (Size::fill(), Size::Fixed(extent))
         };
         self.view.walk.width = width;
         self.view.walk.height = height;
@@ -975,10 +976,9 @@ impl Widget for MiniAppEdge {
             };
             let pane_walk = Walk {
                 abs_pos: Some(sub.pos),
-                margin: Default::default(),
                 width: Size::Fixed(sub.size.x),
                 height: Size::Fixed(sub.size.y),
-                metrics: Default::default(),
+                ..Walk::default()
             };
             pane.draw_walk_all(cx, &mut Scope::empty(), pane_walk);
             if i == 0.0 {
@@ -1117,10 +1117,9 @@ impl Widget for MiniAppChipsRow {
             x -= CHIP_WIDTH + 6.0;
             let chip_walk = Walk {
                 abs_pos: Some(Vec2d { x, y: rect.pos.y + 3.0 }),
-                margin: Default::default(),
                 width: Size::Fixed(CHIP_WIDTH),
                 height: Size::fit(),
-                metrics: Default::default(),
+                ..Walk::default()
             };
             chip.draw_walk_all(cx, &mut Scope::empty(), chip_walk);
         }

@@ -1027,7 +1027,12 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
                         let (room_id, name) = room(room_name_id);
                         serde_json::json!({ "kind": "invite", "room_id": room_id, "name": name })
                     }
-                    _ => serde_json::json!({ "kind": "space" }),
+                    // A popped-out pane shows info about its room.
+                    SelectedRoom::RoomPane { room_name_id, .. } => {
+                        let (room_id, name) = room(room_name_id);
+                        serde_json::json!({ "kind": "room", "room_id": room_id, "name": name })
+                    }
+                    SelectedRoom::Space { .. } => serde_json::json!({ "kind": "space" }),
                 };
                 host_events.push(("on_active_room_changed", payload));
                 continue;
@@ -1298,6 +1303,7 @@ fn deliver_room_hooks(
 ) {
     prune_hook_subs();
     let show_receipts = cx.global::<AppPreferencesGlobal>().0.show_read_receipts;
+    let show_typing = cx.global::<AppPreferencesGlobal>().0.show_typing_notices;
     // Messages and receipts batch per pass, reactions, edits and invites get
     // a call each, the rest coalesce to the latest; a `None` room is account-wide.
     let mut messages: HashMap<OwnedRoomId, Vec<serde_json::Value>> = HashMap::new();
@@ -1340,6 +1346,8 @@ fn deliver_room_hooks(
                     "added": added,
                 })));
             }
+            // The user's "show when others are typing" switch hides typing from apps too.
+            RoomWatchKind::Typing { .. } if !show_typing => {}
             RoomWatchKind::Typing { users } => {
                 let typing: Vec<_> = users.iter()
                     .map(|(user_id, name)| serde_json::json!({ "user_id": user_id, "name": name }))

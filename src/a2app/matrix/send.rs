@@ -102,6 +102,10 @@ pub(super) async fn react(room_id: OwnedRoomId, event_id: OwnedEventId, key: Str
 }
 
 pub(super) async fn typing(room_id: OwnedRoomId, typing: bool) -> Result<String, String> {
+    // The user's "let others see when you're typing" switch applies to apps too.
+    if typing && !crate::settings::app_preferences::send_typing_notices() {
+        return Ok(String::from("{}"));
+    }
     super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;

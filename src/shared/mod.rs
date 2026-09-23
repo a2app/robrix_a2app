@@ -12,9 +12,11 @@ pub mod hover_highlight;
 pub mod html_or_plaintext;
 pub mod icon_button;
 pub mod jump_to_bottom_button;
+pub mod list_rows;
 pub mod mention_popup;
 pub mod mentionable_text_input;
 pub mod navigation_bar_button;
+pub mod password_input;
 pub mod popup_list;
 pub mod progress_bar;
 pub mod room_filter_input_bar;
@@ -38,6 +40,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
     styles::script_mod(vm);
     helpers::script_mod(vm);
     icon_button::script_mod(vm);
+    password_input::script_mod(vm);
     speech_text_input::script_mod(vm);
     context_menu::script_mod(vm);
     navigation_bar_button::script_mod(vm);
@@ -54,6 +57,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
     jump_to_bottom_button::script_mod(vm);
     popup_list::script_mod(vm);
     verification_badge::script_mod(vm);
+    list_rows::script_mod(vm);
     mention_popup::script_mod(vm);
     mentionable_text_input::script_mod(vm);
     restore_status_view::script_mod(vm);

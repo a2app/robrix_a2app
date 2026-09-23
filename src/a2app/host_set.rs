@@ -111,10 +111,9 @@ impl Widget for MiniAppHostArea {
         {
             let host_walk = Walk {
                 abs_pos: Some(rect.pos),
-                margin: Default::default(),
                 width: Size::Fixed(rect.size.x),
                 height: Size::Fixed(rect.size.y),
-                metrics: Default::default(),
+                ..Walk::default()
             };
             host.draw_walk_all(cx, &mut Scope::empty(), host_walk);
         }
