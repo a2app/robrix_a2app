@@ -18,6 +18,8 @@ pub use crate::a2app::room_panes as mini_app_panes;
 pub use crate::a2app_dummy::room_panes as mini_app_panes;
 
 /// The kinds of panes that can be shown for a room.
+///
+/// This isn't `Copy`, so that a kind of pane can carry data, e.g., which content it shows.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RoomPaneKind {
     /// The list of the room's members.
