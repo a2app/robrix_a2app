@@ -451,6 +451,7 @@ script_mod! {
         turn_body := Label {
             width: Fill, height: Fit
             visible: false
+            flow: Flow.Right{wrap: true}
             padding: 0, margin: Inset{left: 19}
             draw_text +: {
                 text_style: SMALL_STATE_TEXT_STYLE {},

@@ -14,6 +14,13 @@ Tasks resume in their original account and context after launch. A missing or
 unjoined room is never replaced with another room. A changed app version requires
 review and explicit re-enabling.
 
+Choose **New task**, select the mini-app and its room or space, then choose
+when it should run. **Save and enable task** starts that schedule. For a saved
+task, **Edit schedule** opens its form; **Cancel** leaves the saved schedule
+unchanged. Pause, Resume, and Remove task are available beside its status.
+Alarm times use the device's local time zone and are stored as an absolute time;
+ambiguous or nonexistent times during daylight-saving changes must be corrected.
+
 ## Try the examples
 
 - **Website Watch**: choose a room, open the app to save an HTTP(S) URL and a
@@ -24,9 +31,9 @@ review and explicit re-enabling.
   absent. Responses are limited to 64 KiB in this example. It does not execute
   JavaScript or scrape authenticated browser sessions.
 - **Reminder**: save a reminder in an account, room, or space and choose an
-  interval or a one-time UTC alarm. Use it for a regular break, a project check-in,
+  interval or a one-time alarm in your device’s local time. Use it for a regular break, a project check-in,
   or a deadline. The output is a Robrix popup.
-- **Keyword Alert**: select a room and the **New room messages** trigger. Open the
+- **Keyword Alert**: select a room and the **When new messages arrive** trigger. Open the
   app to save a keyword such as `release` or an incident tag. Matching is literal
   and case-sensitive; your own messages are ignored. Each delivered batch can
   produce one popup.

@@ -135,6 +135,7 @@ script_mod! {
             spacing: 2
             perm_title := Label {
                 width: Fill, height: Fit
+                flow: Flow.Right{wrap: true}
                 padding: 0, margin: 0
                 draw_text +: {
                     text_style: theme.font_bold {font_size: 11},
@@ -146,24 +147,25 @@ script_mod! {
                 flow: Flow.Right{wrap: true}
                 padding: 0, margin: 0
                 draw_text +: {
-                    text_style: REGULAR_TEXT {font_size: 9.5},
+                    text_style: REGULAR_TEXT {font_size: 11},
                     color: (MESSAGE_TEXT_COLOR)
                 }
             }
-        }
-        perm_state := Label {
-            width: Fit, height: Fit
-            padding: 0, margin: 0
-            align: Align{x: 1.0}
-            draw_text +: {
-                text_style: theme.font_bold {font_size: 10.5},
-                color: (COLOR_TEXT)
+            perm_state := Label {
+                width: Fill, height: Fit
+                flow: Flow.Right{wrap: true}
+                padding: 0, margin: 0
+                align: Align{x: 0.0}
+                draw_text +: {
+                    text_style: theme.font_bold {font_size: 10.5},
+                    color: (COLOR_TEXT)
+                }
             }
         }
         perm_change_button := RobrixNeutralIconButton {
             padding: 8,
             icon_walk: Walk{width: 0, height: 0, margin: 0}
-            text: "Change"
+            text: "Edit…"
         }
     }
 
@@ -176,7 +178,7 @@ script_mod! {
         flow: Right
         spacing: 8
         align: Align{y: 0.5}
-        padding: Inset{top: 3, bottom: 3, left: 44, right: 10}
+        padding: Inset{top: 3, bottom: 3, left: 26, right: 10}
 
         View {
             width: Fill, height: Fit
@@ -184,6 +186,7 @@ script_mod! {
             spacing: 1
             cap_title := Label {
                 width: Fill, height: Fit
+                flow: Flow.Right{wrap: true}
                 padding: 0, margin: 0
                 draw_text +: {
                     text_style: REGULAR_TEXT {font_size: 10.5},
@@ -192,26 +195,28 @@ script_mod! {
             }
             cap_tags := Label {
                 width: Fill, height: Fit
+                flow: Flow.Right{wrap: true}
                 padding: 0, margin: 0
                 draw_text +: {
-                    text_style: REGULAR_TEXT {font_size: 8.5},
+                    text_style: REGULAR_TEXT {font_size: 10},
                     color: (MESSAGE_TEXT_COLOR)
                 }
             }
-        }
-        cap_state := Label {
-            width: Fit, height: Fit
-            padding: 0, margin: 0
-            align: Align{x: 1.0}
-            draw_text +: {
-                text_style: REGULAR_TEXT {font_size: 9.5},
-                color: (MESSAGE_TEXT_COLOR)
+            cap_state := Label {
+                width: Fill, height: Fit
+                flow: Flow.Right{wrap: true}
+                padding: 0, margin: 0
+                align: Align{x: 0.0}
+                draw_text +: {
+                    text_style: REGULAR_TEXT {font_size: 11},
+                    color: (MESSAGE_TEXT_COLOR)
+                }
             }
         }
         cap_change_button := RobrixNeutralIconButton {
             padding: Inset{top: 4, bottom: 4, left: 8, right: 8},
             icon_walk: Walk{width: 0, height: 0, margin: 0}
-            text: "Change"
+            text: "Edit…"
         }
     }
 
@@ -373,14 +378,18 @@ script_mod! {
 
 
     mod.widgets.MiniAppAccessRuleRow = set_type_default() do #(MiniAppAccessRuleRow::register_widget(vm)) {
-        width: Fill, height: Fit, flow: Right, spacing: 8, padding: 8, align: Align{y: 0.5}
+        width: Fill, height: Fit, flow: Down, spacing: 8, padding: 10
         rule_label := mod.widgets.PermissionOptionLabel {}
-        rule_edit := RobrixNeutralIconButton {
-            padding: 6, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Edit"
+        View {
+            width: Fill, height: Fit, flow: Flow.Right{wrap: true}, spacing: 8
+            rule_edit := RobrixNeutralIconButton {
+                padding: 6, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Edit"
+            }
+            rule_remove := RobrixNegativeIconButton {
+                padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Remove"
+            }
         }
-        rule_remove := RobrixNegativeIconButton {
-            padding: 6, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Remove"
-        }
+        LineH {}
     }
 
     mod.widgets.MiniAppsScreen = #(MiniAppsScreen::register_widget(vm)) {
@@ -406,59 +415,42 @@ script_mod! {
             RoundedView {
                 width: Fill, height: Fit, flow: Down, spacing: 8, padding: 12
                 show_bg: true
-                draw_bg +: { color: #F4F6F9, border_radius: 8.0 }
-                SubsectionLabel { text: "Room and space protection", margin: 0 }
+                draw_bg +: { color: (COLOR_BG_PREVIEW), border_radius: 8.0 }
+                SubsectionLabel { text: "Permissions and privacy", margin: 0 }
                 mod.widgets.PermissionOptionLabel {
-                    text: "Applies to every mini-app and agent. Blocks always win, including over room or space allowlists. Allow rules skip permission prompts for declared room abilities."
+                    text: "Set room access, agent permissions, and where private data may be shared."
                 }
-                mod.widgets.PermissionOptionLabel { text: "Read access to rooms" }
-                global_read := mod.widgets.PermissionDropDown { labels: ["Ask unless a room or space rule allows", "Allow everywhere", "Only allowlisted rooms and spaces", "Block all room reads"] }
-                mod.widgets.PermissionOptionLabel {
-                    text: "Blocking reads prevents new access. To stop sharing data an app or agent already read, remove that source's data sharing rules too."
-                }
-                global_write_enabled := ToggleFlat {
+                global_write_enabled := RobrixSettingsToggle {
                     width: Fill, height: Fit
                     padding: Inset{left: 15}
                     active: false
                     draw_bg +: { size: 21 }
-                    text: "Enable room writes for mini-apps and agents"
+                    text: "Allow room writes"
                     draw_text +: { text_style: REGULAR_TEXT {font_size: 10.5}, color: (COLOR_TEXT) }
                 }
                 mod.widgets.PermissionOptionLabel {
-                    text: "Turning this off blocks every room write and disables write controls below. Your saved write rules are kept for when you turn it on again."
+                    text: "Turn off to stop all mini-apps and agents from sending messages or changing rooms. Your saved write rules are kept."
                 }
-                mod.widgets.PermissionOptionLabel { text: "Write access when enabled" }
-                global_write := mod.widgets.PermissionDropDown { labels: ["Ask unless a room or space rule allows", "Allow everywhere", "Only allowlisted rooms and spaces"] }
                 protection_summary := mod.widgets.PermissionOptionLabel {}
                 protection_status := mod.widgets.PermissionOptionLabel { visible: false }
                 View {
                     width: Fill, height: Fit, flow: Flow.Right{wrap: true}, spacing: 8
                     protection_button := RobrixNeutralIconButton {
                         padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                        text: "Manage room and space rules"
+                        text: "Room and space access…"
                     }
                     agent_permissions_button := RobrixNeutralIconButton {
                         padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                        text: "Manage agent permissions"
+                        text: "Agent permissions…"
+                    }
+                    sharing_button := RobrixNeutralIconButton {
+                        padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                        text: "Data sharing…"
                     }
                     inspect_protection_button := RobrixNeutralIconButton {
                         padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                        text: "Inspect room protection"
+                        text: "Check access…"
                     }
-                }
-            }
-
-            RoundedView {
-                width: Fill, height: Fit, flow: Down, spacing: 8, padding: 12
-                show_bg: true
-                draw_bg +: { color: #F4F6F9, border_radius: 8.0 }
-                SubsectionLabel { text: "Private data sharing", margin: 0 }
-                mod.widgets.PermissionOptionLabel {
-                    text: "Room and account data stay protected after an app or agent reads them. Choose which model services, websites or other rooms may receive data from each source. Internet permission alone does not permit sharing private data."
-                }
-                sharing_button := RobrixNeutralIconButton {
-                    padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                    text: "Manage data sharing rules"
                 }
             }
 
@@ -474,7 +466,7 @@ script_mod! {
                 padding: 14
                 show_bg: true,
                 draw_bg +: {
-                    color: #F4F6F9
+                    color: (COLOR_BG_PREVIEW)
                     border_radius: 8.0
                 }
 
@@ -771,6 +763,41 @@ script_mod! {
                 text: "Older shared saved data is retained in its original storage folder. Isolated instances start with separate storage; old files are not automatically imported. Clear data also removes the retained old files."
             }
 
+            SubsectionLabel { text: "Permissions" }
+            perm_hint := Label {
+                visible: false,
+                width: Fill, height: Fit
+                padding: 0, margin: Inset{left: 6}
+                draw_text +: {
+                    text_style: REGULAR_TEXT {font_size: 9.5},
+                    color: (MESSAGE_TEXT_COLOR)
+                }
+                text: "This app is running: permission changes apply immediately; changing network access stops it, so open it again afterwards."
+            }
+            no_perms_label := Label {
+                visible: false,
+                width: Fill, height: Fit
+                padding: 0, margin: Inset{left: 6}
+                draw_text +: {
+                    text_style: REGULAR_TEXT {font_size: 10.5},
+                    color: (MESSAGE_TEXT_COLOR)
+                }
+                text: "This app declares no permissions: it can only draw its own UI and use its private storage."
+            }
+            mod.widgets.PermissionOptionLabel { text: "Choose what this mini-app can do. Room blocks and data sharing rules still apply to every permission." }
+            ability_details := RobrixNeutralIconButton {
+                padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                text: "Show individual abilities"
+            }
+            perms_list := FlatList {
+                width: Fill, height: Fit
+                spacing: 2
+                flow: Down
+
+                permission_row := mod.widgets.MiniAppPermissionRow { }
+                capability_row := mod.widgets.MiniAppCapabilityRow { }
+            }
+
             // Everything else, grouped so a narrow window wraps each group
             // on its own line instead of scattering twelve buttons.
             manage_card := RoundedView {
@@ -780,7 +807,7 @@ script_mod! {
                 padding: 12
                 show_bg: true,
                 draw_bg +: {
-                    color: #F4F6F9
+                    color: (COLOR_BG_PREVIEW)
                     border_radius: 8.0
                 }
 
@@ -884,36 +911,6 @@ script_mod! {
                 }
             }
 
-            SubsectionLabel { text: "Permissions" }
-            perm_hint := Label {
-                visible: false,
-                width: Fill, height: Fit
-                padding: 0, margin: Inset{left: 6}
-                draw_text +: {
-                    text_style: REGULAR_TEXT {font_size: 9.5},
-                    color: (MESSAGE_TEXT_COLOR)
-                }
-                text: "This app is running: permission changes apply immediately; changing network access stops it, so open it again afterwards."
-            }
-            no_perms_label := Label {
-                visible: false,
-                width: Fill, height: Fit
-                padding: 0, margin: Inset{left: 6}
-                draw_text +: {
-                    text_style: REGULAR_TEXT {font_size: 10.5},
-                    color: (MESSAGE_TEXT_COLOR)
-                }
-                text: "This app declares no permissions: it can only draw its own UI and use its private storage."
-            }
-            perms_list := FlatList {
-                width: Fill, height: Fit
-                spacing: 2
-                flow: Down
-
-                permission_row := mod.widgets.MiniAppPermissionRow { }
-                capability_row := mod.widgets.MiniAppCapabilityRow { }
-            }
-
             SubsectionLabel { text: "Version history" }
             no_versions_label := Label {
                 visible: false,
@@ -934,55 +931,80 @@ script_mod! {
             }
         }
 
-        access_pane := ScrollYView {
+        access_pane := View {
             visible: false
-            width: Fill, height: Fill, flow: Down, spacing: 10, padding: 15
+            width: Fill, height: Fill, flow: Down
             View {
-                width: Fill, height: Fit, flow: Right, spacing: 10, align: Align{y: 0.5}
+                width: Fill, height: Fit, flow: Right, spacing: 10, padding: 15, align: Align{y: 0.5}
                 access_back := RobrixNeutralIconButton {
-                    padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Back"
+                    padding: 8, draw_icon +: { svg: (ICON_JUMP) }
+                    icon_walk: Walk{width: 14, height: 14, margin: 0}, text: "Back"
                 }
-                access_title := TitleLabel { width: Fill }
+                access_title := TitleLabel { width: Fill, margin: 0, flow: Flow.Right{wrap: true} }
             }
-            agent_selector := View {
-                visible: false
-                width: Fill, height: Fit, flow: Down, spacing: 5
-                mod.widgets.PermissionOptionLabel { text: "Agent in room" }
-                agent_choice := mod.widgets.PermissionDropDown {}
-                mod.widgets.PermissionOptionLabel { text: "Permission or ability" }
-                agent_ability := mod.widgets.PermissionDropDown {}
-            }
-            access_hint := mod.widgets.PermissionOptionLabel {}
-            access_baseline := mod.widgets.PermissionOptionLabel {}
-            access_scope := mod.widgets.PermissionScopeEditor {}
-            policy_choices := View {
-                width: Fill, height: Fit, flow: Down, spacing: 5
-                mod.widgets.PermissionOptionLabel { text: "Read access for the selection" }
-                policy_read := mod.widgets.PermissionDropDown { labels: ["Ask / no rule", "Allow", "Block"] }
-                mod.widgets.PermissionOptionLabel { text: "Write access for the selection" }
-                policy_write := mod.widgets.PermissionDropDown { labels: ["Ask / no rule", "Allow", "Block"] }
-                policy_write_disabled := mod.widgets.PermissionOptionLabel {
+            access_scroll := ScrollYView {
+                width: Fill, height: Fill, flow: Down, spacing: 10
+                padding: Inset{left: 15, right: 15, bottom: 15}
+                access_subject := mod.widgets.PermissionOptionLabel {}
+                agent_selector := View {
                     visible: false
-                    text: "All room writes are disabled on the Mini Apps main screen. Saved write rules are paused and will be kept when you edit read rules."
+                    width: Fill, height: Fit, flow: Down, spacing: 5
+                    mod.widgets.PermissionOptionLabel { text: "Agent in room" }
+                    agent_choice := mod.widgets.PermissionDropDown {}
+                    mod.widgets.PermissionOptionLabel { text: "Permission or ability" }
+                    agent_ability := mod.widgets.PermissionDropDown {}
                 }
-            }
-            View {
-                width: Fill, height: Fit, flow: Flow.Right{wrap: true}, spacing: 8
-                access_save := RobrixPositiveIconButton {
-                    padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Allow selected"
+                protection_defaults := View {
+                    visible: false
+                    width: Fill, height: Fit, flow: Down, spacing: 8
+                    SubsectionLabel { text: "Default access", margin: 0 }
+                    protection_write_enabled := RobrixSettingsToggle {
+                        width: Fill, height: Fit, text: "Allow room writes"
+                    }
+                    mod.widgets.PermissionOptionLabel { text: "These defaults apply to every mini-app and agent. Blocked rooms and spaces stay blocked even when the default is Allow everywhere." }
+                    mod.widgets.PermissionOptionLabel { text: "Reading messages and room details" }
+                    global_read := mod.widgets.PermissionDropDown { labels: ["Ask before allowing", "Allow everywhere", "Only allowed rooms and spaces", "Block all room reads"] }
+                    mod.widgets.PermissionOptionLabel {
+                        text: "Blocking reads prevents new access. To stop sharing data an app or agent already read, remove that source's data sharing rules too."
+                    }
+                    mod.widgets.PermissionOptionLabel { text: "Sending messages and making changes" }
+                    global_write := mod.widgets.PermissionDropDown { labels: ["Ask before allowing", "Allow everywhere", "Only allowed rooms and spaces"] }
+                    LineH { margin: Inset{top: 8, bottom: 8} }
+                    SubsectionLabel { text: "Room and space rules", margin: 0 }
                 }
-                access_ask := RobrixNeutralIconButton {
-                    padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Ask / use default"
+                access_hint := mod.widgets.PermissionOptionLabel {}
+                access_baseline := mod.widgets.PermissionOptionLabel {}
+                access_scope := mod.widgets.PermissionScopeEditor {}
+                policy_choices := View {
+                    width: Fill, height: Fit, flow: Down, spacing: 5
+                    mod.widgets.PermissionOptionLabel { text: "Read access" }
+                    policy_read := mod.widgets.PermissionDropDown { labels: ["Use default", "Allow without asking", "Block"] }
+                    mod.widgets.PermissionOptionLabel { text: "Write access" }
+                    policy_write := mod.widgets.PermissionDropDown { labels: ["Use default", "Allow without asking", "Block"] }
+                    policy_write_disabled := mod.widgets.PermissionOptionLabel {
+                        visible: false
+                        text: "Room writes are off. Turn on Allow room writes above to edit write access. Saving read access keeps your existing write rules."
+                    }
                 }
-                access_block := RobrixNegativeIconButton {
-                    padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Block everywhere"
+                access_selection_hint := mod.widgets.PermissionOptionLabel {}
+                View {
+                    width: Fill, height: Fit, flow: Flow.Right{wrap: true}, spacing: 8
+                    access_save := RobrixPositiveIconButton {
+                        padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Allow selected"
+                    }
+                    access_ask := RobrixNeutralIconButton {
+                        padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Use default"
+                    }
+                    access_block := RobrixNegativeIconButton {
+                        padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Block everywhere"
+                    }
                 }
-            }
-            SubsectionLabel { text: "Current rules" }
-            access_empty := mod.widgets.PermissionOptionLabel { text: "No saved or session rules yet." }
-            access_rules := FlatList {
-                width: Fill, height: Fit, flow: Down, spacing: 5
-                access_rule := mod.widgets.MiniAppAccessRuleRow {}
+                SubsectionLabel { text: "Current rules" }
+                access_empty := mod.widgets.PermissionOptionLabel { text: "No saved or session rules yet." }
+                access_rules := FlatList {
+                    width: Fill, height: Fit, flow: Down, spacing: 5
+                    access_rule := mod.widgets.MiniAppAccessRuleRow {}
+                }
             }
         }
 
@@ -992,9 +1014,10 @@ script_mod! {
             View {
                 width: Fill, height: Fit, flow: Right, spacing: 10, padding: 15
                 background_back := RobrixNeutralIconButton {
-                    padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Back"
+                    padding: 8, draw_icon +: { svg: (ICON_JUMP) }
+                    icon_walk: Walk{width: 14, height: 14, margin: 0}, text: "Back"
                 }
-                TitleLabel { width: Fill, text: "Background tasks" }
+                TitleLabel { width: Fill, margin: 0, flow: Flow.Right{wrap: true}, text: "Background tasks" }
             }
             background_tasks := mod.widgets.BackgroundTasks {}
         }
@@ -1005,9 +1028,10 @@ script_mod! {
             View {
                 width: Fill, height: Fit, flow: Right, spacing: 10, padding: 15
                 inspector_back := RobrixNeutralIconButton {
-                    padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Back"
+                    padding: 8, draw_icon +: { svg: (ICON_JUMP) }
+                    icon_walk: Walk{width: 14, height: 14, margin: 0}, text: "Back"
                 }
-                TitleLabel { width: Fill, text: "Room protection inspector" }
+                TitleLabel { width: Fill, margin: 0, flow: Flow.Right{wrap: true}, text: "Check access" }
             }
             protection_inspector := mod.widgets.ProtectionInspector {}
         }
@@ -1019,9 +1043,10 @@ script_mod! {
                 width: Fill, height: Fit, flow: Right, spacing: 10, padding: 15
                 align: Align{y: 0.5}
                 sharing_back_button := RobrixNeutralIconButton {
-                    padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Back"
+                    padding: 8, draw_icon +: { svg: (ICON_JUMP) }
+                    icon_walk: Walk{width: 14, height: 14, margin: 0}, text: "Back"
                 }
-                TitleLabel { text: "Private data sharing" }
+                TitleLabel { width: Fill, margin: 0, flow: Flow.Right{wrap: true}, text: "Private data sharing" }
             }
             sharing_editor := mod.widgets.DataSharing {}
         }
@@ -1414,13 +1439,20 @@ impl MiniAppPermissionRow {
         self.view.label(cx, ids!(perm_blurb)).set_text(cx, perm.blurb());
         let (state_text, color) = match effective {
             Effective::Granted => ("Allowed", crate::shared::styles::COLOR_FG_ACCEPT_GREEN),
-            Effective::NeedsPrompt => ("Asks", crate::shared::styles::COLOR_ACTIVE_PRIMARY),
-            Effective::Denied => ("Denied", crate::shared::styles::COLOR_FG_DANGER_RED),
+            Effective::NeedsPrompt => ("Ask first", crate::shared::styles::COLOR_ACTIVE_PRIMARY),
+            Effective::Denied => ("Blocked", crate::shared::styles::COLOR_FG_DANGER_RED),
             Effective::Undeclared => ("Undeclared", crate::shared::styles::COLOR_FG_DISABLED),
         };
-        let scoped_count = with_a2app(|state| state.permissions.scoped_grants(app_id).into_iter()
-            .filter(|grant| grant.permission == perm.as_str()).count()).unwrap_or(0);
-        let state_text = if scoped_count > 0 { format!("{state_text} · {scoped_count} scoped rules") } else { state_text.to_string() };
+        let (scoped_count, writes_blocked) = with_a2app(|state| (
+            state.permissions.scoped_grants(app_id).into_iter()
+                .filter(|grant| grant.permission == perm.as_str()).count(),
+            !state.permissions.matrix_write() && a2app_core::capabilities::in_group(perm)
+                .any(|cap| cap.status == a2app_core::capabilities::Status::RefusedBySwitch),
+        )).unwrap_or_default();
+        let (state_text, color) = if writes_blocked {
+            ("Room writes blocked · Allow room writes is off", crate::shared::styles::COLOR_FG_DANGER_RED)
+        } else { (state_text, color) };
+        let state_text = if scoped_count > 0 { format!("{state_text} · {scoped_count} saved allowances") } else { state_text.to_string() };
         let mut state_label = self.view.label(cx, ids!(perm_state));
         script_apply_eval!(cx, state_label, {
             text: #(state_text),
@@ -1465,18 +1497,32 @@ impl MiniAppCapabilityRow {
         self.app_id = app_id.to_string();
         self.cap_id = cap.id.to_string();
         self.view.label(cx, ids!(cap_title)).set_text(cx, cap.title);
-        self.view.label(cx, ids!(cap_tags)).set_text(cx, &cap.tags());
-        // An explicit answer reads as such; otherwise it follows the group.
-        let (state_text, color) = match (own, effective) {
-            (GrantState::Granted, _) => (String::from("Allowed"), crate::shared::styles::COLOR_FG_ACCEPT_GREEN),
-            (GrantState::Denied, _) => (String::from("Denied"), crate::shared::styles::COLOR_FG_DANGER_RED),
-            (GrantState::Ask, Effective::Granted) => (String::from("Allowed · group"), crate::shared::styles::COLOR_FG_DISABLED),
-            (GrantState::Ask, Effective::NeedsPrompt) => (String::from("Asks · group"), crate::shared::styles::COLOR_FG_DISABLED),
-            (GrantState::Ask, _) => (String::from("Denied · group"), crate::shared::styles::COLOR_FG_DISABLED),
+        self.view.label(cx, ids!(cap_tags)).set_text(cx, cap.blurb);
+        let (scoped_count, block_reason) = with_a2app(|state| {
+            let permissions = &state.permissions;
+            let count = permissions.scoped_grants(app_id).into_iter()
+                .filter(|grant| grant.capability.as_deref() == Some(cap.id)).count();
+            let reason = if effective != Effective::Denied {
+                None
+            } else if permissions.is_restricted(app_id) {
+                Some(String::from("Blocked · mini-app is stopped"))
+            } else if cap.status == a2app_core::capabilities::Status::RefusedBySwitch && !permissions.matrix_write() {
+                Some(String::from("Blocked · Allow room writes is off"))
+            } else {
+                cap.group.filter(|group| permissions.state(app_id, *group) == GrantState::Denied)
+                    .map(|group| format!("Blocked · {} permission group", group.title()))
+            };
+            (count, reason)
+        }).unwrap_or_default();
+        // Show the enforced result even when a saved individual allowance is overridden.
+        let (state_text, color) = match effective {
+            Effective::Denied => (block_reason.unwrap_or_else(|| String::from("Blocked")), crate::shared::styles::COLOR_FG_DANGER_RED),
+            Effective::Undeclared => (String::from("Not declared"), crate::shared::styles::COLOR_FG_DISABLED),
+            Effective::Granted if own == GrantState::Ask => (String::from("Allowed · group"), crate::shared::styles::COLOR_FG_DISABLED),
+            Effective::Granted => (String::from("Allowed"), crate::shared::styles::COLOR_FG_ACCEPT_GREEN),
+            Effective::NeedsPrompt => (String::from("Ask first"), crate::shared::styles::COLOR_ACTIVE_PRIMARY),
         };
-        let scoped_count = with_a2app(|state| state.permissions.scoped_grants(app_id).into_iter()
-            .filter(|grant| grant.capability.as_deref() == Some(cap.id)).count()).unwrap_or(0);
-        let state_text = if scoped_count > 0 { format!("{state_text} · {scoped_count} scoped rules") } else { state_text };
+        let state_text = if scoped_count > 0 { format!("{state_text} · {scoped_count} saved allowances") } else { state_text };
         let mut state_label = self.view.label(cx, ids!(cap_state));
         script_apply_eval!(cx, state_label, {
             text: #(state_text),
@@ -1595,7 +1641,7 @@ fn room_label(cx: &mut Cx, room_id: &str) -> String {
 // -----------------------------------------------------------------------
 
 /// Which of the screen's panes is showing.
-#[derive(Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum Pane {
     #[default]
     List,
@@ -1614,6 +1660,9 @@ enum Pane {
 pub struct MiniAppsScreen {
     #[deref] view: View,
     #[rust] pane: Pane,
+    #[rust] pane_history: Vec<Pane>,
+    #[rust] cancel_scope: Option<CancelScope>,
+    #[rust] show_abilities: bool,
     /// The app shown in the info (or source, diff, editor) pane.
     #[rust] info_app: Option<MiniAppId>,
     /// Versions of the info app, newest first, refreshed when the pane opens
@@ -1646,12 +1695,29 @@ impl Widget for MiniAppsScreen {
             self.view.redraw(cx);
         }
 
+        if self.cancel_scope.as_ref().is_some_and(|scope| cx.owns_cancel(scope))
+            && (event.back_pressed()
+                || matches!(event, Event::KeyUp(key) if key.key_code == KeyCode::Escape)
+                || matches!(event, Event::MouseUp(mouse) if mouse.button.is_back()))
+        {
+            self.go_back(cx);
+            return;
+        }
+
         let Event::Actions(actions) = event else { return };
 
+        if self.view.button(cx, ids!(ability_details)).clicked(actions) {
+            self.show_abilities = !self.show_abilities;
+            self.view.button(cx, ids!(ability_details)).set_text(cx,
+                if self.show_abilities { "Hide individual abilities" } else { "Show individual abilities" });
+            self.view.redraw(cx);
+        }
         if let Some(index) = self.view.drop_down(cx, ids!(global_read)).changed(actions) {
             cx.action(global_policy_action(RoomAccess::Read, index));
         }
-        if let Some(enabled) = self.view.check_box(cx, ids!(global_write_enabled)).changed(actions) {
+        if let Some(enabled) = self.view.check_box(cx, ids!(global_write_enabled)).changed(actions)
+            .or_else(|| self.view.check_box(cx, ids!(protection_write_enabled)).changed(actions))
+        {
             self.set_write_controls_enabled(cx, enabled);
             cx.action(A2AppOp::SetMatrixWrite(enabled));
         }
@@ -1671,21 +1737,21 @@ impl Widget for MiniAppsScreen {
             self.set_pane(cx, Pane::Inspector);
         }
         if self.view.button(cx, ids!(inspector_back)).clicked(actions) {
-            self.set_pane(cx, Pane::List);
+            self.go_back(cx);
         }
         if self.view.button(cx, ids!(background_tasks_button)).clicked(actions) {
             self.view.background_tasks(cx, ids!(background_tasks)).configure(cx);
             self.set_pane(cx, Pane::Background);
         }
         if self.view.button(cx, ids!(background_back)).clicked(actions) {
-            self.set_pane(cx, Pane::List);
+            self.go_back(cx);
         }
         if self.view.button(cx, ids!(sharing_button)).clicked(actions) {
             self.view.data_sharing(cx, ids!(sharing_editor)).configure(cx);
             self.set_pane(cx, Pane::Sharing);
         }
         if self.view.button(cx, ids!(sharing_back_button)).clicked(actions) {
-            self.set_pane(cx, Pane::List);
+            self.go_back(cx);
         }
         if self.view.drop_down(cx, ids!(agent_choice)).changed(actions).is_some()
             || self.view.drop_down(cx, ids!(agent_ability)).changed(actions).is_some()
@@ -1731,7 +1797,7 @@ impl Widget for MiniAppsScreen {
             }
             if let Some(action) = action.downcast_ref::<ProtectionInspectorAction>() {
                 match action {
-                    ProtectionInspectorAction::Global => self.set_pane(cx, Pane::List),
+                    ProtectionInspectorAction::Global => self.show_access_editor(cx, AccessEditor::Protection),
                     ProtectionInspectorAction::Rule(key) => self.edit_access_rule(cx, key),
                     ProtectionInspectorAction::Ability { subject, permission, capability, scope } => {
                         self.show_access_editor(cx, AccessEditor::App {
@@ -1885,7 +1951,7 @@ impl Widget for MiniAppsScreen {
 
         // ----- info pane -----
         if self.view.button(cx, ids!(info_back_button)).clicked(actions) {
-            self.set_pane(cx, Pane::List);
+            self.go_back(cx);
         }
         if let Some(app_id) = self.info_app.clone() {
             if self.view.button(cx, ids!(info_open_button)).clicked(actions) {
@@ -1964,7 +2030,7 @@ impl Widget for MiniAppsScreen {
 
         // ----- providers pane -----
         if self.view.button(cx, ids!(providers_back_button)).clicked(actions) {
-            self.set_pane(cx, Pane::List);
+            self.go_back(cx);
         }
         if self.view.button(cx, ids!(key_save_button)).clicked(actions)
             && let Some(provider) = self.key_entry.clone()
@@ -1992,14 +2058,14 @@ impl Widget for MiniAppsScreen {
             || self.view.button(cx, ids!(diff_close_button)).clicked(actions)
             || self.view.button(cx, ids!(edit_cancel_button)).clicked(actions)
         {
-            self.set_pane(cx, Pane::Info);
+            self.go_back(cx);
         }
         if self.view.button(cx, ids!(edit_save_button)).clicked(actions)
             && let Some(app_id) = self.info_app.clone()
         {
             let source = self.view.code_view(cx, ids!(source_editor)).text();
             cx.action(A2AppOp::SaveSource { app_id, source });
-            self.set_pane(cx, Pane::Info);
+            self.go_back(cx);
         }
     }
 
@@ -2067,6 +2133,28 @@ impl MiniAppsScreen {
     }
 
     fn set_pane(&mut self, cx: &mut Cx, pane: Pane) {
+        if pane == Pane::List {
+            self.pane_history.clear();
+        } else if pane != self.pane {
+            self.pane_history.push(self.pane);
+        }
+        self.display_pane(cx, pane);
+    }
+
+    fn go_back(&mut self, cx: &mut Cx) {
+        let pane = self.pane_history.pop().unwrap_or(Pane::List);
+        if pane == Pane::Inspector {
+            self.view.protection_inspector(cx, ids!(protection_inspector)).configure(cx);
+        }
+        self.display_pane(cx, pane);
+    }
+
+    fn display_pane(&mut self, cx: &mut Cx, pane: Pane) {
+        if pane == Pane::List {
+            self.cancel_scope = None;
+        } else if self.cancel_scope.is_none() {
+            self.cancel_scope = Some(self.begin_cancel_scope(cx));
+        }
         // A hidden editor would still get key events.
         if self.pane == Pane::Edit && pane != Pane::Edit {
             cx.set_key_focus(Area::Empty);
@@ -2087,6 +2175,10 @@ impl MiniAppsScreen {
     }
 
     fn show_info(&mut self, cx: &mut Cx, app_id: MiniAppId) {
+        if self.info_app.as_ref() != Some(&app_id) {
+            self.show_abilities = false;
+            self.view.button(cx, ids!(ability_details)).set_text(cx, "Show individual abilities");
+        }
         self.info_app = Some(app_id);
         self.refresh_info(cx);
         self.set_pane(cx, Pane::Info);
@@ -2249,6 +2341,27 @@ impl MiniAppsScreen {
 
     /// Refreshes all code-set labels/visibility from the a2app state.
     fn populate_before_draw(&mut self, cx: &mut Cx2d) {
+        if matches!(self.pane, Pane::List | Pane::Access) {
+            let (read, read_mode, write, write_mode, write_enabled, rooms, spaces) = with_a2app(|state| (
+                state.permissions.global_policy(RoomAccess::Read), state.permissions.policy_mode(RoomAccess::Read),
+                state.permissions.write_policy_when_enabled(), state.permissions.policy_mode(RoomAccess::Write),
+                state.permissions.matrix_write(),
+                state.permissions.room_rules().len(), state.permissions.space_rules().len(),
+            )).unwrap_or((PolicyDecision::Ask, RoomPolicyMode::Standard, PolicyDecision::Ask, RoomPolicyMode::Standard, false, 0, 0));
+            self.view.drop_down(cx, ids!(global_read)).set_selected_item(cx, global_policy_index(read, read_mode));
+            self.view.drop_down(cx, ids!(global_write)).set_selected_item(cx, global_policy_index(write, write_mode));
+            self.set_write_controls_enabled(cx, write_enabled);
+            self.view.label(cx, ids!(protection_summary)).set_text(cx, &format!(
+                "Read: {}. Write: {}.\n{rooms} room rules · {spaces} space rules.",
+                global_policy_label(read, read_mode),
+                if write_enabled { global_policy_label(write, write_mode) } else { "Blocked everywhere" },
+            ));
+            let status = with_a2app(|state| state.policy_spaces_status.clone()).flatten();
+            self.view.widget(cx, ids!(protection_status)).set_visible(cx, spaces > 0 && status.is_some());
+            if let Some(status) = status {
+                self.view.label(cx, ids!(protection_status)).set_text(cx, &status);
+            }
+        }
         match self.pane {
             Pane::List => {
                 let (any_apps, console) = with_a2app(|state| {
@@ -2259,21 +2372,6 @@ impl MiniAppsScreen {
                     )
                 }).unwrap_or((false, (false, String::new(), false, false)));
                 self.view.widget(cx, ids!(no_apps_label)).set_visible(cx, !any_apps);
-                let (read, read_mode, write, write_mode, write_enabled, rooms, spaces) = with_a2app(|state| (
-                    state.permissions.global_policy(RoomAccess::Read), state.permissions.policy_mode(RoomAccess::Read),
-                    state.permissions.write_policy_when_enabled(), state.permissions.policy_mode(RoomAccess::Write),
-                    state.permissions.matrix_write(),
-                    state.permissions.room_rules().len(), state.permissions.space_rules().len(),
-                )).unwrap_or((PolicyDecision::Ask, RoomPolicyMode::Standard, PolicyDecision::Ask, RoomPolicyMode::Standard, false, 0, 0));
-                self.view.drop_down(cx, ids!(global_read)).set_selected_item(cx, global_policy_index(read, read_mode));
-                self.view.drop_down(cx, ids!(global_write)).set_selected_item(cx, global_policy_index(write, write_mode));
-                self.set_write_controls_enabled(cx, write_enabled);
-                self.view.label(cx, ids!(protection_summary)).set_text(cx, &format!("{rooms} room rules · {spaces} space rules. Rules are saved until you change them."));
-                let status = with_a2app(|state| state.policy_spaces_status.clone()).flatten();
-                self.view.widget(cx, ids!(protection_status)).set_visible(cx, spaces > 0 && status.is_some());
-                if let Some(status) = status {
-                    self.view.label(cx, ids!(protection_status)).set_text(cx, &status);
-                }
                 let (active, status, running, can_retry) = console;
                 self.view.widget(cx, ids!(console_section)).set_visible(cx, active);
                 if active {
@@ -2345,6 +2443,16 @@ impl MiniAppsScreen {
                 }
             }
             Pane::Access => {
+                let selection = self.view.permission_scope_editor(cx, ids!(access_scope)).selection();
+                self.view.button(cx, ids!(access_save)).set_enabled(cx, selection.is_ok());
+                self.view.widget(cx, ids!(access_save)).set_disabled(cx, selection.is_err());
+                let selection_hint = match selection {
+                    Ok(selection) if matches!(self.access_editor, Some(AccessEditor::Protection)) =>
+                        format!("Save changes for: {}", scope_label(cx, &selection.scope)),
+                    Ok(selection) => format!("Applies to {} · {}", scope_label(cx, &selection.scope), duration_label(selection.duration)),
+                    Err(error) => error,
+                };
+                self.view.label(cx, ids!(access_selection_hint)).set_text(cx, &selection_hint);
                 let write_enabled = with_a2app(|state| state.permissions.matrix_write()).unwrap_or(false);
                 self.set_write_controls_enabled(cx, write_enabled);
                 let empty = self.access_rows(cx).is_empty();
@@ -2355,7 +2463,7 @@ impl MiniAppsScreen {
                         global_policy_label(state.permissions.global_policy(RoomAccess::Write), state.permissions.policy_mode(RoomAccess::Write)),
                     )).unwrap_or(("Ask", "All writes disabled"));
                     self.view.label(cx, ids!(access_baseline)).set_text(cx, &format!(
-                        "Global read: {} · Global write: {}. Change global defaults on the Mini Apps main screen; a global block overrides every allowance.",
+                        "Currently: read — {}. Write — {}. Changes to defaults apply immediately; selection rules are saved with the button below.",
                         read, write,
                     ));
                 }
@@ -2365,13 +2473,19 @@ impl MiniAppsScreen {
                             .unwrap_or_else(|| runtime.permissions.state(app_id, *perm)),
                         runtime.permissions.state(app_id, *perm),
                     )).unwrap_or((GrantState::Ask, GrantState::Ask));
-                    let baseline = match state {
-                        GrantState::Granted => "Broad override: allowed everywhere.",
-                        GrantState::Denied => "Broad override: blocked everywhere, including saved allowances.",
-                        GrantState::Ask if cap_id.is_some() && group == GrantState::Granted => "Broad override: follows the permission group, which allows everywhere.",
-                        GrantState::Ask if cap_id.is_some() && group == GrantState::Denied => "Broad override: follows the permission group, which blocks everywhere.",
-                        GrantState::Ask => "Broad override: asks / uses defaults. Scoped allowances are listed below.",
-                    };
+                    let group_blocked = cap_id.is_some() && *perm != Permission::Network && group == GrantState::Denied;
+                    let baseline = if group_blocked {
+                        "Blocked by its permission group. Open that group and choose Use default before allowing this ability."
+                    } else { match state {
+                        GrantState::Granted => "Default for this permission: allowed everywhere.",
+                        GrantState::Denied => "Blocked everywhere. Saving an allowance below removes this permission block.",
+                        GrantState::Ask if cap_id.is_some() && group == GrantState::Granted => "Uses its permission group, which allows access everywhere.",
+                        GrantState::Ask => "Uses the default for this permission and the saved allowances below.",
+                    }};
+                    if group_blocked {
+                        self.view.button(cx, ids!(access_save)).set_enabled(cx, false);
+                        self.view.widget(cx, ids!(access_save)).set_disabled(cx, true);
+                    }
                     self.view.label(cx, ids!(access_baseline)).set_text(cx, baseline);
                 }
             }
@@ -2415,6 +2529,7 @@ impl MiniAppsScreen {
                         }
                         item.draw_all(cx, &mut Scope::empty());
 
+                        if !self.show_abilities { continue; }
                         // The single abilities this group unlocks, each with
                         // its own override.
                         let caps: Vec<(&'static a2app_core::capabilities::Capability, GrantState, Effective)> =
@@ -2457,17 +2572,23 @@ impl MiniAppsScreen {
                     if let Some(mut row) = item.borrow_mut::<MiniAppAccessRuleRow>() {
                         row.key = Some(key.clone());
                         row.view.label(cx, ids!(rule_label)).set_text(cx, &label);
-                        row.view.widget(cx, ids!(rule_edit)).set_visible(cx, matches!(key, AccessRuleKey::Room(_) | AccessRuleKey::Space(_)));
                         let write_enabled = with_a2app(|state| state.permissions.matrix_write()).unwrap_or(false);
-                        let read_only = !write_enabled && matches!(key, AccessRuleKey::Room(_) | AccessRuleKey::Space(_));
-                        let has_read_rule = with_a2app(|state| match &key {
-                            AccessRuleKey::Room(id) => state.permissions.room_rules().get(id),
-                            AccessRuleKey::Space(id) => state.permissions.space_rules().get(id),
-                            _ => None,
-                        }.is_some_and(|policy| policy.read != PolicyDecision::Ask)).unwrap_or(false);
-                        row.view.button(cx, ids!(rule_edit)).set_text(cx, if read_only { "Edit read rule" } else { "Edit" });
-                        row.view.button(cx, ids!(rule_remove)).set_text(cx, if read_only { "Remove read rule" } else { "Remove" });
-                        row.view.button(cx, ids!(rule_remove)).set_enabled(cx, !read_only || has_read_rule);
+                        let room_rule = matches!(key, AccessRuleKey::Room(_) | AccessRuleKey::Space(_));
+                        row.view.button(cx, ids!(rule_remove)).set_text(cx,
+                            if room_rule && !write_enabled { "Remove read rule" } else { "Remove" });
+                        let can_remove = !room_rule || write_enabled || with_a2app(|state| {
+                            let policy = match &key {
+                                AccessRuleKey::Room(id) => state.permissions.room_rules().get(id),
+                                AccessRuleKey::Space(id) => state.permissions.space_rules().get(id),
+                                _ => None,
+                            };
+                            policy.is_some_and(|policy| policy.read != PolicyDecision::Ask)
+                        }).unwrap_or(false);
+                        row.view.button(cx, ids!(rule_remove)).set_enabled(cx, can_remove);
+                        row.view.widget(cx, ids!(rule_remove)).set_disabled(cx, !can_remove);
+                        row.view.widget(cx, ids!(rule_edit)).set_visible(cx, matches!(key, AccessRuleKey::Room(_) | AccessRuleKey::Space(_)));
+                        row.view.button(cx, ids!(rule_edit)).set_text(cx,
+                            if room_rule && !write_enabled { "Edit read rule" } else { "Edit" });
                     }
                     item.draw_all(cx, &mut Scope::empty());
                 }
@@ -2678,7 +2799,7 @@ fn global_policy_label(decision: PolicyDecision, mode: RoomPolicyMode) -> &'stat
 }
 
 fn policy_label(decision: PolicyDecision) -> &'static str {
-    match decision { PolicyDecision::Ask => "Ask / no rule", PolicyDecision::Allow => "Allow", PolicyDecision::Deny => "Block" }
+    match decision { PolicyDecision::Ask => "Use default", PolicyDecision::Allow => "Allow", PolicyDecision::Deny => "Block" }
 }
 
 fn scope_label(cx: &mut Cx, scope: &RoomScope) -> String {
@@ -2700,6 +2821,7 @@ fn scope_label(cx: &mut Cx, scope: &RoomScope) -> String {
 impl MiniAppsScreen {
     fn set_write_controls_enabled(&mut self, cx: &mut Cx, enabled: bool) {
         self.view.check_box(cx, ids!(global_write_enabled)).set_active(cx, enabled, Animate::No);
+        self.view.check_box(cx, ids!(protection_write_enabled)).set_active(cx, enabled, Animate::No);
         self.view.widget(cx, ids!(global_write)).set_disabled(cx, !enabled);
         self.view.widget(cx, ids!(policy_write)).set_disabled(cx, !enabled);
         self.view.widget(cx, ids!(policy_write_disabled)).set_visible(cx, !enabled);
@@ -2709,10 +2831,11 @@ impl MiniAppsScreen {
     }
 
     fn show_access_editor(&mut self, cx: &mut Cx, editor: AccessEditor) {
+        self.view.view(cx, ids!(access_scroll)).set_scroll_pos(cx, Vec2d::default());
         let (title, hint, room, protection) = match &editor {
             AccessEditor::Protection => (
-                "Room and space protection".to_string(),
-                "Select one or more rooms or spaces, then save read and write rules. Spaces cover their nested rooms. Any matching block wins, including a global block. Allow skips prompts; Ask removes this rule and follows other rules. In allowlist-only mode, rooms without a matching Allow are blocked. These protections apply to all mini-apps and agents.".to_string(),
+                "Room and space access".to_string(),
+                "Choose rooms or spaces, then set read and write access below. A space rule includes all its rooms, including nested spaces. Allow skips prompts for declared abilities; Block prevents access; Use default removes this rule. Any matching block takes priority.".to_string(),
                 None, true,
             ),
             AccessEditor::App { app_id, perm, cap_id } => {
@@ -2721,13 +2844,21 @@ impl MiniAppsScreen {
                 })).flatten());
                 let title = cap_id.as_deref().and_then(a2app_core::capabilities::by_id)
                     .map(|cap| cap.title).unwrap_or(perm.title()).to_string();
-                let mut hint = "Allow this ability in selected rooms or spaces for a session or always. Scoped allowances replace a broad group Allow/Block. Existing scoped rules remain until removed below. Global room and space blocks always win.".to_string();
+                let mut hint = "Choose where and for how long to allow this ability. Saving replaces an overall Allow or Block for this permission; other saved allowances stay in place. Room and space blocks always take priority.".to_string();
                 if *perm == Permission::Network {
-                    hint = format!("{}\n\nChoose the allowed websites below. Private data also needs a source sharing rule in Manage data sharing rules.\n\n{hint}", perm.blurb());
+                    hint = format!("{}\n\nChoose the allowed websites below. Private data also needs a source sharing rule in Data sharing.\n\n{hint}", perm.blurb());
                 }
                 (title, hint, room, false)
             }
         };
+        let subject = match &editor {
+            AccessEditor::Protection => "For every mini-app and agent on this device".to_string(),
+            AccessEditor::App { app_id, .. } => match agent_room_of(app_id) {
+                Some(room) => format!("For the agent in {}", room_label(cx, room)),
+                None => format!("For {}", with_a2app(|state| state.registry.get(app_id).map(|app| app.name.clone())).flatten().unwrap_or_else(|| app_id.clone())),
+            },
+        };
+        self.view.label(cx, ids!(access_subject)).set_text(cx, &subject);
         self.view.label(cx, ids!(access_title)).set_text(cx, &title);
         self.view.label(cx, ids!(access_hint)).set_text(cx, &hint);
         let agent = matches!(&editor, AccessEditor::App { app_id, .. } if is_agent_subject(app_id));
@@ -2740,8 +2871,12 @@ impl MiniAppsScreen {
         }
         self.view.widget(cx, ids!(agent_selector)).set_visible(cx, agent);
         self.view.widget(cx, ids!(access_baseline)).set_visible(cx, true);
+        self.view.widget(cx, ids!(protection_defaults)).set_visible(cx, protection);
         self.view.widget(cx, ids!(policy_choices)).set_visible(cx, protection);
         self.view.widget(cx, ids!(access_ask)).set_visible(cx, !protection);
+        self.view.button(cx, ids!(access_ask)).set_text(cx, if matches!(&editor, AccessEditor::App { cap_id: Some(_), .. }) {
+            "Use group setting"
+        } else { "Use default" });
         self.view.widget(cx, ids!(access_block)).set_visible(cx, !protection);
         self.view.button(cx, ids!(access_save)).set_text(cx, if protection { "Save rules for selection" } else { "Allow selected" });
         self.view.drop_down(cx, ids!(policy_read)).set_selected_item(cx, 0);
@@ -2755,9 +2890,7 @@ impl MiniAppsScreen {
         if self.pane != Pane::Access { return }
         let Some(editor) = self.access_editor.clone() else { return };
         if self.view.button(cx, ids!(access_back)).clicked(actions) {
-            let list = matches!(&editor, AccessEditor::Protection)
-                || matches!(&editor, AccessEditor::App { app_id, .. } if is_agent_subject(app_id));
-            self.set_pane(cx, if list { Pane::List } else { Pane::Info });
+            self.go_back(cx);
             return;
         }
         if self.view.button(cx, ids!(access_save)).clicked(actions) {
@@ -2964,6 +3097,51 @@ mod access_tests {
     use super::*;
 
     #[test]
+    fn capability_row_shows_enforced_blocks_over_saved_individual_allowances() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppCapabilityRow {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let mut row = widget.borrow_mut::<MiniAppCapabilityRow>().unwrap();
+        let mut permissions = a2app_core::permissions::PermissionStore::default();
+        let app = "capability-row-test";
+        let cap = a2app_core::capabilities::by_id("matrix.rooms.messages.read").unwrap();
+        permissions.set(app, cap.group.unwrap(), GrantState::Denied);
+        permissions.set_capability(app, cap.id, GrantState::Granted);
+        let own = permissions.capability_state(app, cap.id);
+        let effective = permissions.effective_capability_for(app, |_| true, |_| true, cap);
+        assert_eq!(effective, Effective::Denied);
+        row.populate(&mut cx, app, cap, own, effective);
+        let status = row.view.label(&cx, ids!(cap_state));
+        assert!(status.text().starts_with("Blocked"));
+        assert_eq!(status.borrow().unwrap().draw_text.color, crate::shared::styles::COLOR_FG_DANGER_RED);
+
+        permissions.set(app, cap.group.unwrap(), GrantState::Ask);
+        let effective = permissions.effective_capability_for(app, |_| true, |_| true, cap);
+        assert_eq!(effective, Effective::Granted);
+        row.populate(&mut cx, app, cap, own, effective);
+        assert!(status.text().starts_with("Allowed"));
+
+        let effective = permissions.effective_capability_for(app, |_| true, |_| false, cap);
+        assert_eq!(effective, Effective::Undeclared);
+        row.populate(&mut cx, app, cap, own, effective);
+        assert!(status.text().starts_with("Not declared"));
+
+        let write = a2app_core::capabilities::by_id("matrix.room.message.send").unwrap();
+        permissions.set_capability(app, write.id, GrantState::Granted);
+        let effective = permissions.effective_capability_for(app, |_| true, |_| true, write);
+        assert_eq!(effective, Effective::Denied);
+        row.populate(&mut cx, app, write, GrantState::Granted, effective);
+        assert!(status.text().starts_with("Blocked"));
+        assert_eq!(status.borrow().unwrap().draw_text.color, crate::shared::styles::COLOR_FG_DANGER_RED);
+    }
+
+    #[test]
     fn background_task_configuration_opens_the_exact_context_and_preserves_room_review_surface() {
         use a2app_core::background::{JobBinding, JobContext};
         let mut binding = JobBinding { account: "@alice:example.org".into(), app_id: "reminder".into(), context: JobContext::Room { room_id: "!room:example.org".into() } };
@@ -3002,6 +3180,36 @@ mod access_tests {
         screen.handle_event(&mut cx, &Event::Actions(click), &mut Scope::empty());
         assert!(screen.view.widget(&cx, ids!(list_pane)).visible());
         assert!(!screen.view.widget(&cx, ids!(background_pane)).visible());
+    }
+
+    #[test]
+    fn nested_settings_return_to_the_page_that_opened_them() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
+        screen.set_pane(&mut cx, Pane::Background);
+        screen.set_pane(&mut cx, Pane::Sharing);
+        screen.set_pane(&mut cx, Pane::Inspector);
+        screen.show_access_editor(&mut cx, AccessEditor::Protection);
+        // Selecting another rule within the same page must not add another Back step.
+        screen.show_access_editor(&mut cx, AccessEditor::Protection);
+        for expected in [Pane::Inspector, Pane::Sharing, Pane::Background, Pane::List] {
+            screen.go_back(&mut cx);
+            assert_eq!(screen.pane, expected);
+        }
+        assert!(screen.cancel_scope.is_none());
+        screen.set_pane(&mut cx, Pane::Info);
+        screen.set_pane(&mut cx, Pane::Source);
+        // A generation request resets navigation to the landing page.
+        screen.set_pane(&mut cx, Pane::List);
+        assert!(screen.pane_history.is_empty());
     }
 
     #[test]

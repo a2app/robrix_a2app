@@ -1,5 +1,5 @@
 use super::*;
-use a2app_core::{information_flow::Label, protection_audit::{self, ActivityKind}};
+use a2app_core::{information_flow::Label, protection_audit::{self, ActivityKind, ActivityOutcome}};
 
 impl DataSharing {
     pub(super) fn sharing_remedy(&self, blocked: &Label, recipient: &Recipient) -> String {
@@ -9,7 +9,7 @@ impl DataSharing {
         if *recipient == Recipient::External {
             return "Blocked control: this operation exports to an uncontrolled recipient. It cannot be approved with an internet or room permission. Use an operation with an explicit website origin or Matrix room, then review that destination's sharing rule.".into();
         }
-        let mut text = "Blocked control: Private data sharing. At this check, no matching source-to-recipient allowance covered this app or agent. Every blocked source needs its own rule.\n\nTo change it: select a blocked source above and press Review this source and recipient below. Check Data source, Who may share this source, Allowed recipient and lifetime, then press Allow sharing with this recipient. Repeat for each blocked source. Room read/write and internet permissions do not substitute for these rules. A historical block remains in this history after settings change; retry the operation to check the new rules.".to_string();
+        let mut text = "Blocked by: Sharing rules. This app or agent did not have permission to send data from these sources to this destination. Every blocked source needs its own rule.\n\nTo change it: open Review blocked actions, choose this sharing decision and a data source, then press Review sharing rule. Check Data to protect, Who can share this data, Where can it be sent and For how long, then press Allow sharing. Repeat for each blocked source. Room read/write and internet permissions do not grant sharing permission. This historical record will stay blocked; retry the operation to check your new rules.".to_string();
         if blocked.iter().any(|source| match source { Source::Room { account, .. } | Source::Account { account } => account != &self.account, Source::UnknownPrivate => false }) {
             text.push_str("\nThis also includes another account's source. Sign in to that source account to review its rules; the current account cannot authorize it.");
         }
@@ -27,6 +27,16 @@ impl DataSharing {
             .and_then(|index| self.snapshots.get(index)).map(|snapshot| snapshot.context.clone());
         let source = self.selected_source(cx).ok();
         let recipient = self.selected_recipient(cx).ok();
+        let selection = match filter {
+            1 => context.as_ref().map(|context| self.context_label(context)),
+            2 => source.as_ref().map(|source| self.source_label(source)),
+            3 => recipient.as_ref().map(|recipient| self.recipient_label(recipient)),
+            _ => None,
+        };
+        self.view.widget(cx, ids!(activity_scope)).set_visible(cx, filter != 0);
+        self.view.widget(cx, ids!(activity_settings)).set_visible(cx, filter != 0);
+        self.view.label(cx, ids!(activity_scope)).set_text(cx,
+            &selection.map(|selection| format!("Showing activity for: {selection}")).unwrap_or_else(|| "No selection yet. Use Change filter selection to choose it under Sharing rules.".into()));
         let key = (protection_audit::revision(), filter, context.clone(), source.clone(), recipient.clone());
         if self.activity_key.as_ref() != Some(&key) {
             let selected = self.view.drop_down(cx, ids!(activity_choice)).selected_item().checked_sub(1)
@@ -40,8 +50,8 @@ impl DataSharing {
                 3 => recipient.is_some() && entry.recipient == recipient,
                 _ => false,
             }).collect();
-            let labels = std::iter::once("Select an activity record".into()).chain(self.activities.iter().map(|entry|
-                format!("{} · {} · {}", activity_time(entry.timestamp_ms), activity_kind(entry.kind), entry.outcome.label()))).collect();
+            let labels = std::iter::once("Choose an activity record".into()).chain(self.activities.iter().enumerate().map(|(index, entry)|
+                format!("{}. {} · {}", index + 1, activity_outcome(entry.outcome), activity_kind(entry.kind)))).collect();
             self.view.drop_down(cx, ids!(activity_choice)).set_labels(cx, labels);
             let index = selected.and_then(|id| self.activities.iter().position(|entry| entry.id == id)).map(|index| index + 1).unwrap_or(0);
             self.view.drop_down(cx, ids!(activity_choice)).set_selected_item(cx, index);
@@ -60,7 +70,7 @@ impl DataSharing {
             format!("{}\n{context}\n{}\n{}\nRecipient: {recipient}\nSources:\n{}{remedy}",
                 activity_time(entry.timestamp_ms), activity_kind(entry.kind), entry.outcome.label(),
                 if sources.is_empty() { "None recorded".into() } else { bullets(&sources) })
-        }).unwrap_or_else(|| "Select a record to inspect its source identities, actual recipient and outcome. History is bounded; older records expire. Filter selections refer to the controls on this page.".into());
+        }).unwrap_or_else(|| if self.activities.is_empty() { "No activity matches this filter.".into() } else { "Choose a record to see which data sources and destination were checked, and the result.".into() });
         self.view.label(cx, ids!(activity_details)).set_text(cx, &details);
     }
 }
@@ -79,5 +89,17 @@ fn activity_kind(kind: ActivityKind) -> &'static str {
         ActivityKind::MatrixOperation => "Matrix operation",
         ActivityKind::ToolCall => "Tool call",
         ActivityKind::PolicyChange => "Protection change",
+    }
+}
+
+fn activity_outcome(outcome: ActivityOutcome) -> &'static str {
+    match outcome {
+        ActivityOutcome::Allowed => "Allowed",
+        ActivityOutcome::Blocked => "Blocked",
+        ActivityOutcome::Started => "Started",
+        ActivityOutcome::Completed => "Completed",
+        ActivityOutcome::Failed => "Failed",
+        ActivityOutcome::Interrupted => "Interrupted",
+        ActivityOutcome::Changed => "Changed",
     }
 }

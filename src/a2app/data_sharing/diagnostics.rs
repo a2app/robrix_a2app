@@ -4,6 +4,10 @@ pub(super) fn bullets(labels: &[String]) -> String {
     labels.iter().map(|label| format!("• {label}")).collect::<Vec<_>>().join("\n")
 }
 
+pub(super) fn numbered(labels: &[String]) -> String {
+    labels.iter().enumerate().map(|(index, label)| format!("{}. {label}", index + 1)).collect::<Vec<_>>().join("\n")
+}
+
 fn review_payload(payload: &str) -> String {
     // Render direction-changing/invisible controls explicitly. Literal JSON
     // backslashes are already escaped, so a user can distinguish the contents.
@@ -31,7 +35,7 @@ impl DataSharing {
     fn selected_context(&self, cx: &Cx) -> Result<&ContextId, String> {
         self.view.drop_down(cx, ids!(context_choice)).selected_item().checked_sub(1)
             .and_then(|index| self.snapshots.get(index))
-            .map(|snapshot| &snapshot.context).ok_or_else(|| "Start an app or agent, then select its context.".into())
+            .map(|snapshot| &snapshot.context).ok_or_else(|| "Start a mini-app or agent, then choose it above.".into())
     }
 
     fn selected_decision(&self, cx: &Cx) -> Option<&FlowDecision> {
@@ -80,7 +84,7 @@ impl DataSharing {
 
     pub(super) fn authority_action(&self, cx: &Cx) -> Result<A2AppOp, String> {
         let decision = self.selected_action(cx)
-            .ok_or("Select a blocked sensitive action to review.")?;
+            .ok_or("Choose a blocked action to review.")?;
         let snapshot = self.snapshots.iter().find(|snapshot| snapshot.context == decision.context && snapshot.epoch == decision.epoch)
             .ok_or("This context is no longer active. Restart it and review the new request.")?;
         let session = match self.view.drop_down(cx, ids!(action_session)).selected_item() {
@@ -109,8 +113,8 @@ impl DataSharing {
             .filter(|snapshot| snapshot.context.account() == self.account).collect::<Vec<_>>();
         let previous = self.selected_context(cx).ok().cloned();
         if self.snapshots != snapshots {
-            let labels = std::iter::once("Select an app or agent context".into())
-                .chain(snapshots.iter().map(|snapshot| self.context_label(&snapshot.context))).collect();
+            let labels = std::iter::once("Choose a running mini-app or agent".into())
+                .chain(snapshots.iter().map(|snapshot| self.context_choice_label(&snapshot.context))).collect();
             self.view.drop_down(cx, ids!(context_choice)).set_labels(cx, labels);
             let index = previous.as_ref().and_then(|context| snapshots.iter().position(|snapshot| &snapshot.context == context)).map(|index| index + 1).unwrap_or(0);
             self.snapshots = snapshots;
@@ -121,8 +125,8 @@ impl DataSharing {
         if self.decisions != decisions {
             let selected = self.selected_decision(cx);
             let index = selected.and_then(|selected| decisions.iter().position(|decision| decision == selected)).map(|index| index + 1).unwrap_or(0);
-            let labels = std::iter::once("Select a sharing decision".into()).chain(decisions.iter().map(|decision| format!("{} · {} → {}",
-                if decision.allowed { "Allowed" } else { "Blocked" }, self.context_label(&decision.context), self.recipient_label(&decision.recipient)))).collect();
+            let labels = std::iter::once("Choose a sharing decision".into()).chain(decisions.iter().enumerate().map(|(index, decision)| format!("{}. {} · {}",
+                index + 1, if decision.allowed { "Allowed" } else { "Blocked" }, self.recipient_choice_label(&decision.recipient)))).collect();
             self.decisions = decisions;
             self.view.drop_down(cx, ids!(decision_choice)).set_labels(cx, labels);
             self.view.drop_down(cx, ids!(decision_choice)).set_selected_item(cx, index);
@@ -132,8 +136,8 @@ impl DataSharing {
         if self.action_decisions != decisions {
             let selected = self.selected_action(cx);
             let index = selected.and_then(|selected| decisions.iter().position(|decision| decision == selected)).map(|index| index + 1).unwrap_or(0);
-            let labels = std::iter::once("Select a blocked sensitive action".into()).chain(decisions.iter().map(|decision| format!("{} · {} → {}",
-                self.context_label(&decision.context), decision.action.kind, decision.action.target))).collect();
+            let labels = std::iter::once("Choose a blocked action".into()).chain(decisions.iter().enumerate().map(|(index, decision)| format!("{}. {}",
+                index + 1, self.action_choice_label(&decision.action)))).collect();
             self.action_decisions = decisions;
             self.view.drop_down(cx, ids!(action_choice)).set_labels(cx, labels);
             self.view.drop_down(cx, ids!(action_choice)).set_selected_item(cx, index);
@@ -148,8 +152,9 @@ impl DataSharing {
                     AuthoritySession::RobrixSession => "Until Robrix closes".into(),
                     AuthoritySession::RoomSession { room, .. } => format!("Until {} closes", self.room_label(room)),
                 })).collect::<Vec<_>>();
-            self.view.label(cx, ids!(authority_rules)).set_text(cx, &if labels.is_empty() { "No session action permissions.".into() } else { bullets(&labels) });
-            self.view.drop_down(cx, ids!(authority_remove_choice)).set_labels(cx, labels);
+            self.view.label(cx, ids!(authority_rules)).set_text(cx, &if labels.is_empty() { "No action approvals.".into() } else { numbered(&labels) });
+            self.view.drop_down(cx, ids!(authority_remove_choice)).set_labels(cx, authorities.iter().enumerate().map(|(index, grant)|
+                format!("{}. {} · {}", index + 1, self.action_choice_label(&grant.action), self.context_choice_label(&grant.context))).collect());
             self.view.drop_down(cx, ids!(authority_remove_choice)).set_selected_item(cx, 0);
             self.authorities = authorities;
         }
@@ -163,26 +168,26 @@ impl DataSharing {
             Some(snapshot) => {
                 let sources = snapshot.label.iter().map(|source| self.source_label(source)).collect::<Vec<_>>();
                 let influences = snapshot.influences.iter().map(|influence| self.influence_label(influence)).collect::<Vec<_>>();
-                let clearance = if snapshot.clearance.is_some() { "Public context: private inputs are blocked." } else { "Sources accumulate before private inputs are delivered." };
-                format!("{}\n{clearance}\nSources:\n{}\nOutside influences:\n{}",
+                let clearance = if snapshot.clearance.is_some() { "Public mode: this app cannot receive private room or account data." } else { "Robrix remembers where data came from before the app or agent receives it." };
+                format!("{}\n{clearance}\nData it may know:\n{}\nContent that may influence its actions:\n{}",
                     self.context_label(&snapshot.context), if sources.is_empty() { "None".into() } else { bullets(&sources) },
                     if influences.is_empty() { "None".into() } else { bullets(&influences) })
             }
-            None => "Select an active context for this account to inspect its sources. Start a mini-app or agent if none is available.".into(),
+            None => "Choose a mini-app or agent under Sharing rules to see the data it may know. Start it first if it is not listed.".into(),
         };
         self.view.label(cx, ids!(context_details)).set_text(cx, &details);
         let decision = self.selected_decision(cx);
         let details = decision.map(|decision| {
             let blocked = decision.denied_sources.iter().map(|source| self.source_label(source)).collect::<Vec<_>>();
-            format!("{}\nActual recipient: {}\n{}",
+            format!("{}\nDestination: {}\n{}",
                 self.context_label(&decision.context), self.recipient_label(&decision.recipient),
-                if decision.allowed { "Every source allowed this recipient when checked.".into() }
-                else { format!("Blocked sources:\n{}\n\n{}", bullets(&blocked), self.sharing_remedy(&decision.denied_sources, &decision.recipient)) })
-        }).unwrap_or_else(|| "No recent sharing decisions for this account.".into());
+                if decision.allowed { "Sharing was allowed for every data source when checked.".into() }
+                else { format!("Data sources that blocked sharing:\n{}\n\n{}", bullets(&blocked), self.sharing_remedy(&decision.denied_sources, &decision.recipient)) })
+        }).unwrap_or_else(|| if self.decisions.is_empty() { "No sharing requests have been checked in this account yet.".into() } else { "Choose a sharing decision to see its destination and the exact reason it was allowed or blocked.".into() });
         self.view.label(cx, ids!(decision_details)).set_text(cx, &details);
         let blocked = decision.map(|decision| decision.denied_sources.iter().cloned().collect::<Vec<_>>()).unwrap_or_default();
         if blocked != self.blocked_sources {
-            let labels = blocked.iter().map(|source| self.source_label(source)).collect();
+            let labels = blocked.iter().map(|source| self.source_choice_label(source)).collect();
             self.blocked_sources = blocked;
             self.view.drop_down(cx, ids!(blocked_source_choice)).set_labels(cx, labels);
             self.view.drop_down(cx, ids!(blocked_source_choice)).set_selected_item(cx, 0);
@@ -196,11 +201,11 @@ impl DataSharing {
             let warning = if self.view.drop_down(cx, ids!(action_session)).selected_item() == 0 {
                 "Once authorizes only one unchanged retry of the complete request shown below. Other requests, paths, contents and targets need their own approval."
             } else if self.view.drop_down(cx, ids!(action_session)).selected_item() == 1 && decision.context.room().is_none() {
-                "This context has no room to close. Choose This exact action once or Until Robrix closes before approving it."
+                "This app has no attached room. Choose This exact action once or Until Robrix closes before approving it."
             } else if decision.action.kind.starts_with("network.") {
                 "This HTTP method permission covers every path on this exact origin. Internet and source sharing rules still apply."
             } else { "Session permission covers repeated actions of this kind to this target, including different contents. Room permissions and source sharing rules still apply." };
-            let activation = if snapshot.is_some() { "Current activation" } else { "Closed activation: this request can no longer be approved" };
+            let activation = if snapshot.is_some() { "This app or agent is currently running" } else { "This app or agent has stopped. Run it again and review its new request." };
             let contents = decision.request.as_ref().map(|request| format!("\nExact request #{} (invisible controls are shown as Unicode escapes):\n{}", request.id, review_payload(&request.payload)))
                 .unwrap_or_else(|| "\nExact contents have not been captured. Retry the operation to capture them before choosing Once.".into());
             let approved = snapshot.is_some() && self.authorities.iter().any(|grant| {
@@ -212,11 +217,11 @@ impl DataSharing {
             let status = if approved {
                 "A matching action approval is now present. Retry the unchanged operation; all other permission and sharing checks still apply."
             } else {
-                "Blocked control at this check: Sensitive actions. Outside influences required a matching action approval. Review the contents below, choose Once or an explicit session duration, and press Allow."
+                "Blocked by: action approval. Content read by this app or agent may have influenced this action. Review the contents below, choose how long to allow it, then press Allow this exact action once or Allow for this session."
             };
-            format!("{}\n{activation}\nAction: {}\nTarget: {}\n{status}\n{warning}\nCurrent influences to review:\n{}{contents}",
+            format!("{}\n{activation}\nAction: {}\nTarget: {}\n{status}\n{warning}\nContent that may have influenced this action:\n{}{contents}",
                 self.context_label(&decision.context), review_payload(&decision.action.kind), review_payload(&decision.action.target), bullets(&labels))
-        }).unwrap_or_else(|| "No blocked sensitive actions for this account.".into());
+        }).unwrap_or_else(|| if self.action_decisions.is_empty() { "No actions need review in this account.".into() } else { "Choose a blocked action to review its destination, contents and approval options.".into() });
         self.view.label(cx, ids!(action_details)).set_text(cx, &details);
         self.view.widget(cx, ids!(authority_button)).set_visible(cx, action.is_some());
         let can_approve = action.is_some_and(|decision| {
@@ -232,7 +237,7 @@ impl DataSharing {
         self.view.widget(cx, ids!(authority_button)).set_disabled(cx, !can_approve);
         self.view.widget(cx, ids!(action_session)).set_visible(cx, action.is_some());
         self.view.button(cx, ids!(authority_button)).set_text(cx,
-            if self.view.drop_down(cx, ids!(action_session)).selected_item() == 0 { "Allow this exact action once" } else { "Allow actions to this target for the session" });
+            if self.view.drop_down(cx, ids!(action_session)).selected_item() == 0 { "Allow this exact action once" } else { "Allow for this session" });
     }
 
     pub(super) fn review_decision(&mut self, cx: &mut Cx) -> Result<(), String> {
@@ -243,7 +248,7 @@ impl DataSharing {
         let index = if let Some(index) = self.sources.iter().position(|(candidate, _)| candidate == &source) { index }
         else {
             self.sources.push((source.clone(), self.source_label(&source)));
-            self.view.drop_down(cx, ids!(source_choice)).set_labels(cx, self.sources.iter().map(|(_, label)| label.clone()).collect());
+            self.view.drop_down(cx, ids!(source_choice)).set_labels(cx, self.sources.iter().map(|(source, _)| self.source_choice_label(source)).collect());
             self.sources.len() - 1
         };
         self.view.drop_down(cx, ids!(source_choice)).set_selected_item(cx, index);
@@ -271,11 +276,51 @@ impl DataSharing {
         }
         self.update_recipient_form(cx);
         self.update_diagnostic_details(cx);
+        self.view.drop_down(cx, ids!(page_choice)).set_selected_item(cx, 0);
+        self.update_page(cx);
         Ok(())
     }
 
     fn room_label(&self, room: &str) -> String {
         self.rooms.iter().find(|(id, _)| id == room).map(|(_, name)| format!("{name} ({room})")).unwrap_or_else(|| room.to_owned())
+    }
+
+    pub(super) fn room_name<'a>(&'a self, room: &'a str) -> &'a str {
+        self.rooms.iter().find(|(id, _)| id == room).map(|(_, name)| name.as_str()).unwrap_or(room)
+    }
+
+    pub(super) fn context_choice_label(&self, context: &ContextId) -> String {
+        let name = |app: &str| self.apps.iter().find(|(id, _)| id == app)
+            .map(|(_, name)| name.clone()).unwrap_or_else(|| app.into());
+        match context {
+            ContextId::App { app, room, .. } => format!("{} · {}", name(app), room.as_deref().map(|room| self.room_name(room)).unwrap_or("Account-wide")),
+            ContextId::PublicApp { app, .. } => format!("{} · Public mode", name(app)),
+            ContextId::Agent { room, .. } => format!("Agent · {}", self.room_name(room)),
+        }
+    }
+
+    pub(super) fn source_choice_label(&self, source: &Source) -> String {
+        match source {
+            Source::Account { .. } => "Account data".into(),
+            Source::Room { room, .. } => format!("Room · {}", self.room_name(room)),
+            Source::UnknownPrivate => "Unknown private data".into(),
+        }
+    }
+
+    pub(super) fn recipient_choice_label(&self, recipient: &Recipient) -> String {
+        match recipient {
+            Recipient::NetworkOrigin(origin) => origin.clone(),
+            Recipient::ModelProvider(id) => self.model.as_ref().filter(|model| &model.id == id)
+                .map(|model| model.label.clone()).unwrap_or_else(|| "Other AI service".into()),
+            Recipient::MatrixRoom { room, .. } => format!("Room · {}", self.room_name(room)),
+            Recipient::External => "Unrestricted sharing".into(),
+        }
+    }
+
+    fn action_choice_label(&self, action: &flow::SensitiveAction) -> String {
+        let action_name = a2app_core::capabilities::by_id(&action.kind).map(|cap| cap.title.to_string())
+            .unwrap_or_else(|| action.kind.strip_prefix("network.").map(|method| format!("Website request ({method})")).unwrap_or_else(|| action.kind.clone()));
+        format!("{action_name} · {}", self.room_name(&action.target))
     }
 
     fn app_label(&self, app: &str) -> String {
@@ -294,7 +339,7 @@ impl DataSharing {
         match source {
             Source::Account { account } => format!("Account data · {account}"),
             Source::Room { account, room } => format!("Room · {} · {account}", self.room_label(room)),
-            Source::UnknownPrivate => "Unknown private sources (cannot be released)".into(),
+            Source::UnknownPrivate => "Private data with an unknown source (sharing blocked)".into(),
         }
     }
 
@@ -311,14 +356,14 @@ impl DataSharing {
     pub(super) fn reader_label(&self, reader: &ReaderScope) -> String {
         match reader {
             ReaderScope::AllReaders => "All mini-apps and agents".into(),
-            ReaderScope::App { account, app } => format!("Mini-app {} in all contexts · {account}", self.app_label(app)),
+            ReaderScope::App { account, app } => format!("Everywhere {} runs: rooms, spaces and account-wide use · {account}", self.app_label(app)),
             ReaderScope::Context(context) => self.context_label(context),
         }
     }
 
     pub(super) fn duration_label(&self, duration: &SharingDuration) -> String {
         match duration {
-            SharingDuration::Permanent => "Always (until removed)".into(),
+            SharingDuration::Permanent => "Until you remove this rule".into(),
             SharingDuration::RobrixSession => "Until Robrix closes".into(),
             SharingDuration::RoomSession { account, room } => format!("Until {} closes · {account}", self.room_label(room)),
         }

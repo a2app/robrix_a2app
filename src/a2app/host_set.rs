@@ -2,9 +2,10 @@
 //! template whose `Splash` child owns an app's isolated VM, the area a
 //! surface draws one host into, and the surface's captured DSL templates.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use makepad_widgets::*;
+use crate::shared::popup_list::{enqueue_popup_notification, PopupKind};
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -65,6 +66,8 @@ script_mod! {
 pub struct MiniAppHostArea {
     #[deref] view: View,
     #[rust] host: Option<WidgetRef>,
+    /// Input failures already explained for this host; cleared after successful input.
+    #[rust] input_errors_shown: HashSet<String>,
     /// The content box the host was last drawn at, for `on_app_resize`.
     #[rust] last_size: Vec2d,
 }
@@ -82,8 +85,10 @@ impl Widget for MiniAppHostArea {
             if matches!(event, Event::TextInput(_) | Event::TextRangeReplace(_)
                 | Event::KeyDown(_) | Event::KeyUp(_) | Event::Drag(_) | Event::Drop(_))
             {
-                let recorded = super::instances::context_of_host(&host)
-                    .ok_or("Mini-app input context is unavailable.".to_string())
+                let context = super::instances::context_of_host(&host);
+                let is_public = matches!(&context, Some(a2app_core::information_flow::ContextId::PublicApp { .. }));
+                let recorded = context
+                    .ok_or_else(|| "Mini-app input context is unavailable.".to_string())
                     .and_then(|context| {
                         super::information_flow::current_context(&context)?;
                         a2app_core::information_flow::add_sources(&context,
@@ -96,7 +101,32 @@ impl Widget for MiniAppHostArea {
                         }
                         Ok(())
                     });
-                if recorded.is_err() { return; }
+                if let Err(error) = recorded {
+                    // These events reach every host. Explain a failure only when
+                    // keyboard input belongs to this host, not the room composer.
+                    // A drag/drop target cannot be inferred from keyboard focus.
+                    let focus = cx.key_focus();
+                    if !self.input_errors_shown.contains(&error)
+                        && matches!(event, Event::TextInput(_) | Event::TextRangeReplace(_)
+                            | Event::KeyDown(_) | Event::KeyUp(_))
+                        && focus.is_valid(cx)
+                        && active_host_contains_focus(&host, focus)
+                    {
+                        self.input_errors_shown.insert(error.clone());
+                        let guidance = if is_public {
+                            "A public instance cannot accept typed, pasted, or dropped private data. Close this public instance, then open the mini-app normally from Mini Apps to enter text."
+                        } else {
+                            "Close this mini-app and reopen it from its room or Mini Apps. If input is still blocked, restart Robrix."
+                        };
+                        enqueue_popup_notification(
+                            format!("Mini-app input was blocked.\n\n{error}\n\n{guidance}"),
+                            PopupKind::Warning,
+                            Some(12.0),
+                        );
+                    }
+                    return;
+                }
+                self.input_errors_shown.clear();
             }
             // Robrix opens the URLs of any link actions it sees, so a guest's must not get out.
             let actions = cx.capture_actions(|cx| host.handle_event(cx, event, scope));
@@ -130,6 +160,18 @@ impl Widget for MiniAppHostArea {
     }
 }
 
+/// Whether the focused area belongs to an active widget inside this host.
+fn active_host_contains_focus(host: &WidgetRef, focus: Area) -> bool {
+    if focus.is_empty() { return false; }
+    let mut found = host.area() == focus;
+    let active = host.visit_cancel(&mut |_, child| {
+        if !found {
+            found = active_host_contains_focus(&child, focus);
+        }
+    });
+    active && found
+}
+
 /// Whether the given action carries a URL, e.g., from a tap on a link.
 fn is_url_action(action: &Action) -> bool {
     let widget_action = action.as_widget_action();
@@ -141,6 +183,9 @@ impl MiniAppHostAreaRef {
     /// Sets (or clears) the host this area draws.
     pub fn set_host(&self, host: Option<WidgetRef>) {
         if let Some(mut inner) = self.borrow_mut() {
+            if inner.host.as_ref().map(WidgetRef::widget_uid) != host.as_ref().map(WidgetRef::widget_uid) {
+                inner.input_errors_shown.clear();
+            }
             inner.host = host;
         }
     }
@@ -181,5 +226,88 @@ impl Templates {
 
     pub fn get(&self, id: LiveId) -> Option<ScriptObjectRef> {
         self.templates.get(&id).cloned()
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FocusBranch {
+        uid: WidgetUid,
+        area: Area,
+        visible: bool,
+        children: Vec<WidgetRef>,
+    }
+
+    impl ScriptApply for FocusBranch {
+        fn script_apply(&mut self, _vm: &mut ScriptVm, _apply: &Apply, _scope: &mut Scope, _value: ScriptValue) {}
+    }
+
+    impl WidgetNode for FocusBranch {
+        fn widget_uid(&self) -> WidgetUid { self.uid }
+        fn walk(&mut self, _cx: &mut Cx) -> Walk { Walk::default() }
+        fn area(&self) -> Area { self.area }
+        fn visible(&self) -> bool { self.visible }
+        fn redraw(&mut self, _cx: &mut Cx) {}
+        fn children(&self, visit: &mut dyn FnMut(LiveId, WidgetRef)) {
+            for child in &self.children { visit(id!(child), child.clone()); }
+        }
+    }
+
+    impl Widget for FocusBranch {
+        fn draw_walk(&mut self, _cx: &mut Cx2d, _scope: &mut Scope, _walk: Walk) -> DrawStep {
+            DrawStep::done()
+        }
+    }
+
+    fn focus_branch(area: Area, children: Vec<WidgetRef>) -> WidgetRef {
+        WidgetRef::new_with_inner(Box::new(FocusBranch {
+            uid: WidgetUid::new(), area, children, visible: true,
+        }))
+    }
+
+    #[test]
+    fn input_feedback_only_matches_focus_in_the_hosts_active_subtree() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let list = DrawList::new(&mut cx);
+        let guest_focus = Area::Rect(RectArea { draw_list_id: list.id(), rect_id: 0, redraw_id: 1 });
+        let composer_focus = Area::Rect(RectArea { draw_list_id: list.id(), rect_id: 1, redraw_id: 1 });
+        let guest = focus_branch(guest_focus, Vec::new());
+        let guest_view = focus_branch(Area::Empty, vec![guest]);
+        let host = focus_branch(Area::Empty, vec![guest_view.clone()]);
+        assert!(!active_host_contains_focus(&host, Area::Empty));
+        assert!(!active_host_contains_focus(&host, composer_focus), "typing in another part of Robrix must not warn for this host");
+        assert!(active_host_contains_focus(&host, guest_focus));
+        guest_view.borrow_mut::<FocusBranch>().unwrap().visible = false;
+        assert!(!active_host_contains_focus(&host, guest_focus), "hidden cached content cannot own input feedback");
+    }
+
+    #[test]
+    fn redrawing_the_same_host_keeps_warning_deduplication_but_replacement_resets_it() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let (area, first, second) = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            crate::shared::script_mod(vm);
+            super::script_mod(vm);
+            let area = script_eval!(vm, { mod.widgets.MiniAppHostArea {} });
+            let area = WidgetRef::script_from_value(vm, area).as_mini_app_host_area();
+            let first = script_eval!(vm, { mod.widgets.View {} });
+            let first = WidgetRef::script_from_value(vm, first);
+            let second = script_eval!(vm, { mod.widgets.View {} });
+            let second = WidgetRef::script_from_value(vm, second);
+            (area, first, second)
+        });
+        area.set_host(Some(first.clone()));
+        area.borrow_mut().unwrap().input_errors_shown.insert("blocked input".into());
+        // A room pane reattaches the same host on draw; this must not rearm its popup.
+        area.set_host(Some(first));
+        assert_eq!(area.borrow().unwrap().input_errors_shown.len(), 1);
+        area.set_host(Some(second));
+        assert!(area.borrow().unwrap().input_errors_shown.is_empty());
+        area.borrow_mut().unwrap().input_errors_shown.insert("blocked input".into());
+        area.set_host(None);
+        assert!(area.borrow().unwrap().input_errors_shown.is_empty());
     }
 }

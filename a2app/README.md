@@ -26,7 +26,7 @@ cargo run --features a2app
 - **Per-app isolation**: each app runs in its own Splash isolate with nothing
   by default: no filesystem beyond its private jail, no network, no host access.
   Capabilities are declared in the app's manifest, prompted at first use
-  (Allow selected / Allow Once / Block everywhere / Not Now), revocable at any time, and a
+  (Allow selected / Allow once / Block permission / Not now), revocable at any time, and a
   request-flooding app gets stopped and restricted.
 - **Matrix services**, each behind its own permission group: the attached
   room (info, messages, older history, one event, threads and replies,
@@ -76,6 +76,22 @@ cargo run --features a2app
   state across launches, while all permissions and IFC checks remain active.
   See [Background mini-apps](BACKGROUND_TASKS.md) for setup, examples, and recovery
   semantics. Tasks run only while Robrix is running and signed in.
+
+## Managing access
+
+The Mini Apps screen keeps **Allow room writes** at the top. Turning it off
+blocks every mini-app and agent from writing to rooms and disables their room
+write controls, while keeping saved rules. **Room and space access** sets the
+read/write defaults and the allowed or blocked rooms and spaces; a block always
+wins. Use **Check access** to see which rule decides an operation and open that
+setting directly.
+
+Open a mini-app's settings to edit its permission groups. **Show individual
+abilities** exposes narrower controls. **Agent permissions** provides the same
+room, website and duration choices for an agent. **Data sharing** separates
+sharing rules, blocked-action review and activity; it shows the source, reader,
+destination and duration before allowing a rule. Back, Escape and the mouse
+Back button return to the page that opened the settings.
 
 ## Crates
 
@@ -129,8 +145,7 @@ Linux `keychain:` references use Octos's existing `~/.octos/secrets` store,
 including credentials scoped to a profile. Credentials remain in Robrix's
 host process and are never supplied to the confined worker.
 
-Run with `cargo run --features a2app` (or `a2app-embedded-agent`), then use **Manage data
-sharing rules** to allow the configured model recipient for the sources the
+Run with `cargo run --features a2app` (or `a2app-embedded-agent`), then use **Data sharing** to allow the configured model recipient for the sources the
 agent or generator needs. A local endpoint also needs explicit source consent;
 Robrix cannot guarantee that the service itself will not forward data.
 
@@ -333,7 +348,7 @@ actual homeserver origin before a request is sent, even in encrypted rooms.
 Cached event reads stay local; ordinary messages use the destination room's
 normal encryption and sharing checks.
 
-Mini Apps → **Manage data sharing rules** manages source-to-recipient allowances
+Mini Apps → **Data sharing** manages source-to-recipient allowances
 for a configured model service, an exact HTTP(S) origin, or a Matrix room.
 Choose one app in the current account, one exact app/room or agent context,
 or explicitly all readers. Rules can last for a room session, until Robrix

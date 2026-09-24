@@ -23,49 +23,70 @@ script_mod! {
         content := ScrollYView {
             width: Fill, height: Fill, flow: Down, spacing: 10, padding: 15
             mod.widgets.PermissionOptionLabel {
-                text: "Inspect the current room policies and a particular app or agent's permission checks. A permission allowance still requires data-sharing checks, action approval and the actual operation's other checks."
+                text: "Find out why access is allowed or blocked, and go straight to the setting responsible. Start by choosing the room or space you want to check."
             }
-            refresh := RobrixNeutralIconButton {
-                padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                text: "Refresh protection details"
-            }
-            snapshot_status := mod.widgets.PermissionOptionLabel {}
-            SubsectionLabel { text: "Room or space", margin: 0 }
+            SubsectionLabel { text: "Room or space", margin: Inset{top: 8} }
             target := mod.widgets.PermissionDropDown {}
             target_details := mod.widgets.PermissionOptionLabel {}
-            SubsectionLabel { text: "Read policy", margin: 0 }
-            read_details := mod.widgets.PermissionOptionLabel {}
-            read_control_choice := mod.widgets.PermissionDropDown {}
-            read_rule := RobrixNeutralIconButton {
-                padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                text: "Open deciding read control"
+            page_choice := mod.widgets.PermissionDropDown {
+                labels: ["Room and space access", "One app or agent", "Previously accessed data"]
             }
-            SubsectionLabel { text: "Write policy", margin: 0 }
-            write_details := mod.widgets.PermissionOptionLabel {}
-            write_control_choice := mod.widgets.PermissionDropDown {}
-            write_rule := RobrixNeutralIconButton {
-                padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                text: "Open deciding write control"
+            LineH { margin: Inset{top: 8, bottom: 8} }
+            room_page := View {
+                width: Fill, height: Fit, flow: Down, spacing: 10
+                SubsectionLabel { text: "Read access", margin: 0 }
+                read_details := mod.widgets.PermissionOptionLabel {}
+                read_control_choice := mod.widgets.PermissionDropDown {}
+                read_rule := RobrixNeutralIconButton {
+                    padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                    text: "Change read setting"
+                }
+                LineH { margin: Inset{top: 8, bottom: 8} }
+                SubsectionLabel { text: "Write access", margin: 0 }
+                write_details := mod.widgets.PermissionOptionLabel {}
+                write_control_choice := mod.widgets.PermissionDropDown {}
+                write_rule := RobrixNeutralIconButton {
+                    padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                    text: "Change write setting"
+                }
+                mod.widgets.PermissionOptionLabel {
+                    text: "These room rules apply to every mini-app and agent. They must also pass their own permissions, data-sharing rules and any required action approval."
+                }
             }
-            SubsectionLabel { text: "App or agent context", margin: 0 }
-            subject := mod.widgets.PermissionDropDown {}
-            subject_details := mod.widgets.PermissionOptionLabel {}
-            SubsectionLabel { text: "Ability", margin: 0 }
-            capability := mod.widgets.PermissionDropDown {}
-            capability_details := mod.widgets.PermissionOptionLabel {}
-            capability_rule := RobrixNeutralIconButton {
-                padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                text: "Open deciding permission control"
+            subject_page := View {
+                visible: false, width: Fill, height: Fit, flow: Down, spacing: 10
+                SubsectionLabel { text: "Mini-app or agent", margin: 0 }
+                subject := mod.widgets.PermissionDropDown {}
+                subject_details := mod.widgets.PermissionOptionLabel {}
+                SubsectionLabel { text: "What it wants to do", margin: Inset{top: 8} }
+                capability := mod.widgets.PermissionDropDown {}
+                capability_details := mod.widgets.PermissionOptionLabel {}
+                capability_rule := RobrixNeutralIconButton {
+                    padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                    text: "Change permission"
+                }
             }
-            SubsectionLabel { text: "Retained room provenance", margin: 0 }
-            retained_details := mod.widgets.PermissionOptionLabel {}
-            mod.widgets.PermissionOptionLabel {
-                text: "Provenance records which sources a context may know, including saved data, history and app code. They do not prove that original messages are still stored. Blocking new reads does not erase prior provenance or revoke sharing rules."
+            retained_page := View {
+                visible: false, width: Fill, height: Fit, flow: Down, spacing: 10
+                SubsectionLabel { text: "Who may already know this room's data?", margin: 0 }
+                mod.widgets.PermissionOptionLabel {
+                    text: "Blocking new reads does not erase data already read or remove sharing rules. Robrix keeps track of possible access in saved app data, agent history and app code, even after they stop running."
+                }
+                retained_details := mod.widgets.PermissionOptionLabel {}
+                mod.widgets.PermissionOptionLabel {
+                    text: "These records show which data may have been used. They do not prove that the original messages are still stored. To prevent future sharing, remove the relevant sharing rules."
+                }
             }
+            LineH { margin: Inset{top: 8, bottom: 8} }
             sharing := RobrixNeutralIconButton {
-                padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                text: "Inspect data sharing and sensitive actions"
+                padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                text: "Manage data sharing"
             }
+            refresh := RobrixNeutralIconButton {
+                padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                text: "Refresh access check"
+            }
+            snapshot_status := mod.widgets.PermissionOptionLabel {}
         }
     }
 }
@@ -110,8 +131,12 @@ pub struct ProtectionInspector {
 
 impl Widget for ProtectionInspector {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if self.refresh_account(cx) { return; }
         self.view.handle_event(cx, event, scope);
         let Event::Actions(actions) = event else { return };
+        if self.view.drop_down(cx, ids!(page_choice)).changed(actions).is_some() {
+            self.update_page(cx);
+        }
         if self.view.button(cx, ids!(refresh)).clicked(actions) {
             self.configure(cx);
         } else if self.view.drop_down(cx, ids!(target)).changed(actions).is_some()
@@ -135,15 +160,38 @@ impl Widget for ProtectionInspector {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.refresh_account(cx);
         self.view.draw_walk(cx, scope, walk)
     }
 }
 
 impl ProtectionInspector {
+    fn refresh_account(&mut self, cx: &mut Cx) -> bool {
+        if self.account == super::information_flow::account().unwrap_or_default() { return false; }
+        self.configure(cx);
+        true
+    }
+
+    fn update_page(&mut self, cx: &mut Cx) {
+        let page = self.view.drop_down(cx, ids!(page_choice)).selected_item();
+        self.view.widget(cx, ids!(room_page)).set_visible(cx, page == 0);
+        self.view.widget(cx, ids!(subject_page)).set_visible(cx, page == 1);
+        self.view.widget(cx, ids!(retained_page)).set_visible(cx, page == 2);
+        self.view.view(cx, ids!(content)).set_scroll_pos(cx, Vec2d::default());
+        self.view.redraw(cx);
+    }
+
     fn configure(&mut self, cx: &mut Cx) {
-        let previous_target = self.selected_target(cx).map(|target| target.0.clone());
-        let previous_subject = self.selected_subject(cx).cloned();
-        self.account = super::information_flow::account().unwrap_or_default();
+        let account = super::information_flow::account().unwrap_or_default();
+        let account_changed = self.account != account;
+        let previous_target = self.selected_target(cx).filter(|_| !account_changed).map(|target| target.0.clone());
+        let previous_subject = self.selected_subject(cx).filter(|_| !account_changed).cloned();
+        self.account = account;
+        if account_changed {
+            self.configured = false;
+            self.view.drop_down(cx, ids!(page_choice)).set_selected_item(cx, 0);
+            self.update_page(cx);
+        }
         match flow::retained_contexts() {
             Ok(snapshots) => {
                 self.snapshots = snapshots.into_iter().filter(|snapshot| snapshot.context.account() == self.account).collect();
@@ -188,8 +236,8 @@ impl ProtectionInspector {
         }
         self.targets = targets.into_iter().map(|(id, (name, space))| (id, name, space)).collect();
         self.targets.sort_by_cached_key(|target| (target.1.to_lowercase(), target.0.clone()));
-        self.view.drop_down(cx, ids!(target)).set_labels(cx, self.targets.iter().map(|(id, name, space)|
-            format!("{}: {name} ({id})", if *space { "Space" } else { "Room" })).collect());
+        self.view.drop_down(cx, ids!(target)).set_labels(cx, self.targets.iter().map(|(_, name, space)|
+            format!("{}: {name}", if *space { "Space" } else { "Room" })).collect());
         self.view.drop_down(cx, ids!(target)).set_selected_item(cx,
             previous_target.and_then(|id| self.targets.iter().position(|target| target.0 == id)).unwrap_or(0));
 
@@ -197,28 +245,39 @@ impl ProtectionInspector {
             let context = &snapshot.context;
             let subject = context.app().map(str::to_owned).unwrap_or_else(|| agent_subject(context.room().unwrap_or_default()));
             SubjectChoice {
-                subject, label: format!("{} · {}", self.context_label(context, &apps), if snapshot.epoch == 0 { "Stopped; provenance retained" } else { "Active" }),
+                subject, label: format!("{} · {}", self.context_label(context, &apps), if snapshot.epoch == 0 { "Stopped; data protection retained" } else { "Active" }),
                 context: Some(context.clone()), origin_room: context.room().map(str::to_owned), active: snapshot.epoch != 0,
             }
         }).collect();
         for (app, name, scope) in &apps {
             if !self.subjects.iter().any(|subject| subject.subject == *app) {
                 self.subjects.push(SubjectChoice {
-                    subject: app.clone(), label: format!("{name} ({app}) · No retained context"), context: None, active: false,
+                    subject: app.clone(), label: format!("{name} ({app}) · No saved activity"), context: None, active: false,
                     origin_room: match scope { A2AppScope::Room { room_id } => Some(room_id.clone()), _ => None },
                 });
             }
         }
-        self.view.drop_down(cx, ids!(subject)).set_labels(cx, self.subjects.iter().map(|subject| subject.label.clone()).collect());
+        self.view.drop_down(cx, ids!(subject)).set_labels(cx, self.subjects.iter().map(|subject| {
+            let app_name = |app: &str| apps.iter().find(|candidate| candidate.0 == app)
+                .map(|candidate| candidate.1.clone()).unwrap_or_else(|| app.into());
+            let room_name = |room: &str| self.targets.iter().find(|target| target.0 == room)
+                .map(|target| target.1.clone()).unwrap_or_else(|| room.into());
+            match &subject.context {
+                Some(ContextId::App { app, room, .. }) => format!("{} · {}", app_name(app), room.as_deref().map(room_name).unwrap_or_else(|| "Account-wide".into())),
+                Some(ContextId::PublicApp { app, .. }) => format!("{} · Public mode", app_name(app)),
+                Some(ContextId::Agent { room, .. }) => format!("Agent · {}", room_name(room)),
+                None => app_name(&subject.subject),
+            }
+        }).collect());
         self.view.drop_down(cx, ids!(subject)).set_selected_item(cx,
             previous_subject.and_then(|previous| self.subjects.iter().position(|subject|
                 subject.subject == previous.subject && subject.context == previous.context)).unwrap_or(0));
         let previous_capability = if self.configured { self.view.drop_down(cx, ids!(capability)).selected_item() }
             else { capabilities::CATALOG.iter().position(|cap| cap.id == "matrix.rooms.messages.read").unwrap_or(0) };
-        self.view.drop_down(cx, ids!(capability)).set_labels(cx, capabilities::CATALOG.iter().map(|cap| format!("{} ({})", cap.title, cap.id)).collect());
+        self.view.drop_down(cx, ids!(capability)).set_labels(cx, capabilities::CATALOG.iter().map(|cap| cap.title.to_string()).collect());
         self.view.drop_down(cx, ids!(capability)).set_selected_item(cx, previous_capability);
         self.configured = true;
-        self.view.label(cx, ids!(snapshot_status)).set_text(cx, "Snapshot refreshed. Refresh again after another app, agent or room changes; selecting a target or ability rechecks its current permissions.");
+        self.view.label(cx, ids!(snapshot_status)).set_text(cx, "Checked just now. Refresh after changing apps, agents or rooms. Choosing another room or action also rechecks its permissions.");
         self.update_details(cx);
     }
 
@@ -238,8 +297,8 @@ impl ProtectionInspector {
         let app_name = |app: &str| apps.iter().find(|candidate| candidate.0 == app)
             .map(|candidate| format!("{} ({app})", candidate.1)).unwrap_or_else(|| app.into());
         match context {
-            ContextId::App { app, room, .. } => format!("{} · {}", app_name(app), room.as_deref().map(|room| self.room_label(room)).unwrap_or_else(|| "Account context".into())),
-            ContextId::PublicApp { app, .. } => format!("{} · Public context", app_name(app)),
+            ContextId::App { app, room, .. } => format!("{} · {}", app_name(app), room.as_deref().map(|room| self.room_label(room)).unwrap_or_else(|| "Account-wide".into())),
+            ContextId::PublicApp { app, .. } => format!("{} · Public mode", app_name(app)),
             ContextId::Agent { room, .. } => format!("Agent · {}", self.room_label(room)),
         }
     }
@@ -264,31 +323,33 @@ impl ProtectionInspector {
             self.view.label(cx, ids!(write_details)).set_text(cx, &write.0);
             self.read_controls = read.1;
             self.write_controls = write.1;
-            self.view.label(cx, ids!(capability_details)).set_text(cx, capability.as_ref().map(|result| result.text.as_str()).unwrap_or("Select an installed app or an agent context and an ability."));
+            self.view.label(cx, ids!(capability_details)).set_text(cx, capability.as_ref().map(|result| result.text.as_str()).unwrap_or("Choose a mini-app or agent and the action you want to check."));
             self.capability_control = capability.and_then(|result| result.control);
         } else {
             for id in [ids!(read_details), ids!(write_details), ids!(capability_details)] {
-                self.view.label(cx, id).set_text(cx, "No permission result is available. Select a room or space after signing in.");
+                self.view.label(cx, id).set_text(cx, "Sign in and choose a room or space to check its access.");
             }
         }
-        self.view.label(cx, ids!(target_details)).set_text(cx, if target.as_ref().is_some_and(|target| target.2) {
-            "These checks apply to the space itself. Its rules also cover nested rooms; select a child room to inspect its own blocks and other ancestor spaces."
-        } else { "Read and write policies below are host restrictions for this exact room, before app or agent grants." });
+        let target_hint = if target.as_ref().is_some_and(|target| target.2) {
+            "Checking this space itself. Space rules also cover its rooms and nested spaces. Choose a room to check all the rules that apply to that room."
+        } else { "Checking this room, including rules inherited from its spaces. A Block rule always wins over an Allow rule." };
+        self.view.label(cx, ids!(target_details)).set_text(cx, &target.as_ref().map(|(room, _, _)|
+            format!("{} · {}\n{target_hint}", self.room_label(room), self.account)).unwrap_or_else(|| "Choose a room or space to check its access.".into()));
         let context_text = subject.as_ref().map(|subject| {
-            let activity = if subject.active { "Active at the last refresh." } else { "Not active at the last refresh. A new activation must pass its own session and data-sharing checks." };
+            let activity = if subject.active { "Running when last checked." } else { "Not running when last checked. Starting it again requires fresh session and data-sharing checks." };
             let clearance = if matches!(subject.context, Some(ContextId::PublicApp { .. })) {
-                "Public context: private room and account inputs are blocked by its clearance even when a permission is allowed."
-            } else { "Data-sharing checks and sensitive-action approval are separate from the permission result below." };
+                "Public mode: this app cannot receive private room or account data, even when a permission is allowed."
+            } else { "Permission to perform this action does not also approve data sharing or instructions found in outside content." };
             format!("{}\n{activity}\n{clearance}", subject.label)
-        }).unwrap_or_else(|| "No app or agent context is available.".into());
+        }).unwrap_or_else(|| "No mini-app or agent is available. Install a mini-app or start an agent to check its permissions.".into());
         self.view.label(cx, ids!(subject_details)).set_text(cx, &context_text);
         let retained = match (&self.provenance_error, &target) {
-            (Some(error), _) => format!("Retained provenance is unavailable: {error}. No conclusion about retained room data can be drawn."),
-            (_, Some((room, _, _))) => format!("Context provenance:\n{}\n\nShared mini-app source provenance:\n{}",
+            (Some(error), _) => format!("Previously accessed data could not be checked: {error}. Robrix cannot tell which apps or agents may already know this room’s data."),
+            (_, Some((room, _, _))) => format!("App data and agent history:\n{}\n\nMini-app code:\n{}",
                 retained_text(&self.snapshots, &self.account, room, |context|
                     self.subjects.iter().find(|subject| subject.context.as_ref() == Some(context)).map(|subject| subject.label.clone()).unwrap_or_else(|| format!("{context:?}"))),
                 retained_code_text(&self.code_sources, &self.account, room)),
-            _ => "Select a room or space to inspect retained provenance.".into(),
+            _ => "Choose a room or space to check previously accessed data.".into(),
         };
         self.view.label(cx, ids!(retained_details)).set_text(cx, &retained);
         for (choice, button, controls) in [
@@ -296,9 +357,9 @@ impl ProtectionInspector {
             (ids!(write_control_choice), ids!(write_rule), &self.write_controls),
         ] {
             self.view.drop_down(cx, choice).set_labels(cx, controls.iter().map(|control| match control {
-                ProtectionInspectorAction::Global => "Global policy / write switch".into(),
-                ProtectionInspectorAction::Rule(AccessRuleKey::Room(room)) => format!("Room: {}", self.room_label(room)),
-                ProtectionInspectorAction::Rule(AccessRuleKey::Space(space)) => format!("Space: {}", self.room_label(space)),
+                ProtectionInspectorAction::Global => "Default room rules / write switch".into(),
+                ProtectionInspectorAction::Rule(AccessRuleKey::Room(room)) => format!("Room: {}", self.targets.iter().find(|target| &target.0 == room).map(|target| target.1.as_str()).unwrap_or(room)),
+                ProtectionInspectorAction::Rule(AccessRuleKey::Space(space)) => format!("Space: {}", self.targets.iter().find(|target| &target.0 == space).map(|target| target.1.as_str()).unwrap_or(space)),
                 _ => "Permission control".into(),
             }).collect());
             self.view.drop_down(cx, choice).set_selected_item(cx, 0);
@@ -319,7 +380,7 @@ fn explain_room_rules(store: &PermissionStore, access: RoomAccess, room: &str, s
         let explanation = explain_room(evaluation, access, room, space, label);
         return (explanation.text, explanation.control.into_iter().collect());
     }
-    let mut lines = vec!["Blocked by host room policy. Every blocking rule below must be resolved before access is possible:".into()];
+    let mut lines = vec!["Blocked by room access settings. Every setting listed below must allow access before it can proceed:".into()];
     let mut controls = Vec::new();
     for reason in blockers {
         let explanation = explain_room(RoomPolicyEvaluation { decision: PolicyDecision::Deny, reason }, access, room, space, &label);
@@ -334,18 +395,18 @@ fn explain_room(evaluation: RoomPolicyEvaluation<'_>, access: RoomAccess, room: 
     use RoomPolicyReason::*;
     let verb = if access == RoomAccess::Read { "read" } else { "write" };
     let status = match evaluation.decision {
-        PolicyDecision::Allow => "Allowed by host room policy",
-        PolicyDecision::Ask => "No host room allowance; app or agent permission checks decide",
-        PolicyDecision::Deny => "Blocked by host room policy",
+        PolicyDecision::Allow => "Allowed by room access settings",
+        PolicyDecision::Ask => "No room-wide allowance; the app or agent must have permission",
+        PolicyDecision::Deny => "Blocked by room access settings",
     };
     let (reason, control) = match evaluation.reason {
-        WriteMasterOff => ("The top-level room-write switch is off. Enable it on the Mini Apps main screen to restore saved write rules.".into(), ProtectionInspectorAction::Global),
-        GlobalBlock => (format!("The global {verb} default blocks every room. Change it on the Mini Apps main screen; a room Allow cannot override it."), ProtectionInspectorAction::Global),
-        GlobalDefault => (format!("The global {verb} default decides this result. Change that default on the Mini Apps main screen or add a room or space rule."), ProtectionInspectorAction::Global),
+        WriteMasterOff => ("Allow room writes is off. Turn it on in Mini Apps → Room and space access → Allow room writes to restore your saved write rules.".into(), ProtectionInspectorAction::Global),
+        GlobalBlock => (format!("The default {verb} setting blocks every room. Open Room and space access → Default access to change it. Allowing an individual room cannot override this block."), ProtectionInspectorAction::Global),
+        GlobalDefault => (format!("The default {verb} setting decides this result. Change it under Room and space access → Default access, or add a room or space rule."), ProtectionInspectorAction::Global),
         RoomRule { room } => (format!("The {verb} rule for {} decides this result. Edit that room rule; any matching block still wins.", label(room)), ProtectionInspectorAction::Rule(AccessRuleKey::Room(room.into()))),
         SpaceRule { space, ancestor } => (format!("The {verb} rule for {}{} decides this result. Edit that space rule; any matching block still wins.", if ancestor { "ancestor space " } else { "space " }, label(space)), ProtectionInspectorAction::Rule(AccessRuleKey::Space(space.into()))),
         UnresolvedSpaceHierarchy { space, rule } => (format!("Robrix has not resolved whether this target belongs to space {}. Its {} {verb} rule cannot yet be safely evaluated. Wait for room/space synchronization and refresh; inspect that space rule if needed.", label(space), if rule == PolicyDecision::Deny { "Block" } else { "Allow" }), ProtectionInspectorAction::Rule(AccessRuleKey::Space(space.into()))),
-        WhitelistRequired => (format!("Allowlist-only {verb} access is enabled, and no room or ancestor-space Allow matches. Add an Allow for this target or one of its spaces; ordinary app grants cannot bypass this restriction."), ProtectionInspectorAction::Rule(if space { AccessRuleKey::Space(room.into()) } else { AccessRuleKey::Room(room.into()) })),
+        WhitelistRequired => (format!("Only allowed rooms and spaces is selected for {verb} access, and no Allow rule matches this room or its spaces. Under Room and space rules, select this target or one of its spaces and choose Allow without asking. App permissions cannot bypass this restriction."), ProtectionInspectorAction::Rule(if space { AccessRuleKey::Space(room.into()) } else { AccessRuleKey::Room(room.into()) })),
     };
     Explanation { text: format!("{status}.\n{reason}"), control: Some(control) }
 }
@@ -363,7 +424,7 @@ fn explain_capability(store: &PermissionStore, manifest: Option<&MiniAppManifest
         PermissionContext { origin_room: subject.origin_room.as_deref(), target_room: Some(room) });
     if !agent && manifest.is_none() {
         return Explanation {
-            text: "Permission layer: unavailable. The app associated with this retained context is no longer installed. Its stored data and code provenance remain protected; app permission controls require an installed manifest.".into(),
+            text: "App permission: unavailable. This mini-app is no longer installed. Its previously accessed data is still protected. Install it again to change its app permissions.".into(),
             control: None,
         };
     }
@@ -381,34 +442,34 @@ fn explain_capability_result(evaluation: CapabilityEvaluation<'_>, subject: &Sub
     let default_control = cap.group.map(|permission| permission_control(permission, Some(cap.id.into())));
     let (reason, control) = match evaluation.reason {
         Unavailable => ("This ability is not available in this build; permission settings cannot enable it.".into(), None),
-        Undeclared => ("This app's manifest or agent's tool catalog does not declare this ability. Permission settings cannot grant an undeclared ability.".into(), Some(ProtectionInspectorAction::SubjectInfo(subject.subject.clone()))),
+        Undeclared => ("This app or agent does not support this ability. Permission settings cannot add abilities it has not declared.".into(), Some(ProtectionInspectorAction::SubjectInfo(subject.subject.clone()))),
         SubjectRestricted => ("Robrix restricted this app or agent after a security failure. Review the restriction in its settings before allowing it to run again.".into(), Some(ProtectionInspectorAction::SubjectInfo(subject.subject.clone()))),
         RoomPolicy { access, reason } => {
             let explanation = explain_room(RoomPolicyEvaluation { decision: if evaluation.effective == Effective::Granted { PolicyDecision::Allow } else { PolicyDecision::Deny }, reason }, access, room, space, label);
             (explanation.text, explanation.control)
         }
-        PermissionDenied { permission } => (format!("The {} permission group is blocked for this app or agent. Its group block overrides capability and scoped allowances; change that group control.", permission.title()), Some(permission_control(permission, None))),
-        CapabilityDenied => ("This individual ability is blocked. Change its app or agent capability control.".into(), default_control),
-        CapabilityGrant => ("An explicit allowance for this ability passes the permission layer.".into(), default_control),
-        ScopedGrant => ("A saved or session allowance matches this ability, target and origin room.".into(), default_control),
+        PermissionDenied { permission } => (format!("The {} permission group is blocked for this app or agent. Blocking a group overrides individual abilities and room allowances. Change the permission group to allow access.", permission.title()), Some(permission_control(permission, None))),
+        CapabilityDenied => ("This individual ability is blocked. Open its app or agent permission setting to change it.".into(), default_control),
+        CapabilityGrant => ("You have allowed this individual ability.".into(), default_control),
+        ScopedGrant => ("A saved or temporary permission allows this ability for this target from the app or agent’s room.".into(), default_control),
         RoomGrant => ("An earlier per-room allowance matches this target. Manage the app or agent's saved room allowances to revoke it.".into(), default_control),
-        PermissionGrant => ("The app or agent's permission group allowance passes this permission check.".into(), cap.group.map(|permission| permission_control(permission, None))),
-        NormalPermission => ("This declared normal-tier ability is enabled by the current default. Strict mode or narrower rules can require approval.".into(), default_control),
-        ApprovalRequired => ("No applicable allowance passes this permission check. Review the app or agent's scoped ability permissions, or approve its request when prompted.".into(), default_control),
-        NoPermissionRequired => ("This ability does not require an app permission group. Its host and data-flow checks still apply.".into(), None),
+        PermissionGrant => ("The permission group allows this action for this app or agent.".into(), cap.group.map(|permission| permission_control(permission, None))),
+        NormalPermission => ("This basic ability is allowed by the current permission defaults. Strict mode or a more specific rule can require approval.".into(), default_control),
+        ApprovalRequired => ("This action needs your approval. Change the app or agent’s permission for this room, or approve its request when prompted.".into(), default_control),
+        NoPermissionRequired => ("This ability does not need a separate app permission. Room access and data-sharing checks still apply.".into(), None),
     };
     let status = match evaluation.effective {
-        Effective::Granted => "Permission layer: allowed",
-        Effective::NeedsPrompt => "Permission layer: approval required",
-        Effective::Denied => "Permission layer: blocked",
-        Effective::Undeclared => "Permission layer: unavailable or undeclared",
+        Effective::Granted => "App permission: allowed",
+        Effective::NeedsPrompt => "App permission: approval required",
+        Effective::Denied => "App permission: blocked",
+        Effective::Undeclared => "App permission: unavailable or unsupported",
     };
     let applicability = if cap.scope == CapabilityScope::Room && subject.origin_room.as_deref() != Some(room) {
-        "\nThis is an attached-room ability: it cannot target the selected room from this context. Select its attached room or inspect a cross-room ability."
+        "\nThis ability works only in the app or agent’s attached room. Choose that room, or check an ability that supports other rooms."
     } else if matches!(cap.scope, CapabilityScope::MultiRoom | CapabilityScope::Space) {
-        "\nThis is the check for the selected target. A collection query may start for an allowed subset, but every returned or accessed room must pass its own target check."
+        "\nThis result applies to the selected target. Requests involving several rooms check each room separately and may return only the allowed rooms."
     } else { "" };
-    Explanation { text: format!("{} ({})\n{status}.\n{reason}{applicability}\nThis result does not authorize data sharing or a sensitive action, and does not promise that an operation will succeed.", cap.title, cap.id), control }
+    Explanation { text: format!("{} ({})\n{status}.\n{reason}{applicability}\nData sharing and actions influenced by outside content may still need separate approval. Other requirements of the operation also apply.", cap.title, cap.id), control }
 }
 
 fn retained_text(snapshots: &[ContextSnapshot], account: &str, room: &str, label: impl Fn(&ContextId) -> String) -> String {
@@ -417,12 +478,12 @@ fn retained_text(snapshots: &[ContextSnapshot], account: &str, room: &str, label
     for snapshot in snapshots {
         if snapshot.context.account() != account { continue; }
         if snapshot.label.contains(&source) {
-            lines.push(format!("• {} — this room's provenance", label(&snapshot.context)));
+            lines.push(format!("• {} — may include data from this room", label(&snapshot.context)));
         } else if snapshot.label.contains(&Source::UnknownPrivate) {
-            lines.push(format!("• {} — unknown private provenance; room ownership cannot be determined", label(&snapshot.context)));
+            lines.push(format!("• {} — may include private data whose room is unknown", label(&snapshot.context)));
         }
     }
-    if lines.is_empty() { "No current or retained context in this account is recorded with this room's provenance or unknown private provenance at the last refresh.".into() }
+    if lines.is_empty() { "No app data or agent history was recorded as possibly containing data from this room, or private data with an unknown source, when last checked.".into() }
     else { lines.join("\n") }
 }
 
@@ -432,14 +493,14 @@ fn retained_code_text(apps: &[(String, String, Result<Label, String>)], account:
     let mut missing = 0;
     for (app, name, labels) in apps {
         match labels {
-            Ok(labels) if labels.contains(&source) => lines.push(format!("• {name} ({app}) — shared source contains this room's provenance, even without a running instance")),
-            Ok(labels) if labels.contains(&Source::UnknownPrivate) => lines.push(format!("• {name} ({app}) — shared source has unknown private provenance; room ownership cannot be determined")),
+            Ok(labels) if labels.contains(&source) => lines.push(format!("• {name} ({app}) — its code may include data from this room, even without a running instance")),
+            Ok(labels) if labels.contains(&Source::UnknownPrivate) => lines.push(format!("• {name} ({app}) — its code may include private data whose room is unknown")),
             Err(_) => missing += 1,
             _ => {}
         }
     }
-    if lines.is_empty() { lines.push("No installed mini-app source with this room's known or unknown private provenance is recorded at the last refresh.".into()); }
-    if missing > 0 { lines.push(format!("Code provenance is unavailable for {missing} installed mini-app(s); no conclusion about their retained room data can be drawn.")); }
+    if lines.is_empty() { lines.push("No installed mini-app code was recorded as possibly containing data from this room, or private data with an unknown source, when last checked.".into()); }
+    if missing > 0 { lines.push(format!("The source of data in {missing} installed mini-app(s) could not be checked. They may still know data from this room.")); }
     lines.join("\n")
 }
 
@@ -453,6 +514,40 @@ impl ProtectionInspectorRef {
 mod tests {
     use super::*;
     use a2app_core::permissions::{GrantState, RoomPolicyMode};
+
+    #[test]
+    fn changing_accounts_discards_stale_control_navigation() {
+        struct ResetAccount(Option<String>);
+        impl Drop for ResetAccount {
+            fn drop(&mut self) {
+                crate::a2app::information_flow::TEST_ACCOUNT.with(|account| account.replace(self.0.take()));
+            }
+        }
+        let _account = ResetAccount(crate::a2app::information_flow::TEST_ACCOUNT.with(|account|
+            account.replace(Some("@inspector-new:example.org".into()))));
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::permission_prompt::script_mod(vm);
+            super::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.ProtectionInspector {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let mut inspector = widget.borrow_mut::<ProtectionInspector>().unwrap();
+        inspector.account = "@inspector-old:example.org".into();
+        inspector.read_controls.push(ProtectionInspectorAction::Rule(AccessRuleKey::Room("!old:example.org".into())));
+        inspector.view.drop_down(&cx, ids!(page_choice)).set_selected_item(&mut cx, 2);
+        let uid = inspector.view.button(&cx, ids!(read_rule)).widget_uid();
+        let click = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+        let actions = cx.capture_actions(|cx| inspector.handle_event(cx, &Event::Actions(click), &mut Scope::empty()));
+        assert!(!actions.iter().any(|action| action.downcast_ref::<ProtectionInspectorAction>().is_some()));
+        assert_eq!(inspector.account, "@inspector-new:example.org");
+        assert_eq!(inspector.view.drop_down(&cx, ids!(page_choice)).selected_item(), 0);
+        assert!(inspector.selected_subject(&cx).is_none_or(|subject|
+            subject.context.as_ref().is_none_or(|context| context.account() == "@inspector-new:example.org")));
+    }
 
     fn agent() -> SubjectChoice {
         SubjectChoice {
@@ -470,7 +565,7 @@ mod tests {
         permissions.set_room_policy("!private:example.org", RoomAccess::Read, PolicyDecision::Allow);
         permissions.set(&subject.subject, Permission::MatrixRoomsRead, GrantState::Denied);
         let explanation = explain_capability(&permissions, None, &subject, cap, "!private:example.org", false, str::to_owned);
-        assert!(explanation.text.contains("Permission layer: blocked"));
+        assert!(explanation.text.contains("App permission: blocked"));
         assert!(explanation.text.contains("permission group is blocked"));
         assert!(matches!(explanation.control, Some(ProtectionInspectorAction::Ability {
             permission: Permission::MatrixRoomsRead, capability: None, ..
@@ -489,7 +584,7 @@ mod tests {
         let mut permissions = PermissionStore::default();
         let target = "!private:example.org";
         let reason = explain_room(permissions.room_policy_evaluation(Some(target), RoomAccess::Write), RoomAccess::Write, target, false, str::to_owned);
-        assert!(reason.text.contains("top-level room-write switch is off"));
+        assert!(reason.text.contains("Allow room writes is off"));
         assert!(matches!(reason.control, Some(ProtectionInspectorAction::Global)));
         permissions.set_room_spaces(target, vec!["!protected:example.org".into()]);
         permissions.set_space_policy("!protected:example.org", RoomAccess::Read, PolicyDecision::Deny);
@@ -499,7 +594,7 @@ mod tests {
         permissions.set_space_policy("!protected:example.org", RoomAccess::Read, PolicyDecision::Ask);
         permissions.set_policy_mode(RoomAccess::Read, RoomPolicyMode::WhitelistOnly);
         let reason = explain_room(permissions.room_policy_evaluation(Some(target), RoomAccess::Read), RoomAccess::Read, target, false, str::to_owned);
-        assert!(reason.text.contains("no room or ancestor-space Allow matches"));
+        assert!(reason.text.contains("no Allow rule matches this room or its spaces"));
         assert!(matches!(reason.control, Some(ProtectionInspectorAction::Rule(AccessRuleKey::Room(id))) if id == target));
     }
 
@@ -512,7 +607,7 @@ mod tests {
         permissions.set_space_policy("!protected:example.org", RoomAccess::Write, PolicyDecision::Deny);
         permissions.set_space_policy("!outer:example.org", RoomAccess::Write, PolicyDecision::Deny);
         let (text, controls) = explain_room_rules(&permissions, RoomAccess::Write, target, false, str::to_owned);
-        assert!(text.contains("top-level room-write switch is off"));
+        assert!(text.contains("Allow room writes is off"));
         assert!(text.contains(target));
         assert!(text.contains("!protected:example.org"));
         assert!(text.contains("!outer:example.org"));
@@ -535,8 +630,8 @@ mod tests {
             snapshot("other-account", "@bob:example.org", [Source::Room { account: account.into(), room: room.into() }].into()),
         ];
         let text = retained_text(&snapshots, account, room, |context| context.app().unwrap().into());
-        assert!(text.contains("stopped — this room's provenance"));
-        assert!(text.contains("legacy — unknown private provenance"));
+        assert!(text.contains("stopped — may include data from this room"));
+        assert!(text.contains("legacy — may include private data whose room is unknown"));
         assert!(!text.contains("other-account"));
     }
 

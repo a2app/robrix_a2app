@@ -16,124 +16,103 @@ script_mod! {
     mod.widgets.PermissionOptionLabel = Label {
         width: Fill, height: Fit, padding: 0, margin: 0
         flow: Flow.Right{wrap: true}
-        draw_text +: { text_style: REGULAR_TEXT {font_size: 10.5}, color: (COLOR_TEXT) }
+        draw_text +: { text_style: SETTINGS_REGULAR_TEXT_STYLE {}, color: (MESSAGE_TEXT_COLOR) }
     }
-    mod.widgets.PermissionDropDown = DropDownFlat {
-        width: Fill, height: 32
-        draw_text +: { text_style: REGULAR_TEXT {font_size: 10.5}, color: (COLOR_TEXT) }
-        draw_bg +: { color: (COLOR_PRIMARY), border_color: (COLOR_DIVIDER), border_size: 1.0 }
+    mod.widgets.PermissionDropDown = RobrixSettingsDropDown {
+        width: Fill, margin: 0
+        draw_text +: { max_lines: 1, text_overflow: TextOverflow.Ellipsis }
     }
     mod.widgets.PermissionScopeEditor = set_type_default() do #(PermissionScopeEditor::register_widget(vm)) {
-        width: Fill, height: Fit, flow: Down, spacing: 7
-        mod.widgets.PermissionOptionLabel { text: "Where" }
-        scope_choice := mod.widgets.PermissionDropDown {
-            labels: ["Selected rooms and spaces", "All rooms"]
+        width: Fill, height: Fit, flow: Down, spacing: 8
+        SettingsItemLabel { text: "Rooms and spaces" }
+        scope_choice_section := View {
+            width: Fill, height: Fit
+            scope_choice := mod.widgets.PermissionDropDown {
+                labels: ["Choose rooms and spaces", "All rooms and spaces"]
+            }
+        }
+        target_summary := mod.widgets.PermissionOptionLabel {}
+        choose_targets := RobrixNeutralIconButton {
+            text: "Choose rooms and spaces"
+            icon_walk: Walk{width: 0, height: 0, margin: 0}
         }
         selected_targets := View {
-            width: Fill, height: Fit, flow: Down, spacing: 4
+            visible: false
+            width: Fill, height: Fit, flow: Down, spacing: 6
             target_filter := RobrixTextInput { width: Fill, empty_text: "Find rooms or spaces…" }
             targets := PortalList {
-                width: Fill, height: 150, flow: Down
-                target := CheckBox {
-                    width: Fill, height: 30
-                    draw_text +: { text_style: REGULAR_TEXT {font_size: 10.5}, color: (COLOR_TEXT) }
-                }
+                width: Fill, height: 168, flow: Down
+                target := RobrixSettingsCheckBox {}
             }
-            target_summary := mod.widgets.PermissionOptionLabel {}
+            target_empty := mod.widgets.PermissionOptionLabel { visible: false }
         }
         duration_section := View {
-            width: Fill, height: Fit, flow: Down, spacing: 4
-            mod.widgets.PermissionOptionLabel { text: "For how long" }
+            width: Fill, height: Fit, flow: Down, spacing: 8
+            margin: Inset{top: 8}
+            SettingsItemLabel { text: "Keep this permission" }
             duration_choice := mod.widgets.PermissionDropDown {
-                labels: ["Until Robrix closes", "Always"]
+                labels: ["Until Robrix closes", "Until I change it"]
             }
             session_origin_section := View {
                 visible: false
-                width: Fill, height: Fit, flow: Down, spacing: 4
-                mod.widgets.PermissionOptionLabel { text: "Source room for this session" }
+                width: Fill, height: Fit, flow: Down, spacing: 6
+                SettingsItemLabel { text: "Room that ends this session" }
                 session_origin := mod.widgets.PermissionDropDown {}
-                mod.widgets.PermissionOptionLabel { text: "Applies while the mini-app runs in this source room; ends when that room closes." }
+                mod.widgets.PermissionOptionLabel { text: "Closing this room ends the permission. The rooms it applies to are selected above." }
             }
         }
         network_section := View {
             visible: false
-            width: Fill, height: Fit, flow: Down, spacing: 4
-            mod.widgets.PermissionOptionLabel { text: "Internet access" }
+            width: Fill, height: Fit, flow: Down, spacing: 8
+            margin: Inset{top: 8}
+            SettingsItemLabel { text: "Allowed websites" }
             network_choice := mod.widgets.PermissionDropDown {
-                labels: ["Only this URL", "This site (scheme, host and port)", "This exact host (all ports)", "This domain and subdomains (all ports)", "All internet sites"]
+                labels: ["Only this web address", "This website", "This host, any port", "Domain and subdomains", "Any website"]
             }
-            network_value := RobrixTextInput { width: Fill, empty_text: "https://example.com/path" }
+            network_value := RobrixTextInput { width: Fill, empty_text: "https://example.com/page" }
             network_summary := mod.widgets.PermissionOptionLabel {}
+            network_warning := RoundedView {
+                width: Fill, height: Fit, padding: 12
+                draw_bg +: { color: (COLOR_BG_PREVIEW), border_radius: 4.0 }
+                mod.widgets.PermissionOptionLabel {
+                    text: "Internet access can let this mini-app or agent send messages, files, or other local data it can access off this device to websites and online services. What is shared depends on what it does. Your data-sharing rules still apply."
+                }
+            }
         }
     }
 
     mod.widgets.MiniAppPermissionPrompt = set_type_default() do #(MiniAppPermissionPrompt::register_widget(vm)) {
         ..mod.widgets.SmallModal
 
-        // Wide enough for all four answer buttons on one row.
         width: Fill { max: 640 }
+        height: Fill { max: 760 }
+        padding: 20
+        scroll_bars: ScrollBars { show_scroll_x: false, show_scroll_y: false }
 
-        prompt_glyph := Label {
-            width: Fill, height: Fit
-            align: Align{x: 0.5}
-            margin: Inset{bottom: 10}
-            draw_text +: {
-                text_style: TITLE_TEXT {font_size: 28},
-                color: #000
+        prompt_title := ModalTitle { margin: Inset{bottom: 14} }
+        prompt_content := ScrollYView {
+            width: Fill, height: Fill, flow: Down, spacing: 12
+            padding: Inset{right: 8}
+            prompt_blurb := ModalBody {}
+            prompt_reason := ModalBody {
+                draw_text +: { text_style: SETTINGS_REGULAR_TEXT_STYLE {}, color: (MESSAGE_TEXT_COLOR) }
             }
-        }
-        prompt_title := ModalTitle {
-            margin: Inset{bottom: 10}
-        }
-        prompt_blurb := ModalBody {}
-        prompt_reason := ModalBody {
-            margin: Inset{top: 10}
-            draw_text +: {
-                text_style: REGULAR_TEXT {font_size: 10.5},
-                color: (MESSAGE_TEXT_COLOR)
-            }
-        }
 
-        // The app-authored tool text, shown VERBATIM and rendered as inert
-        // plain text: no markdown, no links, nothing the app can dress up.
-        // This is exactly what would enter the model's context.
-        prompt_tool := View {
-            width: Fill, height: Fit
-            visible: false
-            flow: Down
-            margin: Inset{top: 10}
-            tool_label := Label {
-                width: Fill, height: Fit
-                padding: 8, margin: 0
-                draw_text +: {
-                    text_style: REGULAR_TEXT {font_size: 10.5},
-                    color: #x1C274C
+            // App-authored tool text stays plain and inert, with no links or markup.
+            prompt_tool := RoundedView {
+                width: Fill, height: Fit, visible: false, flow: Down, padding: 12, spacing: 8
+                draw_bg +: { color: (COLOR_BG_PREVIEW), border_radius: 4.0 }
+                SettingsItemLabel {
+                    width: Fill, flow: Flow.Right{wrap: true}
+                    text: "Tool details provided by the mini-app"
                 }
+                tool_label := mod.widgets.PermissionOptionLabel {}
             }
-        }
-
-        scope_editor := mod.widgets.PermissionScopeEditor {}
-
-        ModalButtonsRow {
-            align: Align{x: 0.5, y: 0.5}
-            spacing: 8
-            margin: Inset{top: 6}
-
-            not_now_button := RobrixNeutralIconButton {
-                padding: 12,
-                icon_walk: Walk{width: 0, height: 0, margin: 0}
-                text: "Not Now"
-            }
-            deny_button := RobrixNegativeIconButton {
-                padding: 12,
-                draw_icon +: { svg: (ICON_FORBIDDEN) }
-                icon_walk: Walk{width: 14, height: 14, margin: Inset{left: -2, right: -1}}
-                text: "Block everywhere"
-            }
-            allow_once_button := RobrixIconButton {
-                padding: 12,
-                icon_walk: Walk{width: 0, height: 0, margin: 0}
-                text: "Allow Once"
+            LineH { height: 1 }
+            SettingsItemLabel { text: "Allow with these settings" }
+            scope_editor := mod.widgets.PermissionScopeEditor {}
+            mod.widgets.PermissionOptionLabel {
+                text: "Room and space protections always take priority. You can change this permission later in Mini Apps."
             }
             allow_button := RobrixPositiveIconButton {
                 padding: 12,
@@ -141,6 +120,32 @@ script_mod! {
                 icon_walk: Walk{width: 14, height: 14, margin: Inset{left: -2, right: -1}}
                 text: "Allow selected"
             }
+        }
+
+        ModalButtonsRow {
+            spacing: 8, padding: Inset{top: 16, bottom: 0}
+            allow_once_button := RobrixIconButton {
+                padding: 12,
+                icon_walk: Walk{width: 0, height: 0, margin: 0}
+                text: "Allow once"
+            }
+            not_now_button := RobrixNeutralIconButton {
+                padding: 12,
+                icon_walk: Walk{width: 0, height: 0, margin: 0}
+                text: "Not now"
+            }
+        }
+        ModalButtonsRow {
+            spacing: 8, padding: Inset{top: 8, bottom: 0}
+            deny_button := RobrixNegativeIconButton {
+                padding: 12,
+                icon_walk: Walk{width: 0, height: 0, margin: 0}
+                text: "Block permission"
+            }
+        }
+        mod.widgets.PermissionOptionLabel {
+            margin: Inset{top: 10}
+            text: "Block permission denies this permission in every room. Not now skips this request."
         }
     }
 }
@@ -202,6 +207,10 @@ impl Widget for MiniAppPermissionPrompt {
         self.view.handle_event(cx, event, scope);
 
         if let Event::Actions(actions) = event {
+            let editor = self.view.permission_scope_editor(cx, ids!(scope_editor));
+            if matches!(actions.find_widget_action(editor.widget_uid()).cast(), PermissionScopeEditorAction::Changed) {
+                self.refresh_allow_button(cx);
+            }
             if self.view.button(cx, ids!(allow_button)).clicked(actions) {
                 match self.view.permission_scope_editor(cx, ids!(scope_editor)).selection() {
                     Ok(selection) => cx.action(PermissionPromptAction::AllowScoped {
@@ -224,26 +233,39 @@ impl Widget for MiniAppPermissionPrompt {
     }
 }
 
+impl MiniAppPermissionPrompt {
+    fn refresh_allow_button(&self, cx: &mut Cx) {
+        let valid = self.view.permission_scope_editor(cx, ids!(scope_editor)).selection().is_ok();
+        self.view.button(cx, ids!(allow_button)).set_enabled(cx, valid);
+        self.view.widget(cx, ids!(allow_button)).set_disabled(cx, !valid);
+    }
+}
+
 impl MiniAppPermissionPromptRef {
     /// Populates the prompt for the given request.
     pub fn show(&self, cx: &mut Cx, info: &PromptInfo) {
         let Some(mut inner) = self.borrow_mut() else { return };
+        inner.view.view(cx, ids!(prompt_content)).set_scroll_pos(cx, Vec2d::default());
         inner.view.permission_scope_editor(cx, ids!(scope_editor)).configure(
             cx, info.room_id.as_deref(), info.origin_room_id.as_deref(),
             info.network_url.as_deref(), info.perm == Permission::Network, false,
         );
-        inner.view.label(cx, ids!(prompt_glyph)).set_text(cx, info.perm.glyph());
-        let asked = info.capability.as_deref().unwrap_or(info.perm.title());
+        let asked = info.capability.as_deref().unwrap_or(if info.perm == Permission::Network { "Access the internet" } else { info.perm.title() });
         inner.view.label(cx, ids!(prompt_title)).set_text(cx, &format!(
             "{} \"{}\" wants to: {}",
             info.app_icon, info.app_name, asked,
         ));
         inner.view.widget(cx, ids!(allow_once_button)).set_visible(cx, info.can_allow_once);
-        let once_blurb = if info.can_allow_once { " Allow Once applies only to this request." } else { "" };
-        let blurb = format!(
-            "{} Choose where and for how long to allow it.{once_blurb} Room and space protection rules always take priority.",
-            info.perm.blurb(),
-        );
+        let once_blurb = if info.perm == Permission::Network { "" }
+        else if info.can_allow_once { " Allow once applies only to this request." }
+        else { " Choose where and for how long to allow it below." };
+        // Keep the internet warning before the choices, including Allow once.
+        // The management editor also shows it next to its website controls.
+        inner.view.widget(cx, ids!(scope_editor.network_warning)).set_visible(cx, false);
+        let description = if info.perm == Permission::Network {
+            "This mini-app or agent may send room messages, files or other local data off this device to online services, depending on what it does."
+        } else { info.perm.blurb() };
+        let blurb = format!("{description}{once_blurb}");
         inner.view.label(cx, ids!(prompt_blurb)).set_text(cx, &blurb);
         let reason_text = match (info.agent, info.reason.as_deref()) {
             (true, Some(reason)) => reason.to_string(),
@@ -271,6 +293,7 @@ impl MiniAppPermissionPromptRef {
             }
             None => inner.view.view(cx, ids!(prompt_tool)).set_visible(cx, false),
         }
+        inner.refresh_allow_button(cx);
         inner.view.redraw(cx);
     }
 }
@@ -283,6 +306,13 @@ pub(crate) struct PermissionSelection {
     pub origin_room: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+enum PermissionScopeEditorAction {
+    Changed,
+    #[default]
+    None,
+}
+
 #[derive(Script, ScriptHook, Widget)]
 pub struct PermissionScopeEditor {
     #[deref] view: View,
@@ -291,6 +321,7 @@ pub struct PermissionScopeEditor {
     #[rust] rooms: BTreeSet<String>,
     #[rust] spaces: BTreeSet<String>,
     #[rust] all_rooms: bool,
+    #[rust] targets_expanded: bool,
     #[rust] origin_room: Option<String>,
     #[rust] choose_origin: bool,
     #[rust] session_rooms: Vec<String>,
@@ -305,27 +336,39 @@ impl Widget for PermissionScopeEditor {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
         let Event::Actions(actions) = event else { return };
+        let mut changed = false;
         if let Some(index) = self.view.drop_down(cx, ids!(scope_choice)).changed(actions) {
+            changed = true;
             self.all_rooms = index == 1;
-            self.view.widget(cx, ids!(selected_targets)).set_visible(cx, !self.all_rooms);
+            self.update_target_visibility(cx);
+        }
+        if self.view.button(cx, ids!(choose_targets)).clicked(actions) {
+            changed = true;
+            self.targets_expanded = !self.targets_expanded;
+            self.update_target_visibility(cx);
         }
         if let Some(index) = self.view.drop_down(cx, ids!(duration_choice)).changed(actions) {
+            changed = true;
             self.duration = index;
             self.view.widget(cx, ids!(session_origin_section)).set_visible(cx, self.choose_origin && index == 0);
         }
         if let Some(index) = self.view.drop_down(cx, ids!(session_origin)).changed(actions) {
+            changed = true;
             self.session_origin_index = index;
         }
         if let Some(index) = self.view.drop_down(cx, ids!(network_choice)).changed(actions) {
+            changed = true;
             self.network_kind = index;
             self.view.widget(cx, ids!(network_value)).set_visible(cx, index != 4);
             self.update_network_summary(cx);
         }
         if let Some(value) = self.view.text_input(cx, ids!(network_value)).changed(actions) {
+            changed = true;
             self.network_value = value;
             self.update_network_summary(cx);
         }
         if let Some(filter) = self.view.text_input(cx, ids!(target_filter)).changed(actions) {
+            changed = true;
             let filter = filter.to_lowercase();
             self.filtered = self.targets.iter().enumerate()
                 .filter(|(_, (id, name, _))| name.to_lowercase().contains(&filter) || id.contains(&filter))
@@ -336,13 +379,17 @@ impl Widget for PermissionScopeEditor {
             if let Some(checked) = row.as_check_box().changed(actions)
                 && let Some(&target_index) = self.filtered.get(row_index)
             {
+                changed = true;
                 let (id, _, is_space) = &self.targets[target_index];
                 let selected = if *is_space { &mut self.spaces } else { &mut self.rooms };
                 if checked { selected.insert(id.clone()); } else { selected.remove(id); }
             }
         }
-        self.update_summary(cx);
-        self.view.redraw(cx);
+        if changed {
+            self.update_summary(cx);
+            self.view.redraw(cx);
+            cx.widget_action(self.widget_uid(), PermissionScopeEditorAction::Changed);
+        }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -366,13 +413,32 @@ impl Widget for PermissionScopeEditor {
 }
 
 impl PermissionScopeEditor {
+    fn update_target_visibility(&self, cx: &mut Cx) {
+        self.view.widget(cx, ids!(selected_targets)).set_visible(cx, !self.all_rooms && self.targets_expanded);
+        self.view.widget(cx, ids!(choose_targets)).set_visible(cx, !self.all_rooms);
+        self.view.button(cx, ids!(choose_targets)).set_text(cx, if self.targets_expanded {
+            "Done choosing rooms"
+        } else { "Choose rooms and spaces" });
+    }
+
     fn update_summary(&self, cx: &mut Cx) {
-        let text = if self.targets.is_empty() {
-            "No rooms or spaces are loaded yet.".to_string()
+        let selected = self.targets.iter().filter(|(id, _, space)| {
+            if *space { self.spaces.contains(id) } else { self.rooms.contains(id) }
+        }).map(|(_, name, space)| if *space { format!("{name} (space)") } else { name.clone() }).collect::<Vec<_>>();
+        let text = if self.all_rooms {
+            "Applies in every room and space, including ones you join later.".to_string()
+        } else if selected.is_empty() {
+            "Choose at least one room or space. Selecting a space includes its nested rooms.".to_string()
         } else {
-            format!("{} rooms and {} spaces selected. Spaces include their nested rooms.", self.rooms.len(), self.spaces.len())
+            let mut text = format!("Selected: {}", selected.join(", "));
+            if !self.spaces.is_empty() { text.push_str(". Spaces include their nested rooms."); }
+            text
         };
         self.view.label(cx, ids!(target_summary)).set_text(cx, &text);
+        self.view.widget(cx, ids!(target_empty)).set_visible(cx, self.filtered.is_empty());
+        self.view.label(cx, ids!(target_empty)).set_text(cx, if self.targets.is_empty() {
+            "No rooms or spaces are loaded yet. Open a room and try again."
+        } else { "No rooms or spaces match your search." });
     }
 
     fn network_scope(&self) -> Result<Option<NetworkScope>, String> {
@@ -383,14 +449,20 @@ impl PermissionScopeEditor {
             1 => NetworkScopeKind::Origin,
             2 => NetworkScopeKind::Host,
             3 => NetworkScopeKind::Domain,
-            _ => NetworkScopeKind::AllHosts,
+            _ => return Err("Choose which websites to allow.".into()),
         };
         NetworkScope::from_url(self.network_value.trim(), kind).map(Some)
     }
 
     fn update_network_summary(&self, cx: &mut Cx) {
         let text = match self.network_scope() {
-            Ok(Some(network)) => network_scope_label(&network),
+            Ok(Some(network)) => match &network {
+                NetworkScope::ExactUrl(url) => format!("Only this address: {url}"),
+                NetworkScope::Origin(origin) => format!("Every page at {origin}. Other protocols, ports, and subdomains need separate permission."),
+                NetworkScope::Host(host) => format!("{host} over HTTP or HTTPS, on any port. Subdomains need separate permission."),
+                NetworkScope::Domain(domain) => format!("{domain} and all its subdomains, over HTTP or HTTPS on any port."),
+                NetworkScope::AllHosts => "Any website, including sites this mini-app or agent has not contacted yet.".into(),
+            },
             Ok(None) => String::new(),
             Err(error) => error,
         };
@@ -427,8 +499,9 @@ impl PermissionScopeEditorRef {
         inner.network_value = network_url.unwrap_or("").to_string();
         inner.all_rooms = room_id.is_none() && !policy;
         inner.view.drop_down(cx, ids!(scope_choice)).set_selected_item(cx, usize::from(inner.all_rooms));
-        inner.view.widget(cx, ids!(scope_choice)).set_visible(cx, !policy);
-        inner.view.widget(cx, ids!(selected_targets)).set_visible(cx, !inner.all_rooms);
+        inner.view.widget(cx, ids!(scope_choice_section)).set_visible(cx, !policy);
+        inner.targets_expanded = !inner.all_rooms && (policy || room_id.is_none());
+        inner.update_target_visibility(cx);
         inner.view.text_input(cx, ids!(target_filter)).set_text(cx, "");
         inner.view.portal_list(cx, ids!(targets)).set_first_id_and_scroll(0, 0.0);
         let mut durations = Vec::new();
@@ -436,11 +509,12 @@ impl PermissionScopeEditorRef {
             let name = inner.targets.iter().find(|(id, _, _)| id == origin).map(|(_, name, _)| name.as_str()).unwrap_or(origin);
             durations.push(format!("Until {name} closes"));
         }
-        durations.extend(["Until Robrix closes".to_string(), "Always".to_string()]);
+        durations.extend(["Until Robrix closes".to_string(), "Until I change it".to_string()]);
         inner.view.drop_down(cx, ids!(duration_choice)).set_labels(cx, durations);
         inner.view.drop_down(cx, ids!(duration_choice)).set_selected_item(cx, 0);
         inner.view.widget(cx, ids!(duration_section)).set_visible(cx, !policy);
         inner.view.widget(cx, ids!(network_section)).set_visible(cx, network);
+        inner.view.widget(cx, ids!(network_warning)).set_visible(cx, true);
         inner.view.widget(cx, ids!(network_value)).set_visible(cx, true);
         inner.view.drop_down(cx, ids!(network_choice)).set_selected_item(cx, 0);
         inner.view.text_input(cx, ids!(network_value)).set_text(cx, network_url.unwrap_or(""));
@@ -460,10 +534,11 @@ impl PermissionScopeEditorRef {
         let duration = match (inner.origin_room.is_some() || inner.choose_origin, inner.duration) {
             (true, 0) => GrantDuration::RoomSession,
             (true, 1) | (false, 0) => GrantDuration::RobrixSession,
-            _ => GrantDuration::Always,
+            (true, 2) | (false, 1) => GrantDuration::Always,
+            _ => return Err("Choose how long to keep this permission.".into()),
         };
         let origin_room = if duration == GrantDuration::RoomSession && inner.choose_origin {
-            Some(inner.session_rooms.get(inner.session_origin_index).cloned().ok_or("Choose a source room for the room session.")?)
+            Some(inner.session_rooms.get(inner.session_origin_index).cloned().ok_or("Choose the room that ends this permission when it closes.")?)
         } else { inner.origin_room.clone() };
         Ok(PermissionSelection { scope, duration, network: inner.network_scope()?, origin_room })
     }
@@ -479,7 +554,7 @@ impl PermissionScopeEditorRef {
         inner.view.drop_down(cx, ids!(session_origin)).set_labels(cx, rooms.into_iter().map(|(_, name, _)| name).collect());
         inner.view.drop_down(cx, ids!(session_origin)).set_selected_item(cx, 0);
         inner.view.drop_down(cx, ids!(duration_choice)).set_labels(cx, vec![
-            "Until the source room closes".into(), "Until Robrix closes".into(), "Always".into(),
+            "Until a selected room closes".into(), "Until Robrix closes".into(), "Until I change it".into(),
         ]);
         inner.duration = 1;
         inner.view.drop_down(cx, ids!(duration_choice)).set_selected_item(cx, 1);
@@ -503,7 +578,8 @@ impl PermissionScopeEditorRef {
             inner.filtered = (0..inner.targets.len()).collect();
         }
         inner.view.drop_down(cx, ids!(scope_choice)).set_selected_item(cx, usize::from(inner.all_rooms));
-        inner.view.widget(cx, ids!(selected_targets)).set_visible(cx, !inner.all_rooms);
+        inner.targets_expanded = !inner.all_rooms && inner.rooms.is_empty() && inner.spaces.is_empty();
+        inner.update_target_visibility(cx);
         inner.update_summary(cx);
         inner.view.redraw(cx);
     }
@@ -511,19 +587,19 @@ impl PermissionScopeEditorRef {
 
 pub(crate) fn network_scope_label(scope: &NetworkScope) -> String {
     match scope {
-        NetworkScope::ExactUrl(url) => format!("URL: {url}"),
-        NetworkScope::Origin(origin) => format!("Site: {origin}"),
-        NetworkScope::Host(host) => format!("Host: {host} (any HTTP/S port)"),
-        NetworkScope::Domain(domain) => format!("Domain: {domain} and subdomains (any HTTP/S port)"),
-        NetworkScope::AllHosts => "All internet sites".into(),
+        NetworkScope::ExactUrl(url) => format!("Only this address: {url}"),
+        NetworkScope::Origin(origin) => format!("Website: {origin} (same protocol and port)"),
+        NetworkScope::Host(host) => format!("Host: {host} (HTTP/S, any port)"),
+        NetworkScope::Domain(domain) => format!("Domain: {domain} and subdomains (HTTP/S, any port)"),
+        NetworkScope::AllHosts => "Any website".into(),
     }
 }
 
 pub(crate) fn duration_label(duration: GrantDuration) -> &'static str {
     match duration {
-        GrantDuration::RoomSession => "Until the source room closes",
+        GrantDuration::RoomSession => "Until the starting room closes",
         GrantDuration::RobrixSession => "Until Robrix closes",
-        GrantDuration::Always => "Always",
+        GrantDuration::Always => "Until you change it",
     }
 }
 
@@ -571,4 +647,111 @@ mod tests {
         assert_eq!(selection.network, None, "the previous prompt's internet selection must be discarded");
         assert_eq!(selection.duration, GrantDuration::RobrixSession);
     }
+
+    #[test]
+    fn room_selection_expands_when_needed_and_resets_between_editors() {
+        let (mut cx, editor) = editor();
+        editor.configure(&mut cx, Some("!room:example.org"), None, None, false, false);
+        assert!(!editor.borrow().unwrap().targets_expanded);
+        assert!(editor.borrow().unwrap().view.widget(&cx, ids!(scope_choice_section)).visible());
+        assert!(!editor.borrow().unwrap().view.widget(&cx, ids!(selected_targets)).visible());
+        assert!(editor.borrow().unwrap().view.label(&cx, ids!(target_summary)).text().contains("!room:example.org"));
+
+        editor.configure(&mut cx, None, None, None, false, true);
+        assert!(editor.borrow().unwrap().targets_expanded);
+        assert!(!editor.borrow().unwrap().view.widget(&cx, ids!(scope_choice_section)).visible());
+        assert!(editor.borrow().unwrap().view.widget(&cx, ids!(selected_targets)).visible());
+        assert!(editor.selection().is_err());
+
+        editor.configure(&mut cx, None, None, None, false, false);
+        assert!(editor.borrow().unwrap().view.widget(&cx, ids!(scope_choice_section)).visible());
+        assert!(!editor.borrow().unwrap().view.widget(&cx, ids!(selected_targets)).visible());
+        assert!(editor.borrow().unwrap().view.label(&cx, ids!(target_summary)).text().contains("including ones you join later"));
+    }
+
+    #[test]
+    fn invalid_duration_and_network_choices_never_broaden_permission() {
+        let (mut cx, editor) = editor();
+        editor.configure(&mut cx, Some("!room:example.org"), None, Some("https://example.org/page"), true, false);
+        editor.borrow_mut().unwrap().network_kind = 5;
+        assert!(editor.selection().is_err(), "unknown website scope must never become all websites");
+        editor.borrow_mut().unwrap().network_kind = 0;
+        editor.borrow_mut().unwrap().duration = 2;
+        assert!(editor.selection().is_err(), "unknown duration must never become a permanent grant");
+    }
+
+    #[test]
+    fn prompt_keeps_app_text_plain_and_resets_one_time_approval_visibility() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let prompt = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            crate::shared::script_mod(vm);
+            super::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppPermissionPrompt {} });
+            WidgetRef::script_from_value(vm, value).as_mini_app_permission_prompt()
+        });
+        let mut info = PromptInfo {
+            app_name: "Test mini-app".into(), app_icon: "".into(), perm: Permission::Network,
+            reason: Some("<a href=\"https://example.org\">a claimed reason</a>".into()),
+            capability: None, agent: false,
+            tool: Some(ToolPreview {name: "example".into(), description: "<b>Plain tool text</b>".into(), args: Vec::new()}),
+            room_id: Some("!room:example.org".into()), origin_room_id: None,
+            network_url: Some("https://example.org/page".into()), can_allow_once: true,
+        };
+        prompt.show(&mut cx, &info);
+        assert!(prompt.borrow().unwrap().view.label(&cx, ids!(prompt_reason)).text().contains("<a href="));
+        assert!(prompt.borrow().unwrap().view.label(&cx, ids!(tool_label)).text().contains("<b>Plain tool text</b>"));
+        assert!(prompt.borrow().unwrap().view.widget(&cx, ids!(allow_once_button)).visible());
+        assert!(prompt.borrow().unwrap().view.label(&cx, ids!(prompt_blurb)).text().contains("off this device"));
+        let editor = prompt.borrow().unwrap().view.permission_scope_editor(&cx, ids!(scope_editor));
+        assert!(!editor.borrow().unwrap().view.widget(&cx, ids!(network_warning)).visible(), "the prompt warning must appear only once");
+        info.can_allow_once = false;
+        info.tool = None;
+        prompt.show(&mut cx, &info);
+        assert!(!prompt.borrow().unwrap().view.widget(&cx, ids!(allow_once_button)).visible());
+        assert!(!prompt.borrow().unwrap().view.widget(&cx, ids!(prompt_tool)).visible());
+    }
+
+    #[test]
+    fn scoped_approval_tracks_form_validity_without_disabling_one_time_approval() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let prompt = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            crate::shared::script_mod(vm);
+            super::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppPermissionPrompt {} });
+            WidgetRef::script_from_value(vm, value).as_mini_app_permission_prompt()
+        });
+        let info = PromptInfo {
+            app_name: "Test mini-app".into(), app_icon: String::new(), perm: Permission::Network,
+            reason: None, capability: None, agent: false, tool: None,
+            room_id: None, origin_room_id: None, network_url: None, can_allow_once: true,
+        };
+        prompt.show(&mut cx, &info);
+        let editor = prompt.borrow().unwrap().view.permission_scope_editor(&cx, ids!(scope_editor));
+        let network_input = editor.borrow().unwrap().view.text_input(&cx, ids!(network_value)).widget_uid();
+        let room_scope = editor.borrow().unwrap().view.drop_down(&cx, ids!(scope_choice)).widget_uid();
+        let allow = prompt.borrow().unwrap().view.widget(&cx, ids!(allow_button));
+        let once = prompt.borrow().unwrap().view.widget(&cx, ids!(allow_once_button));
+        assert!(allow.disabled(&cx));
+        assert!(!once.disabled(&cx));
+
+        // Dispatch the same child actions a user edit produces, then the editor's notification.
+        for (text, disabled) in [("https://example.org/page", false), ("not a web address", true), ("https://example.org/page", false)] {
+            let change = cx.capture_actions(|cx| cx.widget_action(network_input, TextInputAction::Changed(text.into())));
+            let notify = cx.capture_actions(|cx| prompt.borrow_mut().unwrap().handle_event(cx, &Event::Actions(change), &mut Scope::empty()));
+            prompt.borrow_mut().unwrap().handle_event(&mut cx, &Event::Actions(notify), &mut Scope::empty());
+            assert_eq!(allow.disabled(&cx), disabled);
+            assert!(!once.disabled(&cx));
+        }
+        for (index, disabled) in [(0, true), (1, false)] {
+            let change = cx.capture_actions(|cx| cx.widget_action(room_scope, DropDownAction::Select(index)));
+            let notify = cx.capture_actions(|cx| prompt.borrow_mut().unwrap().handle_event(cx, &Event::Actions(change), &mut Scope::empty()));
+            prompt.borrow_mut().unwrap().handle_event(&mut cx, &Event::Actions(notify), &mut Scope::empty());
+            assert_eq!(allow.disabled(&cx), disabled, "an empty room selection cannot be approved");
+        }
+        prompt.show(&mut cx, &info);
+        assert!(allow.disabled(&cx), "a new prompt must not keep the previous enabled state");
+    }
+
 }

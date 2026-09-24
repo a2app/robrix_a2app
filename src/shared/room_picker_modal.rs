@@ -44,7 +44,7 @@ script_mod! {
         title := ModalTitle {}
 
         filter_bar := RoomFilterInputBar {
-            input +: { empty_text: "Filter rooms..." }
+            input +: { text_input +: { empty_text: "Filter rooms..." } }
         }
 
         list := PortalList {
@@ -221,14 +221,12 @@ impl RoomPickerModal {
     fn show(&mut self, cx: &mut Cx, content: RoomPickerContent) {
         self.view.label(cx, ids!(title)).set_text(cx, &content.title);
         self.content = content;
-        let input = self.view.text_input(cx, ids!(filter_bar.input));
-        input.set_text(cx, "");
-        self.view.button(cx, ids!(filter_bar.clear_button)).set_visible(cx, false);
+        self.view.room_filter_input_bar(cx, ids!(filter_bar)).clear(cx);
         self.load_rooms(cx, "");
         self.view.portal_list(cx, ids!(list)).set_first_id_and_scroll(0, 0.0);
         self.view.button(cx, ids!(cancel_button)).reset_hover(cx);
         self.view.redraw(cx);
-        input.set_key_focus(cx);
+        self.view.text_input(cx, ids!(filter_bar.input.text_input)).set_key_focus(cx);
     }
 
     fn load_rooms(&mut self, cx: &mut Cx, keywords: &str) {

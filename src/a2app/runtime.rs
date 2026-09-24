@@ -4812,6 +4812,10 @@ fn refresh_ai_room_panel(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
 /// unrestrict) and re-shows the panel with the new state.
 #[cfg(unix)]
 fn apply_ai_room_panel_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomPanelAction) {
+    if matches!(action.command, AiRoomPanelCommand::Close) {
+        ui.modal(cx, ids!(ai_room_panel_modal)).close(cx);
+        return;
+    }
     let Ok(room_id) = OwnedRoomId::try_from(action.room_id.as_str()) else { return };
     let subject = agent_subject(&action.room_id);
     match (action.perm, action.command) {
