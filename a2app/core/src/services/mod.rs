@@ -398,7 +398,6 @@ pub struct PaneState {
     /// `dock`, `tab` or `modal`; `parked` while nothing shows it.
     pub surface: &'static str,
     pub side: Option<PaneSide>,
-    pub minimized: bool,
     pub foreground: bool,
     pub width: f64,
     pub height: f64,
@@ -409,7 +408,6 @@ impl PaneState {
         serde_json::json!({
             "surface": self.surface,
             "side": self.side.map(PaneSide::as_str),
-            "minimized": self.minimized,
             "foreground": self.foreground,
             "width": self.width,
             "height": self.height,
@@ -435,7 +433,6 @@ pub enum HostAction {
     /// The `ui.pane.*` calls, acting on the calling instance's own pane.
     ClosePane,
     SetSide { side: PaneSide },
-    Minimize,
     BreakOut,
 }
 
@@ -936,10 +933,9 @@ impl Broker {
                 Some(pane) => respond(cx, reply, Ok(&pane.to_json().to_string())),
                 None => respond(cx, reply, Err("this instance has no pane")),
             },
-            "ui.pane.close" | "ui.pane.set_side" | "ui.pane.minimize" | "ui.pane.break_out" => {
+            "ui.pane.close" | "ui.pane.set_side" | "ui.pane.break_out" => {
                 let action = match req.service.as_str() {
                     "ui.pane.close" => Ok(HostAction::ClosePane),
-                    "ui.pane.minimize" => Ok(HostAction::Minimize),
                     "ui.pane.break_out" => Ok(HostAction::BreakOut),
                     _ => args["side"].as_str().and_then(PaneSide::from_str)
                         .map(|side| HostAction::SetSide { side })

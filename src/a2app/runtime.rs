@@ -39,12 +39,11 @@ use crate::a2app::host_pane::{MiniAppHostPaneAction, MiniAppHostPaneWidgetRefExt
 use crate::a2app::permission_prompt::{
     MiniAppPermissionPromptWidgetRefExt, PermissionPromptAction, PromptInfo, ToolPreview,
 };
-use crate::a2app::dock::{DockCmd, PaneOp};
+use crate::room::room_pane::{self, RoomPaneKind, RoomPaneOp};
 use crate::a2app::instances::{self, MiniAppInstanceAction, Surface};
 use crate::a2app::matrix::{self, A2AppMatrixRequest, A2AppMatrixResult};
 use crate::a2app::room_watch::{A2AppRoomWatchEvent, RoomWatchKind};
 use crate::a2app::account_watch::{A2AppAccountWatchEvent, AccountWatchKind, ACCOUNT_HOOKS};
-use a2app_core::layout::PaneLayout;
 use crate::app::{AppStateAction, SelectedRoom};
 use crate::home::navigation_tab_bar::NavigationBarAction;
 use crate::home::rooms_list::{RoomsListAction, RoomsListRef};
@@ -1135,7 +1134,7 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
                 host_pane(cx, ui).close_active(cx, true);
                 with_a2app(|state| state.foreground_app = None);
                 ui.modal(cx, ids!(mini_app_host_modal)).close(cx);
-                cx.action(DockCmd::Open { app_id, room_id });
+                open_in_room_pane(cx, app_id, room_id);
             }
             MiniAppHostPaneAction::None => {}
         }
@@ -1229,18 +1228,12 @@ pub(super) fn app_stopped(cx: &mut Cx, app_id: &str) {
     publish_grants(cx);
 }
 
-/// The dock position an instance last had, for its next open.
-pub fn saved_layout(tag: &str) -> PaneLayout {
-    with_a2app(|state| state.persisted.pane_layouts.get(tag).copied())
-        .flatten()
-        .unwrap_or_default()
-}
-
-pub fn remember_layout(tag: &str, layout: PaneLayout) {
-    with_a2app(|state| {
-        state.persisted.pane_layouts.insert(tag.to_string(), layout);
-        state.registry_dirty = true;
-    });
+/// Shows the app's popped-out pane if it has one,
+/// or else docks it in its room's pane if a dock is showing that room.
+fn open_in_room_pane(cx: &mut Cx, app_id: MiniAppId, room_id: OwnedRoomId) {
+    let key = (app_id.clone(), Some(room_id.clone()));
+    let op = if instances::surface_of(&key) == Some(Surface::Tab) { RoomPaneOp::Focus } else { RoomPaneOp::Open };
+    room_pane::request(cx, room_id, RoomPaneKind::MiniApp(app_id), op);
 }
 
 /// Invalidate queued watch events when the OS suspends the app.
@@ -1518,9 +1511,10 @@ fn permission_filtered_hook(app_id: &str, origin: Option<&RoomId>, hook: &str, p
 }
 
 /// Drops every instance of the app, on every surface.
+///
+/// Terminating an instance also removes any room pane showing it.
 fn stop_app_everywhere(cx: &mut Cx, ui: &WidgetRef, app_id: &str) {
     host_pane(cx, ui).drop_app(cx, app_id);
-    cx.action(DockCmd::QuitEverywhere(app_id.to_string()));
     instances::quit_app(cx, app_id);
 }
 
@@ -1567,16 +1561,14 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             match (in_room_pane, room) {
                 // One isolate per (app, room): the target room's dock opens
                 // (or restores) ITS OWN instance, independent of any other.
-                (true, Some(pane_room)) => {
-                    cx.action(DockCmd::Open { app_id, room_id: pane_room });
-                }
+                (true, Some(pane_room)) => open_in_room_pane(cx, app_id, pane_room),
                 (_, room) => {
                     if host_pane(cx, ui).open_app(cx, &manifest, grants, room.clone()) {
                         with_a2app(|state| state.foreground_app = Some(app_id.clone()));
                         ui.modal(cx, ids!(mini_app_host_modal)).open(cx);
                     } else if let Some(room_id) = room {
                         // Shown in a room already: bring that up instead.
-                        cx.action(DockCmd::Open { app_id, room_id });
+                        open_in_room_pane(cx, app_id, room_id);
                     }
                 }
             }
@@ -1593,8 +1585,7 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             host_pane(cx, ui).drop_app(cx, &app_id);
             if instances::terminate(cx, &key) { app_stopped(cx, &app_id); }
             let grants = grants_in_room(&app_id, None);
-            let seed = saved_layout(&instances::tag_of(&key));
-            if instances::ensure_public(cx, &manifest, &grants, seed).is_none() { return; }
+            if instances::ensure_public(cx, &manifest, &grants).is_none() { return; }
             let mut display = manifest;
             display.scope = A2AppScope::Account;
             display.name = format!("{} · Public instance", display.name);
@@ -1604,7 +1595,7 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             }
         }
         A2AppOp::CloseHostPane => {
-            // Close QUITS: keeping apps alive is what minimize is for.
+            // Closing quits the app.
             with_a2app(|state| state.foreground_app = None);
             if let Some((app_id, _)) = host_pane(cx, ui).close_active(cx, false) {
                 app_stopped(cx, &app_id);
@@ -3047,9 +3038,8 @@ fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, heap: usize, action: HostAct
             let room_id = room_of(room)?;
             queue_composer_action(cx, heap, room_id, RoomAction::ReplyTo(event_of(&event_id)?), "host.composer.reply_to")?;
         }
-        HostAction::ClosePane | HostAction::SetSide { .. } | HostAction::Minimize | HostAction::BreakOut => {
+        HostAction::ClosePane | HostAction::SetSide { .. } | HostAction::BreakOut => {
             let key = instances::key_of_heap(heap).ok_or("this instance has no pane")?;
-            let desktop = effective_is_desktop(cx);
             let op = match (&action, instances::surface_of(&key)) {
                 // The caller closes the modal once this answers.
                 (HostAction::ClosePane, Some(Surface::Modal)) => return Ok(()),
@@ -3059,19 +3049,17 @@ fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, heap: usize, action: HostAct
                     }
                     return Ok(());
                 }
-                (HostAction::ClosePane, _) => PaneOp::Close,
+                (HostAction::ClosePane, _) => RoomPaneOp::Close,
                 (HostAction::BreakOut, Some(Surface::Tab)) => return Ok(()),
-                (HostAction::SetSide { side }, Some(Surface::Dock)) => PaneOp::SetSide(*side),
-                (HostAction::Minimize, Some(Surface::Dock)) => PaneOp::Minimize,
-                (HostAction::BreakOut, Some(Surface::Dock)) if desktop => PaneOp::BreakOut,
-                (HostAction::BreakOut, Some(Surface::Dock)) => {
-                    return Err(String::from("breaking out needs the desktop layout"));
+                (HostAction::SetSide { side }, Some(Surface::Dock)) => {
+                    RoomPaneOp::MoveTo(super::room_panes::from_app_side(*side))
                 }
+                (HostAction::BreakOut, Some(Surface::Dock)) => RoomPaneOp::PopOut,
                 _ => return Err(String::from("this instance is not docked in a room")),
             };
             let (app_id, room_id) = key;
             let room_id = room_id.ok_or("this instance is not docked in a room")?;
-            cx.action(DockCmd::Pane { app_id, room_id, op });
+            room_pane::request(cx, room_id, RoomPaneKind::MiniApp(app_id), op);
         }
     }
     Ok(())

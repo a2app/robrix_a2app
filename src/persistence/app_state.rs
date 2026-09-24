@@ -3,7 +3,7 @@ use std::io::Write;
 use makepad_widgets::*;
 use serde::{self, Deserialize, Serialize};
 use matrix_sdk::ruma::{OwnedUserId, UserId};
-use crate::{app::AppState, app_data_dir, persistence::persistent_state_dir};
+use crate::{app::{AppState, SelectedRoom}, app_data_dir, persistence::persistent_state_dir, room::room_pane::RoomPaneKind};
 
 const LATEST_APP_STATE_FILE_NAME: &str = "latest_app_state.json";
 
@@ -107,7 +107,14 @@ pub fn save_app_state(app_state: AppState, user_id: OwnedUserId) -> anyhow::Resu
 
 /// Serializes the current app state into the same format used by [`save_app_state`].
 pub fn serialize_app_state(app_state: &AppState) -> anyhow::Result<Vec<u8>> {
-    Ok(serde_json::to_vec(app_state)?)
+    // Popped-out mini-apps don't outlive a restart, and builds without mini-apps can't read their tabs.
+    let mut app_state = app_state.clone();
+    for saved in std::iter::once(&mut app_state.saved_dock_state_home)
+        .chain(app_state.saved_dock_state_per_space.values_mut())
+    {
+        saved.remove_tabs(|room| matches!(room, SelectedRoom::RoomPane { kind: RoomPaneKind::MiniApp(_), .. }));
+    }
+    Ok(serde_json::to_vec(&app_state)?)
 }
 
 /// Save pre-serialized app state bytes to persistent storage.

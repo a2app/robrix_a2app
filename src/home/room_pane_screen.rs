@@ -1,17 +1,17 @@
-//! A room's pane (e.g., its member list) that was popped out of its room
+//! A room's pane (e.g., its member list or a mini-app) that was popped out of its room
 //! into its own dock tab (desktop) or stack view (mobile).
 
 use makepad_widgets::*;
 use matrix_sdk_ui::sync_service::State as SyncServiceState;
 
 use crate::{
-    app::AppStateAction,
-    home::rooms_list_header::RoomsListHeaderAction,
+    app::{AppStateAction, SelectedRoom},
+    home::{rooms_list::RoomsListAction, rooms_list_header::RoomsListHeaderAction},
     profile::user_profile::UserProfileSlidingPaneWidgetExt,
     room::{
         room_members_list::{RoomMembersChanged, RoomMembersFetchAction, RoomMembersListAction, RoomMembersListWidgetRefExt, show_member_profile},
-        pane_dock::set_pane_title,
-        room_pane::RoomPaneKind,
+        pane_dock::{set_pane_icon, set_pane_title},
+        room_pane::{RoomPaneKind, RoomPaneOp, RoomPaneRequest, mini_app_panes},
     },
     sliding_sync::{MatrixRequest, submit_async_request},
     utils::RoomNameId,
@@ -56,6 +56,7 @@ script_mod! {
                 width: Fill, height: Fill
                 flow: Down
                 room_members := mod.widgets.RoomMembersList { visible: false }
+                mini_app_host := mod.widgets.MiniAppHostArea { visible: false }
             }
         }
 
@@ -73,6 +74,12 @@ pub enum RoomPaneScreenAction {
         room_name_id: RoomNameId,
         kind: RoomPaneKind,
     },
+    /// This pane's content went away (e.g., its mini-app was closed),
+    /// so its tab or view should be closed.
+    Closed {
+        room_name_id: RoomNameId,
+        kind: RoomPaneKind,
+    },
     #[default]
     None,
 }
@@ -82,6 +89,15 @@ pub struct RoomPaneScreen {
     #[deref] view: View,
     /// The room and kind of pane being displayed.
     #[rust] displayed: Option<(RoomNameId, RoomPaneKind)>,
+    /// Whether this screen let go of its mini-app (e.g., to return it to its room),
+    /// such that it must not show or quit it again.
+    #[rust] is_vacated: bool,
+}
+
+impl Drop for RoomPaneScreen {
+    fn drop(&mut self) {
+        mini_app_panes::release_all_shown_by(self.widget_uid());
+    }
 }
 
 impl Widget for RoomPaneScreen {
@@ -97,6 +113,15 @@ impl Widget for RoomPaneScreen {
                     && room_name_id.room_id() == new_name.room_id()
                 {
                     self.set_displayed(cx, new_name, kind);
+                }
+
+                if let Some(RoomPaneRequest { room_id, kind, op }) = action.downcast_ref()
+                    && let Some((room_name_id, displayed_kind)) = self.displayed.clone()
+                    && room_name_id.room_id() == room_id
+                    && &displayed_kind == kind
+                    && !self.is_vacated
+                {
+                    self.handle_request(cx, room_name_id, displayed_kind, *op);
                 }
 
                 // Without a timeline, we fetch this room's members ourselves.
@@ -149,41 +174,109 @@ impl Widget for RoomPaneScreen {
         let return_clicked = self.view.button(cx, ids!(return_button)).clicked(&unhandled);
         cx.extend_actions(unhandled);
 
+        // Whoever handles this also calls `vacate()`, once it's sure to return the pane to its room.
         if return_clicked && let Some((room_name_id, kind)) = self.displayed.clone() {
             cx.widget_action(self.widget_uid(), RoomPaneScreenAction::ReturnToRoom { room_name_id, kind });
         }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        self.view.draw_walk(cx, scope, walk)
+        let step = self.view.draw_walk(cx, scope, walk);
+        if let Some((room_name_id, RoomPaneKind::MiniApp(app_id))) = self.displayed.as_ref()
+            && !self.is_vacated
+        {
+            let host_area = self.view.widget(cx, ids!(content.mini_app_host));
+            mini_app_panes::note_size(&host_area, room_name_id.room_id(), app_id);
+        }
+        step
     }
 }
 
 impl RoomPaneScreen {
-    /// Displays the given kind of pane for the given room.
-    ///
-    /// Call this again with the same room whenever its name changes.
-    pub fn set_displayed(&mut self, cx: &mut Cx, room_name_id: &RoomNameId, kind: RoomPaneKind) {
+    /// Displays the given kind of pane for the given room; call it again whenever the room's name changes.
+    /// Returns false (and emits `Closed`) if its mini-app isn't running or is shown elsewhere.
+    pub fn set_displayed(&mut self, cx: &mut Cx, room_name_id: &RoomNameId, kind: RoomPaneKind) -> bool {
         let is_same = self.displayed.as_ref()
             .is_some_and(|(r, k)| r.room_id() == room_name_id.room_id() && *k == kind);
         let members = self.view.child_by_path(ids!(content.room_members)).as_room_members_list();
         if !is_same {
-            self.view.user_profile_sliding_pane(cx, ids!(user_profile_sliding_pane)).reset(cx);
-            members.reset(cx);
+            self.hide_displayed(cx);
         }
-        set_pane_title(cx, &self.view.widget(cx, ids!(title_row)), kind.title());
+        let title_row = self.view.widget(cx, ids!(title_row));
+        set_pane_title(cx, &title_row, &kind.title());
+        set_pane_icon(cx, &title_row, &kind);
         self.view.label(cx, ids!(pane_room)).set_text(cx, &room_name_id.to_string());
         let members_widget = self.view.child_by_path(ids!(content.room_members));
         members_widget.set_visible(cx, kind == RoomPaneKind::Members);
-        self.displayed = Some((room_name_id.clone(), kind));
-        match kind {
+        let host_area = self.view.widget(cx, ids!(content.mini_app_host));
+        host_area.set_visible(cx, matches!(kind, RoomPaneKind::MiniApp(_)));
+        self.displayed = Some((room_name_id.clone(), kind.clone()));
+        match &kind {
             // Also re-fetch upon re-showing, in case we missed changes while hidden.
             RoomPaneKind::Members => {
                 members.set_members(cx, room_name_id, None);
                 self.fetch_members(false);
             }
+            RoomPaneKind::MiniApp(app_id) => {
+                // A vacated screen is about to close, so it must not take its app back.
+                let room_id = room_name_id.room_id();
+                if !self.is_vacated
+                    && !mini_app_panes::is_shown_by(room_id, app_id, self.widget_uid())
+                    && !mini_app_panes::attach(cx, &host_area, self.widget_uid(), room_id, app_id, None, false)
+                {
+                    self.is_vacated = true;
+                    cx.widget_action(self.widget_uid(), RoomPaneScreenAction::Closed { room_name_id: room_name_id.clone(), kind });
+                    return false;
+                }
+            }
         }
         self.redraw(cx);
+        true
+    }
+
+    /// Applies a request to this screen's pane, e.g., from its mini-app asking to be closed.
+    fn handle_request(&mut self, cx: &mut Cx, room_name_id: RoomNameId, kind: RoomPaneKind, op: RoomPaneOp) {
+        match op {
+            RoomPaneOp::Close | RoomPaneOp::Remove => {
+                self.detach_mini_app(cx, matches!(op, RoomPaneOp::Close));
+                self.is_vacated = true;
+                cx.widget_action(self.widget_uid(), RoomPaneScreenAction::Closed { room_name_id, kind });
+            }
+            RoomPaneOp::Focus => {
+                cx.widget_action(self.widget_uid(), RoomsListAction::Selected(SelectedRoom::RoomPane { room_name_id, kind }));
+            }
+            RoomPaneOp::Open | RoomPaneOp::MoveTo(_) | RoomPaneOp::PopOut => {}
+        }
+    }
+
+    /// Stops showing this screen's mini-app, if any, and either quits or parks it.
+    fn detach_mini_app(&mut self, cx: &mut Cx, is_quitting: bool) {
+        if let Some((room_name_id, RoomPaneKind::MiniApp(app_id))) = self.displayed.as_ref() {
+            let host_area = self.view.widget(cx, ids!(content.mini_app_host));
+            mini_app_panes::detach(cx, &host_area, self.widget_uid(), room_name_id.room_id(), app_id, is_quitting);
+        }
+    }
+
+    /// Lets go of this screen's mini-app, if any, so it can be docked in its room again.
+    pub fn vacate(&mut self, cx: &mut Cx) {
+        self.detach_mini_app(cx, false);
+        self.is_vacated = true;
+    }
+
+    /// Closes this screen's content for good: its mini-app, if any, is quit.
+    pub fn close_content(&mut self, cx: &mut Cx) {
+        if self.is_vacated {
+            return;
+        }
+        if let Some((room_name_id, RoomPaneKind::MiniApp(app_id))) = self.displayed.clone() {
+            if mini_app_panes::is_shown_by(room_name_id.room_id(), &app_id, self.widget_uid()) {
+                self.detach_mini_app(cx, true);
+            } else {
+                // E.g., a mobile view whose app was parked while another screen covered it.
+                mini_app_panes::quit_if_parked(cx, room_name_id.room_id(), &app_id);
+            }
+        }
+        self.is_vacated = true;
     }
 
     /// Fetches the displayed room's members.
@@ -196,19 +289,38 @@ impl RoomPaneScreen {
         }
     }
 
-    /// Stops displaying this screen's pane.
+    /// Stops displaying this screen's pane. Its mini-app, if any, is parked.
     pub fn hide_displayed(&mut self, cx: &mut Cx) {
+        self.detach_mini_app(cx, false);
         self.view.user_profile_sliding_pane(cx, ids!(user_profile_sliding_pane)).reset(cx);
         self.view.child_by_path(ids!(content.room_members)).as_room_members_list().reset(cx);
         self.displayed = None;
+        self.is_vacated = false;
     }
 }
 
 impl RoomPaneScreenRef {
     /// See [`RoomPaneScreen::set_displayed()`].
-    pub fn set_displayed(&self, cx: &mut Cx, room_name_id: &RoomNameId, kind: RoomPaneKind) {
+    pub fn set_displayed(&self, cx: &mut Cx, room_name_id: &RoomNameId, kind: RoomPaneKind) -> bool {
+        self.borrow_mut().is_some_and(|mut inner| inner.set_displayed(cx, room_name_id, kind))
+    }
+
+    /// Returns whether this screen was given a pane to display.
+    pub fn is_displaying(&self) -> bool {
+        self.borrow().is_some_and(|inner| inner.displayed.is_some())
+    }
+
+    /// See [`RoomPaneScreen::vacate()`].
+    pub fn vacate(&self, cx: &mut Cx) {
         if let Some(mut inner) = self.borrow_mut() {
-            inner.set_displayed(cx, room_name_id, kind);
+            inner.vacate(cx);
+        }
+    }
+
+    /// See [`RoomPaneScreen::close_content()`].
+    pub fn close_content(&self, cx: &mut Cx) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.close_content(cx);
         }
     }
 

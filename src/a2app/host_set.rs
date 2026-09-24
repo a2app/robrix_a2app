@@ -150,8 +150,7 @@ impl MiniAppHostAreaRef {
     }
 }
 
-/// The DSL templates a host surface instantiates at runtime (`AppHost`,
-/// and the dock's `PaneFrame` / `Chip`).
+/// The DSL templates a host surface instantiates at runtime (e.g., `AppHost`).
 #[derive(Default)]
 pub struct Templates {
     templates: HashMap<LiveId, ScriptObjectRef>,

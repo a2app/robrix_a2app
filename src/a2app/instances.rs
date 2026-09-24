@@ -2,8 +2,8 @@
 //! owned here so a pane, tab or modal only ever borrows one to draw it.
 //!
 //! Surfaces `adopt` an instance to show it and `release` it when they go
-//! away; the isolate, its script state and its pane layout survive room
-//! switches, tab closes and view-mode changes. Only the explicit quit paths
+//! away; the isolate and its script state survive room switches, tab
+//! closes and view-mode changes. Only the explicit quit paths
 //! tear an instance down. Parked hosts stay linked under the widget-tree
 //! root so their scripts' `ui.*` calls keep resolving.
 
@@ -15,9 +15,10 @@ use makepad_widgets::*;
 use makepad_widgets::widget_async::gc_dead_splash_isolates;
 use matrix_sdk::ruma::{OwnedRoomId, RoomId};
 
-use a2app_core::layout::PaneLayout;
+use a2app_core::layout::PaneSide;
 use a2app_core::manifest::{instance_tag, MiniAppId, MiniAppManifest};
 use a2app_core::services::PaneState;
+use crate::room::room_pane::{self, RoomPaneKind, RoomPaneOp};
 
 /// `(app, room)`; `None` is a room-less app in the host modal.
 pub type InstanceKey = (MiniAppId, Option<OwnedRoomId>);
@@ -49,7 +50,8 @@ struct MiniAppInstance {
     /// Content size the script was last told about.
     last_size: Vec2d,
     pending_resize: Option<Vec2d>,
-    layout: PaneLayout,
+    /// The side it's docked to, while it's shown by a dock.
+    side: PaneSide,
     /// The surface drawing it; `None` while parked.
     shown_by: Option<WidgetUid>,
     surface: Option<Surface>,
@@ -59,12 +61,9 @@ struct MiniAppInstance {
 }
 
 impl MiniAppInstance {
+    /// Whether a pane, tab or modal shows this instance.
     fn foreground(&self) -> bool {
-        match self.surface {
-            Some(Surface::Dock) => !self.layout.minimized,
-            Some(_) => true,
-            None => false,
-        }
+        self.surface.is_some()
     }
 }
 
@@ -81,7 +80,6 @@ struct Registry {
     instances: HashMap<InstanceKey, MiniAppInstance>,
     needs_anchor: bool,
     has_pending_resize: bool,
-    pending_prompt_updates: Vec<InstanceKey>,
     /// Surface and focus hooks owed to instances; payloads are built at
     /// flush time, so a burst of changes is one call with the final state.
     pending_hooks: Vec<(InstanceKey, LiveId)>,
@@ -194,31 +192,29 @@ fn spawn(cx: &mut Cx, manifest: &MiniAppManifest, _grants: &[String], key: &Inst
 }
 
 /// The host for `key`, creating its isolate if it isn't running yet.
-/// `seed` is the layout a brand-new instance starts with.
 pub fn ensure(
     cx: &mut Cx,
     key: &InstanceKey,
     manifest: &MiniAppManifest,
     grants: &[String],
-    seed: PaneLayout,
 ) -> Option<WidgetRef> {
-    ensure_mode(cx, key, manifest, grants, seed, false, false)
+    ensure_mode(cx, key, manifest, grants, false, false)
 }
 
 /// Starts an isolated public worker with no room/account read clearance.
 ///
 /// Callers must release an existing standalone private instance first.
-pub fn ensure_public(cx: &mut Cx, manifest: &MiniAppManifest, grants: &[String], seed: PaneLayout) -> Option<WidgetRef> {
+pub fn ensure_public(cx: &mut Cx, manifest: &MiniAppManifest, grants: &[String]) -> Option<WidgetRef> {
     let account = super::information_flow::account().ok()?;
     let expected = a2app_core::information_flow::ContextId::PublicApp { account, app: manifest.id.clone() };
     if context_of_key(&(manifest.id.clone(), None)).is_some_and(|context| context != expected) { return None; }
-    ensure_mode(cx, &(manifest.id.clone(), None), manifest, grants, seed, true, false)
+    ensure_mode(cx, &(manifest.id.clone(), None), manifest, grants, true, false)
 }
 
 /// Background creation configures prompt suppression before evaluating source.
 /// Existing foreground instances are reused without resetting their state.
-pub fn ensure_background(cx: &mut Cx, key: &InstanceKey, manifest: &MiniAppManifest, grants: &[String], seed: PaneLayout) -> Option<WidgetRef> {
-    ensure_mode(cx, key, manifest, grants, seed, false, true)
+pub fn ensure_background(cx: &mut Cx, key: &InstanceKey, manifest: &MiniAppManifest, grants: &[String]) -> Option<WidgetRef> {
+    ensure_mode(cx, key, manifest, grants, false, true)
 }
 
 pub fn set_background_running(cx: &mut Cx, key: &InstanceKey, running: bool) {
@@ -241,7 +237,7 @@ fn refresh_prompt_state(cx: &mut Cx, key: &InstanceKey) {
     if let Some(running) = running { set_background_running(cx, key, running); }
 }
 
-fn ensure_mode(cx: &mut Cx, key: &InstanceKey, manifest: &MiniAppManifest, grants: &[String], seed: PaneLayout, public: bool, background: bool) -> Option<WidgetRef> {
+fn ensure_mode(cx: &mut Cx, key: &InstanceKey, manifest: &MiniAppManifest, grants: &[String], public: bool, background: bool) -> Option<WidgetRef> {
     if let Some(host) = host_of(key) {
         return Some(host);
     }
@@ -256,7 +252,7 @@ fn ensure_mode(cx: &mut Cx, key: &InstanceKey, manifest: &MiniAppManifest, grant
             alive: Arc::new(AtomicBool::new(true)),
             last_size: Vec2d::default(),
             pending_resize: None,
-            layout: seed,
+            side: PaneSide::default(),
             shown_by: None,
             surface: None,
             anchored: true,
@@ -353,8 +349,7 @@ pub fn pane_state(heap_key: usize) -> Option<PaneState> {
         let inst = r.instances.values().find(|i| i.heap_key == Some(heap_key))?;
         Some(PaneState {
             surface: inst.surface.map_or("parked", Surface::as_str),
-            side: (inst.surface == Some(Surface::Dock)).then_some(inst.layout.side),
-            minimized: inst.surface == Some(Surface::Dock) && inst.layout.minimized,
+            side: (inst.surface == Some(Surface::Dock)).then_some(inst.side),
             foreground: inst.foreground(),
             width: inst.last_size.x,
             height: inst.last_size.y,
@@ -399,27 +394,26 @@ pub fn context_of_key(key: &InstanceKey) -> Option<a2app_core::information_flow:
     with_registry(|r| r.instances.get(key).map(|i| i.flow_context.clone()))
 }
 
-pub fn layout(key: &InstanceKey) -> PaneLayout {
-    with_registry(|r| r.instances.get(key).map(|i| i.layout)).unwrap_or_default()
-}
-
-pub fn set_layout(key: &InstanceKey, layout: PaneLayout) {
+/// Records the side of the dock that shows the instance.
+pub fn set_side(key: &InstanceKey, side: PaneSide) {
     with_registry(|r| {
         if let Some(inst) = r.instances.get_mut(key) {
-            inst.layout = layout;
-            if !r.pending_prompt_updates.contains(key) { r.pending_prompt_updates.push(key.clone()); }
+            inst.side = side;
         }
     });
 }
 
-/// Apps with an instance in `room`, sorted so adoption order is stable.
-pub fn apps_in_room(room: &RoomId) -> Vec<MiniAppId> {
-    let mut apps: Vec<MiniAppId> = with_registry(|r| {
-        r.instances.keys()
-            .filter(|(_, r)| r.as_deref() == Some(room))
-            .map(|(app, _)| app.clone())
+/// Apps with an instance in `room` that no surface shows and no background task runs,
+/// sorted so their order is stable.
+pub fn parked_apps_in_room(room: &RoomId) -> Vec<MiniAppId> {
+    let mut keys: Vec<InstanceKey> = with_registry(|r| {
+        r.instances.iter()
+            .filter(|((_, r), inst)| r.as_deref() == Some(room) && inst.shown_by.is_none())
+            .map(|(key, _)| key.clone())
             .collect()
     });
+    keys.retain(|key| !super::background::retains_instance(key));
+    let mut apps: Vec<MiniAppId> = keys.into_iter().map(|(app, _)| app).collect();
     apps.sort();
     apps
 }
@@ -462,6 +456,10 @@ pub fn terminate(cx: &mut Cx, key: &InstanceKey) -> bool {
     drop(instance);
     gc(cx);
     super::background::changed();
+    // Any pane still showing this instance must let go of it.
+    if let Some(room_id) = key.1.clone() {
+        room_pane::request(cx, room_id, RoomPaneKind::MiniApp(key.0.clone()), RoomPaneOp::Remove);
+    }
     !is_running(&key.0)
 }
 
@@ -515,8 +513,6 @@ pub fn note_size(key: &InstanceKey, size: Vec2d) {
 /// Event-time housekeeping: re-anchors hosts whose surface died and
 /// delivers queued `on_app_resize` calls.
 pub fn flush_pending(cx: &mut Cx) {
-    let prompt_updates = with_registry(|registry| std::mem::take(&mut registry.pending_prompt_updates));
-    for key in prompt_updates { refresh_prompt_state(cx, &key); }
     let (to_anchor, resizes, hooks) = with_registry(|r| {
         if !r.needs_anchor && !r.has_pending_resize && r.pending_hooks.is_empty() {
             return (Vec::new(), Vec::new(), Vec::new());
@@ -542,7 +538,7 @@ pub fn flush_pending(cx: &mut Cx) {
                 } else {
                     serde_json::json!({
                         "surface": inst.surface.map_or("parked", Surface::as_str),
-                        "side": (inst.surface == Some(Surface::Dock)).then(|| inst.layout.side.as_str()),
+                        "side": (inst.surface == Some(Surface::Dock)).then(|| inst.side.as_str()),
                     })
                 };
                 Some((inst.host.clone(), hook, payload.to_string()))

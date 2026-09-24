@@ -62,7 +62,7 @@ fn cost_of(service: &str) -> f64 {
         // Steer Robrix itself: a pane, a room switch, the composer.
         "nav.room" | "nav.event" | "nav.thread" | "nav.user" | "nav.space" | "nav.screen"
         | "nav.link" | "nav.app" | "composer.insert" | "composer.reply_to"
-        | "ui.pane.close" | "ui.pane.set_side" | "ui.pane.minimize" | "ui.pane.break_out" => 8.0,
+        | "ui.pane.close" | "ui.pane.set_side" | "ui.pane.break_out" => 8.0,
         // Unknown services are refused upstream; price them like the worst.
         _ => 8.0,
     }

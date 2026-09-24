@@ -37,9 +37,8 @@ pub mod mini_apps_screen;
 pub mod room_app_picker;
 /// The runtime permission prompt modal.
 pub mod permission_prompt;
-/// The in-room mini-app pane docked beside a room's timeline.
-pub mod dock;
-pub mod tab_screen;
+/// Mini-apps shown as room panes, docked around a room's timeline or popped out.
+pub mod room_panes;
 /// State ownership and per-event-pass processing.
 pub mod runtime;
 /// The matrix services a mini-app can call, run on the worker.
@@ -60,8 +59,6 @@ pub fn script_mod(vm: &mut ScriptVm) {
     ai_room_events::script_mod(vm);
     ai_room_panel::script_mod(vm);
     host_pane::script_mod(vm);
-    dock::script_mod(vm);
-    tab_screen::script_mod(vm);
     timeline_card::script_mod(vm);
     mini_apps_screen::script_mod(vm);
     room_app_picker::script_mod(vm);

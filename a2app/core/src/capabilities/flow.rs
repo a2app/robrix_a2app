@@ -63,7 +63,7 @@ pub fn contract(id: &str) -> Option<FlowContract> {
         "permissions.query" | "permissions.request" | "storage.file.read"
         | "storage.file.write" | "storage.quota.read" | "timer.schedule"
         | "events.subscribe" | "events.unsubscribe" | "ui.pane.read"
-        | "ui.pane.close" | "ui.pane.set_side" | "ui.pane.minimize"
+        | "ui.pane.close" | "ui.pane.set_side"
         | "ui.pane.break_out" | "notifications.post" | "notifications.clear"
         | "on_app_resize" | "on_permissions_changed" | "on_focus_changed"
         | "on_surface_changed" | "background.complete" | "on_background"

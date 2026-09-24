@@ -191,8 +191,7 @@ impl MiniAppHostPaneRef {
         let uid = inner.widget_uid();
         let room = room.or_else(|| scope_room(manifest));
         let key: InstanceKey = (manifest.id.clone(), room);
-        let seed = crate::a2app::runtime::saved_layout(&instances::tag_of(&key));
-        if instances::ensure(cx, &key, manifest, &grants, seed).is_none() {
+        if instances::ensure(cx, &key, manifest, &grants).is_none() {
             return false;
         }
         let Some(host) = instances::adopt(cx, &key, uid, Surface::Modal) else { return false };

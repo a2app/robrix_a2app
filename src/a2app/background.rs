@@ -313,8 +313,7 @@ fn prepare(cx: &mut Cx, job: &Job) -> Result<(InstanceKey, usize, ContextId, u64
     if instances::context_of_key(&key).is_some_and(|current| current != context) {
         return Err("A different account or public instance currently owns this mini-app surface. Close it before starting the private background context.".into());
     }
-    let layout = super::runtime::saved_layout(&instances::tag_of(&key));
-    instances::ensure_background(cx, &key, &manifest, &[], layout).ok_or("The background mini-app could not start.")?;
+    instances::ensure_background(cx, &key, &manifest, &[]).ok_or("The background mini-app could not start.")?;
     match (instances::heap_of(&key), flow::context_epoch(&context)) {
         (Some(heap), Ok(epoch)) => Ok((key, heap, context, epoch)),
         _ => { terminate_instance(cx, &key); Err("The background mini-app has no live protected script.".into()) }
@@ -645,7 +644,7 @@ View{width: Fill height: Fill}
         assert!(!snapshot().unwrap()[0].status.contains("unrelated"));
         assert!(!with_a2app(|state| state.permissions.has_once(&key.0, a2app_core::permissions::Permission::Notifications)).unwrap(), "legacy one-time grants expire with the final hidden isolate");
         let manifest = with_a2app(|state| state.registry.get(&fixture.binding.app_id).cloned()).flatten().unwrap();
-        instances::ensure(&mut fixture.cx, &key, &manifest, &[], Default::default()).unwrap();
+        instances::ensure(&mut fixture.cx, &key, &manifest, &[]).unwrap();
         makepad_widgets::splash_host::take_splash_host_requests();
         let heap = instances::heap_of(&key).unwrap();
         let owner = WidgetUid(444);
@@ -672,7 +671,7 @@ View{width: Fill height: Fill}
         let old_heap = instances::heap_of(&key).unwrap();
         let old_run = snapshot().unwrap()[0].job.in_flight.clone().unwrap().run_id;
         let manifest = with_a2app(|state| state.registry.get(&fixture.binding.app_id).cloned()).flatten().unwrap();
-        assert!(instances::ensure_public(&mut fixture.cx, &manifest, &[], Default::default()).is_none(), "a public launch must never reuse a private background heap");
+        assert!(instances::ensure_public(&mut fixture.cx, &manifest, &[]).is_none(), "a public launch must never reuse a private background heap");
         lifecycle(&mut fixture.cx, false);
         assert!(instances::heap_of(&key).is_none(), "OS suspension also retires idle scheduled scripts");
         process(&mut fixture.cx, &Event::Signal);
@@ -695,7 +694,7 @@ View{width: Fill height: Fill}
         assert!(complete(&mut fixture.cx, heap, run.run_id, true).is_err());
         let id = fixture.enable();
         let manifest = with_a2app(|state| state.registry.get(&fixture.binding.app_id).cloned()).flatten().unwrap();
-        instances::ensure_background(&mut fixture.cx, &key, &manifest, &[], Default::default()).unwrap();
+        instances::ensure_background(&mut fixture.cx, &key, &manifest, &[]).unwrap();
         set_enabled(&mut fixture.cx, id, false, fixture.fingerprint.clone()).unwrap();
         assert!(instances::heap_of(&key).is_none(), "Pause also terminates a currently idle app");
     }

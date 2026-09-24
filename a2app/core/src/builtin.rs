@@ -178,7 +178,7 @@ fn reasons_for(id: &str) -> std::collections::BTreeMap<String, String> {
             ("robrix-navigation", "Opens the DM you already have with a user you look up."),
         ],
         "inspector" => &[
-            ("robrix-ui", "Moves, minimizes, breaks out or closes its own pane when you tap."),
+            ("robrix-ui", "Moves, pops out or closes its own pane when you tap."),
             ("robrix-preferences", "Shows Robrix's display settings and follows changes to them."),
             ("robrix-observe", "Logs which room and screen you switch to, so you can see what an app would see."),
             ("device-info", "Shows what this device reports about itself."),

@@ -76,7 +76,7 @@ pub enum Permission {
     RobrixNavigation,
     /// Put a draft in this room's message box for you to review and send. Nothing is sent by the 
     RobrixComposer,
-    /// Resize, move, minimize or break out its pane, badge its tab, and ask for keyboard focus.
+    /// Resize, move or pop out its pane, badge its tab, and ask for keyboard focus.
     RobrixUi,
     /// Know display settings like view mode, zoom and theme so the app can match Robrix.
     RobrixPreferences,
@@ -372,7 +372,7 @@ impl Permission {
             Permission::MatrixSpaces => "See your spaces and the rooms inside them.",
             Permission::RobrixNavigation => "Take you to a room, message, thread, person, space, screen or another mini-app.",
             Permission::RobrixComposer => "Put a draft in this room's message box for you to review and send. Nothing is sent by the app.",
-            Permission::RobrixUi => "Resize, move, minimize or break out its pane, badge its tab, and ask for keyboard focus.",
+            Permission::RobrixUi => "Resize, move or pop out its pane, badge its tab, and ask for keyboard focus.",
             Permission::RobrixPreferences => "Know display settings like view mode, zoom and theme so the app can match Robrix.",
             Permission::RobrixObserve => "Be told which room or screen you switch to.",
             Permission::AppGeneration => "Run the AI app-builder here. It spends your provider's usage and installs a new sandboxed app into this room.",

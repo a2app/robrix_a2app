@@ -3,7 +3,7 @@
 // tint: #546E7A
 // description: What Robrix tells a mini-app about its pane, settings and device.
 // permissions: robrix-ui, robrix-preferences, robrix-observe, device-info
-// why-robrix-ui: Moves, minimizes, breaks out or closes its own pane when you tap.
+// why-robrix-ui: Moves, pops out or closes its own pane when you tap.
 // why-robrix-preferences: Shows Robrix's display settings and follows changes to them.
 // why-robrix-observe: Logs which room and screen you switch to, so you can see what an app would see.
 // why-device-info: Shows what this device reports about itself.
@@ -36,7 +36,7 @@ fn show_pane(){
     let side = pane.side
     if side.is_nil() { side = "none" }
     ui.pane_line.set_text(pane.surface + " · side " + side + " · " + floor(pane.width) + "×" + floor(pane.height))
-    ui.pane_state.set_text("foreground " + yes_no(pane.foreground) + " · minimized " + yes_no(pane.minimized))
+    ui.pane_state.set_text("foreground " + yes_no(pane.foreground))
 }
 
 fn read_pane(){
@@ -187,8 +187,7 @@ View{
                 Button{ text: "Bottom" on_click: || pane_call("ui.pane.set_side", {side: "bottom"}) draw_text +: { color: #x1C274C } }
                 Button{ text: "Left" on_click: || pane_call("ui.pane.set_side", {side: "left"}) draw_text +: { color: #x1C274C } }
                 Button{ text: "Right" on_click: || pane_call("ui.pane.set_side", {side: "right"}) draw_text +: { color: #x1C274C } }
-                Button{ text: "Minimize" on_click: || pane_call("ui.pane.minimize", nil) draw_text +: { color: #x1C274C } }
-                Button{ text: "Break out" on_click: || pane_call("ui.pane.break_out", nil) draw_text +: { color: #x1C274C } }
+                Button{ text: "Pop out" on_click: || pane_call("ui.pane.break_out", nil) draw_text +: { color: #x1C274C } }
                 Button{ text: "Close app" on_click: || pane_call("ui.pane.close", nil) draw_text +: { color: #xB91C1C } }
             }
         }

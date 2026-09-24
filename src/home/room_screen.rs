@@ -749,11 +749,7 @@ script_mod! {
                 // surrounded by any of this room's panes that are docked around it.
                 room_pane_dock := mod.widgets.RoomPaneDock {
                     body +: { mid +: { center +: {
-                        mini_app_dock := mod.widgets.MiniAppDock {
-                            app_body +: { app_mid +: { app_center +: {
-                                timeline := mod.widgets.Timeline { }
-                            }}}
-                        }
+                        timeline := mod.widgets.Timeline { }
                     }}}
                 }
 
@@ -3848,7 +3844,7 @@ impl RoomScreen {
         if self.is_loaded
             && let Some(tl) = self.tl_state.as_ref()
             && !timeline_state_store::is_invalidated(&tl.kind)
-            && self.view.room_pane_dock(cx, ids!(room_pane_dock)).has_pane(RoomPaneKind::Members)
+            && self.view.room_pane_dock(cx, ids!(room_pane_dock)).has_pane(&RoomPaneKind::Members)
         {
             submit_async_request(MatrixRequest::GetRoomMembers {
                 timeline_kind: tl.kind.clone(),
@@ -3918,17 +3914,6 @@ impl RoomScreen {
         self.view.room_input_bar(cx, ids!(room_input_bar))
             .set_room_context(cx, self.widget_uid(), timeline_kind.clone(), None);
 
-        // Tell the mini-app dock too. Only a main-room screen hosts panes;
-        // a thread of the same room must not adopt them away from it.
-        #[cfg(feature = "a2app")]
-        {
-            use crate::a2app::dock::MiniAppDockWidgetExt;
-            let dock_room = matches!(timeline_kind, TimelineKind::MainRoom { .. })
-                .then(|| timeline_kind.room_id().clone());
-            self.view.mini_app_dock(cx, ids!(mini_app_dock))
-                .set_room(cx, dock_room, &room_name_id.display());
-        }
-
         self.show_timeline(cx);
 
         // A mini-app may have opened this room just to act in it. With no
@@ -3949,12 +3934,6 @@ impl RoomScreen {
         if self.tl_state.is_some() {
             self.hide_timeline();
         }
-        #[cfg(feature = "a2app")]
-        {
-            use crate::a2app::dock::MiniAppDockWidgetExt;
-            self.view.mini_app_dock(cx, ids!(mini_app_dock)).set_room(cx, None, "");
-        }
-
         // Close all overlay views before this screen is reused for another room.
         self.view.room_pane_dock(cx, ids!(room_pane_dock)).clear(cx);
         self.loading_pane(cx, ids!(loading_pane)).hide(cx); // also cancels an in-progress search

@@ -417,10 +417,10 @@ fn hidden_instance_cannot_navigate_through_another_foreground_instance_of_the_sa
     // ID below and Harness::process's is_docked=true. The calling heap wins.
     host.foreground_app = Some(app.into());
     host.panes.insert(hidden, PaneState {
-        surface: "parked", side: None, minimized: false, foreground: false, width: 0.0, height: 0.0,
+        surface: "parked", side: None, foreground: false, width: 0.0, height: 0.0,
     });
     host.panes.insert(visible, PaneState {
-        surface: "modal", side: None, minimized: false, foreground: true, width: 400.0, height: 300.0,
+        surface: "modal", side: None, foreground: true, width: 400.0, height: 300.0,
     });
     for splash in &mut host.splashes {
         assert!(splash.call_script_fn(&mut host.cx, id!(navigate), &[]));

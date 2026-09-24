@@ -1,10 +1,10 @@
-//! Panes that show extra info about a room (e.g., its member list).
+//! Panes that show extra info about a room (e.g., its member list) or run a mini-app in it.
 //!
 //! A pane is docked to one edge of a RoomScreen's timeline,
 //! or popped out into its own dock tab (desktop) or stack view (mobile).
 //! Docked panes are saved and restored along with their timeline's UI state.
 
-use std::{cell::RefCell, collections::HashMap};
+use std::{borrow::Cow, cell::RefCell, collections::HashMap};
 
 use makepad_widgets::*;
 use serde::{Deserialize, Serialize};
@@ -12,26 +12,45 @@ use serde::{Deserialize, Serialize};
 use ruma::{OwnedRoomId, RoomId};
 
 use crate::{app::SelectedRoom, home::rooms_list::RoomsListAction, sliding_sync::TimelineKind, utils::RoomNameId};
+#[cfg(feature = "a2app")]
+pub use crate::a2app::room_panes as mini_app_panes;
+#[cfg(not(feature = "a2app"))]
+pub use crate::a2app_dummy::room_panes as mini_app_panes;
 
 /// The kinds of panes that can be shown for a room.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RoomPaneKind {
     /// The list of the room's members.
     Members,
+    /// A mini-app running in this room, by its app ID.
+    /// Present in all builds so any build can read saved dock states; only shown with `a2app`.
+    MiniApp(String),
 }
 
 impl RoomPaneKind {
     /// The title shown in the pane's header.
-    pub fn title(self) -> &'static str {
+    pub fn title(&self) -> Cow<'static, str> {
         match self {
-            RoomPaneKind::Members => "Members",
+            RoomPaneKind::Members => Cow::Borrowed("Members"),
+            RoomPaneKind::MiniApp(app_id) => mini_app_panes::app_name(app_id)
+                .map_or_else(|| Cow::Owned(app_id.clone()), Cow::Owned),
         }
     }
 
     /// A unique string for this kind, used to build its popped-out tab's ID.
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> Cow<'static, str> {
         match self {
-            RoomPaneKind::Members => "members",
+            RoomPaneKind::Members => Cow::Borrowed("members"),
+            RoomPaneKind::MiniApp(app_id) => Cow::Owned(format!("app:{app_id}")),
+        }
+    }
+
+    /// Whether this kind of pane is dockable in the given timeline.
+    /// A mini-app runs once per room, so it's only docked in its room's main timeline.
+    pub fn is_dockable_in(&self, timeline_kind: &TimelineKind) -> bool {
+        match self {
+            RoomPaneKind::Members => true,
+            RoomPaneKind::MiniApp(_) => matches!(timeline_kind, TimelineKind::MainRoom { .. }),
         }
     }
 }
@@ -96,6 +115,33 @@ fn with_room_panes<R>(f: impl FnOnce(&mut RoomPanes) -> R) -> R {
     ROOM_PANES.with_borrow_mut(f)
 }
 
+/// A request to change a room's pane wherever it's shown, docked or popped out,
+/// e.g., from a mini-app asking to move or close its own pane.
+///
+/// This is NOT a widget action.
+#[derive(Clone, Debug)]
+pub struct RoomPaneRequest {
+    pub room_id: OwnedRoomId,
+    pub kind: RoomPaneKind,
+    pub op: RoomPaneOp,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum RoomPaneOp {
+    /// Docks the pane now if a dock is showing its room, else does nothing.
+    Open,
+    /// Closes the pane, like its close button.
+    Close,
+    /// Removes the pane without closing its content, as that is already gone or is handled elsewhere.
+    Remove,
+    /// Moves the docked pane to the given side.
+    MoveTo(PaneSide),
+    /// Pops the docked pane out, like its pop-out button.
+    PopOut,
+    /// Shows the popped-out pane's tab.
+    Focus,
+}
+
 /// Emitted when panes are waiting to be docked in the given timeline,
 /// such that a dock currently showing that timeline can dock them right away.
 ///
@@ -127,6 +173,11 @@ pub fn dock_when_shown(cx: &mut Cx, timeline_kind: TimelineKind, kind: RoomPaneK
     cx.action(RoomPanesPending { timeline_kind });
 }
 
+/// Sends the given request to the given room's pane wherever it's shown.
+pub fn request(cx: &mut Cx, room_id: OwnedRoomId, kind: RoomPaneKind, op: RoomPaneOp) {
+    cx.action(RoomPaneRequest { room_id, kind, op });
+}
+
 /// Takes the panes waiting to be docked in the given timeline.
 pub fn take_pending(timeline_kind: &TimelineKind) -> Vec<RoomPaneKind> {
     with_room_panes(|rp| rp.pending.remove(timeline_kind).unwrap_or_default())
@@ -143,7 +194,7 @@ pub fn pop_out(
     kind: RoomPaneKind,
     timeline_kind: TimelineKind,
 ) {
-    with_room_panes(|rp| rp.popped_out_from.insert((room_name_id.room_id().clone(), kind), timeline_kind));
+    with_room_panes(|rp| rp.popped_out_from.insert((room_name_id.room_id().clone(), kind.clone()), timeline_kind));
     cx.widget_action(
         widget_uid,
         RoomsListAction::Selected(SelectedRoom::RoomPane {
@@ -154,8 +205,8 @@ pub fn pop_out(
 }
 
 /// Returns the timeline that the given popped-out pane came from, or else its room's main timeline.
-pub fn popped_out_from(room_id: &RoomId, kind: RoomPaneKind) -> TimelineKind {
-    with_room_panes(|rp| rp.popped_out_from.get(&(room_id.to_owned(), kind)).cloned())
+pub fn popped_out_from(room_id: &RoomId, kind: &RoomPaneKind) -> TimelineKind {
+    with_room_panes(|rp| rp.popped_out_from.get(&(room_id.to_owned(), kind.clone())).cloned())
         .unwrap_or_else(|| TimelineKind::MainRoom { room_id: room_id.to_owned() })
 }
 

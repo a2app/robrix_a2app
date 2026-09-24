@@ -42,8 +42,8 @@ cargo run --features a2app
   hooks (focus, surface, display settings, which room or screen the user is
   on).
 - **Host and pane services**: an app can read where it runs (surface, dock
-  side, size, platform, view mode), move, minimize, break out or close its
-  own pane, and read Robrix's display settings and device facts.
+  side, size, platform, view mode), move, pop out or close its own pane, and
+  read Robrix's display settings and device facts.
 - **Refusals are Robrix's to show**: a mini-app that tries something it may
   not do, or whose action fails, gets a Robrix warning naming the app and the
   reason; it never depends on the app surfacing its own error. Deleting a

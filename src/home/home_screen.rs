@@ -609,7 +609,7 @@ impl Widget for HomeScreen {
                         if let SelectedRoom::RoomPane { room_name_id, kind } = &selected_room
                             && app_state.selected_room.as_ref() != Some(&selected_room)
                         {
-                            room_pane::dock_when_shown(cx, room_pane::popped_out_from(room_name_id.room_id(), *kind), *kind);
+                            room_pane::dock_when_shown(cx, room_pane::popped_out_from(room_name_id.room_id(), kind), kind.clone());
                         }
                     }
                     // On desktop, `MainDesktopUI` handles this, so we only need to update this in mobile view mode.
@@ -648,6 +648,14 @@ impl Widget for HomeScreen {
                     && !effective_is_desktop(cx)
                 {
                     self.return_to_room_from_pane(cx, app_state, room_name_id, kind);
+                }
+
+                // A popped-out pane's content went away (e.g., its mini-app quit), so go back from it.
+                if let RoomPaneScreenAction::Closed { room_name_id, kind } = action.as_widget_action().cast()
+                    && !effective_is_desktop(cx)
+                    && app_state.selected_room == Some(SelectedRoom::RoomPane { room_name_id, kind })
+                {
+                    self.pop_selected_screen_view(cx, app_state);
                 }
 
                 if let RoomActionBarAction::LayoutChanged { new_height } = action.as_widget_action().cast() {
@@ -872,9 +880,13 @@ impl HomeScreen {
                     return None;
                 };
                 Self::hide_displayed_stack_screen(cx, &stack_navigation_view);
-                stack_navigation_view
+                // E.g., a mini-app that's no longer running can't be shown.
+                let is_displayed = stack_navigation_view
                     .room_pane_screen(cx, ids!(room_pane_screen))
-                    .set_displayed(cx, room_name_id, *kind);
+                    .set_displayed(cx, room_name_id, kind.clone());
+                if !is_displayed {
+                    return None;
+                }
                 view_id
             }
         };
@@ -1019,11 +1031,16 @@ impl HomeScreen {
     /// and docks that pane in that room screen.
     fn return_to_room_from_pane(&mut self, cx: &mut Cx, app_state: &mut AppState, room_name_id: RoomNameId, kind: RoomPaneKind) {
         let Some(pane_screen @ SelectedRoom::RoomPane { .. }) = app_state.selected_room.clone() else { return };
+        let stack_navigation = self.view.stack_navigation(cx, ids!(view_stack));
         // We can't navigate during a transition, so the user can just try again.
-        if self.view.stack_navigation(cx, ids!(view_stack)).is_transitioning() {
+        if stack_navigation.is_transitioning() {
             return;
         }
-        let timeline_kind = room_pane::popped_out_from(room_name_id.room_id(), kind);
+        // Let go of the pane's content first, as the room's screen may dock it right away.
+        if let Some(view_id) = stack_navigation.current_view() {
+            stack_navigation.view_by_id(cx, view_id).room_pane_screen(cx, ids!(room_pane_screen)).vacate(cx);
+        }
+        let timeline_kind = room_pane::popped_out_from(room_name_id.room_id(), &kind);
         let screen = room_pane::timeline_screen(&room_name_id, &timeline_kind);
         room_pane::dock_when_shown(cx, timeline_kind, kind);
         // The pane was usually popped out of the room (or thread) right beneath it.
@@ -1057,21 +1074,35 @@ impl HomeScreen {
             self.mobile_screen_history.clear();
             return;
         };
-        match self.mobile_screen_history.pop() {
-            Some(previous) => {
-                let Some(view_id) = self.populate_mobile_stack_view(cx, &stack_nav, &previous) else {
-                    // Nav failed; current_screen is restored, so don't free it.
-                    app_state.selected_room = Some(current_screen);
-                    self.mobile_screen_history.push(previous);
-                    return;
-                };
-                // current_screen is gone for good — free its thread timeline if it is one.
-                current_screen.close_thread_timeline(cx);
+        // Going back from a popped-out pane closes it, e.g., quitting its mini-app.
+        let current_pane_screen = matches!(current_screen, SelectedRoom::RoomPane { .. })
+            .then(|| stack_nav.current_view())
+            .flatten()
+            .map(|view_id| stack_nav.view_by_id(cx, view_id).room_pane_screen(cx, ids!(room_pane_screen)));
+        // A popped-out pane that can't be shown again (e.g., its mini-app stopped) is skipped.
+        let revealed = loop {
+            let Some(previous) = self.mobile_screen_history.pop() else { break None };
+            if let Some(view_id) = self.populate_mobile_stack_view(cx, &stack_nav, &previous) {
+                break Some((previous, view_id));
+            }
+            if !matches!(previous, SelectedRoom::RoomPane { .. }) {
+                // Nav failed; current_screen is restored, so don't free it.
+                app_state.selected_room = Some(current_screen);
+                self.mobile_screen_history.push(previous);
+                return;
+            }
+        };
+        // current_screen is gone for good — free its thread timeline if it is one.
+        current_screen.close_thread_timeline(cx);
+        if let Some(pane_screen) = current_pane_screen {
+            pane_screen.close_content(cx);
+        }
+        match revealed {
+            Some((previous, view_id)) => {
                 app_state.selected_room = Some(previous);
                 stack_nav.pop_to_view(cx, view_id);
             }
             None => {
-                current_screen.close_thread_timeline(cx);
                 app_state.selected_room = None;
                 stack_nav.pop_to_root(cx);
             }

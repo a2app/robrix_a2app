@@ -19,7 +19,7 @@ use std::sync::OnceLock;
 pub mod header;
 /// Mini-app manifests, scopes, and the in-memory registry.
 pub mod manifest;
-/// Where docked panes sit, per (app, room).
+/// Which side of a room's timeline a mini-app pane is docked to.
 pub mod layout;
 /// The `.splashapp` bundle format for exporting/importing/sharing apps.
 pub mod bundle;

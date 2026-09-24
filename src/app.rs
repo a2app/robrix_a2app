@@ -4,7 +4,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     hash::{Hash, Hasher},
     time::Duration,
 };
@@ -1254,6 +1254,38 @@ pub struct SavedDockState {
     pub room_order: Vec<SelectedRoom>,
     /// The selected room tab in this dock when the dock state was saved.
     pub selected_room: Option<SelectedRoom>,
+}
+
+impl SavedDockState {
+    /// Removes the tabs of all rooms (or other screens) for which `is_tab_to_remove` is true.
+    pub fn remove_tabs(&mut self, is_tab_to_remove: impl Fn(&SelectedRoom) -> bool) {
+        let tab_ids: HashSet<LiveId> = self.open_rooms.iter()
+            .filter(|(_, room)| is_tab_to_remove(room))
+            .map(|(tab_id, _)| *tab_id)
+            .collect();
+        self.room_order.retain(|room| !is_tab_to_remove(room));
+        if self.selected_room.as_ref().is_some_and(&is_tab_to_remove) {
+            self.selected_room = None;
+        }
+        self.remove_tab_ids(&tab_ids);
+    }
+
+    /// Removes the dock tabs with the given IDs.
+    pub fn remove_tab_ids(&mut self, tab_ids: &HashSet<LiveId>) {
+        if tab_ids.is_empty() {
+            return;
+        }
+        self.open_rooms.retain(|tab_id, _| !tab_ids.contains(tab_id));
+        for tab_id in tab_ids {
+            self.dock_items.remove(tab_id);
+        }
+        for item in self.dock_items.values_mut() {
+            if let DockItem::Tabs { tabs, selected, .. } = item {
+                tabs.retain(|tab| !tab_ids.contains(tab));
+                *selected = (*selected).min(tabs.len().saturating_sub(1));
+            }
+        }
+    }
 }
 
 

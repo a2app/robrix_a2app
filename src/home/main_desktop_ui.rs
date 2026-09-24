@@ -5,7 +5,7 @@ use std::{collections::{HashMap, HashSet}, sync::Arc};
 
 use crate::{app::{AppState, AppStateAction, SavedDockState, SelectedRoom}, home::{navigation_tab_bar::{NavigationBarAction, SelectedTab}, rooms_list::RoomsListRef, space_lobby::SpaceLobbyScreenWidgetRefExt}, shared::speech_text_input::cancel_all_dictation, utils::RoomNameId};
 use super::{invite_screen::InviteScreenWidgetRefExt, room_pane_screen::{RoomPaneScreenAction, RoomPaneScreenWidgetRefExt}, room_screen::RoomScreenWidgetRefExt, rooms_list::{AcceptedInviteKind, RoomsListAction}, spaces_bar::SpacesBarAction};
-use crate::room::{room_action_bar::RoomActionBarWidgetRefExt, room_pane, room_tabs::RoomTabs};
+use crate::room::{room_action_bar::RoomActionBarWidgetRefExt, room_pane::{self, RoomPaneKind, mini_app_panes}, room_tabs::RoomTabs};
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -67,7 +67,6 @@ script_mod! {
             invite_screen := mod.widgets.InviteScreen {}
             space_lobby_screen := mod.widgets.SpaceLobbyScreen {}
             room_pane_screen := mod.widgets.RoomPaneScreen {}
-            mini_app_tab := mod.widgets.MiniAppTabScreen {}
         }
 
         // this is a hover card that appears when the user hovers over a room tab in the dock,
@@ -107,11 +106,6 @@ pub struct MainDesktopUI {
     /// This determines which set of rooms this dock is currently showing.
     /// If `None`, we're displaying the main home view of all rooms from any space.
     #[rust] selected_space: Option<OwnedRoomId>,
-
-    /// Mini-apps broken out into their own tabs, keyed by tab id.
-    #[cfg(feature = "a2app")]
-    #[rust]
-    open_mini_app_tabs: HashMap<LiveId, (String, matrix_sdk::ruma::OwnedRoomId)>,
 
     /// Boolean to indicate if we've drawn the MainDesktopUi previously in the desktop view.
     ///
@@ -277,7 +271,7 @@ impl MainDesktopUI {
                     );
                 }
                 SelectedRoom::RoomPane { room_name_id, kind } => {
-                    new_widget.as_room_pane_screen().set_displayed(cx, room_name_id, *kind);
+                    new_widget.as_room_pane_screen().set_displayed(cx, room_name_id, kind.clone());
                 }
             }
             cx.action(MainDesktopUiAction::SaveDockIntoAppState);
@@ -292,19 +286,6 @@ impl MainDesktopUI {
     fn close_tab(&mut self, cx: &mut Cx, tab_id: LiveId) {
         let dock = self.view.dock(cx, ids!(dock));
 
-        // A mini-app tab: quit its instance, then close the tab itself.
-        #[cfg(feature = "a2app")]
-        if self.open_mini_app_tabs.remove(&tab_id).is_some() {
-            use crate::a2app::tab_screen::MiniAppTabScreenWidgetRefExt;
-            let widget = dock.item(tab_id);
-            if !widget.is_empty() {
-                widget.as_mini_app_tab_screen().quit(cx);
-            }
-            dock.close_tab(cx, tab_id);
-            self.init_all_visible_tabs(cx);
-            return;
-        }
-
         let Some(room_being_closed) = self.open_rooms.get(&tab_id).cloned() else {
             // This shouldn't happen (the tab should always be in the set of open rooms),
             // but we still need to handle it gracefully.
@@ -314,6 +295,7 @@ impl MainDesktopUI {
         };
         // If we're closing a thread timeline, free up its resources & bkgd async tasks.
         room_being_closed.close_thread_timeline(cx);
+        Self::close_pane_content(cx, &dock.item(tab_id), &room_being_closed);
         self.room_order.retain(|sr| sr != &room_being_closed);
 
         let is_active_tab = self.most_recently_selected_room.as_ref() == Some(&room_being_closed);
@@ -340,6 +322,18 @@ impl MainDesktopUI {
         self.init_all_visible_tabs(cx);
     }
 
+    /// Closes the content of a popped-out pane whose tab is being closed, e.g., quitting its mini-app.
+    fn close_pane_content(cx: &mut Cx, widget: &WidgetRef, room: &SelectedRoom) {
+        let SelectedRoom::RoomPane { room_name_id, kind } = room else { return };
+        let screen = widget.as_room_pane_screen();
+        if screen.is_displaying() {
+            screen.close_content(cx);
+        } else if let RoomPaneKind::MiniApp(app_id) = kind {
+            // A restored tab that was never shown may still own a parked mini-app.
+            mini_app_panes::quit_if_parked(cx, room_name_id.room_id(), app_id);
+        }
+    }
+
     /// Closes all tabs
     pub fn close_all_tabs(&mut self, cx: &mut Cx) {
         let dock = self.view.dock(cx, ids!(dock));
@@ -347,6 +341,7 @@ impl MainDesktopUI {
             #[cfg(feature = "a2app")]
             crate::a2app::runtime::on_room_closed(cx, room.room_id());
             room.close_thread_timeline(cx);
+            Self::close_pane_content(cx, &dock.item(*tab_id), room);
             dock.close_tab(cx, *tab_id);
         }
 
@@ -456,8 +451,13 @@ impl MainDesktopUI {
         let space_label = self.selected_space.as_ref()
             .map(|s| format!("space {s}"))
             .unwrap_or_else(|| "home".to_string());
+        let saved = saved_ref.map(|sds| {
+            let mut sds = sds.clone();
+            strip_stopped_mini_app_tabs(&mut sds);
+            sds
+        });
         let (to_restore, recreate_from_room_order): (SavedDockState, Option<Vec<SelectedRoom>>) =
-            match saved_ref {
+            match saved.as_ref() {
                 None => (self.default_layout.clone(), None),
                 Some(sds) if sds.open_rooms.is_empty()
                     && sds.room_order.is_empty()
@@ -492,14 +492,18 @@ impl MainDesktopUI {
                 }
             };
 
-        let SavedDockState { mut dock_items, open_rooms, room_order, selected_room } = to_restore;
-        #[cfg(feature = "a2app")]
-        strip_mini_app_tabs(&mut dock_items);
+        let SavedDockState { dock_items, open_rooms, room_order, selected_room } = to_restore;
 
         self.room_order = room_order;
         self.open_rooms = open_rooms;
 
         dock.load_state(cx, dock_items);
+        // Popped-out mini-apps take back their parked apps before any room's dock can.
+        for (tab_id, room) in &self.open_rooms {
+            if matches!(room, SelectedRoom::RoomPane { kind: RoomPaneKind::MiniApp(_), .. }) {
+                Self::init_tab_widget(cx, &self.open_rooms, tab_id, &dock.item(*tab_id));
+            }
+        }
         // Lazily populate the dock content to avoid initializing tabs that aren't visible.
         self.init_all_visible_tabs(cx);
 
@@ -561,64 +565,9 @@ impl MainDesktopUI {
                 );
             }
             Some(SelectedRoom::RoomPane { room_name_id, kind }) => {
-                widget.as_room_pane_screen().set_displayed(cx, room_name_id, *kind);
+                widget.as_room_pane_screen().set_displayed(cx, room_name_id, kind.clone());
             }
             None => { }
-        }
-    }
-
-    #[cfg(feature = "a2app")]
-    fn mini_app_tab_id(app_id: &str, room_id: &matrix_sdk::ruma::RoomId) -> LiveId {
-        LiveId::from_str(&format!("miniapp:{app_id}:{room_id}"))
-    }
-
-    /// A mini-app tab is showing, so no room is focused; a later
-    /// NavigateToRoom then selects the room's tab instead of assuming it's up.
-    #[cfg(feature = "a2app")]
-    fn focus_mini_app_tab(&mut self, cx: &mut Cx) {
-        self.most_recently_selected_room = None;
-        cx.action(AppStateAction::FocusNone);
-    }
-
-    /// Creates (or focuses) the dock tab hosting one mini-app instance.
-    #[cfg(feature = "a2app")]
-    fn open_mini_app_tab(
-        &mut self,
-        cx: &mut Cx,
-        app_id: String,
-        room_id: matrix_sdk::ruma::OwnedRoomId,
-        room_name: String,
-    ) {
-        use crate::a2app::tab_screen::MiniAppTabScreenWidgetRefExt;
-        let tab_id = Self::mini_app_tab_id(&app_id, &room_id);
-        let dock = self.view.dock(cx, ids!(dock));
-        if self.open_mini_app_tabs.contains_key(&tab_id) {
-            dock.select_tab(cx, tab_id);
-            self.focus_mini_app_tab(cx);
-            return;
-        }
-        let label = crate::a2app::runtime::with_a2app(|state| {
-            state.registry.get(&app_id).map(|m| format!("{} {}", m.icon, m.name))
-        }).flatten().unwrap_or_else(|| app_id.clone());
-
-        let (tab_bar, insert_after) = self.most_recently_selected_room.as_ref()
-            .and_then(|curr_room| dock.find_tab_bar_of_tab(curr_room.tab_id()))
-            .unwrap_or_else(|| dock.find_tab_bar_of_tab(id!(home_tab)).unwrap());
-        let new_tab_widget = dock.create_and_select_tab(
-            cx,
-            tab_bar,
-            tab_id,
-            id!(mini_app_tab),
-            label,
-            id!(CloseableTab),
-            Some(insert_after),
-        );
-        if let Some(new_widget) = new_tab_widget {
-            new_widget.as_mini_app_tab_screen().open(cx, app_id.clone(), room_id.clone(), &room_name);
-            self.open_mini_app_tabs.insert(tab_id, (app_id, room_id));
-            self.focus_mini_app_tab(cx);
-        } else {
-            error!("BUG: failed to create a mini-app tab for {app_id}");
         }
     }
 
@@ -655,26 +604,19 @@ impl MainDesktopUI {
     }
 }
 
-/// Mini-app tabs can't outlive a restart (their isolates never persist), so
-/// a saved layout drops them before it's loaded.
-#[cfg(feature = "a2app")]
-fn strip_mini_app_tabs(dock_items: &mut HashMap<LiveId, DockItem>) {
-    let zombies: Vec<LiveId> = dock_items.iter()
+/// Drops the tabs of popped-out mini-apps that aren't running anymore (e.g., after a restart),
+/// plus any tabs of a2app's old mini-app tab kind.
+fn strip_stopped_mini_app_tabs(state: &mut SavedDockState) {
+    state.remove_tabs(|room| matches!(
+        room,
+        SelectedRoom::RoomPane { room_name_id, kind: RoomPaneKind::MiniApp(app_id) }
+            if !mini_app_panes::is_running(room_name_id.room_id(), app_id)
+    ));
+    let old_tab_ids: HashSet<LiveId> = state.dock_items.iter()
         .filter(|(_, item)| matches!(item, DockItem::Tab { kind, .. } if *kind == id!(mini_app_tab)))
-        .map(|(id, _)| *id)
+        .map(|(tab_id, _)| *tab_id)
         .collect();
-    if zombies.is_empty() {
-        return;
-    }
-    for id in &zombies {
-        dock_items.remove(id);
-    }
-    for item in dock_items.values_mut() {
-        if let DockItem::Tabs { tabs, selected, .. } = item {
-            tabs.retain(|tab| !zombies.contains(tab));
-            *selected = (*selected).min(tabs.len().saturating_sub(1));
-        }
-    }
+    state.remove_tab_ids(&old_tab_ids);
 }
 
 impl WidgetMatchEvent for MainDesktopUI {
@@ -699,55 +641,6 @@ impl WidgetMatchEvent for MainDesktopUI {
                 self.close_all_tabs(cx);
                 on_close_all.notify_one();
                 continue;
-            }
-
-            #[cfg(feature = "a2app")]
-            {
-                use crate::a2app::tab_screen::{A2AppTabRequest, MiniAppTabScreenAction};
-                use crate::a2app::dock::DockCmd;
-                if let Some(A2AppTabRequest::Open { app_id, room_id, room_name }) = action.downcast_ref() {
-                    self.open_mini_app_tab(cx, app_id.clone(), room_id.clone(), room_name.clone());
-                    should_save_dock_action = true;
-                    continue;
-                }
-                if let Some(MiniAppTabScreenAction::Vacated { app_id, room_id, room_name, returning }) = action.downcast_ref() {
-                    let tab_id = Self::mini_app_tab_id(app_id, room_id);
-                    if self.open_mini_app_tabs.remove(&tab_id).is_some() {
-                        self.view.dock(cx, ids!(dock)).close_tab(cx, tab_id);
-                        self.init_all_visible_tabs(cx);
-                        should_save_dock_action = true;
-                    }
-                    // "Return to room" put the app back in that room's dock, so
-                    // show the room: closing its tab would otherwise leave the
-                    // user on whatever tab happened to be next.
-                    if *returning {
-                        let room_tab = LiveId::from_str(room_id.as_str());
-                        let room = self.open_rooms.get(&room_tab).cloned().unwrap_or_else(|| {
-                            SelectedRoom::JoinedRoom {
-                                room_name_id: RoomNameId::new(
-                                    matrix_sdk::RoomDisplayName::Named(room_name.clone()),
-                                    room_id.clone(),
-                                ),
-                            }
-                        });
-                        self.focus_or_create_tab(cx, room);
-                        // Re-issued because a room screen created just now missed
-                        // the tab screen's own open in this same action pass.
-                        cx.action(DockCmd::Open {
-                            app_id: app_id.clone(),
-                            room_id: room_id.clone(),
-                        });
-                    }
-                    continue;
-                }
-                // An app already living in a tab: "run" focuses that tab. The
-                // room docks skip it themselves via the instance registry.
-                if let Some(DockCmd::Open { app_id, room_id }) = action.downcast_ref() {
-                    let tab_id = Self::mini_app_tab_id(app_id, room_id);
-                    if self.open_mini_app_tabs.contains_key(&tab_id) {
-                        self.view.dock(cx, ids!(dock)).select_tab(cx, tab_id);
-                    }
-                }
             }
 
             // An invited space's InviteScreen should be shown in the main home dock.
@@ -798,10 +691,6 @@ impl WidgetMatchEvent for MainDesktopUI {
                     }
                     else if let Some(selected_room) = self.open_rooms.get(&tab_id).cloned() {
                         self.select_room(cx, Some(selected_room));
-                    }
-                    #[cfg(feature = "a2app")]
-                    if self.open_mini_app_tabs.contains_key(&tab_id) {
-                        self.focus_mini_app_tab(cx);
                     }
                     // Lazily initialize this tab's widget if it was deferred during dock restoration.
                     self.init_tab_if_needed(cx, tab_id);
@@ -879,9 +768,11 @@ impl WidgetMatchEvent for MainDesktopUI {
             // A popped-out room pane wants to be returned to its room screen,
             // show that room screen and dock the pane in it, then close the pane's dedicated tab.
             if let RoomPaneScreenAction::ReturnToRoom { room_name_id, kind } = widget_action.cast() {
-                let timeline_kind = room_pane::popped_out_from(room_name_id.room_id(), kind);
-                let pane_tab_id = SelectedRoom::RoomPane { room_name_id: room_name_id.clone(), kind }.tab_id();
+                let timeline_kind = room_pane::popped_out_from(room_name_id.room_id(), &kind);
+                let pane_tab_id = SelectedRoom::RoomPane { room_name_id: room_name_id.clone(), kind: kind.clone() }.tab_id();
                 let screen = room_pane::timeline_screen(&room_name_id, &timeline_kind);
+                // Let go of the pane's content first, as the room's screen may dock it right away.
+                self.view.dock(cx, ids!(dock)).item(pane_tab_id).as_room_pane_screen().vacate(cx);
                 room_pane::dock_when_shown(cx, timeline_kind, kind);
                 // Use the room's existing tab, which has the room's current name.
                 let screen = self.open_rooms.get(&screen.tab_id()).cloned().unwrap_or(screen);
@@ -889,6 +780,17 @@ impl WidgetMatchEvent for MainDesktopUI {
                 self.close_tab(cx, pane_tab_id);
                 self.redraw(cx);
                 should_save_dock_action = true;
+                continue;
+            }
+
+            // A popped-out pane's content went away (e.g., its mini-app quit), so close its tab.
+            if let RoomPaneScreenAction::Closed { room_name_id, kind } = widget_action.cast() {
+                let pane_tab_id = SelectedRoom::RoomPane { room_name_id, kind }.tab_id();
+                if self.open_rooms.contains_key(&pane_tab_id) {
+                    self.close_tab(cx, pane_tab_id);
+                    self.redraw(cx);
+                    should_save_dock_action = true;
+                }
                 continue;
             }
 

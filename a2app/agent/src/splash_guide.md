@@ -319,7 +319,7 @@ and scope (this room, account, device, app-local). Available today:
 | matrix-room-watch | `on_room_message`, `on_room_message_changed`, `on_room_reaction`, `on_room_typing`, `on_room_receipt`, `on_room_members_changed` (Robrix→app hooks) | read · this room |
 | matrix-room-info | `on_room_pins_changed`, `on_room_info_changed`, `on_room_unread_changed` (Robrix→app hooks) | read · this room |
 | matrix-rooms-list | `on_rooms_changed`, `on_invite_received`, `on_unread_totals_changed` (Robrix→app hooks) | read · many rooms |
-| robrix-ui | `ui.pane.set_side`, `ui.pane.minimize`, `ui.pane.break_out` | act · this pane |
+| robrix-ui | `ui.pane.set_side`, `ui.pane.break_out` | act · this pane |
 | robrix-preferences | `host.prefs.read`, `on_prefs_changed` (Robrix→app hook) | read · account |
 | robrix-observe | `on_active_room_changed`, `on_navigation_changed` (Robrix→app hooks) | read · many rooms · high risk |
 | device-info | `device.info.read` | read · device |
@@ -512,8 +512,8 @@ Each hook gets one JSON string argument:
 The three account-wide hooks need `matrix-rooms-list` and work with or
 without an attached room; the others need a room.
 `events.unsubscribe` `{event: "on_room_message"}` (or `"*"`) stops them.
-Hooks arrive only while the app is running (its pane, chip, tab or
-modal); nothing is queued for a closed app.
+Hooks arrive only while the app is running (its pane, tab or modal);
+nothing is queued for a closed app.
 
 `host.has()` accepts either a group id (`host.has("network")`) or a
 capability id (`host.has("matrix.room.members.read")`), and
@@ -881,31 +881,29 @@ Every app can read where it is and quit itself; nothing to declare:
 
 - `"env"` -> `{app_id, room_attached, room_id, room_name, instance_tag,
   surface, platform, view_mode}`. Show `room_name` to people, never the id. `surface` is `"dock"` (a pane on a room), `"tab"`
-  (its own desktop tab), `"modal"` (the full-screen host) or `"parked"`;
+  (popped out into its own tab, or its own view on mobile), `"modal"`
+  (the full-screen host) or `"parked"`;
   `platform` is `macos | ios | android | windows | linux | other`;
   `view_mode` is `"desktop"` or `"mobile"`.
-- `"ui.pane.read"` -> `{surface, side, minimized, foreground, width,
-  height}`; `side` is set only while docked.
+- `"ui.pane.read"` -> `{surface, side, foreground, width, height}`; `side`
+  is set only while docked.
 - `"ui.pane.close"` -> `{}`: quits this instance, same as its Close button.
   Only from a button the user taps, never on load.
 - `"storage.quota"` -> `{used, cap}`: bytes in your `fs` jail; `cap` is
   `nil` today.
 - Hooks, called whenever you define them (no subscribe):
   `fn on_focus_changed(json)` with `{foreground: bool}`, true while the
-  user can see the pane (docked and not minimized, in a tab, or in the
-  modal); `fn on_surface_changed(json)` with `{surface, side}` after a
-  dock, break-out, return or side change. Pause timers and polling while
+  user can see the pane (docked, popped out, or in the modal);
+  `fn on_surface_changed(json)` with `{surface, side}` after a dock,
+  pop-out, return or side change. Pause timers and polling while
   not foreground.
 
 Needs `robrix-ui` (prompts on first use), only while docked in a room, and
 only from a tap:
 
-- `"ui.pane.set_side"` `{side}`: `"top" | "bottom" | "left" | "right"`;
-  left and right are refused in the mobile layout.
-- `"ui.pane.minimize"` `{}`: collapses to a chip. An app can never
-  un-minimize itself.
-- `"ui.pane.break_out"` `{}`: moves to its own desktop tab; refused in the
-  mobile layout.
+- `"ui.pane.set_side"` `{side}`: `"top" | "bottom" | "left" | "right"`.
+- `"ui.pane.break_out"` `{}`: pops out into its own tab (desktop) or view
+  (mobile), same as its pop-out button.
 
 Needs `robrix-preferences` (prompts on first use):
 

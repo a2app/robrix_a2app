@@ -1,4 +1,4 @@
-//! A dock around a room's timeline that shows that room's panes, e.g., its member list.
+//! A dock around a room's timeline that shows that room's panes, e.g., its member list or a mini-app.
 //!
 //! Each pane is docked to one of the four edges around the timeline,
 //! can be resized along its edge's one meaningful axis via a grab handle on its inner border,
@@ -20,7 +20,7 @@ use crate::{
 use super::{
     room_action_bar::RoomActionTooltip,
     room_members_list::{RoomMembersListRef, RoomMembersListWidgetRefExt, SavedRoomMembersList},
-    room_pane::{self, PaneLayout, PaneSide, RoomPaneKind, RoomPanesPending},
+    room_pane::{self, PaneLayout, PaneSide, RoomPaneKind, RoomPaneOp, RoomPaneRequest, RoomPanesPending, mini_app_panes},
 };
 
 script_mod! {
@@ -53,6 +53,17 @@ script_mod! {
             align: Align{y: 0.5}
             icon_walk: Walk{width: 16, height: 16, margin: Inset{left: 2, right: 2}}
             draw_icon +: { color: (COLOR_TEXT) }
+        }
+        // A text icon (e.g., a mini-app's emoji), shown in place of `pane_icon`.
+        pane_glyph := Label {
+            visible: false
+            width: Fit, height: #(HEADER_BUTTON_SIZE)
+            align: Align{y: 0.5}
+            padding: 0, margin: Inset{left: 2, right: 2}
+            draw_text +: {
+                text_style: TITLE_TEXT {font_size: 12},
+                color: #000
+            }
         }
         titles := View {
             width: Fill, height: Fit
@@ -243,6 +254,13 @@ script_mod! {
             header +: { title_row +: { pane_icon +: { draw_icon +: { svg: (ICON_MEMBERS) } } } }
             content +: { room_members := mod.widgets.RoomMembersList {} }
         }
+        mini_app_pane: mod.widgets.RoomPaneFrame {
+            // The bottom padding keeps a top pane's grab handle off the app's content.
+            content +: {
+                padding: Inset{top: 2, bottom: 8}
+                mini_app_host := mod.widgets.MiniAppHostArea {}
+            }
+        }
     }
 }
 
@@ -263,7 +281,7 @@ type TimelineMembers = Option<Result<Arc<Vec<RoomMember>>, String>>;
 /// Shows the given room's info in the content of the given pane.
 fn populate_content(
     cx: &mut Cx,
-    kind: RoomPaneKind,
+    kind: &RoomPaneKind,
     frame: &WidgetRef,
     room_name_id: &RoomNameId,
     room_members: &TimelineMembers,
@@ -273,6 +291,8 @@ fn populate_content(
             let list = frame.child_by_path(ids!(content.room_members)).as_room_members_list();
             show_members(cx, &list, room_name_id, room_members);
         }
+        // A mini-app is attached once, when its pane is created.
+        RoomPaneKind::MiniApp(_) => {}
     }
 }
 
@@ -291,13 +311,16 @@ fn show_members(cx: &mut Cx, list: &RoomMembersListRef, room_name_id: &RoomNameI
 #[derive(Clone)]
 enum SavedPaneContent {
     Members(SavedRoomMembersList),
+    /// A mini-app keeps its own state in its instance, which is parked while its pane is saved.
+    MiniApp,
 }
 
-fn save_content(kind: RoomPaneKind, frame: &WidgetRef) -> SavedPaneContent {
+fn save_content(kind: &RoomPaneKind, frame: &WidgetRef) -> SavedPaneContent {
     match kind {
         RoomPaneKind::Members => SavedPaneContent::Members(
             frame.child_by_path(ids!(content.room_members)).as_room_members_list().save_state()
         ),
+        RoomPaneKind::MiniApp(_) => SavedPaneContent::MiniApp,
     }
 }
 
@@ -314,6 +337,7 @@ fn restore_content(
             list.restore_state(cx, room_name_id, saved);
             show_members(cx, &list, room_name_id, room_members);
         }
+        SavedPaneContent::MiniApp => {}
     }
 }
 
@@ -337,6 +361,29 @@ pub fn set_pane_title(cx: &mut Cx, pane: &WidgetRef, title: &str) {
     script_apply_eval!(cx, title_line, {
         padding: mod.prelude.widgets.Inset{top: #(top)}
     });
+}
+
+/// Shows the icon of the given kind of pane in the given pane (or popped-out pane):
+/// a mini-app's text glyph, or else the SVG icon from its template.
+pub fn set_pane_icon(cx: &mut Cx, pane: &WidgetRef, kind: &RoomPaneKind) {
+    let glyph = match kind {
+        RoomPaneKind::MiniApp(app_id) => Some(mini_app_panes::app_glyph(app_id).unwrap_or_default()),
+        RoomPaneKind::Members => None,
+    };
+    pane.widget(cx, ids!(pane_icon)).set_visible(cx, glyph.is_none());
+    let glyph_label = pane.label(cx, ids!(pane_glyph));
+    glyph_label.set_visible(cx, glyph.is_some());
+    glyph_label.set_text(cx, glyph.as_deref().unwrap_or_default());
+}
+
+/// Returns the width of the given pane's icon before it's drawn: its text glyph's width, if shown.
+fn measure_icon_width(cx: &mut Cx, frame: &WidgetRef) -> Option<f64> {
+    let glyph = frame.label(cx, ids!(pane_glyph));
+    if !glyph.visible() {
+        return None;
+    }
+    let text = glyph.text();
+    glyph.borrow().map(|label| utils::unwrapped_text_width(cx, &label.draw_text, &text) + label.walk.margin.width())
 }
 
 /// Returns the width of the given pane's title laid out on one line.
@@ -367,12 +414,15 @@ struct DockedPane {
     button_cols: usize,
     /// The width of the title on one line, which the buttons must leave room for.
     title_width: f64,
+    /// The width of the icon before it's first drawn, if it's a text glyph.
+    glyph_width: Option<f64>,
 }
 
 #[derive(Script, Widget)]
 pub struct RoomPaneDock {
     #[deref] view: View,
     #[live] members_pane: Option<LivePtr>,
+    #[live] mini_app_pane: Option<LivePtr>,
     #[rust] room_name_id: Option<RoomNameId>,
     /// The timeline that this dock's panes belong to.
     #[rust] timeline_kind: Option<TimelineKind>,
@@ -391,6 +441,13 @@ pub struct RoomPaneDock {
 impl ScriptHook for RoomPaneDock {
     fn on_after_apply(&mut self, vm: &mut ScriptVm, _apply: &Apply, _scope: &mut Scope, _value: ScriptValue) {
         vm.cx_mut().widget_tree_mark_dirty(self.widget_uid());
+    }
+}
+
+impl Drop for RoomPaneDock {
+    fn drop(&mut self) {
+        // Our RoomScreen saves our panes when it's dropped, so their mini-apps are parked to be shown again.
+        mini_app_panes::release_all_shown_by(self.widget_uid());
     }
 }
 
@@ -437,6 +494,12 @@ impl Widget for RoomPaneDock {
                 && self.timeline_kind.as_ref() == Some(timeline_kind)
             {
                 self.dock_pending(cx);
+                continue;
+            }
+            if let Some(RoomPaneRequest { room_id: request_room_id, kind, op }) = action.downcast_ref()
+                && request_room_id == room_id
+            {
+                self.handle_request(cx, &room_name_id, kind, *op);
                 continue;
             }
             if self.needs_full_redraw
@@ -486,25 +549,19 @@ impl Widget for RoomPaneDock {
             } else {
                 return None;
             };
-            Some((pane.kind, button))
+            Some((pane.kind.clone(), button))
         }).collect();
         for (kind, button) in pressed {
             self.tooltip.hide(cx);
             match button {
-                PaneButton::Close => self.remove_pane(cx, kind, true),
+                PaneButton::Close => self.remove_pane(cx, &kind, true, true),
                 PaneButton::MoveToNextEdge => {
-                    if let Some(pane) = self.panes.iter_mut().find(|pane| pane.kind == kind) {
-                        pane.layout.side = pane.layout.side.next();
-                        room_pane::set_last_layout(pane.layout);
-                    }
-                    self.place_panes(cx, true);
-                }
-                PaneButton::PopOut => {
-                    self.remove_pane(cx, kind, true);
-                    if let Some(timeline_kind) = self.timeline_kind.clone() {
-                        room_pane::pop_out(cx, self.widget_uid(), &room_name_id, kind, timeline_kind);
+                    let side = self.panes.iter().find(|pane| pane.kind == kind).map(|pane| pane.layout.side.next());
+                    if let Some(side) = side {
+                        self.move_pane(cx, &room_name_id, &kind, side, true);
                     }
                 }
+                PaneButton::PopOut => self.pop_out(cx, &room_name_id, kind),
             }
         }
     }
@@ -524,6 +581,14 @@ impl Widget for RoomPaneDock {
             // The grab handles straddle the panes' borders, so they're drawn over the timeline.
             for side in ALL_SIDES {
                 self.edge(cx, side).draw_divider(cx);
+            }
+            if let Some(room_name_id) = self.room_name_id.as_ref() {
+                for pane in &self.panes {
+                    if let RoomPaneKind::MiniApp(app_id) = &pane.kind {
+                        let host_area = pane.frame.widget(cx, ids!(content.mini_app_host));
+                        mini_app_panes::note_size(&host_area, room_name_id.room_id(), app_id);
+                    }
+                }
             }
         }
         step
@@ -549,13 +614,17 @@ impl RoomPaneDock {
         self.view.room_pane_edge(cx, id)
     }
 
+    fn has_pane(&self, kind: &RoomPaneKind) -> bool {
+        self.panes.iter().any(|pane| &pane.kind == kind)
+    }
+
     /// Updates the room name used by each pane's content, e.g., when showing a member's profile.
     fn set_room_name(&mut self, cx: &mut Cx, room_name_id: &RoomNameId) {
         if self.room_name_id.as_ref().is_none_or(|r| r.room_id() != room_name_id.room_id()) {
             return;
         }
         for pane in &self.panes {
-            populate_content(cx, pane.kind, &pane.frame, room_name_id, &self.room_members);
+            populate_content(cx, &pane.kind, &pane.frame, room_name_id, &self.room_members);
         }
         self.room_name_id = Some(room_name_id.clone());
     }
@@ -565,15 +634,17 @@ impl RoomPaneDock {
         self.room_members = room_members;
         let Some(room_name_id) = self.room_name_id.as_ref() else { return };
         for pane in self.panes.iter().filter(|pane| pane.kind == RoomPaneKind::Members) {
-            populate_content(cx, pane.kind, &pane.frame, room_name_id, &self.room_members);
+            populate_content(cx, &pane.kind, &pane.frame, room_name_id, &self.room_members);
         }
     }
 
     /// Removes all panes right away, e.g., before this dock shows another timeline.
+    ///
+    /// Their mini-apps are parked, to be shown again when this timeline is.
     fn clear(&mut self, cx: &mut Cx) {
-        let kinds: Vec<_> = self.panes.iter().map(|pane| pane.kind).collect();
+        let kinds: Vec<_> = self.panes.iter().map(|pane| pane.kind.clone()).collect();
         for kind in kinds {
-            self.remove_pane(cx, kind, false);
+            self.remove_pane(cx, &kind, false, false);
         }
         // Also drop any closed pane that's still sliding out.
         for side in ALL_SIDES {
@@ -598,18 +669,23 @@ impl RoomPaneDock {
         self.timeline_kind = Some(timeline_kind);
         self.room_members = room_members.map(Ok);
         for saved in saved_panes {
-            self.create_pane(cx, saved.kind, saved.layout, Some(saved.content));
+            self.create_pane(cx, saved.kind, saved.layout, Some(saved.content), false);
         }
         self.place_panes(cx, false);
         self.dock_pending(cx);
     }
 
-    /// Docks any panes waiting to be docked in our timeline.
+    /// Docks any panes waiting to be docked in our timeline,
+    /// plus any mini-apps of our room that are running without being shown anywhere.
     fn dock_pending(&mut self, cx: &mut Cx) {
-        let Some(timeline_kind) = self.timeline_kind.as_ref() else { return };
-        for kind in room_pane::take_pending(timeline_kind) {
-            if !self.panes.iter().any(|pane| pane.kind == kind) {
-                self.create_pane(cx, kind, room_pane::last_layout(), None);
+        let Some(timeline_kind) = self.timeline_kind.clone() else { return };
+        let mut kinds = room_pane::take_pending(&timeline_kind);
+        if let TimelineKind::MainRoom { room_id } = &timeline_kind {
+            kinds.extend(mini_app_panes::parked_apps(room_id).into_iter().map(RoomPaneKind::MiniApp));
+        }
+        for kind in kinds {
+            if !self.has_pane(&kind) {
+                self.create_pane(cx, kind, room_pane::last_layout(), None, false);
             }
         }
         self.place_panes(cx, true);
@@ -617,11 +693,54 @@ impl RoomPaneDock {
 
     /// Opens the given kind of pane at the last-chosen layout, or closes it if it's open.
     fn toggle(&mut self, cx: &mut Cx, kind: RoomPaneKind) {
-        if self.panes.iter().any(|pane| pane.kind == kind) {
-            self.remove_pane(cx, kind, true);
-        } else if self.room_name_id.is_some() {
-            self.create_pane(cx, kind, room_pane::last_layout(), None);
+        if self.has_pane(&kind) {
+            self.remove_pane(cx, &kind, true, true);
+        } else if self.create_pane(cx, kind, room_pane::last_layout(), None, true) {
             self.place_panes(cx, true);
+        }
+    }
+
+    /// Applies a request to one of our room's panes, e.g., from a mini-app asking to move its own pane.
+    fn handle_request(&mut self, cx: &mut Cx, room_name_id: &RoomNameId, kind: &RoomPaneKind, op: RoomPaneOp) {
+        match op {
+            RoomPaneOp::Open => {
+                if !self.has_pane(kind)
+                    && self.create_pane(cx, kind.clone(), room_pane::last_layout(), None, true)
+                {
+                    self.place_panes(cx, true);
+                }
+            }
+            RoomPaneOp::Close => self.remove_pane(cx, kind, true, true),
+            RoomPaneOp::Remove => self.remove_pane(cx, kind, true, false),
+            // A pane's content choosing its side isn't the user's choice, so it's not remembered.
+            RoomPaneOp::MoveTo(side) => self.move_pane(cx, room_name_id, kind, side, false),
+            RoomPaneOp::PopOut => {
+                if self.has_pane(kind) {
+                    self.pop_out(cx, room_name_id, kind.clone());
+                }
+            }
+            RoomPaneOp::Focus => {}
+        }
+    }
+
+    /// Moves the given pane to the given side, remembering that layout for new panes if `is_user_choice`.
+    fn move_pane(&mut self, cx: &mut Cx, room_name_id: &RoomNameId, kind: &RoomPaneKind, side: PaneSide, is_user_choice: bool) {
+        let Some(pane) = self.panes.iter_mut().find(|pane| &pane.kind == kind) else { return };
+        pane.layout.side = side;
+        if is_user_choice {
+            room_pane::set_last_layout(pane.layout);
+        }
+        if let RoomPaneKind::MiniApp(app_id) = kind {
+            mini_app_panes::note_side(room_name_id.room_id(), app_id, side);
+        }
+        self.place_panes(cx, true);
+    }
+
+    /// Pops the given pane out into its own tab (desktop) or view (mobile).
+    fn pop_out(&mut self, cx: &mut Cx, room_name_id: &RoomNameId, kind: RoomPaneKind) {
+        self.remove_pane(cx, &kind, true, false);
+        if let Some(timeline_kind) = self.timeline_kind.clone() {
+            room_pane::pop_out(cx, self.widget_uid(), room_name_id, kind, timeline_kind);
         }
     }
 
@@ -629,9 +748,9 @@ impl RoomPaneDock {
     fn save_state(&self) -> Vec<SavedRoomPane> {
         self.panes.iter()
             .map(|pane| SavedRoomPane {
-                kind: pane.kind,
+                kind: pane.kind.clone(),
                 layout: pane.layout,
-                content: save_content(pane.kind, &pane.frame),
+                content: save_content(&pane.kind, &pane.frame),
             })
             .collect()
     }
@@ -641,7 +760,7 @@ impl RoomPaneDock {
     fn place_panes(&mut self, cx: &mut Cx, animate: bool) {
         for index in 0..self.panes.len() {
             let pane = &self.panes[index];
-            let (kind, frame, layout, placed) = (pane.kind, pane.frame.clone(), pane.layout, pane.placed);
+            let (kind, frame, layout, placed) = (pane.kind.clone(), pane.frame.clone(), pane.layout, pane.placed);
             match placed {
                 Some(side) if side == layout.side => {
                     self.edge(cx, side).set_size(layout.edge_size);
@@ -649,7 +768,7 @@ impl RoomPaneDock {
                 }
                 // A moving pane vanishes from its old edge, then slides into its new one.
                 Some(old_side) => {
-                    self.edge(cx, old_side).remove_pane(cx, kind, false);
+                    self.edge(cx, old_side).remove_pane(cx, &kind, false);
                     self.panes[index].placed = None;
                 }
                 None => {}
@@ -658,7 +777,7 @@ impl RoomPaneDock {
             // A pane that was closed and then reopened may still be sliding out of an edge:
             // it reverses course if that's its new edge, and otherwise vanishes from the old one.
             for side in ALL_SIDES.into_iter().filter(|side| *side != layout.side) {
-                self.edge(cx, side).remove_pane(cx, kind, false);
+                self.edge(cx, side).remove_pane(cx, &kind, false);
             }
             let edge = self.edge(cx, layout.side);
             edge.set_size(layout.edge_size);
@@ -669,19 +788,31 @@ impl RoomPaneDock {
     }
 
     /// Returns the DSL template of the given kind of pane.
-    fn frame_template(&self, kind: RoomPaneKind) -> Option<LivePtr> {
+    fn frame_template(&self, kind: &RoomPaneKind) -> Option<LivePtr> {
         match kind {
             RoomPaneKind::Members => self.members_pane,
+            RoomPaneKind::MiniApp(_) => self.mini_app_pane,
         }
     }
 
-    /// Creates a new pane, which is placed on an edge by `place_panes()`.
-    fn create_pane(&mut self, cx: &mut Cx, kind: RoomPaneKind, layout: PaneLayout, content: Option<SavedPaneContent>) {
-        let Some(room_name_id) = self.room_name_id.clone() else { return };
-        let frame = widget_ref_from_live_ptr(cx, self.frame_template(kind));
+    /// Creates a pane for `place_panes()` to place, returning whether it was created.
+    /// A mini-app pane needs its app running (or `is_spawn_allowed`) and not shown elsewhere.
+    fn create_pane(
+        &mut self,
+        cx: &mut Cx,
+        kind: RoomPaneKind,
+        layout: PaneLayout,
+        content: Option<SavedPaneContent>,
+        is_spawn_allowed: bool,
+    ) -> bool {
+        let Some(room_name_id) = self.room_name_id.clone() else { return false };
+        if self.timeline_kind.as_ref().is_none_or(|timeline_kind| !kind.is_dockable_in(timeline_kind)) {
+            return false;
+        }
+        let frame = widget_ref_from_live_ptr(cx, self.frame_template(&kind));
         if frame.is_empty() {
             error!("BUG: missing the room pane template for {kind:?}");
-            return;
+            return false;
         }
         // Link the manually-drawn frame into the widget tree so its children can be found.
         cx.widget_tree_insert_child_deep(
@@ -689,29 +820,55 @@ impl RoomPaneDock {
             LiveId::from_str(&format!("room_pane_{}", kind.as_str())),
             frame.clone(),
         );
-        set_pane_title(cx, &frame, kind.title());
-        match content {
-            Some(content) => restore_content(cx, &frame, &room_name_id, content, &self.room_members),
-            None => populate_content(cx, kind, &frame, &room_name_id, &self.room_members),
-        }
-        // Our timeline only keeps its members up to date while a members pane is open,
-        // so refresh them when one is opened (and fetch any that are missing).
-        if kind == RoomPaneKind::Members
-            && let Some(timeline_kind) = self.timeline_kind.clone()
-        {
-            submit_async_request(MatrixRequest::GetRoomMembers {
-                timeline_kind,
-                memberships: matrix_sdk::RoomMemberships::ACTIVE,
-                local_only: false,
-            });
+        set_pane_title(cx, &frame, &kind.title());
+        set_pane_icon(cx, &frame, &kind);
+        match &kind {
+            RoomPaneKind::MiniApp(app_id) => {
+                let host_area = frame.widget(cx, ids!(content.mini_app_host));
+                let is_attached = mini_app_panes::attach(
+                    cx,
+                    &host_area,
+                    self.widget_uid(),
+                    room_name_id.room_id(),
+                    app_id,
+                    Some(layout.side),
+                    is_spawn_allowed,
+                );
+                if !is_attached {
+                    return false;
+                }
+            }
+            RoomPaneKind::Members => {
+                match content {
+                    Some(content) => restore_content(cx, &frame, &room_name_id, content, &self.room_members),
+                    None => populate_content(cx, &kind, &frame, &room_name_id, &self.room_members),
+                }
+                // Our timeline only keeps its members up to date while a members pane is open,
+                // so refresh them when one is opened (and fetch any that are missing).
+                if let Some(timeline_kind) = self.timeline_kind.clone() {
+                    submit_async_request(MatrixRequest::GetRoomMembers {
+                        timeline_kind,
+                        memberships: matrix_sdk::RoomMemberships::ACTIVE,
+                        local_only: false,
+                    });
+                }
+            }
         }
         let title_width = measure_title_width(cx, &frame);
-        self.panes.push(DockedPane { kind, frame, layout, placed: None, button_cols: 0, title_width });
+        let glyph_width = measure_icon_width(cx, &frame);
+        self.panes.push(DockedPane { kind, frame, layout, placed: None, button_cols: 0, title_width, glyph_width });
+        true
     }
 
-    fn remove_pane(&mut self, cx: &mut Cx, kind: RoomPaneKind, animate: bool) {
-        let Some(index) = self.panes.iter().position(|pane| pane.kind == kind) else { return };
+    /// Removes the given pane, quitting its mini-app if `is_closing`, or else parking it.
+    fn remove_pane(&mut self, cx: &mut Cx, kind: &RoomPaneKind, animate: bool, is_closing: bool) {
+        let Some(index) = self.panes.iter().position(|pane| &pane.kind == kind) else { return };
         let pane = self.panes.remove(index);
+        // The frame slides out without its mini-app, which may be shown elsewhere right away.
+        if let (RoomPaneKind::MiniApp(app_id), Some(room_name_id)) = (kind, self.room_name_id.as_ref()) {
+            let host_area = pane.frame.widget(cx, ids!(content.mini_app_host));
+            mini_app_panes::detach(cx, &host_area, self.widget_uid(), room_name_id.room_id(), app_id, is_closing);
+        }
         if let Some(side) = pane.placed {
             // The edge keeps drawing the pane until it has slid out.
             self.edge(cx, side).remove_pane(cx, kind, animate);
@@ -771,9 +928,10 @@ impl RoomPaneDock {
                 dock_size.x / count.max(1) as f64
             };
             let pane = &mut self.panes[index];
-            // The icon hasn't been measured before its first draw.
-            let icon_width = pane.frame.widget(cx, ids!(pane_icon)).area().rect(cx).size.x;
-            let icon_width = if icon_width > 0.0 { icon_width } else { 20.0 };
+            // The icon (or text glyph) hasn't been measured before its first draw.
+            let icon_width = pane.frame.widget(cx, ids!(pane_icon)).area().rect(cx).size.x
+                + pane.frame.widget(cx, ids!(pane_glyph)).area().rect(cx).size.x;
+            let icon_width = if icon_width > 0.0 { icon_width } else { pane.glyph_width.unwrap_or(20.0) };
             let title_area = |cols: usize| pane_width - FRAME_PADDING * 2.0 - icon_width - HEADER_SPACING * 2.0
                 - (HEADER_BUTTON_STEP * cols as f64 - HEADER_BUTTON_SPACING);
             let cols = if side.is_vertical() {
@@ -830,8 +988,8 @@ impl RoomPaneDockRef {
     }
 
     /// Returns whether the given kind of pane is docked here.
-    pub fn has_pane(&self, kind: RoomPaneKind) -> bool {
-        self.borrow().is_some_and(|inner| inner.panes.iter().any(|pane| pane.kind == kind))
+    pub fn has_pane(&self, kind: &RoomPaneKind) -> bool {
+        self.borrow().is_some_and(|inner| inner.has_pane(kind))
     }
 
     /// See [`RoomPaneDock::save_state()`].
@@ -1229,9 +1387,9 @@ impl RoomPaneEdgeRef {
     }
 
     /// Removes the given pane, sliding it out first if it's this edge's last pane.
-    fn remove_pane(&self, cx: &mut Cx, kind: RoomPaneKind, animate: bool) {
+    fn remove_pane(&self, cx: &mut Cx, kind: &RoomPaneKind, animate: bool) {
         let Some(mut inner) = self.borrow_mut() else { return };
-        if !inner.panes.iter().any(|(k, _)| *k == kind) {
+        if !inner.panes.iter().any(|(k, _)| k == kind) {
             return;
         }
         if animate && inner.panes.len() == 1 {
@@ -1241,7 +1399,7 @@ impl RoomPaneEdgeRef {
                 inner.animator_play(cx, ids!(panel.hide));
             }
         } else {
-            inner.panes.retain(|(k, _)| *k != kind);
+            inner.panes.retain(|(k, _)| k != kind);
             if inner.panes.is_empty() {
                 inner.is_sliding_out = false;
                 inner.animator_cut(cx, ids!(panel.hide));
