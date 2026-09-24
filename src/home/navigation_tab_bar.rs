@@ -11,15 +11,15 @@
 //!
 //! Their order in Mobile view (horizontally from left to right) is:
 //! 1. Home (house icon): the main view that shows all rooms across all spaces.
-//! 2. Add Room (plus sign icon): a separate view that allows adding (joining) existing rooms,
-//!    exploring public rooms, or creating new rooms/spaces.
-//! 3. Mini Apps (sparkle icon): the Splash mini-apps management view.
+//! 2. Mini Apps (sparkle icon): the Splash mini-apps management view.
 //!    * Hidden unless the `a2app` feature is enabled and the corresponding
 //!      App Setting is on.
-//! 4. Spaces: a button that toggles the `SpacesBar` (shows/hides it).
+//! 3. Spaces: a button that toggles the `SpacesBar` (shows/hides it).
 //!    * This is NOT a regular radio button, it's a separate toggle.
 //!    * This is only shown in Mobile view mode, because the `SpacesBar` is always shown
 //!      within the NavigationTabBar itself in Desktop view mode.
+//! 4. Add Room (plus sign icon): a separate view that allows adding (joining) existing rooms,
+//!    exploring public rooms, or creating new rooms/spaces.
 //! 5. Profile/Settings (user profile avatar): the `ProfileIcon` with a
 //!    verification badge. This single button serves as both the user-avatar
 //!    indicator and the entry point to the SettingsScreen.
@@ -29,8 +29,8 @@
 //! The order in Desktop view (vertically from top to bottom) is:
 //! 1. Profile/Settings
 //! 2. Home
-//! 3. Add/Join
-//! 4. Mini Apps (optional, as above)
+//! 3. Mini Apps (optional, as above)
+//! 4. Add/Join
 //! 5. ----- separator -----
 //!      SpacesBar content
 //!
@@ -220,10 +220,10 @@ script_mod! {
                 home_button := mod.widgets.HomeButton {}
             }
             CachedWidget {
-                add_room_button := mod.widgets.AddRoomButton {}
+                mini_apps_button := mod.widgets.MiniAppsButton {}
             }
             CachedWidget {
-                mini_apps_button := mod.widgets.MiniAppsButton {}
+                add_room_button := mod.widgets.AddRoomButton {}
             }
 
             mod.widgets.Separator {}
@@ -257,14 +257,14 @@ script_mod! {
                 home_button := mod.widgets.HomeButton {}
             }
             CachedWidget {
-                add_room_button := mod.widgets.AddRoomButton {}
-            }
-            CachedWidget {
                 mini_apps_button := mod.widgets.MiniAppsButton {}
             }
 
             toggle_spaces_bar_button := mod.widgets.ToggleSpacesBarButton {}
 
+            CachedWidget {
+                add_room_button := mod.widgets.AddRoomButton {}
+            }
             CachedWidget {
                 profile_icon := mod.widgets.ProfileIcon {}
             }
