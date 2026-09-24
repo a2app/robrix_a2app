@@ -271,6 +271,11 @@ fn native_requests_and_resource_aliases_cannot_bypass_the_broker() {
     let mut cx = Cx::new(Box::new(|_, _| {}));
     cx.with_vm(makepad_widgets::script_mod);
     let isolate = cx.alloc_splash_vm_with_host_io();
+    // With a network runtime present, only the host I/O guards can refuse these calls.
+    makepad_widgets::widget_async::with_isolate(&mut cx, isolate, |cx| {
+        let net = cx.net.clone();
+        cx.script_data.std.net = Some(net);
+    });
     for attempt in [
         script! { mod.net.http_request(mod.net.HttpRequest{url:"http://127.0.0.1:9/secret"}, mod.net.HttpEvents{}) },
         script! { mod.net.socket_stream(mod.net.SocketStreamOptions{host:"127.0.0.1" port:"9"}) },
@@ -279,10 +284,11 @@ fn native_requests_and_resource_aliases_cannot_bypass_the_broker() {
         script! { mod.prelude.widgets.file_resource("/etc/passwd") },
     ] {
         cx.with_script_vm_id(isolate, |vm| {
+            vm.bx.captured_errors = Some(Vec::new());
             let value = vm.eval(attempt);
             let errors = vm.take_errors();
-            assert!(value.is_err() || !errors.is_empty(), "native bypass succeeded");
-            assert!(errors.is_empty() || errors.iter().any(|error| error.contains("host request")), "unexpected script error: {errors:?}");
+            assert!(value.is_err(), "native bypass succeeded");
+            assert!(errors.iter().any(|error| error.contains("host request")), "unexpected script error: {errors:?}");
         });
     }
     cx.free_splash_vm(isolate);

@@ -98,7 +98,15 @@ impl Widget for MiniAppHostArea {
                     });
                 if recorded.is_err() { return; }
             }
-            host.handle_event(cx, event, scope);
+            // Robrix opens the URLs of any link actions it sees, so a guest's must not get out.
+            let actions = cx.capture_actions(|cx| host.handle_event(cx, event, scope));
+            let mut allowed = ActionsBuf::new();
+            for action in actions {
+                if !is_url_action(&action) {
+                    allowed.push(action);
+                }
+            }
+            cx.extend_actions(allowed);
         }
     }
 
@@ -120,6 +128,13 @@ impl Widget for MiniAppHostArea {
         cx.end_turtle();
         DrawStep::done()
     }
+}
+
+/// Whether the given action carries a URL, e.g., from a tap on a link.
+fn is_url_action(action: &Action) -> bool {
+    let widget_action = action.as_widget_action();
+    matches!(widget_action.cast(), HtmlLinkAction::Clicked { .. } | HtmlLinkAction::SecondaryClicked { .. })
+        || matches!(widget_action.cast(), MarkdownAction::LinkNavigated(_))
 }
 
 impl MiniAppHostAreaRef {

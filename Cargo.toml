@@ -176,8 +176,8 @@ members = ["a2app/core", "a2app/agent"]
 [workspace.dependencies]
 # makepad-widgets = { git = "https://github.com/makepad/makepad", branch = "dev", features = ["serde"] }
 # makepad-code-editor = { git = "https://github.com/makepad/makepad", branch = "dev" }
-makepad-widgets = { git = "https://github.com/kevinaboos/makepad", branch = "splash-host-io-radio-focus", features = ["serde"] }
-makepad-code-editor = { git = "https://github.com/kevinaboos/makepad", branch = "splash-host-io-radio-focus" }
+makepad-widgets = { git = "https://github.com/kevinaboos/makepad", branch = "splash-host-io-dev", features = ["serde"] }
+makepad-code-editor = { git = "https://github.com/kevinaboos/makepad", branch = "splash-host-io-dev" }
 
 
 [patch.crates-io]
