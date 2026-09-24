@@ -117,6 +117,18 @@ needs no CLI installation. Use the embedded feature on iOS and platforms
 without a supported process sandbox. Embedded mode uses the same guarded
 model/tool transport but has no separate OS process compartment.
 
+A fourth process model is available behind the same interface on Apple
+platforms: an [ExtensionFoundation](https://developer.apple.com/documentation/extensionfoundation/adding-support-for-app-extensions-to-your-app)
+app extension — an `.appex` the system launches and hosts, reached over XPC
+rather than a byte pipe. Robrix prefers it when a matching, enabled extension
+is installed and falls back to the confined child otherwise. The frame
+transport boundary is `a2app_agent::channel`, the process-model selection is
+the private `a2app/agent/src/launcher.rs`, and the Swift/XPC seam is
+`a2app_agent::extension`. Until a bridge is installed — which is every
+platform until Octos ships a matching extension — the extension launcher
+reports itself unavailable, so behavior is unchanged and the confined child
+remains the backend.
+
 Configure an OpenAI-compatible or
 Anthropic provider through **AI Providers**, an existing Octos configuration,
 or that provider's supported environment/auth-store credentials. Supported

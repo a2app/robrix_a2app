@@ -64,7 +64,17 @@ trap 'forward_signal INT 130' INT
 trap 'forward_signal TERM 143' TERM
 trap 'forward_signal HUP 129' HUP
 
-inputs=$(/usr/bin/shasum -a 256 "$binary" "$packaging_dir/macos/Info.plist" "${BASH_SOURCE[0]}")
+extension_inputs=()
+for f in "$working_dir/a2app/agent/extension/apple/build.sh" \
+         "$working_dir/a2app/agent/extension/apple/HostBridge.swift" \
+         "$working_dir/a2app/agent/extension/apple/AgentExtension.swift" \
+         "$working_dir/a2app/agent/extension/apple/Extension.entitlements"; do
+    if [[ -f "$f" ]]; then extension_inputs+=("$f"); fi
+done
+if [[ -n "${ROBRIX_OCTOS_FFI_DYLIB:-}" && -f "${ROBRIX_OCTOS_FFI_DYLIB}" ]]; then
+    extension_inputs+=("$ROBRIX_OCTOS_FFI_DYLIB")
+fi
+inputs=$(/usr/bin/shasum -a 256 "$binary" "$packaging_dir/macos/Info.plist" "${BASH_SOURCE[0]}" "${extension_inputs[@]}")
 previous_inputs=
 if [[ -f $bundle_dir/inputs ]]; then previous_inputs=$(< "$bundle_dir/inputs"); fi
 if [[ $inputs != "$previous_inputs" || ! -f $bundle/Contents/MacOS/robrix ]]; then
@@ -86,6 +96,14 @@ if [[ $inputs != "$previous_inputs" || ! -f $bundle/Contents/MacOS/robrix ]]; th
     /usr/libexec/PlistBuddy -c 'Set :CFBundleName Robrix Development' "$plist"
     # Development builds must not register URL handlers over an installed Robrix.
     /usr/libexec/PlistBuddy -c 'Delete :CFBundleURLTypes' "$plist"
+    # Embed the ExtensionFoundation agent extension when its Octos FFI dylib is
+    # available. Without ROBRIX_OCTOS_FFI_DYLIB (or the sources), Robrix simply
+    # runs the confined child, exactly as before.
+    extension_dir="$working_dir/a2app/agent/extension/apple"
+    octos_ffi="${ROBRIX_OCTOS_FFI_DYLIB:-$working_dir/../octos/target/aarch64-apple-darwin/release/liboctos_ffi.dylib}"
+    if [[ -x "$extension_dir/build.sh" && -f "$octos_ffi" ]]; then
+        "$extension_dir/build.sh" rs.robius.robrix.development "$staging/Robrix.app" "$octos_ffi"
+    fi
     if ! /usr/bin/codesign --force --sign - "$staging/Robrix.app" >"$staging/signing.log" 2>&1; then
         cat "$staging/signing.log" >&2
         echo 'robrix: could not sign the development app bundle, so running without it.' >&2
@@ -101,6 +119,12 @@ fi
 
 # LaunchServices opens these paths in launchd, so /dev/stdout does not refer to
 # Cargo's output. Private FIFOs preserve logs for terminals and redirected runs.
+#
+# Re-register the (rebuilt) bundle first so ExtensionFoundation discovery sees
+# the embedded app extension; replacing the bundle otherwise leaves a stale
+# registration behind.
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+    -f "$bundle" >/dev/null 2>&1 || true
 mkfifo "$launch_dir/stdout" "$launch_dir/stderr"
 (trap '' INT; exec cat "$launch_dir/stdout") &
 stdout_pid=$!

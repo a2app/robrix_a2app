@@ -5,12 +5,21 @@
 //! composes), and the `embedded` cargo feature adds an in-process backend
 //! that links the octos agent crates directly (no child process — the only
 //! option on iOS, where exec() is prohibited).
+//!
+//! How that process is started and how its bytes arrive is itself pluggable:
+//! see [`channel::AgentChannel`] for the frame transport and
+//! [`extension`] for the ExtensionFoundation app-extension process model.
 
 pub mod acp_client;
+#[cfg(target_os = "macos")]
+mod apple_extension;
+pub mod channel;
+pub mod extension;
 pub mod intent;
 pub mod mcp;
 pub mod model_transport;
 mod host_broker;
+mod launcher;
 #[cfg(feature = "embedded")]
 mod octos_embedded;
 pub mod pipeline;
@@ -21,6 +30,7 @@ pub mod setup;
 pub mod skills;
 
 use acp_client::{AcpClient, AcpEvent};
+use launcher::AgentLauncher;
 
 /// The Splash dialect guide — the entire "app-card memory" teaching the agent
 /// THIS repo's dialect. Inlined into prompts by default; `persistent-guide`
@@ -653,7 +663,7 @@ pub fn start_backend_with_mcp(
         if let Ok(model) = std::env::var("ROBRIX_AGENT_MODEL") {
             env.push((String::from("ANTHROPIC_MODEL"), model));
         }
-        return Ok(Box::new(AcpClient::spawn(&cmd, workspace, &env, &extra, mcp_servers)?));
+        return Ok(Box::new(external_client(&cmd, workspace, env, extra, mcp_servers)?));
     }
     #[cfg(feature = "embedded")]
     {
@@ -680,7 +690,7 @@ pub fn start_backend_with_mcp(
             // The bridge gets its own env only: `backend.env(prefs)` carries
             // octos's knobs, and the model/effort names in it mean nothing to
             // another provider's endpoint.
-            return Ok(Box::new(AcpClient::spawn(&cmd, workspace, &bridge_env, &[], mcp_servers)?));
+            return Ok(Box::new(external_client(&cmd, workspace, bridge_env, Vec::new(), mcp_servers)?));
         }
         // Ordinary upstream ACP does not connect client-advertised MCP
         // servers. Room agents have already taken the protected broker path.
@@ -688,8 +698,24 @@ pub fn start_backend_with_mcp(
             return Err("Ordinary Octos ACP cannot connect client MCP servers. Use a protected room agent with host-owned tools.".into());
         }
         let cmd = octos_acp_command(prefs);
-        Ok(Box::new(AcpClient::spawn(&cmd, workspace, &env, &extra, mcp_servers)?))
+        Ok(Box::new(external_client(&cmd, workspace, env, extra, mcp_servers)?))
     }
+}
+
+/// Starts an unconfined external ACP command through the launcher abstraction
+/// and wraps the resulting channel in an `AcpClient`. The one-line form of
+/// "there is some command line, make a working transport out of it".
+fn external_client(
+    cmd_line: &str,
+    workspace: &std::path::Path,
+    env: Vec<(String, String)>,
+    extra_args: Vec<String>,
+    mcp_servers: &[mcp::McpServerConfig],
+) -> Result<AcpClient, String> {
+    let launcher = launcher::ExternalCommandLauncher::new(cmd_line, env, extra_args);
+    let cfg = launcher::LaunchConfig { workspace, mcp_servers, broker: None };
+    let launched = launcher.launch(&cfg)?;
+    Ok(AcpClient::new(launched.channel, &launched.desc, launched.broker, workspace, mcp_servers))
 }
 
 /// The `octos acp` command line a run would be spawned with.
@@ -730,6 +756,9 @@ fn octos_acp_command(prefs: &prefs::AgentPrefs) -> String {
 pub enum Runtime {
     /// octos compiled in, running on a thread of this process — no child.
     Embedded,
+    /// An ExtensionFoundation app extension process (Apple platforms): the
+    /// system launches and hosts it, and Robrix talks to it over XPC.
+    Extension,
     /// A child process we spawn, and the exact command line.
     Child(String),
     /// A child process the USER chose via `ROBRIX_AGENT_CMD`.
@@ -742,6 +771,7 @@ impl Runtime {
     pub fn summary(&self) -> String {
         match self {
             Self::Embedded => "Runs inside this app — octos is compiled in, no child process".into(),
+            Self::Extension => "Runs as an app extension — the system hosts the agent process".into(),
             Self::Child(cmd) => format!("Runs as a child process — `{cmd}`"),
             Self::Override(cmd) => {
                 format!("Runs as a child process — `{cmd}` (from ROBRIX_AGENT_CMD)")
@@ -754,6 +784,12 @@ impl Runtime {
 pub fn runtime(prefs: &prefs::AgentPrefs) -> Runtime {
     if let Some(cmd) = providers::agent_command() {
         return Runtime::Override(cmd);
+    }
+    // An installed ExtensionFoundation extension is the process model when
+    // present; the confined subprocess is the fallback everywhere else
+    // (including every non-Apple platform, where no bridge is installed).
+    if extension::extension_launcher().is_some_and(|launcher| launcher.installed()) {
+        return Runtime::Extension;
     }
     #[cfg(feature = "embedded")]
     {
