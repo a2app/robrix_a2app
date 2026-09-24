@@ -51,7 +51,7 @@ script_mod! {
         pane_icon := Icon {
             height: #(HEADER_BUTTON_SIZE)
             align: Align{y: 0.5}
-            icon_walk: Walk{width: 16, height: 16, margin: Inset{left: 2, right: 2}}
+            icon_walk: Walk{width: #(PANE_ICON_SIZE), height: #(PANE_ICON_SIZE), margin: Inset{left: #(PANE_ICON_MARGIN), right: #(PANE_ICON_MARGIN)}}
             draw_icon +: { color: (COLOR_TEXT) }
         }
         // A text icon (e.g., a mini-app's emoji), shown in place of `pane_icon`.
@@ -264,6 +264,9 @@ script_mod! {
     }
 }
 
+/// The size of a pane's SVG icon, and the space on either side of it.
+const PANE_ICON_SIZE: f64 = 16.0;
+const PANE_ICON_MARGIN: f64 = 2.0;
 /// The spacing between the header's icon, titles, and buttons.
 /// The horizontal padding of a pane's frame.
 const FRAME_PADDING: f64 = 10.0;
@@ -370,7 +373,15 @@ pub fn set_pane_icon(cx: &mut Cx, pane: &WidgetRef, kind: &RoomPaneKind) {
         RoomPaneKind::MiniApp(app_id) => Some(mini_app_panes::app_glyph(app_id).unwrap_or_default()),
         RoomPaneKind::Members => None,
     };
-    pane.widget(cx, ids!(pane_icon)).set_visible(cx, glyph.is_none());
+    // An `Icon` can't be hidden, so it shrinks to nothing when a glyph is shown instead.
+    let (size, margin) = if glyph.is_some() { (0.0, 0.0) } else { (PANE_ICON_SIZE, PANE_ICON_MARGIN) };
+    let mut icon = pane.widget(cx, ids!(pane_icon));
+    script_apply_eval!(cx, icon, {
+        icon_walk: mod.prelude.widgets.Walk{
+            width: #(size), height: #(size)
+            margin: mod.prelude.widgets.Inset{left: #(margin), right: #(margin)}
+        }
+    });
     let glyph_label = pane.label(cx, ids!(pane_glyph));
     glyph_label.set_visible(cx, glyph.is_some());
     glyph_label.set_text(cx, glyph.as_deref().unwrap_or_default());
