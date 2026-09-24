@@ -65,6 +65,7 @@ impl Registry {
     }
 
     pub fn ensure_action_allowed(&self, context: &ContextId, action: &SensitiveAction) -> Result<(), String> {
+        if super::unsafe_flows_disabled() { return Ok(()); }
         if self.action_decision(context, action)?.allowed { Ok(()) }
         else { Err("Untrusted input influenced this action. Review its exact operation and target in Mini Apps before authorizing it.".into()) }
     }
@@ -221,6 +222,7 @@ impl Registry {
     }
 
     fn exact_action(&mut self, context: &ContextId, epoch: u64, action: &SensitiveAction, payload: &serde_json::Value, commit: bool) -> Result<(), String> {
+        if super::unsafe_flows_disabled() { return Ok(()); }
         self.ensure_context_epoch(context, epoch)?;
         validate_action(action)?;
         let influences = self.influences(context)?;

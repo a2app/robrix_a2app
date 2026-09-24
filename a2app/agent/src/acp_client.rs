@@ -1,28 +1,28 @@
-//! A minimal Agent Client Protocol (ACP) client over stdio.
+//! A minimal Agent Client Protocol (ACP) client over an [`AgentChannel`].
 //!
-//! Speaks newline-delimited JSON-RPC 2.0 to a spawned agent process (by default
-//! `octos acp`, but any ACP agent binary works — the protocol is the standard
-//! one from <https://agentclientprotocol.com>). Deliberately dependency-light:
-//! plain `std::process` + `std::thread` + `mpsc`, no async runtime. Incoming
+//! Speaks newline-delimited JSON-RPC 2.0 to whichever transport a launcher
+//! connected (by default a spawned `octos acp` child over its OS pipes, but
+//! any ACP agent binary works — the protocol is the standard one from
+//! <https://agentclientprotocol.com>). The pipe/process choice lives behind
+//! [`AgentChannel`]; this client only sees frames. Deliberately
+//! dependency-light: plain `std::thread` + `mpsc`, no async runtime. Incoming
 //! events are queued for the UI thread, which drains them from `handle_event`;
 //! each queued event is followed by a `SignalToUI` wakeup so replies that land
 //! while the app is idle don't sit in the channel until the next input event.
 //!
-//! One client == one child process == one generation. The pipeline spawns a
+//! One client == one connection == one generation. The pipeline starts a
 //! fresh agent per create-app request and drops it when the request completes,
 //! so there is no reconnect/restart state to manage; a cancel is just a
-//! `session/cancel` (and ultimately a kill on drop).
+//! `session/cancel` (and ultimately a channel close on drop).
 //!
-//! Threading: THREE threads touch the child, and none of them may block
-//! another. All stdin writes go through a dedicated writer thread fed by a
-//! bounded channel — the UI thread and the reader thread only ever
-//! `try_send()`, so a stalled/wedged child can never freeze
-//! the UI (or deadlock the reader against its own refusal replies). `Drop`
-//! kills the child FIRST (kill takes no locks), which closes the pipes and
-//! unblocks any thread stuck mid-write/mid-read.
+//! Threading: a writer thread and a reader thread touch the channel, and
+//! neither may block the other or the UI. All outgoing frames go through the
+//! dedicated writer thread fed by a bounded channel — the UI thread and the
+//! reader thread only ever `try_send()`, so a stalled/wedged peer can never
+//! freeze the UI (or deadlock the reader against its own refusal replies).
+//! `Drop` closes the channel FIRST (which, for a subprocess, kills the child;
+//! kill takes no locks), unblocking any thread stuck mid-write/mid-read.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -30,13 +30,15 @@ use std::sync::{Arc, Mutex};
 use makepad_widgets::SignalToUI;
 use serde_json::{json, Value};
 
+use crate::channel::{AgentChannel, ChannelError, MAX_FRAME_BYTES};
+use crate::launcher::{AgentLauncher, ExternalCommandLauncher, LaunchConfig};
 use crate::mcp::McpServerConfig;
 use crate::host_broker::HostBroker;
 
 /// Cap on one incoming NDJSON line. A frame past this is not a protocol we
 /// can parse anyway (real replies are a few KB) — treat it as a dead agent
 /// rather than buffering without bound.
-const MAX_LINE_BYTES: usize = octos_llm::host::MAX_FRAME_BYTES;
+const MAX_LINE_BYTES: usize = MAX_FRAME_BYTES;
 const MAX_QUEUED_BYTES: usize = 2 * MAX_LINE_BYTES;
 
 /// Events surfaced to the UI thread, already reduced from raw JSON-RPC to what
@@ -103,7 +105,7 @@ fn event_size(event: &AcpEvent) -> usize {
 /// Which JSON-RPC request an outstanding id belongs to. The pipeline runs
 /// strictly one request at a time (initialize → session/new → prompt → ...),
 /// so a single pending slot replaces a request table.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Pending {
     Initialize,
     NewSession,
@@ -157,6 +159,7 @@ impl Shared {
 
     fn fail(&self, error: &str) {
         if !self.closed.swap(true, Ordering::AcqRel) {
+            makepad_widgets::log!("acp-client: FAIL: {error}");
             *self.failure.lock().unwrap() = Some(error.into());
             if let Some(broker) = &self.broker { broker.stop(); }
             SignalToUI::set_ui_signal();
@@ -166,15 +169,18 @@ impl Shared {
     fn send_request(&self, kind: Pending, method: &str, params: Value) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         *self.pending.lock().unwrap() = Some((id, kind));
+        makepad_widgets::log!("acp-client: -> {method} (id {id})");
         self.write_line(
             json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string(),
         );
     }
 }
 
-/// A live connection to a spawned ACP agent process.
+/// A live connection to an ACP agent over an [`AgentChannel`].
 pub struct AcpClient {
-    child: Child,
+    /// Kept so `Drop` can tear the transport down; also shared with the
+    /// reader thread, which is why it is an `Arc` rather than a plain box.
+    channel: Arc<dyn AgentChannel>,
     events: Receiver<(usize, AcpEvent)>,
     shared: Arc<Shared>,
     /// Human-readable command line, for diagnostics.
@@ -196,42 +202,23 @@ impl AcpClient {
         extra_args: &[String],
         mcp_servers: &[McpServerConfig],
     ) -> Result<Self, String> {
-        let mut parts = cmd_line.split_whitespace();
-        let bin = parts.next().ok_or("agent command is empty")?;
-        let mut args: Vec<String> = parts.map(str::to_string).collect();
-        args.extend(extra_args.iter().cloned());
-
-        std::fs::create_dir_all(workspace).ok();
-        let mut command = Command::new(bin);
-        command.args(&args)
-            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            // Robrix may itself be running from inside a Claude Code
-            // session (dev workflows); the claude-code-acp adapter refuses to
-            // start when it sees CLAUDECODE, thinking it's being nested. Robrix
-            // isn't Claude Code — drop the marker for the child (the
-            // adapter's own documented bypass).
-            .env_remove("CLAUDECODE")
-            .current_dir(workspace);
-        Self::spawn_command(command, cmd_line, workspace, mcp_servers, None)
+        let launcher = ExternalCommandLauncher::new(cmd_line.to_string(), env.to_vec(), extra_args.to_vec());
+        let cfg = LaunchConfig { workspace, mcp_servers, broker: None };
+        let launched = launcher.launch(&cfg)?;
+        Ok(Self::new(launched.channel, &launched.desc, launched.broker, workspace, mcp_servers))
     }
 
-    pub(crate) fn spawn_protected(executable: &std::path::Path, broker: Arc<HostBroker>) -> Result<Self, String> {
-        let mut command = octos_sandbox::host_managed_command(executable).map_err(|error| format!("Could not confine Octos: {error}"))?;
-        command.args(["acp", "--host-managed"]);
-        Self::spawn_command(command, "confined Octos host broker", std::path::Path::new("/"), &[], Some(broker))
-    }
-
-    fn spawn_command(mut command: Command, cmd_desc: &str, workspace: &std::path::Path, mcp_servers: &[McpServerConfig], broker: Option<Arc<HostBroker>>) -> Result<Self, String> {
-        let mut child = command.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("couldn't start `{cmd_desc}`: {e}"))?;
-
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
-        let mut stdin = child.stdin.take().expect("piped stdin");
-
+    /// Builds the protocol machinery over an already-connected channel and
+    /// starts the ACP handshake. Transport-agnostic: the same code drives a
+    /// spawned child's pipes and an ExtensionFoundation XPC connection.
+    pub(crate) fn new(
+        channel: Box<dyn AgentChannel>,
+        cmd_desc: &str,
+        broker: Option<Arc<HostBroker>>,
+        workspace: &std::path::Path,
+        mcp_servers: &[McpServerConfig],
+    ) -> Self {
+        let channel: Arc<dyn AgentChannel> = Arc::from(channel);
         let (tx, events) = std::sync::mpsc::sync_channel::<(usize, AcpEvent)>(128);
         let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<String>(16);
         let shared = Arc::new(Shared {
@@ -247,71 +234,48 @@ impl AcpClient {
             mcp_servers: mcp_servers.to_vec(),
         });
 
-        // Writer thread: sole owner of the child's stdin. Exits when every
-        // Sender is gone (client dropped) or the pipe breaks (child died).
+        // Writer thread: sole writer of the channel. Exits when every Sender
+        // is gone (client dropped) or the transport breaks (peer died).
         let writer_shared = Arc::downgrade(&shared);
-        std::thread::spawn(move || {
-            for line in write_rx {
-                let result = stdin
-                    .write_all(line.as_bytes())
-                    .and_then(|_| stdin.write_all(b"\n"))
-                    .and_then(|_| stdin.flush());
-                if let Some(shared) = writer_shared.upgrade() {
-                    shared.queued_bytes.fetch_sub(line.len(), Ordering::AcqRel);
-                    if result.is_err() { shared.fail("Agent protocol input closed."); }
-                }
-                if result.is_err() {
-                    break;
-                }
-            }
-        });
-
-        // Stderr drain: keep the tail for diagnostics (a missing provider
-        // config makes the agent exit immediately with the reason on stderr).
-        // Read lossily — a stray invalid-UTF-8 byte must not kill the drain.
-        let err_tail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let stderr_done = {
-            let err_tail = err_tail.clone();
-            let protected = shared.broker.is_some();
+        {
+            let channel = channel.clone();
             std::thread::spawn(move || {
-                let mut reader = BufReader::new(stderr);
-                let mut buf = Vec::new();
-                while crate::mcp::read_frame(&mut reader, 4096, &mut buf) {
-                    if protected { continue; }
-                    let line = String::from_utf8_lossy(&buf);
-                    let line = line.trim_end_matches(['\r', '\n']);
-                    let mut tail = err_tail.lock().unwrap();
-                    tail.push(line.to_string());
-                    let excess = tail.len().saturating_sub(12);
-                    if excess > 0 {
-                        tail.drain(..excess);
+                for line in write_rx {
+                    let result = channel.send_frame(line.as_bytes());
+                    if let Some(shared) = writer_shared.upgrade() {
+                        shared.queued_bytes.fetch_sub(line.len(), Ordering::AcqRel);
+                        if result.is_err() { shared.fail("Agent protocol input closed."); }
+                    }
+                    if result.is_err() {
+                        break;
                     }
                 }
-            })
-        };
+            });
+        }
 
-        // Reader thread: NDJSON lines → reduced AcpEvents → queue + UI signal.
-        // Also read lossily and with a per-line cap, so a malformed agent
-        // can't wedge or balloon the host app.
+        // Reader thread: frames → reduced AcpEvents → queue + UI signal. The
+        // channel enforces its own per-frame cap, so a malformed agent can't
+        // wedge or balloon the host app.
         {
             let tx = tx.clone();
             let shared = shared.clone();
-            let err_tail = err_tail.clone();
+            let channel = channel.clone();
             std::thread::spawn(move || {
-                let mut reader = BufReader::new(stdout);
                 let mut buf = Vec::new();
                 loop {
-                    if !read_capped_line(&mut reader, &mut buf) {
-                        break;
-                    }
-                    if buf.len() >= MAX_LINE_BYTES {
-                        shared.fail("Agent sent an oversized protocol frame.");
-                        return;
+                    match channel.recv_frame(&mut buf) {
+                        Ok(()) => {}
+                        Err(ChannelError::Oversized) => {
+                            shared.fail("Agent sent an oversized protocol frame.");
+                            return;
+                        }
+                        Err(_) => break,
                     }
                     let line = String::from_utf8_lossy(&buf);
                     if line.trim().is_empty() {
                         continue;
                     }
+                    makepad_widgets::log!("acp-client: <- {}", line.chars().take(200).collect::<String>());
                     for event in reduce_line(&shared, &line) {
                         let size = event_size(&event);
                         if shared.queued_event_bytes.fetch_update(Ordering::AcqRel, Ordering::Acquire,
@@ -330,18 +294,13 @@ impl AcpClient {
                     if shared.closed.load(Ordering::Acquire) { return; }
                 }
                 // EOF revokes broker work immediately. Diagnostic draining
-                // must not extend a disconnected child's active turn.
+                // must not extend a disconnected peer's active turn.
                 if let Some(broker) = &shared.broker { broker.stop(); }
-                // Stdout closed: the process died or shut down. Wait briefly
-                // for the stderr drain to finish flushing the reason (bounded:
-                // stderr may stay open in exotic cases, so don't join blindly).
-                for _ in 0..20 {
-                    if stderr_done.is_finished() {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                let tail = if shared.broker.is_some() { String::new() } else { err_tail.lock().unwrap().join("\n") };
+                // The channel closed. Wait briefly for its diagnostics drain to
+                // finish flushing the reason (bounded, so an open stderr that
+                // never closes can't hang teardown).
+                channel.wait_diagnostics(std::time::Duration::from_millis(1000));
+                let tail = if shared.broker.is_some() { String::new() } else { channel.diagnostics() };
                 let msg = if tail.trim().is_empty() {
                     "agent process exited".to_string()
                 } else {
@@ -370,7 +329,7 @@ impl AcpClient {
             }),
         );
 
-        Ok(Self { child, events, shared, cmd_desc: cmd_desc.to_string() })
+        Self { channel, events, shared, cmd_desc: cmd_desc.to_string() }
     }
 
     /// Drains every event queued by the reader thread. Call from the UI
@@ -378,7 +337,7 @@ impl AcpClient {
     pub fn drain_events(&mut self) -> Vec<AcpEvent> {
         let failure = self.shared.failure.lock().unwrap().take();
         if let Some(error) = failure {
-            let _ = self.child.kill();
+            self.channel.close();
             return vec![AcpEvent::ProcessGone(error)];
         }
         let mut out = Vec::new();
@@ -437,10 +396,10 @@ impl AcpClient {
 impl Drop for AcpClient {
     fn drop(&mut self) {
         if let Some(broker) = &self.shared.broker { broker.stop(); }
-        // Kill FIRST: it takes no locks and closes the pipes, so any thread
-        // blocked on the child (reader mid-read, writer mid-write) unwedges.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Close FIRST: for a subprocess channel this kills the child, which
+        // takes no locks and closes the pipes, so any thread blocked on the
+        // peer (reader mid-read, writer mid-write) unwedges.
+        self.channel.close();
         // Dropping the sender lets the writer thread exit.
         self.shared.write_tx.lock().unwrap().take();
     }
@@ -575,28 +534,6 @@ done
     }
 }
 
-/// Reads one `\n`-terminated line into `buf` (cleared first), lossily and
-/// capped at `MAX_LINE_BYTES`. Returns false on EOF/error with nothing read.
-/// A line hitting the cap is returned as-is (caller checks `buf.len()`).
-fn read_capped_line(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> bool {
-    buf.clear();
-    let mut limited = reader.take(MAX_LINE_BYTES as u64);
-    match limited.read_until(b'\n', buf) {
-        Ok(0) => false,
-        Ok(_) => {
-            // Preserve the cap marker even when its last byte is whitespace.
-            // Otherwise a frame ending this chunk with CR could be split and
-            // accepted as several independently bounded protocol frames.
-            if buf.len() >= MAX_LINE_BYTES { return true; }
-            while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
-                buf.pop();
-            }
-            true
-        }
-        Err(_) => false,
-    }
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -638,15 +575,6 @@ mod tests {
             assert!(shared.closed.load(Ordering::Acquire));
             assert!(shared.session_id.lock().unwrap().is_none());
         }
-    }
-
-    #[test]
-    fn capped_frame_cannot_hide_its_limit_with_trailing_carriage_return() {
-        let mut input = vec![b'x'; MAX_LINE_BYTES];
-        input[MAX_LINE_BYTES - 1] = b'\r';
-        let mut buffer = Vec::new();
-        assert!(read_capped_line(&mut std::io::Cursor::new(input), &mut buffer));
-        assert_eq!(buffer.len(), MAX_LINE_BYTES);
     }
 
     /// Regression test for the review-confirmed deadlock: an agent that
@@ -876,6 +804,7 @@ fn reduce_line(shared: &Arc<Shared>, line: &str) -> Vec<AcpEvent> {
     let Some(pending) = pending else { return vec![] };
 
     if let Some(err) = value.get("error") {
+        makepad_widgets::log!("acp-client: <- error for {pending:?}: {err}");
         if let Some(broker) = &shared.broker {
             if pending == Pending::Prompt { broker.cancel(); }
             else { shared.fail("The protected agent handshake failed."); return vec![]; }
@@ -900,6 +829,7 @@ fn reduce_line(shared: &Arc<Shared>, line: &str) -> Vec<AcpEvent> {
 
     match pending {
         Pending::Initialize => {
+            makepad_widgets::log!("acp-client: <- initialize reply");
             if let Some(broker) = &shared.broker {
                 if let Err(error) = broker.accept_handshake(&value["result"]) {
                     shared.fail(&error);
@@ -915,6 +845,7 @@ fn reduce_line(shared: &Arc<Shared>, line: &str) -> Vec<AcpEvent> {
             vec![]
         }
         Pending::NewSession => {
+            makepad_widgets::log!("acp-client: <- session/new reply: {}", value);
             let Some(sid) = value
                 .pointer("/result/sessionId")
                 .and_then(Value::as_str)
@@ -930,6 +861,7 @@ fn reduce_line(shared: &Arc<Shared>, line: &str) -> Vec<AcpEvent> {
             vec![AcpEvent::SessionReady]
         }
         Pending::Prompt => {
+            makepad_widgets::log!("acp-client: <- prompt reply");
             if let Some(broker) = &shared.broker { broker.cancel(); }
             let stop_reason = value
                 .pointer("/result/stopReason")

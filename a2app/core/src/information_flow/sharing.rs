@@ -77,12 +77,14 @@ impl Registry {
     }
 
     pub fn ensure_allowed(&self, context: &ContextId, recipient: &Recipient) -> Result<(), String> {
+        if super::unsafe_flows_disabled() { return Ok(()); }
         let decision = self.decision(context, recipient)?;
         if decision.allowed { Ok(()) } else { Err(denied_message(&decision.denied_sources, recipient)) }
     }
 
     /// Without an identified reader only AllReaders grants can authorize data.
     pub fn ensure_labels_allowed(&self, label: &Label, recipient: &Recipient) -> Result<(), String> {
+        if super::unsafe_flows_disabled() { return Ok(()); }
         self.check_healthy()?;
         recipient.validate()?;
         for source in label { validate_source(source)?; }

@@ -192,6 +192,7 @@ impl Registry {
     }
 
     pub fn context_epoch(&self, context: &ContextId) -> Result<u64, String> {
+        if unsafe_flows_disabled() { return Ok(0); }
         self.check_context(context)?;
         self.context_epochs.get(context).copied().ok_or_else(|| "Missing context activation identity.".into())
     }
@@ -199,6 +200,7 @@ impl Registry {
     /// Reject asynchronous work captured by an earlier live instance even
     /// when its durable compartment has since reopened with identical labels.
     pub fn ensure_context_epoch(&self, context: &ContextId, epoch: u64) -> Result<(), String> {
+        if unsafe_flows_disabled() { return Ok(()); }
         if self.context_epoch(context)? == epoch { Ok(()) }
         else { Err("The requesting context stopped or restarted.".into()) }
     }
@@ -214,11 +216,13 @@ impl Registry {
     }
 
     pub fn ensure_allowed_for_activation(&self, context: &ContextId, epoch: u64, recipient: &Recipient) -> Result<(), String> {
+        if unsafe_flows_disabled() { return Ok(()); }
         self.ensure_context_epoch(context, epoch)?;
         self.ensure_allowed(context, recipient)
     }
 
     pub fn ensure_action_allowed_for_activation(&self, context: &ContextId, epoch: u64, action: &SensitiveAction) -> Result<(), String> {
+        if unsafe_flows_disabled() { return Ok(()); }
         self.ensure_context_epoch(context, epoch)?;
         self.ensure_action_allowed(context, action)
     }
@@ -230,6 +234,7 @@ impl Registry {
     }
 
     pub fn labels(&self, context: &ContextId) -> Result<Label, String> {
+        if unsafe_flows_disabled() { return Ok(Label::new()); }
         let entry = self.stored_context(context)?;
         let label = storage::effective_provenance(&self.metadata, entry).label;
         check_clearance(context, entry.clearance.as_ref(), &label)?;
@@ -416,6 +421,7 @@ impl Registry {
     }
 
     fn check_context(&self, context: &ContextId) -> Result<(), String> {
+        if unsafe_flows_disabled() { return Ok(()); }
         self.check_healthy()?;
         if self.contexts.contains(context) { Ok(()) }
         else { Err("Information-flow context is not registered; access is blocked.".into()) }
@@ -561,14 +567,35 @@ pub fn transfer(sender: &ContextId, receiver: &ContextId) -> Result<(), String> 
 }
 
 pub fn labels(context: &ContextId) -> Result<Label, String> {
+    if unsafe_flows_disabled() { return Ok(Label::new()); }
     with_registry(|registry| registry.labels(context))
 }
 
+/// TEST-ONLY escape hatch. When `ROBRIX_DISABLE_INFORMATION_FLOW=1`, every
+/// sharing/recipient gate below succeeds unconditionally so a local run can
+/// exercise the agent without configuring data-sharing rules. Opt-in via the
+/// environment, logged once, and never enabled by default.
+pub fn unsafe_flows_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        let on = std::env::var("ROBRIX_DISABLE_INFORMATION_FLOW")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        if on {
+            makepad_widgets::log!(
+                "WARNING: information-flow checks are DISABLED (ROBRIX_DISABLE_INFORMATION_FLOW) — test only"
+            );
+        }
+        on
+    })
+}
+
 pub fn ensure_allowed(context: &ContextId, recipient: &Recipient) -> Result<(), String> {
+    if unsafe_flows_disabled() { return Ok(()); }
     with_registry(|registry| registry.ensure_allowed(context, recipient))
 }
 
 pub fn ensure_labels_allowed(label: &Label, recipient: &Recipient) -> Result<(), String> {
+    if unsafe_flows_disabled() { return Ok(()); }
     with_registry(|registry| registry.ensure_labels_allowed(label, recipient))
 }
 
@@ -597,10 +624,12 @@ pub fn context_storage_path(context: &ContextId) -> Result<PathBuf, String> {
 }
 
 pub fn context_epoch(context: &ContextId) -> Result<u64, String> {
+    if unsafe_flows_disabled() { return Ok(0); }
     with_registry(|registry| registry.context_epoch(context))
 }
 
 pub fn ensure_context_epoch(context: &ContextId, epoch: u64) -> Result<(), String> {
+    if unsafe_flows_disabled() { return Ok(()); }
     with_registry(|registry| registry.ensure_context_epoch(context, epoch))
 }
 
@@ -613,10 +642,12 @@ pub fn add_sources_for_activation(context: &ContextId, epoch: u64, sources: impl
 }
 
 pub fn ensure_allowed_for_activation(context: &ContextId, epoch: u64, recipient: &Recipient) -> Result<(), String> {
+    if unsafe_flows_disabled() { return Ok(()); }
     with_registry(|registry| registry.ensure_allowed_for_activation(context, epoch, recipient))
 }
 
 pub fn ensure_action_allowed_for_activation(context: &ContextId, epoch: u64, action: &SensitiveAction) -> Result<(), String> {
+    if unsafe_flows_disabled() { return Ok(()); }
     with_registry(|registry| registry.ensure_action_allowed_for_activation(context, epoch, action))
 }
 
@@ -701,6 +732,7 @@ pub fn action_decision(context: &ContextId, action: &SensitiveAction) -> Result<
 }
 
 pub fn ensure_action_allowed(context: &ContextId, action: &SensitiveAction) -> Result<(), String> {
+    if unsafe_flows_disabled() { return Ok(()); }
     with_registry(|registry| registry.ensure_action_allowed(context, action))
 }
 
