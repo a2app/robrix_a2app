@@ -9,10 +9,30 @@ use a2app_core::background::{Job, JobBinding, JobContext, PauseReason, RunOutcom
 use crate::home::rooms_list::RoomsListRef;
 use super::background::{self, TaskView};
 use super::runtime::{with_a2app, A2AppOp};
+use super::permission_choices::*;
 
 script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
+
+    mod.widgets.BackgroundTaskRow = #(BackgroundTaskRow::register_widget(vm)) {
+        width: Fill, height: Fit, flow: Down, spacing: 8, padding: 12
+        task_name := SubsectionLabel { width: Fill, margin: 0, flow: Flow.Right{wrap: true} }
+        task_summary := mod.widgets.PermissionOptionLabel {}
+        View {
+            width: Fill, height: Fit, flow: Flow.Right{wrap: true}, spacing: 8
+            pause := RobrixNeutralIconButton {
+                padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Pause"
+            }
+            edit := RobrixNeutralIconButton {
+                padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Edit"
+            }
+            details := RobrixNeutralIconButton {
+                padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Details"
+            }
+        }
+        LineH { margin: Inset{top: 4} }
+    }
 
     mod.widgets.BackgroundTasks = set_type_default() do #(BackgroundTasks::register_widget(vm)) {
         width: Fill, height: Fill, flow: Down
@@ -25,10 +45,7 @@ script_mod! {
             overview_header := View {
                 width: Fill, height: Fit, flow: Down, spacing: 12
                 mod.widgets.PermissionOptionLabel {
-                    text: "Let a mini-app work for you on a schedule or when new messages arrive. For example, check a website every 12 hours and post updates in a room."
-                }
-                mod.widgets.PermissionOptionLabel {
-                    text: "Tasks run while Robrix is open and you are signed in. Enabled tasks resume the next time you open Robrix, in the same room or space."
+                    text: "Mini-apps can check for updates or respond to messages while Robrix is open. Enabled tasks resume when you next sign in."
                 }
                 View {
                     width: Fill, height: Fit, flow: Flow.Right{wrap: true}, spacing: 8
@@ -41,45 +58,41 @@ script_mod! {
                 }
                 no_background_apps := mod.widgets.PermissionOptionLabel {
                     visible: false
-                    text: "None of your installed mini-apps supports background tasks yet. Install or create a mini-app with background support to get started."
+                    text: "Install or create a mini-app with background support to get started."
                 }
                 no_tasks := mod.widgets.PermissionOptionLabel {
-                    text: "No background tasks yet. Choose New task to set one up."
+                    text: "No tasks yet. Try checking a website every 12 hours and posting updates in a room."
                 }
-                task_list := View {
-                    visible: false
-                    width: Fill, height: Fit, flow: Down, spacing: 8
-                    SubsectionLabel { text: "Your tasks", margin: 0 }
-                    task_choice := mod.widgets.PermissionDropDown { labels: ["Choose a task…"] }
+                task_list := FlatList {
+                    width: Fill, height: Fit, flow: Down
+                    task_row := mod.widgets.BackgroundTaskRow {}
                 }
             }
             task_overview := View {
-                visible: false
-                width: Fill, height: Fit, flow: Down, spacing: 10
+                visible: false, width: Fill, height: Fit, flow: Down, spacing: 10
+                close_details := RobrixNeutralIconButton {
+                    padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Back to tasks"
+                }
                 task_details := mod.widgets.PermissionOptionLabel {}
-                task_actions := View {
+                View {
                     width: Fill, height: Fit, flow: Flow.Right{wrap: true}, spacing: 8
                     pause_resume := RobrixNeutralIconButton {
                         padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Pause"
                     }
-                    run_now := RobrixNeutralIconButton {
-                        padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Run now"
-                    }
                     edit_task := RobrixNeutralIconButton {
                         padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Edit schedule"
                     }
-                    remove_task := RobrixNegativeIconButton {
-                        padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Remove task"
+                    run_now := RobrixNeutralIconButton {
+                        padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Run now"
                     }
                 }
-                show_details := RobrixNeutralIconButton {
-                    padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Show task details"
+                runtime_details := mod.widgets.PermissionOptionLabel {}
+                remove_task := RobrixNegativeIconButton {
+                    padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Remove task"
                 }
-                runtime_details := mod.widgets.PermissionOptionLabel { visible: false }
             }
             task_editor := View {
-                visible: false
-                width: Fill, height: Fit, flow: Down, spacing: 10
+                visible: false, width: Fill, height: Fit, flow: Down, spacing: 12
                 View {
                     width: Fill, height: Fit, flow: Flow.Right{wrap: true}, spacing: 8, align: Align{y: 0.5}
                     editor_title := SubsectionLabel { width: Fit, text: "New task", margin: 0 }
@@ -87,69 +100,80 @@ script_mod! {
                         padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Cancel"
                     }
                 }
-                mod.widgets.PermissionOptionLabel { text: "Mini-app" }
-                app_choice_section := View {
-                    width: Fill, height: Fit
-                    app_choice := mod.widgets.PermissionDropDown { labels: ["Choose a mini-app…"] }
+                step_title := SubsectionLabel { width: Fill, margin: 0, flow: Flow.Right{wrap: true} }
+                app_step := View {
+                    width: Fill, height: Fit, flow: Down, spacing: 8
+                    mod.widgets.PermissionOptionLabel { text: "Which mini-app should work in the background?" }
+                    app_choice := mod.widgets.PermissionChoices {}
                 }
-                saved_app := mod.widgets.PermissionOptionLabel { visible: false }
-                mod.widgets.PermissionOptionLabel { text: "Room or space" }
-                context_choice_section := View {
-                    width: Fill, height: Fit
-                    context_choice := mod.widgets.PermissionDropDown { labels: ["Choose where this task runs…"] }
+                context_step := View {
+                    visible: false, width: Fill, height: Fit, flow: Down, spacing: 8
+                    mod.widgets.PermissionOptionLabel { text: "Choose the room or space where it should run." }
+                    context_choice := mod.widgets.PermissionDropDown { labels: ["Choose a room or space…"] }
+                    mod.widgets.PermissionOptionLabel { text: "It uses the mini-app's saved settings here. Each mini-app can have one task per room, space, or account." }
                 }
-                saved_context := mod.widgets.PermissionOptionLabel { visible: false }
-                mod.widgets.PermissionOptionLabel {
-                    text: "The task uses this mini-app's saved settings in the selected room or space. Each mini-app can have one task per room, space, or account."
+                schedule_step := View {
+                    visible: false, width: Fill, height: Fit, flow: Down, spacing: 10
+                    schedule_choice := mod.widgets.PermissionChoices {
+                        labels: ["Every hour", "Every 12 hours", "Every day", "Once, at a set time", "When new room messages arrive", "Custom interval"]
+                    }
+                    interval_section := View {
+                        visible: false, width: Fill, height: Fit, flow: Down, spacing: 6
+                        mod.widgets.PermissionOptionLabel { text: "Repeat every" }
+                        interval_value := RobrixTextInput { width: Fill, text: "5", empty_text: "Enter a whole number" }
+                        interval_unit := mod.widgets.PermissionChoices { horizontal: true, labels: ["Seconds", "Minutes", "Hours", "Days"] }
+                        mod.widgets.PermissionOptionLabel { text: "At least one minute between runs." }
+                    }
+                    alarm_section := View {
+                        visible: false, width: Fill, height: Fit, flow: Down, spacing: 6
+                        mod.widgets.PermissionOptionLabel { text: "Local date and time (24-hour clock)" }
+                        alarm_value := RobrixTextInput { width: Fill, empty_text: "YYYY-MM-DD HH:MM", autocorrect: Disabled }
+                        alarm_timezone := mod.widgets.PermissionOptionLabel {}
+                    }
+                    messages_section := mod.widgets.PermissionOptionLabel {
+                        visible: false
+                        text: "Requires a single room and permission to read it. The mini-app checks new messages for its conditions. Old messages are not replayed, and messages received during a run may be skipped."
+                    }
+                    schedule_error := mod.widgets.PermissionOptionLabel { visible: false, draw_text +: {color: (COLOR_FG_DANGER_RED)} }
                 }
-                mod.widgets.PermissionOptionLabel { text: "When to run" }
-                trigger_choice := mod.widgets.PermissionDropDown {
-                    labels: ["Repeat on a schedule", "Once at a set time", "When new messages arrive"]
-                }
-                interval_section := View {
-                    width: Fill, height: Fit, flow: Down, spacing: 6
-                    mod.widgets.PermissionOptionLabel { text: "Repeat every" }
-                    interval_value := RobrixTextInput { width: Fill, text: "5", empty_text: "Enter a whole number" }
-                    interval_unit := mod.widgets.PermissionDropDown { labels: ["Seconds", "Minutes", "Hours", "Days"] }
-                    mod.widgets.PermissionOptionLabel { text: "At least one minute. Missed runs are combined into one run when Robrix reopens." }
-                }
-                alarm_section := View {
-                    visible: false
-                    width: Fill, height: Fit, flow: Down, spacing: 6
-                    mod.widgets.PermissionOptionLabel { text: "Date and time on this device (24-hour clock)" }
-                    alarm_value := RobrixTextInput { width: Fill, empty_text: "YYYY-MM-DD HH:MM", autocorrect: Disabled }
-                    alarm_timezone := mod.widgets.PermissionOptionLabel {}
+                review_step := View {
+                    visible: false, width: Fill, height: Fit, flow: Down, spacing: 10
+                    review_summary := mod.widgets.PermissionOptionLabel {}
                     mod.widgets.PermissionOptionLabel {
-                        text: "Runs once. If Robrix is closed at that time, it runs when you next open Robrix. Run now uses up the scheduled run."
+                        text: "Runs while Robrix is open and you are signed in. Missed scheduled runs are combined into one run when you return."
                     }
-                }
-                messages_section := mod.widgets.PermissionOptionLabel {
-                    visible: false
-                    text: "Requires a single room and permission to read it. The mini-app checks new messages for its conditions. Old messages are not replayed, and messages received during a run may be skipped. Run now checks without a message."
-                }
-                changed_version := View {
-                    visible: false
-                    width: Fill, height: Fit, flow: Down, spacing: 6
                     mod.widgets.PermissionOptionLabel {
-                        text: "The mini-app changed since you enabled this task. Open it and review its permissions before allowing the new version to run."
+                        text: "This task gets no new permissions. Set up the mini-app and its access before leaving it to run."
                     }
-                    reviewed_version := RobrixSettingsCheckBox {
-                        width: Fill, height: Fit
-                        text: "I reviewed this version and allow it to run"
+                    changed_version := View {
+                        visible: false, width: Fill, height: Fit, flow: Down, spacing: 6
+                        mod.widgets.PermissionOptionLabel { text: "The mini-app changed. Open it and review its permissions before enabling this version." }
+                        reviewed_version := RobrixSettingsCheckBox {
+                            width: Fill, height: Fit, text: "I reviewed this version and allow it to run"
+                        }
+                    }
+                    review_error := mod.widgets.PermissionOptionLabel { visible: false, draw_text +: {color: (COLOR_FG_DANGER_RED)} }
+                    save_task := RobrixPositiveIconButton {
+                        padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Enable task"
                     }
                 }
-                save_task := RobrixPositiveIconButton {
-                    padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Save and enable task"
+                View {
+                    width: Fill, height: Fit, flow: Flow.Right{wrap: true}, spacing: 8
+                    step_back := RobrixNeutralIconButton {
+                        padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Back"
+                    }
+                    next_section := View {
+                        width: Fit, height: Fit
+                        step_next := RobrixPositiveIconButton {
+                            padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Continue"
+                        }
+                    }
                 }
             }
             app_settings := View {
-                visible: false
-                width: Fill, height: Fit, flow: Down, spacing: 10
+                visible: false, width: Fill, height: Fit, flow: Down, spacing: 10
                 LineH { width: Fill, margin: Inset{top: 4, bottom: 4} }
                 SubsectionLabel { text: "Mini-app settings and access", margin: 0 }
-                mod.widgets.PermissionOptionLabel {
-                    text: "Saving a task does not give it new permissions. Set up the mini-app and allow the access it needs before leaving it to run. Background tasks cannot ask you for permission while running."
-                }
                 View {
                     width: Fill, height: Fit, flow: Flow.Right{wrap: true}, spacing: 8
                     open_task_app := RobrixNeutralIconButton {
@@ -164,17 +188,16 @@ script_mod! {
                 }
                 room_action_help := mod.widgets.PermissionOptionLabel {
                     visible: false
-                    text: "If an action is blocked: open the mini-app in its room, keep its pane open, return here and choose Run now. Then review the blocked action in Data sharing and retry."
+                    text: "To review a blocked action, keep the mini-app open in its room, return here and choose Run now. Then review the action in Data sharing and retry. Background tasks cannot ask for permission while running."
                 }
             }
             show_help := RobrixNeutralIconButton {
                 padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "How background tasks work"
             }
             task_help := View {
-                visible: false
-                width: Fill, height: Fit, flow: Down, spacing: 8
+                visible: false, width: Fill, height: Fit, flow: Down, spacing: 8
                 mod.widgets.PermissionOptionLabel {
-                    text: "Pausing or removing a task stops its current work and closes the mini-app instance. Its saved settings and data are kept. Force Stop in the mini-app's details also disables its tasks."
+                    text: "Pausing or removing a task stops its work and closes the mini-app instance. Saved settings and data are kept. Force Stop in the mini-app's details also disables its tasks."
                 }
                 mod.widgets.PermissionOptionLabel {
                     text: "Tasks restore saved settings and data, not unsaved work. Session permissions and action approvals can expire when the mini-app or Robrix closes. A task may need your attention before it can run again."
@@ -189,6 +212,38 @@ pub enum BackgroundTasksAction {
     OpenApp(JobBinding),
     AppPermissions(String),
     Sharing,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TaskStep { #[default] App, Context, Schedule, Review }
+
+#[derive(Clone, Copy, Debug)]
+enum TaskCommand { PauseResume, Edit, Details }
+
+#[derive(Clone, Debug)]
+struct TaskRowAction { account: String, id: u64, command: TaskCommand }
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct BackgroundTaskRow {
+    #[deref] view: View,
+    #[rust] account: String,
+    #[rust] task_id: u64,
+}
+
+impl Widget for BackgroundTaskRow {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+        let Event::Actions(actions) = event else { return };
+        for (id, command) in [(ids!(pause), TaskCommand::PauseResume), (ids!(edit), TaskCommand::Edit), (ids!(details), TaskCommand::Details)] {
+            if self.view.button(cx, id).clicked(actions) {
+                cx.action(TaskRowAction { account: self.account.clone(), id: self.task_id, command });
+            }
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.view.draw_walk(cx, scope, walk)
+    }
 }
 
 #[derive(Clone)]
@@ -216,6 +271,11 @@ pub struct BackgroundTasks {
     #[rust] revision: Option<u64>,
     #[rust] pending_save: Option<JobBinding>,
     #[rust] editing: bool,
+    #[rust] step: TaskStep,
+    #[rust] selected_task_id: Option<u64>,
+    #[rust] selected_app_id: Option<String>,
+    #[rust] selected_context_id: Option<JobContext>,
+    #[rust] showing_details: bool,
 }
 
 impl Widget for BackgroundTasks {
@@ -227,67 +287,68 @@ impl Widget for BackgroundTasks {
         }
         self.view.handle_event(cx, event, scope);
         let Event::Actions(actions) = event else { return };
-        if self.view.button(cx, ids!(refresh_tasks)).clicked(actions) {
-            self.configure(cx);
+        for action in actions.iter() {
+            if let Some(action) = action.downcast_ref::<TaskRowAction>() {
+                if action.account != self.account || !self.tasks.iter().any(|task| task.job.id == action.id) { continue; }
+                match action.command {
+                    TaskCommand::PauseResume => { let result = self.pause_action(action.id); self.submit(cx, result); }
+                    TaskCommand::Edit => self.open_task(cx, action.id, true),
+                    TaskCommand::Details => self.open_task(cx, action.id, false),
+                }
+            }
         }
+        if self.view.button(cx, ids!(refresh_tasks)).clicked(actions) { self.configure(cx); }
         if self.view.button(cx, ids!(new_task)).clicked(actions) {
+            self.selected_task_id = None;
+            self.showing_details = false;
+            self.step = TaskStep::App;
             self.view.widget(cx, ids!(task_error)).set_visible(cx, false);
-            self.view.drop_down(cx, ids!(task_choice)).set_selected_item(cx, 0);
             self.set_editing(cx, true);
-            self.load_selected_task(cx);
-        }
-        if self.view.drop_down(cx, ids!(task_choice)).changed(actions).is_some() {
-            self.set_editing(cx, false);
-            self.view.widget(cx, ids!(task_error)).set_visible(cx, false);
             self.load_selected_task(cx);
         }
         if self.view.button(cx, ids!(edit_task)).clicked(actions) {
-            self.set_editing(cx, true);
-            self.update_form(cx);
+            if let Some(id) = self.selected_task_id { self.open_task(cx, id, true); }
         }
         if self.view.button(cx, ids!(cancel_edit)).clicked(actions) {
-            self.set_editing(cx, false);
-            self.view.widget(cx, ids!(task_error)).set_visible(cx, false);
-            self.load_selected_task(cx);
+            self.close_task(cx);
+            return;
         }
-        for (button, section, closed, opened) in [
-            (ids!(show_help), ids!(task_help), "How background tasks work", "Hide background task help"),
-            (ids!(show_details), ids!(runtime_details), "Show task details", "Hide task details"),
-        ] {
-            if self.view.button(cx, button).clicked(actions) {
-                let visible = !self.view.widget(cx, section).visible();
-                self.view.widget(cx, section).set_visible(cx, visible);
-                self.view.button(cx, button).set_text(cx, if visible { opened } else { closed });
-            }
+        if self.view.button(cx, ids!(close_details)).clicked(actions) {
+            self.back(cx);
+            return;
         }
-        if self.view.drop_down(cx, ids!(app_choice)).changed(actions).is_some() {
+        if let Some(index) = self.view.permission_choices(cx, ids!(app_choice)).changed(actions) {
+            self.selected_app_id = self.apps.get(index).map(|app| app.id.clone());
             self.load_contexts(cx, None);
             self.view.check_box(cx, ids!(reviewed_version)).set_active(cx, false, Animate::No);
-        }
-        if self.view.drop_down(cx, ids!(app_choice)).changed(actions).is_some()
-            || self.view.drop_down(cx, ids!(context_choice)).changed(actions).is_some()
-        {
-            self.select_existing_binding(cx);
-        }
-        if self.view.drop_down(cx, ids!(trigger_choice)).changed(actions).is_some()
-            || self.view.drop_down(cx, ids!(app_choice)).changed(actions).is_some()
-            || self.view.drop_down(cx, ids!(context_choice)).changed(actions).is_some()
-        {
             self.update_form(cx);
+        }
+        if let Some(index) = self.view.drop_down(cx, ids!(context_choice)).changed(actions) {
+            self.selected_context_id = index.checked_sub(1).and_then(|index| self.contexts.get(index)).map(|choice| choice.context.clone());
+            self.update_form(cx);
+        }
+        if self.view.permission_choices(cx, ids!(schedule_choice)).changed(actions).is_some()
+            || self.view.permission_choices(cx, ids!(interval_unit)).changed(actions).is_some()
+            || self.view.text_input(cx, ids!(interval_value)).changed(actions).is_some()
+            || self.view.text_input(cx, ids!(alarm_value)).changed(actions).is_some()
+            || self.view.check_box(cx, ids!(reviewed_version)).changed(actions).is_some()
+        { self.update_form(cx); }
+        if self.view.button(cx, ids!(step_next)).clicked(actions) {
+            match self.advance_step(cx, now_ms()) {
+                Ok(()) => {},
+                Err(error) => self.show_error(cx, &error),
+            }
+        }
+        if self.view.button(cx, ids!(step_back)).clicked(actions) {
+            self.back(cx);
+            return;
         }
         if self.view.button(cx, ids!(save_task)).clicked(actions) {
             let result = self.save_action(cx, now_ms());
             self.submit(cx, result);
         }
         if self.view.button(cx, ids!(pause_resume)).clicked(actions) {
-            let result = self.selected_task(cx).ok_or_else(|| "Select a saved task.".to_string()).and_then(|task| {
-                let fingerprint = task.current_fingerprint.clone().unwrap_or_default();
-                let enabled = !task_is_active(&task.job);
-                if enabled && !can_resume(task, now_ms()) {
-                    return Err("This task cannot resume with its saved app version or alarm. Review the current app version and enter a future alarm if needed, then save and enable.".into());
-                }
-                Ok(A2AppOp::SetBackgroundTaskEnabled { id: task.job.id, enabled, expected_fingerprint: fingerprint })
-            });
+            let result = self.selected_task_id.ok_or_else(|| "Select a task.".into()).and_then(|id| self.pause_action(id));
             self.submit(cx, result);
         }
         if self.view.button(cx, ids!(run_now)).clicked(actions) {
@@ -322,31 +383,136 @@ impl Widget for BackgroundTasks {
             }
         }
         if self.view.button(cx, ids!(task_permissions)).clicked(actions) {
-            if let Some(app) = self.selected_app(cx) {
-                cx.action(BackgroundTasksAction::AppPermissions(app.id.clone()));
-            }
+            if let Some(app) = self.selected_app(cx) { cx.action(BackgroundTasksAction::AppPermissions(app.id.clone())); }
         }
-        if self.view.button(cx, ids!(task_sharing)).clicked(actions) {
-            cx.action(BackgroundTasksAction::Sharing);
+        if self.view.button(cx, ids!(task_sharing)).clicked(actions) { cx.action(BackgroundTasksAction::Sharing); }
+        if self.view.button(cx, ids!(show_help)).clicked(actions) {
+            let visible = !self.view.widget(cx, ids!(task_help)).visible();
+            self.view.widget(cx, ids!(task_help)).set_visible(cx, visible);
+            self.view.button(cx, ids!(show_help)).set_text(cx, if visible { "Hide help" } else { "How background tasks work" });
         }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         if self.account != super::information_flow::account().unwrap_or_default() { self.configure(cx); }
         else if self.revision != Some(background::revision()) { self.refresh_tasks(cx); }
-        self.view.draw_walk(cx, scope, walk)
+        while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
+            if let Some(mut list) = item.borrow_mut::<FlatList>() {
+                for task in &self.tasks {
+                    let Some(row) = list.item(cx, LiveId(task.job.id), id!(task_row)) else { continue };
+                    if let Some(mut card) = row.borrow_mut::<BackgroundTaskRow>() {
+                        card.account = self.account.clone();
+                        card.task_id = task.job.id;
+                        let app = self.apps.iter().find(|app| app.id == task.job.binding.app_id)
+                            .map(|app| app.name.as_str()).unwrap_or(&task.job.binding.app_id);
+                        card.view.label(cx, ids!(task_name)).set_text(cx, app);
+                        let mut summary = format!("{}\n{} · {}", self.context_label(&task.job.binding.context), trigger_label(&task.job.trigger), task_state_label(&task.job));
+                        if task.job.enabled && let Some(next) = task.job.next_due_ms { summary.push_str(&format!("\nNext: {}", local_label(next))); }
+                        card.view.label(cx, ids!(task_summary)).set_text(cx, &summary);
+                        card.view.button(cx, ids!(pause)).set_text(cx, if task_is_active(&task.job) { "Pause" } else { "Resume" });
+                        set_button_enabled(&card.view, cx, ids!(pause), task_is_active(&task.job) || can_resume(task, now_ms()));
+                        set_button_enabled(&card.view, cx, ids!(edit), task.job.in_flight.is_none());
+                    }
+                    row.draw_all(cx, &mut Scope::empty());
+                }
+            }
+        }
+        DrawStep::done()
     }
 }
 
 impl BackgroundTasks {
+    pub fn back(&mut self, cx: &mut Cx) -> bool {
+        if self.account != super::information_flow::account().unwrap_or_default() {
+            self.configure(cx);
+            return true;
+        }
+        if self.editing {
+            self.step = match self.step {
+                TaskStep::Review => TaskStep::Schedule,
+                TaskStep::Schedule if self.selected_task_id.is_none() => TaskStep::Context,
+                TaskStep::Context => TaskStep::App,
+                _ => { self.close_task(cx); return true; },
+            };
+            self.view.widget(cx, ids!(task_error)).set_visible(cx, false);
+            self.reset_scroll(cx);
+            self.update_form(cx);
+            true
+        } else if self.showing_details {
+            self.close_task(cx);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn reset_scroll(&self, cx: &mut Cx) {
+        self.view.view(cx, ids!(content)).set_scroll_pos(cx, Vec2d::default());
+    }
+
     fn set_editing(&mut self, cx: &mut Cx, editing: bool) {
         self.editing = editing;
-        self.view.view(cx, ids!(content)).set_scroll_pos(cx, Vec2d::default());
+        self.reset_scroll(cx);
+    }
+
+    fn open_task(&mut self, cx: &mut Cx, id: u64, edit: bool) {
+        let Some(task) = self.tasks.iter().find(|task| task.job.id == id) else { return };
+        if edit && task.job.in_flight.is_some() { self.show_error(cx, "Pause the task before editing its schedule."); return; }
+        self.selected_task_id = Some(id);
+        self.showing_details = !edit;
+        self.step = TaskStep::Schedule;
+        self.set_editing(cx, edit);
+        self.load_selected_task(cx);
+        self.view.widget(cx, ids!(task_error)).set_visible(cx, false);
+    }
+
+    fn close_task(&mut self, cx: &mut Cx) {
+        self.selected_task_id = None;
+        self.showing_details = false;
+        self.set_editing(cx, false);
+        self.load_selected_task(cx);
+        self.view.widget(cx, ids!(task_error)).set_visible(cx, false);
+    }
+
+    fn advance_step(&mut self, cx: &mut Cx, now: u64) -> Result<(), String> {
+        self.step = match self.step {
+            TaskStep::App => {
+                self.selected_app(cx).ok_or("Choose a mini-app first.")?;
+                TaskStep::Context
+            }
+            TaskStep::Context => {
+                let binding = self.selected_binding(cx)?;
+                if let Some(id) = self.tasks.iter().find(|task| task.job.binding == binding).map(|task| task.job.id) {
+                    self.open_task(cx, id, true);
+                    return Ok(());
+                }
+                TaskStep::Schedule
+            }
+            TaskStep::Schedule => { self.selected_trigger(cx, now)?; TaskStep::Review }
+            TaskStep::Review => TaskStep::Review,
+        };
+        self.view.widget(cx, ids!(task_error)).set_visible(cx, false);
+        self.reset_scroll(cx);
+        self.update_form(cx);
+        Ok(())
+    }
+
+    fn pause_action(&self, id: u64) -> Result<A2AppOp, String> {
+        let task = self.tasks.iter().find(|task| task.job.id == id).ok_or("This task is no longer available.")?;
+        let enabled = !task_is_active(&task.job);
+        if enabled && !can_resume(task, now_ms()) {
+            return Err("Open task details to review the mini-app version or choose a future alarm before resuming.".into());
+        }
+        Ok(A2AppOp::SetBackgroundTaskEnabled { id, enabled, expected_fingerprint: task.current_fingerprint.clone().unwrap_or_default() })
     }
 
     fn configure(&mut self, cx: &mut Cx) {
         self.account = super::information_flow::account().unwrap_or_default();
         self.pending_save = None;
+        self.selected_task_id = None;
+        self.selected_app_id = None;
+        self.selected_context_id = None;
+        self.showing_details = false;
         self.set_editing(cx, false);
         self.targets = if cx.has_global::<RoomsListRef>() { cx.get_global::<RoomsListRef>().permission_targets() }
             else { Vec::new() };
@@ -358,50 +524,38 @@ impl BackgroundTasks {
         self.apps.sort_by_cached_key(|app| (app.name.to_lowercase(), app.id.clone()));
         let mut app_names = HashMap::new();
         for app in &self.apps { *app_names.entry(app.name.as_str()).or_insert(0) += 1; }
-        self.view.drop_down(cx, ids!(app_choice)).set_labels(cx, std::iter::once("Choose a mini-app…".into())
-            .chain(self.apps.iter().map(|app| {
-                if app_names[app.name.as_str()] > 1 { format!("{} ({})", app.name, app.id) }
-                else { app.name.clone() }
-            })).collect());
+        self.view.permission_choices(cx, ids!(app_choice)).set_labels(cx, self.apps.iter().map(|app| {
+            if app_names[app.name.as_str()] > 1 { format!("{} ({})", app.name, app.id) }
+            else { app.name.clone() }
+        }).collect());
         self.view.widget(cx, ids!(no_background_apps)).set_visible(cx, self.apps.is_empty());
         self.refresh_tasks(cx);
         self.load_selected_task(cx);
     }
 
     fn refresh_tasks(&mut self, cx: &mut Cx) {
-        let selected = self.selected_task(cx).map(|task| task.job.id);
-        match background::snapshot() {
-            Ok(tasks) => {
-                self.tasks = tasks;
-                self.view.widget(cx, ids!(task_error)).set_visible(cx, false);
-            }
-            Err(error) => { self.tasks.clear(); self.show_error(cx, &error); }
-        }
-        self.view.drop_down(cx, ids!(task_choice)).set_labels(cx, std::iter::once("Choose a task…".into()).chain(self.tasks.iter().map(|task| {
-            let app = self.apps.iter().find(|app| app.id == task.job.binding.app_id).map(|app| app.name.as_str()).unwrap_or(&task.job.binding.app_id);
-            format!("{app} · {} · {}", self.context_label(&task.job.binding.context), task_state_label(&task.job))
-        })).collect());
-        let saved = self.pending_save.take().and_then(|binding| self.tasks.iter().position(|task| task.job.binding == binding));
-        let index = saved.or_else(|| selected.and_then(|id| self.tasks.iter().position(|task| task.job.id == id))).map(|index| index + 1).unwrap_or(0);
-        self.view.drop_down(cx, ids!(task_choice)).set_selected_item(cx, index);
+        let error = match background::snapshot() {
+            Ok(tasks) => { self.tasks = tasks; self.view.widget(cx, ids!(task_error)).set_visible(cx, false); None }
+            Err(error) => { self.tasks.clear(); Some(error) }
+        };
         self.revision = Some(background::revision());
-        if saved.is_some() || (selected.is_some() && index == 0) {
-            self.set_editing(cx, false);
-            self.load_selected_task(cx);
-        }
+        let saved = self.pending_save.take().is_some_and(|binding| self.tasks.iter().any(|task| task.job.binding == binding));
+        let removed = self.selected_task_id.is_some_and(|id| !self.tasks.iter().any(|task| task.job.id == id));
+        if saved || removed { self.close_task(cx); }
+        if let Some(error) = error { self.show_error(cx, &error); }
         self.update_form(cx);
     }
 
-    fn selected_task(&self, cx: &Cx) -> Option<&TaskView> {
-        self.view.drop_down(cx, ids!(task_choice)).selected_item().checked_sub(1).and_then(|index| self.tasks.get(index))
+    fn selected_task(&self, _cx: &Cx) -> Option<&TaskView> {
+        self.selected_task_id.and_then(|id| self.tasks.iter().find(|task| task.job.id == id))
     }
 
-    fn selected_app(&self, cx: &Cx) -> Option<&AppChoice> {
-        self.view.drop_down(cx, ids!(app_choice)).selected_item().checked_sub(1).and_then(|index| self.apps.get(index))
+    fn selected_app(&self, _cx: &Cx) -> Option<&AppChoice> {
+        self.selected_app_id.as_ref().and_then(|id| self.apps.iter().find(|app| &app.id == id))
     }
 
-    fn selected_context(&self, cx: &Cx) -> Option<&ContextChoice> {
-        self.view.drop_down(cx, ids!(context_choice)).selected_item().checked_sub(1).and_then(|index| self.contexts.get(index))
+    fn selected_context(&self, _cx: &Cx) -> Option<&ContextChoice> {
+        self.selected_context_id.as_ref().and_then(|context| self.contexts.iter().find(|choice| &choice.context == context))
     }
 
     fn selected_binding(&self, cx: &Cx) -> Result<JobBinding, String> {
@@ -412,35 +566,33 @@ impl BackgroundTasks {
         Ok(JobBinding { account: self.account.clone(), app_id: app.id.clone(), context: context.context.clone() })
     }
 
-    fn select_existing_binding(&mut self, cx: &mut Cx) {
-        let Ok(binding) = self.selected_binding(cx) else { return };
-        if let Some(index) = self.tasks.iter().position(|task| task.job.binding == binding) {
-            self.view.drop_down(cx, ids!(task_choice)).set_selected_item(cx, index + 1);
-            self.set_editing(cx, false);
-            self.load_selected_task(cx);
-        }
-    }
-
     fn load_selected_task(&mut self, cx: &mut Cx) {
         let selected = self.selected_task(cx).map(|task| task.job.clone());
         self.view.check_box(cx, ids!(reviewed_version)).set_active(cx, false, Animate::No);
-        self.view.widget(cx, ids!(runtime_details)).set_visible(cx, false);
-        self.view.button(cx, ids!(show_details)).set_text(cx, "Show task details");
-        let app = selected.as_ref().and_then(|job| self.apps.iter().position(|app| app.id == job.binding.app_id)).map(|index| index + 1).unwrap_or(0);
-        self.view.drop_down(cx, ids!(app_choice)).set_selected_item(cx, app);
+        self.selected_app_id = selected.as_ref().map(|job| job.binding.app_id.clone());
+        let app = self.selected_app_id.as_ref().and_then(|id| self.apps.iter().position(|app| &app.id == id)).unwrap_or(usize::MAX);
+        self.view.permission_choices(cx, ids!(app_choice)).set_selected_item(cx, app);
         self.load_contexts(cx, selected.as_ref().map(|job| &job.binding.context));
-        let (trigger, amount, units, alarm) = match selected.as_ref().map(|job| &job.trigger) {
-            Some(Trigger::Interval { seconds }) if seconds % 86_400 == 0 => (0, (seconds / 86_400).to_string(), 3, String::new()),
-            Some(Trigger::Interval { seconds }) if seconds % 3600 == 0 => (0, (seconds / 3600).to_string(), 2, String::new()),
-            Some(Trigger::Interval { seconds }) if seconds % 60 == 0 => (0, (seconds / 60).to_string(), 1, String::new()),
-            Some(Trigger::Interval { seconds }) => (0, seconds.to_string(), 0, String::new()),
-            Some(Trigger::Alarm { unix_ms }) => (1, "5".into(), 1, local_input(*unix_ms)),
-            Some(Trigger::RoomMessages) => (2, "5".into(), 1, String::new()),
-            None => (0, "5".into(), 1, String::new()),
+        let (amount, units, alarm) = match selected.as_ref().map(|job| &job.trigger) {
+            Some(Trigger::Interval { seconds }) if seconds % 86_400 == 0 => ((seconds / 86_400).to_string(), 3, String::new()),
+            Some(Trigger::Interval { seconds }) if seconds % 3600 == 0 => ((seconds / 3600).to_string(), 2, String::new()),
+            Some(Trigger::Interval { seconds }) if seconds % 60 == 0 => ((seconds / 60).to_string(), 1, String::new()),
+            Some(Trigger::Interval { seconds }) => (seconds.to_string(), 0, String::new()),
+            Some(Trigger::Alarm { unix_ms }) => ("5".into(), 1, local_input(*unix_ms)),
+            _ => ("5".into(), 1, String::new()),
         };
-        self.view.drop_down(cx, ids!(trigger_choice)).set_selected_item(cx, trigger);
+        let schedule = match selected.as_ref().map(|job| &job.trigger) {
+            Some(Trigger::Interval { seconds: 3600 }) => 0,
+            Some(Trigger::Interval { seconds: 43200 }) => 1,
+            Some(Trigger::Interval { seconds: 86400 }) => 2,
+            Some(Trigger::Alarm { .. }) => 3,
+            Some(Trigger::RoomMessages) => 4,
+            Some(Trigger::Interval { .. }) => 5,
+            None => 1,
+        };
+        self.view.permission_choices(cx, ids!(schedule_choice)).set_selected_item(cx, schedule);
         self.view.text_input(cx, ids!(interval_value)).set_text(cx, &amount);
-        self.view.drop_down(cx, ids!(interval_unit)).set_selected_item(cx, units);
+        self.view.permission_choices(cx, ids!(interval_unit)).set_selected_item(cx, units);
         self.view.text_input(cx, ids!(alarm_value)).set_text(cx, &alarm);
         self.update_form(cx);
     }
@@ -475,6 +627,7 @@ impl BackgroundTasks {
         let index = selected.and_then(|selected| self.contexts.iter().position(|choice| &choice.context == selected)).map(|index| index + 1)
             .unwrap_or_else(|| usize::from(self.contexts.len() == 1));
         self.view.drop_down(cx, ids!(context_choice)).set_selected_item(cx, index);
+        self.selected_context_id = index.checked_sub(1).and_then(|index| self.contexts.get(index)).map(|choice| choice.context.clone());
     }
 
     fn context_label(&self, context: &JobContext) -> String {
@@ -492,60 +645,86 @@ impl BackgroundTasks {
     }
 
     fn update_form(&mut self, cx: &mut Cx) {
-        let trigger = self.view.drop_down(cx, ids!(trigger_choice)).selected_item();
-        self.view.widget(cx, ids!(interval_section)).set_visible(cx, trigger == 0);
-        self.view.widget(cx, ids!(alarm_section)).set_visible(cx, trigger == 1);
-        self.view.widget(cx, ids!(messages_section)).set_visible(cx, trigger == 2);
+        let schedule = self.view.permission_choices(cx, ids!(schedule_choice)).selected_item();
+        self.view.widget(cx, ids!(interval_section)).set_visible(cx, schedule == 5);
+        self.view.widget(cx, ids!(alarm_section)).set_visible(cx, schedule == 3);
+        self.view.widget(cx, ids!(messages_section)).set_visible(cx, schedule == 4);
         let selected = self.selected_task(cx);
-        self.view.widget(cx, ids!(task_list)).set_visible(cx, !self.tasks.is_empty());
-        self.view.widget(cx, ids!(no_tasks)).set_visible(cx, self.tasks.is_empty() && !self.editing && !self.apps.is_empty());
-        self.view.widget(cx, ids!(overview_header)).set_visible(cx, !self.editing);
-        self.view.widget(cx, ids!(task_overview)).set_visible(cx, selected.is_some() && !self.editing);
+        let landing = !self.editing && !self.showing_details;
+        self.view.widget(cx, ids!(no_tasks)).set_visible(cx, self.tasks.is_empty());
+        self.view.widget(cx, ids!(overview_header)).set_visible(cx, landing);
+        self.view.widget(cx, ids!(task_overview)).set_visible(cx, selected.is_some() && self.showing_details && !self.editing);
         self.view.widget(cx, ids!(task_editor)).set_visible(cx, self.editing);
-        self.view.widget(cx, ids!(app_settings)).set_visible(cx, self.selected_app(cx).is_some());
-        self.view.label(cx, ids!(editor_title)).set_text(cx, if selected.is_some() { "Edit schedule" } else { "New task" });
-        self.view.button(cx, ids!(save_task)).set_text(cx, if selected.is_some_and(|task| task.job.enabled) { "Save schedule" } else { "Save and enable task" });
+        self.view.widget(cx, ids!(app_settings)).set_visible(cx, self.selected_app(cx).is_some()
+            && (self.showing_details || (self.editing && self.step == TaskStep::Review)));
+        self.view.label(cx, ids!(editor_title)).set_text(cx, if selected.is_some() { "Edit task" } else { "New task" });
+        let title = match (selected.is_some(), self.step) {
+            (_, TaskStep::App) => "1 of 4 · Choose a mini-app",
+            (_, TaskStep::Context) => "2 of 4 · Choose where it runs",
+            (false, TaskStep::Schedule) => "3 of 4 · Choose a schedule",
+            (false, TaskStep::Review) => "4 of 4 · Review your task",
+            (true, TaskStep::Schedule) => "1 of 2 · Choose a schedule",
+            (true, TaskStep::Review) => "2 of 2 · Review your changes",
+        };
+        self.view.label(cx, ids!(step_title)).set_text(cx, title);
+        for (id, step) in [(ids!(app_step), TaskStep::App), (ids!(context_step), TaskStep::Context),
+            (ids!(schedule_step), TaskStep::Schedule), (ids!(review_step), TaskStep::Review)]
+        { self.view.widget(cx, id).set_visible(cx, self.step == step); }
+        self.view.widget(cx, ids!(next_section)).set_visible(cx, self.step != TaskStep::Review);
+        self.view.button(cx, ids!(step_back)).set_text(cx,
+            if self.step == TaskStep::App || (selected.is_some() && self.step == TaskStep::Schedule) { "Back to tasks" } else { "Back" });
+        let trigger = self.selected_trigger(cx, now_ms());
+        let next = match self.step {
+            TaskStep::App => self.selected_app(cx).is_some(),
+            TaskStep::Context => self.selected_binding(cx).is_ok(),
+            TaskStep::Schedule => trigger.is_ok(),
+            TaskStep::Review => false,
+        };
+        set_button_enabled(&self.view, cx, ids!(step_next), next);
+        self.view.widget(cx, ids!(schedule_error)).set_visible(cx, trigger.is_err());
+        self.view.label(cx, ids!(schedule_error)).set_text(cx, trigger.as_ref().err().map(String::as_str).unwrap_or_default());
+        let app = self.selected_app(cx).map(|app| app.name.as_str()).unwrap_or("Mini-app unavailable");
+        let context = self.selected_context(cx).map(|context| context.label.as_str()).unwrap_or("Room or space unavailable");
+        let summary = format!("{app}\n{context}\n{}", trigger.as_ref().map(trigger_label).unwrap_or_else(Clone::clone));
+        self.view.label(cx, ids!(review_summary)).set_text(cx, &summary);
+        self.view.button(cx, ids!(save_task)).set_text(cx, if selected.is_some_and(|task| task.job.enabled) { "Save changes" } else { "Enable task" });
         self.view.label(cx, ids!(alarm_timezone)).set_text(cx, &format!("Local time now: {}.", chrono::Local::now().format("%Y-%m-%d %H:%M (%:z)")));
-        for id in [ids!(app_choice), ids!(context_choice)] {
-            self.view.widget(cx, id).set_disabled(cx, selected.is_some());
-        }
-        for id in [ids!(app_choice_section), ids!(context_choice_section)] {
-            self.view.widget(cx, id).set_visible(cx, selected.is_none());
-        }
-        for id in [ids!(saved_app), ids!(saved_context)] {
-            self.view.widget(cx, id).set_visible(cx, selected.is_some());
-        }
-        if let Some(task) = selected {
-            let app = self.selected_app(cx).map(|app| app.name.clone())
-                .unwrap_or_else(|| format!("{} (not installed)", task.job.binding.app_id));
-            let context = self.selected_context(cx).map(|context| context.label.clone())
-                .unwrap_or_else(|| self.context_label(&task.job.binding.context));
-            self.view.label(cx, ids!(saved_app)).set_text(cx, &app);
-            self.view.label(cx, ids!(saved_context)).set_text(cx, &context);
-        }
         self.view.widget(cx, ids!(changed_version)).set_visible(cx, self.version_changed(cx));
-        self.view.widget(cx, ids!(room_action_help)).set_visible(cx, self.selected_context(cx).is_some_and(|choice| matches!(choice.context, JobContext::Room { .. })));
+        self.view.widget(cx, ids!(room_action_help)).set_visible(cx, self.showing_details && self.selected_context(cx).is_some_and(|choice| matches!(choice.context, JobContext::Room { .. })));
         let details = selected.map(|task| {
             let next = task.job.next_due_ms.map(local_label).unwrap_or_else(|| if matches!(task.job.trigger, Trigger::RoomMessages) && task.job.enabled { "Waiting for room messages".into() } else { "Not scheduled".into() });
             let last = task.job.last_run.as_ref().map(|run| format!("{} at {}", outcome_label(&run.outcome), local_label(run.finished_ms))).unwrap_or_else(|| "No run recorded".into());
-            format!("{} · {}\n{}\nNext run: {next}\nLast run: {last}\n\n{}", task_state_label(&task.job), self.context_label(&task.job.binding.context), trigger_label(&task.job.trigger), saved_status(&task.job))
+            format!("{app}\n{}\n{} · {}\nNext run: {next}\nLast run: {last}\n\n{}", self.context_label(&task.job.binding.context), trigger_label(&task.job.trigger), task_state_label(&task.job), saved_status(&task.job))
         }).unwrap_or_default();
         self.view.label(cx, ids!(task_details)).set_text(cx, &details);
         self.view.label(cx, ids!(runtime_details)).set_text(cx, selected.map(|task| task.status.as_str()).unwrap_or_default());
-        self.view.widget(cx, ids!(show_details)).set_visible(cx, selected.is_some_and(|task| !task.status.is_empty()));
         self.view.button(cx, ids!(run_now)).set_text(cx, if selected.is_some_and(|task| matches!(task.job.trigger, Trigger::Alarm { .. })) { "Run now (uses alarm)" } else { "Run now" });
         set_button_enabled(&self.view, cx, ids!(new_task), !self.apps.is_empty());
         set_button_enabled(&self.view, cx, ids!(edit_task), selected.is_some_and(|task| task.job.in_flight.is_none()));
-        let resume = selected.is_some_and(|task| !task_is_active(&task.job));
-        self.view.button(cx, ids!(pause_resume)).set_text(cx, if resume { "Resume" } else { "Pause" });
-        set_button_enabled(&self.view, cx, ids!(pause_resume), selected.is_some_and(|task|
-            task_is_active(&task.job) || can_resume(task, now_ms())));
-        set_button_enabled(&self.view, cx, ids!(run_now), selected.is_some_and(|task|
-            task.job.enabled && task.job.in_flight.is_none() && task.current_fingerprint.as_ref() == Some(&task.job.fingerprint)));
-        set_button_enabled(&self.view, cx, ids!(save_task), self.selected_binding(cx).is_ok() && selected.is_none_or(|task| task.job.in_flight.is_none()));
-        set_button_enabled(&self.view, cx, ids!(open_task_app), self.selected_app(cx).is_some() && self.selected_context(cx).is_some_and(|context| context.available));
+        self.view.button(cx, ids!(pause_resume)).set_text(cx, if selected.is_some_and(|task| !task_is_active(&task.job)) { "Resume" } else { "Pause" });
+        set_button_enabled(&self.view, cx, ids!(pause_resume), selected.is_some_and(|task| task_is_active(&task.job) || can_resume(task, now_ms())));
+        set_button_enabled(&self.view, cx, ids!(run_now), selected.is_some_and(|task| task.job.enabled && task.job.in_flight.is_none() && task.current_fingerprint.as_ref() == Some(&task.job.fingerprint)));
+        let save = self.save_action(cx, now_ms());
+        self.view.widget(cx, ids!(review_error)).set_visible(cx, save.is_err());
+        self.view.label(cx, ids!(review_error)).set_text(cx, save.as_ref().err().map(String::as_str).unwrap_or_default());
+        set_button_enabled(&self.view, cx, ids!(save_task), save.is_ok());
+        set_button_enabled(&self.view, cx, ids!(open_task_app), self.selected_binding(cx).is_ok());
         set_button_enabled(&self.view, cx, ids!(task_permissions), self.selected_app(cx).is_some());
         self.view.redraw(cx);
+    }
+
+    fn selected_trigger(&self, cx: &Cx, now: u64) -> Result<Trigger, String> {
+        let context = self.selected_context(cx).ok_or("Choose where the task runs first.")?;
+        let (kind, amount, units) = match self.view.permission_choices(cx, ids!(schedule_choice)).selected_item() {
+            0 => (0, "1".into(), 2),
+            1 => (0, "12".into(), 2),
+            2 => (0, "1".into(), 3),
+            3 => (1, String::new(), 0),
+            4 => (2, String::new(), 0),
+            5 => (0, self.view.text_input(cx, ids!(interval_value)).text(), self.view.permission_choices(cx, ids!(interval_unit)).selected_item()),
+            _ => return Err("Choose a schedule.".into()),
+        };
+        parse_trigger(kind, &amount, units, &self.view.text_input(cx, ids!(alarm_value)).text(), &context.context, now)
     }
 
     fn save_action(&self, cx: &Cx, now_ms: u64) -> Result<A2AppOp, String> {
@@ -557,18 +736,13 @@ impl BackgroundTasks {
                 return Err("Pause this task before changing its settings.".into());
             }
             if task.current_fingerprint.as_ref() != Some(fingerprint) {
-                return Err("The mini-app changed after this page was loaded. Choose Refresh, review the new version, then enable the task.".into());
+                return Err("The mini-app changed after this page was loaded. Cancel, choose Refresh in the task list, then review the new version before enabling the task.".into());
             }
             if task.job.fingerprint != *fingerprint && !self.view.check_box(cx, ids!(reviewed_version)).active(cx) {
                 return Err("Review the current app version, then check the version confirmation before enabling this task.".into());
             }
         }
-        let trigger = parse_trigger(
-            self.view.drop_down(cx, ids!(trigger_choice)).selected_item(),
-            &self.view.text_input(cx, ids!(interval_value)).text(),
-            self.view.drop_down(cx, ids!(interval_unit)).selected_item(),
-            &self.view.text_input(cx, ids!(alarm_value)).text(), &binding.context, now_ms,
-        )?;
+        let trigger = self.selected_trigger(cx, now_ms)?;
         Ok(A2AppOp::SaveBackgroundTask { binding, trigger, expected_fingerprint: fingerprint.clone() })
     }
 
@@ -696,6 +870,10 @@ fn trigger_label(trigger: &Trigger) -> String {
 }
 
 impl BackgroundTasksRef {
+    pub fn back(&self, cx: &mut Cx) -> bool {
+        self.borrow_mut().is_some_and(|mut inner| inner.back(cx))
+    }
+
     pub fn configure(&self, cx: &mut Cx) {
         if let Some(mut inner) = self.borrow_mut() { inner.configure(cx); }
     }
@@ -726,6 +904,7 @@ mod tests {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
             crate::shared::script_mod(vm);
+            super::super::permission_choices::script_mod(vm);
             super::super::permission_prompt::script_mod(vm);
             super::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.BackgroundTasks {} });
@@ -752,20 +931,23 @@ mod tests {
     fn set_form(editor: &mut BackgroundTasks, cx: &mut Cx) {
         let binding = binding();
         editor.account = binding.account;
+        editor.selected_app_id = Some(binding.app_id.clone());
+        editor.selected_context_id = Some(binding.context.clone());
         editor.apps.push(AppChoice { id: binding.app_id, name: "Reminder".into(), fingerprint: Ok("a".repeat(64)) });
         editor.contexts.push(ContextChoice { context: binding.context, label: "Room: Test".into(), available: true });
-        editor.view.drop_down(cx, ids!(app_choice)).set_labels(cx, vec!["Choose".into(), "Reminder".into()]);
-        editor.view.drop_down(cx, ids!(app_choice)).set_selected_item(cx, 1);
+        editor.view.permission_choices(cx, ids!(app_choice)).set_labels(cx, vec!["Reminder".into()]);
+        editor.view.permission_choices(cx, ids!(app_choice)).set_selected_item(cx, 0);
         editor.view.drop_down(cx, ids!(context_choice)).set_labels(cx, vec!["Choose".into(), "Room: Test".into()]);
         editor.view.drop_down(cx, ids!(context_choice)).set_selected_item(cx, 1);
         editor.view.text_input(cx, ids!(interval_value)).set_text(cx, "5");
-        editor.view.drop_down(cx, ids!(interval_unit)).set_selected_item(cx, 1);
+        editor.view.permission_choices(cx, ids!(interval_unit)).set_selected_item(cx, 1);
+        editor.view.permission_choices(cx, ids!(schedule_choice)).set_selected_item(cx, 5);
     }
 
-    fn select_task(editor: &mut BackgroundTasks, cx: &mut Cx, task: TaskView) {
+    fn select_task(editor: &mut BackgroundTasks, _cx: &mut Cx, task: TaskView) {
+        editor.selected_task_id = Some(task.job.id);
+        editor.showing_details = true;
         editor.tasks.push(task);
-        editor.view.drop_down(cx, ids!(task_choice)).set_labels(cx, vec!["New".into(), "Saved task".into()]);
-        editor.view.drop_down(cx, ids!(task_choice)).set_selected_item(cx, 1);
     }
 
     #[test]
@@ -825,9 +1007,93 @@ mod tests {
         let actions = cx.capture_actions(|cx| editor.handle_event(cx, &Event::Actions(clicks), &mut Scope::empty()));
         assert!(!editor.view.widget(&cx, ids!(task_editor)).visible());
         assert!(editor.view.widget(&cx, ids!(overview_header)).visible());
-        assert!(editor.view.widget(&cx, ids!(task_overview)).visible());
-        assert_eq!(editor.view.text_input(&cx, ids!(interval_value)).text(), "5");
+        assert!(!editor.view.widget(&cx, ids!(task_overview)).visible());
+        assert!(editor.selected_task_id.is_none());
+        assert!(editor.selected_app_id.is_none());
         assert!(!actions.iter().any(|action| action.downcast_ref::<A2AppOp>().is_some()));
+    }
+
+    #[test]
+    fn creation_reviews_the_selected_binding_and_schedule_before_enabling() {
+        let _account = AccountGuard::set("@alice:example.org");
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<BackgroundTasks>().unwrap();
+        set_form(&mut editor, &mut cx);
+        editor.set_editing(&mut cx, true);
+        editor.step = TaskStep::App;
+        editor.update_form(&mut cx);
+        for expected in [TaskStep::Context, TaskStep::Schedule, TaskStep::Review] {
+            let uid = editor.view.button(&cx, ids!(step_next)).widget_uid();
+            let clicks = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+            let actions = cx.capture_actions(|cx| editor.handle_event(cx, &Event::Actions(clicks), &mut Scope::empty()));
+            assert_eq!(editor.step, expected);
+            assert!(!actions.iter().any(|action| action.downcast_ref::<A2AppOp>().is_some()));
+        }
+        assert!(editor.view.widget(&cx, ids!(review_step)).visible());
+        assert!(!editor.view.widget(&cx, ids!(schedule_step)).visible());
+        let uid = editor.view.button(&cx, ids!(save_task)).widget_uid();
+        let clicks = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+        let actions = cx.capture_actions(|cx| editor.handle_event(cx, &Event::Actions(clicks), &mut Scope::empty()));
+        assert!(actions.iter().any(|action| matches!(action.downcast_ref::<A2AppOp>(),
+            Some(A2AppOp::SaveBackgroundTask { binding: actual, trigger: Trigger::Interval { seconds: 300 }, .. }) if actual == &binding())));
+    }
+
+    #[test]
+    fn back_retraces_task_steps_before_leaving_the_task_list() {
+        let _account = AccountGuard::set("@alice:example.org");
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<BackgroundTasks>().unwrap();
+        set_form(&mut editor, &mut cx);
+        editor.set_editing(&mut cx, true);
+        editor.step = TaskStep::Review;
+        let actions = cx.capture_actions(|cx| {
+            for expected in [TaskStep::Schedule, TaskStep::Context, TaskStep::App] {
+                assert!(editor.back(cx));
+                assert_eq!(editor.step, expected);
+                assert!(editor.editing);
+            }
+            assert!(editor.back(cx));
+            assert!(!editor.editing);
+            assert!(!editor.showing_details);
+            assert!(editor.selected_app_id.is_none());
+            assert!(!editor.back(cx));
+
+            select_task(&mut editor, cx, task());
+            assert!(editor.back(cx));
+            assert!(editor.selected_task_id.is_none());
+            assert!(!editor.showing_details);
+            assert!(!editor.back(cx));
+
+            editor.selected_task_id = Some(7);
+            editor.set_editing(cx, true);
+            editor.step = TaskStep::Review;
+            assert!(editor.back(cx));
+            assert_eq!(editor.step, TaskStep::Schedule);
+            assert!(editor.back(cx));
+            assert!(editor.selected_task_id.is_none());
+            assert!(!editor.editing);
+            assert!(!editor.back(cx));
+        });
+        assert!(!actions.iter().any(|action| action.downcast_ref::<A2AppOp>().is_some()));
+    }
+
+    #[test]
+    fn task_cards_address_stable_ids_and_reject_another_accounts_actions() {
+        let _account = AccountGuard::set("@alice:example.org");
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<BackgroundTasks>().unwrap();
+        set_form(&mut editor, &mut cx);
+        select_task(&mut editor, &mut cx, task());
+        let mut second = task();
+        second.job.id = 8;
+        editor.tasks.insert(0, second);
+        for (account, id, expected) in [("@alice:example.org", 8, true), ("@bob:example.org", 7, false), ("@alice:example.org", 99, false)] {
+            let clicks = cx.capture_actions(|cx| cx.action(TaskRowAction { account: account.into(), id, command: TaskCommand::PauseResume }));
+            let actions = cx.capture_actions(|cx| editor.handle_event(cx, &Event::Actions(clicks), &mut Scope::empty()));
+            let paused = actions.iter().any(|action| matches!(action.downcast_ref::<A2AppOp>(), Some(A2AppOp::SetBackgroundTaskEnabled { id: 8, enabled: false, .. })));
+            assert_eq!(paused, expected);
+            if !expected { assert!(!actions.iter().any(|action| action.downcast_ref::<A2AppOp>().is_some())); }
+        }
     }
 
     #[test]
@@ -903,7 +1169,7 @@ mod tests {
         assert!(editor.view.widget(&cx, ids!(changed_version)).visible());
         assert!(!editor.view.button(&cx, ids!(pause_resume)).borrow().unwrap().enabled());
         assert!(editor.save_action(&cx, 0).unwrap_err().contains("version confirmation"));
-        editor.view.drop_down(&cx, ids!(task_choice)).set_selected_item(&mut cx, 0);
+        editor.selected_task_id = None;
         assert!(editor.save_action(&cx, 0).is_err(), "New must not bypass existing source review");
         editor.view.check_box(&cx, ids!(reviewed_version)).set_active(&mut cx, true, Animate::No);
         assert!(editor.save_action(&cx, 0).is_ok());
@@ -940,18 +1206,8 @@ mod tests {
         assert_eq!(editor.view.button(&cx, ids!(pause_resume)).text(), "Resume");
         assert!(editor.view.button(&cx, ids!(pause_resume)).borrow().unwrap().enabled());
         assert!(!editor.view.button(&cx, ids!(run_now)).borrow().unwrap().enabled());
-        assert!(editor.view.widget(&cx, ids!(app_choice)).disabled(&cx));
-        assert!(editor.view.widget(&cx, ids!(context_choice)).disabled(&cx));
-        assert!(!editor.view.widget(&cx, ids!(app_choice_section)).visible());
-        assert!(!editor.view.widget(&cx, ids!(context_choice_section)).visible());
-        assert!(editor.view.widget(&cx, ids!(saved_app)).visible());
-        assert!(editor.view.widget(&cx, ids!(saved_context)).visible());
-        editor.view.drop_down(&cx, ids!(task_choice)).set_selected_item(&mut cx, 0);
-        editor.update_form(&mut cx);
-        assert!(editor.view.widget(&cx, ids!(app_choice_section)).visible());
-        assert!(editor.view.widget(&cx, ids!(context_choice_section)).visible());
-        assert!(!editor.view.widget(&cx, ids!(saved_app)).visible());
-        assert!(!editor.view.widget(&cx, ids!(saved_context)).visible());
+        assert!(!editor.editing);
+        assert!(editor.showing_details);
     }
 
     #[test]

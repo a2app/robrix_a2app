@@ -35,6 +35,8 @@ pub mod background;
 pub mod mini_apps_screen;
 /// Selects an installed mini-app for a particular room or space.
 pub mod room_app_picker;
+/// Visible choices shared by mini-app permission and task screens.
+pub mod permission_choices;
 /// The runtime permission prompt modal.
 pub mod permission_prompt;
 /// Mini-apps shown as room panes, docked around a room's timeline or popped out.
@@ -52,6 +54,7 @@ pub mod timeline_card;
 
 pub fn script_mod(vm: &mut ScriptVm) {
     host_set::script_mod(vm);
+    permission_choices::script_mod(vm);
     permission_prompt::script_mod(vm);
     data_sharing::script_mod(vm);
     protection_inspector::script_mod(vm);

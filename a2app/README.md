@@ -81,17 +81,27 @@ cargo run --features a2app
 
 The Mini Apps screen keeps **Allow room writes** at the top. Turning it off
 blocks every mini-app and agent from writing to rooms and disables their room
-write controls, while keeping saved rules. **Room and space access** sets the
-read/write defaults and the allowed or blocked rooms and spaces; a block always
-wins. Use **Check access** to see which rule decides an operation and open that
-setting directly.
+write controls, while keeping saved rules. **Room and space access** starts with
+the current reading and writing settings and saved rules. Choose **Change** to
+edit one default, or **Add room or space…** to choose targets and then set their
+read/write access. A block always wins. **Check access** explains which control
+decides an operation and opens that setting directly.
 
-Open a mini-app's settings to edit its permission groups. **Show individual
-abilities** exposes narrower controls. **Agent permissions** provides the same
-room, website and duration choices for an agent. **Data sharing** separates
-sharing rules, blocked-action review and activity; it shows the source, reader,
-destination and duration before allowing a rule. Back, Escape and the mouse
-Back button return to the page that opened the settings.
+Open a mini-app's settings and choose a permission to see its current state and
+saved allowances. **Add an allowance…** opens room, website and duration choices;
+**Show individual abilities** exposes narrower controls. **Agent permissions**
+asks for the agent's room and then the permission to edit. Opening or cancelling
+an editor does not grant access.
+
+Request prompts start with **Allow once** and **Not now**. Choose **Remember this
+permission…** to see scope and duration. Website access starts with the exact
+requested address; broader website options require an explicit selection.
+
+**Data sharing** has **Rules**, **Needs attention**, and **History** views. Adding
+a rule walks through data and app, destination, then duration and a final review.
+Blocked actions retain an exact review before approval. **Background tasks**
+shows task cards with Pause/Resume, Edit, and Details; new tasks walk through
+mini-app, location, schedule, and review before enabling.
 
 ## Crates
 
@@ -312,10 +322,10 @@ only the pending request, including its asynchronous completion. Subscriptions
 and requests to enable a permission use a selected duration instead.
 
 Global, room and ancestor-space blocks always override allowlists and app
-grants. Read and write are independent. The **Enable room writes for mini-apps and agents** master switch
+grants. Read and write are independent. The **Allow room writes** master switch
 pauses all room writes and disables individual write editors, retaining their
 saved rules and the previous write default for when the switch is enabled again.
-Read and write defaults each support **Only allowlisted rooms and spaces**:
+Read and write defaults each support **Only in rooms I allow**:
 selected room/space allowances work, unlisted rooms are denied, and explicit
 blocks still win. The ordinary Ask default instead prompts for unlisted rooms.
 Allowlists skip prompts for declared capabilities, while

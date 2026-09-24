@@ -4,10 +4,6 @@ pub(super) fn bullets(labels: &[String]) -> String {
     labels.iter().map(|label| format!("• {label}")).collect::<Vec<_>>().join("\n")
 }
 
-pub(super) fn numbered(labels: &[String]) -> String {
-    labels.iter().enumerate().map(|(index, label)| format!("{}. {label}", index + 1)).collect::<Vec<_>>().join("\n")
-}
-
 fn review_payload(payload: &str) -> String {
     // Render direction-changing/invisible controls explicitly. Literal JSON
     // backslashes are already escaped, so a user can distinguish the contents.
@@ -38,18 +34,18 @@ impl DataSharing {
             .map(|snapshot| &snapshot.context).ok_or_else(|| "Start a mini-app or agent, then choose it above.".into())
     }
 
-    fn selected_decision(&self, cx: &Cx) -> Option<&FlowDecision> {
-        self.view.drop_down(cx, ids!(decision_choice)).selected_item().checked_sub(1)
+    fn selected_decision(&self, _cx: &Cx) -> Option<&FlowDecision> {
+        self.decision_selection.checked_sub(1)
             .and_then(|index| self.decisions.get(index))
     }
 
-    fn selected_action(&self, cx: &Cx) -> Option<&ActionDecision> {
-        self.view.drop_down(cx, ids!(action_choice)).selected_item().checked_sub(1)
+    fn selected_action(&self, _cx: &Cx) -> Option<&ActionDecision> {
+        self.action_selection.checked_sub(1)
             .and_then(|index| self.action_decisions.get(index))
     }
 
     pub(super) fn selected_reader(&self, cx: &Cx) -> Result<ReaderScope, String> {
-        match self.view.drop_down(cx, ids!(reader_kind)).selected_item() {
+        match self.view.permission_choices(cx, ids!(reader_kind)).selected_item() {
             0 => Ok(ReaderScope::Context(self.selected_context(cx)?.clone())),
             1 => self.apps.get(self.view.drop_down(cx, ids!(reader_app)).selected_item())
                 .map(|(app, _)| ReaderScope::App { account: self.account.clone(), app: app.clone() })
@@ -60,7 +56,7 @@ impl DataSharing {
     }
 
     fn selected_duration(&self, cx: &Cx) -> Result<SharingDuration, String> {
-        match self.view.drop_down(cx, ids!(sharing_lifetime)).selected_item() {
+        match self.view.permission_choices(cx, ids!(sharing_lifetime)).selected_item() {
             0 => Ok(SharingDuration::RobrixSession),
             1 => self.rooms.get(self.view.drop_down(cx, ids!(lifetime_room)).selected_item())
                 .map(|(room, _)| SharingDuration::RoomSession { account: self.account.clone(), room: room.clone() })
@@ -87,7 +83,7 @@ impl DataSharing {
             .ok_or("Choose a blocked action to review.")?;
         let snapshot = self.snapshots.iter().find(|snapshot| snapshot.context == decision.context && snapshot.epoch == decision.epoch)
             .ok_or("This context is no longer active. Restart it and review the new request.")?;
-        let session = match self.view.drop_down(cx, ids!(action_session)).selected_item() {
+        let session = match self.view.permission_choices(cx, ids!(action_session)).selected_item() {
             0 => {
                 let request = decision.request.as_ref().ok_or("This operation has no exact contents to review. Retry it to capture a request, or explicitly choose a session permission.")?;
                 return Ok(A2AppOp::GrantExactFlowAuthority {
@@ -123,42 +119,29 @@ impl DataSharing {
         let decisions = flow::recent_decisions().unwrap_or_default().into_iter().rev()
             .filter(|decision| decision.context.account() == self.account).collect::<Vec<_>>();
         if self.decisions != decisions {
-            let selected = self.selected_decision(cx);
-            let index = selected.and_then(|selected| decisions.iter().position(|decision| decision == selected)).map(|index| index + 1).unwrap_or(0);
-            let labels = std::iter::once("Choose a sharing decision".into()).chain(decisions.iter().enumerate().map(|(index, decision)| format!("{}. {} · {}",
-                index + 1, if decision.allowed { "Allowed" } else { "Blocked" }, self.recipient_choice_label(&decision.recipient)))).collect();
+            self.decision_selection = self.selected_decision(cx).and_then(|selected|
+                decisions.iter().position(|decision| decision == selected)).map(|index| index + 1).unwrap_or(0);
             self.decisions = decisions;
-            self.view.drop_down(cx, ids!(decision_choice)).set_labels(cx, labels);
-            self.view.drop_down(cx, ids!(decision_choice)).set_selected_item(cx, index);
         }
         let decisions = flow::recent_action_decisions().unwrap_or_default().into_iter().rev()
             .filter(|decision| !decision.allowed && decision.context.account() == self.account).collect::<Vec<_>>();
         if self.action_decisions != decisions {
-            let selected = self.selected_action(cx);
-            let index = selected.and_then(|selected| decisions.iter().position(|decision| decision == selected)).map(|index| index + 1).unwrap_or(0);
-            let labels = std::iter::once("Choose a blocked action".into()).chain(decisions.iter().enumerate().map(|(index, decision)| format!("{}. {}",
-                index + 1, self.action_choice_label(&decision.action)))).collect();
+            self.action_selection = self.selected_action(cx).and_then(|selected|
+                decisions.iter().position(|decision| decision == selected)).map(|index| index + 1).unwrap_or(0);
             self.action_decisions = decisions;
-            self.view.drop_down(cx, ids!(action_choice)).set_labels(cx, labels);
-            self.view.drop_down(cx, ids!(action_choice)).set_selected_item(cx, index);
         }
-        let authorities = flow::authorities().unwrap_or_default().into_iter()
-            .filter(|grant| grant.context.account() == self.account).collect::<Vec<_>>();
-        if self.authorities != authorities {
-            let labels = authorities.iter().map(|grant| format!("{} · {} → {} · {}",
-                self.context_label(&grant.context), grant.action.kind, grant.action.target,
-                match &grant.session {
-                    AuthoritySession::Once { .. } => "One unchanged action, once".into(),
-                    AuthoritySession::RobrixSession => "Until Robrix closes".into(),
-                    AuthoritySession::RoomSession { room, .. } => format!("Until {} closes", self.room_label(room)),
-                })).collect::<Vec<_>>();
-            self.view.label(cx, ids!(authority_rules)).set_text(cx, &if labels.is_empty() { "No action approvals.".into() } else { numbered(&labels) });
-            self.view.drop_down(cx, ids!(authority_remove_choice)).set_labels(cx, authorities.iter().enumerate().map(|(index, grant)|
-                format!("{}. {} · {}", index + 1, self.action_choice_label(&grant.action), self.context_choice_label(&grant.context))).collect());
-            self.view.drop_down(cx, ids!(authority_remove_choice)).set_selected_item(cx, 0);
-            self.authorities = authorities;
-        }
-        self.view.widget(cx, ids!(authority_remove_section)).set_visible(cx, !self.authorities.is_empty());
+        self.authorities = flow::authorities().unwrap_or_default().into_iter()
+            .filter(|grant| grant.context.account() == self.account).collect();
+        let count = self.decisions.iter().filter(|decision| !decision.allowed).count() + self.action_decisions.len();
+        self.view.label(cx, ids!(attention_summary)).set_text(cx, if count == 0 {
+            "Nothing needs your attention. Blocked sharing requests and actions will appear here."
+        } else { "Choose a request to see why it was blocked. Reviewing a request does not approve it." });
+        self.view.widget(cx, ids!(attention_more)).set_visible(cx, count > self.attention_limit);
+        let reviewing = self.decision_selection != 0 || self.action_selection != 0;
+        self.view.widget(cx, ids!(attention_overview)).set_visible(cx, !reviewing);
+        self.view.widget(cx, ids!(attention_details)).set_visible(cx, reviewing);
+        self.view.widget(cx, ids!(sharing_details)).set_visible(cx, self.decision_selection != 0);
+        self.view.widget(cx, ids!(action_review)).set_visible(cx, self.action_selection != 0);
         self.update_diagnostic_details(cx);
     }
 
@@ -189,8 +172,8 @@ impl DataSharing {
         if blocked != self.blocked_sources {
             let labels = blocked.iter().map(|source| self.source_choice_label(source)).collect();
             self.blocked_sources = blocked;
-            self.view.drop_down(cx, ids!(blocked_source_choice)).set_labels(cx, labels);
-            self.view.drop_down(cx, ids!(blocked_source_choice)).set_selected_item(cx, 0);
+            self.view.permission_choices(cx, ids!(blocked_source_choice)).set_labels(cx, labels);
+            self.view.permission_choices(cx, ids!(blocked_source_choice)).set_selected_item(cx, 0);
         }
         self.view.widget(cx, ids!(review_section)).set_visible(cx, !self.blocked_sources.is_empty());
         let action = self.selected_action(cx);
@@ -198,9 +181,9 @@ impl DataSharing {
             let snapshot = self.snapshots.iter().find(|snapshot| snapshot.context == decision.context && snapshot.epoch == decision.epoch);
             let influences = snapshot.map(|snapshot| &snapshot.influences).unwrap_or(&decision.influences);
             let labels = influences.iter().map(|influence| self.influence_label(influence)).collect::<Vec<_>>();
-            let warning = if self.view.drop_down(cx, ids!(action_session)).selected_item() == 0 {
+            let warning = if self.view.permission_choices(cx, ids!(action_session)).selected_item() == 0 {
                 "Once authorizes only one unchanged retry of the complete request shown below. Other requests, paths, contents and targets need their own approval."
-            } else if self.view.drop_down(cx, ids!(action_session)).selected_item() == 1 && decision.context.room().is_none() {
+            } else if self.view.permission_choices(cx, ids!(action_session)).selected_item() == 1 && decision.context.room().is_none() {
                 "This app has no attached room. Choose This exact action once or Until Robrix closes before approving it."
             } else if decision.action.kind.starts_with("network.") {
                 "This HTTP method permission covers every path on this exact origin. Internet and source sharing rules still apply."
@@ -226,7 +209,7 @@ impl DataSharing {
         self.view.widget(cx, ids!(authority_button)).set_visible(cx, action.is_some());
         let can_approve = action.is_some_and(|decision| {
             self.snapshots.iter().any(|snapshot| snapshot.context == decision.context && snapshot.epoch == decision.epoch)
-                && match self.view.drop_down(cx, ids!(action_session)).selected_item() {
+                && match self.view.permission_choices(cx, ids!(action_session)).selected_item() {
                     0 => decision.request.is_some(),
                     1 => decision.context.room().is_some(),
                     2 => true,
@@ -237,13 +220,13 @@ impl DataSharing {
         self.view.widget(cx, ids!(authority_button)).set_disabled(cx, !can_approve);
         self.view.widget(cx, ids!(action_session)).set_visible(cx, action.is_some());
         self.view.button(cx, ids!(authority_button)).set_text(cx,
-            if self.view.drop_down(cx, ids!(action_session)).selected_item() == 0 { "Allow this exact action once" } else { "Allow for this session" });
+            if self.view.permission_choices(cx, ids!(action_session)).selected_item() == 0 { "Allow this exact action once" } else { "Allow for this session" });
     }
 
     pub(super) fn review_decision(&mut self, cx: &mut Cx) -> Result<(), String> {
         let decision = self.selected_decision(cx)
             .ok_or("Select a blocked sharing decision.")?.clone();
-        let source = self.blocked_sources.get(self.view.drop_down(cx, ids!(blocked_source_choice)).selected_item())
+        let source = self.blocked_sources.get(self.view.permission_choices(cx, ids!(blocked_source_choice)).selected_item())
             .ok_or("Select one blocked source to review.")?.clone();
         let index = if let Some(index) = self.sources.iter().position(|(candidate, _)| candidate == &source) { index }
         else {
@@ -255,28 +238,33 @@ impl DataSharing {
         if let Some(index) = self.snapshots.iter().position(|snapshot| snapshot.context == decision.context && snapshot.epoch == decision.epoch) {
             self.view.drop_down(cx, ids!(context_choice)).set_selected_item(cx, index + 1);
         } else { return Err("This context is no longer active. Its sources remain protected; restart it before adding a context rule.".into()); }
-        self.view.drop_down(cx, ids!(reader_kind)).set_selected_item(cx, 0);
-        self.view.drop_down(cx, ids!(sharing_lifetime)).set_selected_item(cx, 0);
+        self.view.permission_choices(cx, ids!(reader_kind)).set_selected_item(cx, 0);
+        self.view.permission_choices(cx, ids!(sharing_lifetime)).set_selected_item(cx, 0);
         match &decision.recipient {
             Recipient::NetworkOrigin(origin) => {
-                self.view.drop_down(cx, ids!(recipient_kind)).set_selected_item(cx, 1);
+                self.view.permission_choices(cx, ids!(recipient_kind)).set_selected_item(cx, 1);
                 self.view.text_input(cx, ids!(network_url)).set_text(cx, origin);
             }
             Recipient::ModelProvider(id) if self.model.as_ref().is_some_and(|model| &model.id == id) => {
-                self.view.drop_down(cx, ids!(recipient_kind)).set_selected_item(cx, 0);
+                self.view.permission_choices(cx, ids!(recipient_kind)).set_selected_item(cx, 0);
             }
             Recipient::ModelProvider(_) => return Err("This request used a different model configuration. Restart the agent with the currently configured service before approving it.".into()),
             Recipient::MatrixRoom { account, room } => {
                 if account != &self.account { return Err("The recipient belongs to a different account.".into()); }
                 let index = self.rooms.iter().position(|(id, _)| id == room).ok_or("The destination room is no longer joined.")?;
-                self.view.drop_down(cx, ids!(recipient_kind)).set_selected_item(cx, 2);
+                self.view.permission_choices(cx, ids!(recipient_kind)).set_selected_item(cx, 2);
                 self.view.drop_down(cx, ids!(target_room)).set_selected_item(cx, index);
             }
             Recipient::External => return Err("Unrestricted external sharing cannot be approved here.".into()),
         }
         self.update_recipient_form(cx);
         self.update_diagnostic_details(cx);
-        self.view.drop_down(cx, ids!(page_choice)).set_selected_item(cx, 0);
+        self.wizard_return_page = 1;
+        self.wizard_open = true;
+        self.wizard_step = 2;
+        self.reader_options_open = false;
+        self.rule_identifiers_open = false;
+        self.view.permission_choices(cx, ids!(page_choice)).set_selected_item(cx, 0);
         self.update_page(cx);
         Ok(())
     }
@@ -317,7 +305,7 @@ impl DataSharing {
         }
     }
 
-    fn action_choice_label(&self, action: &flow::SensitiveAction) -> String {
+    pub(super) fn action_choice_label(&self, action: &flow::SensitiveAction) -> String {
         let action_name = a2app_core::capabilities::by_id(&action.kind).map(|cap| cap.title.to_string())
             .unwrap_or_else(|| action.kind.strip_prefix("network.").map(|method| format!("Website request ({method})")).unwrap_or_else(|| action.kind.clone()));
         format!("{action_name} · {}", self.room_name(&action.target))
@@ -350,6 +338,22 @@ impl DataSharing {
             Influence::MiniApp { account, app } => format!("Mini-app content · {} · {account}", self.app_label(app)),
             Influence::Model(id) => self.recipient_label(&Recipient::ModelProvider(id.clone())),
             Influence::Unknown => "Unknown stored influences".into(),
+        }
+    }
+
+    pub(super) fn reader_choice_label(&self, reader: &ReaderScope) -> String {
+        match reader {
+            ReaderScope::AllReaders => "All mini-apps and agents".into(),
+            ReaderScope::App { app, .. } => format!("{} everywhere it runs", self.apps.iter().find(|(id, _)| id == app).map(|(_, name)| name.as_str()).unwrap_or(app)),
+            ReaderScope::Context(context) => self.context_choice_label(context),
+        }
+    }
+
+    pub(super) fn authority_duration_label(&self, session: &AuthoritySession) -> String {
+        match session {
+            AuthoritySession::Once { .. } => "One unchanged action, once".into(),
+            AuthoritySession::RobrixSession => "Until Robrix closes".into(),
+            AuthoritySession::RoomSession { room, .. } => format!("Until {} closes", self.room_label(room)),
         }
     }
 

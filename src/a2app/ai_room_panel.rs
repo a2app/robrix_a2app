@@ -16,14 +16,23 @@
 
 use makepad_widgets::*;
 use a2app_core::permissions::Permission;
+use super::permission_choices::*;
 
 script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
 
+    let GroupRow = View {
+        width: Fill, height: Fit, spacing: 8
+        flow: Right, align: Align{y: 0.5}
+    }
+    let ChangeButton = RobrixNeutralIconButton {
+        text: "Change…"
+        icon_walk: Walk{width: 0, height: 0, margin: 0}
+    }
+
     mod.widgets.AiRoomPanel = set_type_default() do #(AiRoomPanel::register_widget(vm)) {
         ..mod.widgets.SmallModal
-
         width: Fill { max: 640 }
         height: Fill { max: 760 }
         padding: 20
@@ -39,185 +48,98 @@ script_mod! {
             panel_subtitle := ModalBody {
                 text: "Room protections and data-sharing rules also apply to this agent."
             }
-
             power_row := View {
                 width: Fill, height: Fit
-                flow: Down
-                spacing: 2
                 ai_power_toggle := RobrixSettingsToggle {
                     active: true
                     text: "Allow this room's AI to run"
                 }
             }
-            SubsectionLabel { text: "Permissions", margin: 0 }
-            ModalBody {
-                text: "Always allow lasts until changed. Ask when needed keeps saved approvals. Block stops this permission everywhere for this agent."
-            }
-
-            read_row := View {
-                width: Fill, height: Fit
-                flow: Down
-                spacing: 4
-                read_state := ModalBody {}
-                read_buttons := View {
-                    width: Fill, height: Fit
-                    flow: Flow.Right{wrap: true}
-                    spacing: 8
-                    read_allow := RobrixPositiveIconButton { text: "Always allow", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                    read_ask := RobrixNeutralIconButton { text: "Ask when needed", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                    read_block := RobrixNegativeIconButton { text: "Block", icon_walk: Walk{width: 0, height: 0, margin: 0} }
+            permission_overview := View {
+                width: Fill, height: Fit, flow: Down, spacing: 12
+                SubsectionLabel { text: "Permissions", margin: 0 }
+                ModalBody { text: "See what this agent can do. Choose Change to review one permission." }
+                read_row := GroupRow {
+                    read_state := ModalBody {}
+                    read_change := ChangeButton {}
+                }
+                info_row := GroupRow {
+                    info_state := ModalBody {}
+                    info_change := ChangeButton {}
+                }
+                gen_row := GroupRow {
+                    gen_state := ModalBody {}
+                    gen_change := ChangeButton {}
+                }
+                app_use_row := GroupRow {
+                    app_use_state := ModalBody {}
+                    app_use_change := ChangeButton {}
+                }
+                rooms_read_row := GroupRow {
+                    rooms_read_state := ModalBody {}
+                    rooms_read_change := ChangeButton {}
+                }
+                rooms_list_row := GroupRow {
+                    rooms_list_state := ModalBody {}
+                    rooms_list_change := ChangeButton {}
+                }
+                spaces_row := GroupRow {
+                    spaces_state := ModalBody {}
+                    spaces_change := ChangeButton {}
+                }
+                rooms_send_row := GroupRow {
+                    rooms_send_state := ModalBody {}
+                    rooms_send_change := ChangeButton {}
+                }
+                tools_row := GroupRow {
+                    tools_state := ModalBody {}
+                    tools_change := ChangeButton {}
+                }
+                net_row := GroupRow {
+                    net_state := ModalBody {}
+                    net_change := ChangeButton {}
                 }
             }
-
-            info_row := View {
-                width: Fill, height: Fit
-                flow: Down
-                spacing: 4
-                info_state := ModalBody {}
-                info_buttons := View {
-                    width: Fill, height: Fit
-                    flow: Flow.Right{wrap: true}
-                    spacing: 8
-                    info_allow := RobrixPositiveIconButton { text: "Always allow", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                    info_ask := RobrixNeutralIconButton { text: "Ask when needed", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                    info_block := RobrixNegativeIconButton { text: "Block", icon_walk: Walk{width: 0, height: 0, margin: 0} }
+            permission_editor := View {
+                visible: false
+                width: Fill, height: Fit, flow: Down, spacing: 12
+                back_permissions := RobrixNeutralIconButton {
+                    text: "Back to permissions"
+                    icon_walk: Walk{width: 0, height: 0, margin: 0}
+                }
+                editor_title := SettingsItemLabel { width: Fill, flow: Flow.Right{wrap: true} }
+                editor_current := ModalBody {}
+                editor_explanation := ModalBody {}
+                editor_network_warning := ModalBody {
+                    visible: false
+                    text: "Internet access can let this agent send room messages, files or other local data off this device to online services. What is shared depends on what it does."
+                }
+                editor_choice := PermissionChoices {}
+                ModalBody {
+                    text: "Choose an option to apply it now. Ask when needed keeps existing approvals. Room and space protections still take priority."
+                }
+                abilities_button := RobrixNeutralIconButton {
+                    text: "What this permission covers…"
+                    icon_walk: Walk{width: 0, height: 0, margin: 0}
+                }
+                abilities_section := View {
+                    visible: false
+                    width: Fill, height: Fit, flow: Down, spacing: 8
+                    ability_details := ModalBody {}
+                    ModalBody { text: "Individual ability settings and scoped approvals are available in Mini Apps → Agent permissions." }
                 }
             }
-
-            gen_row := View {
-                width: Fill, height: Fit
-                flow: Down
-                spacing: 4
-                gen_state := ModalBody {}
-                gen_buttons := View {
-                    width: Fill, height: Fit
-                    flow: Flow.Right{wrap: true}
-                    spacing: 8
-                    gen_allow := RobrixPositiveIconButton { text: "Always allow", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                    gen_ask := RobrixNeutralIconButton { text: "Ask when needed", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                    gen_block := RobrixNegativeIconButton { text: "Block", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                }
-            }
-
-            app_use_row := View {
-                width: Fill, height: Fit
-                flow: Down
-                spacing: 4
-                app_use_state := ModalBody {}
-                app_use_buttons := View {
-                    width: Fill, height: Fit
-                    flow: Flow.Right{wrap: true}
-                    spacing: 8
-                    app_use_allow := RobrixPositiveIconButton { text: "Always allow", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                    app_use_ask := RobrixNeutralIconButton { text: "Ask when needed", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                    app_use_block := RobrixNegativeIconButton { text: "Block", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                }
-            }
-
-            rooms_read_row := View {
-                width: Fill, height: Fit
-                flow: Down
-                spacing: 4
-                rooms_read_state := ModalBody {}
-                rooms_read_buttons := View {
-                    width: Fill, height: Fit
-                    flow: Flow.Right{wrap: true}
-                    spacing: 8
-                    rooms_read_allow := RobrixPositiveIconButton { text: "Always allow", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                    rooms_read_ask := RobrixNeutralIconButton { text: "Ask when needed", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                    rooms_read_block := RobrixNegativeIconButton { text: "Block", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                }
-            }
-
-            rooms_list_row := View {
-                width: Fill, height: Fit
-                flow: Down
-                spacing: 4
-                rooms_list_state := ModalBody {}
-                rooms_list_buttons := View {
-                    width: Fill, height: Fit
-                    flow: Flow.Right{wrap: true}
-                    spacing: 8
-                    rooms_list_allow := RobrixPositiveIconButton { text: "Always allow", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                    rooms_list_ask := RobrixNeutralIconButton { text: "Ask when needed", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                    rooms_list_block := RobrixNegativeIconButton { text: "Block", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                }
-            }
-
-            spaces_row := View {
-                width: Fill, height: Fit
-                flow: Down
-                spacing: 4
-                spaces_state := ModalBody {}
-                spaces_buttons := View {
-                    width: Fill, height: Fit
-                    flow: Flow.Right{wrap: true}
-                    spacing: 8
-                    spaces_allow := RobrixPositiveIconButton { text: "Always allow", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                    spaces_ask := RobrixNeutralIconButton { text: "Ask when needed", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                    spaces_block := RobrixNegativeIconButton { text: "Block", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                }
-            }
-
-            rooms_send_row := View {
-                width: Fill, height: Fit
-                flow: Down
-                spacing: 4
-                rooms_send_state := ModalBody {}
-                rooms_send_buttons := View {
-                    width: Fill, height: Fit
-                    flow: Flow.Right{wrap: true}
-                    spacing: 8
-                    rooms_send_ask := RobrixNeutralIconButton { text: "Ask when needed", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                    rooms_send_block := RobrixNegativeIconButton { text: "Block", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                }
-            }
-
-            tools_row := View {
-                width: Fill, height: Fit
-                flow: Down
-                spacing: 4
-                tools_state := ModalBody {}
-                tools_buttons := View {
-                    width: Fill, height: Fit
-                    flow: Flow.Right{wrap: true}
-                    spacing: 8
-                    tools_ask := RobrixNeutralIconButton { text: "Ask when needed", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                    tools_block := RobrixNegativeIconButton { text: "Block", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                }
-            }
-
-            net_row := View {
-                width: Fill, height: Fit
-                flow: Down
-                spacing: 4
-                net_state := ModalBody {}
-                net_buttons := View {
-                    width: Fill, height: Fit
-                    flow: Flow.Right{wrap: true}
-                    spacing: 8
-                    net_ask := RobrixNeutralIconButton { text: "Ask when needed", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                    net_block := RobrixNegativeIconButton { text: "Block", icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                }
-            }
-
             extras_row := View {
-                width: Fill, height: Fit
-                flow: Down
-                spacing: 4
+                width: Fill, height: Fit, flow: Down, spacing: 8
                 extras_state := ModalBody {}
                 forget_extras_button := RobrixNegativeIconButton {
                     text: "Remove these approvals"
                     icon_walk: Walk{width: 0, height: 0, margin: 0}
                 }
             }
-
             usage_label := ModalBody {}
-
             restrict_row := View {
-                width: Fill, height: Fit
-                flow: Down
-                spacing: 4
+                width: Fill, height: Fit, flow: Down, spacing: 8
                 restrict_notice := ModalBody {}
                 unrestrict_button := RobrixPositiveIconButton {
                     text: "Let it run again", visible: false
@@ -285,6 +207,10 @@ pub struct AiRoomPanel {
     #[deref] view: View,
     /// The room this panel manages, set at [`AiRoomPanelRef::show`] time.
     #[rust] room_id: Option<String>,
+    #[rust] rows: Vec<String>,
+    #[rust] selected_group: Option<usize>,
+    #[rust] abilities_expanded: bool,
+    #[rust] has_extras: bool,
 }
 
 /// Emits one panel action (a helper so `handle_event` never holds a closure
@@ -316,83 +242,39 @@ impl Widget for AiRoomPanel {
             );
             return;
         }
-        // (perm, allow, ask, deny) button triples, one per managed group.
-        // Read this room's content.
-        if self.view.button(cx, ids!(read_allow)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomRead), AiRoomPanelCommand::Allow);
-        } else if self.view.button(cx, ids!(read_ask)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomRead), AiRoomPanelCommand::Ask);
-        } else if self.view.button(cx, ids!(read_block)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomRead), AiRoomPanelCommand::Deny);
+        if self.view.button(cx, ids!(back_permissions)).clicked(actions) {
+            self.selected_group = None;
+            self.abilities_expanded = false;
+            self.update_editor(cx);
+            self.view.view(cx, ids!(panel_content)).set_scroll_pos(cx, Vec2d::default());
+            return;
         }
-        // See this room's details.
-        if self.view.button(cx, ids!(info_allow)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomInfo), AiRoomPanelCommand::Allow);
-        } else if self.view.button(cx, ids!(info_ask)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomInfo), AiRoomPanelCommand::Ask);
-        } else if self.view.button(cx, ids!(info_block)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomInfo), AiRoomPanelCommand::Deny);
+        if self.selected_group.is_none() {
+            for (index, (_, _, _, change)) in panel_groups().into_iter().enumerate() {
+                if self.view.button(cx, &[change]).clicked(actions) {
+                    self.open_group(cx, index);
+                    return;
+                }
+            }
         }
-        // Build and run mini-apps.
-        if self.view.button(cx, ids!(gen_allow)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::AppGeneration), AiRoomPanelCommand::Allow);
-        } else if self.view.button(cx, ids!(gen_ask)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::AppGeneration), AiRoomPanelCommand::Ask);
-        } else if self.view.button(cx, ids!(gen_block)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::AppGeneration), AiRoomPanelCommand::Deny);
-        }
-        // Open your mini-apps.
-        if self.view.button(cx, ids!(app_use_allow)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::AppLaunch), AiRoomPanelCommand::Allow);
-        } else if self.view.button(cx, ids!(app_use_ask)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::AppLaunch), AiRoomPanelCommand::Ask);
-        } else if self.view.button(cx, ids!(app_use_block)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::AppLaunch), AiRoomPanelCommand::Deny);
-        }
-        // Read messages in other rooms.
-        if self.view.button(cx, ids!(rooms_read_allow)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomsRead), AiRoomPanelCommand::Allow);
-        } else if self.view.button(cx, ids!(rooms_read_ask)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomsRead), AiRoomPanelCommand::Ask);
-        } else if self.view.button(cx, ids!(rooms_read_block)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomsRead), AiRoomPanelCommand::Deny);
-        }
-        // See a list of the user's rooms.
-        if self.view.button(cx, ids!(rooms_list_allow)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomsList), AiRoomPanelCommand::Allow);
-        } else if self.view.button(cx, ids!(rooms_list_ask)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomsList), AiRoomPanelCommand::Ask);
-        } else if self.view.button(cx, ids!(rooms_list_block)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomsList), AiRoomPanelCommand::Deny);
-        }
-        // Your spaces.
-        if self.view.button(cx, ids!(spaces_allow)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::MatrixSpaces), AiRoomPanelCommand::Allow);
-        } else if self.view.button(cx, ids!(spaces_ask)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::MatrixSpaces), AiRoomPanelCommand::Ask);
-        } else if self.view.button(cx, ids!(spaces_block)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::MatrixSpaces), AiRoomPanelCommand::Deny);
-        }
-        // Post into other rooms. Scoped approval is the most this row can offer: the real
-        // answer is given per room / per tool / per site.
-        if self.view.button(cx, ids!(rooms_send_ask)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomsSend), AiRoomPanelCommand::Ask);
-        } else if self.view.button(cx, ids!(rooms_send_block)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::MatrixRoomsSend), AiRoomPanelCommand::Deny);
-        }
-        // Call tools a mini-app offers here. Scoped approval is the most this row can offer: the real
-        // answer is given per room / per tool / per site.
-        if self.view.button(cx, ids!(tools_ask)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::McpTools), AiRoomPanelCommand::Ask);
-        } else if self.view.button(cx, ids!(tools_block)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::McpTools), AiRoomPanelCommand::Deny);
-        }
-        // Reach the internet. Scoped approval is the most this row can offer: the real
-        // answer is given per room / per tool / per site.
-        if self.view.button(cx, ids!(net_ask)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::Network), AiRoomPanelCommand::Ask);
-        } else if self.view.button(cx, ids!(net_block)).clicked(actions) {
-            emit_panel_action(cx, &room_id, Some(Permission::Network), AiRoomPanelCommand::Deny);
+        if let Some(index) = self.selected_group {
+            if self.view.button(cx, ids!(abilities_button)).clicked(actions) {
+                self.abilities_expanded = !self.abilities_expanded;
+                self.update_abilities(cx);
+            }
+            if let Some(choice) = self.view.permission_choices(cx, ids!(editor_choice)).changed(actions)
+                && let Some((perm, _, _, _)) = panel_groups().get(index).copied()
+            {
+                let command = match (scoped_only(perm), choice) {
+                    (true, 0) | (false, 1) => Some(AiRoomPanelCommand::Ask),
+                    (true, 1) | (false, 2) => Some(AiRoomPanelCommand::Deny),
+                    (false, 0) => Some(AiRoomPanelCommand::Allow),
+                    _ => None,
+                };
+                if let Some(command) = command {
+                    emit_panel_action(cx, &room_id, Some(perm), command);
+                }
+            }
         }
         if self.view.button(cx, ids!(forget_extras_button)).clicked(actions) {
             emit_panel_action(cx, &room_id, None, AiRoomPanelCommand::ForgetExtras);
@@ -407,52 +289,119 @@ impl Widget for AiRoomPanel {
     }
 }
 
+fn panel_groups() -> [(Permission, LiveId, LiveId, LiveId); 10] {
+    [
+        (Permission::MatrixRoomRead, id!(read_row), id!(read_state), id!(read_change)),
+        (Permission::MatrixRoomInfo, id!(info_row), id!(info_state), id!(info_change)),
+        (Permission::AppGeneration, id!(gen_row), id!(gen_state), id!(gen_change)),
+        (Permission::AppLaunch, id!(app_use_row), id!(app_use_state), id!(app_use_change)),
+        (Permission::MatrixRoomsRead, id!(rooms_read_row), id!(rooms_read_state), id!(rooms_read_change)),
+        (Permission::MatrixRoomsList, id!(rooms_list_row), id!(rooms_list_state), id!(rooms_list_change)),
+        (Permission::MatrixSpaces, id!(spaces_row), id!(spaces_state), id!(spaces_change)),
+        (Permission::MatrixRoomsSend, id!(rooms_send_row), id!(rooms_send_state), id!(rooms_send_change)),
+        (Permission::McpTools, id!(tools_row), id!(tools_state), id!(tools_change)),
+        (Permission::Network, id!(net_row), id!(net_state), id!(net_change)),
+    ]
+}
+
+fn scoped_only(perm: Permission) -> bool {
+    matches!(perm, Permission::MatrixRoomsSend | Permission::McpTools | Permission::Network)
+}
+
+impl AiRoomPanel {
+    fn open_group(&mut self, cx: &mut Cx, index: usize) {
+        if self.rows.get(index).is_none_or(String::is_empty) { return }
+        self.selected_group = Some(index);
+        self.abilities_expanded = false;
+        self.update_editor(cx);
+        self.view.view(cx, ids!(panel_content)).set_scroll_pos(cx, Vec2d::default());
+    }
+
+    fn update_abilities(&mut self, cx: &mut Cx) {
+        self.view.widget(cx, ids!(abilities_section)).set_visible(cx, self.abilities_expanded);
+        self.view.button(cx, ids!(abilities_button)).set_text(cx, if self.abilities_expanded {
+            "Hide included abilities"
+        } else { "What this permission covers…" });
+        self.view.redraw(cx);
+    }
+
+    fn update_editor(&mut self, cx: &mut Cx) {
+        if self.selected_group.is_some_and(|index| self.rows.get(index).is_none_or(String::is_empty)) {
+            self.selected_group = None;
+        }
+        let editing = self.selected_group.is_some();
+        self.view.widget(cx, ids!(permission_overview)).set_visible(cx, !editing);
+        self.view.widget(cx, ids!(permission_editor)).set_visible(cx, editing);
+        self.view.widget(cx, ids!(power_row)).set_visible(cx, !editing);
+        self.view.widget(cx, ids!(extras_row)).set_visible(cx, !editing && self.has_extras);
+        self.view.widget(cx, ids!(usage_label)).set_visible(cx, !editing);
+        if let Some(index) = self.selected_group {
+            let (perm, _, _, _) = panel_groups()[index];
+            self.view.label(cx, ids!(editor_title)).set_text(cx, match perm {
+                Permission::McpTools => "Use mini-app tools",
+                Permission::Network => "Internet access",
+                other => other.title(),
+            });
+            self.view.label(cx, ids!(editor_current)).set_text(cx, &self.rows[index]);
+            let explanation = if scoped_only(perm) {
+                "This permission is approved separately for each destination or tool. Ask when needed permits those approvals; Block stops all use of this permission for this agent."
+            } else {
+                "Always allow lasts until you change it. Block stops this permission for this agent, including existing approvals."
+            };
+            self.view.label(cx, ids!(editor_explanation)).set_text(cx, explanation);
+            self.view.widget(cx, ids!(editor_network_warning)).set_visible(cx, perm == Permission::Network);
+            let labels = if scoped_only(perm) { vec!["Ask when needed".into(), "Block".into()] }
+            else { vec!["Always allow".into(), "Ask when needed".into(), "Block".into()] };
+            let choices = self.view.permission_choices(cx, ids!(editor_choice));
+            choices.set_labels(cx, labels);
+            // These are explicit actions, not a guessed saved setting. The effective state
+            // above can be blocked by room protections even when this group is allowed.
+            choices.set_selected_item(cx, usize::MAX);
+            let details = super::ai::tools::AI_ROOM_SESSION_CAP_IDS.iter()
+                .filter_map(|id| a2app_core::capabilities::by_id(id))
+                .filter(|cap| cap.group == Some(perm))
+                .map(|cap| format!("• {}: {}", cap.title, cap.blurb))
+                .collect::<Vec<_>>().join("\n\n");
+            self.view.label(cx, ids!(ability_details)).set_text(cx, &details);
+        }
+        self.update_abilities(cx);
+    }
+
+    fn populate(&mut self, cx: &mut Cx, info: &AiRoomPanelInfo) {
+        let different_room = self.room_id.as_ref() != Some(&info.room_id);
+        self.room_id = Some(info.room_id.clone());
+        self.rows.clone_from(&info.rows);
+        if different_room {
+            self.selected_group = None;
+            self.abilities_expanded = false;
+            self.view.view(cx, ids!(panel_content)).set_scroll_pos(cx, Vec2d::default());
+        }
+        self.view.label(cx, ids!(panel_title)).set_text(cx, &format!("AI in {}", info.room_name));
+        self.view.check_box(cx, ids!(ai_power_toggle)).set_active(cx, info.powered_on, Animate::No);
+        for (index, (_, row, state, _)) in panel_groups().into_iter().enumerate() {
+            let text = info.rows.get(index).map(String::as_str).unwrap_or("");
+            self.view.label(cx, &[state]).set_text(cx, text);
+            self.view.widget(cx, &[row]).set_visible(cx, !text.is_empty());
+        }
+        let extras = info.extras.as_deref().unwrap_or_default();
+        self.has_extras = !extras.is_empty();
+        self.view.label(cx, ids!(extras_state)).set_text(cx, extras);
+        self.view.label(cx, ids!(usage_label)).set_text(cx, &info.usage);
+        let notice = info.restriction.as_deref().unwrap_or_default();
+        let restricted = !notice.is_empty();
+        self.view.label(cx, ids!(restrict_notice)).set_text(cx, notice);
+        self.view.widget(cx, ids!(restrict_row)).set_visible(cx, restricted);
+        self.view.button(cx, ids!(unrestrict_button)).set_visible(cx, restricted);
+        self.update_editor(cx);
+    }
+
+}
+
 impl AiRoomPanelRef {
     /// Populates the panel for one AI room and makes it visible within the
     /// (already-open) modal. Call again after every action to refresh state.
     pub fn show(&self, cx: &mut Cx, info: &AiRoomPanelInfo) {
-        let Some(mut inner) = self.borrow_mut() else { return };
-        let different_room = inner.room_id.as_ref() != Some(&info.room_id);
-        inner.room_id = Some(info.room_id.clone());
-        let v = &mut inner.view;
-        if different_room {
-            v.view(cx, ids!(panel_content)).set_scroll_pos(cx, Vec2d::default());
-        }
-        v.label(cx, ids!(panel_title)).set_text(cx, &format!("AI in {}", info.room_name));
-        v.check_box(cx, ids!(ai_power_toggle))
-            .set_active(cx, info.powered_on, Animate::No);
-        let row = |i: usize| info.rows.get(i).map(String::as_str).unwrap_or("");
-        v.label(cx, ids!(read_state)).set_text(cx, row(0));
-        v.label(cx, ids!(info_state)).set_text(cx, row(1));
-        v.label(cx, ids!(gen_state)).set_text(cx, row(2));
-        v.label(cx, ids!(app_use_state)).set_text(cx, row(3));
-        v.label(cx, ids!(rooms_read_state)).set_text(cx, row(4));
-        v.label(cx, ids!(rooms_list_state)).set_text(cx, row(5));
-        v.label(cx, ids!(spaces_state)).set_text(cx, row(6));
-        v.label(cx, ids!(rooms_send_state)).set_text(cx, row(7));
-        v.label(cx, ids!(tools_state)).set_text(cx, row(8));
-        v.label(cx, ids!(net_state)).set_text(cx, row(9));
-        // A group this AI does not offer has no line, so its row is hidden.
-        for (i, id) in [
-            ids!(read_row), ids!(info_row), ids!(gen_row), ids!(app_use_row),
-            ids!(rooms_read_row), ids!(rooms_list_row), ids!(spaces_row),
-            ids!(rooms_send_row), ids!(tools_row), ids!(net_row),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            v.widget(cx, id).set_visible(cx, !row(i).is_empty());
-        }
-        let extras = info.extras.clone().unwrap_or_default();
-        v.label(cx, ids!(extras_state)).set_text(cx, &extras);
-        v.widget(cx, ids!(extras_row)).set_visible(cx, !extras.is_empty());
-        v.label(cx, ids!(usage_label)).set_text(cx, &info.usage);
-        let restrict_notice = info.restriction.clone().unwrap_or_default();
-        let restricted = !restrict_notice.is_empty();
-        v.label(cx, ids!(restrict_notice)).set_text(cx, &restrict_notice);
-        v.label(cx, ids!(restrict_notice)).set_visible(cx, restricted);
-        v.button(cx, ids!(unrestrict_button)).set_visible(cx, restricted);
-        v.redraw(cx);
+        if let Some(mut inner) = self.borrow_mut() { inner.populate(cx, info); }
     }
 }
 
@@ -465,6 +414,7 @@ mod tests {
         let panel = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             crate::shared::script_mod(vm);
+            super::super::permission_choices::script_mod(vm);
             super::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.AiRoomPanel {} });
             WidgetRef::script_from_value(vm, value).as_ai_room_panel()
@@ -478,6 +428,66 @@ mod tests {
             rows: vec!["Read this room — ask when needed".into()], extras: None,
             usage: "No tool use recorded yet.".into(), restriction: None,
         }
+    }
+
+    fn click(panel: &AiRoomPanelRef, cx: &mut Cx, path: &[LiveId]) -> Vec<AiRoomPanelAction> {
+        let uid = panel.borrow().unwrap().view.button(cx, path).widget_uid();
+        let click = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+        let actions = cx.capture_actions(|cx| panel.borrow_mut().unwrap().handle_event(cx, &Event::Actions(click), &mut Scope::empty()));
+        actions.iter().filter_map(|action| action.downcast_ref::<AiRoomPanelAction>()).cloned().collect()
+    }
+
+    fn choose(panel: &AiRoomPanelRef, cx: &mut Cx, index: usize) -> Vec<AiRoomPanelAction> {
+        let uid = panel.borrow().unwrap().view.permission_choices(cx, ids!(editor_choice)).widget_uid();
+        let changed = cx.capture_actions(|cx| cx.widget_action(uid, PermissionChoicesAction::Changed(index)));
+        let actions = cx.capture_actions(|cx| panel.borrow_mut().unwrap().handle_event(cx, &Event::Actions(changed), &mut Scope::empty()));
+        actions.iter().filter_map(|action| action.downcast_ref::<AiRoomPanelAction>()).cloned().collect()
+    }
+
+    #[test]
+    fn opening_permissions_and_ability_details_never_changes_access() {
+        let (mut cx, panel) = panel();
+        let mut info = info();
+        info.rows[0] = "Read this room — don't allow".into();
+        panel.show(&mut cx, &info);
+        assert!(click(&panel, &mut cx, ids!(read_change)).is_empty());
+        assert!(!panel.borrow().unwrap().view.widget(&cx, ids!(permission_overview)).visible());
+        assert!(panel.borrow().unwrap().view.widget(&cx, ids!(permission_editor)).visible());
+        assert_eq!(panel.borrow().unwrap().view.label(&cx, ids!(editor_current)).text(), info.rows[0]);
+        assert_eq!(panel.borrow().unwrap().view.permission_choices(&cx, ids!(editor_choice)).selected_item(), usize::MAX,
+            "a blocked effective state must not be mistaken for a saved group denial");
+        assert!(click(&panel, &mut cx, ids!(abilities_button)).is_empty());
+        assert!(panel.borrow().unwrap().view.widget(&cx, ids!(abilities_section)).visible());
+        assert!(!panel.borrow().unwrap().view.label(&cx, ids!(ability_details)).text().is_empty());
+        let actions = choose(&panel, &mut cx, 0);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].command, AiRoomPanelCommand::Allow);
+        assert_eq!(actions[0].perm, Some(Permission::MatrixRoomRead));
+        assert!(click(&panel, &mut cx, ids!(back_permissions)).is_empty());
+        assert!(panel.borrow().unwrap().view.widget(&cx, ids!(permission_overview)).visible());
+        assert!(choose(&panel, &mut cx, 0).is_empty(), "a hidden editor cannot apply a stale choice");
+    }
+
+    #[test]
+    fn scoped_groups_never_offer_blanket_allow_and_editor_resets_for_another_room() {
+        let (mut cx, panel) = panel();
+        let mut info = info();
+        info.rows.resize(10, String::new());
+        info.rows[9] = "Internet access — ask when needed".into();
+        panel.show(&mut cx, &info);
+        assert!(click(&panel, &mut cx, ids!(net_change)).is_empty());
+        assert!(choose(&panel, &mut cx, 2).is_empty(), "unknown choices cannot become blanket internet access");
+        for (index, command) in [(0, AiRoomPanelCommand::Ask), (1, AiRoomPanelCommand::Deny)] {
+            let actions = choose(&panel, &mut cx, index);
+            assert_eq!(actions.len(), 1);
+            assert_eq!(actions[0].command, command);
+            assert_eq!(actions[0].perm, Some(Permission::Network));
+        }
+        info.room_id = "!another:example.org".into();
+        panel.show(&mut cx, &info);
+        assert!(panel.borrow().unwrap().view.widget(&cx, ids!(permission_overview)).visible());
+        assert!(panel.borrow().unwrap().selected_group.is_none());
+        assert!(choose(&panel, &mut cx, 0).is_empty());
     }
 
     #[test]

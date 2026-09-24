@@ -14,10 +14,12 @@ Tasks resume in their original account and context after launch. A missing or
 unjoined room is never replaced with another room. A changed app version requires
 review and explicit re-enabling.
 
-Choose **New task**, select the mini-app and its room or space, then choose
-when it should run. **Save and enable task** starts that schedule. For a saved
-task, **Edit schedule** opens its form; **Cancel** leaves the saved schedule
-unchanged. Pause, Resume, and Remove task are available beside its status.
+Choose **New task** and follow the four steps: mini-app, room or space,
+schedule, and review. Choose a common schedule or **Custom interval** for other
+intervals. **Enable task** on the final review starts the schedule. Each saved
+task has a card with Pause/Resume, Edit, and Details. Editing shows the schedule
+and a review; **Cancel** leaves the saved task unchanged. Details includes
+Run now, permission settings, and confirmed removal.
 Alarm times use the device's local time zone and are stored as an absolute time;
 ambiguous or nonexistent times during daylight-saving changes must be corrected.
 

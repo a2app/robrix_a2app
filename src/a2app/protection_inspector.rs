@@ -12,81 +12,122 @@ use a2app_core::permissions::{
 };
 use crate::home::rooms_list::RoomsListRef;
 use super::mini_apps_screen::AccessRuleKey;
+use super::permission_choices::*;
 use super::runtime::with_a2app;
 
 script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
 
+    mod.widgets.ProtectionControlButton = RobrixNeutralIconButton {
+        width: Fill, height: Fit, padding: 10
+        label_walk: Walk{width: Fill, height: Fit}
+        icon_walk: Walk{width: 0, height: 0, margin: 0}
+    }
     mod.widgets.ProtectionInspector = set_type_default() do #(ProtectionInspector::register_widget(vm)) {
         width: Fill, height: Fill, flow: Down
         content := ScrollYView {
             width: Fill, height: Fill, flow: Down, spacing: 10, padding: 15
-            mod.widgets.PermissionOptionLabel {
-                text: "Find out why access is allowed or blocked, and go straight to the setting responsible. Start by choosing the room or space you want to check."
+            page_choice := PermissionChoices {
+                labels: ["Room access", "Check a mini-app"]
+                horizontal: true, tabs: true
             }
-            SubsectionLabel { text: "Room or space", margin: Inset{top: 8} }
-            target := mod.widgets.PermissionDropDown {}
-            target_details := mod.widgets.PermissionOptionLabel {}
-            page_choice := mod.widgets.PermissionDropDown {
-                labels: ["Room and space access", "One app or agent", "Previously accessed data"]
-            }
-            LineH { margin: Inset{top: 8, bottom: 8} }
-            room_page := View {
+            target_picker := View {
                 width: Fill, height: Fit, flow: Down, spacing: 10
-                SubsectionLabel { text: "Read access", margin: 0 }
-                read_details := mod.widgets.PermissionOptionLabel {}
-                read_control_choice := mod.widgets.PermissionDropDown {}
-                read_rule := RobrixNeutralIconButton {
-                    padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                    text: "Change read setting"
+                SubsectionLabel { text: "Which room or space?", margin: Inset{top: 8} }
+                PermissionOptionLabel { text: "See what mini-apps and agents can read or change, and which settings control it." }
+                target := PermissionDropDown {}
+                keep_target := RobrixNeutralIconButton {
+                    visible: false, padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                    text: "Keep current room or space"
                 }
+            }
+            target_summary := View {
+                visible: false, width: Fill, height: Fit, flow: Down, spacing: 10
+                target_title := SubsectionLabel { margin: Inset{top: 8} }
+                change_target := RobrixNeutralIconButton {
+                    padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                    text: "Change room or space"
+                }
+            }
+            room_page := View {
+                visible: false, width: Fill, height: Fit, flow: Down, spacing: 10
+                SubsectionLabel { text: "Read access", margin: Inset{top: 8} }
+                read_details := PermissionOptionLabel {}
+                read_controls_section := View { width: Fill, height: Fit, flow: Down, spacing: 6 }
                 LineH { margin: Inset{top: 8, bottom: 8} }
                 SubsectionLabel { text: "Write access", margin: 0 }
-                write_details := mod.widgets.PermissionOptionLabel {}
-                write_control_choice := mod.widgets.PermissionDropDown {}
-                write_rule := RobrixNeutralIconButton {
-                    padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                    text: "Change write setting"
+                write_details := PermissionOptionLabel {}
+                write_controls_section := View { width: Fill, height: Fit, flow: Down, spacing: 6 }
+                PermissionOptionLabel {
+                    text: "These rules apply to every mini-app and agent. Their own permissions and data-sharing checks still apply."
                 }
-                mod.widgets.PermissionOptionLabel {
-                    text: "These room rules apply to every mini-app and agent. They must also pass their own permissions, data-sharing rules and any required action approval."
+                target_details := PermissionOptionLabel {}
+                retained_toggle := RobrixNeutralIconButton {
+                    padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                    text: "Show previously accessed data"
+                }
+                retained_page := View {
+                    visible: false, width: Fill, height: Fit, flow: Down, spacing: 10
+                    SubsectionLabel { text: "Previously accessed data", margin: 0 }
+                    PermissionOptionLabel {
+                        text: "Blocking new reads does not erase data already read or remove sharing rules. These records show possible use in saved app data, agent history and app code, even after they stop running."
+                    }
+                    retained_details := PermissionOptionLabel {}
+                    PermissionOptionLabel {
+                        text: "These records do not prove that the original messages are still stored. To prevent future sharing, remove the relevant data-sharing rules."
+                    }
+                    sharing := RobrixNeutralIconButton {
+                        padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                        text: "Manage data sharing"
+                    }
                 }
             }
             subject_page := View {
                 visible: false, width: Fill, height: Fit, flow: Down, spacing: 10
-                SubsectionLabel { text: "Mini-app or agent", margin: 0 }
-                subject := mod.widgets.PermissionDropDown {}
-                subject_details := mod.widgets.PermissionOptionLabel {}
-                SubsectionLabel { text: "What it wants to do", margin: Inset{top: 8} }
-                capability := mod.widgets.PermissionDropDown {}
-                capability_details := mod.widgets.PermissionOptionLabel {}
-                capability_rule := RobrixNeutralIconButton {
-                    padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                    text: "Change permission"
+                subject_picker := View {
+                    width: Fill, height: Fit, flow: Down, spacing: 10
+                    SubsectionLabel { text: "Which mini-app or agent?", margin: Inset{top: 8} }
+                    PermissionOptionLabel { text: "Check a specific action and find the setting that allows or blocks it." }
+                    subject := PermissionDropDown {}
+                    keep_subject := RobrixNeutralIconButton {
+                        visible: false, padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                        text: "Keep current mini-app or agent"
+                    }
+                }
+                subject_check := View {
+                    visible: false, width: Fill, height: Fit, flow: Down, spacing: 10
+                    subject_title := SubsectionLabel { margin: Inset{top: 8} }
+                    change_subject := RobrixNeutralIconButton {
+                        padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                        text: "Change mini-app or agent"
+                    }
+                    SubsectionLabel { text: "What does it want to do?", margin: Inset{top: 8} }
+                    capability := PermissionDropDown {}
+                    capability_details := PermissionOptionLabel {}
+                    capability_rule := RobrixNeutralIconButton {
+                        padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                        text: "Change this permission"
+                    }
+                    context_toggle := RobrixNeutralIconButton {
+                        padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                        text: "About this app check"
+                    }
+                    subject_context := View {
+                        visible: false, width: Fill, height: Fit, flow: Down
+                        subject_details := PermissionOptionLabel {}
+                    }
                 }
             }
-            retained_page := View {
+            check_footer := View {
                 visible: false, width: Fill, height: Fit, flow: Down, spacing: 10
-                SubsectionLabel { text: "Who may already know this room's data?", margin: 0 }
-                mod.widgets.PermissionOptionLabel {
-                    text: "Blocking new reads does not erase data already read or remove sharing rules. Robrix keeps track of possible access in saved app data, agent history and app code, even after they stop running."
+                LineH { margin: Inset{top: 8, bottom: 8} }
+                refresh := RobrixNeutralIconButton {
+                    padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                    text: "Refresh access check"
                 }
-                retained_details := mod.widgets.PermissionOptionLabel {}
-                mod.widgets.PermissionOptionLabel {
-                    text: "These records show which data may have been used. They do not prove that the original messages are still stored. To prevent future sharing, remove the relevant sharing rules."
-                }
+                snapshot_status := PermissionOptionLabel {}
             }
-            LineH { margin: Inset{top: 8, bottom: 8} }
-            sharing := RobrixNeutralIconButton {
-                padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                text: "Manage data sharing"
-            }
-            refresh := RobrixNeutralIconButton {
-                padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                text: "Refresh access check"
-            }
-            snapshot_status := mod.widgets.PermissionOptionLabel {}
         }
     }
 }
@@ -127,6 +168,12 @@ pub struct ProtectionInspector {
     #[rust] write_controls: Vec<ProtectionInspectorAction>,
     #[rust] capability_control: Option<ProtectionInspectorAction>,
     #[rust] configured: bool,
+    #[rust] selected_target_id: Option<String>,
+    #[rust] selected_subject_choice: Option<SubjectChoice>,
+    #[rust] choosing_target: bool,
+    #[rust] choosing_subject: bool,
+    #[rust] showing_retained: bool,
+    #[rust] showing_context: bool,
 }
 
 impl Widget for ProtectionInspector {
@@ -134,29 +181,83 @@ impl Widget for ProtectionInspector {
         if self.refresh_account(cx) { return; }
         self.view.handle_event(cx, event, scope);
         let Event::Actions(actions) = event else { return };
-        if self.view.drop_down(cx, ids!(page_choice)).changed(actions).is_some() {
+        if self.view.permission_choices(cx, ids!(page_choice)).changed(actions).is_some() {
+            self.reset_scroll(cx);
             self.update_page(cx);
+            return;
+        }
+        if self.view.button(cx, ids!(change_target)).clicked(actions) {
+            self.choosing_target = true;
+            self.showing_retained = false;
+            self.reset_scroll(cx);
+            self.update_page(cx);
+            return;
+        }
+        if self.view.button(cx, ids!(change_subject)).clicked(actions) {
+            self.choosing_subject = true;
+            self.showing_context = false;
+            self.reset_scroll(cx);
+            self.update_page(cx);
+            return;
         }
         if self.view.button(cx, ids!(refresh)).clicked(actions) {
             self.configure(cx);
-        } else if self.view.drop_down(cx, ids!(target)).changed(actions).is_some()
-            || self.view.drop_down(cx, ids!(subject)).changed(actions).is_some()
-            || self.view.drop_down(cx, ids!(capability)).changed(actions).is_some()
-        {
+            return;
+        } else if let Some(index) = self.view.drop_down(cx, ids!(target)).changed(actions) {
+            self.selected_target_id = index.checked_sub(1).and_then(|index| self.targets.get(index)).map(|target| target.0.clone());
+            self.choosing_target = false;
+            self.showing_retained = false;
             self.update_details(cx);
+            self.reset_scroll(cx);
+            return;
+        } else if let Some(index) = self.view.drop_down(cx, ids!(subject)).changed(actions) {
+            self.selected_subject_choice = index.checked_sub(1).and_then(|index| self.subjects.get(index)).cloned();
+            self.choosing_subject = false;
+            self.showing_context = false;
+            self.update_details(cx);
+            self.reset_scroll(cx);
+            return;
+        } else if self.view.drop_down(cx, ids!(capability)).changed(actions).is_some() {
+            self.update_details(cx);
+            return;
         }
-        for (button, control) in [
-            (ids!(read_rule), self.read_controls.get(self.view.drop_down(cx, ids!(read_control_choice)).selected_item())),
-            (ids!(write_rule), self.write_controls.get(self.view.drop_down(cx, ids!(write_control_choice)).selected_item())),
-            (ids!(capability_rule), self.capability_control.as_ref()),
-        ] {
-            if self.view.button(cx, button).clicked(actions) && let Some(control) = control {
-                cx.action(control.clone());
+        if self.view.button(cx, ids!(retained_toggle)).clicked(actions) {
+            self.showing_retained = !self.showing_retained;
+            self.update_page(cx);
+            return;
+        }
+        if self.view.button(cx, ids!(context_toggle)).clicked(actions) {
+            self.showing_context = !self.showing_context;
+            self.update_page(cx);
+            return;
+        }
+        if self.view.button(cx, ids!(keep_target)).clicked(actions) {
+            self.choosing_target = false;
+            self.update_page(cx);
+            return;
+        }
+        if self.view.button(cx, ids!(keep_subject)).clicked(actions) {
+            self.choosing_subject = false;
+            self.update_page(cx);
+            return;
+        }
+        if self.choosing_target || self.selected_target(cx).is_none() { return; }
+        let page = self.view.permission_choices(cx, ids!(page_choice)).selected_item();
+        if page == 0 {
+            for (section, controls) in [(ids!(read_controls_section), &self.read_controls), (ids!(write_controls_section), &self.write_controls)] {
+                if let Some(buttons) = self.view.view(cx, section).borrow() {
+                    for ((_, button), control) in buttons.children.iter().zip(controls) {
+                        if button.as_button().clicked(actions) { cx.action(control.clone()); }
+                    }
+                }
             }
-        }
-        if self.view.button(cx, ids!(sharing)).clicked(actions) {
-            cx.action(ProtectionInspectorAction::Sharing);
-        }
+            if self.showing_retained && self.view.button(cx, ids!(sharing)).clicked(actions) {
+                cx.action(ProtectionInspectorAction::Sharing);
+            }
+        } else if page == 1 && !self.choosing_subject && self.selected_subject(cx).is_some()
+            && self.view.button(cx, ids!(capability_rule)).clicked(actions)
+            && let Some(control) = &self.capability_control
+        { cx.action(control.clone()); }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -172,12 +273,29 @@ impl ProtectionInspector {
         true
     }
 
-    fn update_page(&mut self, cx: &mut Cx) {
-        let page = self.view.drop_down(cx, ids!(page_choice)).selected_item();
-        self.view.widget(cx, ids!(room_page)).set_visible(cx, page == 0);
-        self.view.widget(cx, ids!(subject_page)).set_visible(cx, page == 1);
-        self.view.widget(cx, ids!(retained_page)).set_visible(cx, page == 2);
+    fn reset_scroll(&self, cx: &mut Cx) {
         self.view.view(cx, ids!(content)).set_scroll_pos(cx, Vec2d::default());
+    }
+
+    fn update_page(&mut self, cx: &mut Cx) {
+        let page = self.view.permission_choices(cx, ids!(page_choice)).selected_item();
+        let has_target = self.selected_target(cx).is_some() && !self.choosing_target;
+        let has_subject = self.selected_subject(cx).is_some() && !self.choosing_subject;
+        self.view.widget(cx, ids!(target_picker)).set_visible(cx, !has_target);
+        self.view.widget(cx, ids!(keep_target)).set_visible(cx, self.selected_target(cx).is_some());
+        self.view.widget(cx, ids!(keep_subject)).set_visible(cx, self.selected_subject(cx).is_some());
+        self.view.widget(cx, ids!(target_summary)).set_visible(cx, has_target);
+        self.view.widget(cx, ids!(room_page)).set_visible(cx, has_target && page == 0);
+        self.view.widget(cx, ids!(subject_page)).set_visible(cx, has_target && page == 1);
+        self.view.widget(cx, ids!(subject_picker)).set_visible(cx, !has_subject);
+        self.view.widget(cx, ids!(subject_check)).set_visible(cx, has_subject);
+        self.view.widget(cx, ids!(retained_page)).set_visible(cx, self.showing_retained);
+        self.view.widget(cx, ids!(subject_context)).set_visible(cx, self.showing_context);
+        self.view.widget(cx, ids!(check_footer)).set_visible(cx, has_target && (page == 0 || has_subject));
+        self.view.button(cx, ids!(retained_toggle)).set_text(cx,
+            if self.showing_retained { "Hide previously accessed data" } else { "Show previously accessed data" });
+        self.view.button(cx, ids!(context_toggle)).set_text(cx,
+            if self.showing_context { "Hide app details" } else { "About this app check" });
         self.view.redraw(cx);
     }
 
@@ -189,8 +307,14 @@ impl ProtectionInspector {
         self.account = account;
         if account_changed {
             self.configured = false;
-            self.view.drop_down(cx, ids!(page_choice)).set_selected_item(cx, 0);
-            self.update_page(cx);
+            self.view.permission_choices(cx, ids!(page_choice)).set_selected_item(cx, 0);
+            self.selected_target_id = None;
+            self.selected_subject_choice = None;
+            self.choosing_target = false;
+            self.choosing_subject = false;
+            self.showing_retained = false;
+            self.showing_context = false;
+            self.reset_scroll(cx);
         }
         match flow::retained_contexts() {
             Ok(snapshots) => {
@@ -236,10 +360,13 @@ impl ProtectionInspector {
         }
         self.targets = targets.into_iter().map(|(id, (name, space))| (id, name, space)).collect();
         self.targets.sort_by_cached_key(|target| (target.1.to_lowercase(), target.0.clone()));
-        self.view.drop_down(cx, ids!(target)).set_labels(cx, self.targets.iter().map(|(_, name, space)|
-            format!("{}: {name}", if *space { "Space" } else { "Room" })).collect());
+        self.selected_target_id = previous_target.filter(|id| self.targets.iter().any(|target| &target.0 == id));
+        let mut target_labels = vec!["Choose a room or space…".into()];
+        target_labels.extend(self.targets.iter().map(|(_, name, space)|
+            format!("{}: {name}", if *space { "Space" } else { "Room" })));
+        self.view.drop_down(cx, ids!(target)).set_labels(cx, target_labels);
         self.view.drop_down(cx, ids!(target)).set_selected_item(cx,
-            previous_target.and_then(|id| self.targets.iter().position(|target| target.0 == id)).unwrap_or(0));
+            self.targets.iter().position(|target| Some(&target.0) == self.selected_target_id.as_ref()).map(|index| index + 1).unwrap_or(0));
 
         self.subjects = self.snapshots.iter().map(|snapshot| {
             let context = &snapshot.context;
@@ -257,7 +384,8 @@ impl ProtectionInspector {
                 });
             }
         }
-        self.view.drop_down(cx, ids!(subject)).set_labels(cx, self.subjects.iter().map(|subject| {
+        let mut subject_labels = vec!["Choose a mini-app or agent…".into()];
+        subject_labels.extend(self.subjects.iter().map(|subject| {
             let app_name = |app: &str| apps.iter().find(|candidate| candidate.0 == app)
                 .map(|candidate| candidate.1.clone()).unwrap_or_else(|| app.into());
             let room_name = |room: &str| self.targets.iter().find(|target| target.0 == room)
@@ -268,25 +396,28 @@ impl ProtectionInspector {
                 Some(ContextId::Agent { room, .. }) => format!("Agent · {}", room_name(room)),
                 None => app_name(&subject.subject),
             }
-        }).collect());
+        }));
+        self.view.drop_down(cx, ids!(subject)).set_labels(cx, subject_labels);
+        self.selected_subject_choice = previous_subject.and_then(|previous| self.subjects.iter().find(|subject|
+            subject.subject == previous.subject && subject.context == previous.context).cloned());
         self.view.drop_down(cx, ids!(subject)).set_selected_item(cx,
-            previous_subject.and_then(|previous| self.subjects.iter().position(|subject|
-                subject.subject == previous.subject && subject.context == previous.context)).unwrap_or(0));
+            self.subjects.iter().position(|subject| self.selected_subject_choice.as_ref() == Some(subject)).map(|index| index + 1).unwrap_or(0));
         let previous_capability = if self.configured { self.view.drop_down(cx, ids!(capability)).selected_item() }
             else { capabilities::CATALOG.iter().position(|cap| cap.id == "matrix.rooms.messages.read").unwrap_or(0) };
         self.view.drop_down(cx, ids!(capability)).set_labels(cx, capabilities::CATALOG.iter().map(|cap| cap.title.to_string()).collect());
         self.view.drop_down(cx, ids!(capability)).set_selected_item(cx, previous_capability);
         self.configured = true;
-        self.view.label(cx, ids!(snapshot_status)).set_text(cx, "Checked just now. Refresh after changing apps, agents or rooms. Choosing another room or action also rechecks its permissions.");
+        self.view.label(cx, ids!(snapshot_status)).set_text(cx, "Checked just now. Refresh after changing settings or running an app.");
         self.update_details(cx);
     }
 
-    fn selected_target(&self, cx: &Cx) -> Option<&(String, String, bool)> {
-        self.targets.get(self.view.drop_down(cx, ids!(target)).selected_item())
+    fn selected_target(&self, _cx: &Cx) -> Option<&(String, String, bool)> {
+        self.targets.iter().find(|target| Some(&target.0) == self.selected_target_id.as_ref())
     }
 
-    fn selected_subject(&self, cx: &Cx) -> Option<&SubjectChoice> {
-        self.subjects.get(self.view.drop_down(cx, ids!(subject)).selected_item())
+    fn selected_subject(&self, _cx: &Cx) -> Option<&SubjectChoice> {
+        let selected = self.selected_subject_choice.as_ref()?;
+        self.subjects.iter().find(|subject| subject.subject == selected.subject && subject.context == selected.context)
     }
 
     fn room_label(&self, room: &str) -> String {
@@ -333,8 +464,11 @@ impl ProtectionInspector {
         let target_hint = if target.as_ref().is_some_and(|target| target.2) {
             "Checking this space itself. Space rules also cover its rooms and nested spaces. Choose a room to check all the rules that apply to that room."
         } else { "Checking this room, including rules inherited from its spaces. A Block rule always wins over an Allow rule." };
-        self.view.label(cx, ids!(target_details)).set_text(cx, &target.as_ref().map(|(room, _, _)|
-            format!("{} · {}\n{target_hint}", self.room_label(room), self.account)).unwrap_or_else(|| "Choose a room or space to check its access.".into()));
+        self.view.label(cx, ids!(target_title)).set_text(cx, &target.as_ref().map(|(_, name, space)|
+            format!("{}: {name}", if *space { "Space" } else { "Room" })).unwrap_or_default());
+        self.view.label(cx, ids!(target_details)).set_text(cx, target_hint);
+        self.view.label(cx, ids!(subject_title)).set_text(cx,
+            &self.view.drop_down(cx, ids!(subject)).borrow().map(|choice| choice.selected_item_label()).unwrap_or_default());
         let context_text = subject.as_ref().map(|subject| {
             let activity = if subject.active { "Running when last checked." } else { "Not running when last checked. Starting it again requires fresh session and data-sharing checks." };
             let clearance = if matches!(subject.context, Some(ContextId::PublicApp { .. })) {
@@ -352,22 +486,39 @@ impl ProtectionInspector {
             _ => "Choose a room or space to check previously accessed data.".into(),
         };
         self.view.label(cx, ids!(retained_details)).set_text(cx, &retained);
-        for (choice, button, controls) in [
-            (ids!(read_control_choice), ids!(read_rule), &self.read_controls),
-            (ids!(write_control_choice), ids!(write_rule), &self.write_controls),
-        ] {
-            self.view.drop_down(cx, choice).set_labels(cx, controls.iter().map(|control| match control {
-                ProtectionInspectorAction::Global => "Default room rules / write switch".into(),
-                ProtectionInspectorAction::Rule(AccessRuleKey::Room(room)) => format!("Room: {}", self.targets.iter().find(|target| &target.0 == room).map(|target| target.1.as_str()).unwrap_or(room)),
-                ProtectionInspectorAction::Rule(AccessRuleKey::Space(space)) => format!("Space: {}", self.targets.iter().find(|target| &target.0 == space).map(|target| target.1.as_str()).unwrap_or(space)),
-                _ => "Permission control".into(),
-            }).collect());
-            self.view.drop_down(cx, choice).set_selected_item(cx, 0);
-            self.view.widget(cx, choice).set_visible(cx, controls.len() > 1);
-            self.view.widget(cx, button).set_visible(cx, !controls.is_empty());
-        }
+        self.populate_controls(cx);
         self.view.widget(cx, ids!(capability_rule)).set_visible(cx, self.capability_control.is_some());
-        self.view.redraw(cx);
+        self.view.button(cx, ids!(capability_rule)).set_text(cx, match &self.capability_control {
+            Some(ProtectionInspectorAction::Global) => "Change room access",
+            Some(ProtectionInspectorAction::Rule(AccessRuleKey::Room(_))) => "Change room rule",
+            Some(ProtectionInspectorAction::Rule(AccessRuleKey::Space(_))) => "Change space rule",
+            Some(ProtectionInspectorAction::SubjectInfo(_)) => "Open app or agent settings",
+            _ => "Change this permission",
+        });
+        self.update_page(cx);
+    }
+
+    fn populate_controls(&self, cx: &mut Cx) {
+        for (section, controls) in [(ids!(read_controls_section), &self.read_controls), (ids!(write_controls_section), &self.write_controls)] {
+            let section_view = self.view.view(cx, section);
+            let Some(mut container) = section_view.borrow_mut() else { continue };
+            // Rebuild controls on each check so stale button actions cannot open a different setting.
+            container.children.clear();
+            for (index, control) in controls.iter().enumerate() {
+                let text = match control {
+                    ProtectionInspectorAction::Global => "Change default room access".into(),
+                    ProtectionInspectorAction::Rule(AccessRuleKey::Room(room)) => format!("Change room rule: {}", self.targets.iter().find(|target| &target.0 == room).map(|target| target.1.as_str()).unwrap_or(room)),
+                    ProtectionInspectorAction::Rule(AccessRuleKey::Space(space)) => format!("Change space rule: {}", self.targets.iter().find(|target| &target.0 == space).map(|target| target.1.as_str()).unwrap_or(space)),
+                    _ => "Change permission".into(),
+                };
+                let button = cx.with_vm(|vm| {
+                    let value = script_eval!(vm, { mod.widgets.ProtectionControlButton {} });
+                    WidgetRef::script_from_value(vm, value)
+                });
+                button.set_text(cx, &text);
+                container.children.push((LiveId(index as u64 + 1), button));
+            }
+        }
     }
 }
 
@@ -401,12 +552,12 @@ fn explain_room(evaluation: RoomPolicyEvaluation<'_>, access: RoomAccess, room: 
     };
     let (reason, control) = match evaluation.reason {
         WriteMasterOff => ("Allow room writes is off. Turn it on in Mini Apps → Room and space access → Allow room writes to restore your saved write rules.".into(), ProtectionInspectorAction::Global),
-        GlobalBlock => (format!("The default {verb} setting blocks every room. Open Room and space access → Default access to change it. Allowing an individual room cannot override this block."), ProtectionInspectorAction::Global),
-        GlobalDefault => (format!("The default {verb} setting decides this result. Change it under Room and space access → Default access, or add a room or space rule."), ProtectionInspectorAction::Global),
+        GlobalBlock => (format!("The default {verb} setting blocks every room. Open Room and space access → Change {verb} access to change it. Allowing an individual room cannot override this block."), ProtectionInspectorAction::Global),
+        GlobalDefault => (format!("The default {verb} setting decides this result. Change it under Room and space access → Change {verb} access, or add a room or space rule."), ProtectionInspectorAction::Global),
         RoomRule { room } => (format!("The {verb} rule for {} decides this result. Edit that room rule; any matching block still wins.", label(room)), ProtectionInspectorAction::Rule(AccessRuleKey::Room(room.into()))),
         SpaceRule { space, ancestor } => (format!("The {verb} rule for {}{} decides this result. Edit that space rule; any matching block still wins.", if ancestor { "ancestor space " } else { "space " }, label(space)), ProtectionInspectorAction::Rule(AccessRuleKey::Space(space.into()))),
         UnresolvedSpaceHierarchy { space, rule } => (format!("Robrix has not resolved whether this target belongs to space {}. Its {} {verb} rule cannot yet be safely evaluated. Wait for room/space synchronization and refresh; inspect that space rule if needed.", label(space), if rule == PolicyDecision::Deny { "Block" } else { "Allow" }), ProtectionInspectorAction::Rule(AccessRuleKey::Space(space.into()))),
-        WhitelistRequired => (format!("Only allowed rooms and spaces is selected for {verb} access, and no Allow rule matches this room or its spaces. Under Room and space rules, select this target or one of its spaces and choose Allow without asking. App permissions cannot bypass this restriction."), ProtectionInspectorAction::Rule(if space { AccessRuleKey::Space(room.into()) } else { AccessRuleKey::Room(room.into()) })),
+        WhitelistRequired => (format!("Only in rooms I allow is selected for {verb} access, and no Allow rule matches this room or its spaces. Open Room and space access → Add room or space, select this target or one of its spaces, and choose Allow for {verb} access. App permissions cannot bypass this restriction."), ProtectionInspectorAction::Rule(if space { AccessRuleKey::Space(room.into()) } else { AccessRuleKey::Room(room.into()) })),
     };
     Explanation { text: format!("{status}.\n{reason}"), control: Some(control) }
 }
@@ -448,8 +599,8 @@ fn explain_capability_result(evaluation: CapabilityEvaluation<'_>, subject: &Sub
             let explanation = explain_room(RoomPolicyEvaluation { decision: if evaluation.effective == Effective::Granted { PolicyDecision::Allow } else { PolicyDecision::Deny }, reason }, access, room, space, label);
             (explanation.text, explanation.control)
         }
-        PermissionDenied { permission } => (format!("The {} permission group is blocked for this app or agent. Blocking a group overrides individual abilities and room allowances. Change the permission group to allow access.", permission.title()), Some(permission_control(permission, None))),
-        CapabilityDenied => ("This individual ability is blocked. Open its app or agent permission setting to change it.".into(), default_control),
+        PermissionDenied { permission } => (format!("The {} permission group is blocked for this app or agent. Blocking a group overrides individual abilities and room allowances. Open that permission group and choose Use default to remove the block. Then add an allowance if approval is required.", permission.title()), Some(permission_control(permission, None))),
+        CapabilityDenied => ("This individual ability is blocked. Open its permission setting and choose Use default to remove the block. Then add an allowance if approval is required.".into(), default_control),
         CapabilityGrant => ("You have allowed this individual ability.".into(), default_control),
         ScopedGrant => ("A saved or temporary permission allows this ability for this target from the app or agent’s room.".into(), default_control),
         RoomGrant => ("An earlier per-room allowance matches this target. Manage the app or agent's saved room allowances to revoke it.".into(), default_control),
@@ -530,6 +681,7 @@ mod tests {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
             crate::shared::script_mod(vm);
+            crate::a2app::permission_choices::script_mod(vm);
             crate::a2app::permission_prompt::script_mod(vm);
             super::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.ProtectionInspector {} });
@@ -537,16 +689,72 @@ mod tests {
         });
         let mut inspector = widget.borrow_mut::<ProtectionInspector>().unwrap();
         inspector.account = "@inspector-old:example.org".into();
-        inspector.read_controls.push(ProtectionInspectorAction::Rule(AccessRuleKey::Room("!old:example.org".into())));
-        inspector.view.drop_down(&cx, ids!(page_choice)).set_selected_item(&mut cx, 2);
-        let uid = inspector.view.button(&cx, ids!(read_rule)).widget_uid();
+        inspector.capability_control = Some(ProtectionInspectorAction::Rule(AccessRuleKey::Room("!old:example.org".into())));
+        inspector.view.permission_choices(&cx, ids!(page_choice)).set_selected_item(&mut cx, 1);
+        let uid = inspector.view.button(&cx, ids!(capability_rule)).widget_uid();
         let click = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
         let actions = cx.capture_actions(|cx| inspector.handle_event(cx, &Event::Actions(click), &mut Scope::empty()));
         assert!(!actions.iter().any(|action| action.downcast_ref::<ProtectionInspectorAction>().is_some()));
         assert_eq!(inspector.account, "@inspector-new:example.org");
-        assert_eq!(inspector.view.drop_down(&cx, ids!(page_choice)).selected_item(), 0);
+        assert_eq!(inspector.view.permission_choices(&cx, ids!(page_choice)).selected_item(), 0);
         assert!(inspector.selected_subject(&cx).is_none_or(|subject|
             subject.context.as_ref().is_none_or(|context| context.account() == "@inspector-new:example.org")));
+    }
+
+    #[test]
+    fn inspector_guides_each_choice_and_discards_replaced_control_buttons() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::permission_choices::script_mod(vm);
+            crate::a2app::permission_prompt::script_mod(vm);
+            super::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.ProtectionInspector {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let mut editor = widget.borrow_mut::<ProtectionInspector>().unwrap();
+        editor.account = super::super::information_flow::account().unwrap_or_default();
+        editor.targets = vec![("!target:example.org".into(), "Target room".into(), false)];
+        editor.subjects = vec![agent()];
+        editor.update_page(&mut cx);
+        assert!(editor.view.widget(&cx, ids!(target_picker)).visible());
+        assert!(!editor.view.widget(&cx, ids!(room_page)).visible());
+        let uid = editor.view.drop_down(&cx, ids!(target)).widget_uid();
+        let actions = cx.capture_actions(|cx| cx.widget_action(uid, DropDownAction::Select(1)));
+        editor.handle_event(&mut cx, &Event::Actions(actions), &mut Scope::empty());
+        assert!(!editor.view.widget(&cx, ids!(target_picker)).visible());
+        assert!(editor.view.widget(&cx, ids!(room_page)).visible());
+        assert!(!editor.view.widget(&cx, ids!(retained_page)).visible());
+
+        editor.read_controls = vec![ProtectionInspectorAction::Rule(AccessRuleKey::Room("!target:example.org".into()))];
+        editor.populate_controls(&mut cx);
+        let uid = editor.view.view(&cx, ids!(read_controls_section)).borrow().unwrap().children[0].1.widget_uid();
+        editor.read_controls = vec![ProtectionInspectorAction::Global];
+        editor.populate_controls(&mut cx);
+        let clicks = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+        let actions = cx.capture_actions(|cx| editor.handle_event(cx, &Event::Actions(clicks), &mut Scope::empty()));
+        assert!(!actions.iter().any(|action| action.downcast_ref::<ProtectionInspectorAction>().is_some()));
+
+        editor.view.permission_choices(&cx, ids!(page_choice)).set_selected_item(&mut cx, 1);
+        editor.update_page(&mut cx);
+        assert!(!editor.view.widget(&cx, ids!(room_page)).visible());
+        assert!(editor.view.widget(&cx, ids!(subject_page)).visible());
+        assert!(editor.view.widget(&cx, ids!(subject_picker)).visible());
+        assert!(!editor.view.widget(&cx, ids!(subject_check)).visible());
+        let uid = editor.view.drop_down(&cx, ids!(subject)).widget_uid();
+        let actions = cx.capture_actions(|cx| cx.widget_action(uid, DropDownAction::Select(1)));
+        editor.handle_event(&mut cx, &Event::Actions(actions), &mut Scope::empty());
+        assert!(!editor.view.widget(&cx, ids!(subject_picker)).visible());
+        assert!(editor.view.widget(&cx, ids!(subject_check)).visible());
+        assert!(!editor.view.widget(&cx, ids!(subject_context)).visible());
+        let uid = editor.view.button(&cx, ids!(change_target)).widget_uid();
+        let actions = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+        editor.handle_event(&mut cx, &Event::Actions(actions), &mut Scope::empty());
+        assert!(editor.view.widget(&cx, ids!(target_picker)).visible());
+        assert!(!editor.view.widget(&cx, ids!(subject_page)).visible());
+        assert_eq!(editor.selected_target(&cx).map(|target| target.0.as_str()), Some("!target:example.org"));
     }
 
     fn agent() -> SubjectChoice {
@@ -665,7 +873,10 @@ mod tests {
         editor.read_controls = explain_room(RoomPolicyEvaluation {
             decision: PolicyDecision::Deny, reason: RoomPolicyReason::SpaceRule { space, ancestor: true },
         }, RoomAccess::Read, "!target:example.org", false, str::to_owned).control.into_iter().collect();
-        let uid = editor.view.button(&cx, ids!(read_rule)).widget_uid();
+        editor.targets.push(("!target:example.org".into(), "Target room".into(), false));
+        editor.selected_target_id = Some("!target:example.org".into());
+        editor.populate_controls(&mut cx);
+        let uid = editor.view.view(&cx, ids!(read_controls_section)).borrow().unwrap().children[0].1.widget_uid();
         let click = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
         let actions = cx.capture_actions(|cx| editor.handle_event(cx, &Event::Actions(click), &mut Scope::empty()));
         assert!(actions.iter().any(|action| matches!(action.downcast_ref::<ProtectionInspectorAction>(),
