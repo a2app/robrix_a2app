@@ -109,9 +109,14 @@ pub fn quit_if_parked(cx: &mut Cx, room_id: &RoomId, app_id: &str) {
     }
 }
 
-/// Returns the apps running in the given room that nothing shows, excluding background tasks.
-pub fn parked_apps(room_id: &RoomId) -> Vec<String> {
-    instances::parked_apps_in_room(room_id)
+/// Returns the apps running in the given room that nothing shows, e.g., minimized or running a background task.
+pub fn background_apps(room_id: &RoomId) -> Vec<String> {
+    instances::background_apps_in_room(room_id)
+}
+
+/// Changes whenever any room's mini-apps start, stop, or are shown or parked.
+pub fn revision() -> u64 {
+    instances::revision()
 }
 
 /// Tells the app that its docked pane moved to the given side.

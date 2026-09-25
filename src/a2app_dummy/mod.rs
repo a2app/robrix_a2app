@@ -44,7 +44,8 @@ pub mod room_panes {
     pub fn is_shown_by(_room_id: &RoomId, _app_id: &str, _surface_uid: WidgetUid) -> bool { false }
     pub fn is_running(_room_id: &RoomId, _app_id: &str) -> bool { false }
     pub fn quit_if_parked(_cx: &mut Cx, _room_id: &RoomId, _app_id: &str) {}
-    pub fn parked_apps(_room_id: &RoomId) -> Vec<String> { Vec::new() }
+    pub fn background_apps(_room_id: &RoomId) -> Vec<String> { Vec::new() }
+    pub fn revision() -> u64 { 0 }
     pub fn note_side(_room_id: &RoomId, _app_id: &str, _side: PaneSide) {}
     pub fn note_size(_host_area: &WidgetRef, _room_id: &RoomId, _app_id: &str) {}
     pub fn release_all_shown_by(_surface_uid: WidgetUid) {}

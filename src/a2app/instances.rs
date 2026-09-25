@@ -83,6 +83,15 @@ struct Registry {
     /// Surface and focus hooks owed to instances; payloads are built at
     /// flush time, so a burst of changes is one call with the final state.
     pending_hooks: Vec<(InstanceKey, LiveId)>,
+    /// Bumped whenever an instance starts, stops, or is shown or parked.
+    revision: u64,
+}
+
+impl Registry {
+    fn note_changed(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        SignalToUI::set_ui_signal();
+    }
 }
 
 thread_local! {
@@ -91,6 +100,11 @@ thread_local! {
 
 fn with_registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
     INSTANCES.with(|r| f(&mut r.borrow_mut()))
+}
+
+/// Changes whenever an instance starts, stops, or is shown or parked.
+pub fn revision() -> u64 {
+    with_registry(|r| r.revision)
 }
 
 /// Emitted when an app's last instance is gone, so the runtime can drop
@@ -258,6 +272,7 @@ fn ensure_mode(cx: &mut Cx, key: &InstanceKey, manifest: &MiniAppManifest, grant
             anchored: true,
             background_running: false,
         });
+        r.note_changed();
     });
     Some(host)
 }
@@ -273,7 +288,9 @@ pub fn adopt(cx: &mut Cx, key: &InstanceKey, surface_uid: WidgetUid, surface: Su
         inst.shown_by = Some(surface_uid);
         inst.surface = Some(surface);
         inst.anchored = true;
-        Some(inst.host.clone())
+        let host = inst.host.clone();
+        r.note_changed();
+        Some(host)
     })?;
     refresh_prompt_state(cx, key);
     cx.widget_tree_insert_child_deep(surface_uid, tree_name(key), host.clone());
@@ -292,7 +309,9 @@ pub fn release(cx: &mut Cx, key: &InstanceKey, surface_uid: WidgetUid) {
         inst.shown_by = None;
         inst.surface = None;
         inst.anchored = true;
-        Some(inst.host.clone())
+        let host = inst.host.clone();
+        r.note_changed();
+        Some(host)
     });
     if let Some(host) = host {
         refresh_prompt_state(cx, key);
@@ -312,6 +331,7 @@ pub fn release_owner_no_cx(surface_uid: WidgetUid) {
                 inst.surface = None;
                 inst.anchored = false;
                 r.needs_anchor = true;
+                r.revision = r.revision.wrapping_add(1);
                 let owed = (key.clone(), live_id!(on_focus_changed));
                 if !r.pending_hooks.contains(&owed) {
                     r.pending_hooks.push(owed);
@@ -403,17 +423,15 @@ pub fn set_side(key: &InstanceKey, side: PaneSide) {
     });
 }
 
-/// Apps with an instance in `room` that no surface shows and no background task runs,
+/// Apps running in `room` that no surface shows, e.g., minimized or running a background task,
 /// sorted so their order is stable.
-pub fn parked_apps_in_room(room: &RoomId) -> Vec<MiniAppId> {
-    let mut keys: Vec<InstanceKey> = with_registry(|r| {
+pub fn background_apps_in_room(room: &RoomId) -> Vec<MiniAppId> {
+    let mut apps: Vec<MiniAppId> = with_registry(|r| {
         r.instances.iter()
             .filter(|((_, r), inst)| r.as_deref() == Some(room) && inst.shown_by.is_none())
-            .map(|(key, _)| key.clone())
+            .map(|((app, _), _)| app.clone())
             .collect()
     });
-    keys.retain(|key| !super::background::retains_instance(key));
-    let mut apps: Vec<MiniAppId> = keys.into_iter().map(|(app, _)| app).collect();
     apps.sort();
     apps
 }
@@ -445,7 +463,13 @@ pub fn quit(cx: &mut Cx, key: &InstanceKey) -> bool {
 /// Unconditionally retire this activation, including references held by a UI.
 /// Background pause/timeout calls this before releasing its persisted claim.
 pub fn terminate(cx: &mut Cx, key: &InstanceKey) -> bool {
-    let removed = with_registry(|r| r.instances.remove(key));
+    let removed = with_registry(|r| {
+        let removed = r.instances.remove(key);
+        if removed.is_some() {
+            r.note_changed();
+        }
+        removed
+    });
     let Some(instance) = removed else { return false };
     instance.alive.store(false, Ordering::Release);
     let _ = a2app_core::information_flow::remove_context_for_activation(&instance.flow_context, instance.flow_epoch);

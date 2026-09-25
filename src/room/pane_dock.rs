@@ -3,6 +3,7 @@
 //! Each pane is docked to one of the four edges around the timeline,
 //! can be resized via the grab handles on its inner border and between it and its edge's other panes,
 //! moved to the next edge, popped out into its own tab or view, or closed.
+//! A mini-app's pane can also be minimized, and each mini-app running unseen in the room is shown as a chip.
 //! A dock's panes belong to its current timeline, and are saved and restored along with it.
 
 use std::sync::Arc;
@@ -131,6 +132,12 @@ script_mod! {
                 pane_pop_out_button := mod.widgets.RoomPaneHeaderButton {
                     margin: Inset{left: #(HEADER_BUTTON_STEP)}
                     draw_icon.svg: (ICON_EXTERNAL_LINK)
+                }
+                // Only a mini-app's pane can be minimized.
+                pane_minimize_button := mod.widgets.RoomPaneHeaderButton {
+                    visible: false
+                    margin: Inset{left: #(2.0 * HEADER_BUTTON_STEP)}
+                    draw_icon.svg: (ICON_MINIMIZE)
                 }
                 pane_close_button := mod.widgets.RoomPaneHeaderButton {
                     margin: Inset{left: #(2.0 * HEADER_BUTTON_STEP)}
@@ -273,7 +280,23 @@ script_mod! {
             content +: { pinned_messages := mod.widgets.PinnedMessagesList {} }
         }
         mini_app_pane: mod.widgets.RoomPaneFrame {
+            header +: { header_buttons +: { pane_minimize_button +: { visible: true } } }
             content +: { mini_app_host := mod.widgets.MiniAppHostArea {} }
+        }
+        // A mini-app that's running without being shown, which is shown again when clicked.
+        mini_app_chip: mod.widgets.RobrixNeutralIconButton {
+            grab_key_focus: false
+            padding: Inset{top: 5, bottom: 5, left: 10, right: 10}
+            icon_walk: Walk{width: 0, height: 0, margin: 0}
+            draw_bg +: {
+                color: #xF2F4F8E0
+                color_hover: #xE6E9EFF2
+                color_down: #xD8DCE6F2
+                border_color: #x00000022
+                border_color_hover: #x00000033
+                border_color_down: #x00000044
+                border_size: 1.0
+            }
         }
     }
 }
@@ -295,16 +318,40 @@ const HEADER_BUTTON_SPACING: f64 = 2.0;
 /// The distance between the starts of adjacent header buttons.
 const HEADER_BUTTON_STEP: f64 = HEADER_BUTTON_SIZE + HEADER_BUTTON_SPACING;
 /// The header's buttons, starting from the close button in its top-right corner.
-const HEADER_BUTTONS: [&[LiveId]; 3] = [
+const HEADER_BUTTONS: &[&[LiveId]] = &[
     ids!(pane_close_button),
+    ids!(pane_pop_out_button),
+    ids!(pane_edge_button),
+];
+/// Likewise for a mini-app's pane, which can also be minimized.
+const MINI_APP_HEADER_BUTTONS: &[&[LiveId]] = &[
+    ids!(pane_close_button),
+    ids!(pane_minimize_button),
     ids!(pane_pop_out_button),
     ids!(pane_edge_button),
 ];
 /// The width of the header's icon, including its margins.
 const HEADER_ICON_WIDTH: f64 = PANE_ICON_SIZE + PANE_ICON_MARGIN * 2.0;
-/// The narrowest a top or bottom pane can be while its header still fits its icon and one row of buttons.
-const MIN_HEADER_WIDTH: f64 = FRAME_PADDING * 2.0 + HEADER_ICON_WIDTH + HEADER_SPACING * 2.0
-    + HEADER_BUTTON_STEP * HEADER_BUTTONS.len() as f64 - HEADER_BUTTON_SPACING;
+/// The space between the chips of background mini-apps, and around them.
+const CHIP_SPACING: f64 = 6.0;
+const CHIP_MARGIN: f64 = 8.0;
+/// The chips' right margin, which keeps them clear of the timeline's scroll bar.
+const CHIP_RIGHT_MARGIN: f64 = 16.0;
+
+/// Returns the header buttons of the given kind of pane.
+fn header_button_ids(kind: &RoomPaneKind) -> &'static [&'static [LiveId]] {
+    match kind {
+        RoomPaneKind::MiniApp(_) => MINI_APP_HEADER_BUTTONS,
+        RoomPaneKind::Members | RoomPaneKind::PinnedMessages => HEADER_BUTTONS,
+    }
+}
+
+/// The narrowest a top or bottom pane can be while its header still fits its icon and one row of `buttons`.
+fn min_header_width(buttons: usize) -> f64 {
+    FRAME_PADDING * 2.0 + HEADER_ICON_WIDTH + HEADER_SPACING * 2.0
+        + HEADER_BUTTON_STEP * buttons as f64 - HEADER_BUTTON_SPACING
+}
+
 /// The dock always leaves at least this much space for the timeline in the center.
 const MIN_CENTER_SIZE: f64 = 150.0;
 
@@ -478,12 +525,23 @@ struct DockedPane {
     glyph_width: Option<f64>,
 }
 
+/// A chip for a mini-app of our room that's running without being shown, e.g., after it was minimized.
+struct MiniAppChip {
+    app_id: String,
+    button: WidgetRef,
+}
+
 #[derive(Script, Widget)]
 pub struct RoomPaneDock {
     #[deref] view: View,
     #[live] members_pane: Option<LivePtr>,
     #[live] pinned_messages_pane: Option<LivePtr>,
     #[live] mini_app_pane: Option<LivePtr>,
+    #[live] mini_app_chip: Option<LivePtr>,
+    /// Our room's mini-apps that are running without being shown, drawn over the timeline's top-right corner.
+    #[rust] chips: Vec<MiniAppChip>,
+    /// The mini-app revision that our chips were last synced to.
+    #[rust] chips_revision: Option<u64>,
     #[rust] room_name_id: Option<RoomNameId>,
     /// The timeline that this dock's panes belong to.
     #[rust] timeline_kind: Option<TimelineKind>,
@@ -520,12 +578,16 @@ impl Widget for RoomPaneDock {
                 self.edge(cx, side).set_side(side);
             }
         }
+        if self.chips_revision != Some(mini_app_panes::revision()) {
+            self.sync_chips(cx);
+        }
         // This is lazy, as the tooltip only looks at the buttons for the few events that can show it.
         let buttons = self.panes.iter().flat_map(|pane| {
             let header_buttons = pane.frame.child(id!(header)).child(id!(header_buttons));
             [
                 (header_buttons.child(id!(pane_edge_button)), pane.layout.side.next().move_tooltip()),
                 (header_buttons.child(id!(pane_pop_out_button)), "Pop out"),
+                (header_buttons.child(id!(pane_minimize_button)), "Minimize"),
                 (header_buttons.child(id!(pane_close_button)), "Close"),
             ]
         });
@@ -539,6 +601,10 @@ impl Widget for RoomPaneDock {
         }
         // A press on a grab handle is handled only by it, not by anything beneath it.
         if !grab_handle_pressed {
+            // The chips float over the timeline, so they get events before it.
+            for chip in &self.chips {
+                chip.button.handle_event(cx, event, scope);
+            }
             for pane in &self.panes {
                 pane.frame.handle_event(cx, event, scope);
             }
@@ -617,6 +683,8 @@ impl Widget for RoomPaneDock {
                 .any(|action| matches!(action.cast(), ButtonAction::Pressed(_)));
             let button = if hit(ids!(pane_close_button)) {
                 PaneButton::Close
+            } else if hit(ids!(pane_minimize_button)) {
+                PaneButton::Minimize
             } else if hit(ids!(pane_edge_button)) {
                 PaneButton::MoveToNextEdge
             } else if hit(ids!(pane_pop_out_button)) {
@@ -637,7 +705,17 @@ impl Widget for RoomPaneDock {
                     }
                 }
                 PaneButton::PopOut => self.pop_out(cx, &room_name_id, kind),
+                PaneButton::Minimize => self.minimize(cx, &kind),
             }
+        }
+        let chip_pressed = self.chips.iter()
+            .find(|chip| actions
+                .filter_widget_actions(chip.button.widget_uid())
+                .any(|action| matches!(action.cast(), ButtonAction::Pressed(_)))
+            )
+            .map(|chip| chip.app_id.clone());
+        if let Some(app_id) = chip_pressed {
+            self.restore(cx, app_id);
         }
     }
 
@@ -665,6 +743,7 @@ impl Widget for RoomPaneDock {
                     }
                 }
             }
+            self.draw_chips(cx);
         }
         step
     }
@@ -674,6 +753,7 @@ enum PaneButton {
     Close,
     MoveToNextEdge,
     PopOut,
+    Minimize,
 }
 
 const ALL_SIDES: [PaneSide; 4] = [PaneSide::Top, PaneSide::Bottom, PaneSide::Left, PaneSide::Right];
@@ -728,6 +808,8 @@ impl RoomPaneDock {
         self.room_name_id = None;
         self.timeline_kind = None;
         self.room_members = None;
+        self.chips.clear();
+        self.chips_revision = None;
     }
 
     /// Shows the given timeline's saved panes right away, and then slides in any pending panes.
@@ -751,19 +833,16 @@ impl RoomPaneDock {
     }
 
     /// Docks any panes waiting to be docked in our timeline,
-    /// plus any mini-apps of our room that are running without being shown anywhere.
+    /// and shows chips for any mini-apps of our room that are running without being shown anywhere.
     fn dock_pending(&mut self, cx: &mut Cx) {
         let Some(timeline_kind) = self.timeline_kind.clone() else { return };
-        let mut kinds = room_pane::take_pending(&timeline_kind);
-        if let TimelineKind::MainRoom { room_id } = &timeline_kind {
-            kinds.extend(mini_app_panes::parked_apps(room_id).into_iter().map(RoomPaneKind::MiniApp));
-        }
-        for kind in kinds {
+        for kind in room_pane::take_pending(&timeline_kind) {
             if !self.has_pane(&kind) {
                 self.create_pane(cx, kind, room_pane::last_layout(), None, None, false);
             }
         }
         self.place_panes(cx, true);
+        self.sync_chips(cx);
     }
 
     /// Opens the given kind of pane at the last-chosen layout, or closes it if it's open.
@@ -825,6 +904,85 @@ impl RoomPaneDock {
         if let Some(timeline_kind) = self.timeline_kind.clone() {
             room_pane::pop_out(cx, self.widget_uid(), room_name_id, kind, timeline_kind);
         }
+    }
+
+    /// Minimizes the given mini-app pane to a chip, which parks its app but keeps it running.
+    fn minimize(&mut self, cx: &mut Cx, kind: &RoomPaneKind) {
+        if matches!(kind, RoomPaneKind::MiniApp(_)) {
+            self.remove_pane(cx, kind, true, false);
+            self.sync_chips(cx);
+        }
+    }
+
+    /// Shows the given background mini-app in a pane again, at the last-chosen layout.
+    fn restore(&mut self, cx: &mut Cx, app_id: String) {
+        let kind = RoomPaneKind::MiniApp(app_id);
+        if !self.has_pane(&kind) && self.create_pane(cx, kind, room_pane::last_layout(), None, None, false) {
+            self.place_panes(cx, true);
+        }
+        self.sync_chips(cx);
+    }
+
+    /// Shows a chip for each of our room's mini-apps that are running without being shown anywhere.
+    fn sync_chips(&mut self, cx: &mut Cx) {
+        self.chips_revision = Some(mini_app_panes::revision());
+        let app_ids = match self.timeline_kind.as_ref() {
+            Some(TimelineKind::MainRoom { room_id }) => mini_app_panes::background_apps(room_id),
+            _ => Vec::new(),
+        };
+        if self.chips.iter().map(|chip| &chip.app_id).eq(app_ids.iter()) {
+            return;
+        }
+        let mut old_chips = std::mem::take(&mut self.chips);
+        for app_id in app_ids {
+            if let Some(index) = old_chips.iter().position(|chip| chip.app_id == app_id) {
+                self.chips.push(old_chips.swap_remove(index));
+                continue;
+            }
+            let button = widget_ref_from_live_ptr(cx, self.mini_app_chip);
+            if button.is_empty() {
+                error!("BUG: missing the mini-app chip template");
+                return;
+            }
+            let glyph = mini_app_panes::app_glyph(&app_id).unwrap_or_default();
+            let name = mini_app_panes::app_name(&app_id).unwrap_or_else(|| app_id.clone());
+            button.set_text(cx, format!("{glyph} {name}").trim());
+            cx.widget_tree_insert_child_deep(
+                self.widget_uid(),
+                LiveId::from_str(&format!("room_pane_chip_{app_id}")),
+                button.clone(),
+            );
+            self.chips.push(MiniAppChip { app_id, button });
+        }
+        self.view.redraw(cx);
+    }
+
+    /// Draws the chips of our room's background mini-apps over the top-right corner of the timeline.
+    fn draw_chips(&self, cx: &mut Cx2d) {
+        if self.chips.is_empty() {
+            return;
+        }
+        let center = self.view.widget(cx, ids!(body.mid.center)).area().rect(cx);
+        cx.begin_turtle(
+            Walk {
+                abs_pos: Some(center.pos),
+                width: Size::Fixed(center.size.x),
+                height: Size::fit(),
+                ..Walk::default()
+            },
+            Layout {
+                flow: Flow::right_wrap(),
+                align: Align { x: 1.0, y: 0.0 },
+                spacing: CHIP_SPACING,
+                wrap_spacing: CHIP_SPACING,
+                padding: Inset { top: CHIP_MARGIN, right: CHIP_RIGHT_MARGIN, bottom: 0.0, left: CHIP_MARGIN },
+                ..Layout::default()
+            },
+        );
+        for chip in &self.chips {
+            chip.button.draw_all(cx, &mut Scope::empty());
+        }
+        cx.end_turtle();
     }
 
     /// Returns the state of our panes, to be restored when our timeline is shown again.
@@ -1035,6 +1193,7 @@ impl RoomPaneDock {
             let side = self.panes[index].layout.side;
             let edge = self.edge(cx, side);
             let pane = &mut self.panes[index];
+            let buttons = header_button_ids(&pane.kind);
             let cols = if side.is_vertical() {
                 let pane_width = edge.pane_size();
                 // The icon (or text glyph) hasn't been measured before its first draw.
@@ -1044,8 +1203,8 @@ impl RoomPaneDock {
                 let title_area = |cols: usize| pane_width - FRAME_PADDING * 2.0 - icon_width - HEADER_SPACING * 2.0
                     - (HEADER_BUTTON_STEP * cols as f64 - HEADER_BUTTON_SPACING);
                 // Beside two or more rows of buttons, the title can wrap onto a second line.
-                (1..=HEADER_BUTTONS.len()).rev()
-                    .find(|&cols| title_area(cols) >= if HEADER_BUTTONS.len().div_ceil(cols) > 1 {
+                (1..=buttons.len()).rev()
+                    .find(|&cols| title_area(cols) >= if buttons.len().div_ceil(cols) > 1 {
                         pane.title_two_line_width
                     } else {
                         pane.title_width
@@ -1053,21 +1212,21 @@ impl RoomPaneDock {
                     .unwrap_or(1)
             } else {
                 // Top and bottom panes are short, so their buttons stay in one row.
-                HEADER_BUTTONS.len()
+                buttons.len()
             };
             // The panes on an edge can't be split so finely that a header's buttons don't fit.
             let min_length = if side.is_vertical() {
-                let rows = HEADER_BUTTONS.len().div_ceil(cols);
+                let rows = buttons.len().div_ceil(cols);
                 EDGE_MIN_SIZE.max(HEADER_PADDING * 2.0 + HEADER_BUTTON_STEP * rows as f64 - HEADER_BUTTON_SPACING)
             } else {
-                MIN_HEADER_WIDTH
+                min_header_width(buttons.len())
             };
             edge.set_min_length(&pane.kind, min_length);
             if cols == pane.button_cols {
                 continue;
             }
             pane.button_cols = cols;
-            for (i, id) in HEADER_BUTTONS.iter().enumerate() {
+            for (i, id) in buttons.iter().enumerate() {
                 let x = (cols - 1 - i % cols) as f64 * HEADER_BUTTON_STEP;
                 let y = (i / cols) as f64 * HEADER_BUTTON_STEP;
                 let mut button = pane.frame.widget(cx, id);

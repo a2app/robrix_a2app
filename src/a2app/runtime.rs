@@ -1229,11 +1229,17 @@ pub(super) fn app_stopped(cx: &mut Cx, app_id: &str) {
 }
 
 /// Shows the app's popped-out pane if it has one,
-/// or else docks it in its room's pane if a dock is showing that room.
+/// or else docks it in its room's pane, either now or once that room is shown.
 fn open_in_room_pane(cx: &mut Cx, app_id: MiniAppId, room_id: OwnedRoomId) {
     let key = (app_id.clone(), Some(room_id.clone()));
-    let op = if instances::surface_of(&key) == Some(Surface::Tab) { RoomPaneOp::Focus } else { RoomPaneOp::Open };
-    room_pane::request(cx, room_id, RoomPaneKind::MiniApp(app_id), op);
+    let kind = RoomPaneKind::MiniApp(app_id);
+    if instances::surface_of(&key) == Some(Surface::Tab) {
+        room_pane::request(cx, room_id, kind, RoomPaneOp::Focus);
+        return;
+    }
+    room_pane::request(cx, room_id.clone(), kind.clone(), RoomPaneOp::Open);
+    // If no dock is showing the room, a running app would otherwise only show as a chip there.
+    room_pane::dock_when_shown(cx, crate::sliding_sync::TimelineKind::MainRoom { room_id }, kind);
 }
 
 /// Invalidate queued watch events when the OS suspends the app.

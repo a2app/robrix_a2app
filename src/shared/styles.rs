@@ -53,6 +53,7 @@ script_mod! {
     mod.widgets.ICON_CARET_RIGHT      = crate_resource("self://resources/icons/caret_right.svg")
     mod.widgets.ICON_CARET_UP         = crate_resource("self://resources/icons/caret_up.svg")
     mod.widgets.ICON_CARET_DOWN       = crate_resource("self://resources/icons/caret_down.svg")
+    mod.widgets.ICON_MINIMIZE         = crate_resource("self://resources/icons/minimize.svg")
     mod.widgets.ICON_UPLOAD           = crate_resource("self://resources/icons/upload.svg")
     mod.widgets.ICON_VIEW_SOURCE      = crate_resource("self://resources/icons/view_source.svg")
     mod.widgets.ICON_WARNING          = crate_resource("self://resources/icons/warning.svg")
