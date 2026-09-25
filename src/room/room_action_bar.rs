@@ -129,9 +129,9 @@ script_mod! {
         width: Fit
         spacing: 8
         draw_bg +: {
-            color: #xEDE8FD
-            color_hover: #xE8E1FA
-            color_down: #xE1D7F7
+            color: (COLOR_BG_LAVENDER)
+            color_hover: (COLOR_BG_LAVENDER_HOVER)
+            color_down: (COLOR_BG_LAVENDER_DOWN)
         }
     }
 
@@ -235,18 +235,28 @@ script_mod! {
     }
 }
 
+/// Each button's ID, label, and the kind of room pane it shows (if any).
+///
 /// This also defines the ordering of the buttons, from right to left
 /// so that buttons don't move around when the bar's width changes.
 /// Earlier entries have priority when only some buttons fit in the header.
-const ACTIONS: &[(LiveId, &str)] = &[
+const ACTIONS: &[(LiveId, &str, Option<RoomPaneKind>)] = &[
     #[cfg(feature = "a2app")]
-    (id!(room_mini_apps_button), "Mini Apps"),
-    (id!(room_info_button), "Room info"),
-    (id!(room_settings_button), "Room settings"),
-    (id!(room_threads_button), "Threads"),
-    (id!(room_members_button), "Members"),
-    (id!(room_pinned_messages_button), "Pinned messages"),
+    (id!(room_mini_apps_button), "Mini Apps", None),
+    (id!(room_info_button), "Room info", None),
+    (id!(room_settings_button), "Room settings", None),
+    (id!(room_threads_button), "Threads", None),
+    (id!(room_members_button), "Members", Some(RoomPaneKind::Members)),
+    (id!(room_pinned_messages_button), "Pinned messages", Some(RoomPaneKind::PinnedMessages)),
 ];
+
+fn action_label(is_space: bool, id: LiveId, label: &'static str) -> &'static str {
+    if is_space {
+        if id == id!(room_info_button) { return "Space info"; }
+        if id == id!(room_settings_button) { return "Space settings"; }
+    }
+    label
+}
 
 pub fn show_room_action_placeholder(label: &'static str) {
     // TODO: implement the features for these buttons
@@ -297,6 +307,10 @@ pub struct RoomActionBar {
     #[rust] icon_tooltip: RoomActionTooltip,
     /// The room or space belonging to this bar, independent of the focused tab.
     #[rust] room_context: Option<(RoomNameId, bool)>,
+    /// The kinds of room panes that are shown, whose buttons are highlighted.
+    #[rust] shown_panes: Vec<RoomPaneKind>,
+    /// The shown panes whose buttons were last highlighted, or `None` if they must be highlighted again.
+    #[rust] highlighted_panes: Option<Vec<RoomPaneKind>>,
 }
 
 impl ScriptHook for RoomActionBar {
@@ -306,6 +320,7 @@ impl ScriptHook for RoomActionBar {
             return;
         }
         self.latest_layout = None;
+        self.highlighted_panes = None;
         // A reapply resets `expand` to its DSL default, and the animator can't be changed during an apply.
         if apply.is_reload() {
             self.expand = if self.is_expanded { 1.0 } else { 0.0 };
@@ -331,10 +346,11 @@ impl Widget for RoomActionBar {
             }
         }
         if !self.is_desktop_mode {
-            let mut buttons: Vec<_> = ACTIONS.iter().map(|(id, label)| {
-                (self.view.widget(cx, &[*id]), self.action_label(*id, label))
-            }).collect();
-            buttons.push((self.view.widget(cx, ids!(button_container.left_button)), "Back"));
+            // This is lazy, as the tooltip only looks at the buttons for the few events that can show it.
+            let is_space = self.is_space();
+            let buttons = ACTIONS.iter()
+                .map(|(id, label, _)| (self.view.child(*id), action_label(is_space, *id, label)))
+                .chain(std::iter::once_with(|| (self.view.child(id!(button_container)).child(id!(left_button)), "Back")));
             self.icon_tooltip.handle_event(cx, event, buttons, TooltipPosition::Bottom);
         }
         self.view.handle_event(cx, event, scope);
@@ -353,12 +369,12 @@ impl Widget for RoomActionBar {
             {
                 self.set_expanded(cx, !self.is_expanded, true);
             }
-            for &(id, label) in ACTIONS {
-                if !self.action_available(id) { continue; }
-                if self.view.button(cx, &[id]).clicked(actions)
-                    || self.view.button(cx, &[id!(expanded_room_actions), id]).clicked(actions)
+            for (id, label, pane_kind) in ACTIONS {
+                if !self.action_available(*id) { continue; }
+                if self.view.button(cx, &[*id]).clicked(actions)
+                    || self.view.button(cx, &[id!(expanded_room_actions), *id]).clicked(actions)
                 {
-                    if id == id!(room_mini_apps_button) {
+                    if *id == id!(room_mini_apps_button) {
                         #[cfg(feature = "a2app")]
                         if let Some((room_name_id, is_space)) = &self.room_context {
                             cx.action(crate::a2app::room_app_picker::RoomAppPickerAction::Show {
@@ -368,11 +384,10 @@ impl Widget for RoomActionBar {
                         }
                         continue;
                     }
-                    // A space lobby has no pane dock to show the Members pane in.
-                    if id == id!(room_members_button) && !self.is_space() {
-                        cx.widget_action(self.widget_uid(), RoomActionBarAction::TogglePane(RoomPaneKind::Members));
-                    } else {
-                        show_room_action_placeholder(self.action_label(id, label));
+                    match pane_kind {
+                        // A space lobby has no pane dock to show panes in.
+                        Some(kind) if !self.is_space() => cx.widget_action(self.widget_uid(), RoomActionBarAction::TogglePane(kind.clone())),
+                        _ => show_room_action_placeholder(action_label(self.is_space(), *id, label)),
                     }
                 }
             }
@@ -380,13 +395,16 @@ impl Widget for RoomActionBar {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, mut walk: Walk) -> DrawStep {
+        if self.highlighted_panes.as_ref() != Some(&self.shown_panes) {
+            self.highlight_shown_panes(cx);
+        }
         let width = (cx.peek_walk_turtle(walk).size.x - self.view.layout.padding.left - self.view.layout.padding.right).max(0.0);
         let inline = if !self.is_desktop_mode {
             let title = self.view.label(cx, ids!(title_container.title));
             let title_width = title.borrow().map(|title| {
                 utils::unwrapped_text_width(cx, &title.draw_text, &title.text()) + title.walk.margin.width()
             }).unwrap_or(width);
-            inline_count(width, title_width).min(ACTIONS.iter().filter(|(id, _)| self.action_available(*id)).count())
+            inline_count(width, title_width).min(ACTIONS.iter().filter(|(id, _, _)| self.action_available(*id)).count())
         } else {
             // in desktop view mode, the dock tabs only show the expand/collapse button.
             0
@@ -432,15 +450,38 @@ impl RoomActionBar {
             || (id != id!(room_threads_button) && id != id!(room_pinned_messages_button))
     }
 
-    fn action_label(&self, id: LiveId, label: &'static str) -> &'static str {
-        if self.is_space() {
-            if id == id!(room_info_button) { return "Space info"; }
-            if id == id!(room_settings_button) { return "Space settings"; }
+    /// Expands or collapses the full list of buttons, optionally sliding them in or out.
+    ///
+    /// Any button whose room pane is shown will be colored-in/highlighted.
+    fn highlight_shown_panes(&mut self, cx: &mut Cx) {
+        for (id, _, kind) in ACTIONS {
+            let Some(kind) = kind else { continue };
+            let mut button = self.view.widget(cx, &[*id]);
+            let mut expanded_button = self.view.widget(cx, &[id!(expanded_room_actions), *id]);
+            if self.shown_panes.contains(kind) {
+                script_apply_eval!(cx, button, { draw_bg +: {
+                    color: (mod.widgets.COLOR_BG_LAVENDER)
+                    color_hover: (mod.widgets.COLOR_BG_LAVENDER_HOVER)
+                    color_down: (mod.widgets.COLOR_BG_LAVENDER_DOWN)
+                } });
+                // The expanded buttons are always lavender, so a shown pane's button is darker.
+                script_apply_eval!(cx, expanded_button, { draw_bg +: {
+                    color: (mod.widgets.COLOR_BG_LAVENDER_DOWN)
+                    color_hover: (mod.widgets.COLOR_BG_LAVENDER_HOVER)
+                    color_down: (mod.widgets.COLOR_BG_LAVENDER_DOWN)
+                } });
+            } else {
+                script_apply_eval!(cx, button, { draw_bg +: { color: #0000, color_hover: #0001, color_down: #0002 } });
+                script_apply_eval!(cx, expanded_button, { draw_bg +: {
+                    color: (mod.widgets.COLOR_BG_LAVENDER)
+                    color_hover: (mod.widgets.COLOR_BG_LAVENDER_HOVER)
+                    color_down: (mod.widgets.COLOR_BG_LAVENDER_DOWN)
+                } });
+            }
         }
-        label
+        self.highlighted_panes = Some(self.shown_panes.clone());
     }
 
-    /// Expands or collapses the full list of buttons, optionally sliding them in or out.
     fn set_expanded(&mut self, cx: &mut Cx, expanded: bool, animate: bool) {
         self.is_expanded = expanded;
         match (animate, expanded) {
@@ -527,14 +568,14 @@ impl RoomActionBar {
         }
 
         let mut index = 0;
-        for (id, label) in ACTIONS {
+        for (id, label, _) in ACTIONS {
             let available = self.action_available(*id);
             let button = self.view.widget(cx, &[*id]);
             let in_header_row = available && !self.is_desktop_mode && index < inline;
             button.set_visible(cx, in_header_row);
             let expanded_button = expanded_room_actions.widget(cx, &[*id]);
             expanded_button.set_visible(cx, available && show_overflow);
-            expanded_button.set_text(cx, self.action_label(*id, label));
+            expanded_button.set_text(cx, action_label(self.is_space(), *id, label));
             if in_header_row {
                 let slots_after = index + 2;
                 let x = width - HEADER_BUTTON_INSET - slots_after as f64 * (BUTTON_SIZE + HEADER_BUTTON_GAP) + HEADER_BUTTON_GAP;
@@ -567,6 +608,14 @@ impl RoomActionBarRef {
         if let Some(mut inner) = self.borrow_mut() {
             inner.room_context = room.map(|room| (room.clone(), is_space));
             inner.latest_layout = None;
+        }
+    }
+
+    pub fn set_shown_panes(&self, cx: &mut Cx, shown_panes: Vec<RoomPaneKind>) {
+        let Some(mut inner) = self.borrow_mut() else { return };
+        if inner.shown_panes != shown_panes {
+            inner.shown_panes = shown_panes;
+            inner.redraw(cx);
         }
     }
 

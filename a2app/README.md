@@ -181,12 +181,11 @@ CPU or resident-memory caps, and do not eliminate timing/resource side channels.
 
 ## Makepad pin
 
-The workspace dependencies in `Cargo.toml` use `kevinaboos/makepad`'s
-`splash-host-io-dev` branch for both widgets and the code editor.
+The workspace dependencies in `Cargo.toml` use upstream `makepad/makepad`'s
+`dev` branch for both widgets and the code editor, the same as Robrix's `main`.
 `Cargo.lock` currently resolves it to
-`c129360abba69b45fd564542846074a148fe9d58`. The pin is upstream makepad `dev`
-plus the Splash host I/O boundary and isolated validation required by this
-feature. The host I/O changes are tracked in
+`fda40f5650c7eec10ff578d765d38191c2585a0d`. The Splash host I/O boundary and
+isolated validation required by this feature landed upstream in
 [Makepad PR #1243](https://github.com/makepad/makepad/pull/1243).
 Keep the workspace dependency entries and lockfile aligned when updating it.
 

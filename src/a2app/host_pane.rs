@@ -57,7 +57,7 @@ script_mod! {
                 visible: false
                 padding: Inset{top: 5, bottom: 5, left: 10, right: 10},
                 icon_walk: Walk{width: 0, height: 0, margin: 0}
-                text: "Return to room"
+                text: "Back to room"
             }
 
             close_button := RobrixIconButton {

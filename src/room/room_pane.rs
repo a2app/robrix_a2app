@@ -24,6 +24,8 @@ pub use crate::a2app_dummy::room_panes as mini_app_panes;
 pub enum RoomPaneKind {
     /// The list of the room's members.
     Members,
+    /// The list of the room's pinned messages.
+    PinnedMessages,
     /// A mini-app running in this room, by its app ID.
     /// Present in all builds so any build can read saved dock states; only shown with `a2app`.
     MiniApp(String),
@@ -34,6 +36,7 @@ impl RoomPaneKind {
     pub fn title(&self) -> Cow<'static, str> {
         match self {
             RoomPaneKind::Members => Cow::Borrowed("Members"),
+            RoomPaneKind::PinnedMessages => Cow::Borrowed("Pinned messages"),
             RoomPaneKind::MiniApp(app_id) => mini_app_panes::app_name(app_id)
                 .map_or_else(|| Cow::Owned(app_id.clone()), Cow::Owned),
         }
@@ -43,6 +46,7 @@ impl RoomPaneKind {
     pub fn as_str(&self) -> Cow<'static, str> {
         match self {
             RoomPaneKind::Members => Cow::Borrowed("members"),
+            RoomPaneKind::PinnedMessages => Cow::Borrowed("pinned_messages"),
             RoomPaneKind::MiniApp(app_id) => Cow::Owned(format!("app:{app_id}")),
         }
     }
@@ -51,7 +55,7 @@ impl RoomPaneKind {
     /// A mini-app runs once per room, so it's only docked in its room's main timeline.
     pub fn is_dockable_in(&self, timeline_kind: &TimelineKind) -> bool {
         match self {
-            RoomPaneKind::Members => true,
+            RoomPaneKind::Members | RoomPaneKind::PinnedMessages => true,
             RoomPaneKind::MiniApp(_) => matches!(timeline_kind, TimelineKind::MainRoom { .. }),
         }
     }
@@ -81,6 +85,16 @@ impl PaneSide {
     /// Whether a pane on this side spans the dock's full height.
     pub fn is_vertical(self) -> bool {
         matches!(self, PaneSide::Left | PaneSide::Right)
+    }
+
+    /// The tooltip for a pane's edge button, which moves the pane to this side.
+    pub fn move_tooltip(self) -> &'static str {
+        match self {
+            PaneSide::Top => "Move to the top",
+            PaneSide::Bottom => "Move to the bottom",
+            PaneSide::Left => "Move to the left",
+            PaneSide::Right => "Move to the right",
+        }
     }
 }
 
