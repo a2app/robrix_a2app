@@ -46,6 +46,10 @@ pub mod room_panes {
     pub fn quit_if_parked(_cx: &mut Cx, _room_id: &RoomId, _app_id: &str) {}
     pub fn background_apps(_room_id: &RoomId) -> Vec<String> { Vec::new() }
     pub fn revision() -> u64 { 0 }
+    pub fn has_restore_requests(_room_id: &RoomId) -> bool { false }
+    pub fn is_host_modal_shown() -> bool { false }
+    pub fn take_restore_requests(_room_id: &RoomId) -> Vec<String> { Vec::new() }
+    pub fn take_minimize_request(_room_id: &RoomId, _app_id: &str) -> bool { false }
     pub fn note_side(_room_id: &RoomId, _app_id: &str, _side: PaneSide) {}
     pub fn note_size(_host_area: &WidgetRef, _room_id: &RoomId, _app_id: &str) {}
     pub fn release_all_shown_by(_surface_uid: WidgetUid) {}

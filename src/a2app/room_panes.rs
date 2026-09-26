@@ -114,6 +114,33 @@ pub fn background_apps(room_id: &RoomId) -> Vec<String> {
     instances::background_apps_in_room(room_id)
 }
 
+/// Whether a hidden mini-app in the given room asked to be docked again.
+pub fn has_restore_requests(room_id: &RoomId) -> bool {
+    instances::has_restore_requests(room_id)
+}
+
+/// Whether a mini-app is shown in the full-screen host modal, which covers the rooms.
+pub fn is_host_modal_shown() -> bool {
+    instances::is_modal_shown()
+}
+
+/// Takes the hidden mini-apps in the given room that asked to be docked again
+/// and may still do so.
+pub fn take_restore_requests(room_id: &RoomId) -> Vec<String> {
+    instances::take_restore_requests(room_id)
+        .into_iter()
+        .filter(|app_id| {
+            let is_restricted = with_a2app(|state| state.permissions.is_restricted(app_id)).unwrap_or(true);
+            !is_restricted && super::runtime::grants_in_room(app_id, Some(room_id.as_str())).iter().any(|cap| cap == "ui.pane.restore")
+        })
+        .collect()
+}
+
+/// Takes whether the app asked to stay minimized while its room wasn't shown.
+pub fn take_minimize_request(room_id: &RoomId, app_id: &str) -> bool {
+    instances::take_minimize_request(&key(room_id, app_id))
+}
+
 /// Changes whenever any room's mini-apps start, stop, or are shown or parked.
 pub fn revision() -> u64 {
     instances::revision()

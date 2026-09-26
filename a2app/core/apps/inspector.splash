@@ -3,7 +3,7 @@
 // tint: #546E7A
 // description: What Robrix tells a mini-app about its pane, settings and device.
 // permissions: robrix-ui, robrix-preferences, robrix-observe, device-info
-// why-robrix-ui: Moves, pops out or closes its own pane when you tap.
+// why-robrix-ui: Moves, pops out, minimizes, restores or closes its own pane when you tap.
 // why-robrix-preferences: Shows Robrix's display settings and follows changes to them.
 // why-robrix-observe: Logs which room and screen you switch to, so you can see what an app would see.
 // why-device-info: Shows what this device reports about itself.
@@ -103,6 +103,11 @@ fn pane_call(service, args){
     })
 }
 
+fn minimize_briefly(){
+    pane_call("ui.pane.minimize", nil)
+    let _restore = start_timeout(5.0, || pane_call("ui.pane.restore", nil))
+}
+
 fn on_focus_changed(json){
     let ev = json.parse_json()
     log("focus: foreground " + yes_no(ev.foreground))
@@ -188,6 +193,8 @@ View{
                 Button{ text: "Left" on_click: || pane_call("ui.pane.set_side", {side: "left"}) draw_text +: { color: #x1C274C } }
                 Button{ text: "Right" on_click: || pane_call("ui.pane.set_side", {side: "right"}) draw_text +: { color: #x1C274C } }
                 Button{ text: "Pop out" on_click: || pane_call("ui.pane.break_out", nil) draw_text +: { color: #x1C274C } }
+                Button{ text: "Minimize" on_click: || pane_call("ui.pane.minimize", nil) draw_text +: { color: #x1C274C } }
+                Button{ text: "Minimize for 5 s" on_click: || minimize_briefly() draw_text +: { color: #x1C274C } }
                 Button{ text: "Close app" on_click: || pane_call("ui.pane.close", nil) draw_text +: { color: #xB91C1C } }
             }
         }

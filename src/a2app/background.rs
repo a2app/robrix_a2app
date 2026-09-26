@@ -390,7 +390,10 @@ pub fn complete(cx: &mut Cx, heap: usize, run_id: u64, success: bool) -> Result<
 pub fn retire_completed(cx: &mut Cx, heap: usize) {
     let Some(key) = instances::key_of_heap(heap) else { return };
     let active = with(|state| state.active.values().any(|active| active.heap == heap));
-    if !active && instances::pane_state(heap).is_some_and(|pane| !pane.foreground) { terminate_instance(cx, &key); }
+    // An app the user opened (and maybe minimized) keeps running.
+    if !active && instances::is_run_only(&key) && instances::pane_state(heap).is_some_and(|pane| !pane.foreground) {
+        terminate_instance(cx, &key);
+    }
 }
 
 /// Keep trusted host-denial instructions in memory, never app-authored output.
@@ -658,6 +661,66 @@ View{width: Fill height: Fill}
         assert!(instances::heap_of(&key).is_none(), "Pause retires the actual foreground isolate before clearing the claim");
         assert!(snapshot().unwrap()[0].job.in_flight.is_none());
         assert!(!snapshot().unwrap()[0].job.enabled);
+    }
+
+    #[test]
+    fn minimized_app_outlives_a_run_but_one_closed_during_a_run_stops_after_it() {
+        let mut fixture = Fixture::new(r#"// background: true
+fn on_background(json){
+    let run = json.parse_json().run_id
+    host.request("background.complete", {run_id: run, success: true})
+}
+View{width: Fill height: Fill}
+"#);
+        let id = fixture.enable();
+        let key = job_key(&fixture.binding).unwrap();
+        let manifest = with_a2app(|state| state.registry.get(&fixture.binding.app_id).cloned()).flatten().unwrap();
+        instances::ensure(&mut fixture.cx, &key, &manifest, &[]).unwrap();
+        makepad_widgets::splash_host::take_splash_host_requests();
+        let owner = WidgetUid(445);
+        instances::adopt(&mut fixture.cx, &key, owner, instances::Surface::Dock).unwrap();
+        instances::release(&mut fixture.cx, &key, owner);
+        run_now(&mut fixture.cx, id).unwrap();
+        super::super::runtime::process_background_test_broker(&mut fixture.cx);
+        assert!(snapshot().unwrap()[0].job.in_flight.is_none());
+        assert!(instances::heap_of(&key).is_some(), "an app the user opened keeps running after a run, even when minimized");
+
+        instances::adopt(&mut fixture.cx, &key, owner, instances::Surface::Dock).unwrap();
+        run_now(&mut fixture.cx, id).unwrap();
+        assert!(!instances::quit(&mut fixture.cx, &key), "a run keeps the app the user closed until it completes");
+        assert!(instances::heap_of(&key).is_some());
+        assert!(!instances::request_pane(&key, instances::PaneRequest::Restore), "an app the user closed can't restore itself");
+        super::super::runtime::process_background_test_broker(&mut fixture.cx);
+        assert!(instances::heap_of(&key).is_none(), "an app the user closed during a run stops after it");
+    }
+
+    #[test]
+    fn pane_requests_follow_the_latest_request_and_clear_when_shown() {
+        let mut fixture = Fixture::new("// background: true\nfn on_background(json){}\nView{width: Fill height: Fill}");
+        let room = OwnedRoomId::try_from("!pane-requests:example.org").unwrap();
+        let key = (fixture.binding.app_id.clone(), Some(room.clone()));
+        let manifest = with_a2app(|state| state.registry.get(&fixture.binding.app_id).cloned()).flatten().unwrap();
+        instances::ensure(&mut fixture.cx, &key, &manifest, &[]).unwrap();
+        let owner = WidgetUid(446);
+        instances::adopt(&mut fixture.cx, &key, owner, instances::Surface::Dock).unwrap();
+        assert!(instances::request_pane(&key, instances::PaneRequest::Restore));
+        assert!(!instances::has_restore_requests(&room), "a shown app can't queue a restore for later");
+
+        instances::note_minimizing(&key);
+        assert!(instances::request_pane(&key, instances::PaneRequest::Restore));
+        instances::release(&mut fixture.cx, &key, owner);
+        assert_eq!(instances::take_restore_requests(&room), vec![key.0.clone()], "a restore after its own minimize wins");
+        assert!(!instances::has_restore_requests(&room));
+
+        assert!(instances::request_pane(&key, instances::PaneRequest::Restore));
+        assert!(instances::request_pane(&key, instances::PaneRequest::Minimize));
+        assert!(!instances::has_restore_requests(&room), "the latest request wins");
+        assert!(instances::take_minimize_request(&key));
+
+        assert!(instances::request_pane(&key, instances::PaneRequest::Restore));
+        instances::adopt(&mut fixture.cx, &key, owner, instances::Surface::Dock).unwrap();
+        instances::release(&mut fixture.cx, &key, owner);
+        assert!(!instances::has_restore_requests(&room), "showing the app clears its request");
     }
 
     #[test]

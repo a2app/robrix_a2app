@@ -64,7 +64,8 @@ pub fn contract(id: &str) -> Option<FlowContract> {
         | "storage.file.write" | "storage.quota.read" | "timer.schedule"
         | "events.subscribe" | "events.unsubscribe" | "ui.pane.read"
         | "ui.pane.close" | "ui.pane.set_side"
-        | "ui.pane.break_out" | "notifications.post" | "notifications.clear"
+        | "ui.pane.break_out" | "ui.pane.minimize" | "ui.pane.restore"
+        | "notifications.post" | "notifications.clear"
         | "on_app_resize" | "on_permissions_changed" | "on_focus_changed"
         | "on_surface_changed" | "background.complete" | "on_background"
             => (S::None, O::Local, false, false),

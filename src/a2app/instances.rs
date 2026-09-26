@@ -58,6 +58,21 @@ struct MiniAppInstance {
     /// False after its surface died without a `Cx` to re-anchor it.
     anchored: bool,
     background_running: bool,
+    /// Whether it only lives for a background run: spawned for one, or closed by the user during one.
+    is_run_only: bool,
+    /// Whether the user closed it during a background run, so it may not restore itself.
+    was_closed_by_user: bool,
+    /// What the app last asked for its pane while nothing showed it.
+    pane_request: Option<PaneRequest>,
+}
+
+/// A request from a hidden app about its pane; the latest one wins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaneRequest {
+    /// Dock it in its room once the user is looking at that room.
+    Restore,
+    /// Keep it minimized instead of re-docking it with its room's saved panes.
+    Minimize,
 }
 
 impl MiniAppInstance {
@@ -271,6 +286,9 @@ fn ensure_mode(cx: &mut Cx, key: &InstanceKey, manifest: &MiniAppManifest, grant
             surface: None,
             anchored: true,
             background_running: false,
+            is_run_only: background,
+            was_closed_by_user: false,
+            pane_request: None,
         });
         r.note_changed();
     });
@@ -288,6 +306,9 @@ pub fn adopt(cx: &mut Cx, key: &InstanceKey, surface_uid: WidgetUid, surface: Su
         inst.shown_by = Some(surface_uid);
         inst.surface = Some(surface);
         inst.anchored = true;
+        inst.is_run_only = false;
+        inst.was_closed_by_user = false;
+        inst.pane_request = None;
         let host = inst.host.clone();
         r.note_changed();
         Some(host)
@@ -317,6 +338,7 @@ pub fn release(cx: &mut Cx, key: &InstanceKey, surface_uid: WidgetUid) {
         refresh_prompt_state(cx, key);
         let root = cx.widget_tree().root_uid();
         cx.widget_tree_insert_child_deep(root, tree_name(key), host);
+        note_hook(key, live_id!(on_surface_changed));
         note_hook(key, live_id!(on_focus_changed));
     }
 }
@@ -332,9 +354,11 @@ pub fn release_owner_no_cx(surface_uid: WidgetUid) {
                 inst.anchored = false;
                 r.needs_anchor = true;
                 r.revision = r.revision.wrapping_add(1);
-                let owed = (key.clone(), live_id!(on_focus_changed));
-                if !r.pending_hooks.contains(&owed) {
-                    r.pending_hooks.push(owed);
+                for hook in [live_id!(on_surface_changed), live_id!(on_focus_changed)] {
+                    let owed = (key.clone(), hook);
+                    if !r.pending_hooks.contains(&owed) {
+                        r.pending_hooks.push(owed);
+                    }
                 }
             }
         }
@@ -455,9 +479,86 @@ pub fn is_docked(app_id: &str) -> bool {
 pub fn quit(cx: &mut Cx, key: &InstanceKey) -> bool {
     if super::background::retains_instance(key) {
         if let Some(owner) = shown_by(key) { release(cx, key, owner); }
+        // The user closed it, so it stops once its run completes.
+        with_registry(|r| if let Some(inst) = r.instances.get_mut(key) {
+            inst.is_run_only = true;
+            inst.was_closed_by_user = true;
+            inst.pane_request = None;
+        });
         return false;
     }
     terminate(cx, key)
+}
+
+/// Whether the instance only lives for a background run, so it stops when that run completes.
+pub fn is_run_only(key: &InstanceKey) -> bool {
+    with_registry(|r| r.instances.get(key).is_some_and(|inst| inst.is_run_only))
+}
+
+/// Records a hidden app's request for its pane, or a shown app changing its mind about minimizing.
+/// Returns false if the user closed the app, so it may not restore itself.
+pub fn request_pane(key: &InstanceKey, request: PaneRequest) -> bool {
+    let is_allowed = with_registry(|r| {
+        let Some(inst) = r.instances.get_mut(key) else { return true };
+        if inst.was_closed_by_user {
+            return false;
+        }
+        if inst.shown_by.is_none() || inst.pane_request == Some(PaneRequest::Minimize) {
+            inst.pane_request = Some(request);
+        }
+        true
+    });
+    SignalToUI::set_ui_signal();
+    is_allowed
+}
+
+/// Notes that a docked app asked to minimize itself, which its dock does later.
+pub fn note_minimizing(key: &InstanceKey) {
+    with_registry(|r| if let Some(inst) = r.instances.get_mut(key) {
+        inst.pane_request = Some(PaneRequest::Minimize);
+    });
+}
+
+/// Whether a hidden app in `room` asked to be docked again.
+pub fn has_restore_requests(room: &RoomId) -> bool {
+    with_registry(|r| r.instances.iter().any(|((_, inst_room), inst)|
+        inst_room.as_deref() == Some(room) && inst.shown_by.is_none() && inst.pane_request == Some(PaneRequest::Restore)
+    ))
+}
+
+/// Whether an app is shown in the full-screen host modal, which covers the rooms.
+pub fn is_modal_shown() -> bool {
+    with_registry(|r| r.instances.values().any(|inst| inst.surface == Some(Surface::Modal)))
+}
+
+/// Takes the apps in `room` that asked to be docked again while nothing showed them.
+pub fn take_restore_requests(room: &RoomId) -> Vec<MiniAppId> {
+    with_registry(|r| {
+        let mut apps = Vec::new();
+        for ((app, inst_room), inst) in r.instances.iter_mut() {
+            if inst_room.as_deref() == Some(room)
+                && inst.shown_by.is_none()
+                && inst.pane_request == Some(PaneRequest::Restore)
+            {
+                inst.pane_request = None;
+                apps.push(app.clone());
+            }
+        }
+        apps.sort();
+        apps
+    })
+}
+
+/// Takes whether the app asked to stay minimized while nothing showed it.
+pub fn take_minimize_request(key: &InstanceKey) -> bool {
+    with_registry(|r| {
+        let Some(inst) = r.instances.get_mut(key) else { return false };
+        let was_requested = inst.pane_request == Some(PaneRequest::Minimize);
+        if was_requested {
+            inst.pane_request = None;
+        }
+        was_requested
+    })
 }
 
 /// Unconditionally retire this activation, including references held by a UI.

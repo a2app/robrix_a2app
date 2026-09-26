@@ -434,6 +434,8 @@ pub enum HostAction {
     ClosePane,
     SetSide { side: PaneSide },
     BreakOut,
+    Minimize,
+    Restore,
 }
 
 
@@ -933,10 +935,12 @@ impl Broker {
                 Some(pane) => respond(cx, reply, Ok(&pane.to_json().to_string())),
                 None => respond(cx, reply, Err("this instance has no pane")),
             },
-            "ui.pane.close" | "ui.pane.set_side" | "ui.pane.break_out" => {
+            "ui.pane.close" | "ui.pane.set_side" | "ui.pane.break_out" | "ui.pane.minimize" | "ui.pane.restore" => {
                 let action = match req.service.as_str() {
                     "ui.pane.close" => Ok(HostAction::ClosePane),
                     "ui.pane.break_out" => Ok(HostAction::BreakOut),
+                    "ui.pane.minimize" => Ok(HostAction::Minimize),
+                    "ui.pane.restore" => Ok(HostAction::Restore),
                     _ => args["side"].as_str().and_then(PaneSide::from_str)
                         .map(|side| HostAction::SetSide { side })
                         .ok_or("ui.pane.set_side needs {side: top | bottom | left | right}"),

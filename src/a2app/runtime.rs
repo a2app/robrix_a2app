@@ -2574,7 +2574,7 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
             // Queued composer actions retain their requester until the room
             // checks its live authority. Other modal departures quit now.
             let queued_composer = matches!(action, HostAction::ComposerInsert { .. } | HostAction::ComposerReplyTo { .. });
-            let leaves_modal = !matches!(action, HostAction::OpenApp { .. })
+            let leaves_modal = !matches!(action, HostAction::OpenApp { .. } | HostAction::Minimize | HostAction::Restore)
                 && host_pane(cx, ui).active().is_some_and(|key| {
                     key.0 == app_id && instances::heap_of(&key) == Some(reply.heap_key)
                 });
@@ -3044,9 +3044,37 @@ fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, heap: usize, action: HostAct
             let room_id = room_of(room)?;
             queue_composer_action(cx, heap, room_id, RoomAction::ReplyTo(event_of(&event_id)?), "host.composer.reply_to")?;
         }
-        HostAction::ClosePane | HostAction::SetSide { .. } | HostAction::BreakOut => {
+        HostAction::ClosePane | HostAction::SetSide { .. } | HostAction::BreakOut
+        | HostAction::Minimize | HostAction::Restore => {
             let key = instances::key_of_heap(heap).ok_or("this instance has no pane")?;
             let op = match (&action, instances::surface_of(&key)) {
+                // Already minimized, or its room isn't shown: it stays minimized when that room is shown again.
+                (HostAction::Minimize, None) if key.1.is_some() => {
+                    instances::request_pane(&key, instances::PaneRequest::Minimize);
+                    return Ok(());
+                }
+                (HostAction::Minimize, Some(Surface::Dock)) => {
+                    instances::note_minimizing(&key);
+                    RoomPaneOp::Minimize
+                }
+                // Already on screen, unless it's about to be minimized.
+                (HostAction::Restore, Some(_)) => {
+                    instances::request_pane(&key, instances::PaneRequest::Restore);
+                    return Ok(());
+                }
+                (HostAction::Restore, None) => {
+                    let is_joined_room = key.1.as_ref().is_some_and(|room_id| crate::sliding_sync::get_client()
+                        .and_then(|client| client.get_room(room_id))
+                        .is_some_and(|room| !room.is_space() && room.state() == RoomState::Joined));
+                    if !is_joined_room {
+                        return Err(String::from("only an app in a joined room can restore its pane"));
+                    }
+                    // The room's screen docks it once the user is looking at that room.
+                    if !instances::request_pane(&key, instances::PaneRequest::Restore) {
+                        return Err(String::from("the user closed this app"));
+                    }
+                    return Ok(());
+                }
                 // The caller closes the modal once this answers.
                 (HostAction::ClosePane, Some(Surface::Modal)) => return Ok(()),
                 (HostAction::ClosePane, None) => {

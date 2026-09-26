@@ -38,13 +38,14 @@ use crate::{
     sliding_sync::{BackwardsPaginateUntilEventRequest, MatrixRequest, PaginationDirection, TimelineEndpoints, TimelineKind, TimelineRequestSender, UserPowerLevels, submit_async_request, take_timeline_endpoints, TimelineEndpointsRecreated}, utils::{self, MEDIA_THUMBNAIL_FORMAT, RoomNameId, unix_time_millis_to_datetime}
 };
 use crate::home::event_reaction_list::ReactionListWidgetRefExt;
+use crate::home::navigation_tab_bar::SelectedTab;
 use crate::home::room_read_receipt::AvatarRowWidgetRefExt;
 use crate::room::{
     pane_dock::{RoomPaneDockAction, RoomPaneDockWidgetExt, RoomPaneDockWidgetRefExt, SavedRoomPane},
     pinned_messages_list::{PinnedMessagesListAction, confirm_unpin_message},
     room_action_bar::{RoomActionBarAction, RoomActionBarWidgetExt},
     room_members_list::{RoomMembersChanged, RoomMembersListAction, show_member_profile},
-    room_pane::RoomPaneKind,
+    room_pane::{RoomPaneKind, mini_app_panes},
 };
 use crate::home::failed_send_banner::{BlockedSend, FailedSendBannerWidgetExt};
 use crate::home::send_status_indicator::{SendStatusIndicatorAction, SendStatusIndicatorRef, SendStatusIndicatorWidgetExt};
@@ -1109,6 +1110,20 @@ impl Widget for RoomScreen {
         // Skip event handling if this RoomScreen is uninitialized (a background dock tab after dock restore).
         if self.tl_state.is_none() && self.room_name_id.is_none() {
             return;
+        }
+
+        // A hidden mini-app may ask to be docked again, but only in the room the user is looking at.
+        if self.room_id().is_some_and(|room_id| mini_app_panes::has_restore_requests(room_id))
+            && !mini_app_panes::is_host_modal_shown()
+            && _scope.data.get::<crate::app::AppState>().is_some_and(|app_state| {
+                matches!(app_state.selected_tab, SelectedTab::Home | SelectedTab::Space { .. })
+                    && matches!(
+                        &app_state.selected_room,
+                        Some(SelectedRoom::JoinedRoom { room_name_id }) if self.room_id() == Some(room_name_id.room_id())
+                    )
+            })
+        {
+            self.view.room_pane_dock(cx, ids!(room_pane_dock)).dock_restore_requests(cx);
         }
 
         let room_screen_widget_uid = self.widget_uid();

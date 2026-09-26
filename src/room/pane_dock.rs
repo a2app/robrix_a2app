@@ -826,6 +826,12 @@ impl RoomPaneDock {
         self.timeline_kind = Some(timeline_kind);
         self.room_members = room_members.map(Ok);
         for saved in saved_panes {
+            // A mini-app that minimized itself while hidden stays minimized.
+            if let RoomPaneKind::MiniApp(app_id) = &saved.kind
+                && mini_app_panes::take_minimize_request(room_name_id.room_id(), app_id)
+            {
+                continue;
+            }
             self.create_pane(cx, saved.kind, saved.layout, saved.weight, Some(saved.content), false);
         }
         self.place_panes(cx, false);
@@ -873,6 +879,7 @@ impl RoomPaneDock {
                     self.pop_out(cx, room_name_id, kind.clone());
                 }
             }
+            RoomPaneOp::Minimize => self.minimize(cx, kind),
             RoomPaneOp::Focus => {}
         }
     }
@@ -903,6 +910,22 @@ impl RoomPaneDock {
         self.remove_pane(cx, &kind, true, false);
         if let Some(timeline_kind) = self.timeline_kind.clone() {
             room_pane::pop_out(cx, self.widget_uid(), room_name_id, kind, timeline_kind);
+        }
+    }
+
+    /// Docks our room's hidden mini-apps that asked to be docked again.
+    /// Only call this while the user is looking at our room.
+    fn dock_restore_requests(&mut self, cx: &mut Cx) {
+        let Some(TimelineKind::MainRoom { room_id }) = self.timeline_kind.clone() else { return };
+        let mut is_docked = false;
+        for app_id in mini_app_panes::take_restore_requests(&room_id) {
+            let kind = RoomPaneKind::MiniApp(app_id);
+            is_docked |= !self.has_pane(&kind)
+                && self.create_pane(cx, kind, room_pane::last_layout(), None, None, false);
+        }
+        if is_docked {
+            self.place_panes(cx, true);
+            self.sync_chips(cx);
         }
     }
 
@@ -1295,6 +1318,13 @@ impl RoomPaneDockRef {
     pub fn toggle(&self, cx: &mut Cx, kind: RoomPaneKind) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.toggle(cx, kind);
+        }
+    }
+
+    /// See [`RoomPaneDock::dock_restore_requests()`].
+    pub fn dock_restore_requests(&self, cx: &mut Cx) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.dock_restore_requests(cx);
         }
     }
 }

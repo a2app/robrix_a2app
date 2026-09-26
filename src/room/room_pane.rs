@@ -154,6 +154,8 @@ pub enum RoomPaneOp {
     MoveTo(PaneSide),
     /// Pops the docked pane out, like its pop-out button.
     PopOut,
+    /// Minimizes the docked pane to a chip, like its minimize button.
+    Minimize,
     /// Shows the popped-out pane's tab.
     Focus,
 }

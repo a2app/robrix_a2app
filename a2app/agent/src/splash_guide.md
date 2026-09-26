@@ -319,7 +319,7 @@ and scope (this room, account, device, app-local). Available today:
 | matrix-room-watch | `on_room_message`, `on_room_message_changed`, `on_room_reaction`, `on_room_typing`, `on_room_receipt`, `on_room_members_changed` (Robrix→app hooks) | read · this room |
 | matrix-room-info | `on_room_pins_changed`, `on_room_info_changed`, `on_room_unread_changed` (Robrix→app hooks) | read · this room |
 | matrix-rooms-list | `on_rooms_changed`, `on_invite_received`, `on_unread_totals_changed` (Robrix→app hooks) | read · many rooms |
-| robrix-ui | `ui.pane.set_side`, `ui.pane.break_out` | act · this pane |
+| robrix-ui | `ui.pane.set_side`, `ui.pane.break_out`, `ui.pane.minimize`, `ui.pane.restore` | act · this pane |
 | robrix-preferences | `host.prefs.read`, `on_prefs_changed` (Robrix→app hook) | read · account |
 | robrix-observe | `on_active_room_changed`, `on_navigation_changed` (Robrix→app hooks) | read · many rooms · high risk |
 | device-info | `device.info.read` | read · device |
@@ -882,7 +882,8 @@ Every app can read where it is and quit itself; nothing to declare:
 - `"env"` -> `{app_id, room_attached, room_id, room_name, instance_tag,
   surface, platform, view_mode}`. Show `room_name` to people, never the id. `surface` is `"dock"` (a pane on a room), `"tab"`
   (popped out into its own tab, or its own view on mobile), `"modal"`
-  (the full-screen host) or `"parked"`;
+  (the full-screen host) or `"parked"` (not shown anywhere: minimized, running
+  unseen like a background task, or its room isn't shown);
   `platform` is `macos | ios | android | windows | linux | other`;
   `view_mode` is `"desktop"` or `"mobile"`.
 - `"ui.pane.read"` -> `{surface, side, foreground, width, height}`; `side`
@@ -895,8 +896,9 @@ Every app can read where it is and quit itself; nothing to declare:
   `fn on_focus_changed(json)` with `{foreground: bool}`, true while the
   user can see the pane (docked, popped out, or in the modal);
   `fn on_surface_changed(json)` with `{surface, side}` after a dock,
-  pop-out, return or side change. Pause timers and polling while
-  not foreground.
+  pop-out, return, side change, or park (minimized or hidden). Pause timers
+  and polling while not foreground, unless you're watching for something to
+  restore yourself for; prefer room hooks to polling.
 
 Needs `robrix-ui` (prompts on first use), only while docked in a room, and
 only from a tap:
@@ -904,6 +906,25 @@ only from a tap:
 - `"ui.pane.set_side"` `{side}`: `"top" | "bottom" | "left" | "right"`.
 - `"ui.pane.break_out"` `{}`: pops out into its own tab (desktop) or view
   (mobile), same as its pop-out button.
+
+Needs `robrix-ui`, from a tap or once you've finished showing what the user
+asked for, never on load:
+
+- `"ui.pane.minimize"` `{}`: collapses into a chip over the room's
+  timeline, same as its minimize button. The app keeps running but isn't
+  foreground; the user can click its chip to dock it again.
+
+Also needs `robrix-ui`, but it's called while the app is hidden, so it can't
+prompt: ask ahead with `permissions.request {perm: "robrix-ui"}` from a tap
+(e.g., a "Show me new matches" toggle), and check `r.is_ok`.
+
+- `"ui.pane.restore"` `{}`: docks the app in its room again while it's
+  minimized or running unseen (e.g., in a background task), to show
+  something new. Robrix docks it as soon as the user is looking at that
+  room (right away if they already are); it never switches rooms or tabs,
+  and does nothing if the app is already on screen. Only for apps in a
+  joined room, and refused if the user closed the app during a background
+  run. Only restore for something the user will want to see.
 
 Needs `robrix-preferences` (prompts on first use):
 
@@ -963,8 +984,11 @@ After ALL async callbacks, effects and checkpoints finish, call
 or `success: false` on failure. A run has a two-minute deadline; missing
 completion pauses the task and stops the old instance. Never acknowledge early
 or start independent repeating timers for scheduled work. Keep background work
-independent of `ui.*` until the app has been drawn; save status and display it
-when `on_app_resize` initializes the UI.
+independent of your widgets (`ui.<name>`) until the app has been drawn; save
+status and display it when `on_app_resize` initializes the UI. To show a result,
+a room task may call `ui.pane.restore` and then `background.complete` from that
+request's reply: if the user is looking at its room, the app is docked there and
+stays open; otherwise it stops as usual after the run, so also `notify.post`.
 
 Tasks run while Robrix is open and signed in, not as OS wakeup alarms. Missed
 intervals coalesce, alarms finish once, and uncertain interrupted alarms require

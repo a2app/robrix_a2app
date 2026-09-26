@@ -254,7 +254,7 @@ impl RoomPaneScreen {
             RoomPaneOp::Focus => {
                 cx.widget_action(self.widget_uid(), RoomsListAction::Selected(SelectedRoom::RoomPane { room_name_id, kind }));
             }
-            RoomPaneOp::Open | RoomPaneOp::MoveTo(_) | RoomPaneOp::PopOut => {}
+            RoomPaneOp::Open | RoomPaneOp::MoveTo(_) | RoomPaneOp::PopOut | RoomPaneOp::Minimize => {}
         }
     }
 

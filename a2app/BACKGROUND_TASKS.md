@@ -4,7 +4,8 @@ Mini Apps > Background tasks saves an explicitly enabled task for an installed
 mini-app and one account, room, or space. A run reuses an existing
 foreground instance when available, otherwise it restores an isolate from that
 context's private storage. Hidden workers are retired after their run; the next
-trigger restores their saved files. Pause, Remove,
+trigger restores their saved files. An app the user opened keeps running after a
+run, even if it's minimized; one the user closed during a run stops after it. Pause, Remove,
 and Force Stop end its background work; Force Stop disables that app's tasks in
 the current account.
 
@@ -119,6 +120,11 @@ The service cannot create, enable, reschedule, or grant authority to a task.
 Completion is cooperative: do not acknowledge while callbacks are still working.
 Every service call still undergoes the ordinary permission and IFC checks.
 
-A task may run before its app is ever drawn. Keep its work independent of `ui.*`;
-store status in script state and render it when the foreground UI is initialized.
+A task may run before its app is ever drawn. Keep its work independent of its
+widgets (`ui.<name>`); store status in script state and render it when the
+foreground UI is initialized. A room task with something to show may call
+`ui.pane.restore` (needs `robrix-ui` already allowed), then call
+`background.complete` from that request's reply. If the user is looking at the
+task's room, the app is docked there and stays open after the run; otherwise
+it's retired as usual, so also post a notification.
 Use host scheduling instead of a perpetual `start_interval` for task triggers.
