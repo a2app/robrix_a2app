@@ -51,15 +51,29 @@ cargo run --features a2app
 - **Room protection is above app permissions**: the Mini Apps screen has
   separate read/write defaults and room/space allow/block lists. Writes are
   blocked by default; a block always wins over an allowance.
-- **Version history**: every AI change, hand edit (there is a source editor),
-  and version switch is kept; switch back and forth freely, diff any version
-  against the current source, and reset a built-in to stock.
+- **History and provenance**: each app records where it came from (built-in,
+  generated, copied, clipboard, file or room attachment), the account that
+  changed or imported it, AI changes, hand edits and restores. Revisit or diff
+  archived versions and reset a built-in to stock. Earlier records without
+  an author are labeled as such; authors in shared histories are unverified
+  claims supplied with the app. Import entries retain the full file path or
+  room, message and attachment identifiers, sender and sharing time when
+  available. Dates show the year, seconds and UTC offset. New records also
+  retain the Robrix version and revision when known.
+- **Updated built-ins**: when Robrix ships a new default, an unchanged app
+  adopts it automatically. Customized apps keep the version you are using;
+  the new default is added to their history and a **NEW** badge appears in
+  Mini Apps. Open the app's settings to view or compare the update and choose
+  **Use updated default**. Your customized version remains in history.
 - **Sharing**: export any app as a `.splashapp` bundle (file + clipboard),
   hand it to another app through the system share sheet, send it into a room
   as a file attachment with a pre-filled caption ("Send to room…"), or post
   it with `/miniapp share <name>`, where it renders as a card other Robrix
-  users can install and run. "Open in room…" docks an app into any room you
-  pick, straight from the Mini Apps screen.
+  users can install and run. Bundles include the recorded provenance and
+  archived sources, so importing keeps the app's history and adds a local
+  import entry. Mini-app file attachments also offer **Add to my mini-apps**;
+  after importing, compatible apps offer **Run in this room**. "Open in room…"
+  docks an app into any room you pick, straight from the Mini Apps screen.
 - Built-in apps: **Public Web** (a fixed public example.com fetch),
   **Room Peek** (room info + recent messages + send),
   **Roll Call** (dice roller that can post its roll), **Room Info**,

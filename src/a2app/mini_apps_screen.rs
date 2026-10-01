@@ -75,12 +75,29 @@ script_mod! {
             width: Fill, height: Fit
             flow: Down
             spacing: 2
-            row_name := Label {
+            View {
                 width: Fill, height: Fit
-                padding: 0, margin: 0
-                draw_text +: {
-                    text_style: theme.font_bold {font_size: 12},
-                    color: (COLOR_TEXT)
+                flow: Flow.Right{wrap: true}
+                spacing: 6
+                align: Align{y: 0.5}
+                row_name := Label {
+                    width: Fill{min: 80}, height: Fit
+                    flow: Flow.Right{wrap: true}
+                    padding: 0, margin: 0
+                    draw_text +: {
+                        text_style: theme.font_bold {font_size: 12},
+                        color: (COLOR_TEXT)
+                    }
+                }
+                row_update_badge := Label {
+                    visible: false
+                    width: Fit, height: Fit
+                    padding: Inset{top: 2, bottom: 2, left: 4, right: 4}, margin: 0
+                    draw_text +: {
+                        text_style: theme.font_bold {font_size: 9},
+                        color: (COLOR_ACTIVE_PRIMARY)
+                    }
+                    text: "NEW"
                 }
             }
             row_detail := Label {
@@ -109,6 +126,39 @@ script_mod! {
         }
         row_settings_button := mod.widgets.MiniAppGhostButton {
             draw_icon +: { svg: (ICON_SETTINGS) }
+        }
+    }
+
+    mod.widgets.MiniAppBuiltinUpdateNotice = RoundedView {
+        width: Fill, height: Fit
+        flow: Down, spacing: 8, padding: 12
+        show_bg: true
+        draw_bg +: { color: (COLOR_BG_PREVIEW), border_radius: 6.0 }
+        Label {
+            width: Fill, height: Fit
+            flow: Flow.Right{wrap: true}
+            padding: 0, margin: 0
+            draw_text +: { text_style: theme.font_bold {font_size: 12}, color: (COLOR_TEXT) }
+            text: "Updated default available"
+        }
+        mod.widgets.PermissionOptionLabel {
+            text: "Robrix includes a newer default for this app. Your customized version is still in use. You can review the changes or use the updated default; your current version stays in history."
+        }
+        View {
+            width: Fill, height: Fit
+            flow: Flow.Right{wrap: true}, spacing: 8
+            info_use_updated_default := RobrixIconButton {
+                padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                text: "Use updated default"
+            }
+            info_view_updated_default := RobrixNeutralIconButton {
+                padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                text: "View default"
+            }
+            info_diff_updated_default := RobrixNeutralIconButton {
+                padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                text: "Compare changes"
+            }
         }
     }
 
@@ -237,14 +287,56 @@ script_mod! {
             spacing: 1
             version_label := Label {
                 width: Fill, height: Fit
+                flow: Flow.Right{wrap: true}
                 padding: 0, margin: 0
                 draw_text +: {
                     text_style: REGULAR_TEXT {font_size: 10.5},
                     color: (COLOR_TEXT)
                 }
             }
+            version_actor := Label {
+                width: Fill, height: Fit
+                flow: Flow.Right{wrap: true}
+                padding: 0, margin: 0
+                draw_text +: {
+                    text_style: REGULAR_TEXT {font_size: 9.5},
+                    color: (MESSAGE_TEXT_COLOR)
+                }
+            }
+            version_source := Label {
+                visible: false
+                width: Fill, height: Fit
+                flow: Flow.Right{wrap: true}
+                padding: 0, margin: 0
+                draw_text +: {
+                    text_style: REGULAR_TEXT {font_size: 9.5},
+                    color: (MESSAGE_TEXT_COLOR)
+                }
+            }
+            version_host := Label {
+                visible: false
+                width: Fill, height: Fit
+                flow: Flow.Right{wrap: true}
+                padding: 0, margin: 0
+                draw_text +: {
+                    text_style: REGULAR_TEXT {font_size: 9.5},
+                    color: (MESSAGE_TEXT_COLOR)
+                }
+            }
+            version_shared_history := Label {
+                visible: false
+                width: Fill, height: Fit
+                flow: Flow.Right{wrap: true}
+                padding: 0, margin: 0
+                draw_text +: {
+                    text_style: REGULAR_TEXT {font_size: 9.5},
+                    color: (MESSAGE_TEXT_COLOR)
+                }
+                text: "Shared history · authors are unverified"
+            }
             version_note := Label {
                 width: Fill, height: Fit
+                flow: Flow.Right{wrap: true}
                 padding: 0, margin: 0
                 draw_text +: {
                     text_style: REGULAR_TEXT {font_size: 9.5},
@@ -692,6 +784,10 @@ script_mod! {
                 }
             }
 
+            info_builtin_update := mod.widgets.MiniAppBuiltinUpdateNotice {
+                visible: false
+            }
+
             restricted_banner := RoundedView {
                 visible: false,
                 width: Fill, height: Fit
@@ -909,7 +1005,17 @@ script_mod! {
                 }
             }
 
-            SubsectionLabel { text: "Version history" }
+            SubsectionLabel { text: "History and provenance" }
+            Label {
+                width: Fill, height: Fit
+                flow: Flow.Right{wrap: true}
+                padding: 0, margin: Inset{left: 6}
+                draw_text +: {
+                    text_style: REGULAR_TEXT {font_size: 10.5},
+                    color: (MESSAGE_TEXT_COLOR)
+                }
+                text: "Where this app came from, who changed it, and the source for each version. Shared histories are supplied by the sender."
+            }
             no_versions_label := Label {
                 visible: false,
                 width: Fill, height: Fit
@@ -918,7 +1024,7 @@ script_mod! {
                     text_style: REGULAR_TEXT {font_size: 10.5},
                     color: (MESSAGE_TEXT_COLOR)
                 }
-                text: "No versions yet. Every AI change, hand edit, and switch is kept here, so you can move between them freely."
+                text: "No recorded history yet. New apps, imports, edits and restores are kept here so you can revisit each version."
             }
             versions_list := FlatList {
                 width: Fill, height: Fit
@@ -1411,6 +1517,7 @@ pub(super) struct MiniAppRowData {
     /// Where it runs, plus running / stopped.
     detail: String,
     summary: String,
+    has_update: bool,
     tint: u32,
     pub(super) open_label: &'static str,
 }
@@ -1423,6 +1530,7 @@ impl MiniAppRow {
         self.view.label(cx, ids!(row_detail)).set_text(cx, &row.detail);
         self.view.label(cx, ids!(row_summary)).set_text(cx, &row.summary);
         self.view.widget(cx, ids!(row_summary)).set_visible(cx, !row.summary.is_empty());
+        self.view.widget(cx, ids!(row_update_badge)).set_visible(cx, row.has_update);
         self.view.button(cx, ids!(row_open_button)).set_text(cx, row.open_label);
         // The tile is the app's tint at a pastel strength.
         let tint = row.tint;
@@ -1459,6 +1567,7 @@ pub(super) fn mini_app_rows(
                 name: m.name.clone(),
                 detail,
                 summary: m.description.clone(),
+                has_update: m.builtin && state.persisted.builtin_updates.contains_key(&m.id),
                 tint: m.tint,
                 open_label: run_label(&m.scope, m.runs_in()),
             }
@@ -1625,12 +1734,24 @@ impl MiniAppVersionRow {
     fn populate(&mut self, cx: &mut Cx, app_id: &str, version: &AppVersion, current: bool) {
         self.app_id = app_id.to_string();
         self.stamp = version.stamp.clone();
-        let when = a2app_core::versions::label_for(
-            version.at_unix,
-            crate::a2app::runtime::utc_offset_secs(),
-        );
+        let when = version_date_label(version);
         self.view.label(cx, ids!(version_label))
             .set_text(cx, &format!("{when} · {}", version.origin.label()));
+        let actor = match &version.actor {
+            Some(actor) => format!("By {}", actor.label()),
+            None if version.origin == a2app_core::versions::VersionOrigin::Stock && !version.imported => "Provided with Robrix".to_string(),
+            None => "Author not recorded".to_string(),
+        };
+        self.view.label(cx, ids!(version_actor)).set_text(cx, &actor);
+        let source = self.view.label(cx, ids!(version_source));
+        source.set_visible(cx, version.acquired_from.is_some());
+        source.set_text(cx, &version.acquired_from.as_ref().map(provenance_source_label).unwrap_or_default());
+        let mut host = Vec::new();
+        if let Some(version) = &version.host_version { host.push(format!("Robrix version: {version}")); }
+        if let Some(revision) = &version.host_revision { host.push(format!("Robrix revision: {revision}")); }
+        self.view.widget(cx, ids!(version_host)).set_visible(cx, !host.is_empty());
+        self.view.label(cx, ids!(version_host)).set_text(cx, &host.join("\n"));
+        self.view.widget(cx, ids!(version_shared_history)).set_visible(cx, version.imported);
         // The note repeats the origin for stock and hand edits; skip it then.
         let note = self.view.label(cx, ids!(version_note));
         note.set_visible(cx, !version.note.is_empty() && version.note != version.origin.label());
@@ -1638,6 +1759,34 @@ impl MiniAppVersionRow {
         self.view.widget(cx, ids!(version_current)).set_visible(cx, current);
         self.view.widget(cx, ids!(version_use_button)).set_visible(cx, !current);
         self.view.widget(cx, ids!(version_diff_button)).set_visible(cx, !current);
+    }
+}
+
+fn version_date_label(version: &AppVersion) -> String {
+    provenance_date_label(version.at_unix)
+}
+
+fn provenance_date_label(at_unix: u64) -> String {
+    if at_unix == 0 { return "Date not recorded".to_string(); }
+    i64::try_from(at_unix).ok()
+        .and_then(|at| chrono::DateTime::from_timestamp(at, 0))
+        .map(|time| time.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S UTC%:z").to_string())
+        .unwrap_or_else(|| "Date not recorded".to_string())
+}
+
+fn provenance_source_label(source: &a2app_core::versions::AcquisitionSource) -> String {
+    use a2app_core::versions::AcquisitionSource;
+    match source {
+        AcquisitionSource::File { file_name, path: Some(path) } => format!("File: {file_name}\nPath: {path}"),
+        AcquisitionSource::RoomAttachment { room_id, event_id, media_uri, shared_at_unix, file_name, sender } => {
+            let mut lines = vec![format!("Room attachment: {file_name}"), format!("Room: {room_id}")];
+            if let Some(sender) = sender { lines.push(format!("Shared by {}", sender.label())); }
+            if let Some(at) = shared_at_unix { lines.push(format!("Shared on: {}", provenance_date_label(*at))); }
+            if let Some(id) = event_id { lines.push(format!("Message: {id}")); }
+            if let Some(uri) = media_uri { lines.push(format!("Attachment: {uri}")); }
+            lines.join("\n")
+        }
+        _ => source.label(),
     }
 }
 
@@ -1744,8 +1893,10 @@ pub struct MiniAppsScreen {
     /// or the runtime says they changed.
     #[rust] versions: Vec<AppVersion>,
     #[rust] current_stamp: Option<String>,
-    /// A built-in whose working copy differs from its stock source.
+    /// A built-in whose source or portable metadata differs from its shipped default.
     #[rust] reset_available: bool,
+    /// The newer shipped default offered while the user keeps their custom version.
+    #[rust] pending_stock_stamp: Option<String>,
     /// What the diff pane shows.
     #[rust] diff_lines: Vec<DiffLine>,
     /// The provider awaiting a pasted key, if any.
@@ -2047,6 +2198,17 @@ impl Widget for MiniAppsScreen {
             self.go_back(cx);
         }
         if let Some(app_id) = self.info_app.clone() {
+            if let Some(stamp) = self.pending_stock_stamp.clone() {
+                if self.view.button(cx, ids!(info_use_updated_default)).clicked(actions) {
+                    cx.action(A2AppOp::SwitchVersion { app_id: app_id.clone(), stamp: stamp.clone() });
+                }
+                if self.view.button(cx, ids!(info_view_updated_default)).clicked(actions) {
+                    self.show_version_source(cx, &stamp);
+                }
+                if self.view.button(cx, ids!(info_diff_updated_default)).clicked(actions) {
+                    self.show_diff(cx, &stamp);
+                }
+            }
             if self.view.button(cx, ids!(info_open_button)).clicked(actions) {
                 self.open_app(cx, app_id.clone());
             }
@@ -2275,6 +2437,7 @@ impl MiniAppsScreen {
             self.show_abilities = false;
             self.view.button(cx, ids!(ability_details)).set_text(cx, "Show individual abilities");
         }
+        crate::a2app::runtime::ensure_app_history(&app_id);
         self.info_app = Some(app_id);
         self.refresh_info(cx);
         self.set_pane(cx, Pane::Info);
@@ -2285,12 +2448,18 @@ impl MiniAppsScreen {
         let Some(app_id) = self.info_app.clone() else { return };
         self.versions = persistence::list_versions(&app_id);
         self.versions.reverse();
-        let (current, builtin, source) = with_a2app(|state| {
-            state.registry.get(&app_id).map(|m| (m.current_version.clone(), m.builtin, m.source.clone()))
+        let (current, reset_available, update) = with_a2app(|state| {
+            state.registry.get(&app_id).map(|m| (
+                m.current_version.clone(),
+                m.builtin && a2app_core::builtin::stock(&app_id)
+                    .is_some_and(|stock| !a2app_core::builtin::matches_default(m, &stock)),
+                if m.builtin { state.persisted.builtin_updates.get(&app_id).cloned() } else { None },
+            ))
         }).flatten().unwrap_or_default();
         self.current_stamp = current;
-        self.reset_available = builtin
-            && a2app_core::builtin::stock(&app_id).is_some_and(|stock| stock.source != source);
+        self.pending_stock_stamp = update;
+        self.view.widget(cx, ids!(info_builtin_update)).set_visible(cx, self.pending_stock_stamp.is_some());
+        self.reset_available = reset_available;
         self.view.redraw(cx);
     }
 
@@ -2336,9 +2505,9 @@ impl MiniAppsScreen {
             enqueue_popup_notification("Couldn't load that version.", PopupKind::Error, Some(4.0));
             return;
         };
-        let when = a2app_core::versions::label_for(version.at_unix, crate::a2app::runtime::utc_offset_secs());
+        let when = version_date_label(&version);
         self.view.label(cx, ids!(source_title))
-            .set_text(cx, &format!("{} · version from {when}", version.name));
+            .set_text(cx, &format!("{} · version · {when}", version.name));
         self.view.code_view(cx, ids!(source_code_view)).set_text(cx, &source);
         self.set_pane(cx, Pane::Source);
     }
@@ -2356,8 +2525,8 @@ impl MiniAppsScreen {
         self.diff_lines = line_diff(&old, &current);
         let added = self.diff_lines.iter().filter(|l| matches!(l, DiffLine::Added(_))).count();
         let removed = self.diff_lines.iter().filter(|l| matches!(l, DiffLine::Removed(_))).count();
-        let when = a2app_core::versions::label_for(version.at_unix, crate::a2app::runtime::utc_offset_secs());
-        self.view.label(cx, ids!(diff_title)).set_text(cx, &format!("{name} · changes since {when}"));
+        let when = version_date_label(&version);
+        self.view.label(cx, ids!(diff_title)).set_text(cx, &format!("{name} · changes from version · {when}"));
         let summary = if added == 0 && removed == 0 {
             String::from("The current source is identical to that version.")
         } else {
@@ -3309,6 +3478,204 @@ fn background_app_open_action(binding: &a2app_core::background::JobBinding) -> R
 #[cfg(test)]
 mod access_tests {
     use super::*;
+
+    #[test]
+    fn builtin_update_badge_tracks_pending_updates_and_clears_when_rows_are_reused() {
+        let mut manifest = a2app_core::builtin::stock("roll-call").unwrap();
+        manifest.id = "builtin-update-badge-test".into();
+        manifest.source.push_str("\n// Customized dice roller");
+        crate::a2app::runtime::initialize_background_test(manifest.clone());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppRow {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let mut row = widget.borrow_mut::<MiniAppRow>().unwrap();
+        let data = mini_app_rows(&mut cx, |_| true).remove(0);
+        row.populate(&mut cx, &data);
+        assert!(!row.view.widget(&cx, ids!(row_update_badge)).visible(),
+            "customizing a built-in alone does not mean an updated default exists");
+
+        with_a2app(|state| { state.persisted.builtin_updates.insert(manifest.id.clone(), "offered-default".into()); });
+        let data = mini_app_rows(&mut cx, |_| true).remove(0);
+        row.populate(&mut cx, &data);
+        assert!(row.view.widget(&cx, ids!(row_update_badge)).visible());
+        assert_eq!(row.view.label(&cx, ids!(row_update_badge)).text(), "NEW");
+
+        with_a2app(|state| { state.persisted.builtin_updates.remove(&manifest.id); });
+        let data = mini_app_rows(&mut cx, |_| true).remove(0);
+        row.populate(&mut cx, &data);
+        assert!(!row.view.widget(&cx, ids!(row_update_badge)).visible(),
+            "the badge must disappear after the offered default is selected");
+
+        with_a2app(|state| {
+            state.persisted.builtin_updates.insert(manifest.id.clone(), "offered-default".into());
+            state.registry.get_mut(&manifest.id).unwrap().builtin = false;
+        });
+        let data = mini_app_rows(&mut cx, |_| true).remove(0);
+        row.populate(&mut cx, &data);
+        assert!(!row.view.widget(&cx, ids!(row_update_badge)).visible(),
+            "an imported app must not inherit a built-in update badge");
+    }
+
+    #[test]
+    fn updated_default_is_optional_and_uses_the_offered_version_until_refresh_clears_it() {
+        let mut manifest = a2app_core::builtin::stock("roll-call").unwrap();
+        manifest.id = "builtin-update-info-test".into();
+        manifest.source.push_str("\n// Keep this custom version");
+        manifest.current_version = Some("custom-version".into());
+        crate::a2app::runtime::initialize_background_test(manifest.clone());
+        with_a2app(|state| { state.persisted.builtin_updates.insert(manifest.id.clone(), "offered-default".into()); });
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
+        screen.info_app = Some(manifest.id.clone());
+        let actions = cx.capture_actions(|cx| {
+            screen.refresh_info(cx);
+            screen.set_pane(cx, Pane::Info);
+        });
+        assert!(screen.view.widget(&cx, ids!(info_builtin_update)).visible());
+        assert_eq!(screen.current_stamp.as_deref(), Some("custom-version"));
+        assert!(!actions.iter().any(|action| action.downcast_ref::<A2AppOp>().is_some()),
+            "showing an update must not switch away from the custom version");
+
+        let uid = screen.view.button(&cx, ids!(info_use_updated_default)).widget_uid();
+        let click = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+        let emitted = cx.capture_actions(|cx| screen.handle_event(cx, &Event::Actions(click), &mut Scope::empty()));
+        assert!(emitted.iter().any(|action| matches!(action.downcast_ref::<A2AppOp>(),
+            Some(A2AppOp::SwitchVersion { app_id, stamp }) if app_id == &manifest.id && stamp == "offered-default")));
+        assert_eq!(with_a2app(|state| state.registry.get(&manifest.id).unwrap().current_version.clone()).flatten().as_deref(), Some("custom-version"));
+
+        with_a2app(|state| { state.persisted.builtin_updates.remove(&manifest.id); });
+        let changed = cx.capture_actions(|cx| cx.action(A2AppRuntimeAction::VersionsChanged(manifest.id.clone())));
+        screen.handle_event(&mut cx, &Event::Actions(changed), &mut Scope::empty());
+        assert!(!screen.view.widget(&cx, ids!(info_builtin_update)).visible());
+        assert!(screen.pending_stock_stamp.is_none());
+        let click = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+        let emitted = cx.capture_actions(|cx| screen.handle_event(cx, &Event::Actions(click), &mut Scope::empty()));
+        assert!(!emitted.iter().any(|action| action.downcast_ref::<A2AppOp>().is_some()),
+            "a stale update button action must not select a default after the notice clears");
+    }
+
+    #[test]
+    fn builtin_metadata_customization_can_be_reset_without_claiming_a_new_default() {
+        let mut manifest = a2app_core::builtin::stock("roll-call").unwrap();
+        manifest.name = "My dice roller".into();
+        crate::a2app::runtime::initialize_background_test(manifest.clone());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
+        screen.info_app = Some(manifest.id.clone());
+        screen.refresh_info(&mut cx);
+        assert!(screen.reset_available, "metadata-only changes must be resettable even when source is identical");
+        assert!(screen.pending_stock_stamp.is_none());
+        assert!(!screen.view.widget(&cx, ids!(info_builtin_update)).visible());
+
+        with_a2app(|state| { state.registry.insert(a2app_core::builtin::stock(&manifest.id).unwrap()); });
+        screen.refresh_info(&mut cx);
+        assert!(!screen.reset_available);
+    }
+
+    #[test]
+    fn version_history_distinguishes_shared_authors_local_imports_and_unknown_earlier_authors() {
+        use a2app_core::versions::{AcquisitionSource, VersionActor, VersionOrigin, new_version};
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppVersionRow {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let mut row = widget.borrow_mut::<MiniAppVersionRow>().unwrap();
+        let manifest = a2app_core::builtin::stock("roll-call").unwrap();
+        let mut version = new_version(&manifest, VersionOrigin::Manual, "Changed the dice", None, 1_784_907_124, 0);
+        version.actor = Some(VersionActor { user_id: "@alice:example.org".into(), display_name: Some("Alice".into()) });
+        version.host_version = Some("1.0.0-beta.1".into());
+        version.host_revision = Some("abcdef0123456789".into());
+        version.imported = true;
+        row.populate(&mut cx, &manifest.id, &version, false);
+        let when = row.view.label(&cx, ids!(version_label)).text();
+        assert!(when.starts_with("2026-07-"));
+        assert!(when.contains(":04 UTC"), "provenance dates include seconds and the UTC offset");
+        assert_eq!(row.view.label(&cx, ids!(version_actor)).text(), "By Alice (@alice:example.org)");
+        assert!(row.view.widget(&cx, ids!(version_host)).visible());
+        assert_eq!(row.view.label(&cx, ids!(version_host)).text(), "Robrix version: 1.0.0-beta.1\nRobrix revision: abcdef0123456789");
+        assert!(row.view.widget(&cx, ids!(version_shared_history)).visible());
+        assert!(!row.view.widget(&cx, ids!(version_source)).visible());
+        assert!(row.view.widget(&cx, ids!(version_use_button)).visible());
+
+        version.origin = VersionOrigin::Import;
+        version.actor = Some(VersionActor { user_id: "@bob:example.org".into(), display_name: None });
+        version.acquired_from = Some(AcquisitionSource::RoomAttachment {
+            room_id: "!dice:example.org".into(), event_id: Some("$shared-event".into()), media_uri: Some("mxc://example.org/shared-file".into()),
+            shared_at_unix: Some(1_784_907_124),
+            file_name: "roll-call.splashapp".into(),
+            sender: Some(VersionActor { user_id: "@sender:example.org".into(), display_name: None }),
+        });
+        version.imported = false;
+        row.populate(&mut cx, &manifest.id, &version, true);
+        assert_eq!(row.view.label(&cx, ids!(version_actor)).text(), "By @bob:example.org");
+        let source = row.view.label(&cx, ids!(version_source)).text();
+        assert!(source.contains("roll-call.splashapp"));
+        assert!(source.contains("!dice:example.org"));
+        assert!(source.contains("$shared-event"));
+        assert!(source.contains("mxc://example.org/shared-file"));
+        assert!(source.contains("Shared on: 2026-07-"));
+        assert!(source.contains(":04 UTC"));
+        assert!(source.contains("@sender:example.org"));
+        assert!(row.view.widget(&cx, ids!(version_source)).visible());
+        assert!(!row.view.widget(&cx, ids!(version_shared_history)).visible());
+        assert!(!row.view.widget(&cx, ids!(version_use_button)).visible());
+
+        version.origin = VersionOrigin::Legacy;
+        version.actor = None;
+        version.host_version = None;
+        version.host_revision = None;
+        version.acquired_from = None;
+        version.at_unix = 0;
+        row.populate(&mut cx, &manifest.id, &version, false);
+        assert_eq!(row.view.label(&cx, ids!(version_actor)).text(), "Author not recorded");
+        assert!(!row.view.widget(&cx, ids!(version_host)).visible(), "an old record must not inherit this device's current Robrix version");
+        assert!(row.view.label(&cx, ids!(version_label)).text().starts_with("Date not recorded"));
+        assert!(!row.view.widget(&cx, ids!(version_source)).visible(), "reusing a row must clear the earlier room source");
+        assert!(row.view.widget(&cx, ids!(version_diff_button)).visible());
+
+        version.origin = VersionOrigin::Stock;
+        version.imported = true;
+        row.populate(&mut cx, &manifest.id, &version, false);
+        assert_eq!(row.view.label(&cx, ids!(version_actor)).text(), "Author not recorded",
+            "a shared record claiming a stock origin must not be attributed to Robrix");
+        version.imported = false;
+        row.populate(&mut cx, &manifest.id, &version, false);
+        assert_eq!(row.view.label(&cx, ids!(version_actor)).text(), "Provided with Robrix");
+
+        version.acquired_from = Some(AcquisitionSource::File {
+            file_name: "roll-call.splashapp".into(), path: Some("/Users/alice/Downloads/roll-call.splashapp".into()),
+        });
+        row.populate(&mut cx, &manifest.id, &version, false);
+        assert!(row.view.label(&cx, ids!(version_source)).text().contains("/Users/alice/Downloads/roll-call.splashapp"));
+        assert_eq!(provenance_date_label(u64::MAX), "Date not recorded");
+    }
 
     #[test]
     fn capability_row_shows_enforced_blocks_over_saved_individual_allowances() {

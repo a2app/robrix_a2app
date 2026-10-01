@@ -280,7 +280,7 @@ pub fn union_permissions(base: &[String], added: &[String]) -> Vec<String> {
 
 /// A widget provided by a mini-app: a separate, smaller Splash script.
 /// Bundle compat only; Robrix never runs it.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WidgetManifest {
     /// The Splash source code of the widget form of the app.
     pub source: String,

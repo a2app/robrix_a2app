@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     data_root,
     manifest::{A2AppScope, MiniAppId, MiniAppManifest, WidgetManifest},
-    versions::{AppVersion, VersionOrigin, new_version},
+    versions::{AppVersion, VersionOrigin, VersionSnapshot, new_version},
 };
 
 const PERMISSIONS_FILE_NAME: &str = "permissions.json";
@@ -73,6 +73,15 @@ pub struct A2AppPersistedState {
     /// manifest costs a few KB and makes uninstall reversible.
     #[serde(default)]
     pub archived: Vec<MiniAppManifest>,
+    /// Complete portable histories retained before an uninstall removes code.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub archived_bundles: BTreeMap<MiniAppId, String>,
+    /// Latest shipped default, independent of the user's current branch.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub builtin_baselines: BTreeMap<MiniAppId, crate::builtin::BuiltinBaseline>,
+    /// Updated default snapshots offered to users who customized an app.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub builtin_updates: BTreeMap<MiniAppId, String>,
     /// Unix timestamp (secs) of when each app was last opened, for "recents".
     #[serde(default)]
     pub recents: BTreeMap<MiniAppId, u64>,
@@ -118,6 +127,11 @@ fn app_dir(id: &str) -> PathBuf {
     apps_dir().join(id)
 }
 
+/// Whether an installed or interrupted import already owns this directory.
+pub fn has_app_files(id: &str) -> bool {
+    is_safe_app_id(id) && app_dir(id).exists()
+}
+
 /// Writes `bytes` to `path` atomically: a sibling temp file renamed over the
 /// target (same-dir rename is atomic on the platforms we target). A crash
 /// mid-write leaves the OLD file intact rather than a truncated one — the
@@ -135,8 +149,8 @@ struct AppManifestFile {
     name: String,
     icon: String,
     tint: u32,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
     #[serde(default)]
     allow_net: bool,
     /// Declared permission ids. Declarations only — the user's grants live in
@@ -185,7 +199,7 @@ pub fn save_user_app(manifest: &MiniAppManifest) -> Result<()> {
         name: manifest.name.clone(),
         icon: manifest.icon.clone(),
         tint: manifest.tint,
-        description: manifest.description.clone(),
+        description: Some(manifest.description.clone()),
         allow_net: manifest.allow_net,
         permissions: manifest.permissions.clone(),
         permission_reasons: manifest.permission_reasons.clone(),
@@ -229,6 +243,9 @@ fn version_file(id: &str, stamp: &str, ext: &str) -> Option<PathBuf> {
 pub fn append_version(manifest: &MiniAppManifest, mut version: AppVersion) -> Result<String> {
     if !is_safe_app_id(&manifest.id) {
         anyhow::bail!("refusing to version app with unsafe id '{}'", manifest.id);
+    }
+    if !is_safe_app_id(&version.stamp) {
+        anyhow::bail!("refusing to persist an unsafe version stamp");
     }
     let dir = versions_dir(&manifest.id);
     std::fs::create_dir_all(&dir)?;
@@ -300,7 +317,8 @@ fn collision_index(stamp: &str) -> u32 {
 /// One version's record and its archived source.
 pub fn load_version(id: &str, stamp: &str) -> Option<(AppVersion, String)> {
     let bytes = std::fs::read(version_file(id, stamp, "json")?).ok()?;
-    let version = serde_json::from_slice(&bytes).ok()?;
+    let version: AppVersion = serde_json::from_slice(&bytes).ok()?;
+    if version.stamp != stamp { return None; }
     let source = std::fs::read_to_string(version_file(id, stamp, "splash")?).ok()?;
     Some((version, source))
 }
@@ -310,8 +328,111 @@ pub fn load_version_source(id: &str, stamp: &str) -> Option<String> {
     load_version(id, stamp).map(|(_, source)| source)
 }
 
-/// No-op when `current_version` names a version on disk; otherwise appends the
-/// working copy as one, points at it, and saves the app.
+/// Loads every historical source for export, reporting damage instead of
+/// silently dropping an unreadable record from the shared provenance.
+pub fn export_history(id: &str) -> Result<Vec<VersionSnapshot>> {
+    if !is_safe_app_id(id) { anyhow::bail!("unsafe app identity"); }
+    let entries = match std::fs::read_dir(versions_dir(id)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut history = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if !path.extension().is_some_and(|ext| ext == "json") { continue; }
+        let version: AppVersion = serde_json::from_slice(&std::fs::read(&path)?)?;
+        if path.file_stem().and_then(|stem| stem.to_str()) != Some(version.stamp.as_str()) {
+            anyhow::bail!("a history file does not match its version stamp");
+        }
+        let source_path = version_file(id, &version.stamp, "splash")
+            .ok_or_else(|| anyhow::anyhow!("unsafe history stamp"))?;
+        history.push(VersionSnapshot { version, source: std::fs::read_to_string(source_path)? });
+    }
+    validate_history(&history, None)?;
+    history.sort_by(|a, b| a.version.at_unix.cmp(&b.version.at_unix)
+        .then(collision_index(&a.version.stamp).cmp(&collision_index(&b.version.stamp))));
+    Ok(history)
+}
+
+/// Checks portable history before any part of it is written to disk.
+pub fn validate_history(history: &[VersionSnapshot], current_version: Option<&str>) -> Result<()> {
+    let mut stamps = std::collections::BTreeMap::new();
+    for snapshot in history {
+        let version = &snapshot.version;
+        if !is_safe_app_id(&version.stamp) || version.stamp.len() > 96
+            || stamps.insert(version.stamp.as_str(), version).is_some() {
+            anyhow::bail!("history contains an unsafe or duplicate version stamp");
+        }
+        if snapshot.source.trim().is_empty() {
+            anyhow::bail!("history contains a version without source code");
+        }
+    }
+    let mut checked = std::collections::BTreeSet::new();
+    for snapshot in history {
+        let mut ancestor = snapshot.version.parent.as_deref();
+        let mut visited = std::collections::BTreeSet::from([snapshot.version.stamp.as_str()]);
+        while let Some(stamp) = ancestor {
+            let Some(parent) = stamps.get(stamp) else {
+                anyhow::bail!("history refers to a missing parent version");
+            };
+            if !visited.insert(stamp) {
+                anyhow::bail!("history contains a cycle");
+            }
+            if checked.contains(stamp) { break; }
+            ancestor = parent.parent.as_deref();
+        }
+        checked.extend(visited);
+    }
+    if current_version.is_some_and(|stamp| !stamps.contains_key(stamp)) {
+        anyhow::bail!("history refers to a missing current version");
+    }
+    Ok(())
+}
+
+/// Restores all historical code and metadata into a newly assigned app id.
+///
+/// Stamps and parent links stay intact. Existing history is never overwritten,
+/// and shared attribution is explicitly marked as unverified.
+pub fn import_history(
+    manifest: &mut MiniAppManifest,
+    history: &[VersionSnapshot],
+    current_version: Option<&str>,
+) -> Result<()> {
+    if !is_safe_app_id(&manifest.id) {
+        anyhow::bail!("refusing to import history for an unsafe app id");
+    }
+    validate_history(history, current_version)?;
+    if let Some(stamp) = current_version {
+        let current = history.iter().find(|entry| entry.version.stamp == stamp).unwrap();
+        if current.source != manifest.source {
+            anyhow::bail!("the current history version does not match the app source");
+        }
+    }
+    let dir = versions_dir(&manifest.id);
+    for snapshot in history {
+        if dir.join(format!("{}.json", snapshot.version.stamp)).exists()
+            || dir.join(format!("{}.splash", snapshot.version.stamp)).exists() {
+            anyhow::bail!("the destination already contains this version history");
+        }
+    }
+    if !history.is_empty() {
+        std::fs::create_dir_all(&dir)?;
+    }
+    for snapshot in history {
+        let mut version = snapshot.version.clone();
+        version.imported = true;
+        atomic_write(&dir.join(format!("{}.splash", version.stamp)), snapshot.source.as_bytes())?;
+        atomic_write(&dir.join(format!("{}.json", version.stamp)), &serde_json::to_vec_pretty(&version)?)?;
+    }
+    manifest.current_version = current_version.map(str::to_string);
+    Ok(())
+}
+
+/// Saves the working copy when its recorded version no longer matches it.
+///
+/// An external source edit or upgraded metadata keeps the previous snapshot
+/// as its parent; a missing snapshot never becomes a dangling parent link.
 pub fn ensure_current_version(
     manifest: &mut MiniAppManifest,
     origin: VersionOrigin,
@@ -319,14 +440,14 @@ pub fn ensure_current_version(
     at_unix: u64,
     offset_secs: i64,
 ) -> Result<()> {
-    let on_disk = manifest.current_version.as_deref().is_some_and(|stamp| {
-        version_file(&manifest.id, stamp, "json").is_some_and(|p| p.exists())
-            && version_file(&manifest.id, stamp, "splash").is_some_and(|p| p.exists())
-    });
-    if on_disk {
+    let previous = manifest.current_version.as_deref()
+        .and_then(|stamp| load_version(&manifest.id, stamp))
+        .map(|(version, source)| VersionSnapshot { version, source });
+    if previous.as_ref().is_some_and(|snapshot| snapshot.matches_manifest(manifest)) {
         return Ok(());
     }
-    let version = new_version(manifest, origin, note, None, at_unix, offset_secs);
+    let parent = previous.as_ref().map(|snapshot| snapshot.version.stamp.as_str());
+    let version = new_version(manifest, origin, note, parent, at_unix, offset_secs);
     manifest.current_version = Some(append_version(manifest, version)?);
     save_user_app(manifest)
 }
@@ -419,11 +540,8 @@ fn load_user_app(id: &str) -> Option<MiniAppManifest> {
         icon: file.icon,
         tint: file.tint,
         // Copies saved before descriptions existed still have the header line.
-        description: if file.description.is_empty() {
-            crate::header::parse_app_header(&source).description.unwrap_or_default()
-        } else {
-            file.description
-        },
+        description: file.description.unwrap_or_else(||
+            crate::header::parse_app_header(&source).description.unwrap_or_default()),
         source,
         allow_net: file.allow_net,
         permissions: file.permissions,
@@ -556,6 +674,25 @@ mod tests {
     }
 
     #[test]
+    fn explicit_empty_descriptions_survive_disk_load_beside_a_source_header() {
+        let mut m = manifest("hist-empty-description");
+        m.description.clear();
+        m.source = "// description: Header description\nView{}".into();
+        save_user_app(&m).unwrap();
+        let loaded = load_user_app(&m.id).unwrap();
+        assert!(loaded.description.is_empty());
+        assert!(crate::builtin::matches_default(&m, &loaded));
+        let mut older = new_version(&m, VersionOrigin::Stock, "Older snapshot", None, T, 0);
+        older.description = None;
+        let older_snapshot = VersionSnapshot { version: older, source: m.source.clone() };
+        assert!(!older_snapshot.matches_manifest(&loaded));
+        let mut header_copy = loaded.clone();
+        header_copy.description = "Header description".into();
+        assert!(older_snapshot.matches_manifest(&header_copy));
+        remove_user_app(&m.id);
+    }
+
+    #[test]
     fn collision_index_orders_same_second_snapshots() {
         // Plain stamps have no counter; suffixed ones sort numerically, so a
         // 10th snapshot in one second still comes after the 2nd.
@@ -587,6 +724,84 @@ mod tests {
 
     // 2026-07-24 15:32:04 UTC.
     const T: u64 = 1_784_907_124;
+
+    #[test]
+    fn imported_history_is_validated_before_any_files_are_written() {
+        let mut m = manifest("hist-invalid-import");
+        let mut version = new_version(&m, VersionOrigin::Manual, "", None, T, 0);
+        let safe_stamp = version.stamp.clone();
+        version.stamp = "../../escape".into();
+        let mut history = vec![VersionSnapshot { version, source: m.source.clone() }];
+        assert!(import_history(&mut m, &history, None).is_err());
+        assert!(!app_dir(&m.id).exists());
+        history[0].version.stamp = safe_stamp.clone();
+        history[0].version.parent = Some("absent".into());
+        assert!(import_history(&mut m, &history, None).is_err());
+        assert!(!app_dir(&m.id).exists());
+        history[0].version.parent = Some(safe_stamp.clone());
+        assert!(import_history(&mut m, &history, None).is_err());
+        assert!(!app_dir(&m.id).exists());
+        history[0].version.parent = None;
+        history.push(history[0].clone());
+        assert!(import_history(&mut m, &history, None).is_err());
+        history.pop();
+        assert!(import_history(&mut m, &history, Some("absent")).is_err());
+        history[0].source = "Different{}".into();
+        assert!(import_history(&mut m, &history, Some(&safe_stamp)).is_err());
+        assert!(!app_dir(&m.id).exists());
+    }
+
+    #[test]
+    fn importing_history_never_overwrites_an_existing_version() {
+        let mut m = manifest("hist-import-no-overwrite");
+        let version = new_version(&m, VersionOrigin::Manual, "", None, T, 0);
+        let stamp = append_version(&m, version.clone()).unwrap();
+        let history = vec![VersionSnapshot { version, source: "Replacement{}".into() }];
+        assert!(import_history(&mut m, &history, None).is_err());
+        assert_eq!(load_version(&m.id, &stamp).unwrap().1, m.source);
+        remove_user_app(&m.id);
+    }
+
+    #[test]
+    fn history_parent_cycles_are_rejected_in_any_input_order() {
+        let m = manifest("hist-cycle");
+        let mut first = new_version(&m, VersionOrigin::Manual, "", None, T, 0);
+        let second = new_version(&m, VersionOrigin::Manual, "", Some(&first.stamp), T + 1, 0);
+        first.parent = Some(second.stamp.clone());
+        let history = vec![
+            VersionSnapshot { version: second, source: m.source.clone() },
+            VersionSnapshot { version: first, source: m.source.clone() },
+        ];
+        assert!(validate_history(&history, None).unwrap_err().to_string().contains("cycle"));
+    }
+
+    #[test]
+    fn old_version_files_preserve_widgets_that_were_not_recorded() {
+        let mut m = manifest("hist-legacy-widget");
+        m.widget = Some(WidgetManifest { source: "OldWidget{}".into(), default_span: (2, 2), min_span: (1, 1) });
+        let old: AppVersion = serde_json::from_str(
+            r#"{"stamp":"20260724-153204","at_unix":1784907124,"note":"x","name":"N","icon":"i","tint":7,"origin":"Manual"}"#,
+        ).unwrap();
+        assert!(!old.widget_recorded);
+        assert_eq!(old.apply_to(&m, m.source.clone()).widget, m.widget);
+        let mut current = new_version(&m, VersionOrigin::Manual, "", None, T, 0);
+        current.widget = None;
+        assert!(current.apply_to(&m, m.source.clone()).widget.is_none());
+    }
+
+    #[test]
+    fn archive_state_round_trips_complete_histories_and_loads_old_files() {
+        let old: A2AppPersistedState = serde_json::from_str(r#"{"archived":[],"recents":{}}"#).unwrap();
+        assert!(old.archived_bundles.is_empty());
+        let m = manifest("hist-archive-state");
+        let mut state = A2AppPersistedState::default();
+        state.archived.push(m.clone());
+        state.archived_bundles.insert(m.id.clone(), crate::bundle::try_to_text(&m).unwrap());
+        let restored: A2AppPersistedState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        let bundle = crate::bundle::parse_with_history(&restored.archived_bundles[&m.id]).unwrap();
+        assert_eq!(bundle.history.len(), 1);
+        assert_eq!(bundle.history[0].source, m.source);
+    }
 
     #[test]
     fn a_version_round_trips_through_append_list_and_load() {
@@ -655,6 +870,44 @@ mod tests {
     }
 
     #[test]
+    fn an_external_source_edit_keeps_the_preceding_code_and_unknown_author() {
+        let mut m = manifest("hist-external-edit");
+        ensure_current_version(&mut m, VersionOrigin::Ai, "Generated", T, 0).unwrap();
+        let original = m.current_version.clone().unwrap();
+        std::fs::write(app_dir(&m.id).join("app.splash"), b"View{ external_edit }").unwrap();
+        let mut edited = load_user_app(&m.id).unwrap();
+        ensure_current_version(&mut edited, VersionOrigin::Legacy, "Observed saved copy", 0, 0).unwrap();
+        let history = export_history(&m.id).unwrap();
+        assert_eq!(history.len(), 2);
+        let baseline = load_version(&m.id, edited.current_version.as_deref().unwrap()).unwrap();
+        assert_eq!(baseline.0.parent.as_deref(), Some(original.as_str()));
+        assert_eq!(baseline.0.at_unix, 0);
+        assert!(baseline.0.actor.is_none());
+        assert_eq!(baseline.1, "View{ external_edit }");
+        assert_eq!(load_version(&m.id, &original).unwrap().1, m.source);
+        assert!(has_app_files(&m.id));
+        remove_user_app(&m.id);
+        assert!(!has_app_files(&m.id));
+        assert!(!has_app_files("../escape"));
+    }
+
+    #[test]
+    fn upgraded_metadata_gets_a_snapshot_without_losing_the_previous_contract() {
+        let mut m = manifest("hist-upgraded-metadata");
+        ensure_current_version(&mut m, VersionOrigin::Ai, "Generated", T, 0).unwrap();
+        let original = m.current_version.clone().unwrap();
+        m.permissions.push("network".into());
+        m.normalize_permissions();
+        ensure_current_version(&mut m, VersionOrigin::Legacy, "Observed saved copy", 0, 0).unwrap();
+        assert_eq!(list_versions(&m.id).len(), 2);
+        let latest = load_version(&m.id, m.current_version.as_deref().unwrap()).unwrap().0;
+        assert_eq!(latest.parent.as_deref(), Some(original.as_str()));
+        assert_eq!(latest.permissions, m.permissions);
+        assert_eq!(load_version(&m.id, &original).unwrap().0.permissions, vec!["location"]);
+        remove_user_app(&m.id);
+    }
+
+    #[test]
     fn apply_to_takes_declarations_only_from_full_versions() {
         let mut base = manifest("hist-apply");
         base.permissions = vec!["network".into()];
@@ -671,12 +924,24 @@ mod tests {
         assert!(!restored.allow_net);
         assert_eq!(restored.current_version.as_deref(), Some("20260724-153204"));
 
-        // A Legacy version never recorded declarations, so base keeps its own.
-        let legacy = crate::versions::version_of(&older, "", T, 0);
+        // An old Legacy file never recorded declarations, so base keeps its own.
+        let legacy: AppVersion = serde_json::from_str(
+            r#"{"stamp":"20260724-153204","at_unix":1784907124,"note":"","name":"Hist","icon":"h","tint":1}"#,
+        ).unwrap();
         let restored = legacy.apply_to(&base, "View{ v1 }".into());
         assert_eq!(restored.permissions, vec!["network".to_string()]);
         assert!(restored.allow_net);
         assert_eq!(restored.current_version.as_deref(), Some("20260724-153204"));
+        // A newly observed copy records its whole contract even when its
+        // original author and modification date remain unknown.
+        let mut observed = older.clone();
+        observed.description = "Saved local description".into();
+        let modern_legacy = new_version(&observed, VersionOrigin::Legacy, "Observed saved copy", None, 0, 0);
+        let restored = modern_legacy.apply_to(&base, observed.source.clone());
+        assert_eq!(restored.permissions, observed.permissions);
+        assert_eq!(restored.permission_reasons, observed.permission_reasons);
+        assert_eq!(restored.description, observed.description);
+        assert!(!restored.allow_net);
     }
 
     #[test]

@@ -127,9 +127,12 @@ script_mod! {
     // A download button or loading spinner shown beneath a message.
     mod.widgets.MessageDownloadSection = View {
         visible: false,
-        width: Fit, height: Fit,
-        flow: Right,
+        width: Fill, height: Fit,
+        flow: Flow.Right{wrap: true},
+        spacing: 8,
         margin: Inset{top: 8, bottom: 2}
+
+        mini_app_attachment := mod.widgets.MiniAppAttachmentAction {}
 
         download_button := RobrixIconButton {
             height: mod.widgets.SETTINGS_BUTTON_HEIGHT,
@@ -143,7 +146,7 @@ script_mod! {
         share_button := RobrixIconButton {
             height: mod.widgets.SETTINGS_BUTTON_HEIGHT,
             padding: Inset{left: 12, right: 12}
-            margin: Inset{left: 8}
+            margin: 0
             draw_icon.svg: (ICON_SHARE)
             icon_walk: Walk{width: 16, height: 16}
             text: "Share"
@@ -5477,6 +5480,30 @@ fn populate_message_view(
         is_room_encrypted,
     );
 
+    #[cfg(feature = "a2app")]
+    {
+        use crate::a2app::timeline_card::{MiniAppAttachmentActionWidgetRefExt, MiniAppAttachmentContext, is_mini_app_attachment};
+        let context = if let MsgLikeKind::Message(message) = &msg_like_content.kind
+            && let MessageType::File(file) = message.msgtype()
+            && is_mini_app_attachment(file.filename(), file.info.as_ref().and_then(|info| info.mimetype.as_deref()))
+        {
+            Some(MiniAppAttachmentContext {
+                media_source: file.source.clone(),
+                filename: file.filename().to_owned(),
+                size: file.info.as_ref().and_then(|info| info.size).map(u64::from),
+                room_id: timeline_kind.room_id().clone(),
+                event_id: event_tl_item.event_id().map(ToOwned::to_owned),
+                shared_at_unix: Some(u64::from(event_tl_item.timestamp().0) / 1000),
+                sender_id: event_tl_item.sender().to_string(),
+                sender_name: get_profile_display_name(event_tl_item)
+                    .unwrap_or_else(|| event_tl_item.sender().to_string()),
+            })
+        } else {
+            None
+        };
+        item.mini_app_attachment_action(cx, ids!(content.download_section.mini_app_attachment)).populate(cx, context);
+    }
+
 
     // If `used_cached_item` is false, we should always redraw the profile, even if profile_drawn is true.
     let skip_draw_profile =
@@ -6509,8 +6536,8 @@ fn populate_other_message_like(
     #[cfg(feature = "a2app")]
     if other.event_type().to_string() == crate::a2app::timeline_card::A2APP_EVENT_TYPE {
         use crate::a2app::timeline_card::MiniAppTimelineCardWidgetRefExt;
-        let (item, existed) = list.item_with_existed(cx, item_id, id!(MiniAppTimelineCard));
-        if !(existed && item_drawn_status.content_drawn) {
+        let (item, _existed) = list.item_with_existed(cx, item_id, id!(MiniAppTimelineCard));
+        {
             let bundle_text = event_tl_item.latest_json()
                 .and_then(|raw| raw.deserialize_as::<serde_json::Value>().ok())
                 .and_then(|v| v.get("content")
@@ -6522,7 +6549,11 @@ fn populate_other_message_like(
                 cx,
                 &bundle_text,
                 event_tl_item.sender().as_str(),
+                &get_profile_display_name(event_tl_item)
+                    .unwrap_or_else(|| event_tl_item.sender().to_string()),
                 Some(timeline_kind.room_id().clone()),
+                event_tl_item.event_id().map(ToOwned::to_owned),
+                Some(u64::from(event_tl_item.timestamp().0) / 1000),
             );
         }
         return (item, ItemDrawnStatus::both_drawn());

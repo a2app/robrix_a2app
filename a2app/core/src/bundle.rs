@@ -3,6 +3,8 @@
 //! A generated app is just a Splash script plus a scrap of metadata, so a
 //! bundle is a single JSON file — small enough to paste into a chat message,
 //! self-contained enough to drop in a folder and hand to someone.
+//! Format 2 includes the complete version lineage, recorded authors, and
+//! historical main and widget code. Format 1 remains importable.
 //!
 //! Import also accepts a **bare Splash script** (`.splash`, or anything that
 //! isn't JSON): the `// name:` / `// icon:` / `// tint:` header the generator
@@ -20,16 +22,20 @@ use serde::{Deserialize, Serialize};
 use crate::{
     data_root,
     manifest::{MiniAppManifest, WidgetManifest},
+    versions::{AcquisitionSource, VersionOrigin, VersionSnapshot, new_version},
 };
 
 /// Extension of an exported bundle. Deliberately not `.json`: an export is a
 /// *thing you can install*, and the file listing says so.
 pub const BUNDLE_EXT: &str = "splashapp";
+pub const BUNDLE_MIME: &str = "application/vnd.robius.splashapp+json";
+/// One bounded read may contain the working copy and every historical source.
+pub const MAX_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Bumped only for a change old readers can't cope with. Readers accept
 /// anything ≤ this; a newer bundle is rejected with a message rather than
 /// silently importing half of it.
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 
 /// The wire form. Flat and boring on purpose — someone will read this in a
 /// text editor.
@@ -42,6 +48,8 @@ struct BundleFile {
     name: String,
     icon: String,
     tint: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
     #[serde(default)]
     allow_net: bool,
     /// Declared permission ids. Declarations only; the importing user's
@@ -59,6 +67,10 @@ struct BundleFile {
     source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     widget: Option<BundleWidget>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    history: Vec<VersionSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    current_version: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -71,12 +83,61 @@ struct BundleWidget {
 /// Serializes an app to bundle text. Pretty-printed: bundles get pasted into
 /// chats and diffed, and the source is one long escaped string either way.
 pub fn to_text(manifest: &MiniAppManifest) -> String {
+    try_to_text(manifest).unwrap_or_default()
+}
+
+fn text_with_current_history(manifest: &MiniAppManifest, mut history: Vec<VersionSnapshot>) -> String {
+    let mut current_version = manifest.current_version.clone().filter(|stamp|
+        history.iter().any(|entry| entry.version.stamp == *stamp && entry.matches_manifest(manifest)));
+    // A pristine built-in or older app may never have been edited. Include
+    // its initial code without inventing a creation date or author.
+    if current_version.is_none() {
+        let pristine = manifest.builtin && crate::builtin::stock(&manifest.id)
+            .is_some_and(|stock| crate::builtin::matches_default(manifest, &stock));
+        let origin = if pristine { VersionOrigin::Stock } else { VersionOrigin::Legacy };
+        let parent = manifest.current_version.as_deref().filter(|stamp|
+            history.iter().any(|entry| entry.version.stamp == *stamp));
+        let note = if pristine { "Original" } else if history.is_empty() {
+            "Saved copy (earlier history unavailable)"
+        } else { "Current saved copy (date not recorded)" };
+        let mut version = new_version(manifest, origin, note, parent, 0, 0);
+        if manifest.builtin {
+            version.acquired_from = Some(AcquisitionSource::BuiltIn { app_id: manifest.id.clone() });
+        }
+        let base = version.stamp.clone();
+        let mut collision = 2;
+        while history.iter().any(|entry| entry.version.stamp == version.stamp) {
+            version.stamp = format!("{base}-{collision}");
+            collision += 1;
+        }
+        current_version = Some(version.stamp.clone());
+        history.push(VersionSnapshot { version, source: manifest.source.clone() });
+    }
+    to_text_with_history(manifest, history, current_version)
+}
+
+/// Exports only a complete, readable history within the import size limit.
+pub fn try_to_text(manifest: &MiniAppManifest) -> Result<String, String> {
+    let history = crate::persistence::export_history(&manifest.id)
+        .map_err(|error| format!("cannot export the app's complete history: {error}"))?;
+    let text = text_with_current_history(manifest, history);
+    parse_with_history(&text)?;
+    Ok(text)
+}
+
+/// Serializes an explicit complete history, also useful for backup tooling.
+pub fn to_text_with_history(
+    manifest: &MiniAppManifest,
+    history: Vec<VersionSnapshot>,
+    current_version: Option<String>,
+) -> String {
     let file = BundleFile {
         format: FORMAT,
         id: manifest.id.clone(),
         name: manifest.name.clone(),
         icon: manifest.icon.clone(),
         tint: manifest.tint,
+        description: Some(manifest.description.clone()),
         allow_net: manifest.allow_net,
         permissions: manifest.permissions.clone(),
         permission_reasons: manifest.permission_reasons.clone(),
@@ -88,10 +149,19 @@ pub fn to_text(manifest: &MiniAppManifest) -> String {
             default_span: w.default_span,
             min_span: w.min_span,
         }),
+        history,
+        current_version,
     };
     // Infallible in practice (plain owned data); fall back rather than panic
     // in a UI handler.
     serde_json::to_string_pretty(&file).unwrap_or_default()
+}
+
+#[derive(Clone, Debug)]
+pub struct ImportedBundle {
+    pub manifest: MiniAppManifest,
+    pub history: Vec<VersionSnapshot>,
+    pub current_version: Option<String>,
 }
 
 /// Parses bundle text — or a bare Splash script — into a manifest.
@@ -101,6 +171,14 @@ pub fn to_text(manifest: &MiniAppManifest) -> String {
 /// always false: importing can't mint a protected app. `scope` is always
 /// Account: room attachment is local state and never travels in a file.
 pub fn parse(text: &str) -> Result<MiniAppManifest, String> {
+    parse_with_history(text).map(|bundle| bundle.manifest)
+}
+
+/// Parses a portable app while retaining every restorable historical source.
+pub fn parse_with_history(text: &str) -> Result<ImportedBundle, String> {
+    if text.len() > MAX_BUNDLE_BYTES {
+        return Err("the mini-app file is too large (maximum 16 MiB)".into());
+    }
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Err("nothing to import".to_string());
@@ -108,10 +186,12 @@ pub fn parse(text: &str) -> Result<MiniAppManifest, String> {
     if trimmed.starts_with('{') {
         return parse_bundle(trimmed);
     }
-    parse_bare_source(trimmed)
+    parse_bare_source(trimmed).map(|manifest| ImportedBundle {
+        manifest, history: Vec::new(), current_version: None,
+    })
 }
 
-fn parse_bundle(text: &str) -> Result<MiniAppManifest, String> {
+fn parse_bundle(text: &str) -> Result<ImportedBundle, String> {
     let file: BundleFile = serde_json::from_str(text)
         .map_err(|e| format!("not a valid app bundle: {}", first_line(&e.to_string())))?;
     if file.format > FORMAT {
@@ -123,12 +203,41 @@ fn parse_bundle(text: &str) -> Result<MiniAppManifest, String> {
     if file.source.trim().is_empty() {
         return Err("the bundle has no app source".to_string());
     }
+    if file.format == 2 && file.history.is_empty() {
+        return Err("the bundle is missing its version history".into());
+    }
+    crate::persistence::validate_history(&file.history, file.current_version.as_deref())
+        .map_err(|error| format!("invalid app history: {error}"))?;
+    if !file.history.is_empty() && file.current_version.is_none() {
+        return Err("the bundle's history has no current version".into());
+    }
+    if let Some(stamp) = file.current_version.as_deref() {
+        let current = file.history.iter().find(|entry| entry.version.stamp == stamp).unwrap();
+        let version = &current.version;
+        if current.source != file.source || version.name != file.name || version.icon != file.icon
+            || version.tint != file.tint || version.allow_net != file.allow_net
+            || version.description.as_ref().is_some_and(|description| Some(description) != file.description.as_ref())
+            || version.permissions != file.permissions || version.permission_reasons != file.permission_reasons
+            || version.capabilities != file.capabilities || version.shortcuts != file.shortcuts {
+            return Err("the current history version does not match the app".into());
+        }
+        if version.widget_recorded {
+            let historical = version.widget.as_ref().map(|widget|
+                (&widget.source, widget.default_span, widget.min_span));
+            let working = file.widget.as_ref().map(|widget|
+                (&widget.source, widget.default_span, widget.min_span));
+            if historical != working {
+                return Err("the current history version does not match the app widget".into());
+            }
+        }
+    }
     let mut manifest = MiniAppManifest {
         id: sanitize_id(&file.id, &file.name),
         name: clamp_name(&file.name),
         icon: clamp_icon(&file.icon),
         tint: file.tint,
-        description: crate::header::parse_app_header(&file.source).description.unwrap_or_default(),
+        description: file.description.unwrap_or_else(||
+            crate::header::parse_app_header(&file.source).description.unwrap_or_default()),
         source: file.source,
         allow_net: file.allow_net,
         permissions: sanitize_permissions(&file.permissions),
@@ -150,7 +259,11 @@ fn parse_bundle(text: &str) -> Result<MiniAppManifest, String> {
         current_version: None,
     };
     manifest.normalize_permissions();
-    Ok(manifest)
+    let history = file.history.into_iter().map(|mut entry| {
+        entry.version.imported = true;
+        entry
+    }).collect();
+    Ok(ImportedBundle { manifest, history, current_version: file.current_version })
 }
 
 /// Keeps only permission ids this build knows, deduped. Unknown ids couldn't
@@ -264,7 +377,7 @@ pub fn write_export(manifest: &MiniAppManifest) -> Result<PathBuf, String> {
     let dir = exchange_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("can't create {}: {e}", dir.display()))?;
     let path = dir.join(format!("{}.{BUNDLE_EXT}", sanitize_id(&manifest.id, &manifest.name)));
-    std::fs::write(&path, to_text(manifest).as_bytes())
+    std::fs::write(&path, try_to_text(manifest)?.as_bytes())
         .map_err(|e| format!("can't write {}: {e}", path.display()))?;
     Ok(path)
 }
@@ -313,7 +426,7 @@ pub fn list_importable() -> Vec<ImportEntry> {
         // Cap the read: this folder is user-writable, and a stray gigabyte
         // file must not stall the picker.
         let Ok(meta) = entry.metadata() else { continue };
-        if meta.len() > 1_000_000 {
+        if meta.len() > MAX_BUNDLE_BYTES as u64 {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -363,15 +476,27 @@ mod tests {
 
     #[test]
     fn round_trips_a_bundle() {
-        let text = to_text(&sample());
-        // The version pointer is local history and never travels in a file.
-        assert!(!text.contains("current_version"));
+        let mut initial = sample();
+        initial.source = "// name: Pomodoro\n// description: A header description\nView{}".into();
+        // An explicitly empty saved description remains empty, rather than
+        // being replaced by the source header on import.
+        let text = to_text(&initial);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap()["format"], 2);
+        // The pointer travels with its matching historical source, separately
+        // from the installed manifest until the caller imports the history.
+        let bundle = parse_with_history(&text).unwrap();
+        assert_eq!(bundle.history.len(), 1);
+        assert_eq!(bundle.history[0].version.at_unix, 0);
+        assert!(bundle.history[0].version.actor.is_none());
+        assert!(bundle.history[0].version.imported);
+        assert_eq!(bundle.current_version.as_deref(), Some(bundle.history[0].version.stamp.as_str()));
         let m = parse(&text).unwrap();
         assert!(m.current_version.is_none());
         assert_eq!(m.id, "pomodoro");
         assert_eq!(m.name, "Pomodoro");
         assert_eq!(m.icon, "🍅");
         assert_eq!(m.tint, 0xE84D3D);
+        assert!(m.description.is_empty());
         assert_eq!(m.shortcuts, vec!["Start".to_string()]);
         // Declarations travel; grants never do (they're host state).
         assert_eq!(m.permissions, vec!["network".to_string(), "open-url".to_string()]);
@@ -379,6 +504,115 @@ mod tests {
         assert!(m.allow_net);
         // An import can never mint a protected app, whatever the file says.
         assert!(!m.builtin);
+    }
+
+    #[test]
+    fn old_bundles_have_no_invented_history_or_author() {
+        let bundle = parse_with_history(r#"{"format":1,"id":"x","name":"X","icon":"x","tint":0,"source":"View{}"}"#).unwrap();
+        assert!(bundle.history.is_empty());
+        assert!(bundle.current_version.is_none());
+    }
+
+    #[test]
+    fn shares_all_authors_historical_code_and_parent_links() {
+        use crate::versions::VersionActor;
+        let mut manifest = sample();
+        manifest.id = "portable-history-source".into();
+        manifest.builtin = false;
+        manifest.widget = Some(WidgetManifest {
+            source: "View{ widget_v1 }".into(), default_span: (2, 2), min_span: (1, 1),
+        });
+        manifest.normalize_permissions();
+        let mut first = new_version(&manifest, VersionOrigin::Ai, "Create a timer", None, 1_784_907_124, 0);
+        first.actor = Some(VersionActor { user_id: "@alice:example.org".into(), display_name: Some("Alice".into()) });
+        first.host_version = Some("0.4.0".into());
+        first.host_revision = Some("alice-revision".into());
+        let first_stamp = crate::persistence::append_version(&manifest, first).unwrap();
+        manifest.source = "// name: Pomodoro\nView{ updated }".into();
+        manifest.widget.as_mut().unwrap().source = "View{ widget_v2 }".into();
+        let mut second = new_version(&manifest, VersionOrigin::Manual, "Add pause", Some(&first_stamp), 1_784_907_125, 0);
+        second.actor = Some(VersionActor { user_id: "@bob:example.org".into(), display_name: None });
+        manifest.current_version = Some(crate::persistence::append_version(&manifest, second).unwrap());
+        let mut bundle = parse_with_history(&try_to_text(&manifest).unwrap()).unwrap();
+        assert_eq!(bundle.history.len(), 2);
+        assert_eq!(bundle.history[0].version.actor.as_ref().unwrap().user_id, "@alice:example.org");
+        assert_eq!(bundle.history[0].version.host_version.as_deref(), Some("0.4.0"));
+        assert_eq!(bundle.history[0].version.host_revision.as_deref(), Some("alice-revision"));
+        assert_eq!(bundle.history[1].version.actor.as_ref().unwrap().user_id, "@bob:example.org");
+        assert_eq!(bundle.history[1].version.parent.as_deref(), Some(first_stamp.as_str()));
+        assert!(bundle.history.iter().all(|snapshot| snapshot.version.imported));
+        assert_eq!(bundle.history[0].source, sample().source);
+        bundle.manifest.id = "portable-history-destination".into();
+        crate::persistence::import_history(&mut bundle.manifest, &bundle.history, bundle.current_version.as_deref()).unwrap();
+        let imported = crate::persistence::load_version(&bundle.manifest.id, &first_stamp).unwrap();
+        assert_eq!(imported.1, sample().source);
+        let restored = imported.0.apply_to(&bundle.manifest, imported.1);
+        assert_eq!(restored.source, sample().source);
+        assert_eq!(restored.widget.as_ref().unwrap().source, "View{ widget_v1 }");
+        assert!(!restored.builtin);
+        let mut acquisition = new_version(&bundle.manifest, VersionOrigin::Import, "Imported this file",
+            bundle.manifest.current_version.as_deref(), 1_784_907_126, 0);
+        acquisition.actor = Some(VersionActor { user_id: "@charlie:example.org".into(), display_name: None });
+        acquisition.acquired_from = Some(AcquisitionSource::RoomAttachment {
+            room_id: "!room:example.org".into(), event_id: Some("$message".into()),
+            media_uri: Some("mxc://example.org/file".into()), shared_at_unix: Some(1_784_907_125),
+            file_name: "pomodoro.splashapp".into(),
+            sender: Some(VersionActor { user_id: "@bob:example.org".into(), display_name: Some("Bob".into()) }),
+        });
+        bundle.manifest.current_version = Some(crate::persistence::append_version(&bundle.manifest, acquisition).unwrap());
+        let relayed = parse_with_history(&try_to_text(&bundle.manifest).unwrap()).unwrap();
+        assert_eq!(relayed.history.len(), 3);
+        assert_eq!(relayed.history[0].version.actor.as_ref().unwrap().user_id, "@alice:example.org");
+        assert_eq!(relayed.history[2].version.actor.as_ref().unwrap().user_id, "@charlie:example.org");
+        assert!(matches!(&relayed.history[2].version.acquired_from,
+            Some(AcquisitionSource::RoomAttachment { shared_at_unix: Some(1_784_907_125), sender: Some(sender), .. })
+                if sender.user_id == "@bob:example.org"));
+        crate::persistence::remove_user_app(&manifest.id);
+        crate::persistence::remove_user_app(&bundle.manifest.id);
+    }
+
+    #[test]
+    fn refuses_history_that_disagrees_with_the_working_copy() {
+        let manifest = sample();
+        let version = new_version(&manifest, VersionOrigin::Manual, "", None, 1_784_907_124, 0);
+        let stamp = version.stamp.clone();
+        let text = to_text_with_history(&manifest, vec![VersionSnapshot { version, source: "View{ other }".into() }], Some(stamp));
+        assert!(parse_with_history(&text).unwrap_err().contains("does not match"));
+        let mut version = new_version(&manifest, VersionOrigin::Manual, "", None, 1_784_907_124, 0);
+        version.permissions.clear();
+        let stamp = version.stamp.clone();
+        let text = to_text_with_history(&manifest, vec![VersionSnapshot { version, source: manifest.source.clone() }], Some(stamp));
+        assert!(parse_with_history(&text).unwrap_err().contains("does not match"));
+        let version = new_version(&manifest, VersionOrigin::Manual, "", None, 1_784_907_124, 0);
+        let text = to_text_with_history(&manifest, vec![VersionSnapshot { version, source: manifest.source.clone() }], None);
+        assert!(parse_with_history(&text).unwrap_err().contains("no current version"));
+        assert!(parse_with_history(r#"{"format":2,"id":"x","name":"X","icon":"x","tint":0,"source":"View{}"}"#)
+            .unwrap_err().contains("missing its version history"));
+    }
+
+    #[test]
+    fn a_modified_builtin_with_missing_history_never_claims_to_be_stock() {
+        let mut manifest = crate::builtin::stock("room-info").unwrap();
+        let pristine = parse_with_history(&try_to_text(&manifest).unwrap()).unwrap();
+        assert_eq!(pristine.history.last().unwrap().version.origin, VersionOrigin::Stock);
+        manifest.source.push_str("\n// locally modified");
+        let modified = parse_with_history(&try_to_text(&manifest).unwrap()).unwrap();
+        let version = &modified.history.last().unwrap().version;
+        assert_eq!(version.origin, VersionOrigin::Legacy);
+        assert_eq!(version.at_unix, 0);
+        assert!(version.actor.is_none());
+        assert!(matches!(&version.acquired_from,
+            Some(AcquisitionSource::BuiltIn { app_id }) if app_id == "room-info"));
+    }
+
+    #[test]
+    fn damaged_history_is_reported_on_export() {
+        let mut manifest = sample();
+        manifest.id = "portable-history-damaged".into();
+        let version = new_version(&manifest, VersionOrigin::Manual, "", Some("missing-parent"), 1_784_907_124, 0);
+        manifest.current_version = Some(crate::persistence::append_version(&manifest, version).unwrap());
+        assert!(try_to_text(&manifest).unwrap_err().contains("missing parent"));
+        crate::persistence::remove_user_app(&manifest.id);
     }
 
     #[test]

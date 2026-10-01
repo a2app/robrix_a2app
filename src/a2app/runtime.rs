@@ -30,7 +30,7 @@ use a2app_core::services::{
 };
 #[cfg(unix)]
 use a2app_core::services::AppToolRequest;
-use a2app_core::versions::{self, VersionOrigin};
+use a2app_core::versions::{self, AcquisitionSource, VersionActor, VersionOrigin};
 use a2app_agent::intent::Intent;
 use a2app_agent::pipeline::{GenOutcome, Generation};
 use a2app_agent::prefs::AgentPrefs;
@@ -400,6 +400,7 @@ struct PendingGeneratedApp {
     context: a2app_core::information_flow::ContextId,
     epoch: u64,
     request: String,
+    attribution: Option<(Option<VersionActor>, AcquisitionSource)>,
     action_target: Option<String>,
     review_id: Option<u64>,
 }
@@ -442,6 +443,10 @@ impl Drop for PendingGeneratedApp {
 /// All a2app state, owned by the UI thread.
 pub struct A2AppState {
     pub registry: AppRegistry,
+    /// Local imports keyed by account, room, and event ID or media URI.
+    imported_room_apps: HashMap<(String, String, String), MiniAppId>,
+    room_imports: HashMap<String, u64>,
+    next_room_import: u64,
     pub permissions: PermissionStore,
     pub persisted: A2AppPersistedState,
     pub broker: Broker,
@@ -458,6 +463,7 @@ pub struct A2AppState {
     pub generation: Option<Generation>,
     pending_generated: Option<PendingGeneratedApp>,
     pub generation_context: Option<a2app_core::information_flow::ContextId>,
+    generation_attribution: Option<(Option<VersionActor>, AcquisitionSource)>,
     generation_epoch: Option<u64>,
     pub console: GenConsole,
     /// The request text of a failed generation, offered for Retry.
@@ -558,6 +564,13 @@ impl A2AppState {
     pub fn is_running(&self, app_id: &str) -> bool {
         instances::is_running(app_id)
     }
+
+    fn clear_adopted_builtin_update(&mut self, manifest: &MiniAppManifest) {
+        if manifest.builtin && builtin::stock(&manifest.id).is_some_and(|stock| builtin::matches_default(manifest, &stock)) {
+            self.persisted.builtin_updates.remove(&manifest.id);
+            self.registry_dirty = true;
+        }
+    }
 }
 
 /// One-time startup: loads all persisted a2app state into the thread-local.
@@ -568,26 +581,42 @@ pub fn init() {
     }
 
     let mut registry = AppRegistry::new(builtin::builtin_apps());
-    // A user's saved copy shadows the stock one; a built-in updated in this
-    // build only reaches copies still following stock.
-    for mut app in persistence::load_user_apps() {
-        let following_stock = match &app.current_version {
-            None => true,
-            Some(stamp) => persistence::load_version(&app.id, stamp)
-                .is_some_and(|(v, _)| v.origin == VersionOrigin::Stock),
-        };
-        if let Some(stock) = builtin::stock(&app.id)
-            && app.builtin && following_stock && stock.source != app.source
-        {
-            app = on_stock(app, stock);
-            if let Err(e) = persistence::save_user_app(&app) {
-                error!("Failed to save the updated stock copy of {}: {e}", app.id);
-            }
-        }
+    for app in persistence::load_user_apps() {
         registry.insert(app);
     }
+    let mut persisted = persistence::load_registry_state();
+    let builtin_ids: Vec<MiniAppId> = registry.iter().filter(|app| app.builtin).map(|app| app.id.clone()).collect();
+    for app_id in builtin_ids {
+        let Some(current) = registry.get(&app_id).cloned() else { continue };
+        let Some(stock) = builtin::stock(&app_id) else { continue };
+        match builtin::reconcile_builtin_with_host(
+            &current, &stock, persisted.builtin_baselines.get(&app_id),
+            persisted.builtin_updates.get(&app_id).map(String::as_str), versions::now_unix(), utc_offset_secs(),
+            Some(env!("CARGO_PKG_VERSION")), Some(env!("ROBRIX_GIT_COMMIT_HASH")),
+        ) {
+            Ok(update) => {
+                if update.adopted_default || current.current_version != update.manifest.current_version
+                    || !persistence::has_app_files(&app_id)
+                {
+                    if let Err(error) = persistence::save_user_app(&update.manifest) {
+                        error!("Could not save the bundled mini-app update for {app_id}: {error}");
+                        continue;
+                    }
+                }
+                persisted.builtin_baselines.insert(app_id.clone(), update.baseline);
+                match update.available_update {
+                    Some(stamp) => { persisted.builtin_updates.insert(app_id.clone(), stamp); }
+                    None => { persisted.builtin_updates.remove(&app_id); }
+                }
+                registry.insert(update.manifest);
+            }
+            Err(error) => error!("Could not record the bundled mini-app update for {app_id}: {error}"),
+        }
+    }
+    if let Err(error) = persistence::save_registry_state(&persisted) {
+        error!("Could not save bundled mini-app update tracking: {error}");
+    }
     let permissions = persistence::load_permissions();
-    let persisted = persistence::load_registry_state();
     a2app_core::permissions::publish_snapshot(permissions.snapshot(&registry));
     crate::a2app::matrix::publish_permission_policy(&permissions);
 
@@ -598,6 +627,9 @@ pub fn init() {
 fn initialize_state(registry: AppRegistry, permissions: PermissionStore, persisted: A2AppPersistedState, agent_prefs: a2app_agent::prefs::AgentPrefs) {
     A2APP.with(|state| {
         *state.borrow_mut() = Some(A2AppState {
+            imported_room_apps: index_room_imports(&registry),
+            room_imports: HashMap::new(),
+            next_room_import: 0,
             registry,
             permissions,
             persisted,
@@ -609,6 +641,7 @@ fn initialize_state(registry: AppRegistry, permissions: PermissionStore, persist
             generation: None,
             pending_generated: None,
             generation_context: None,
+            generation_attribution: None,
             generation_epoch: None,
             console: GenConsole::default(),
             failed_request: None,
@@ -685,7 +718,25 @@ pub enum A2AppOp {
     RemoveBackgroundTask(u64),
     Export(MiniAppId),
     ImportText(String),
-    ImportRoomBundle { text: String, room_id: Option<OwnedRoomId> },
+    ImportRoomBundle { text: String, room_id: Option<OwnedRoomId>, event_id: Option<OwnedEventId>, sender_id: String, sender_name: String, shared_at_unix: Option<u64> },
+    ImportRoomAttachment {
+        media_source: matrix_sdk::ruma::events::room::MediaSource,
+        filename: String,
+        size: Option<u64>,
+        room_id: OwnedRoomId,
+        event_id: Option<OwnedEventId>,
+        sender_id: String,
+        sender_name: String,
+        shared_at_unix: Option<u64>,
+    },
+    RoomAttachmentDownloaded {
+        request_id: u64,
+        media_uri: String,
+        account: String,
+        actor: Option<VersionActor>,
+        source: AcquisitionSource,
+        text: Result<String, String>,
+    },
     ImportFile(PathBuf),
     /// Makes an archived version the working copy; every other version stays.
     SwitchVersion { app_id: MiniAppId, stamp: String },
@@ -936,6 +987,7 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     if let Event::Actions(actions) = event {
         for action in actions {
             if matches!(action.downcast_ref(), Some(crate::logout::logout_confirm_modal::LogoutAction::ClearAppState { .. })) {
+                with_a2app(|state| state.room_imports.clear());
                 super::background::suspend(cx, true);
                 super::room_watch::stop_all();
                 with_a2app(|state| state.watched_rooms.clear());
@@ -945,6 +997,7 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
                 invalidate_policy_spaces(cx);
             }
             if matches!(action.downcast_ref(), Some(crate::login::login_screen::LoginAction::LoginSuccess)) {
+                with_a2app(|state| state.room_imports.clear());
                 super::background::suspend(cx, false);
                 super::room_watch::stop_all();
                 with_a2app(|state| state.watched_rooms.clear());
@@ -1651,12 +1704,29 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 enqueue_popup_notification("Built-in mini-apps can't be uninstalled.", PopupKind::Warning, Some(4.0));
                 return;
             }
+            let archived_bundle = match bundle::try_to_text(&manifest) {
+                Ok(bundle) => bundle,
+                Err(error) => {
+                    enqueue_popup_notification(format!("Could not archive this mini-app's complete history: {error}"), PopupKind::Error, Some(6.0));
+                    return;
+                }
+            };
+            let archived = with_a2app(|state| {
+                let mut archived = state.persisted.clone();
+                archived.archived.retain(|app| app.id != app_id);
+                archived.archived.push(manifest.clone());
+                archived.archived_bundles.insert(app_id.clone(), archived_bundle);
+                archived
+            });
+            let Some(archived) = archived else { return };
+            if let Err(error) = persistence::save_registry_state(&archived) {
+                enqueue_popup_notification(format!("Could not save the archived history: {error}"), PopupKind::Error, Some(6.0));
+                return;
+            }
             stop_app_everywhere(cx, ui, &app_id);
             with_a2app(|state| {
-                // A generated/imported app exists nowhere else; keep the
-                // manifest so uninstall isn't destruction.
-                state.persisted.archived.retain(|a| a.id != app_id);
-                state.persisted.archived.push(manifest.clone());
+                state.persisted = archived;
+                state.imported_room_apps.retain(|_, installed| installed != &app_id);
                 state.registry.remove(&app_id);
                 state.permissions.remove_app(&app_id);
                 state.foreground_app.take_if(|f| *f == app_id);
@@ -1686,7 +1756,10 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
         }
         A2AppOp::Export(app_id) => {
             let Some(Some(manifest)) = with_a2app(|state| state.registry.get(&app_id).cloned()) else { return };
-            let text = bundle::to_text(&manifest);
+            let text = match bundle::try_to_text(&manifest) {
+                Ok(text) => text,
+                Err(error) => { enqueue_popup_notification(format!("Export failed: {error}"), PopupKind::Error, Some(5.0)); return; }
+            };
             cx.copy_to_clipboard(&text);
             match bundle::write_export(&manifest) {
                 Ok(path) => enqueue_popup_notification(
@@ -1699,21 +1772,69 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 ),
             }
         }
-        A2AppOp::ImportText(text) => install_import(cx, ui, bundle::parse(&text), None),
-        A2AppOp::ImportRoomBundle { text, room_id } => install_import(cx, ui, bundle::parse(&text), room_id.as_deref()),
+        A2AppOp::ImportText(text) => {
+            let actor = current_version_actor(cx);
+            install_import(cx, ui, bundle::parse_with_history(&text), AcquisitionSource::Clipboard, actor);
+        }
+        A2AppOp::ImportRoomBundle { text, room_id, event_id, sender_id, sender_name, shared_at_unix } => {
+            let actor = current_version_actor(cx);
+            let source = match room_id {
+                Some(room_id) => AcquisitionSource::RoomAttachment {
+                    room_id: room_id.to_string(), event_id: event_id.map(|id| id.to_string()),
+                    media_uri: None, file_name: "Shared mini-app".into(), shared_at_unix,
+                    sender: Some(VersionActor { user_id: sender_id, display_name: Some(sender_name) }),
+                },
+                None => AcquisitionSource::Clipboard,
+            };
+            install_import(cx, ui, bundle::parse_with_history(&text), source, actor);
+        }
+        A2AppOp::ImportRoomAttachment { media_source, filename, size, room_id, event_id, sender_id, sender_name, shared_at_unix } => {
+            start_room_import(cx, ui, media_source, filename, size, room_id, event_id, sender_id, sender_name, shared_at_unix);
+        }
+        A2AppOp::RoomAttachmentDownloaded { request_id, media_uri, account, actor, source, text } => {
+            let pending = with_a2app(|state| {
+                if state.room_imports.get(&media_uri) != Some(&request_id) { return false; }
+                state.room_imports.remove(&media_uri);
+                true
+            }).unwrap_or(false);
+            if !pending { return; }
+            if crate::sliding_sync::current_user_id().is_none_or(|id| id.as_str() != account) {
+                enqueue_popup_notification("The account changed before the mini-app finished downloading. Add it again from this account.", PopupKind::Info, Some(5.0));
+                ui.redraw(cx);
+                return;
+            }
+            install_import(cx, ui, text.and_then(|text| bundle::parse_with_history(&text)), source, actor);
+            ui.redraw(cx);
+        }
         A2AppOp::ImportFile(path) => {
-            let parsed = std::fs::read_to_string(&path)
+            let parsed = std::fs::metadata(&path)
                 .map_err(|e| format!("Couldn't read that file: {e}"))
-                .and_then(|text| bundle::parse(&text));
-            install_import(cx, ui, parsed, None);
+                .and_then(|metadata| if metadata.len() > bundle::MAX_BUNDLE_BYTES as u64 {
+                    Err("That mini-app file is too large.".into())
+                } else { std::fs::read_to_string(&path).map_err(|e| format!("Couldn't read that file: {e}")) })
+                .and_then(|text| bundle::parse_with_history(&text));
+            let file_name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let actor = current_version_actor(cx);
+            let path = path.canonicalize().unwrap_or(path).to_string_lossy().into_owned();
+            install_import(cx, ui, parsed, AcquisitionSource::File { file_name, path: Some(path) }, actor);
         }
         A2AppOp::SwitchVersion { app_id, stamp } => {
+            let actor = current_version_actor(cx);
             let switched = with_a2app(|state| {
                 let mut manifest = state.registry.get(&app_id).cloned()?;
                 let (version, source) = persistence::load_version(&app_id, &stamp)?;
-                archive_current(&mut manifest);
+                if let Err(error) = archive_current(&mut manifest) {
+                    enqueue_popup_notification(error, PopupKind::Error, Some(5.0));
+                    return None;
+                }
                 let label = versions::label_for(version.at_unix, utc_offset_secs());
-                Some((version.apply_to(&manifest, source), label))
+                let mut updated = version.apply_to(&manifest, source);
+                let note = format!("Restored version {} from {label}", version.stamp);
+                if let Err(error) = commit_version(&mut updated, VersionOrigin::Restore, &note, actor, None) {
+                    enqueue_popup_notification(error, PopupKind::Error, Some(5.0));
+                    return None;
+                }
+                Some((updated, label))
             }).flatten();
             match switched {
                 Some((updated, label)) => {
@@ -1736,22 +1857,30 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 enqueue_popup_notification(error, PopupKind::Error, Some(6.0));
                 return;
             }
-            archive_current(&mut base);
+            if let Err(error) = archive_current(&mut base) {
+                enqueue_popup_notification(error, PopupKind::Error, Some(5.0));
+                return;
+            }
             let mut updated = a2app_core::manifest::rewritten(&base, source);
-            commit_version(&mut updated, VersionOrigin::Manual, "Edited by hand");
+            if let Err(error) = commit_version(&mut updated, VersionOrigin::Manual, "Edited by hand", current_version_actor(cx), None) {
+                enqueue_popup_notification(error, PopupKind::Error, Some(5.0));
+                return;
+            }
             install_version(cx, ui, updated, String::from("Saved your edit as a new version."));
         }
         A2AppOp::ResetToStock(app_id) => {
+            let actor = current_version_actor(cx);
             let reset = with_a2app(|state| {
                 let current = state.registry.get(&app_id).cloned()?;
                 let stock = builtin::stock(&app_id)?;
-                if current.source == stock.source {
+                if builtin::matches_default(&current, &stock) {
                     return Some(None);
                 }
-                Some(Some(on_stock(current, stock)))
+                Some(Some(on_stock(current, stock, actor)))
             }).flatten();
             match reset {
-                Some(Some(updated)) => install_version(cx, ui, updated, String::from("Back on the stock version.")),
+                Some(Some(Ok(updated))) => install_version(cx, ui, updated, String::from("Back on the stock version.")),
+                Some(Some(Err(error))) => enqueue_popup_notification(error, PopupKind::Error, Some(5.0)),
                 Some(None) => enqueue_popup_notification("This app is already on its stock version.", PopupKind::Info, Some(3.0)),
                 None => enqueue_popup_notification("Only built-in apps have a stock version.", PopupKind::Error, Some(4.0)),
             }
@@ -1762,7 +1891,7 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 robius_share::ShareSheet::new()
                     .set_title(format!("{} mini-app", manifest.name))
                     .set_subject(bundle::share_caption(&manifest))
-                    .add_file_with_mime_type(&path, "application/json")
+                    .add_file_with_mime_type(&path, bundle::BUNDLE_MIME)
                     .share()
                     .map_err(|e| format!("couldn't open the share sheet: {e}"))
             });
@@ -2038,9 +2167,13 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 return;
             }
             let Some(Some(manifest)) = with_a2app(|state| state.registry.get(&app_id).cloned()) else { return };
+            let bundle_json = match bundle::try_to_text(&manifest) {
+                Ok(text) => text,
+                Err(error) => { enqueue_popup_notification(format!("Sharing failed: {error}"), PopupKind::Error, Some(5.0)); return; }
+            };
             submit_async_request(MatrixRequest::A2App(A2AppMatrixRequest::ShareApp {
                 room_id,
-                bundle_json: bundle::to_text(&manifest),
+                bundle_json,
                 app_name: manifest.name.clone(),
             }));
         }
@@ -2065,25 +2198,134 @@ fn ensure_source_owner(source: &a2app_core::information_flow::Source) -> Result<
     else { Err("Switch to the source's account before changing its sharing rules.".into()) }
 }
 
-fn install_import(cx: &mut Cx, ui: &WidgetRef, parsed: Result<MiniAppManifest, String>, source_room: Option<&RoomId>) {
-    let installed = parsed.and_then(|mut manifest| {
+/// Reads a cached display name while keeping the Matrix ID as stable attribution.
+fn current_version_actor(cx: &mut Cx) -> Option<VersionActor> {
+    let user_id = crate::sliding_sync::current_user_id()?;
+    let display_name = crate::profile::user_profile_cache::with_user_profile(
+        cx, user_id.clone(), None, false, |profile, _| profile.username.clone(),
+    ).flatten();
+    Some(VersionActor { user_id: user_id.to_string(), display_name })
+}
+
+fn index_room_imports(registry: &AppRegistry) -> HashMap<(String, String, String), MiniAppId> {
+    let mut index = HashMap::new();
+    for app in registry.iter() {
+        for version in persistence::list_versions(&app.id) {
+            index_room_import(&mut index, &app.id, &version);
+        }
+    }
+    index
+}
+
+fn index_room_import(index: &mut HashMap<(String, String, String), MiniAppId>, app_id: &str, version: &versions::AppVersion) {
+    if version.imported { return; }
+    let Some(actor) = &version.actor else { return };
+    if let Some(AcquisitionSource::RoomAttachment { room_id, event_id, media_uri, .. }) = &version.acquired_from {
+        for transfer in event_id.iter().chain(media_uri.iter()) {
+            index.insert((actor.user_id.clone(), room_id.clone(), transfer.clone()), app_id.into());
+        }
+    }
+}
+
+/// The local copy added from this room event or file, including after restart.
+pub fn imported_room_app(room_id: &RoomId, event_id: Option<&matrix_sdk::ruma::EventId>, media_uri: &str) -> Option<MiniAppManifest> {
+    let account = crate::sliding_sync::current_user_id()?.to_string();
+    with_a2app(|state| {
+        event_id.map(|id| id.as_str()).into_iter().chain(std::iter::once(media_uri))
+            .find_map(|transfer| state.imported_room_apps.get(&(account.clone(), room_id.to_string(), transfer.into()))
+                .and_then(|id| state.registry.get(id)).cloned())
+    }).flatten()
+}
+
+pub fn is_room_import_pending(media_uri: &str) -> bool {
+    with_a2app(|state| state.room_imports.contains_key(media_uri)).unwrap_or(false)
+}
+
+fn start_room_import(
+    cx: &mut Cx, ui: &WidgetRef,
+    media_source: matrix_sdk::ruma::events::room::MediaSource, filename: String, size: Option<u64>,
+    room_id: OwnedRoomId, event_id: Option<OwnedEventId>, sender_id: String, sender_name: String, shared_at_unix: Option<u64>,
+) {
+    use crate::shared::attachment_download::{media_source_mxc, MediaDownloadResult};
+    let media_uri = media_source_mxc(&media_source).to_string();
+    if imported_room_app(&room_id, event_id.as_deref(), &media_uri).is_some() {
+        enqueue_popup_notification("This mini-app is already in your mini-apps.", PopupKind::Info, Some(3.0));
+        ui.redraw(cx);
+        return;
+    }
+    if size.is_some_and(|bytes| bytes > bundle::MAX_BUNDLE_BYTES as u64) {
+        enqueue_popup_notification("That mini-app file is too large.", PopupKind::Error, Some(5.0));
+        return;
+    }
+    let Some(account) = crate::sliding_sync::current_user_id().map(|id| id.to_string()) else {
+        enqueue_popup_notification("Sign in before adding a shared mini-app.", PopupKind::Error, Some(5.0));
+        return;
+    };
+    let actor = current_version_actor(cx);
+    let source = AcquisitionSource::RoomAttachment {
+        room_id: room_id.to_string(), event_id: event_id.map(|id| id.to_string()),
+        media_uri: Some(media_uri.clone()), file_name: filename.clone(), shared_at_unix,
+        sender: Some(VersionActor { user_id: sender_id, display_name: Some(sender_name) }),
+    };
+    let request_id = with_a2app(|state| {
+        if state.room_imports.contains_key(&media_uri) { return None; }
+        state.next_room_import = state.next_room_import.checked_add(1)?;
+        state.room_imports.insert(media_uri.clone(), state.next_room_import);
+        Some(state.next_room_import)
+    }).flatten();
+    let Some(request_id) = request_id else { return };
+    submit_async_request(MatrixRequest::DownloadMedia {
+        media_source, filename,
+        on_download_result: Box::new(move |result| {
+            let text = match result {
+                MediaDownloadResult::Downloaded(bytes) if bytes.len() <= bundle::MAX_BUNDLE_BYTES =>
+                    String::from_utf8(bytes).map_err(|_| "That mini-app file is not UTF-8 text.".into()),
+                MediaDownloadResult::Downloaded(_) => Err("That mini-app file is too large.".into()),
+                MediaDownloadResult::Failed(error) => Err(format!("Couldn't download the mini-app: {error}")),
+                MediaDownloadResult::Cancelled => Err("The mini-app download was cancelled. Try adding it again.".into()),
+            };
+            Cx::post_action(A2AppOp::RoomAttachmentDownloaded { request_id, media_uri, account, actor, source, text });
+        }),
+    });
+    ui.redraw(cx);
+}
+
+fn install_import(
+    cx: &mut Cx, ui: &WidgetRef, parsed: Result<bundle::ImportedBundle, String>,
+    source: AcquisitionSource, actor: Option<VersionActor>,
+) {
+    let installed = parsed.and_then(|imported| {
         with_a2app(|state| {
+            let mut manifest = imported.manifest;
             // New identity never overwrites another app or its provenance.
             let taken: Vec<MiniAppId> = state.registry.iter().map(|a| a.id.clone()).collect();
-            manifest.id = unique_import_id(&manifest.id, &taken);
+            let suggested_id = manifest.id.clone();
+            manifest.id = unique_import_id(&suggested_id, &taken);
             let context = super::information_flow::app_context(&manifest.id, None)?;
             a2app_core::information_flow::register_context(&context)?;
             // Selecting a unique installed id also depends on account inventory.
             let mut sources = vec![super::information_flow::account_source(&context)];
-            if let Some(room) = source_room {
-                sources.push(super::information_flow::room_source(&context, room.as_str()));
+            if let AcquisitionSource::RoomAttachment { room_id, .. } = &source {
+                sources.push(super::information_flow::room_source(&context, room_id));
             }
             a2app_core::information_flow::add_sources(&context, sources)?;
             a2app_core::information_flow::add_influences(&context, [a2app_core::information_flow::Influence::MiniApp {
                 account: super::information_flow::context_account(&context).into(), app: manifest.id.clone(),
             }])?;
             a2app_core::information_flow::record_app_code_from(&manifest.id, &context)?;
+            persistence::import_history(&mut manifest, &imported.history, imported.current_version.as_deref())
+                .map_err(|error| error.to_string())?;
+            let (origin, note) = match &source {
+                AcquisitionSource::Clipboard => (VersionOrigin::Import, "Added from clipboard or pasted text"),
+                AcquisitionSource::File { .. } => (VersionOrigin::Import, "Imported from a file"),
+                AcquisitionSource::RoomAttachment { .. } => (VersionOrigin::Import, "Added from a room message"),
+                _ => (VersionOrigin::Import, "Imported"),
+            };
+            commit_version(&mut manifest, origin, note, actor, Some(source))?;
             persistence::save_user_app(&manifest).map_err(|error| error.to_string())?;
+            if let Some(stamp) = manifest.current_version.as_deref()
+                && let Some((version, _)) = persistence::load_version(&manifest.id, stamp)
+            { index_room_import(&mut state.imported_room_apps, &manifest.id, &version); }
             state.registry.insert(manifest.clone());
             Ok(manifest)
         }).unwrap_or_else(|| Err("Mini-app state is unavailable.".into()))
@@ -2092,7 +2334,7 @@ fn install_import(cx: &mut Cx, ui: &WidgetRef, parsed: Result<MiniAppManifest, S
         Ok(manifest) => {
             publish_grants(cx);
             enqueue_popup_notification(
-                format!("Installed \"{}\".", manifest_name_for_popup(&manifest)),
+                format!("Added \"{}\" to your mini-apps.", manifest_name_for_popup(&manifest)),
                 PopupKind::Success, Some(4.0),
             );
             ui.redraw(cx);
@@ -2119,13 +2361,13 @@ fn manifest_name_for_popup(manifest: &MiniAppManifest) -> String {
 }
 
 fn unique_import_id(base: &str, taken: &[MiniAppId]) -> MiniAppId {
-    if !taken.iter().any(|t| t == base) {
+    if !taken.iter().any(|t| t == base) && !persistence::has_app_files(base) {
         return base.to_string();
     }
     let mut n = 2;
     loop {
         let candidate = format!("{base}-{n}");
-        if !taken.contains(&candidate) {
+        if !taken.contains(&candidate) && !persistence::has_app_files(&candidate) {
             return candidate;
         }
         n += 1;
@@ -2148,6 +2390,7 @@ fn start_generation(
         return;
     }
     let mut failed = None;
+    let actor = current_version_actor(cx);
     with_a2app(|state| {
         if state.generation.is_some() {
             enqueue_popup_notification("A generation is already running.", PopupKind::Warning, Some(3.0));
@@ -2203,7 +2446,13 @@ fn start_generation(
         let generation = match refine_target.and_then(|id| state.registry.get(&id).cloned()) {
             Some(mut base) => {
                 // The state being rewritten stays reachable as a version.
-                archive_current(&mut base);
+                if let Err(error) = archive_current(&mut base) {
+                    state.console.status = error.clone();
+                    state.console.active = true;
+                    enqueue_popup_notification(error.clone(), PopupKind::Error, Some(6.0));
+                    failed = Some(error);
+                    return;
+                }
                 state.registry.insert(base.clone());
                 Generation::start_refine(request.clone(), base, state.agent_prefs.clone(), Some(context.clone()))
             }
@@ -2211,6 +2460,10 @@ fn start_generation(
         };
         match generation {
             Ok(generation) => {
+                state.generation_attribution = Some((actor, AcquisitionSource::Generated {
+                    model: a2app_agent::model_transport::current_recipient(&state.agent_prefs).ok().map(|recipient| recipient.label),
+                    room_id: room_id.as_ref().map(ToString::to_string),
+                }));
                 state.generation = Some(generation);
                 state.generation_epoch = a2app_core::information_flow::context_epoch(&context).ok();
                 state.generation_context = Some(context);
@@ -2285,7 +2538,7 @@ fn advance_generation(cx: &mut Cx, ui: &WidgetRef) {
                 let action_target = state.ai_generation_room.as_ref().map(ToString::to_string);
                 #[cfg(not(unix))]
                 let action_target = None;
-                Ok(PendingGeneratedApp { manifest, refine_of, context, epoch, request, action_target, review_id: None })
+                Ok(PendingGeneratedApp { manifest, refine_of, context, epoch, request, attribution: state.generation_attribution.take(), action_target, review_id: None })
             }).unwrap_or_else(|| Err("Mini-app state is unavailable.".into()));
             match pending {
                 Ok(pending) => finish_generated_app(cx, ui, pending),
@@ -2317,8 +2570,9 @@ fn finish_generated_app(cx: &mut Cx, ui: &WidgetRef, mut pending: PendingGenerat
     let result = with_a2app(|state| -> Result<(), String> {
         super::information_flow::current_context(&pending.context)?;
         a2app_core::information_flow::ensure_context_epoch(&pending.context, pending.epoch)?;
-        if pending.refine_of.is_none() && state.registry.get(&pending.manifest.id).is_some() {
-            return Err("Another app now uses this generated app's ID. Start a new generation; this reviewed build cannot replace it.".into());
+        if pending.refine_of.is_none() && (state.registry.get(&pending.manifest.id).is_some()
+            || persistence::has_app_files(&pending.manifest.id)) {
+            return Err("Another saved app now uses this generated app's ID. Start a new generation; this reviewed build cannot replace it.".into());
         }
         if let Some(action) = pending.action() {
             let approval = pending.commit_review(a2app_core::information_flow::commit_exact_action_for_activation);
@@ -2338,8 +2592,11 @@ fn finish_generated_app(cx: &mut Cx, ui: &WidgetRef, mut pending: PendingGenerat
         a2app_core::information_flow::register_context_with_legacy_data(&to, legacy)?;
         a2app_core::information_flow::transfer(&pending.context, &to)?;
         a2app_core::information_flow::record_app_code_from(&pending.manifest.id, &pending.context)?;
-        commit_version(&mut pending.manifest, VersionOrigin::Ai, &pending.request);
+        let (actor, source) = pending.attribution.clone().map(|(actor, source)| (actor, Some(source)))
+            .unwrap_or((None, None));
+        commit_version(&mut pending.manifest, VersionOrigin::Ai, &pending.request, actor, source)?;
         persistence::save_user_app(&pending.manifest).map_err(|_| "Could not save the reviewed mini-app.".to_string())?;
+        state.clear_adopted_builtin_update(&pending.manifest);
         state.registry.insert((*pending.manifest).clone());
         state.generation = None;
         state.generation_context = None; state.generation_epoch = None;
@@ -2376,6 +2633,7 @@ fn finish_generated_app(cx: &mut Cx, ui: &WidgetRef, mut pending: PendingGenerat
     }
     publish_grants(cx);
     let was_running = stop_for_restart(cx, ui, &pending.manifest);
+    cx.action(A2AppRuntimeAction::VersionsChanged(pending.manifest.id.clone()));
     #[cfg(unix)]
     {
         let summary = serde_json::json!({ "app_id": pending.manifest.id, "name": pending.manifest.name, "status": "installed_and_running" });
@@ -2879,63 +3137,72 @@ pub fn open_event_in_room(cx: &mut Cx, room_id: OwnedRoomId, event_id: OwnedEven
 }
 
 /// Archives the working copy as a new version and points the app at it.
-fn commit_version(manifest: &mut MiniAppManifest, origin: VersionOrigin, note: &str) {
-    let parent = manifest.current_version.take();
-    let version = versions::new_version(
+fn commit_version(
+    manifest: &mut MiniAppManifest, origin: VersionOrigin, note: &str,
+    actor: Option<VersionActor>, acquired_from: Option<AcquisitionSource>,
+) -> Result<(), String> {
+    let parent = manifest.current_version.clone();
+    let mut version = versions::new_version(
         manifest, origin, note, parent.as_deref(), versions::now_unix(), utc_offset_secs(),
     );
-    match persistence::append_version(manifest, version) {
-        Ok(stamp) => manifest.current_version = Some(stamp),
-        Err(e) => {
-            error!("Failed to archive a version of {}: {e}", manifest.id);
-            manifest.current_version = parent;
-        }
-    }
+    version.actor = actor;
+    version.host_version = Some(env!("CARGO_PKG_VERSION").into());
+    version.host_revision = Some(env!("ROBRIX_GIT_COMMIT_HASH")).filter(|revision| !revision.is_empty()).map(str::to_string);
+    version.acquired_from = acquired_from.or(version.acquired_from);
+    manifest.current_version = Some(persistence::append_version(manifest, version)
+        .map_err(|error| format!("Could not save this mini-app's history: {error}"))?);
+    Ok(())
 }
 
 /// Before the working copy gets replaced: makes sure it is a version, so it
 /// stays reachable. A pristine built-in archives as its stock version.
-fn archive_current(manifest: &mut MiniAppManifest) {
+fn archive_current(manifest: &mut MiniAppManifest) -> Result<(), String> {
     let pristine = manifest.builtin
-        && builtin::stock(&manifest.id).is_some_and(|stock| stock.source == manifest.source);
+        && builtin::stock(&manifest.id).is_some_and(|stock| builtin::matches_default(manifest, &stock));
     let (origin, note) = if pristine {
         (VersionOrigin::Stock, "Stock")
     } else {
         (VersionOrigin::Legacy, "Before version history")
     };
-    if let Err(e) = persistence::ensure_current_version(
-        manifest, origin, note, versions::now_unix(), utc_offset_secs(),
-    ) {
-        error!("Failed to archive the current version of {}: {e}", manifest.id);
-    }
+    persistence::ensure_current_version(manifest, origin, note, 0, 0)
+        .map_err(|error| format!("Could not save this mini-app's initial history: {error}"))
 }
 
-/// `current` put on this build's stock source. An archived stock version
-/// with that exact source is reused rather than duplicated.
-fn on_stock(mut current: MiniAppManifest, mut stock: MiniAppManifest) -> MiniAppManifest {
-    archive_current(&mut current);
-    let archived = persistence::list_versions(&current.id).into_iter()
-        .filter(|v| v.origin == VersionOrigin::Stock)
-        .filter_map(|v| persistence::load_version(&current.id, &v.stamp))
-        .find(|(_, source)| *source == stock.source);
-    match archived {
-        Some((version, source)) => version.apply_to(&current, source),
-        None => {
-            stock.scope = current.scope;
-            stock.current_version = current.current_version;
-            commit_version(&mut stock, VersionOrigin::Stock, "Stock");
-            stock
+/// Ensures the current app has an initial history record before showing it.
+pub fn ensure_app_history(app_id: &str) {
+    with_a2app(|state| {
+        if let Some(mut manifest) = state.registry.get(app_id).cloned() {
+            if let Err(error) = archive_current(&mut manifest) {
+                error!("{error}");
+                return;
+            }
+            state.registry.insert(manifest);
         }
-    }
+    });
+}
+
+/// Restores this build's stock source and records when that change happened.
+fn on_stock(mut current: MiniAppManifest, mut stock: MiniAppManifest, actor: Option<VersionActor>) -> Result<MiniAppManifest, String> {
+    archive_current(&mut current)?;
+    stock.scope = current.scope;
+    stock.current_version = current.current_version;
+    let source = AcquisitionSource::BuiltIn { app_id: stock.id.clone() };
+    let note = if actor.is_some() { "Reset to the built-in version" } else { "Updated built-in version" };
+    commit_version(&mut stock, VersionOrigin::Stock, note, actor, Some(source))?;
+    Ok(stock)
 }
 
 /// Makes `updated` the app's working copy: saved, registered, restarted
 /// where it runs, and announced.
 fn install_version(cx: &mut Cx, ui: &WidgetRef, updated: MiniAppManifest, done: String) {
-    if let Err(e) = persistence::save_user_app(&updated) {
-        error!("Failed to save mini-app {}: {e}", updated.id);
+    if let Err(error) = persistence::save_user_app(&updated) {
+        enqueue_popup_notification(format!("Could not save this mini-app: {error}"), PopupKind::Error, Some(5.0));
+        return;
     }
-    with_a2app(|state| state.registry.insert(updated.clone()));
+    with_a2app(|state| {
+        state.clear_adopted_builtin_update(&updated);
+        state.registry.insert(updated.clone());
+    });
     publish_grants(cx);
     let was_running = stop_for_restart(cx, ui, &updated);
     cx.action(A2AppRuntimeAction::VersionsChanged(updated.id.clone()));
@@ -7247,6 +7514,25 @@ mod permission_tests {
     const TARGET: &str = "!target:example.org";
     const SPACE: &str = "!space:example.org";
 
+    #[test]
+    fn adopting_the_complete_builtin_default_clears_its_pending_update() {
+        let stock = builtin::stock("roll-call").unwrap();
+        let mut customized = stock.clone();
+        customized.name = "My dice roller".into();
+        initialize_background_test(customized.clone());
+        with_a2app(|state| {
+            state.persisted.builtin_updates.insert(stock.id.clone(), "new-default".into());
+            state.clear_adopted_builtin_update(&customized);
+            assert!(state.persisted.builtin_updates.contains_key(&stock.id),
+                "matching code alone must not discard a metadata update");
+            let mut adopted = stock.clone();
+            adopted.scope = A2AppScope::Room { room_id: SOURCE.into() };
+            state.clear_adopted_builtin_update(&adopted);
+            assert!(!state.persisted.builtin_updates.contains_key(&stock.id));
+            assert!(state.registry_dirty);
+        });
+    }
+
     fn bridge(service: &str, args: serde_json::Value, room: Option<&str>) -> ParkedRequest {
         ParkedRequest::Bridge(Some(SplashHostRequest {
             app_tag: a2app_core::manifest::instance_tag("permission-test", room),
@@ -7256,6 +7542,68 @@ mod permission_tests {
             args_json: args.to_string(),
             may_prompt: true,
         }))
+    }
+
+    #[test]
+    fn version_commit_records_editor_acquisition_and_parent() {
+        let mut manifest = builtin::stock("room-peek").unwrap();
+        manifest.id = "runtime-provenance-version".into();
+        manifest.builtin = false;
+        let actor = VersionActor { user_id: "@editor:example.org".into(), display_name: Some("Editor".into()) };
+        let source = AcquisitionSource::File { file_name: "app.splashapp".into(), path: Some("/Downloads/app.splashapp".into()) };
+        commit_version(&mut manifest, VersionOrigin::Import, "Imported", Some(actor.clone()), Some(source.clone())).unwrap();
+        let original = manifest.current_version.clone().unwrap();
+        manifest.source.push_str("\n// edited\n");
+        commit_version(&mut manifest, VersionOrigin::Manual, "Changed by hand", Some(actor.clone()), None).unwrap();
+        let (edited, code) = persistence::load_version(&manifest.id, manifest.current_version.as_deref().unwrap()).unwrap();
+        assert_eq!(edited.parent.as_deref(), Some(original.as_str()));
+        assert_eq!(edited.actor, Some(actor.clone()));
+        assert!(!edited.imported);
+        assert!(edited.at_unix > 0);
+        assert_eq!(edited.host_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(edited.host_revision.as_deref(), Some(env!("ROBRIX_GIT_COMMIT_HASH")).filter(|revision| !revision.is_empty()));
+        assert_eq!(code, manifest.source);
+        let (imported, original_code) = persistence::load_version(&manifest.id, &original).unwrap();
+        assert_eq!(imported.acquired_from, Some(source));
+        let mut restored = imported.apply_to(&manifest, original_code);
+        commit_version(&mut restored, VersionOrigin::Restore, "Restored original", Some(actor), None).unwrap();
+        let (restoration, _) = persistence::load_version(&manifest.id, restored.current_version.as_deref().unwrap()).unwrap();
+        assert_eq!(restoration.origin, VersionOrigin::Restore);
+        assert_eq!(restoration.parent.as_deref(), Some(original.as_str()));
+        assert_eq!(persistence::list_versions(&manifest.id).len(), 3);
+        persistence::remove_user_app(&manifest.id);
+    }
+
+    #[test]
+    fn room_import_index_accepts_only_local_acquisitions() {
+        let manifest = builtin::stock("room-peek").unwrap();
+        let mut version = versions::new_version(&manifest, VersionOrigin::Import, "Added", None, 123, 0);
+        version.actor = Some(VersionActor { user_id: "@importer:example.org".into(), display_name: None });
+        version.acquired_from = Some(AcquisitionSource::RoomAttachment {
+            room_id: "!room:example.org".into(), event_id: Some("$event:example.org".into()),
+            media_uri: Some("mxc://example.org/file".into()), shared_at_unix: Some(100), file_name: "app.splashapp".into(),
+            sender: Some(VersionActor { user_id: "@sender:example.org".into(), display_name: None }),
+        });
+        let mut index = HashMap::new();
+        version.imported = true;
+        index_room_import(&mut index, "shared-copy", &version);
+        assert!(index.is_empty(), "shared claims cannot mark a file as locally imported");
+        version.imported = false;
+        index_room_import(&mut index, "local-copy", &version);
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.get(&("@importer:example.org".into(), "!room:example.org".into(), "mxc://example.org/file".into())), Some(&"local-copy".into()));
+        assert!(!index.keys().any(|key| key.0 == "@sender:example.org"));
+
+        let mut local = manifest.clone();
+        local.id = "runtime-room-import-restart".into();
+        local.builtin = false;
+        local.current_version = Some(persistence::append_version(&local, version).unwrap());
+        persistence::save_user_app(&local).unwrap();
+        let registry = AppRegistry::new(vec![local.clone()]);
+        let rebuilt = index_room_imports(&registry);
+        assert_eq!(rebuilt.get(&("@importer:example.org".into(), "!room:example.org".into(), "$event:example.org".into())), Some(&local.id));
+        assert_eq!(rebuilt.get(&("@importer:example.org".into(), "!room:example.org".into(), "mxc://example.org/file".into())), Some(&local.id));
+        persistence::remove_user_app(&local.id);
     }
 
     #[test]
@@ -7269,7 +7617,7 @@ mod permission_tests {
         registry.add_influences(&context, [flow::Influence::Model("provider".into())]).unwrap();
         let mut pending = PendingGeneratedApp {
             manifest: Box::new(a2app_core::builtin::stock("room-peek").unwrap()), refine_of: None,
-            context: context.clone(), epoch: registry.context_epoch(&context).unwrap(), request: "build fixture".into(),
+            context: context.clone(), epoch: registry.context_epoch(&context).unwrap(), request: "build fixture".into(), attribution: None,
             action_target: Some(SOURCE.into()), review_id: None,
         };
         assert!(pending.can_retain());

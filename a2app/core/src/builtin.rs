@@ -5,6 +5,174 @@
 //! show up on the next app launch without a rebuild.
 
 use crate::manifest::MiniAppManifest;
+use crate::versions::{VersionOrigin, VersionSnapshot};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// The latest shipped default recorded for an installed built-in app.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuiltinBaseline {
+    pub fingerprint: String,
+    pub stamp: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct BuiltinReconciliation {
+    pub manifest: MiniAppManifest,
+    pub baseline: BuiltinBaseline,
+    pub available_update: Option<String>,
+    pub adopted_default: bool,
+}
+
+/// Fingerprints the complete portable default, excluding installation state.
+pub fn builtin_fingerprint(manifest: &MiniAppManifest) -> Result<String, String> {
+    let mut permissions = manifest.permissions.iter().collect::<Vec<_>>();
+    permissions.sort();
+    permissions.dedup();
+    let mut capabilities = manifest.capabilities.iter().collect::<Vec<_>>();
+    capabilities.sort();
+    capabilities.dedup();
+    let bytes = serde_json::to_vec(&(
+        &manifest.name, &manifest.icon, manifest.tint, &manifest.description,
+        &manifest.source, &manifest.widget, manifest.allow_net, permissions,
+        &manifest.permission_reasons, capabilities, &manifest.shortcuts,
+    )).map_err(|error| format!("Could not fingerprint the built-in default: {error}"))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+pub fn matches_default(current: &MiniAppManifest, stock: &MiniAppManifest) -> bool {
+    match (builtin_fingerprint(current), builtin_fingerprint(stock)) {
+        (Ok(current), Ok(stock)) => current == stock,
+        _ => false,
+    }
+}
+
+fn snapshot_manifest(base: &MiniAppManifest, snapshot: &VersionSnapshot) -> MiniAppManifest {
+    let version = &snapshot.version;
+    MiniAppManifest {
+        name: version.name.clone(), icon: version.icon.clone(), tint: version.tint,
+        description: version.description.clone().unwrap_or_else(||
+            crate::header::parse_app_header(&snapshot.source).description.unwrap_or_default()),
+        source: snapshot.source.clone(), allow_net: version.allow_net,
+        permissions: version.permissions.clone(), permission_reasons: version.permission_reasons.clone(),
+        capabilities: version.capabilities.clone(), shortcuts: version.shortcuts.clone(),
+        widget: version.widget.clone(), current_version: Some(version.stamp.clone()),
+        ..base.clone()
+    }
+}
+
+fn local_stock_snapshot(id: &str, stamp: &str) -> Option<VersionSnapshot> {
+    crate::persistence::load_version(id, stamp).and_then(|(version, source)|
+        (version.origin == VersionOrigin::Stock && !version.imported)
+            .then_some(VersionSnapshot { version, source }))
+}
+
+fn migrate_default_declarations(manifest: &mut MiniAppManifest, stock: &MiniAppManifest) {
+    for permission in &stock.permissions {
+        if !manifest.permissions.contains(permission) { manifest.permissions.push(permission.clone()); }
+    }
+    for (permission, reason) in &stock.permission_reasons {
+        manifest.permission_reasons.entry(permission.clone()).or_insert_with(|| reason.clone());
+    }
+    manifest.normalize_permissions();
+}
+
+/// Reconciles a shipped default while preserving the user's customized branch.
+///
+/// New defaults form their own Stock lineage. Untouched apps adopt them;
+/// customized apps retain their source and receive an optional update stamp.
+pub fn reconcile_builtin(
+    current: &MiniAppManifest,
+    stock: &MiniAppManifest,
+    baseline: Option<&BuiltinBaseline>,
+    pending_stamp: Option<&str>,
+    at_unix: u64,
+    offset_secs: i64,
+) -> anyhow::Result<BuiltinReconciliation> {
+    reconcile_builtin_with_host(current, stock, baseline, pending_stamp, at_unix, offset_secs, None, None)
+}
+
+/// Records which Robrix release supplied a newly archived built-in default.
+pub fn reconcile_builtin_with_host(
+    current: &MiniAppManifest,
+    stock: &MiniAppManifest,
+    baseline: Option<&BuiltinBaseline>,
+    pending_stamp: Option<&str>,
+    at_unix: u64,
+    offset_secs: i64,
+    host_version: Option<&str>,
+    host_revision: Option<&str>,
+) -> anyhow::Result<BuiltinReconciliation> {
+    if current.id != stock.id || !current.builtin || !stock.builtin {
+        anyhow::bail!("built-in reconciliation requires the same installed built-in app");
+    }
+    let fingerprint = builtin_fingerprint(stock).map_err(anyhow::Error::msg)?;
+    let mut previous = baseline.and_then(|baseline| {
+        let snapshot = local_stock_snapshot(&current.id, &baseline.stamp)?;
+        (builtin_fingerprint(&snapshot_manifest(stock, &snapshot)).ok().as_deref()
+            == Some(baseline.fingerprint.as_str())).then_some(snapshot)
+    });
+    let authenticated_baseline = previous.is_some();
+    // A local Stock pointer predates release tracking but still records the
+    // user's unmodified default. Imported claims never establish that fact.
+    if previous.is_none() {
+        previous = current.current_version.as_deref().and_then(|stamp|
+            local_stock_snapshot(&current.id, stamp));
+    }
+    let previous_fingerprint = previous.as_ref().and_then(|snapshot|
+        builtin_fingerprint(&snapshot_manifest(stock, snapshot)).ok());
+    let changed = previous_fingerprint.as_deref().is_some_and(|previous| previous != fingerprint);
+    let follows_previous = previous.as_ref().is_some_and(|snapshot| {
+        let mut previous = snapshot_manifest(stock, snapshot);
+        let mut working = current.clone();
+        migrate_default_declarations(&mut previous, stock);
+        migrate_default_declarations(&mut working, stock);
+        matches_default(&working, &previous)
+    });
+    let matches_current_stock = matches_default(current, stock);
+    let mut manifest = current.clone();
+    if !matches_current_stock && !follows_previous {
+        crate::persistence::ensure_current_version(&mut manifest, VersionOrigin::Legacy,
+            "Saved customized copy (date not recorded)", 0, 0)?;
+    }
+    // Reuse an already archived default when a state-file save was interrupted.
+    let existing = if previous_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+        previous.clone()
+    } else {
+        let parent = previous.as_ref().map(|snapshot| snapshot.version.stamp.as_str());
+        crate::persistence::list_versions(&stock.id).into_iter().rev()
+            .filter(|version| version.origin == VersionOrigin::Stock && !version.imported && version.actor.is_none()
+                && version.parent.as_deref() == parent)
+            .filter_map(|version| local_stock_snapshot(&stock.id, &version.stamp))
+            .find(|snapshot| builtin_fingerprint(&snapshot_manifest(stock, snapshot)).ok().as_deref()
+                == Some(fingerprint.as_str()))
+    };
+    let stamp = if let Some(snapshot) = existing {
+        snapshot.version.stamp
+    } else {
+        let parent = previous.as_ref().map(|snapshot| snapshot.version.stamp.as_str());
+        let time = if changed { at_unix } else { 0 };
+        let note = if changed { "Updated built-in default" } else { "Built-in default" };
+        let mut version = crate::versions::new_version(stock, VersionOrigin::Stock, note, parent, time, offset_secs);
+        version.host_version = host_version.filter(|version| !version.is_empty()).map(str::to_string);
+        version.host_revision = host_revision.filter(|revision| !revision.is_empty()).map(str::to_string);
+        crate::persistence::append_version(stock, version)?
+    };
+    let available_update = if matches_current_stock || follows_previous {
+        manifest = stock.clone();
+        manifest.scope = current.scope.clone();
+        manifest.current_version = Some(stamp.clone());
+        None
+    } else if changed || !authenticated_baseline || pending_stamp.is_some() {
+        Some(stamp.clone())
+    } else { None };
+    Ok(BuiltinReconciliation {
+        manifest,
+        baseline: BuiltinBaseline { fingerprint, stamp },
+        available_update,
+        adopted_default: changed && (matches_current_stock || follows_previous),
+    })
+}
 
 fn load_source(file: &str, baked: &'static str) -> String {
     let dev_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -221,6 +389,218 @@ pub fn builtin_apps() -> Vec<MiniAppManifest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const UPDATE_TIME: u64 = 1_784_907_124;
+
+    fn release_app(id: &str) -> MiniAppManifest {
+        let mut manifest = stock("room-info").unwrap();
+        manifest.id = id.into();
+        manifest.source = "View{ original_default }".into();
+        manifest.description = "Original description".into();
+        manifest
+    }
+
+    #[test]
+    fn first_start_seeds_defaults_without_reporting_an_update() {
+        let current = release_app("release-first-start");
+        let reconciled = reconcile_builtin(&current, &current, None, None, UPDATE_TIME, 0).unwrap();
+        assert!(reconciled.available_update.is_none());
+        assert!(!reconciled.adopted_default);
+        let history = crate::persistence::list_versions(&current.id);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].at_unix, 0);
+        assert_eq!(history[0].origin, VersionOrigin::Stock);
+        let repeated = reconcile_builtin(&reconciled.manifest, &current, Some(&reconciled.baseline), None, UPDATE_TIME + 1, 0).unwrap();
+        assert_eq!(repeated.baseline, reconciled.baseline);
+        assert_eq!(crate::persistence::list_versions(&current.id).len(), 1);
+        crate::persistence::remove_user_app(&current.id);
+    }
+
+    #[test]
+    fn default_history_records_the_providing_release_without_rewriting_older_records() {
+        let current = release_app("release-host-provenance");
+        let seeded = reconcile_builtin_with_host(&current, &current, None, None, UPDATE_TIME, 0,
+            Some("0.4.0"), Some("old-revision")).unwrap();
+        let first = crate::persistence::load_version(&current.id, &seeded.baseline.stamp).unwrap().0;
+        assert_eq!(first.host_version.as_deref(), Some("0.4.0"));
+        assert_eq!(first.host_revision.as_deref(), Some("old-revision"));
+        let repeated = reconcile_builtin_with_host(&seeded.manifest, &current, Some(&seeded.baseline), None,
+            UPDATE_TIME + 1, 0, Some("0.4.1"), Some("new-revision")).unwrap();
+        assert_eq!(repeated.baseline, seeded.baseline);
+        assert_eq!(crate::persistence::load_version(&current.id, &seeded.baseline.stamp).unwrap().0.host_version, first.host_version);
+        let mut newer = current.clone(); newer.description = "New release description".into();
+        let updated = reconcile_builtin_with_host(&seeded.manifest, &newer, Some(&seeded.baseline), None,
+            UPDATE_TIME + 2, 0, Some("0.5.0"), Some("next-revision")).unwrap();
+        let latest = crate::persistence::load_version(&current.id, &updated.baseline.stamp).unwrap().0;
+        assert_eq!(latest.host_version.as_deref(), Some("0.5.0"));
+        assert_eq!(latest.host_revision.as_deref(), Some("next-revision"));
+        crate::persistence::remove_user_app(&current.id);
+    }
+
+    #[test]
+    fn untouched_defaults_adopt_a_new_release_and_preserve_default_lineage() {
+        let initial = release_app("release-untouched");
+        let seeded = reconcile_builtin(&initial, &initial, None, None, UPDATE_TIME, 0).unwrap();
+        let mut newer = initial.clone();
+        newer.source = "View{ upgraded_default }".into();
+        newer.description = "Updated description".into();
+        let updated = reconcile_builtin(&seeded.manifest, &newer, Some(&seeded.baseline), None, UPDATE_TIME, 0).unwrap();
+        assert!(updated.adopted_default);
+        assert!(updated.available_update.is_none());
+        assert!(matches_default(&updated.manifest, &newer));
+        let stock = crate::persistence::load_version(&initial.id, &updated.baseline.stamp).unwrap().0;
+        assert_eq!(stock.parent.as_deref(), Some(seeded.baseline.stamp.as_str()));
+        assert_eq!(stock.at_unix, UPDATE_TIME);
+        assert_eq!(stock.description.as_deref(), Some("Updated description"));
+        crate::persistence::remove_user_app(&initial.id);
+    }
+
+    #[test]
+    fn customized_apps_keep_their_branch_and_offer_each_latest_default() {
+        let initial = release_app("release-customized");
+        let seeded = reconcile_builtin(&initial, &initial, None, None, UPDATE_TIME, 0).unwrap();
+        let mut custom = seeded.manifest.clone();
+        custom.source = "View{ customized }".into();
+        let manual = crate::versions::new_version(&custom, VersionOrigin::Manual, "Customized", custom.current_version.as_deref(), UPDATE_TIME, 0);
+        custom.current_version = Some(crate::persistence::append_version(&custom, manual).unwrap());
+        let custom_stamp = custom.current_version.clone();
+        let mut newer = initial.clone();
+        newer.source = "View{ new_default }".into();
+        let updated = reconcile_builtin(&custom, &newer, Some(&seeded.baseline), None, UPDATE_TIME + 1, 0).unwrap();
+        assert!(!updated.adopted_default);
+        assert_eq!(updated.manifest.source, custom.source);
+        assert_eq!(updated.manifest.current_version, custom_stamp);
+        assert_eq!(updated.available_update.as_deref(), Some(updated.baseline.stamp.as_str()));
+        let repeated = reconcile_builtin(&custom, &newer, Some(&updated.baseline), updated.available_update.as_deref(), UPDATE_TIME + 2, 0).unwrap();
+        assert_eq!(repeated.baseline, updated.baseline);
+        assert_eq!(crate::persistence::list_versions(&custom.id).len(), 3);
+        newer.source = "View{ next_default }".into();
+        let next = reconcile_builtin(&custom, &newer, Some(&updated.baseline), updated.available_update.as_deref(), UPDATE_TIME + 3, 0).unwrap();
+        let stock = crate::persistence::load_version(&custom.id, &next.baseline.stamp).unwrap().0;
+        assert_eq!(stock.parent.as_deref(), Some(updated.baseline.stamp.as_str()));
+        assert_eq!(next.manifest.current_version, custom_stamp);
+        let accepted = newer.clone();
+        let cleared = reconcile_builtin(&accepted, &newer, Some(&next.baseline), next.available_update.as_deref(), UPDATE_TIME + 4, 0).unwrap();
+        assert!(cleared.available_update.is_none());
+        crate::persistence::remove_user_app(&custom.id);
+    }
+
+    #[test]
+    fn unknown_modified_apps_preserve_code_and_offer_the_current_default() {
+        let initial = release_app("release-unknown-copy");
+        let mut custom = initial.clone();
+        custom.source = "View{ unknown_modification }".into();
+        let offered = reconcile_builtin(&custom, &initial, None, None, UPDATE_TIME, 0).unwrap();
+        assert_eq!(offered.manifest.source, custom.source);
+        assert!(offered.available_update.is_some());
+        let current = crate::persistence::load_version(&custom.id, offered.manifest.current_version.as_deref().unwrap()).unwrap().0;
+        assert_eq!(current.origin, VersionOrigin::Legacy);
+        assert_eq!(current.at_unix, 0);
+        assert!(current.actor.is_none());
+        let default = crate::persistence::load_version(&custom.id, &offered.baseline.stamp).unwrap().0;
+        assert!(default.parent.is_none());
+        assert_eq!(default.at_unix, 0);
+        let repeated = reconcile_builtin(&offered.manifest, &initial, Some(&offered.baseline), offered.available_update.as_deref(), UPDATE_TIME + 1, 0).unwrap();
+        assert_eq!(repeated.available_update, offered.available_update);
+        assert_eq!(crate::persistence::list_versions(&custom.id).len(), 2);
+        crate::persistence::remove_user_app(&custom.id);
+    }
+
+    #[test]
+    fn declaration_migrations_do_not_mistake_untouched_defaults_for_customizations() {
+        let initial = release_app("release-declaration-migration");
+        let seeded = reconcile_builtin(&initial, &initial, None, None, UPDATE_TIME, 0).unwrap();
+        let mut newer = initial.clone();
+        newer.permissions.push("network".into());
+        newer.permission_reasons.insert("network".into(), "Updated default needs the network.".into());
+        newer.normalize_permissions();
+        let mut loaded = seeded.manifest.clone();
+        migrate_default_declarations(&mut loaded, &newer);
+        let adopted = reconcile_builtin(&loaded, &newer, Some(&seeded.baseline), None, UPDATE_TIME, 0).unwrap();
+        assert!(adopted.adopted_default);
+        assert!(matches_default(&adopted.manifest, &newer));
+        assert!(adopted.available_update.is_none());
+        crate::persistence::remove_user_app(&initial.id);
+    }
+
+    #[test]
+    fn full_default_fingerprints_detect_metadata_and_widget_changes() {
+        let initial = release_app("release-fingerprint");
+        let fingerprint = builtin_fingerprint(&initial).unwrap();
+        let mut local_state = initial.clone();
+        local_state.id = "other-installed-id".into();
+        local_state.scope = crate::manifest::A2AppScope::Room { room_id: "!room:test".into() };
+        local_state.current_version = Some("any".into());
+        assert_eq!(builtin_fingerprint(&local_state).unwrap(), fingerprint);
+        let mut changes = Vec::new();
+        let mut changed = initial.clone(); changed.name.push('!'); changes.push(changed);
+        let mut changed = initial.clone(); changed.icon = "X".into(); changes.push(changed);
+        let mut changed = initial.clone(); changed.tint ^= 1; changes.push(changed);
+        let mut changed = initial.clone(); changed.description.push('!'); changes.push(changed);
+        let mut changed = initial.clone(); changed.source.push('!'); changes.push(changed);
+        let mut changed = initial.clone(); changed.permissions.push("network".into()); changes.push(changed);
+        let mut changed = initial.clone(); changed.permission_reasons.clear(); changes.push(changed);
+        let mut changed = initial.clone(); changed.capabilities.push("room.info".into()); changes.push(changed);
+        let mut changed = initial.clone(); changed.shortcuts.push("Action".into()); changes.push(changed);
+        let mut changed = initial.clone(); changed.widget = Some(crate::manifest::WidgetManifest {
+            source: "Widget{}".into(), default_span: (2, 2), min_span: (1, 1),
+        }); changes.push(changed);
+        for changed in changes { assert!(!matches_default(&initial, &changed)); }
+    }
+
+    #[test]
+    fn older_local_stock_pointers_auto_adopt_but_imported_stock_claims_do_not() {
+        let initial = release_app("release-pretracking-local");
+        let seeded = reconcile_builtin(&initial, &initial, None, None, UPDATE_TIME, 0).unwrap();
+        let mut newer = initial.clone(); newer.source = "View{ new_release }".into();
+        let adopted = reconcile_builtin(&seeded.manifest, &newer, None, None, UPDATE_TIME, 0).unwrap();
+        assert!(adopted.adopted_default);
+        assert!(adopted.available_update.is_none());
+        crate::persistence::remove_user_app(&initial.id);
+        let mut untrusted = initial.clone(); untrusted.id = "release-imported-stock".into();
+        let mut version = crate::versions::new_version(&untrusted, VersionOrigin::Stock, "Claimed stock", None, UPDATE_TIME, 0);
+        version.imported = true;
+        untrusted.current_version = Some(crate::persistence::append_version(&untrusted, version).unwrap());
+        newer.id = untrusted.id.clone();
+        let offered = reconcile_builtin(&untrusted, &newer, None, None, UPDATE_TIME, 0).unwrap();
+        assert_eq!(offered.manifest.source, untrusted.source);
+        assert!(offered.available_update.is_some());
+        crate::persistence::remove_user_app(&untrusted.id);
+    }
+
+    #[test]
+    fn corrupt_baseline_tracking_preserves_customizations_and_offers_a_default() {
+        let initial = release_app("release-corrupt-tracking");
+        let seeded = reconcile_builtin(&initial, &initial, None, None, UPDATE_TIME, 0).unwrap();
+        let mut customized = seeded.manifest.clone();
+        customized.name = "My custom title".into();
+        let damaged = BuiltinBaseline { fingerprint: "not-the-recorded-fingerprint".into(), stamp: seeded.baseline.stamp.clone() };
+        let repaired = reconcile_builtin(&customized, &initial, Some(&damaged), None, UPDATE_TIME, 0).unwrap();
+        assert_eq!(repaired.manifest.name, customized.name);
+        assert_eq!(repaired.available_update.as_deref(), Some(seeded.baseline.stamp.as_str()));
+        let mut missing = repaired.baseline.clone(); missing.stamp = "missing-stock-snapshot".into();
+        let repaired = reconcile_builtin(&repaired.manifest, &initial, Some(&missing), None, UPDATE_TIME + 1, 0).unwrap();
+        assert_eq!(repaired.manifest.name, customized.name);
+        assert!(repaired.available_update.is_some());
+        assert_eq!(repaired.baseline.stamp, seeded.baseline.stamp);
+        crate::persistence::export_history(&initial.id).unwrap();
+        crate::persistence::remove_user_app(&initial.id);
+    }
+
+    #[test]
+    fn a_release_rollback_records_a_new_default_event_instead_of_reusing_old_history() {
+        let original = release_app("release-rollback");
+        let seeded = reconcile_builtin(&original, &original, None, None, UPDATE_TIME, 0).unwrap();
+        let mut newer = original.clone(); newer.source = "View{ intermediate_release }".into();
+        let adopted = reconcile_builtin(&seeded.manifest, &newer, Some(&seeded.baseline), None, UPDATE_TIME, 0).unwrap();
+        let rollback = reconcile_builtin(&adopted.manifest, &original, Some(&adopted.baseline), None, UPDATE_TIME + 1, 0).unwrap();
+        assert!(rollback.adopted_default);
+        assert_ne!(rollback.baseline.stamp, seeded.baseline.stamp);
+        let event = crate::persistence::load_version(&original.id, &rollback.baseline.stamp).unwrap().0;
+        assert_eq!(event.parent.as_deref(), Some(adopted.baseline.stamp.as_str()));
+        assert_eq!(event.at_unix, UPDATE_TIME + 1);
+        crate::persistence::remove_user_app(&original.id);
+    }
 
     /// The hardcoded catalog must agree with each app's own `.splash` header,
     /// or the prompt would show different reasons than the app declares.
