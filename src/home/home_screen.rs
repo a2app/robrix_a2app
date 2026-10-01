@@ -384,6 +384,165 @@ script_mod! {
     }
 }
 
+#[cfg(all(test, feature = "a2app"))]
+mod navigation_tests {
+    use super::*;
+    use crate::a2app::room_app_picker::{RoomAppPickerAction, RoomAppPickerWidgetRefExt};
+
+    fn fixture(is_desktop: bool) -> (Cx, WidgetRef, WidgetRef) {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let (home, picker) = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::script_mod(vm);
+            let home_type = HomeScreen::register_widget(vm);
+            let value = script_eval!(vm, {
+                use mod.widgets.*
+                #(home_type) {
+                    view_stack := StackNavigation {
+                        root_view := View {
+                            home_screen_page_flip := PageFlip {
+                                active_page: @home_page
+                                home_page := View {}
+                                mini_apps_page := View {
+                                    mini_apps_screen := mod.widgets.MiniAppsScreen {}
+                                }
+                            }
+                        }
+                        stack_templates: {
+                            TestRoom := StackNavigationView {}
+                        }
+                    }
+                }
+            });
+            let home = WidgetRef::script_from_value(vm, value);
+            let value = script_eval!(vm, { mod.widgets.RoomAppPicker {} });
+            (home, WidgetRef::script_from_value(vm, value))
+        });
+        cx.global::<MainViewIsDesktop>().0 = Some(is_desktop);
+        assert!(home.borrow::<HomeScreen>().is_some());
+        (cx, home, picker)
+    }
+
+    fn deliver(cx: &mut Cx, home: &WidgetRef, app_state: &mut AppState, actions: ActionsBuf) -> ActionsBuf {
+        cx.capture_actions(|cx| home.handle_event(cx, &Event::Actions(actions), &mut Scope::with_data(app_state)))
+    }
+
+    fn footer_click(cx: &mut Cx, picker: &WidgetRef, room: RoomNameId, is_space: bool) -> ActionsBuf {
+        picker.as_room_app_picker().show(cx, room, is_space);
+        let uid = picker.button(cx, ids!(all_apps_button)).widget_uid();
+        let click = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+        let actions = cx.capture_actions(|cx| picker.handle_event(cx, &Event::Actions(click), &mut Scope::empty()));
+        assert!(matches!(actions[0].downcast_ref(), Some(RoomAppPickerAction::Close)));
+        assert!(matches!(actions[1].downcast_ref(), Some(NavigationBarAction::GoToMiniApps)));
+        actions
+    }
+
+    fn transition_action(cx: &mut Cx, uid: WidgetUid, action: StackNavigationTransitionAction) -> ActionsBuf {
+        cx.capture_actions(|cx| cx.widget_action(uid, action))
+    }
+
+    fn assert_mini_apps_page(cx: &mut Cx, home: &WidgetRef) {
+        let pages = home.page_flip(cx, ids!(home_screen_page_flip));
+        let mut active = Vec::new();
+        pages.borrow().unwrap().cancel_children_impl(&mut |id, _| active.push(id));
+        assert_eq!(active, vec![id!(mini_apps_page)]);
+        assert!(home.widget(cx, ids!(mini_apps_screen.list_pane)).visible());
+        assert!(!home.widget(cx, ids!(mini_apps_screen.info_pane)).visible());
+    }
+
+    #[test]
+    fn picker_footer_reveals_mini_apps_from_room_or_space_even_when_the_tab_is_selected() {
+        for is_space in [false, true] {
+            for selected_tab in [SelectedTab::Home, SelectedTab::MiniApps] {
+                let (mut cx, home, picker) = fixture(false);
+                let room = RoomNameId::empty("!picker-navigation:example.org".try_into().unwrap());
+                let mut app_state = AppState {
+                    selected_room: Some(SelectedRoom::to_joined(room.clone(), is_space)), selected_tab,
+                    ..Default::default()
+                };
+                home.borrow_mut::<HomeScreen>().unwrap().mobile_screen_history.push(
+                    SelectedRoom::JoinedRoom { room_name_id: room.clone() },
+                );
+                let stack = home.stack_navigation(&cx, ids!(view_stack));
+                let (view_id, view) = stack.create_view_from_template(&mut cx, id!(TestRoom)).unwrap();
+                stack.push(&mut cx, view_id);
+                let shown = transition_action(&mut cx, view.widget_uid(), StackNavigationTransitionAction::ShowDone);
+                deliver(&mut cx, &home, &mut app_state, shown);
+                assert_eq!(stack.current_view(), Some(view_id));
+
+                let navigation = footer_click(&mut cx, &picker, room, is_space);
+                let response = deliver(&mut cx, &home, &mut app_state, navigation);
+                assert_eq!(app_state.selected_tab, SelectedTab::MiniApps);
+                assert!(app_state.selected_room.is_none());
+                assert!(home.borrow::<HomeScreen>().unwrap().mobile_screen_history.is_empty());
+                assert!(!home.borrow::<HomeScreen>().unwrap().mini_apps_navigation_pending);
+                assert!(stack.destination_view().is_none());
+                assert_mini_apps_page(&mut cx, &home);
+                assert!(!response.iter().any(|action| matches!(action.downcast_ref(),
+                    Some(crate::a2app::runtime::A2AppOp::RoomClosed(_)))),
+                    "page navigation must preserve room work, including its generation console");
+
+                let hidden = transition_action(&mut cx, view.widget_uid(), StackNavigationTransitionAction::HideEnd(stack.widget_uid()));
+                deliver(&mut cx, &home, &mut app_state, hidden);
+                assert!(stack.current_view().is_none());
+                assert!(stack.stack_view_ids().is_empty());
+                assert!(!view.visible());
+            }
+        }
+    }
+
+    #[test]
+    fn picker_navigation_waits_for_a_mobile_push_to_finish_before_revealing_the_page() {
+        let (mut cx, home, picker) = fixture(false);
+        let room = RoomNameId::empty("!picker-transition:example.org".try_into().unwrap());
+        let mut app_state = AppState {
+            selected_room: Some(SelectedRoom::JoinedRoom { room_name_id: room.clone() }), ..Default::default()
+        };
+        let stack = home.stack_navigation(&cx, ids!(view_stack));
+        let (view_id, view) = stack.create_view_from_template(&mut cx, id!(TestRoom)).unwrap();
+        stack.push(&mut cx, view_id);
+        let navigation = footer_click(&mut cx, &picker, room, false);
+        deliver(&mut cx, &home, &mut app_state, navigation);
+        assert!(home.borrow::<HomeScreen>().unwrap().mini_apps_navigation_pending);
+        assert!(app_state.selected_room.is_some());
+        assert_eq!(stack.destination_view(), Some(view_id));
+
+        let other_room = RoomNameId::empty("!ignored-selection:example.org".try_into().unwrap());
+        let ignored_selection = cx.capture_actions(|cx| cx.widget_action(WidgetUid::default(),
+            RoomsListAction::Selected(SelectedRoom::JoinedRoom { room_name_id: other_room })));
+        deliver(&mut cx, &home, &mut app_state, ignored_selection);
+        assert!(home.borrow::<HomeScreen>().unwrap().mini_apps_navigation_pending,
+            "a selection ignored during a transition must not cancel navigation");
+        assert_eq!(stack.destination_view(), Some(view_id));
+
+        let shown = transition_action(&mut cx, view.widget_uid(), StackNavigationTransitionAction::ShowDone);
+        deliver(&mut cx, &home, &mut app_state, shown);
+        assert!(!home.borrow::<HomeScreen>().unwrap().mini_apps_navigation_pending);
+        assert!(app_state.selected_room.is_none());
+        assert!(stack.destination_view().is_none());
+        let hidden = transition_action(&mut cx, view.widget_uid(), StackNavigationTransitionAction::HideEnd(stack.widget_uid()));
+        deliver(&mut cx, &home, &mut app_state, hidden);
+        assert!(stack.current_view().is_none());
+        assert_mini_apps_page(&mut cx, &home);
+    }
+
+    #[test]
+    fn picker_navigation_to_mini_apps_keeps_the_desktop_room_selection() {
+        let (mut cx, home, picker) = fixture(true);
+        let room = RoomNameId::empty("!picker-desktop:example.org".try_into().unwrap());
+        let selected_room = SelectedRoom::JoinedRoom { room_name_id: room.clone() };
+        let mut app_state = AppState { selected_room: Some(selected_room.clone()), ..Default::default() };
+        let navigation = footer_click(&mut cx, &picker, room, false);
+        deliver(&mut cx, &home, &mut app_state, navigation);
+        assert_eq!(app_state.selected_tab, SelectedTab::MiniApps);
+        assert_eq!(app_state.selected_room, Some(selected_room));
+        assert!(!home.borrow::<HomeScreen>().unwrap().mini_apps_navigation_pending);
+        assert_mini_apps_page(&mut cx, &home);
+    }
+}
+
 
 /// A simple wrapper around the SpacesBar that allows us to animate showing or hiding it.
 #[derive(Script, Widget, Animator)]
@@ -494,6 +653,9 @@ pub struct HomeScreen {
     /// When a view is popped off the stack, the previous `selected_room` is restored.
     #[rust] mobile_screen_history: Vec<SelectedRoom>,
 
+    /// Reveal the Mini Apps page once an active mobile transition finishes.
+    #[rust] mini_apps_navigation_pending: bool,
+
     /// The most recently applied view-mode override, used to short-circuit
     /// redundant `AdaptiveView` selector reinstalls when an
     /// [`AppPreferencesAction::ViewModeChanged`] action repeats the current
@@ -528,6 +690,8 @@ impl Widget for HomeScreen {
                     }
                     Some(NavigationBarAction::GoToMiniApps) => {
                         self.switch_to_tab(cx, app_state, SelectedTab::MiniApps);
+                        self.update_active_page_from_selection(cx, app_state);
+                        self.mini_apps_navigation_pending = !effective_is_desktop(cx);
                     }
                     Some(NavigationBarAction::GoToSpace { space_name_id }) => {
                         self.switch_to_tab(cx, app_state, SelectedTab::Space { space_name_id: space_name_id.clone() });
@@ -735,6 +899,10 @@ impl Widget for HomeScreen {
             let app_state = scope.data.get_mut::<AppState>().unwrap();
             self.sync_effective_view_mode(cx, app_state);
         }
+        if self.mini_apps_navigation_pending {
+            let app_state = scope.data.get_mut::<AppState>().unwrap();
+            self.finish_mini_apps_navigation(cx, app_state);
+        }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -750,6 +918,27 @@ impl Widget for HomeScreen {
 }
 
 impl HomeScreen {
+    fn finish_mini_apps_navigation(&mut self, cx: &mut Cx, app_state: &mut AppState) {
+        if app_state.selected_tab != SelectedTab::MiniApps || effective_is_desktop(cx) {
+            self.mini_apps_navigation_pending = false;
+            return;
+        }
+        let stack_navigation = self.view.stack_navigation(cx, ids!(view_stack));
+        // StackNavigation ignores pops during a transition. Retry after its
+        // completion action has been forwarded to the stack above.
+        if stack_navigation.is_transitioning() { return; }
+
+        cancel_all_dictation();
+        if let Some(room) = app_state.selected_room.take() {
+            room.close_thread_timeline(cx);
+        }
+        // Park room screens so room work can continue in the Mini Apps console.
+        self.clear_mobile_navigation_state(cx);
+        self.mini_apps_navigation_pending = false;
+        cx.action(AppStateAction::FocusNone);
+        self.view.redraw(cx);
+    }
+
     /// Installs a variant selector on the main `AdaptiveView` that honors the
     /// current [`ViewModeOverride`] preference, and publishes each choice so
     /// that `effective_is_desktop()` always matches that same view mode.
@@ -939,9 +1128,8 @@ impl HomeScreen {
     }
 
     fn clear_mobile_navigation_state(&mut self, cx: &mut Cx) {
-        // When switching from mobile --> desktop view mode, we discard the nav stack,
-        // and thus we need to free & destroy any thread timelines in it.
-        // Note that freeing the current room is handled in `sync_effective_view_mode`.
+        // Discarding mobile navigation frees any thread timelines in its history.
+        // The caller handles the current room.
         for room in &self.mobile_screen_history {
             room.close_thread_timeline(cx);
         }
@@ -983,6 +1171,7 @@ impl HomeScreen {
         if stack_navigation.is_transitioning() {
             return;
         }
+        self.mini_apps_navigation_pending = false;
         let has_current_mobile_screen = stack_navigation.current_view().is_some();
         // If it has the same room ID and the same screen type (invite, joined, etc),
         // then we actually don't need to do anything. Otherwise we need to change it

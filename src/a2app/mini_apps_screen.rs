@@ -25,6 +25,7 @@ use a2app_core::versions::AppVersion;
 
 use crate::a2app::runtime::{room_display_name, with_a2app, A2AppOp, A2AppRuntimeAction};
 use crate::home::rooms_list::RoomsListRef;
+use crate::home::navigation_tab_bar::NavigationBarAction;
 use crate::app::ConfirmDeleteAction;
 use crate::shared::confirmation_modal::ConfirmationModalContent;
 use crate::shared::popup_list::{enqueue_popup_notification, PopupKind};
@@ -1915,6 +1916,12 @@ pub struct MiniAppsScreen {
 
 impl Widget for MiniAppsScreen {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if let Event::Actions(actions) = event
+            && actions.iter().any(|action| matches!(action.downcast_ref(), Some(NavigationBarAction::GoToMiniApps)))
+        {
+            self.set_pane(cx, Pane::List);
+            return;
+        }
         self.view.handle_event(cx, event, scope);
 
         // Console output streams in on Signal events; keep it painting.
@@ -2920,6 +2927,49 @@ mod picker_tests {
     use crate::a2app::room_app_picker::{RoomAppPickerAction, RoomAppPickerWidgetRefExt};
     use crate::home::navigation_tab_bar::NavigationBarAction;
     use crate::utils::RoomNameId;
+
+    #[test]
+    fn explicit_mini_apps_navigation_opens_the_list_and_clears_cached_subpane_history() {
+        use crate::home::navigation_tab_bar::SelectedTab;
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
+        screen.info_app = Some("cached-app".into());
+        screen.set_pane(&mut cx, Pane::Info);
+        let selected = cx.capture_actions(|cx| cx.action(NavigationBarAction::TabSelected(SelectedTab::MiniApps)));
+        screen.handle_event(&mut cx, &Event::Actions(selected), &mut Scope::empty());
+        assert_eq!(screen.pane, Pane::Info, "selection notifications must preserve focused app/settings navigation");
+
+        for pane in [Pane::Info, Pane::Source, Pane::Access, Pane::Edit, Pane::Providers] {
+            screen.set_pane(&mut cx, Pane::Info);
+            screen.set_pane(&mut cx, pane);
+            assert!(!screen.pane_history.is_empty());
+            let stale_open = screen.view.button(&cx, ids!(info_open_button)).widget_uid();
+            let navigation = cx.capture_actions(|cx| {
+                cx.action(NavigationBarAction::GoToMiniApps);
+                cx.widget_action(stale_open, ButtonAction::Clicked(Default::default()));
+            });
+            let emitted = cx.capture_actions(|cx| screen.handle_event(cx, &Event::Actions(navigation), &mut Scope::empty()));
+            assert_eq!(screen.pane, Pane::List);
+            assert!(screen.view.widget(&cx, ids!(list_pane)).visible());
+            for hidden in [id!(info_pane), id!(source_pane), id!(access_pane), id!(edit_pane), id!(providers_pane)] {
+                assert!(!screen.view.widget(&cx, &[hidden]).visible());
+            }
+            assert!(screen.pane_history.is_empty());
+            assert!(screen.cancel_scope.is_none());
+            assert!(!emitted.iter().any(|action| action.downcast_ref::<A2AppOp>().is_some()),
+                "opening the main Mini Apps page must not launch an app or apply a stale subpane action");
+            screen.go_back(&mut cx);
+            assert_eq!(screen.pane, Pane::List, "Back must not return to the subpane left by explicit navigation");
+        }
+    }
 
     #[test]
     fn picker_dsl_and_actions_stay_scoped_to_their_surface() {
