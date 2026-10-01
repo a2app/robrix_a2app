@@ -78,6 +78,12 @@ pub trait AiHost: Send + Sync {
     /// Fetch a URL through Robrix's HTTP broker and source-sharing checks.
     fn fetch_url(&self, url: &str) -> Result<String, String>;
 
+    /// Resolves an upfront task permission request — the agent's plan for
+    /// everything a task needs — into the one decision the user sees, applies
+    /// whatever they approve as a single turn-scoped batch, and returns the
+    /// JSON result (`granted`, `not_granted`, `lasts`) the model acts on.
+    fn request_task_permissions(&self, request: Value) -> Result<String, String>;
+
     /// One capability-gated attached-room read. The host hands it to the UI
     /// thread, where the runtime decides whether this session's room subject
     /// may exercise the mapped capability (prompting the user on first use)
@@ -1023,11 +1029,94 @@ impl Tool for SendMessageTool {
     }
 }
 
+/// `request_task_permissions` — ask once, for the whole task.
+///
+/// The agent plans every room it must read, every place it will write, every
+/// website it will fetch and every mini-app tool it will call, then makes one
+/// call. Robrix checks the request against its own capability catalog, room
+/// policy and information-flow rules, shows the user one prompt with every
+/// exact item, and applies the approved subset as one atomic, turn-scoped
+/// batch. The model reads the JSON result and proceeds with what it got.
+pub struct RequestTaskPermissionsTool {
+    host: Arc<dyn AiHost>,
+}
+
+impl RequestTaskPermissionsTool {
+    pub fn new(host: Arc<dyn AiHost>) -> Self {
+        Self { host }
+    }
+}
+
+impl Tool for RequestTaskPermissionsTool {
+    fn name(&self) -> &str {
+        "request_task_permissions"
+    }
+
+    fn description(&self) -> &str {
+        "Ask the user once, up front, for everything a task needs. Call it \
+         BEFORE any task that reads another room, posts to a room, fetches a \
+         website or calls a mini-app tool. List every need in one call: do not \
+         split a task across several requests and do not call a gated tool \
+         first. Write `explanation` as ONE coherent paragraph for the person \
+         who must approve it: what you want to do, and what data you need in \
+         order to do it (which rooms, which websites, which mini-app tools). \
+         Use room names, not ids. Give each need a short `why`. Use room ids \
+         from list_rooms (which needs no request). The result lists `granted` \
+         and `not_granted` with a reason; grants last only until this turn \
+         ends. If the user declines, do not ask again this turn. If the work \
+         later needs something you did not list, do not call this tool again: \
+         do what you can and say in your reply what you could not do."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "A short name for the task, e.g. 'Weekly digest of #ops'.",
+                },
+                "explanation": {
+                    "type": "string",
+                    "description": "One coherent paragraph for the person approving it: what you want to do, and what data you need in order to do it (which rooms, websites and mini-app tools).",
+                },
+                "needs": {
+                    "type": "array",
+                    "description": "Everything the task needs, in one list.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string", "description": "Your short label for this need, e.g. 'n1'." },
+                            "kind": { "type": "string", "enum": ["capability", "website", "app_tool"] },
+                            "capability": { "type": "string", "description": "For kind=capability: a catalog id, e.g. matrix.rooms.messages.read." },
+                            "targets": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "For kind=capability: the room or space ids to narrow it to.",
+                            },
+                            "url": { "type": "string", "description": "For kind=website: one complete HTTP(S) URL." },
+                            "tool": { "type": "string", "description": "For kind=app_tool: the tool id from list_mini_app_tools." },
+                            "why": { "type": "string", "description": "One short sentence in your own words saying why this is needed." },
+                        },
+                        "required": ["id", "kind"],
+                        "additionalProperties": false,
+                    },
+                },
+            },
+            "required": ["task", "needs"],
+            "additionalProperties": false,
+        })
+    }
+
+    fn call(&self, arguments: &Map<String, Value>) -> Result<String, String> {
+        self.host.request_task_permissions(Value::Object(arguments.clone()))
+    }
+}
+
 /// Fetches a page through the host; the agent never resolves DNS or opens a socket.
 pub struct WebFetchTool {
     host: Arc<dyn AiHost>,
 }
-
 impl WebFetchTool {
     pub fn new(host: Arc<dyn AiHost>) -> Self { Self { host } }
 }
@@ -1148,6 +1237,9 @@ pub fn register_session_tools(server: &mut a2app_agent::mcp::McpServer, host: Ar
     // Ungated native tools (the agent's own room plumbing).
     server.add_tool(ReadRoomMemoryTool::new(host.clone()));
     server.add_tool(SendMessageTool::new(host.clone()));
+    // One upfront ask for a whole task, beside the per-call prompts that stay
+    // the fallback for anything the agent did not list.
+    server.add_tool(RequestTaskPermissionsTool::new(host.clone()));
     server.add_tool(WebFetchTool::new(host.clone()));
     server.add_tool(PostRoomMessageTool::new(host));
 }

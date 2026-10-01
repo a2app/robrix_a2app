@@ -48,7 +48,7 @@ script_mod! {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SourceCategory { Room, Conversation, Account, Other }
+pub(super) enum SourceCategory { Room, Conversation, Account, Directory, Other }
 
 #[derive(Clone, Debug)]
 pub(super) struct ApprovalSource {
@@ -76,10 +76,14 @@ pub(super) fn approval_sources(
             category: SourceCategory::Other, name: "Previously received private data".into(),
             identity: "Its original source is not recorded.".into(),
         },
+        Source::RoomDirectory { account } => ApprovalSource {
+            category: SourceCategory::Directory, name: "Room and space directory".into(),
+            identity: format!("Account: {account}"),
+        },
     }).collect::<Vec<_>>();
     rows.sort_by_key(|row| (match row.category {
         SourceCategory::Account => 0, SourceCategory::Room => 1,
-        SourceCategory::Conversation => 2, SourceCategory::Other => 3,
+        SourceCategory::Conversation => 2, SourceCategory::Directory => 3, SourceCategory::Other => 4,
     }, row.name.to_lowercase(), row.identity.clone()));
     rows
 }
@@ -95,6 +99,7 @@ pub(super) fn source_summary(rows: &[ApprovalSource]) -> String {
         let count = count(category);
         if count > 0 { parts.push(format!("data from {count} {}", if count == 1 { singular } else { plural })); }
     }
+    if count(SourceCategory::Directory) > 0 { parts.push("your room and space directory".into()); }
     if count(SourceCategory::Other) > 0 { parts.push("previously received private data".into()); }
     if parts.is_empty() { "No private data sources in this approval.".into() }
     else { format!("May use {}.", parts.join("; ")) }
@@ -104,7 +109,7 @@ fn matches_filter(row: &ApprovalSource, category: usize, query: &str) -> bool {
     let category_matches = match category {
         1 => row.category == SourceCategory::Room,
         2 => row.category == SourceCategory::Conversation,
-        3 => matches!(row.category, SourceCategory::Account | SourceCategory::Other),
+        3 => matches!(row.category, SourceCategory::Account | SourceCategory::Directory | SourceCategory::Other),
         _ => true,
     };
     category_matches && (row.name.to_lowercase().contains(query) || row.identity.to_lowercase().contains(query))
@@ -144,7 +149,8 @@ impl Widget for ApprovalDetails {
                     let item = list.item(cx, index, id!(SourceRow));
                     let kind = match row.category {
                         SourceCategory::Room => "Room", SourceCategory::Conversation => "Direct conversation",
-                        SourceCategory::Account => "Account", SourceCategory::Other => "Other private data",
+                        SourceCategory::Account => "Account", SourceCategory::Directory => "Directory",
+                        SourceCategory::Other => "Other private data",
                     };
                     item.label(cx, ids!(name)).set_text(cx, &format!("{kind}: {}", row.name));
                     item.label(cx, ids!(identity)).set_text(cx, &row.identity);

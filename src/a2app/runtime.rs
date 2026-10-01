@@ -58,7 +58,15 @@ use crate::sliding_sync::{submit_async_request, MatrixRequest};
 use crate::utils::RoomNameId;
 
 #[cfg(unix)]
+use a2app_core::information_flow::{Recipient, Source};
+#[cfg(unix)]
+use a2app_core::task_grants::{self, ItemState, ResolveInputs, TaskLedger, TaskPlan, TaskReason};
+#[cfg(unix)]
 use crate::a2app::ai::session::{AiSession, PromptOutcome, SessionJob, SessionUpdate};
+#[cfg(unix)]
+use crate::a2app::task_permission_prompt::{
+    TaskItemView, TaskPermissionAction, TaskPermissionPromptWidgetRefExt, TaskPromptInfo,
+};
 #[cfg(unix)]
 use crate::a2app::ai::rooms::{next_ai_state_key, AiRoomAction, AiRoomRequest};
 #[cfg(unix)]
@@ -332,6 +340,17 @@ impl FlowContinuation {
     fn approve(&self, approve: impl FnOnce(&a2app_core::information_flow::EffectReview) -> Result<(), String>) -> Result<(), String> {
         match self { Self::Bridge { review, .. } | Self::Generated { review } => approve(review), Self::Worker(worker) => worker.approve(approve) }
     }
+}
+
+/// One resolved task plan waiting to be shown, or showing, as its own modal:
+/// the agent's whole request for a task, applied atomically once answered.
+#[cfg(unix)]
+pub struct TaskPrompt {
+    pub room_id: OwnedRoomId,
+    pub plan: TaskPlan,
+    /// The `request_task_permissions` tool call to release once the user
+    /// answers (or the turn closes).
+    pub answer: Sender<Result<String, String>>,
 }
 
 /// The state of the AI generation console shown in the Mini Apps screen.
@@ -617,6 +636,24 @@ pub struct A2AppState {
     permission_setups: HashMap<(usize, u64), permission_batch::PermissionSetup>,
     permission_gestures: BTreeMap<a2app_core::information_flow::ContextId, (u64, Instant)>,
     dismissed_effects: BTreeSet<(a2app_core::information_flow::ContextId, String)>,
+    /// Upfront task-permission prompts, in their own queue and shown ahead of
+    /// single-permission prompts, one at a time.
+    #[cfg(unix)]
+    pub task_prompts: VecDeque<TaskPrompt>,
+    #[cfg(unix)]
+    pub active_task: Option<TaskPrompt>,
+    /// Exactly what each live task applied, so the turn's end, session
+    /// teardown and the AI panel's Revoke can drop it.
+    #[cfg(unix)]
+    pub task_ledger: TaskLedger,
+    /// Task ids are unique for the process; the tool echoes one back.
+    #[cfg(unix)]
+    next_task_id: u64,
+    /// (room id, plan hash) pairs the user said "Not now" to. Unlike
+    /// `dismissed_prompts`, this memory is cleared when the turn closes, so a
+    /// later request can ask again.
+    #[cfg(unix)]
+    dismissed_task_plans: HashSet<(String, [u8; 32])>,
     /// (app, permission) pairs the user said "Not Now" to this session.
     /// The key is the subject: an app id or an AI room's agent key.
     pub dismissed_prompts: HashSet<(String, Permission)>,
@@ -817,6 +854,16 @@ fn initialize_state(registry: AppRegistry, permissions: PermissionStore, persist
             permission_setups: HashMap::new(),
             permission_gestures: BTreeMap::new(),
             dismissed_effects: BTreeSet::new(),
+            #[cfg(unix)]
+            task_prompts: VecDeque::new(),
+            #[cfg(unix)]
+            active_task: None,
+            #[cfg(unix)]
+            task_ledger: TaskLedger::default(),
+            #[cfg(unix)]
+            next_task_id: 0,
+            #[cfg(unix)]
+            dismissed_task_plans: HashSet::new(),
             dismissed_prompts: HashSet::new(),
             dismissed_net_hosts: HashSet::new(),
             generation: None,
@@ -1159,6 +1206,8 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     let mut ops: Vec<A2AppOp> = Vec::new();
     let mut prompt_answers: Vec<PermissionPromptResponse> = Vec::new();
     let mut group_answers: Vec<PermissionPromptGroupResponse> = Vec::new();
+    #[cfg(unix)]
+    let mut task_answers: Vec<TaskPermissionAction> = Vec::new();
     let mut matrix_results: Vec<A2AppMatrixResult> = Vec::new();
     let mut network_results: Vec<HostNetworkResult> = Vec::new();
     let mut pane_actions: Vec<MiniAppHostPaneAction> = Vec::new();
@@ -1240,6 +1289,11 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
             }
             if let Some(answer) = action.downcast_ref::<PermissionPromptResponse>() {
                 prompt_answers.push(answer.clone());
+                continue;
+            }
+            #[cfg(unix)]
+            if let Some(answer) = action.downcast_ref::<TaskPermissionAction>() {
+                task_answers.push(answer.clone());
                 continue;
             }
             if let Some(result) = action.downcast_ref::<A2AppMatrixResult>() {
@@ -1376,6 +1430,10 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     for answer in prompt_answers.into_iter().take(1) {
         sweep_permission_prompts(cx, ui);
         answer_permission_prompt(cx, ui, answer);
+    }
+    #[cfg(unix)]
+    for answer in task_answers {
+        answer_task_prompt(cx, ui, answer);
     }
     for pane_action in pane_actions {
         match pane_action {
@@ -2380,7 +2438,8 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             let Some(grant) = grant else { return };
             let belongs = super::information_flow::account().is_ok_and(|account| match &grant.source {
                 a2app_core::information_flow::Source::Account { account: owner }
-                | a2app_core::information_flow::Source::Room { account: owner, .. } => owner == &account,
+                | a2app_core::information_flow::Source::Room { account: owner, .. }
+                | a2app_core::information_flow::Source::RoomDirectory { account: owner } => owner == &account,
                 a2app_core::information_flow::Source::UnknownPrivate => false,
             });
             if !belongs { return; }
@@ -2546,7 +2605,7 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
 fn ensure_source_owner(source: &a2app_core::information_flow::Source) -> Result<(), String> {
     use a2app_core::information_flow::Source;
     let owner = match source {
-        Source::Account { account } | Source::Room { account, .. } => account,
+        Source::Account { account } | Source::Room { account, .. } | Source::RoomDirectory { account } => account,
         Source::UnknownPrivate => return Err("Unknown private data cannot be released.".into()),
     };
     if super::information_flow::account()? == *owner { Ok(()) }
@@ -2707,8 +2766,18 @@ fn manifest_flow_context(manifest: &MiniAppManifest) -> Result<a2app_core::infor
 /// Reading an app listing or source does not read its room compartments.
 fn join_manifest_code(manifest: &MiniAppManifest, receiver: &a2app_core::information_flow::ContextId) -> Result<(), String> {
     manifest_flow_context(manifest)?;
-    a2app_core::information_flow::add_sources(receiver, a2app_core::information_flow::code_labels(&manifest.id)?)?;
-    a2app_core::information_flow::add_influences(receiver, a2app_core::information_flow::code_influences(&manifest.id)?)
+    let mut labels = a2app_core::information_flow::code_labels(&manifest.id)?;
+    // An app whose code carries legacy/unknown provenance must not poison the
+    // receiver's label with `Source::UnknownPrivate`, which can never be
+    // shared: a listing exposes app metadata, not the code, and one such app
+    // would wedge every later model call and room write for this agent.
+    if labels.remove(&a2app_core::information_flow::Source::UnknownPrivate) {
+        log!("AI Rooms: app {} has unknown code provenance; not joining it into the agent's flow label.", manifest.id);
+    }
+    a2app_core::information_flow::add_sources(receiver, labels)?;
+    let influences = a2app_core::information_flow::code_influences(&manifest.id)?;
+    let influences = influences.into_iter().filter(|influence| *influence != a2app_core::information_flow::Influence::Unknown);
+    a2app_core::information_flow::add_influences(receiver, influences)
 }
 
 fn manifest_name_for_popup(manifest: &MiniAppManifest) -> String {
@@ -4205,6 +4274,7 @@ fn sweep_permission_prompts(cx: &mut Cx, ui: &WidgetRef) {
 fn ai_job_tool_name(job: &SessionJob) -> String {
     match job {
         SessionJob::ReadTool { kind, .. } => read_tool_name(kind).to_string(),
+        SessionJob::RequestTaskPermissions { .. } => String::from("request_task_permissions"),
         SessionJob::LaunchSplashApp { .. } => String::from("launch_splash_app"),
         SessionJob::ListApps { .. } => String::from("list_apps"),
         SessionJob::LaunchApp { .. } => String::from("launch_app"),
@@ -4265,6 +4335,8 @@ fn session_job_detail(rooms: Option<&RoomsListRef>, job: &SessionJob) -> Option<
         .flatten(),
         // A listing has no single target of its own.
         SessionJob::ListMiniAppTools { .. } => None,
+        // The task prompt names its own task in the modal title.
+        SessionJob::RequestTaskPermissions { .. } => None,
     }
 }
 
@@ -4364,6 +4436,12 @@ fn refuse_room_prompts(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
 }
 
 fn show_next_permission_prompt(cx: &mut Cx, ui: &WidgetRef) {
+    // Task prompts show ahead of single-permission prompts, one modal at a time.
+    #[cfg(unix)]
+    if with_a2app(|state| state.active_task.is_none() && !state.task_prompts.is_empty()).unwrap_or(false) {
+        show_next_task_prompt(cx, ui);
+        return;
+    }
     permission_batch::show_next(cx, ui);
 }
 
@@ -4488,6 +4566,7 @@ fn flow_prompt_info(state: &A2AppState, rooms: Option<&RoomsListRef>, flow: &Flo
         sources: review.sources.iter().map(|source| match source {
             Source::Account { .. } => "Your account data or text entered in this app".into(),
             Source::Room { room, .. } => format!("Data from {}", room_name(room)),
+            Source::RoomDirectory { .. } => "Your room and space directory".into(),
             Source::UnknownPrivate => "Older private data with an unknown source".into(),
         }).collect(),
         payload: serde_json::from_str::<serde_json::Value>(&review.payload)
@@ -4604,6 +4683,7 @@ fn ai_prompt_action(
                 }
                 // Never parked (it answers immediately), but exhaustive.
                 SessionJob::ListMiniAppTools { .. } => continue,
+                SessionJob::RequestTaskPermissions { .. } => continue,
             };
         }
     }
@@ -4676,6 +4756,7 @@ fn ai_prompt_reason(
                 ),
                 // Never parked (it answers immediately), but exhaustive.
                 SessionJob::ListMiniAppTools { .. } => continue,
+                SessionJob::RequestTaskPermissions { .. } => continue,
             };
         }
     }
@@ -5053,7 +5134,8 @@ fn answer_session_job(job: SessionJob, result: Result<String, String>) {
         | SessionJob::FetchUrl { answer, .. }
         | SessionJob::InvokeMiniAppTool { answer, .. }
         | SessionJob::CallMiniAppTool { answer, .. }
-        | SessionJob::ListMiniAppTools { answer } => {
+        | SessionJob::ListMiniAppTools { answer }
+        | SessionJob::RequestTaskPermissions { answer, .. } => {
             let _ = answer.send(result);
         }
     }
@@ -5065,8 +5147,10 @@ fn answer_session_job(job: SessionJob, result: Result<String, String>) {
 #[cfg(unix)]
 fn ai_tool_refused_text(perm: Permission) -> String {
     format!(
-        "The user did not allow the AI in this room to do this (\"{}\"). \
-         Tell them what you wanted to do and why, so they can allow it.",
+        "The user did not allow the \"{}\" permission for this task. If it is \
+         part of a task you are starting, call request_task_permissions with \
+         this need so the user can decide once; otherwise tell the user what \
+         you wanted to do and why.",
         perm.title()
     )
 }
@@ -5435,10 +5519,425 @@ fn refresh_flow_capture(flow: &mut FlowContinuation) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Update the live app without retiring its pending callbacks.
-///
-/// Network authority is checked by the host for each request; isolated VMs
-/// always keep native networking disabled, including after a grant changes.
+/// Handles one `request_task_permissions` tool call: parse the untrusted
+/// request, resolve it into the exact plan Robrix will show, and either park
+/// it behind the task modal or answer at once when nothing needs the user.
+#[cfg(unix)]
+fn run_request_task_permissions(
+    cx: &mut Cx,
+    ui: &WidgetRef,
+    room_id: &OwnedRoomId,
+    request: serde_json::Value,
+    answer: Sender<Result<String, String>>,
+) {
+    let context = match super::information_flow::agent_context(room_id.as_str()) {
+        Ok(context) => context,
+        Err(error) => { let _ = answer.send(Err(error)); return; }
+    };
+    let request = match task_grants::parse_request(&request) {
+        Ok(request) => request,
+        Err(error) => { let _ = answer.send(Err(error)); return; }
+    };
+    let account = context.account().to_string();
+    let subject = agent_subject(room_id.as_str());
+    let epoch = match a2app_core::information_flow::context_epoch(&context) {
+        Ok(epoch) => epoch,
+        Err(error) => { let _ = answer.send(Err(error)); return; }
+    };
+    let (store, model_recipient, task_id) = with_a2app(|state| {
+        state.next_task_id = state.next_task_id.saturating_add(1);
+        let recipient = a2app_agent::model_transport::current_recipient(&state.agent_prefs)
+            .ok()
+            .map(|recipient| Recipient::ModelProvider(recipient.id));
+        (state.permissions.clone(), recipient, state.next_task_id)
+    })
+    .unwrap_or_else(|| (PermissionStore::default(), None, 0));
+    // The AI room's own reply/activity rows are unencrypted Matrix state, so
+    // every source the task reads must also be allowed to this origin.
+    let homeserver_recipient = crate::sliding_sync::get_client()
+        .and_then(|client| Recipient::network_origin(client.homeserver().as_str()).ok());
+    let joined = |id: &str| {
+        let Some(client) = crate::sliding_sync::get_client() else { return false };
+        let Ok(room) = OwnedRoomId::try_from(id) else { return false };
+        client.get_room(&room).is_some()
+    };
+    let inputs = ResolveInputs {
+        task_id,
+        subject: &subject,
+        account: &account,
+        room: room_id.as_str(),
+        context: &context,
+        epoch,
+        model_recipient,
+        homeserver_recipient,
+        joined: &joined,
+        declared_capabilities: AI_ROOM_SESSION_CAP_IDS,
+        store: &store,
+        flow: &task_grants::GlobalFlow,
+    };
+    let plan = match task_grants::resolve(&request, &inputs) {
+        Ok(plan) => plan,
+        Err(error) => { let _ = answer.send(Err(error)); return; }
+    };
+    let declined = |plan: &TaskPlan| task_grants::outcome(plan, &std::collections::BTreeSet::new()).to_string();
+    if !plan.needs_prompt() {
+        // Every item is already allowed or blocked by policy: no modal, so
+        // the agent is answered at once and blocked items surface on the turn.
+        note_ai_tool_call(room_id, "request_task_permissions", true, "Nothing new to allow");
+        let _ = answer.send(Ok(declined(&plan)));
+        return;
+    }
+    let dismissed = with_a2app(|state| {
+        state.dismissed_task_plans.contains(&(room_id.to_string(), plan.plan_hash))
+    })
+    .unwrap_or(false);
+    if dismissed {
+        note_ai_tool_call(room_id, "request_task_permissions", false, "Declined this turn");
+        let _ = answer.send(Ok(declined(&plan)));
+        return;
+    }
+    with_a2app(|state| {
+        state.task_prompts.push_back(TaskPrompt { room_id: room_id.clone(), plan, answer });
+    });
+    show_next_task_prompt(cx, ui);
+}
+
+/// Shows the next task prompt, if none is already open. Task prompts are
+/// shown ahead of single-permission prompts, one modal at a time.
+#[cfg(unix)]
+fn show_next_task_prompt(cx: &mut Cx, ui: &WidgetRef) {
+    // Names for the detail lines come from the room list, so a prompt says
+    // "General" rather than `!abc:server`.
+    let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
+    let info = with_a2app(|state| {
+        if state.active_task.is_some() || state.active_prompt.is_some() {
+            return None;
+        }
+        let prompt = state.task_prompts.pop_front()?;
+        // The model label and the room's live app-tool names let the details
+        // name what a grant reaches instead of echoing raw ids.
+        let model = a2app_agent::model_transport::current_recipient(&state.agent_prefs)
+            .ok()
+            .map(|recipient| (recipient.id, recipient.label));
+        let tool_names: Vec<(String, String)> = state
+            .app_tools
+            .values()
+            .map(|reg| (reg.full_name.clone(), reg.raw_name.clone()))
+            .collect();
+        let info = task_prompt_info(&prompt.plan, rooms.as_ref(), model.as_ref(), &tool_names);
+        state.active_task = Some(prompt);
+        Some(info)
+    })
+    .flatten();
+    let Some(info) = info else { return };
+    ui.task_permission_prompt(cx, ids!(task_permission_modal.content)).show(cx, &info);
+    ui.modal(cx, ids!(task_permission_modal)).open(cx);
+}
+
+/// Builds what the modal shows: the agent's verbatim paragraph and one row per
+/// exact item. Robrix's item titles and details are authoritative; the agent's
+/// text is context only. Room/space ids in those rows are resolved to names,
+/// and the model/app-tool ids to their live labels, so the user reads what a
+/// grant reaches rather than raw identifiers.
+#[cfg(unix)]
+fn task_prompt_info(
+    plan: &TaskPlan,
+    rooms: Option<&RoomsListRef>,
+    model: Option<&(String, String)>,
+    tool_names: &[(String, String)],
+) -> TaskPromptInfo {
+    let name_of = |id: &str| resolve_room_label(rooms, id);
+    let model_label = model.map(|(id, label)| (id.as_str(), label.as_str()));
+    let tool_name_of = |tool: &str| {
+        tool_names
+            .iter()
+            .find(|(full_name, _)| full_name == tool)
+            .or_else(|| tool_names.iter().find(|(_, raw_name)| raw_name == tool))
+            .map(|(_, raw_name)| raw_name.clone())
+    };
+    let items = plan
+        .items
+        .iter()
+        .map(|item| TaskItemView {
+            id: item.id.clone(),
+            title: task_item_title(&item.action, &name_of, model_label, &tool_name_of),
+            detail: task_item_detail(&item.action, &name_of, model_label, &tool_name_of),
+            chip: task_item_chip(&item.state),
+            why: item.why.clone(),
+            grantable: item.state.is_grantable(),
+            checked: item.state.is_grantable(),
+        })
+        .collect();
+    let risk = plan
+        .items
+        .iter()
+        .any(|item| item.state.is_grantable() && item.risk >= a2app_core::capabilities::Risk::High)
+        .then(|| "This plan includes broad or high-risk access. Review the details before allowing.".to_string());
+    TaskPromptInfo {
+        explanation: format!("\u{201c}{}\u{201d}", plan.explanation),
+        items,
+        risk,
+    }
+}
+
+/// The headline for one plan item, with ids resolved to the names the user
+/// recognizes.
+#[cfg(unix)]
+fn task_item_title(
+    action: &a2app_core::task_grants::PlanAction,
+    name_of: &impl Fn(&str) -> String,
+    model: Option<(&str, &str)>,
+    tool_name_of: &impl Fn(&str) -> Option<String>,
+) -> String {
+    use a2app_core::task_grants::PlanAction;
+    match action {
+        PlanAction::Scoped { capability, .. } => a2app_core::capabilities::by_id(capability)
+            .map(|cap| cap.title.to_string())
+            .unwrap_or_else(|| capability.clone()),
+        PlanAction::Network { url, .. } => format!("Open {url}"),
+        PlanAction::Tool { tool, .. } => format!(
+            "Use the mini-app tool \u{201c}{}\u{201d}",
+            tool_name_of(tool).as_deref().unwrap_or(tool),
+        ),
+        PlanAction::Flow { source, recipient } => format!(
+            "Let {} reach {}",
+            task_source_label(source, name_of),
+            task_recipient_label(recipient, name_of, model),
+        ),
+    }
+}
+
+/// A flow's source, named for the user (room/space ids resolved, account and
+/// the directory described rather than dumped).
+#[cfg(unix)]
+fn task_source_label(source: &Source, name_of: &impl Fn(&str) -> String) -> String {
+    match source {
+        Source::Room { room, .. } => format!("\u{201c}{}\u{201d}", name_of(room)),
+        Source::Account { account } => format!("your account ({account})"),
+        Source::RoomDirectory { .. } => "your room directory".to_string(),
+        Source::UnknownPrivate => "stored data".to_string(),
+    }
+}
+
+/// A flow's recipient, named for the user (rooms resolved, the model named by
+/// its current label, origins kept since that is what the grant opens).
+#[cfg(unix)]
+fn task_recipient_label(
+    recipient: &Recipient,
+    name_of: &impl Fn(&str) -> String,
+    model: Option<(&str, &str)>,
+) -> String {
+    match recipient {
+        Recipient::MatrixRoom { room, .. } => format!("room \u{201c}{}\u{201d}", name_of(room)),
+        Recipient::ModelProvider(provider) => match model {
+            Some((id, label)) if id == provider && !label.is_empty() => format!("your AI service ({label})"),
+            _ => "your AI service".to_string(),
+        },
+        Recipient::NetworkOrigin(origin) => origin.clone(),
+        Recipient::External => "outside Robrix".to_string(),
+        Recipient::Clipboard => "the clipboard".to_string(),
+    }
+}
+
+/// The detail line for one plan item, with room/space ids resolved to the
+/// names the user recognizes and app-tool ids to the app's own tool name. A
+/// target unknown to the room list falls back to its id so the row is never
+/// empty.
+#[cfg(unix)]
+fn task_item_detail(
+    action: &a2app_core::task_grants::PlanAction,
+    name_of: &impl Fn(&str) -> String,
+    model: Option<(&str, &str)>,
+    tool_name_of: &impl Fn(&str) -> Option<String>,
+) -> String {
+    use a2app_core::task_grants::PlanAction;
+    match action {
+        PlanAction::Scoped { scope, .. } => match scope {
+            RoomScope::AllRooms => "all rooms".to_string(),
+            RoomScope::Selection { rooms, spaces } => {
+                let mut parts: Vec<String> = Vec::new();
+                if !rooms.is_empty() {
+                    parts.push(format!("rooms: {}", rooms.iter().map(|id| name_of(id)).collect::<Vec<_>>().join(", ")));
+                }
+                if !spaces.is_empty() {
+                    parts.push(format!("spaces: {}", spaces.iter().map(|id| name_of(id)).collect::<Vec<_>>().join(", ")));
+                }
+                parts.join(" · ")
+            }
+        },
+        PlanAction::Flow { source, recipient } => format!(
+            "{} \u{2192} {}",
+            task_source_label(source, name_of),
+            task_recipient_label(recipient, name_of, model),
+        ),
+        PlanAction::Tool { tool, .. } => tool_name_of(tool)
+            .map(|name| format!("tool \u{201c}{name}\u{201d}"))
+            .unwrap_or_default(),
+        // A URL is already exactly the thing the grant opens.
+        PlanAction::Network { .. } => action.detail().unwrap_or_default(),
+    }
+}
+
+#[cfg(unix)]
+fn task_item_chip(state: &ItemState) -> String {
+    match state {
+        ItemState::AlreadyAllowed => "Already allowed".to_string(),
+        ItemState::NeedsGrant => "Will be granted until this turn ends".to_string(),
+        ItemState::Blocked(reason) => format!("Blocked: {}", task_reason_label(*reason)),
+        ItemState::NotOffered(reason) => format!("Not offered: {}", task_reason_label(*reason)),
+    }
+}
+
+#[cfg(unix)]
+fn task_reason_label(reason: TaskReason) -> &'static str {
+    match reason {
+        TaskReason::Declined => "the user declined",
+        TaskReason::BlockedByRoomPolicy => "a room's protection blocks it",
+        TaskReason::NotOffered => "not offered here",
+        TaskReason::InvalidTarget => "not a room or space you have joined",
+        TaskReason::AlreadyAllowed => "already allowed",
+    }
+}
+
+/// Applies the user's answer to one task prompt. "Not now" is remembered by
+/// plan hash until the turn closes; Allow applies exactly the checked items as
+/// one atomic, turn-scoped batch.
+#[cfg(unix)]
+fn answer_task_prompt(cx: &mut Cx, ui: &WidgetRef, action: TaskPermissionAction) {
+    ui.modal(cx, ids!(task_permission_modal)).close(cx);
+    let Some(Some(prompt)) = with_a2app(|state| state.active_task.take()) else { return };
+    if matches!(action, TaskPermissionAction::None) {
+        with_a2app(|state| state.active_task = Some(prompt));
+        return;
+    }
+    let TaskPrompt { room_id, plan, answer } = prompt;
+    let approved = match action {
+        TaskPermissionAction::NotNow => {
+            with_a2app(|state| {
+                state.dismissed_task_plans.insert((room_id.to_string(), plan.plan_hash));
+            });
+            note_ai_tool_call(&room_id, "request_task_permissions", false, "Declined");
+            std::collections::BTreeSet::new()
+        }
+        TaskPermissionAction::Allow(ids) => task_grants::dependent_approval(&plan, ids),
+        TaskPermissionAction::None => unreachable!(),
+    };
+    // Apply outside the state borrow: information-flow rules live in their own
+    // registry, and a partial apply is rolled back by `task_grants::apply`.
+    let mut store = with_a2app(|state| std::mem::take(&mut state.permissions)).unwrap_or_default();
+    let result = task_grants::apply(&plan, &approved, &mut store, &task_grants::GlobalFlowApply);
+    let mut applied = None;
+    let outcome = match result {
+        Ok(task) => {
+            applied = Some(task);
+            note_ai_tool_call(&room_id, "request_task_permissions", true, &format!("Approved: {}", plan.title));
+            Ok(task_grants::outcome(&plan, &approved).to_string())
+        }
+        Err(error) => {
+            let message = error.message();
+            note_ai_tool_call(&room_id, "request_task_permissions", false, &message);
+            Err(message)
+        }
+    };
+    with_a2app(|state| {
+        state.permissions = store;
+        state.mark_perms_dirty();
+        if let Some(task) = applied {
+            state.task_ledger.insert(task);
+        }
+    });
+    publish_grants(cx);
+    let _ = answer.send(outcome);
+    show_next_permission_prompt(cx, ui);
+    ui.redraw(cx);
+}
+
+/// Revokes every task grant a room applied and forgets its "Not now" memory.
+/// Called when the turn closes, when the session stops, and on room close.
+#[cfg(unix)]
+fn revoke_task_grants(room_id: &OwnedRoomId) {
+    let tasks: Vec<task_grants::AppliedTask> = with_a2app(|state| {
+        state.dismissed_task_plans.retain(|(room, _)| room != room_id.as_str());
+        let ids: Vec<u64> = state
+            .task_ledger
+            .tasks()
+            .filter(|task| task.context.room() == Some(room_id.as_str()))
+            .map(|task| task.task_id)
+            .collect();
+        ids.into_iter().filter_map(|id| state.task_ledger.remove(id)).collect()
+    })
+    .unwrap_or_default();
+    if tasks.is_empty() {
+        return;
+    }
+    let mut store = with_a2app(|state| std::mem::take(&mut state.permissions)).unwrap_or_default();
+    for task in &tasks {
+        task_grants::rollback(task, &mut store, &task_grants::GlobalFlowApply);
+    }
+    with_a2app(|state| {
+        state.permissions = store;
+        state.mark_perms_dirty();
+    });
+}
+
+/// Takes every task prompt pending for a room (without a UI handle), so a
+/// teardown path can answer its caller even when it cannot close the modal.
+#[cfg(unix)]
+fn take_room_tasks(room_id: &OwnedRoomId) -> Vec<TaskPrompt> {
+    with_a2app(|state| {
+        let mut pending = Vec::new();
+        if state.active_task.as_ref().is_some_and(|prompt| &prompt.room_id == room_id)
+            && let Some(prompt) = state.active_task.take()
+        {
+            pending.push(prompt);
+        }
+        let (mine, rest): (Vec<_>, Vec<_>) = state
+            .task_prompts
+            .drain(..)
+            .partition(|prompt| &prompt.room_id == room_id);
+        state.task_prompts = rest.into_iter().collect();
+        pending.extend(mine);
+        pending
+    })
+    .unwrap_or_default()
+}
+
+/// Withdraws a room's pending task prompts (turn cancelled or session gone):
+/// the parked tool calls are refused and the modal moves on, so a serve thread
+/// never hangs.
+#[cfg(unix)]
+fn refuse_room_tasks(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
+    let (pending, was_active) = with_a2app(|state| {
+        let mut pending = Vec::new();
+        let mut was_active = false;
+        if state.active_task.as_ref().is_some_and(|prompt| &prompt.room_id == room_id) {
+            if let Some(prompt) = state.active_task.take() {
+                pending.push(prompt);
+                was_active = true;
+            }
+        }
+        let (mine, rest): (Vec<_>, Vec<_>) = state
+            .task_prompts
+            .drain(..)
+            .partition(|prompt| &prompt.room_id == room_id);
+        state.task_prompts = rest.into_iter().collect();
+        pending.extend(mine);
+        (pending, was_active)
+    })
+    .unwrap_or_default();
+    for prompt in pending {
+        let message = task_grants::outcome(&prompt.plan, &std::collections::BTreeSet::new()).to_string();
+        let _ = prompt.answer.send(Ok(message));
+    }
+    if was_active {
+        ui.modal(cx, ids!(task_permission_modal)).close(cx);
+        show_next_permission_prompt(cx, ui);
+    }
+}
+
+/// Pushes a changed grant into the app's live isolate: network changes
+/// stop the app (the net runtime is baked in at VM alloc); anything else
+/// just gets the new caps list plus an `on_permissions_changed` call.
 fn apply_permission_to_running(cx: &mut Cx, _ui: &WidgetRef, app_id: &str, perm: Permission) {
     // The mcp-tools answer is a kill switch, so a Deny takes back the tools
     // the app already installed on a room's agent, not just future ones.
@@ -5605,6 +6104,9 @@ fn request_policy_spaces() {
 
 /// Ends room-session consent when the room's last tab/mobile screen closes.
 pub fn on_room_closed(cx: &mut Cx, room_id: &OwnedRoomId) {
+    // Task grants are turn-scoped and never outlive the room session.
+    #[cfg(unix)]
+    revoke_task_grants(room_id);
     if let Ok(account) = super::information_flow::account() {
         let _ = a2app_core::information_flow::close_room_session(&account, room_id.as_str());
     }
@@ -6024,6 +6526,27 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
                     PopupKind::Error, Some(6.0),
                 );
             }
+            // This write is the turn's output, so the task-scoped grants it
+            // rode on can go now. A natural reply (no parked tool call) only
+            // revokes if no newer turn has taken over; a `send_message` reply
+            // revokes only while its own turn is still the live one.
+            let revoke = match parked.as_ref().and_then(|(_, turn, _, _)| turn.as_deref()) {
+                Some(turn) => with_a2app(|state| {
+                    state
+                        .ai_rooms
+                        .get(&room_id)
+                        .and_then(|info| info.active_turn.as_ref().map(|t| t.key.as_str() == turn))
+                })
+                .flatten()
+                .unwrap_or(false),
+                None => with_a2app(|state| {
+                    state.ai_rooms.get(&room_id).is_none_or(|info| info.active_turn.is_none())
+                })
+                .unwrap_or(false),
+            };
+            if revoke {
+                revoke_task_grants(&room_id);
+            }
             let Some((_, turn, answer, receipts)) = parked else { return };
             // The write outlives a turn the user cancelled (its tool call is
             // abandoned, not awaited), so a result whose turn is over may only
@@ -6105,15 +6628,19 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
                         _ => room_id.as_str(),
                     };
                     if state.permissions.room_policy(Some(target), RoomAccess::Read) == PolicyDecision::Deny
-                        || (!matches!(kind, ReadToolKind::ListRooms | ReadToolKind::ListSpaces | ReadToolKind::SpaceRooms { .. })
+                        || (!is_directory_kind(&kind)
                             && auth.as_ref().is_some_and(|auth| !auth.permits(&state.permissions, Some(target))))
                     { return Err("Reading this room is now blocked in Mini Apps permissions.".into()); }
                     matrix::policy::filter_read_result(&result, &state.permissions, auth.as_ref())
                 }).unwrap_or_else(|| Err("Permissions are unavailable.".into())));
                 let result = result.and_then(|text| {
                     let context = super::information_flow::agent_context(room_id.as_str())?;
-                    let value = serde_json::from_str(&text).map_err(|_| "Invalid tool response.")?;
-                    super::information_flow::record_response(&context, &value)?;
+                    if is_directory_kind(&kind) {
+                        super::information_flow::record_directory_response(&context)?;
+                    } else {
+                        let value = serde_json::from_str(&text).map_err(|_| "Invalid tool response.")?;
+                        super::information_flow::record_response(&context, &value)?;
+                    }
                     Ok(text)
                 });
                 let (summary, ok) = match &result {
@@ -6183,6 +6710,16 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
 /// a fresh activation with the same durable provenance.
 #[cfg(unix)]
 fn stop_ai_session(room_id: &OwnedRoomId) {
+    #[cfg(unix)]
+    {
+        // Task grants are turn-scoped; the session stopping ends them, and a
+        // pending task prompt is answered declined so its caller never hangs.
+        revoke_task_grants(room_id);
+        for prompt in take_room_tasks(room_id) {
+            let message = task_grants::outcome(&prompt.plan, &std::collections::BTreeSet::new()).to_string();
+            let _ = prompt.answer.send(Ok(message));
+        }
+    }
     cancel_ai_fetches(room_id);
     // Drop the exact session before waking tool callers or processing more
     // UI work. Its Drop retires only its captured account and activation;
@@ -6568,6 +7105,54 @@ fn apply_ai_room_panel_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomPanelAc
     ui.redraw(cx);
 }
 
+/// The four directory tools whose reads the agent gets by default, so it can
+/// name real rooms in an upfront request without asking first. Directory
+/// results carry no message content but stay untrusted input.
+#[cfg(unix)]
+fn is_directory_kind(kind: &ReadToolKind) -> bool {
+    matches!(
+        kind,
+        ReadToolKind::ListRooms
+            | ReadToolKind::ListSpaces
+            | ReadToolKind::SpaceInfo { .. }
+            | ReadToolKind::SpaceRooms { .. }
+    )
+}
+
+/// Grants the capabilities an AI room needs to orient itself — the room
+/// directory (`list_rooms` / `list_spaces` / `space_info` / `list_space_rooms`),
+/// the room's own transcript and metadata, and the installed mini-app list —
+/// unless the user has an explicit answer for a group. A stored Deny is the
+/// kill switch and is never overridden; each grant only turns an untouched
+/// `Ask` default into `Granted`, so a revoked group is not silently
+/// re-granted here.
+#[cfg(unix)]
+fn apply_ai_room_capability_defaults(state: &mut A2AppState, room_id: &OwnedRoomId) {
+    let subject = agent_subject(room_id.as_str());
+    let mut changed = false;
+    for cap_id in a2app_core::task_grants::DIRECTORY_CAP_IDS {
+        let Some(cap) = a2app_core::capabilities::by_id(cap_id) else { continue };
+        let Some(group) = cap.group else { continue };
+        if state.permissions.state(&subject, group) == GrantState::Ask {
+            state.permissions.set(&subject, group, GrantState::Granted);
+            changed = true;
+        }
+    }
+    // The room's own transcript and metadata are the reason the AI room
+    // exists, and `AppLaunch` also covers `apps.list`, so the agent can see
+    // which mini-apps exist before it asks to run one. A stored Deny is still
+    // respected, so an explicit revocation is not silently undone.
+    for group in [Permission::MatrixRoomRead, Permission::MatrixRoomInfo, Permission::AppLaunch] {
+        if state.permissions.state(&subject, group) == GrantState::Ask {
+            state.permissions.set(&subject, group, GrantState::Granted);
+            changed = true;
+        }
+    }
+    if changed {
+        state.mark_perms_dirty();
+    }
+}
+
 /// Starts an AI room's session if it isn't already running. Started idle
 /// (no prompt sent yet) — the first forwarded message primes it with the
 /// replayed transcript and sends it as one prompt.
@@ -6613,10 +7198,28 @@ fn attach_ai_session(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, _name: 
 /// Restore reviewed tools and their current provenance on every fresh session,
 /// including the next member prompt after an explicit Stop.
 #[cfg(unix)]
-fn start_ai_session(state: &A2AppState, room_id: &OwnedRoomId, prefs: AgentPrefs) -> Result<AiSession, String> {
+fn start_ai_session(state: &mut A2AppState, room_id: &OwnedRoomId, prefs: AgentPrefs) -> Result<AiSession, String> {
     let context = super::information_flow::prepare_agent(room_id.as_str())?;
     let epoch = a2app_core::information_flow::context_epoch(&context)?;
+    // A fresh room must not have to prompt for the directory, its own
+    // transcript, or the installed mini-app list. Applied here (not only on
+    // the marker-check attach path) so a lazily started session — the first
+    // message in a newly created room — gets them too.
+    apply_ai_room_capability_defaults(state, room_id);
     let result = (|| {
+        // A freshly created AI room has no sharing rules yet, so its first
+        // model call and its own activity/reply cards would be refused with
+        // "Information flow blocked". Grant the baseline it cannot work
+        // without, so an AI room works out of the box (the user can still
+        // revoke these in the Data Sharing editor).
+        let model = a2app_agent::model_transport::current_recipient(&prefs)
+            .ok()
+            .map(|recipient| recipient.id);
+        let homeserver = crate::sliding_sync::get_client()
+            .map(|client| client.homeserver().to_string());
+        super::information_flow::ensure_agent_default_sharing(
+            &context, room_id.as_str(), model.as_deref(), homeserver.as_deref(),
+        );
         for reg in state.app_tools.values().filter(|reg| &reg.room_id == room_id) {
             transfer_app_tool_provenance(state, &reg.app_id, reg.heap_key, room_id)?;
         }
@@ -6719,6 +7322,10 @@ pub fn ai_room_active_turn(_room_id: &OwnedRoomId) -> Option<String> {
 /// (or another room) started keeps running.
 #[cfg(unix)]
 fn abort_ai_room_work(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
+    // Withdraw a task prompt first, so the modal closes and no serve thread
+    // hangs on a task whose turn is being cancelled.
+    #[cfg(unix)]
+    refuse_room_tasks(cx, ui, room_id);
     // Retire before answering any parked tool: a still-running blocking
     // caller must not enqueue a new UI job after we drain the old queue.
     stop_ai_session(room_id);
@@ -7062,8 +7669,10 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
                         // Turn over: the turn card is settled (Done), and
                         // any tool call that never resolved stays as a
                         // `Started` line inside it — the reply's receipt chips
-                        // still tell the outcome.
-                        close_active_turn(&room_id);
+                        // still tell the outcome. This turn's grants stay until
+                        // the reply it queued lands (or, if `send_message`
+                        // already replied, until that write's result landed).
+                        close_active_turn(&room_id, false);
                     }
                     SessionUpdate::TurnEnded => {
                         // The turn ended without a reply (cancelled via Escape,
@@ -7076,7 +7685,7 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
                                 info.pending_tool_calls.clear();
                             }
                         });
-                        close_active_turn(&room_id);
+                        close_active_turn(&room_id, true);
                         ui.redraw(cx);
                     }
                     SessionUpdate::Error(msg) => {
@@ -7091,14 +7700,14 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
                                 info.pending_tool_calls.clear();
                             }
                         });
-                        close_active_turn(&room_id);
+                        close_active_turn(&room_id, true);
                         log!("AI Rooms: room {room_id}'s agent session reported an error: {msg}");
                         post_ai_activity(&room_id, AiActivityKind::Error, Some(&msg));
                         errors.push(msg)
                     }
                     SessionUpdate::Gone(msg) => {
                         log!("AI Rooms: room {room_id}'s agent session is GONE: {msg}");
-                        close_active_turn(&room_id);
+                        close_active_turn(&room_id, true);
                         post_ai_activity(&room_id, AiActivityKind::Stopped, Some(&msg));
                         deaths.push((room_id.clone(), msg))
                     }
@@ -7245,16 +7854,29 @@ fn run_ai_read_tool(
     };
     let flow_context = match super::information_flow::prepare_agent(room_id.as_str()).and_then(|context| {
         // Caller-controlled identifiers and pagination can be sent to the server.
-        if !matches!(kind, ReadToolKind::ListRooms | ReadToolKind::ListSpaces) {
+        // Directory reads are the agent's own map, not an output into a target
+        // room, so they need no room-output rule.
+        if !is_directory_kind(&kind) {
             super::information_flow::ensure_room_output(&context, target)?;
         }
-        let source = if matches!(kind, ReadToolKind::ListRooms | ReadToolKind::ListSpaces | ReadToolKind::SpaceRooms { .. }) {
-            super::information_flow::account_source(&context)
-        } else { super::information_flow::room_source(&context, target) };
-        a2app_core::information_flow::add_sources(&context, [source])?;
-        a2app_core::information_flow::add_influences(&context, [a2app_core::information_flow::Influence::RoomContent {
-            account: super::information_flow::context_account(&context).into(), room: target.into(),
-        }])?;
+        // The directory tools carry one `RoomDirectory` source (and its
+        // untrusted influence) instead of one source per listed room, so one
+        // provider rule covers the whole directory and other recipients do not
+        // inherit every listed room. Everything else labels its target room.
+        if is_directory_kind(&kind) {
+            let source = super::information_flow::directory_source(&context);
+            let influence = a2app_core::information_flow::Influence::RoomDirectory {
+                account: super::information_flow::context_account(&context).into(),
+            };
+            a2app_core::information_flow::add_sources(&context, [source])?;
+            a2app_core::information_flow::add_influences(&context, [influence])?;
+        } else {
+            let source = super::information_flow::room_source(&context, target);
+            a2app_core::information_flow::add_sources(&context, [source])?;
+            a2app_core::information_flow::add_influences(&context, [a2app_core::information_flow::Influence::RoomContent {
+                account: super::information_flow::context_account(&context).into(), room: target.into(),
+            }])?;
+        }
         Ok(context)
     }) {
         Ok(context) => context,
@@ -7373,11 +7995,22 @@ fn run_ai_read_tool(
             with_a2app(|state| {
                 state.ai_reads.insert(id, (room_id.clone(), kind.clone(), answer));
             });
-            let authorization = with_a2app(|state| {
-                let mut auth = matrix::policy::MatrixAuthorization::new(&subject, cap.id, Some(room_id.as_str()), &state.permissions).with_flow(flow_context.clone());
-                auth.target_room = target_room.as_ref().map(ToString::to_string).or_else(|| Some(room_id.to_string()));
-                auth
-            });
+            // A directory read (`list_rooms` / `list_spaces` / space info) is
+            // the agent's own map, not an output into each listed room. Passing
+            // an authorization would make `room_access_allowed` run the flow
+            // check per listed room (`auth.check_flow(Some(room), Read)`),
+            // which requires the label to be allowed to reach every room and so
+            // filters the whole list away. The capability verdict above already
+            // gated the directory as a whole.
+            let authorization = if is_directory_kind(&kind) {
+                None
+            } else {
+                with_a2app(|state| {
+                    let mut auth = matrix::policy::MatrixAuthorization::new(&subject, cap.id, Some(room_id.as_str()), &state.permissions).with_flow(flow_context.clone());
+                    auth.target_room = target_room.as_ref().map(ToString::to_string).or_else(|| Some(room_id.to_string()));
+                    auth
+                })
+            };
             submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::ToolRead {
                 id,
                 room_id: room_id.clone(),
@@ -7937,6 +8570,9 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
         SessionJob::ReadTool { kind, answer } => {
             run_ai_read_tool(cx, ui, room_id, kind, answer);
         }
+        SessionJob::RequestTaskPermissions { request, answer } => {
+            run_request_task_permissions(cx, ui, room_id, request, answer);
+        }
         SessionJob::FetchUrl { url, answer } => run_ai_fetch(cx, ui, room_id, url, answer),
         SessionJob::NetworkAccess { tool, host, url, answer } => {
             run_network_access(cx, ui, room_id, &tool, &host, &url, answer);
@@ -8415,7 +9051,10 @@ fn ai_now_millis() -> u64 {
 /// name), so the room's live tool log shows each call finishing.
 #[cfg(unix)]
 fn note_ai_tool_call(room_id: &OwnedRoomId, name: &str, ok: bool, summary: &str) {
-    let summary: String = summary.chars().take(48).collect();
+    // Keep enough of the result for the turn card's expanded body; the receipt
+    // chip truncates independently. The old 48-char cap cut JSON results
+    // mid-token and made them unreadable.
+    let summary: String = summary.chars().take(240).collect();
     // `finish_ai_tool_call` returns the target detail recorded for the call
     // when its job reached the UI thread, so the receipt chip names the same
     // room/space/app the live row did.
@@ -8466,7 +9105,7 @@ fn finish_ai_tool_call(room_id: &OwnedRoomId, name: &str, ok: bool, summary: &st
         let call = &mut calls[pos];
         call.status = AiTurnToolStatus::Done;
         call.ok = ok;
-        call.summary = summary.chars().take(48).collect();
+        call.summary = summary.chars().take(240).collect();
         detail_out = call.detail.clone();
         true
     });
@@ -8649,8 +9288,17 @@ fn with_turn(
 /// Settles and clears this room's open turn: rewrites its `ai_turn` row
 /// `Done` (turning the card's tint neutral and hiding its spinner) and drops
 /// it, so the next turn gets a fresh card. A no-op when no turn is open.
+///
+/// `revoke_grants` drops the turn's task-scoped grants and "Not now" memory.
+/// A natural reply passes `false` and lets its write finish first (see
+/// [`AiRoomAction::PostReplyResult`]): the reply and the Done row it settles
+/// are output to this room and must still pass the sharing check those grants
+/// authorize. Every turn that ends without a reply passes `true`.
 #[cfg(unix)]
-fn close_active_turn(room_id: &OwnedRoomId) {
+fn close_active_turn(room_id: &OwnedRoomId, revoke_grants: bool) {
+    if revoke_grants {
+        revoke_task_grants(room_id);
+    }
     let closed = with_a2app(|state| {
         let info = state.ai_rooms.get_mut(room_id)?;
         let mut turn = info.active_turn.take()?;
@@ -8728,9 +9376,20 @@ fn flush_pending_ai_turns(cx: &mut Cx) {
             if info.pending_ai_turns.is_empty() {
                 continue;
             }
-            let cooled_down = info
-                .last_ai_turn_post
-                .is_none_or(|last| now.duration_since(last) >= info.ai_turn_backoff);
+            // A new turn's first snapshot is the card's anchor: post it
+            // immediately so the tool-call box appears the moment the agent
+            // starts thinking or calls its first tool, even if the previous
+            // turn wrote a moment ago. Later snapshots still respect the
+            // spacing, which is what keeps a busy turn under the server's
+            // state-event rate limit.
+            let anchor_pending = info
+                .pending_ai_turns
+                .front()
+                .is_some_and(|(key, _)| info.first_posted_turn.as_deref() != Some(key.as_str()));
+            let cooled_down = anchor_pending
+                || info
+                    .last_ai_turn_post
+                    .is_none_or(|last| now.duration_since(last) >= info.ai_turn_backoff);
             if !cooled_down {
                 needs_timer = true;
                 continue;
@@ -8828,6 +9487,17 @@ fn post_ai_reply(room_id: &OwnedRoomId, text: String, answer_id: Option<u64>) {
         Ok(context)
     });
     if flow_context.is_err() || !room_policy_allows(room_id.as_str(), RoomAccess::Write) {
+        let reason = match &flow_context {
+            Err(error) => error.clone(),
+            Ok(_) => String::from("writing to this room is blocked by its Mini Apps policy"),
+        };
+        log!("AI Rooms: refusing to post an ai_reply to {room_id}: {reason}");
+        // The reply could not even be queued. A natural reply has no worker
+        // result to release the turn's task grants, so drop them here; a
+        // parked `send_message` is answered below and its turn keeps them.
+        if answer_id.is_none() {
+            revoke_task_grants(room_id);
+        }
         if let Some(id) = answer_id
             && let Some((_, _, answer, _)) = with_a2app(|state| state.ai_replies.remove(&id)).flatten()
         {
@@ -9402,7 +10072,10 @@ View{note := Label{text:"waiting"}}
         let path = std::env::temp_dir().join(format!("robrix-generation-review-{}-{}", std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         let mut registry = flow::Registry::open(&path).unwrap();
-        let context = flow::ContextId::Agent { account: "alice".into(), room: SOURCE.into() };
+        // An app context, not an agent context: agent sessions bypass the
+        // exact-action review, so this exercises the review's mechanics (which
+        // still apply to mini-app contexts).
+        let context = flow::ContextId::App { account: "alice".into(), app: "tool".into(), room: Some(SOURCE.into()) };
         registry.register_context(&context).unwrap();
         registry.add_influences(&context, [flow::Influence::Model("provider".into())]).unwrap();
         let mut pending = PendingGeneratedApp {

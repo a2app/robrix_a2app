@@ -14,7 +14,7 @@ impl DataSharing {
         } else {
             "Sharing rules need your approval. In Needs attention, select a data source and choose Review sharing rule. Check the destination and duration before choosing Allow sharing. Repeat for each source, then return to the app and try again."
         }.to_string();
-        if blocked.iter().any(|source| match source { Source::Room { account, .. } | Source::Account { account } => account != &self.account, Source::UnknownPrivate => false }) {
+        if blocked.iter().any(|source| match source { Source::Room { account, .. } | Source::Account { account } | Source::RoomDirectory { account } => account != &self.account, Source::UnknownPrivate => false }) {
             text.push_str("\nSome data belongs to another account. Sign in to that account to review its sharing permission.");
         }
         if let Recipient::ModelProvider(id) = recipient

@@ -136,7 +136,7 @@ impl DataSharing {
     pub(super) fn sharing_action(&self, cx: &Cx) -> Result<A2AppOp, String> {
         let source = self.selected_source(cx)?;
         let source_account = match &source {
-            Source::Account { account } | Source::Room { account, .. } => account,
+            Source::Account { account } | Source::Room { account, .. } | Source::RoomDirectory { account } => account,
             Source::UnknownPrivate => return Err("Unknown private sources cannot be released.".into()),
         };
         if source_account != &self.account { return Err("Sign in to the source account to change its sharing rules.".into()); }
@@ -398,6 +398,7 @@ impl DataSharing {
         match source {
             Source::Account { .. } => "Account data".into(),
             Source::Room { room, .. } => format!("Room · {}", self.room_name(room)),
+            Source::RoomDirectory { .. } => "Room and space directory".into(),
             Source::UnknownPrivate => "Unknown private data".into(),
         }
     }
@@ -435,6 +436,7 @@ impl DataSharing {
         match source {
             Source::Account { account } => format!("Account data · {account}"),
             Source::Room { account, room } => format!("Room · {} · {account}", self.room_label(room)),
+            Source::RoomDirectory { account } => format!("Room and space directory · {account}"),
             Source::UnknownPrivate => "Private data with an unknown source (sharing blocked)".into(),
         }
     }
@@ -442,6 +444,7 @@ impl DataSharing {
     pub(super) fn influence_label(&self, influence: &Influence) -> String {
         match influence {
             Influence::RoomContent { account, room } => format!("Room content · {} · {account}", self.room_label(room)),
+            Influence::RoomDirectory { account } => format!("Room names and directory · {account}"),
             Influence::InternetOrigin(origin) => format!("Website content · {origin}"),
             Influence::MiniApp { account, app } => format!("Mini-app content · {} · {account}", self.app_label(app)),
             Influence::Model(id) => self.recipient_label(&Recipient::ModelProvider(id.clone())),

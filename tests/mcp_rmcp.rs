@@ -74,6 +74,16 @@ impl AiHost for RecordingHost {
         Ok(json!({"apps": [{"id": "smoke-app", "name": "Smoke App"}]}).to_string())
     }
 
+    fn fetch_url(&self, url: &str) -> Result<String, String> {
+        self.calls.lock().unwrap().push(format!("fetch_url({url:?})"));
+        Ok(json!({ "url": url, "body": "fixture" }).to_string())
+    }
+
+    fn request_task_permissions(&self, request: serde_json::Value) -> Result<String, String> {
+        self.calls.lock().unwrap().push(format!("request_task_permissions({request:?})"));
+        Ok(json!({ "task_id": 1, "status": "granted", "granted": [], "not_granted": [] }).to_string())
+    }
+
     fn launch_app(&self, app_id: &str) -> Result<String, String> {
         self.calls
             .lock()

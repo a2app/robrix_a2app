@@ -169,7 +169,7 @@ impl EffectReview {
     /// a general sharing rule for unidentified data.
     pub fn allow_session(&self) -> bool {
         self.sources.iter().all(|source| match source {
-            Source::Account { account } | Source::Room { account, .. } => account == self.context.account(),
+            Source::Account { account } | Source::Room { account, .. } | Source::RoomDirectory { account } => account == self.context.account(),
             Source::UnknownPrivate => true,
         })
     }
@@ -288,7 +288,7 @@ impl Registry {
             return Err("This request expired, was cancelled, or already completed.".into());
         }
         if expected.denied_sources.iter().any(|source| match source {
-            Source::Account { account } | Source::Room { account, .. } => account != expected.context.account(),
+            Source::Account { account } | Source::Room { account, .. } | Source::RoomDirectory { account } => account != expected.context.account(),
             Source::UnknownPrivate => false,
         }) { return Err("This request contains private data that cannot be approved from the current account.".into()); }
         Ok(())

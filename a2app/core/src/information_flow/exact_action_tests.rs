@@ -4,7 +4,12 @@ use super::tests::TestRoot;
 fn setup() -> (TestRoot, Registry, ContextId, u64, SensitiveAction) {
     let root = TestRoot::new();
     let mut registry = root.registry();
-    let context = ContextId::Agent { account: "alice".into(), room: "!private:example".into() };
+    // An APP context, not an agent context: agent (AI-room) sessions
+    // deliberately skip the exact-action review — the user's
+    // `request_task_permissions` batch is their consent, and there is no
+    // up-front way to grant this layer — so the review is only reachable for
+    // mini-app contexts now. See `Registry::action_decision`.
+    let context = ContextId::App { account: "alice".into(), app: "tool".into(), room: Some("!private:example".into()) };
     registry.register_context(&context).unwrap();
     registry.add_influences(&context, [Influence::Model("provider".into())]).unwrap();
     let epoch = registry.context_epoch(&context).unwrap();
@@ -62,7 +67,7 @@ fn review_cannot_cross_context_activation_or_new_influences() {
     let payload = serde_json::json!({ "arguments": [1, 2, 3] });
     let decision = pending(&mut registry, &context, epoch, &action, &payload);
     approve(&mut registry, &decision);
-    let other = ContextId::Agent { account: "bob".into(), room: "!private:example".into() };
+    let other = ContextId::App { account: "bob".into(), app: "tool".into(), room: Some("!private:example".into()) };
     registry.register_context(&other).unwrap();
     registry.add_influences(&other, decision.influences.clone()).unwrap();
     let other_epoch = registry.context_epoch(&other).unwrap();

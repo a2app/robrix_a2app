@@ -323,17 +323,48 @@ bodies; only the mini-app services clip.
 | `read_room_messages` | Reads this room's recent messages | `matrix.room.messages.read` |
 | `read_older_messages` | Pages further back in this room | `matrix.room.messages.paginate` |
 | `room_info` | Reads this room's name, topic, members, join rule, encryption | `matrix.room.info.read` |
-| `list_rooms` | Lists the user's joined rooms and DMs | `matrix.rooms.list` |
+| `list_rooms` | Lists the user's joined rooms and DMs | `matrix.rooms.list` (default on) |
 | `read_other_room_messages` | Reads another joined room the model names | `matrix.rooms.messages.read` |
 | `post_room_message` | Posts a notice into another joined room | `matrix.rooms.message.send` (per room) |
-| `list_spaces` | Lists the spaces the user has joined | `matrix.spaces.list` |
-| `space_info` | Reads one space's details | `matrix.space.info.read` |
-| `list_space_rooms` | Lists the rooms/subspaces inside one space | `matrix.space.rooms.list` |
+| `list_spaces` | Lists the spaces the user has joined | `matrix.spaces.list` (default on) |
+| `space_info` | Reads one space's details | `matrix.space.info.read` (default on) |
+| `list_space_rooms` | Lists the rooms/subspaces inside one space | `matrix.space.rooms.list` (default on) |
 | `list_apps` | Lists the mini-apps installed and available in this room (id, name, description, scope, running) | `app-launch` |
 | `launch_app` | Runs an already-installed mini-app in this room, by id from `list_apps` | `app-launch` (run only) |
 | `list_mini_app_tools` | Lists the tools the room's mini-apps registered (id, name, description, args) | `mcp-tools` (kill switch) |
 | `call_mini_app_tool` | Calls one registered mini-app tool by id, forwarding `arguments` | `mcp-tools` (per tool) |
 | `launch_splash_app` | Builds and runs a NEW mini-app from a description | `apps.generate` |
+| `request_task_permissions` | Asks once, up front, for everything a task needs (rooms to read, places to write, URLs, app tools), and applies the approved subset as one turn-scoped batch | none (it raises the prompt the other gates would) |
+
+#### Upfront task permissions
+
+The agent plans first and asks once. Rather than raising a read prompt, then a
+per-room prompt, then a website prompt as it works, it calls
+`request_task_permissions` before a task with all of its needs in Robrix's own
+vocabulary (catalog ids, room ids from `list_rooms`, complete URLs, tool ids).
+Robrix validates each need against the capability catalog, room and space
+policy and the information-flow rules, diffs it against what is already
+granted, and shows **one** modal: the agent's own plain-language paragraph plus
+a collapsible Details list of the exact items. The permission grants and the
+sharing rules they imply are applied together, for the agent's own subject,
+for **this turn only** — no durable or `Always` grant comes from this tool, and
+the turn's end revokes everything. "Not now" is remembered by plan until the
+turn closes, so a looping agent cannot re-ask. A need that appears mid-task is
+not requested again; the agent proceeds with what it has and says in its reply
+what it could not do. The per-call prompts remain the fallback for anything the
+agent did not list. The plan model, resolver and atomic apply live in
+`a2app/core/src/task_grants.rs`; the prompt is
+`src/a2app/task_permission_prompt.rs`.
+
+**The room and space directory is on by default.** `list_rooms`,
+`list_spaces`, `space_info` and `list_space_rooms` are granted when an AI
+room's session starts (unless the user has denied that group), so the agent can
+name real rooms without asking first. Directory results carry no message
+content but are still other people's words, so they are labelled with a single
+`Source::RoomDirectory` source and the `RoomDirectory` influence: one provider
+rule covers the whole directory, and other recipients do not inherit every
+listed room. Rooms with a Deny read policy are filtered out of directory
+results, so a protected room's name never reaches the model.
 
 `launch_splash_app` is create-only: it never rewrites an installed app. Running
 an app that already exists is `launch_app`'s job — list the ids with
