@@ -12,7 +12,7 @@ use octos_llm::{LlmProvider, ToolSpec, host::*};
 use serde_json::Value;
 use tokio::sync::{mpsc, watch, Semaphore};
 
-use crate::{AgentTransport, acp_client::AcpClient, mcp::McpServer, prefs::AgentPrefs};
+use crate::{AgentTransport, acp_client::AcpClient, launcher::{AgentLauncher, ConfinedOctosLauncher, LaunchConfig}, mcp::McpServer, prefs::AgentPrefs};
 
 const MAX_PENDING: usize = 8;
 const MAX_ACTIVE: usize = 4;
@@ -113,6 +113,10 @@ impl HostBroker {
                             };
                             broker.pending.lock().unwrap().remove(&request.key);
                             broker.pending_bytes.fetch_sub(request.bytes, Ordering::AcqRel);
+                            match &result {
+                                Ok(_) => makepad_widgets::log!("host-broker: {} ok", request.method),
+                                Err(error) => makepad_widgets::log!("host-broker: {} failed: {error}", request.method),
+                            }
                             (request.reply)(result);
                         });
                     }
@@ -129,8 +133,13 @@ impl HostBroker {
         let capabilities: HostCapabilities = serde_json::from_value(result["agentCapabilities"]["_meta"][CAPABILITY_KEY].clone())
             .map_err(|_| "This agent does not support Octos's protected host broker. Install the supported upstream Octos revision shown in Providers.")?;
         if capabilities.version != VERSION || !capabilities.confined || capabilities.sandbox.is_empty() {
+            makepad_widgets::log!(
+                "host-broker: handshake rejected (version={}, confined={}, sandbox={:?})",
+                capabilities.version, capabilities.confined, capabilities.sandbox
+            );
             return Err("The agent did not establish the required confined host broker.".into());
         }
+        makepad_widgets::log!("host-broker: handshake accepted (sandbox={})", capabilities.sandbox);
         (self.check)()?;
         self.ready.store(true, Ordering::Release);
         Ok(())
@@ -256,7 +265,32 @@ pub(crate) fn start(prefs: &AgentPrefs, context: ContextId, room_agent: bool, to
     let command = crate::providers::agent_command().unwrap_or_else(|| "octos".into());
     let executable = executable(&command)?;
     let broker = HostBroker::new(prefs, context, room_agent, tools)?;
-    AcpClient::spawn_protected(&executable, broker).map(|client| Box::new(client) as Box<dyn AgentTransport>)
+    let workspace = Path::new("/");
+    let cfg = LaunchConfig { workspace, mcp_servers: &[], broker: Some(broker) };
+    // An installed ExtensionFoundation extension is the process model when
+    // present; the confined subprocess remains the fallback everywhere else
+    // (including every non-Apple platform, where no bridge is installed).
+    let confined = ConfinedOctosLauncher::new(executable);
+    let launched = match crate::extension::extension_launcher() {
+        Some(extension) => {
+            if extension.available(&cfg) {
+                makepad_widgets::log!(
+                    "agent: using the ExtensionFoundation app extension (point {})",
+                    crate::extension::AGENT_HOST_EXTENSION_POINT
+                );
+            }
+            let launchers: [&dyn AgentLauncher; 2] = [&extension, &confined];
+            crate::launcher::launch_first(&launchers, &cfg)?
+        }
+        None => confined.launch(&cfg)?,
+    };
+    Ok(Box::new(AcpClient::new(
+        launched.channel,
+        &launched.desc,
+        launched.broker,
+        cfg.workspace,
+        cfg.mcp_servers,
+    )))
 }
 
 #[cfg(test)]
@@ -315,6 +349,15 @@ mod tests {
     }
 
     pub(super) fn protocol_fixture() -> Arc<HostBroker> { fixture(false).0 }
+
+    /// The confined subprocess, built the same way `start` builds its fallback:
+    /// through the launcher, so the test exercises the shipping path.
+    fn confined_client(executable: &Path, broker: Arc<HostBroker>) -> AcpClient {
+        let launcher = ConfinedOctosLauncher::new(executable.to_path_buf());
+        let cfg = LaunchConfig { workspace: Path::new("/"), mcp_servers: &[], broker: Some(broker) };
+        let launched = launcher.launch(&cfg).unwrap();
+        AcpClient::new(launched.channel, &launched.desc, launched.broker, cfg.workspace, cfg.mcp_servers)
+    }
 
     fn negotiate(broker: &HostBroker) {
         broker.accept_handshake(&json!({"agentCapabilities":{"_meta":{CAPABILITY_KEY:{"version":VERSION,"confined":true,"sandbox":"test"}}}})).unwrap();
@@ -467,7 +510,7 @@ mod tests {
         let (broker, model, _) = fixture(true);
         let calls = Arc::new(AtomicUsize::new(0));
         broker.tools.add_tool(Echo("echo", calls.clone()));
-        let mut client = AcpClient::spawn_protected(&executable, broker.clone()).unwrap();
+        let mut client = confined_client(&executable, broker.clone());
         let wait = |client: &mut AcpClient, ready: bool| {
             let deadline = Instant::now() + Duration::from_secs(20);
             loop {
