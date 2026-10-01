@@ -46,7 +46,7 @@ pub struct FlowDecision {
 }
 
 impl Registry {
-    fn source_allowed(&self, source: &Source, recipient: &Recipient, context: Option<&ContextId>) -> bool {
+    pub(super) fn source_allowed(&self, source: &Source, recipient: &Recipient, context: Option<&ContextId>) -> bool {
         if *source == Source::UnknownPrivate { return false; }
         if matches!((source, recipient),
             (Source::Room { account, room }, Recipient::MatrixRoom { account: target_account, room: target_room })

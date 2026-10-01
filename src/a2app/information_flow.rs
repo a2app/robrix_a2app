@@ -5,7 +5,7 @@
 //! source code carries a separate provenance floor into every compartment.
 
 use a2app_core::capabilities::{Capability, Direction, FlowContract, FlowSource};
-use a2app_core::information_flow::{self as flow, ContextId, Label, Recipient, Source};
+use a2app_core::information_flow::{self as flow, ContextId, Label, ReaderScope, Recipient, SharingDuration, Source};
 use a2app_core::services;
 use makepad_widgets::splash_host::SplashHostRequest;
 
@@ -30,9 +30,64 @@ pub fn agent_context(room: &str) -> Result<ContextId, String> {
 pub fn prepare_agent(room: &str) -> Result<ContextId, String> {
     let context = agent_context(room)?;
     flow::register_context(&context)?;
+    // A fresh session starts knowing only its own room: agent memory is
+    // per-session, so a source a previous session joined (a legacy app's
+    // `UnknownPrivate` code from `list_apps`, a room since left) must not
+    // permanently wedge this one.
+    flow::reset_agent_session_provenance(&context)?;
     flow::add_sources(&context, [room_source(&context, room)])?;
     flow::add_influences(&context, [flow::Influence::RoomContent { account: context_account(&context).into(), room: room.into() }])?;
     Ok(context)
+}
+
+/// The baseline sharing rules an AI room cannot function without.
+///
+/// A freshly created AI room starts with no sharing rules, so its very first
+/// model call and its own reply/activity/turn state events are refused with
+/// "Information flow blocked". Grant the room's own content — plus the
+/// account's room directory and account-level metadata (the installed-app
+/// list) that its default tools read — to the currently configured model
+/// service and to the homeserver origin, so an AI room works out of the box.
+///
+/// Rules are additive and idempotent: an exact rule that already exists is
+/// skipped, so this is safe to call on every session start — which is also how
+/// a newly selected model gets its own rule. A rule the user later revokes in
+/// the Data Sharing editor stays revoked until this runs again.
+pub fn ensure_agent_default_sharing(context: &ContextId, room: &str, model: Option<&str>, homeserver: Option<&str>) {
+    let mut recipients = Vec::new();
+    if let Some(model) = model.filter(|model| !model.is_empty()) {
+        recipients.push(Recipient::ModelProvider(model.to_string()));
+    }
+    if let Some(homeserver) = homeserver {
+        if let Ok(recipient) = Recipient::network_origin(homeserver) {
+            recipients.push(recipient);
+        }
+    }
+    // The agent's own room: the automatic same-room rule only covers the
+    // room's own source, so once the label has grown to include the directory
+    // or account sources, a read/post/cursor write to this room would be
+    // refused unless those are allowed here too.
+    recipients.push(Recipient::MatrixRoom { account: context_account(context).into(), room: room.into() });
+    if recipients.is_empty() {
+        return;
+    }
+    for source in [room_source(context, room), directory_source(context), account_source(context)] {
+        for recipient in &recipients {
+            if flow::sharing_allows_for_reader(&source, recipient, context).unwrap_or(false) {
+                continue;
+            }
+            // A grant can only fail on a registry write; surface it, since the
+            // session otherwise fails later with a bare "Information flow blocked".
+            if let Err(error) = flow::grant_sharing(
+                source.clone(),
+                recipient.clone(),
+                ReaderScope::Context(context.clone()),
+                SharingDuration::Permanent,
+            ) {
+                makepad_widgets::log!("AI Rooms: couldn't grant the default sharing rule {source:?} -> {recipient:?}: {error}");
+            }
+        }
+    }
 }
 
 /// User-supplied source is private account input, including future versions.
@@ -96,6 +151,13 @@ pub fn account_source(context: &ContextId) -> Source {
     Source::Account { account: context_account(context).into() }
 }
 
+/// The agent's room/space directory (names, ids, counts) as one source, so a
+/// single provider rule covers the whole directory and other recipients do not
+/// inherit every listed room.
+pub fn directory_source(context: &ContextId) -> Source {
+    Source::RoomDirectory { account: context_account(context).into() }
+}
+
 pub fn ensure_room_output(context: &ContextId, room: &str) -> Result<(), String> {
     current_context(context)?;
     flow::ensure_allowed(context, &Recipient::MatrixRoom {
@@ -115,6 +177,21 @@ pub fn record_response(context: &ContextId, value: &serde_json::Value) -> Result
     }).collect::<Vec<_>>();
     flow::add_sources(context, sources)?;
     flow::add_influences(context, influences)
+}
+
+/// A directory result (list_rooms / list_spaces / space_info / space_rooms)
+/// labels the context with one [`Source::RoomDirectory`] instead of one source
+/// per listed room. The room names are still other people's words, so the
+/// directory stays untrusted input.
+pub fn record_directory_response(context: &ContextId) -> Result<(), String> {
+    current_context(context)?;
+    let source = directory_source(context);
+    let influence = match &source {
+        Source::RoomDirectory { account } => flow::Influence::RoomDirectory { account: account.clone() },
+        _ => unreachable!(),
+    };
+    flow::add_sources(context, [source])?;
+    flow::add_influences(context, [influence])
 }
 
 pub fn check_response(reply: services::Reply, data: &str) -> Result<(), String> {

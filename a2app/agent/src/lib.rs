@@ -27,6 +27,12 @@ use acp_client::{AcpClient, AcpEvent};
 /// instead injects it persistently on the agent side and sends slim prompts.
 pub(crate) const SPLASH_GUIDE: &str = include_str!("splash_guide.md");
 
+/// The room agent's shared guide: the permission model and how to plan one
+/// upfront `request_task_permissions` call. One file, used by both the
+/// ACP/confined-worker backend and the embedded Octos backend, so the two
+/// cannot drift.
+pub(crate) const ROOM_AGENT_GUIDE: &str = include_str!("room_agent_guide.md");
+
 /// What the generation pipeline needs from an agent, regardless of where it
 /// runs. Implementations push `AcpEvent`s to an internal queue from their own
 /// threads (waking the UI via `SignalToUI`); the UI thread drains.

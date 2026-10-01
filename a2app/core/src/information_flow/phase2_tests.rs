@@ -166,7 +166,7 @@ fn integrity_transfer_persists_and_authority_matches_exact_reviewed_action() {
     let root = TestRoot::new();
     let mut registry = root.registry();
     let from = app("alice", "private");
-    let to = ContextId::Agent { account: "alice".into(), room: "private".into() };
+    let to = ContextId::App { account: "alice".into(), app: "receiver".into(), room: Some("private".into()) };
     for context in [&from, &to] { registry.register_context(context).unwrap(); }
     registry.add_influences(&from, [internet()]).unwrap();
     registry.transfer(&from, &to).unwrap();

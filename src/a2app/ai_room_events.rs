@@ -688,21 +688,51 @@ pub fn ai_turn_tool_label(call: &AiTurnToolCall) -> String {
         AiTurnToolStatus::Done => ai_tool_display_name(&call.name),
     };
     let detail = detail_suffix(call.detail.as_deref());
+    let summary = readable_tool_summary(&call.summary);
     match call.status {
         AiTurnToolStatus::Started => format!("· {action}{detail}…"),
         AiTurnToolStatus::Done => {
             if call.ok {
-                if call.summary.is_empty() {
+                if summary.is_empty() {
                     format!("✓ {action}{detail}")
                 } else {
-                    format!("✓ {action}{detail}: {}", call.summary)
+                    format!("✓ {action}{detail}: {summary}")
                 }
-            } else if call.summary.is_empty() {
+            } else if summary.is_empty() {
                 format!("✗ {action}{detail} refused")
             } else {
-                format!("✗ {action}{detail}: {}", call.summary)
+                format!("✗ {action}{detail}: {summary}")
             }
         }
+    }
+}
+
+/// Render a tool result so it can actually be read in the narrow turn card.
+///
+/// Results are usually compact JSON with no whitespace, which the label's
+/// word-wrap cannot break, so the line overflowed and was clipped mid-token.
+/// Insert a space after JSON structure punctuation and collapse whitespace so
+/// the text wraps, then cap it with an ellipsis.
+fn readable_tool_summary(summary: &str) -> String {
+    let summary = summary.trim();
+    if summary.is_empty() {
+        return String::new();
+    }
+    let mut spaced = String::with_capacity(summary.len() + 16);
+    for ch in summary.chars() {
+        spaced.push(ch);
+        if matches!(ch, '{' | '}' | '[' | ']' | ',' | ':') {
+            spaced.push(' ');
+        }
+    }
+    let collapsed = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX: usize = 200;
+    if collapsed.chars().count() <= MAX {
+        collapsed
+    } else {
+        let mut out: String = collapsed.chars().take(MAX).collect();
+        out.push('…');
+        out
     }
 }
 
@@ -930,19 +960,20 @@ pub fn ai_tool_call_label(content: &AiToolCallContent) -> String {
         AiToolCallStatus::Done => ai_tool_display_name(&content.name),
     };
     let detail = detail_suffix(content.detail.as_deref());
+    let summary = readable_tool_summary(&content.summary);
     match content.status {
         AiToolCallStatus::Started => format!("⚙ {action}{detail}…"),
         AiToolCallStatus::Done => {
             if content.ok {
-                if content.summary.is_empty() {
+                if summary.is_empty() {
                     format!("✓ {action}{detail}")
                 } else {
-                    format!("✓ {action}{detail}: {}", content.summary)
+                    format!("✓ {action}{detail}: {summary}")
                 }
-            } else if content.summary.is_empty() {
+            } else if summary.is_empty() {
                 format!("✗ {action}{detail} refused")
             } else {
-                format!("✗ {action}{detail}: {}", content.summary)
+                format!("✗ {action}{detail}: {summary}")
             }
         }
     }

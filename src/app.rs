@@ -170,6 +170,13 @@ script_mod! {
                             content := MiniAppPermissionPrompt {}
                         }
 
+                        // The one upfront ask for a whole agent task. No scrim
+                        // dismissal: "Not now" is the explicit escape.
+                        task_permission_modal := Modal {
+                            can_dismiss: false,
+                            content := TaskPermissionPrompt {}
+                        }
+
                         // The "AI in this room" management panel (an invisible
                         // stub in builds without `a2app` / on non-unix).
                         ai_room_panel_modal := Modal {
