@@ -165,6 +165,27 @@ provider IDs are `openai`, `anthropic`, `deepseek`, `moonshot`,
 are refused. A local Ollama endpoint can use an already installed model
 without an API key.
 
+On desktop, **AI Providers → Claude Code (your subscription)** uses your
+installed `claude` command and its existing personal Claude Pro or Max sign-in,
+separately from **Anthropic (Claude)** API keys. Everyone sees this row,
+including before Claude Code is installed. Its **+** button opens setup:
+use **Install instructions** if needed, then **Copy command** to run
+`claude auth login` in a terminal with your own Claude account. Return to
+**Check sign-in → Use Claude Code**. If already signed in, select its radio
+button directly to use it for new AI sessions;
+restart existing agents to switch them. No API key or `claude-code-acp`
+adapter is needed. See the [Claude Code setup instructions](https://code.claude.com/docs/en/quickstart)
+if the command is missing.
+
+Robrix runs Claude Code as a model step with its built-in tools, MCP servers,
+hooks, and saved conversation history disabled. Proposed tool calls still
+run through Robrix's host-owned tools and current data-sharing permissions.
+Claude Code retains its own credentials; API credentials and endpoint
+overrides are removed from its process environment. The Octos worker
+requirement above still applies to subprocess builds; embedded builds do
+not need that worker. This option uses Anthropic's service through the local
+CLI, so it is not an offline model.
+
 Linux `keychain:` references use Octos's existing `~/.octos/secrets` store,
 including credentials scoped to a profile. Credentials remain in Robrix's
 host process and are never supplied to the confined worker.
@@ -382,7 +403,14 @@ scope until removed. Changing a rule applies to existing contexts; revocation ca
 data already transmitted. Blocking a room's read access prevents new reads;
 it does not erase data, labels or agent history already retained. To stop
 future sharing of previously read data, remove its source sharing rules too.
-There is no selected-payload release, label reset or automatic declassification.
+Retained private data is never declassified through a sharing rule.
+
+Opening a mini-app does not itself read room or account data. Robrix records
+actual service responses, hooks and input before delivering them. Keyboard
+input belongs only to the focused app; typing in the room composer does not
+mark other apps as private. A blocked app offers **Review permission** to open
+its request directly while keeping the instance running. Sharing rules remain
+reviewable after an app stops; exact action approval requires its live instance.
 
 The design follows the established floating-label approach described by
 [LIO's authors](https://www.scs.stanford.edu/~deian/pubs/stefan%3A2011%3Aflexible.pdf)
@@ -400,19 +428,21 @@ arguments/results. Uncontrolled exports and navigation are refused once
 private data is present; source restrictions transfer across app/agent
 boundaries before delivery. Normal app navigation transfers provenance to
 the opened app. Each account/app/room combination has a separate filesystem
-jail and persistent provenance. An app's source code and version history are
-still shared, so their provenance remains an inherited floor for every
-instance. Generating or editing private source cannot be laundered by opening
-it in another compartment.
+jail and persistent provenance. Current source-code provenance is inherited by
+every instance. Historical source keeps its own archived provenance, which is
+joined before reading or restoring it. Generating or editing private source
+cannot be laundered by opening it in another compartment.
 
 `information_flow.json`, outside app jails, records app/agent provenance,
 integrity influences, clearance bounds and permanent sharing rules. The host writes and syncs a replacement atomically before
 delivering newly labelled input. Write failures and corrupt/unsupported
-metadata block access instead of resetting labels. Old nonempty app storage
-or old private source with no recorded provenance receives `UnknownPrivate`,
-which cannot be released by a sharing rule. Closing, clearing a sandbox,
-restarting or reinstalling the same app does not erase its retained label.
-Migration preserves older app-wide labels as a conservative inherited floor.
+metadata block access instead of resetting labels. Accessible compartment files
+or private source with no recorded provenance receive `UnknownPrivate`, which
+cannot be released by a sharing rule. Saved private data keeps its provenance
+across restarts and reinstalls. For an unchanged built-in app, startup can
+recover a stopped compartment with no saved files using the verified bundled
+code. Running contexts, saved files and historical code remain protected.
+Archiving an ordinary bundled release does not make its current code private.
 Old `app_data/<app>` files remain in their original directory; they are not
 automatically mounted in new compartments. App Info explains this and counts
 them in storage usage. Clear data removes both old files and new compartment

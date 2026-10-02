@@ -66,7 +66,7 @@ impl Registry {
 
     pub fn ensure_action_allowed(&self, context: &ContextId, action: &SensitiveAction) -> Result<(), String> {
         if self.action_decision(context, action)?.allowed { Ok(()) }
-        else { Err("Untrusted input influenced this action. Review its exact operation and target in Mini Apps before authorizing it.".into()) }
+        else { Err("Your approval is needed for this action. Open Mini Apps > Data sharing > Needs attention to review it.".into()) }
     }
 
     pub fn recent_action_decisions(&self) -> Result<Vec<ActionDecision>, String> {
@@ -154,7 +154,7 @@ pub(super) struct PendingAction {
 const MAX_EXACT_PAYLOAD: usize = 64 * 1024;
 const MAX_PENDING_ACTIONS: usize = 64;
 
-pub const ACTION_REVIEW_REQUIRED: &str = "Untrusted input influenced this action. Open Mini Apps > Data sharing and action review, select this blocked action, review its exact contents, and choose Allow this exact action once. Then retry the unchanged action. Session permission is a separate, broader choice.";
+pub const ACTION_REVIEW_REQUIRED: &str = "Your approval is needed for this action. Open Mini Apps > Data sharing > Needs attention, review it and choose Allow this exact action once. Then try the same action again.";
 
 /// Bound allocation and nesting before sorting/serializing untrusted JSON.
 /// Object order has no meaning; arrays, numbers and strings retain their value.

@@ -7,6 +7,7 @@
 //! option on iOS, where exec() is prohibited).
 
 pub mod acp_client;
+pub mod claude_code;
 pub mod intent;
 pub mod mcp;
 pub mod model_transport;
@@ -118,7 +119,7 @@ pub(crate) fn provider_from_auth_store() -> Option<String> {
 fn provider_from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
     PROVIDER_KEY_ENVS
         .iter()
-        .find(|(var, _)| get(var).is_some_and(|v| !v.is_empty()))
+        .find(|(var, _)| get(var).is_some_and(|v| !v.trim().is_empty()))
         .map(|(_, provider)| *provider)
 }
 
@@ -222,6 +223,17 @@ mod tests {
     }
 
     #[test]
+    fn claude_code_selection_cannot_fall_back_to_an_api_provider() {
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let previous = providers::session_provider();
+        providers::set_session(claude_code::ID);
+        let result = start_backend_with_mcp(std::path::Path::new("/unused-claude-guard-fixture"),
+            &prefs::AgentPrefs::default(), &[], false, None, None, None);
+        match previous { Some(provider) => providers::set_session(&provider), None => providers::clear_session() }
+        assert_eq!(result.err().as_deref(), Some("Claude Code requires a protected Robrix model context."));
+    }
+
+    #[test]
     fn provider_detection_prefers_anthropic_and_skips_empty() {
         let get = |var: &str| match var {
             "ANTHROPIC_API_KEY" => Some("sk-ant-x".to_string()),
@@ -239,6 +251,7 @@ mod tests {
         assert_eq!(provider_from_lookup(get), Some("groq"));
 
         assert_eq!(provider_from_lookup(|_| None), None);
+        assert_eq!(provider_from_lookup(|_| Some(" \n\t ".to_string())), None);
     }
 
     #[test]
@@ -308,7 +321,9 @@ pub(crate) fn octos_config_candidates() -> Vec<std::path::PathBuf> {
         return vec![std::path::PathBuf::from(dir).join("config.json")];
     }
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+    if let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE")).map(std::path::PathBuf::from)
+    {
         candidates.push(home.join(".config").join("octos").join("config.json"));
         candidates.push(home.join(".octos").join("config.json"));
     }
@@ -420,7 +435,7 @@ impl Blocker {
     /// at the page, because the hint has nowhere to put a fix.
     pub fn headline(&self) -> String {
         match self {
-            Self::NoProvider => "No AI provider set up yet — tap to add one".to_string(),
+            Self::NoProvider => "Choose an AI provider — tap to set it up".to_string(),
             Self::OctosMissing => "octos isn't installed — tap to see how".to_string(),
         }
     }
@@ -429,7 +444,7 @@ impl Blocker {
     /// would be telling the user to go where they already are.
     pub fn title(&self) -> String {
         match self {
-            Self::NoProvider => "No AI provider set up yet".to_string(),
+            Self::NoProvider => "No AI provider selected".to_string(),
             Self::OctosMissing => "octos isn't installed".to_string(),
         }
     }
@@ -439,7 +454,7 @@ impl Blocker {
     pub fn detail(&self) -> String {
         match self {
             Self::NoProvider => {
-                "Pick a provider below and paste its API key to start making apps.".to_string()
+                "Choose Claude Code to use your subscription, or add an API key for a provider below.".to_string()
             }
             Self::OctosMissing => "octos runs the agent in a confined process. Robrix \
                  keeps your credentials and checks every model request and tool call. \
@@ -600,6 +615,9 @@ pub fn start_backend_with_mcp(
     }
     if host_tools.is_some() {
         return Err("Host-owned tools require a protected agent context.".into());
+    }
+    if providers::effective_provider().as_deref() == Some(claude_code::ID) {
+        return Err("Claude Code requires a protected Robrix model context.".into());
     }
     // Refuse before spawning rather than translating an errno afterwards: the
     // check knows WHICH program is missing, so it can name it and the install.

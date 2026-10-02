@@ -72,14 +72,14 @@ script_mod! {
                     PermissionOptionLabel { text: "Which mini-app or agent can share it?" }
                     reader_context_section := View {
                         width: Fill, height: Fit, flow: Down, spacing: 6
-                        context_choice := PermissionDropDown { labels: ["Choose a running mini-app or agent"] }
+                        context_choice := PermissionDropDown { labels: ["Choose a mini-app or agent"] }
                     }
                     reader_app_section := View { visible: false, width: Fill, height: Fit, flow: Down, reader_app := PermissionDropDown {} }
                     reader_preview := PermissionOptionLabel {}
                     more_readers := TextButton { text: "More sharing options" }
                     reader_options := View {
                         visible: false, width: Fill, height: Fit, flow: Down, spacing: 8
-                        reader_kind := PermissionChoices { labels: ["Only this running mini-app or agent", "Everywhere this mini-app runs", "All mini-apps and agents"] }
+                        reader_kind := PermissionChoices { labels: ["Only this mini-app or agent here", "Everywhere this mini-app runs", "All mini-apps and agents"] }
                         PermissionOptionLabel { text: "The broader options include rooms, spaces and account-wide use. Choose them only if you want the same permission to apply everywhere." }
                     }
                     context_details := PermissionOptionLabel { visible: false }
@@ -143,11 +143,14 @@ script_mod! {
                         visible: false, width: Fill, height: Fit, flow: Down, spacing: 12
                         SubsectionLabel { text: "Sharing was blocked", margin: 0 }
                         decision_details := PermissionOptionLabel {}
+                        decision_identifiers_toggle := TextButton { text: "Show identifiers" }
+                        decision_identifiers := PermissionOptionLabel { visible: false }
                         review_section := View {
                             width: Fill, height: Fit, flow: Down, spacing: 8
                             PermissionOptionLabel { text: "Which blocked data source do you want to review?" }
                             blocked_source_choice := PermissionChoices {}
                             review_button := TextButton { text: "Review sharing rule" }
+                            review_problem := PermissionOptionLabel { visible: false }
                         }
                     }
                     action_review := View {
@@ -236,6 +239,7 @@ pub struct DataSharing {
     #[rust] reader_options_open: bool,
     #[rust] rule_identifiers_open: bool,
     #[rust] saved_identifiers_open: bool,
+    #[rust] decision_identifiers_open: bool,
     #[rust] history_filters_open: bool,
     #[rust] saved_selection: SharingCardTarget,
     #[rust] decision_selection: usize,
@@ -334,6 +338,12 @@ impl Widget for DataSharing {
             self.update_page(cx);
             return;
         }
+        if page == 1 && !self.wizard_open && self.decision_selection != 0
+            && self.view.button(cx, ids!(decision_identifiers_toggle)).clicked(actions)
+        {
+            self.decision_identifiers_open = !self.decision_identifiers_open;
+            self.update_diagnostic_details(cx);
+        }
         if page == 2 && !self.wizard_open && self.view.button(cx, ids!(history_back)).clicked(actions) {
             self.activity_selection = None;
             self.update_page(cx);
@@ -359,6 +369,7 @@ impl Widget for DataSharing {
             || self.view.permission_choices(cx, ids!(recipient_kind)).changed(actions).is_some()
             || self.view.permission_choices(cx, ids!(sharing_lifetime)).changed(actions).is_some()
             || self.view.permission_choices(cx, ids!(action_session)).changed(actions).is_some()
+            || self.view.permission_choices(cx, ids!(blocked_source_choice)).changed(actions).is_some()
         {
             self.update_diagnostic_details(cx);
             self.update_recipient_form(cx);
@@ -481,6 +492,27 @@ impl DataSharing {
         self.update_page(cx);
     }
 
+    fn review_context(&mut self, cx: &mut Cx, context: &ContextId) -> bool {
+        self.configure(cx);
+        if context.account() != self.account { return false; }
+        self.wizard_open = false;
+        self.saved_selection = SharingCardTarget::None;
+        self.decision_selection = 0;
+        self.action_selection = 0;
+        self.view.permission_choices(cx, ids!(page_choice)).set_selected_item(cx, 1);
+        let target = self.action_decisions.iter().find(|decision| &decision.context == context)
+            .map(|decision| SharingCardTarget::Action(decision.clone()))
+            .or_else(|| self.decisions.iter().find(|decision| &decision.context == context && !decision.allowed)
+                .map(|decision| SharingCardTarget::Decision(decision.clone())));
+        if let Some(target) = target {
+            self.open_card(cx, &target);
+            true
+        } else {
+            self.update_page(cx);
+            false
+        }
+    }
+
     fn wizard_step_valid(&self, cx: &Cx) -> Result<(), String> {
         match self.wizard_step {
             0 => {
@@ -512,6 +544,7 @@ impl DataSharing {
             _ => return,
         }
         self.saved_identifiers_open = false;
+        self.decision_identifiers_open = false;
         self.update_diagnostic_details(cx);
         self.update_saved_details(cx);
         self.update_page(cx);
@@ -608,6 +641,7 @@ impl DataSharing {
             self.reader_options_open = false;
             self.rule_identifiers_open = false;
             self.saved_identifiers_open = false;
+            self.decision_identifiers_open = false;
             self.saved_selection = SharingCardTarget::None;
             self.decision_selection = 0;
             self.action_selection = 0;
@@ -804,6 +838,10 @@ impl DataSharingRef {
 
     pub fn back(&self, cx: &mut Cx) -> bool {
         self.borrow_mut().is_some_and(|mut inner| inner.back(cx))
+    }
+
+    pub fn review_context(&self, cx: &mut Cx, context: &ContextId) -> bool {
+        self.borrow_mut().is_some_and(|mut inner| inner.review_context(cx, context))
     }
 }
 
@@ -1115,6 +1153,71 @@ mod tests {
     }
 
     #[test]
+    fn stopped_or_restarted_sharing_request_keeps_its_original_scope() {
+        for epoch in [0, 8] {
+            let (mut cx, widget) = editor();
+            let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+            editor.account = "@alice:example.org".into();
+            let mut snapshot = context_fixture();
+            let source = snapshot.label.first().unwrap().clone();
+            let context = snapshot.context.clone();
+            editor.decisions.push(FlowDecision {
+                context: context.clone(), epoch: snapshot.epoch,
+                recipient: Recipient::NetworkOrigin("https://blocked.example".into()),
+                sources: snapshot.label.clone(), denied_sources: snapshot.label.clone(), allowed: false,
+            });
+            snapshot.epoch = epoch;
+            editor.snapshots.push(snapshot);
+            editor.view.drop_down(&cx, ids!(context_choice)).set_labels(&mut cx, vec!["Select context".into(), "Fixture context".into()]);
+            editor.decision_selection = 1;
+            editor.update_diagnostic_details(&mut cx);
+            assert!(!editor.view.widget(&cx, ids!(review_button)).disabled(&cx));
+            editor.review_decision(&mut cx).unwrap();
+            match editor.sharing_action(&cx).unwrap() {
+                A2AppOp::GrantFlowSharing { source: actual, recipient, reader, duration } => {
+                    assert_eq!(actual, source);
+                    assert_eq!(recipient, Recipient::NetworkOrigin("https://blocked.example".into()));
+                    assert_eq!(reader, ReaderScope::Context(context));
+                    assert_eq!(duration, SharingDuration::RobrixSession);
+                }
+                _ => panic!("expected a sharing rule"),
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_sharing_explains_unreviewable_sources_and_hides_identifiers() {
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+        editor.account = "@alice:example.org".into();
+        editor.rooms.push(("!source:example.org".into(), "Private room".into()));
+        let snapshot = context_fixture();
+        editor.snapshots.push(snapshot.clone());
+        editor.decisions.push(FlowDecision {
+            context: snapshot.context, epoch: snapshot.epoch,
+            recipient: Recipient::NetworkOrigin("https://blocked.example".into()),
+            sources: [Source::UnknownPrivate].into(), denied_sources: [Source::UnknownPrivate].into(), allowed: false,
+        });
+        editor.decision_selection = 1;
+        editor.update_diagnostic_details(&mut cx);
+        assert!(editor.view.widget(&cx, ids!(review_button)).disabled(&cx));
+        assert!(editor.view.label(&cx, ids!(review_problem)).text().contains("cannot identify"));
+        assert!(editor.review_decision(&mut cx).is_err());
+        assert!(!editor.wizard_open);
+        let summary = editor.view.label(&cx, ids!(decision_details)).text();
+        assert!(summary.contains("Private room"));
+        assert!(!summary.contains("@alice:example.org"));
+        assert!(!summary.contains("!source:example.org"));
+        assert!(!editor.view.widget(&cx, ids!(decision_identifiers)).visible());
+        let details = editor.view.label(&cx, ids!(decision_identifiers)).text();
+        assert!(details.contains("@alice:example.org"));
+        assert!(details.contains("!source:example.org"));
+        editor.decision_identifiers_open = true;
+        editor.update_diagnostic_details(&mut cx);
+        assert!(editor.view.widget(&cx, ids!(decision_identifiers)).visible());
+    }
+
+    #[test]
     fn exact_action_review_uses_the_displayed_request_and_rejects_a_closed_activation() {
         let (mut cx, widget) = editor();
         let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
@@ -1153,6 +1256,11 @@ mod tests {
         editor.update_diagnostic_details(&mut cx);
         assert!(editor.view.widget(&cx, ids!(authority_button)).disabled(&cx));
         assert!(editor.authority_action(&cx).is_err());
+        editor.snapshots[0].epoch = 0;
+        editor.action_decisions[0].epoch = 0;
+        editor.update_diagnostic_details(&mut cx);
+        assert!(editor.view.widget(&cx, ids!(authority_button)).disabled(&cx));
+        assert!(editor.authority_action(&cx).is_err(), "retained compartments cannot approve actions while stopped");
     }
 
     #[test]
@@ -1263,7 +1371,7 @@ mod tests {
         assert!(text.contains("Sharing rules"));
         assert!(text.contains("Review sharing rule"));
         assert!(text.contains("Allow sharing"));
-        assert!(editor.sharing_remedy(&[Source::UnknownPrivate].into(), &recipient).contains("No sharing toggle"));
+        assert!(editor.sharing_remedy(&[Source::UnknownPrivate].into(), &recipient).contains("No sharing rule"));
     }
 
 }

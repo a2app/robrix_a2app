@@ -1,7 +1,7 @@
 // name: Public Web
 // icon: 🌐
 // tint: #2A7F92
-// description: Fetch a fixed public example page without reading room or account data. Open in public mode from Mini Apps.
+// description: Fetch a fixed public example page without reading room or account data.
 // permissions: network
 // why-network: Fetches https://example.com/ when you press the button.
 
@@ -36,7 +36,7 @@ View{
             draw_text +: {color: #x1C274C text_style: theme.font_bold{font_size: 22}}
         }
         Label{
-            text: "Open this stock app in public mode from Mini Apps. It requests only the fixed example page below and does not read Matrix data or accept private text."
+            text: "Press Fetch to request a fixed example page. This app does not read your rooms or account data."
             width: Fill
             draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 12}}
         }

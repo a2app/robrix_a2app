@@ -1,6 +1,6 @@
 //! Model recipients are bound to the configured endpoint, model, and credential.
 //!
-//! Protected agents use a single host-owned HTTP transport. It checks current
+//! Protected agents use host-owned transports. They check current
 //! source policies for every request, including tool feedback and compaction;
 //! neither provider fallback nor redirects may silently change the recipient.
 
@@ -16,6 +16,9 @@ pub struct ModelRecipient {
 }
 
 pub fn current_recipient(prefs: &AgentPrefs) -> Result<ModelRecipient, String> {
+    if crate::providers::effective_provider().as_deref() == Some(crate::claude_code::ID) {
+        return claude_code::resolve(prefs).map(|config| config.recipient);
+    }
     guarded::resolve(prefs).map(|config| config.recipient)
 }
 
@@ -64,15 +67,19 @@ fn auth_credentials() -> Option<std::collections::BTreeMap<String, AuthCredentia
     }
     let mut data: AuthData = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     let now = chrono::Utc::now();
-    data.credentials.retain(|_, credential| !credential.access_token.is_empty()
+    data.credentials.retain(|_, credential| !credential.access_token.trim().is_empty()
         && credential.expires_at.is_none_or(|expiry| expiry >= now));
     Some(data.credentials)
 }
 
 pub(crate) fn auth_store_provider() -> Option<String> {
-    let credentials = auth_credentials()?;
-    if credentials.contains_key("anthropic") { Some("anthropic".into()) }
-    else { credentials.into_keys().next() }
+    let providers = auth_store_providers();
+    if providers.iter().any(|provider| provider == "anthropic") { Some("anthropic".into()) }
+    else { providers.into_iter().next() }
+}
+
+pub(crate) fn auth_store_providers() -> Vec<String> {
+    auth_credentials().map(|credentials| credentials.into_keys().collect()).unwrap_or_default()
 }
 
 fn stored_api_key(provider: &str) -> Option<String> {
@@ -80,7 +87,17 @@ fn stored_api_key(provider: &str) -> Option<String> {
 }
 
 mod guarded;
-pub(crate) use guarded::provider;
+mod claude_code;
+
+pub(crate) fn provider(prefs: &AgentPrefs, context: a2app_core::information_flow::ContextId,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<std::sync::Arc<dyn octos_llm::LlmProvider>, String>
+{
+    if crate::providers::effective_provider().as_deref() == Some(crate::claude_code::ID) {
+        claude_code::provider(prefs, context, shutdown)
+    } else {
+        guarded::provider(prefs, context, shutdown)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -142,12 +159,14 @@ mod tests {
         write(serde_json::json!({
             "anthropic": {"access_token":"expired", "expires_at":"2000-01-01T00:00:00Z"},
             "groq": {"access_token":""},
+            "gemini": {"access_token":" \n\t "},
             "openai": {"access_token":"current", "expires_at":"2999-01-01T00:00:00Z"},
         }));
         assert_eq!(crate::provider_from_auth_store().as_deref(), Some("openai"));
         assert_eq!(stored_api_key("openai").as_deref(), Some("current"));
         assert_eq!(stored_api_key("anthropic"), None);
         assert_eq!(stored_api_key("groq"), None);
+        assert_eq!(stored_api_key("gemini"), None);
         write(serde_json::json!({
             "anthropic": {"access_token":""},
             "openai": {"access_token":"expired", "expires_at":"2000-01-01T00:00:00Z"},

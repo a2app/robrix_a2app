@@ -4,19 +4,19 @@ use a2app_core::{information_flow::Label, protection_audit::{self, ActivityKind,
 impl DataSharing {
     pub(super) fn sharing_remedy(&self, blocked: &Label, recipient: &Recipient) -> String {
         if blocked.contains(&Source::UnknownPrivate) {
-            return "Blocked control: retained data has unknown private sources. No sharing toggle can release it. Use a separate public instance with no private input, or a new app with known sources. Clearing storage does not erase retained source labels.".into();
+            return "Robrix cannot identify where this old data or app source came from. No sharing rule can release it. For a public task, use an unchanged built-in app with separately tracked public data.".into();
         }
         if *recipient == Recipient::External {
-            return "Blocked control: this operation exports to an uncontrolled recipient. It cannot be approved with an internet or room permission. Use an operation with an explicit website origin or Matrix room, then review that destination's sharing rule.".into();
+            return "The app has not identified a destination for this data. It must choose a specific website or room before you can allow sharing.".into();
         }
-        let mut text = "Blocked by: Sharing rules. This app or agent did not have permission to send data from these sources to this destination. Every blocked source needs its own rule.\n\nIn Needs attention, choose the blocked data source and select Review sharing rule. Check who can share it, the destination and duration before selecting Allow sharing. Repeat for each blocked source. Room and internet permissions do not replace sharing permission. Retry the operation after changing a rule; the historical block remains in History.".to_string();
+        let mut text = "Sharing rules need your approval. In Needs attention, select a data source and choose Review sharing rule. Check the destination and duration before choosing Allow sharing. Repeat for each source, then return to the app and try again.".to_string();
         if blocked.iter().any(|source| match source { Source::Room { account, .. } | Source::Account { account } => account != &self.account, Source::UnknownPrivate => false }) {
-            text.push_str("\nThis also includes another account's source. Sign in to that source account to review its rules; the current account cannot authorize it.");
+            text.push_str("\nSome data belongs to another account. Sign in to that account to review its sharing permission.");
         }
         if let Recipient::ModelProvider(id) = recipient
             && self.model.as_ref().is_none_or(|model| &model.id != id)
         {
-            text.push_str("\nThis model recipient differs from the current AI provider configuration. Restart the agent with the intended provider and review its new recipient. An old approval cannot follow changed credentials, model or endpoint.");
+            text.push_str("\nYour AI service has changed. Restart the agent and review its new request.");
         }
         text
     }

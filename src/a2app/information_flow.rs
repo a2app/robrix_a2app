@@ -48,26 +48,27 @@ pub fn record_source_edit(manifest: &a2app_core::manifest::MiniAppManifest) -> R
     Ok(context)
 }
 
-/// Only untouched stock code/metadata with no retained source history has a
-/// known public origin when migrating an app with no recorded provenance.
+/// Untouched bundled code has a known public origin.
+///
+/// Version history is tracked separately; recording a bundled release does
+/// not turn its current source into private user input.
 pub fn manifest_has_private_source(manifest: &a2app_core::manifest::MiniAppManifest) -> bool {
     if !manifest.builtin { return true; }
     let Some(stock) = a2app_core::builtin::stock(&manifest.id) else { return true };
-    if manifest.source != stock.source || manifest.name != stock.name
-        || manifest.description != stock.description || manifest.icon != stock.icon
-        || manifest.tint != stock.tint || manifest.permissions != stock.permissions
-        || manifest.permission_reasons != stock.permission_reasons || manifest.capabilities != stock.capabilities
-        || manifest.shortcuts != stock.shortcuts
-        || serde_json::to_value(&manifest.widget).ok() != serde_json::to_value(&stock.widget).ok()
-        || serde_json::to_value(&manifest.scope).ok() != serde_json::to_value(&stock.scope).ok()
-    { return true; }
-    // Restoring an older version must not launder its unknown sources through
-    // a currently-stock working copy. Existing app provenance makes this
-    // conservative migration flag irrelevant for newly recorded versions.
-    match std::fs::read_dir(a2app_core::data_root().join("apps").join(&manifest.id).join("versions")) {
-        Ok(mut entries) => entries.next().is_some(),
-        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    !a2app_core::builtin::matches_default(manifest, &stock)
+}
+
+/// Recover bundled execution without making unrecorded historical code public.
+pub fn reconcile_builtin_manifest(manifest: &a2app_core::manifest::MiniAppManifest) -> Result<(), String> {
+    if manifest_has_private_source(manifest) { return Err("Only an unchanged built-in app can start with public code.".into()); }
+    let history = a2app_core::persistence::export_history(&manifest.id).map_err(|error| error.to_string())?;
+    let unrecorded_private_history = history.iter().any(|snapshot|
+        !snapshot.matches_manifest(manifest)
+            && (snapshot.version.origin != a2app_core::versions::VersionOrigin::Stock || snapshot.version.imported));
+    if unrecorded_private_history && flow::code_labels(&manifest.id).unwrap_or_default().is_empty() {
+        flow::add_code_sources(&manifest.id, [Source::UnknownPrivate])?;
     }
+    flow::reconcile_builtin_code(&manifest.id)
 }
 
 pub fn context_account(context: &ContextId) -> &str {
@@ -284,5 +285,23 @@ mod tests {
         let mut imported = stock;
         imported.builtin = false;
         assert!(manifest_has_private_source(&imported));
+    }
+
+    #[test]
+    fn archived_stock_recovers_an_empty_execution_context_but_keeps_history_protected() {
+        let mut stock = a2app_core::builtin::stock("public-web").unwrap();
+        a2app_core::persistence::ensure_current_version(&mut stock,
+            a2app_core::versions::VersionOrigin::Stock, "Built-in default", 0, 0).unwrap();
+        assert!(!manifest_has_private_source(&stock), "the host's own version archive must not make bundled code private");
+        let context = ContextId::App { account: "@stock-recovery:test".into(), app: stock.id.clone(), room: None };
+        flow::register_context_with_legacy_data(&context, true).unwrap();
+        assert!(flow::labels(&context).unwrap().contains(&Source::UnknownPrivate));
+        flow::remove_context(&context).unwrap();
+        reconcile_builtin_manifest(&stock).unwrap();
+        flow::register_context(&context).unwrap();
+        assert!(flow::labels(&context).unwrap().is_empty());
+        assert!(flow::influences(&context).unwrap().is_empty());
+        assert!(flow::code_labels(&stock.id).unwrap().contains(&Source::UnknownPrivate), "reading old code must still inherit its sources");
+        flow::remove_context(&context).unwrap();
     }
 }

@@ -15,7 +15,7 @@ impl StoredProvenance {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct StoredContext {
     pub context: ContextId,
@@ -23,11 +23,15 @@ pub(super) struct StoredContext {
     pub clearance: Option<Label>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Metadata {
     pub version: u32,
     pub code: BTreeMap<String, StoredProvenance>,
+    /// Earlier source versions remain protected after verified stock replaces
+    /// the working copy. This archive is not executed by a fresh compartment.
+    #[serde(default)]
+    pub historical_code: BTreeMap<String, StoredProvenance>,
     pub contexts: Vec<StoredContext>,
     pub grants: Vec<SharingGrant>,
     pub next_id: u64,
@@ -35,7 +39,7 @@ pub(super) struct Metadata {
 
 impl Default for Metadata {
     fn default() -> Self {
-        Self { version: SCHEMA_VERSION, code: BTreeMap::new(), contexts: Vec::new(), grants: Vec::new(), next_id: 1 }
+        Self { version: SCHEMA_VERSION, code: BTreeMap::new(), historical_code: BTreeMap::new(), contexts: Vec::new(), grants: Vec::new(), next_id: 1 }
     }
 }
 
@@ -121,9 +125,12 @@ pub(super) fn effective_provenance(metadata: &Metadata, entry: &StoredContext) -
 pub(super) fn validate_metadata(metadata: &Metadata) -> Result<(), String> {
     if metadata.version != SCHEMA_VERSION { return Err("Unsupported information-flow metadata version.".into()); }
     if metadata.next_id == 0 || metadata.next_id >= 1 << 63 { return Err("Invalid sharing grant counter.".into()); }
-    for (app, provenance) in &metadata.code {
+    for (app, provenance) in metadata.code.iter().chain(metadata.historical_code.iter()) {
         validate_app(app)?;
         validate_provenance(provenance)?;
+    }
+    if metadata.historical_code.keys().any(|app| !metadata.code.contains_key(app)) {
+        return Err("Archived app code has no current provenance entry.".into());
     }
     let mut contexts = BTreeSet::new();
     for entry in &metadata.contexts {
@@ -137,7 +144,9 @@ pub(super) fn validate_metadata(metadata: &Metadata) -> Result<(), String> {
         if matches!(entry.context, ContextId::PublicApp { .. }) && entry.clearance != Some(Label::new()) {
             return Err("Invalid public app clearance.".into());
         }
-        check_clearance(&entry.context, entry.clearance.as_ref(), &entry.provenance.label)?;
+        // Retained code may have exceeded a context's clearance since it last
+        // ran. Preserve that provenance so diagnostics can explain it; live
+        // registration and every data boundary still enforce the clearance.
     }
     let mut ids = BTreeSet::new();
     for grant in &metadata.grants {

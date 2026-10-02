@@ -14,14 +14,20 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Anthropic model ids offered wherever Claude is the provider. A model the
-/// CLI doesn't know is passed through untouched (the agent errors, not us), so
-/// this list can lag a release without blocking anyone.
+/// Anthropic API model ids offered for direct API providers.
 pub const CLAUDE_MODELS: &[(&str, &str)] = &[
     ("Opus 5", "claude-opus-5"),
     ("Sonnet 5", "claude-sonnet-5"),
     ("Haiku 4.5", "claude-haiku-4-5"),
 ];
+
+/// Claude Code resolves aliases against the models available to its login.
+pub const CLAUDE_CODE_MODELS: &[(&str, &str)] = &[
+    ("Opus", "opus"), ("Sonnet", "sonnet"), ("Haiku", "haiku"),
+];
+
+/// Effort levels accepted by the installed CLI's conservative interface.
+pub const CLAUDE_CODE_EFFORTS: &[(&str, &str)] = &[("Low", "low"), ("Medium", "medium"), ("High", "high")];
 
 /// Effort levels *this* Claude Code build accepts, cheapest first. NOT the
 /// full API ladder — the API also has `xhigh` between `high` and `max`, but the
@@ -203,9 +209,7 @@ impl Knob {
 /// the decision `start_backend` makes — keep the two in step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Backend {
-    /// `claude-code-acp` — a Claude subscription, driven by env vars the
-    /// Claude Code CLI reads: `ANTHROPIC_MODEL`, `CLAUDE_CODE_EFFORT_LEVEL`,
-    /// `MAX_THINKING_TOKENS`.
+    /// A Claude Code subscription through the installed CLI or legacy ACP.
     ClaudeCode,
     /// `octos acp --provider <p>`. Takes `--model`; nothing else is reachable
     /// from here today (no reasoning-effort flag), whatever the underlying
@@ -224,6 +228,9 @@ pub enum Backend {
 impl Backend {
     /// What `start_backend` will actually launch, worked out the same way.
     pub fn detect() -> Self {
+        if super::providers::in_use_id().as_deref() == Some(super::claude_code::ID) {
+            return Self::ClaudeCode;
+        }
         if let Ok(cmd) = std::env::var("ROBRIX_AGENT_CMD") {
             return if cmd.contains("claude-code-acp") { Self::ClaudeCode } else { Self::Custom };
         }
@@ -272,11 +279,12 @@ impl Backend {
     /// The controls this backend can actually honour.
     pub fn knobs(&self) -> Vec<Knob> {
         match self {
-            // All three are env vars the CLI reads itself — verified against
-            // the bundled @anthropic-ai/claude-agent-sdk.
+            // Stable aliases let the installed CLI resolve available models.
             Self::ClaudeCode => vec![
-                Knob::new(KnobId::Model, "Model", CLAUDE_MODELS),
-                Knob::new(KnobId::Effort, "Effort", claude_efforts()),
+                Knob::new(KnobId::Model, "Model", CLAUDE_CODE_MODELS),
+                Knob::new(KnobId::Effort, "Effort", if super::providers::in_use_id().as_deref() == Some(super::claude_code::ID) {
+                    CLAUDE_CODE_EFFORTS
+                } else { claude_efforts() }),
                 Knob::new(KnobId::Thinking, "Thinking", &[("On", "on"), ("Off", "off")]),
             ],
             // Effort for most providers: octos applies
@@ -708,18 +716,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The create UI's segmented controls carry these labels literally — a
-    /// segmented control takes its labels from the DSL, so adding an option
-    /// here means adding a segment there. This pins the counts so the two
-    /// can't drift silently.
+    /// The subscription CLI and legacy ACP adapter have different effort
+    /// ladders. Check both explicitly rather than inherit the user's saved
+    /// provider, and verify the labels map to the values each mode delivers.
     #[test]
-    fn segment_counts_match_the_dsl() {
+    fn claude_subscription_and_legacy_adapter_expose_supported_options() {
+        let _guard = super::super::CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        struct Restore(Option<String>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(provider) => super::super::providers::set_session(provider),
+                    None => super::super::providers::clear_session(),
+                }
+            }
+        }
+        let _restore = Restore(super::super::providers::session_provider());
+        super::super::providers::set_session(super::super::claude_code::ID);
         let knobs = Backend::ClaudeCode.knobs();
-        assert_eq!(knobs[0].options.len(), 4, "Model: Default + 3");
-        // Effort has TWO controls declared — the probe picks one.
-        assert_eq!(knobs[1].options.len(), claude_efforts().len() + 1);
-        assert!(matches!(knobs[1].options.len(), 5 | 6));
+        assert_eq!(knobs[0].options, [("Default", ""), ("Opus", "opus"), ("Sonnet", "sonnet"), ("Haiku", "haiku")]
+            .map(|(label, value)| (label.to_string(), value.to_string())));
+        assert_eq!(knobs[1].options, [("Default", ""), ("Low", "low"), ("Medium", "medium"), ("High", "high")]
+            .map(|(label, value)| (label.to_string(), value.to_string())));
+        assert_eq!(knobs[1].index_of(Some("medium")), 2);
+        assert_eq!(knobs[1].value_at(2).as_deref(), Some("medium"));
+        assert_eq!(knobs[1].index_of(Some("max")), 0);
+        assert_eq!(knobs[1].value_at(4), None);
+        assert_eq!(Backend::ClaudeCode.top_effort().as_deref(), Some("high"));
         assert_eq!(knobs[2].options.len(), 3, "Thinking: Default + 2");
+
+        // The legacy adapter retains its probed Max/X-High support.
+        super::super::providers::set_session("anthropic");
+        let legacy = Backend::ClaudeCode.knobs();
+        assert_eq!(legacy[1].options.len(), claude_efforts().len() + 1);
+        assert!(matches!(legacy[1].options.len(), 5 | 6));
+        let max = legacy[1].options.len() - 1;
+        assert_eq!(legacy[1].options[max].0, "Max");
+        assert_eq!(legacy[1].value_at(max).as_deref(), Some("max"));
+        assert_eq!(Backend::ClaudeCode.top_effort().as_deref(), Some("max"));
 
         // Kimi's Coding Plan ladder is its own control because it has no
         // medium rung.

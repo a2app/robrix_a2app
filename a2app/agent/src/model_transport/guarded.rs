@@ -158,7 +158,7 @@ fn endpoint(base: &str, protocol: Protocol) -> Result<(String, bool), String> {
     Ok((url.to_string(), local))
 }
 
-fn identity(salt: &[u8], fields: &[&str]) -> String {
+pub(super) fn identity(salt: &[u8], fields: &[&str]) -> String {
     let mut digest = Sha256::new();
     digest.update(salt);
     for field in fields {
@@ -168,7 +168,7 @@ fn identity(salt: &[u8], fields: &[&str]) -> String {
     format!("model:{:x}", digest.finalize())
 }
 
-fn identity_salt() -> Result<Vec<u8>, String> {
+pub(super) fn identity_salt() -> Result<Vec<u8>, String> {
     use std::io::Write;
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOCK.lock().map_err(|_| "Model identity storage unavailable.")?;
@@ -235,34 +235,57 @@ pub(super) fn resolve(prefs: &AgentPrefs) -> Result<Resolved, String> {
     })
 }
 
-type Approval = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+pub(super) type Approval = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+/// The same activation, policy, cancellation, and recipient checks protect
+/// both host-owned transports, including every subsequent tool-feedback turn.
+#[derive(Clone)]
+pub(super) struct Guard {
+    pub(super) approve: Approval,
+    pub(super) check_config: Approval,
+    pub(super) on_response: Approval,
+    pub(super) audit_context: Option<ContextId>,
+}
+
+impl Guard {
+    pub(super) fn new(prefs: &AgentPrefs, context: ContextId, shutdown: Arc<AtomicBool>, model: &ModelRecipient) -> Result<Self, String> {
+        let epoch = information_flow::context_epoch(&context)?;
+        let prefs = prefs.clone();
+        let expected = model.id.clone();
+        let recipient = Recipient::ModelProvider(expected.clone());
+        let check_config: Approval = Arc::new(move || {
+            if super::current_recipient(&prefs)?.id != expected {
+                return Err("Model configuration changed. Restart the agent and approve the current model service.".into());
+            }
+            Ok(())
+        });
+        let response_context = context.clone();
+        let audit_context = context.clone();
+        let response_model = model.id.clone();
+        let approve: Approval = Arc::new(move || {
+            if shutdown.load(Ordering::Acquire) { return Err("Model request cancelled.".into()); }
+            information_flow::ensure_allowed_for_activation(&context, epoch, &recipient)?;
+            Ok(())
+        });
+        Ok(Self { approve, check_config, audit_context: Some(audit_context), on_response: Arc::new(move || {
+            information_flow::add_influences_for_activation(&response_context, epoch, [Influence::Model(response_model.clone())])
+        }) })
+    }
+
+    pub(super) fn check(&self) -> Result<(), String> {
+        (self.approve)()?;
+        (self.check_config)()?;
+        (self.approve)()
+    }
+}
 
 pub(crate) fn provider(prefs: &AgentPrefs, context: ContextId, shutdown: Arc<AtomicBool>) -> Result<Arc<dyn LlmProvider>, String> {
-    let epoch = information_flow::context_epoch(&context)?;
     let config = resolve(prefs)?;
-    let prefs = prefs.clone();
-    let expected = config.recipient.id.clone();
-    let recipient = Recipient::ModelProvider(expected.clone());
-    let check_config: Approval = Arc::new(move || {
-        if resolve(&prefs)?.recipient.id != expected {
-            return Err("Model configuration changed. Restart the agent and approve the current model service.".into());
-        }
-        Ok(())
-    });
-    let response_context = context.clone();
-    let audit_context = context.clone();
-    let response_model = config.recipient.id.clone();
-    let approve: Approval = Arc::new(move || {
-        if shutdown.load(Ordering::Acquire) { return Err("Model request cancelled.".into()); }
-        information_flow::ensure_allowed_for_activation(&context, epoch, &recipient)?;
-        Ok(())
-    });
-    let mut provider = GuardedProvider::new(config, approve)?;
-    provider.audit_context = Some(audit_context);
-    provider.check_config = Some(check_config);
-    provider.on_response = Some(Arc::new(move || {
-        information_flow::add_influences_for_activation(&response_context, epoch, [Influence::Model(response_model.clone())])
-    }));
+    let guard = Guard::new(prefs, context, shutdown, &config.recipient)?;
+    let mut provider = GuardedProvider::new(config, guard.approve)?;
+    provider.audit_context = guard.audit_context;
+    provider.check_config = Some(guard.check_config);
+    provider.on_response = Some(guard.on_response);
     Ok(Arc::new(provider))
 }
 

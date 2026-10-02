@@ -5,7 +5,7 @@
 
 use std::{cell::RefCell, collections::HashMap, path::PathBuf, sync::atomic::{AtomicU64, Ordering}};
 use a2app_core::{
-    capabilities::{Capability, FlowSource},
+    capabilities::Capability,
     information_flow::{ContextId, FlowPolicy, Influence, Recipient, Registry, Source},
     manifest::{AppRegistry, instance_tag},
     permissions::{GrantDuration, GrantState, NetworkScope, Permission, PermissionStore, RoomScope},
@@ -28,6 +28,7 @@ struct Harness {
     panes: HashMap<usize, PaneState>,
     foreground_app: Option<String>,
     splashes: Vec<Splash>,
+    stock_hosts: Vec<WidgetRef>,
     attempted_bodies: RefCell<Vec<String>>,
     root: PathBuf,
 }
@@ -41,7 +42,7 @@ impl Harness {
         Self {
             cx, broker: Broker::new(), apps: AppRegistry::default(), permissions: PermissionStore::default(),
             flow: RefCell::new(Registry::open(&root).unwrap()), contexts: HashMap::new(), panes: HashMap::new(), foreground_app: None,
-            splashes: Vec::new(),
+            splashes: Vec::new(), stock_hosts: Vec::new(),
             attempted_bodies: RefCell::new(Vec::new()), root,
         }
     }
@@ -79,6 +80,41 @@ impl Harness {
         (heap, context)
     }
 
+    fn launch_stock(&mut self, app: &str, public: bool) -> (WidgetRef, ContextId) {
+        let manifest = a2app_core::builtin::stock(app).expect("installed stock mini-app");
+        let context = if public { ContextId::PublicApp { account: ACCOUNT.into(), app: app.into() } }
+            else { ContextId::App { account: ACCOUNT.into(), app: app.into(), room: Some(ROOM.into()) } };
+        self.flow.borrow_mut().register_context(&context).unwrap();
+        self.apps.insert(manifest.clone());
+        for permission in Permission::ALL.into_iter().filter(|permission| manifest.declares(*permission)) {
+            self.permissions.set(app, permission, GrantState::Granted);
+        }
+        self.permissions.set_matrix_write(true);
+        if manifest.declares(Permission::Network) {
+            self.permissions.allow_network(app, NetworkScope::ExactUrl("https://example.com/".into()),
+                RoomScope::AllRooms, GrantDuration::Always, None).unwrap();
+        }
+        let host = self.cx.with_vm(|vm| {
+            let value = vm.eval(script! { use mod.widgets.* Splash{} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        makepad_widgets::widget_tree::set_ui_root(&mut self.cx, &host);
+        let jail = self.flow.borrow().context_storage_path(&context).unwrap();
+        std::fs::create_dir_all(&jail).unwrap();
+        let heap = {
+            let mut splash = host.borrow_mut::<Splash>().unwrap();
+            splash.set_host_io_only(true);
+            splash.set_allow_net(false);
+            splash.set_host_tag(&mut self.cx, Some(instance_tag(app, context.room())));
+            splash.set_sandbox_dir(&mut self.cx, Some(jail));
+            splash.set_text(&mut self.cx, &manifest.source);
+            splash.isolate_heap_key(&mut self.cx).expect("stock app isolate")
+        };
+        self.contexts.insert(heap, context.clone());
+        self.stock_hosts.push(host.clone());
+        (host, context)
+    }
+
     fn process(&mut self) -> Vec<BrokerAsk> {
         let contexts = &self.contexts;
         let flow = &self.flow;
@@ -98,9 +134,13 @@ impl Harness {
             if let Some(action) = contract.sensitive_action(cap.id, args, target) {
                 registry.ensure_action_allowed(context, &action)?;
             }
-            registry.add_sources(context, contract.source_labels(ACCOUNT, room, target)?)?;
-            if contract.untrusted_content && matches!(contract.source, FlowSource::TargetRoom | FlowSource::AttachedRoom) {
-                registry.add_influences(context, [Influence::RoomContent { account: ACCOUNT.into(), room: target.unwrap_or(ROOM).into() }])?;
+            let sources = contract.source_labels(ACCOUNT, room, target)?;
+            registry.add_sources(context, sources.clone())?;
+            if contract.untrusted_content {
+                registry.add_influences(context, sources.into_iter().map(|source| match source {
+                    Source::Room { account, room } => Influence::RoomContent { account, room },
+                    _ => Influence::Unknown,
+                }))?;
             }
             Ok(())
         };
@@ -138,6 +178,7 @@ impl Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         for splash in &mut self.splashes { splash.set_text(&mut self.cx, ""); }
+        for host in &self.stock_hosts { host.set_text(&mut self.cx, ""); }
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
@@ -314,6 +355,25 @@ fn room_instructions_cannot_authorize_a_message_as_the_user() {
 }
 
 #[test]
+fn explicit_account_profile_reads_remain_private_and_record_untrusted_influence() {
+    let mut host = Harness::new();
+    let (_, context) = host.launch("profile-reader", false, r#"
+        host.request("matrix.profile", nil, fn(r) {
+            host.request("network.http", {url:"https://example.test/" body:r.data.display_name}, fn(out) {
+                host.request("notify.post", {body:if out.is_ok {"escaped"} else {"profile sharing blocked"}})
+            })
+        })
+        Label{text:"fixture"}
+    "#);
+    let read = matrix_reply(host.process());
+    assert!(host.flow.borrow().labels(&context).unwrap().contains(&Source::Account { account: ACCOUNT.into() }));
+    assert!(host.flow.borrow().influences(&context).unwrap().contains(&Influence::Unknown));
+    host.reply(read, r#"{"user_id":"@owner:test","display_name":"Private profile name"}"#);
+    assert!(host.process().into_iter().all(|ask| !matches!(ask, BrokerAsk::Network { .. })));
+    assert_eq!(host.notifications(), ["profile sharing blocked"]);
+}
+
+#[test]
 fn public_fetch_builtin_runs_with_real_vm_and_host_callback() {
     let stock = a2app_core::builtin::stock("public-web").expect("public worker sample is installed");
     let mut cx = Cx::new(Box::new(|_, _| {}));
@@ -344,6 +404,65 @@ fn public_fetch_builtin_runs_with_real_vm_and_host_callback() {
     cx.with_vm_and_async(|_| {});
     assert_eq!(host.widget(&cx, ids!(result)).text(), "<h1>Public example</h1>");
     host.set_text(&mut cx, "");
+}
+
+#[test]
+fn stock_roll_call_posts_dice_without_private_profile_reads_or_action_review() {
+    let mut host = Harness::new();
+    let (app, context) = host.launch_stock("roll-call", false);
+    assert!(host.process().is_empty(), "rolling dice must not read the user's private account profile");
+    // Prime the widget tree before a script call borrows the Splash. The
+    // running UI normally does this during its first draw.
+    let dice_label = app.widget(&host.cx, ids!(dice));
+    let total_label = app.widget(&host.cx, ids!(total));
+    let note_label = app.widget(&host.cx, ids!(note));
+    assert!(!dice_label.is_empty() && !total_label.is_empty() && !note_label.is_empty());
+    assert!(app.borrow_mut::<Splash>().unwrap().call_script_fn(&mut host.cx, id!(roll), &[]));
+    host.cx.with_vm_and_async(|_| {});
+    let dice = dice_label.text();
+    let total = total_label.text();
+    assert!(dice.contains("●"));
+    assert!(total.starts_with("total "));
+    assert!(app.borrow_mut::<Splash>().unwrap().call_script_fn(&mut host.cx, id!(post), &[]));
+    host.cx.with_vm_and_async(|_| {});
+    let (reply, body) = host.process().into_iter().find_map(|ask| match ask {
+        BrokerAsk::Matrix { reply, call: services::MatrixServiceCall::SendMessage { body }, .. } => Some((reply, body)),
+        _ => None,
+    }).expect("the ordinary room-send permission accepts a stock dice post");
+    assert!(body.starts_with("🎲 Rolled "));
+    assert!(body.ends_with(total.strip_prefix("total ").unwrap()));
+    assert!(host.flow.borrow().labels(&context).unwrap().is_empty());
+    assert!(host.flow.borrow().influences(&context).unwrap().is_empty());
+    host.reply(reply, "{}");
+    host.cx.with_vm_and_async(|_| {});
+    assert_eq!(note_label.text(), "Posted to the room!");
+}
+
+#[test]
+fn stock_public_web_fetches_in_normal_and_public_modes_with_retired_legacy_data() {
+    for public in [false, true] {
+        let mut host = Harness::new();
+        let legacy = host.root.join("app_data").join("public-web");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("private-cache"), "retained private data").unwrap();
+        let (app, context) = host.launch_stock("public-web", public);
+        assert!(host.process().is_empty(), "the example fetch requires a user action");
+        assert!(app.borrow_mut::<Splash>().unwrap().call_script_fn(&mut host.cx, id!(fetch_example), &[]));
+        host.cx.with_vm_and_async(|_| {});
+        let (reply, args) = host.process().into_iter().find_map(|ask| match ask {
+            BrokerAsk::Network { reply, args, .. } => Some((reply, args)),
+            _ => None,
+        }).expect("the fixed public fetch is accepted with Internet permission");
+        assert_eq!(args["url"], "https://example.com/");
+        assert!(host.flow.borrow().labels(&context).unwrap().is_empty());
+        let jail = host.flow.borrow().context_storage_path(&context).unwrap();
+        assert_ne!(jail, legacy);
+        assert!(!jail.join("private-cache").exists(), "retired private files stay outside the fresh compartment");
+        host.reply(reply, r#"{"status":200,"body":"Public page fixture","headers":{}}"#);
+        host.cx.with_vm_and_async(|_| {});
+        assert_eq!(app.widget(&host.cx, ids!(result)).text(), "Public page fixture");
+        assert!(legacy.join("private-cache").exists(), "the fix retains historical files");
+    }
 }
 
 #[test]

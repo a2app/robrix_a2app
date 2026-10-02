@@ -39,6 +39,21 @@ script_mod! {
     // samples the scene beneath it, so the dark fill must actually paint.
     mod.widgets.MiniAppHost = View {
         width: Fill, height: Fill
+        flow: Down
+        permission_help := RoundedView {
+            visible: false
+            width: Fill, height: Fit, flow: Down, padding: 10, spacing: 8
+            draw_bg +: { color: (COLOR_BG_PREVIEW), border_radius: 4.0 }
+            Label {
+                width: Fill, height: Fit, flow: Flow.Right{wrap: true}
+                text: "This app needs your permission to continue."
+                draw_text +: { text_style: SETTINGS_REGULAR_TEXT_STYLE {}, color: (MESSAGE_TEXT_COLOR) }
+            }
+            permission_review := RobrixNeutralIconButton {
+                text: "Review permission"
+                icon_walk: Walk{width: 0, height: 0, margin: 0}
+            }
+        }
         content_bg := RoundedView {
             width: Fill, height: Fill
             flow: Down
@@ -68,6 +83,7 @@ pub struct MiniAppHostArea {
     #[rust] host: Option<WidgetRef>,
     /// Input failures already explained for this host; cleared after successful input.
     #[rust] input_errors_shown: HashSet<String>,
+    #[rust] area: Area,
     /// The content box the host was last drawn at, for `on_app_resize`.
     #[rust] last_size: Vec2d,
 }
@@ -80,10 +96,23 @@ impl Widget for MiniAppHostArea {
         if let Some(host) = self.host.clone()
             && !matches!(event, Event::NetworkResponses(_))
         {
-            // Native input can carry pasted or dragged account data. Label
-            // before the isolate sees it, including keyboard-derived values.
+            if let Event::Actions(actions) = event
+                && host.button(cx, ids!(permission_review)).clicked(actions)
+                && let Some(context) = super::instances::context_of_host(&host)
+            {
+                cx.action(super::runtime::A2AppOp::ReviewFlow(context));
+            }
+            // Keyboard events are broadcast to all surfaces. Only the focused
+            // host receives them; drag/drop belongs to the host under the pointer.
+            let focus = cx.key_focus();
+            if !host_receives_input(&host, event, focus, self.area.rect(cx)) { return; }
+            // Text, character keys and dropped contents carry private data.
+            // Navigation keys and keyboard button activation add no source.
             if matches!(event, Event::TextInput(_) | Event::TextRangeReplace(_)
-                | Event::KeyDown(_) | Event::KeyUp(_) | Event::Drag(_) | Event::Drop(_))
+                | Event::Drag(_) | Event::Drop(_))
+                || matches!(event, Event::KeyDown(key) | Event::KeyUp(key)
+                    if !key.modifiers.control && !key.modifiers.logo
+                        && key.key_code.to_char(false).is_some_and(|character| !character.is_control() && character != ' '))
             {
                 let context = super::instances::context_of_host(&host);
                 let is_public = matches!(&context, Some(a2app_core::information_flow::ContextId::PublicApp { .. }));
@@ -102,17 +131,7 @@ impl Widget for MiniAppHostArea {
                         Ok(())
                     });
                 if let Err(error) = recorded {
-                    // These events reach every host. Explain a failure only when
-                    // keyboard input belongs to this host, not the room composer.
-                    // A drag/drop target cannot be inferred from keyboard focus.
-                    let focus = cx.key_focus();
-                    if !self.input_errors_shown.contains(&error)
-                        && matches!(event, Event::TextInput(_) | Event::TextRangeReplace(_)
-                            | Event::KeyDown(_) | Event::KeyUp(_))
-                        && focus.is_valid(cx)
-                        && active_host_contains_focus(&host, focus)
-                    {
-                        self.input_errors_shown.insert(error.clone());
+                    if self.input_errors_shown.insert(error.clone()) {
                         let guidance = if is_public {
                             "A public instance cannot accept typed, pasted, or dropped private data. Close this public instance, then open the mini-app normally from Mini Apps to enter text."
                         } else {
@@ -147,6 +166,20 @@ impl Widget for MiniAppHostArea {
         if let Some(host) = self.host.clone()
             && rect.size.x > 1.0 && rect.size.y > 1.0
         {
+            let needs_review = super::instances::context_of_host(&host).is_some_and(|context| {
+                let Ok(epoch) = a2app_core::information_flow::context_epoch(&context) else { return false };
+                let mut recipients = std::collections::BTreeSet::new();
+                let blocked_sharing = a2app_core::information_flow::recent_decisions().unwrap_or_default().iter().rev()
+                    .filter(|decision| decision.context == context && decision.epoch == epoch)
+                    .filter(|decision| recipients.insert(decision.recipient.clone()))
+                    .any(|decision| !decision.allowed);
+                let mut actions = HashSet::new();
+                blocked_sharing || a2app_core::information_flow::recent_action_decisions().unwrap_or_default().iter().rev()
+                    .filter(|decision| decision.context == context && decision.epoch == epoch)
+                    .filter(|decision| actions.insert((decision.action.kind.clone(), decision.action.target.clone())))
+                    .any(|decision| !decision.allowed)
+            });
+            host.widget(cx, ids!(permission_help)).set_visible(cx, needs_review);
             let host_walk = Walk {
                 abs_pos: Some(rect.pos),
                 width: Size::Fixed(rect.size.x),
@@ -155,8 +188,18 @@ impl Widget for MiniAppHostArea {
             };
             host.draw_walk_all(cx, &mut Scope::empty(), host_walk);
         }
-        cx.end_turtle();
+        cx.end_turtle_with_area(&mut self.area);
         DrawStep::done()
+    }
+}
+
+fn host_receives_input(host: &WidgetRef, event: &Event, focus: Area, rect: Rect) -> bool {
+    match event {
+        Event::TextInput(_) | Event::TextRangeReplace(_) | Event::KeyDown(_) | Event::KeyUp(_) =>
+            active_host_contains_focus(host, focus),
+        Event::Drag(event) => rect.contains(event.abs),
+        Event::Drop(event) => rect.contains(event.abs),
+        _ => true,
     }
 }
 
@@ -239,6 +282,7 @@ mod tests {
         area: Area,
         visible: bool,
         children: Vec<WidgetRef>,
+        events: Vec<&'static str>,
     }
 
     impl ScriptApply for FocusBranch {
@@ -257,6 +301,10 @@ mod tests {
     }
 
     impl Widget for FocusBranch {
+        fn handle_event(&mut self, _cx: &mut Cx, event: &Event, _scope: &mut Scope) {
+            self.events.push(event.name());
+        }
+
         fn draw_walk(&mut self, _cx: &mut Cx2d, _scope: &mut Scope, _walk: Walk) -> DrawStep {
             DrawStep::done()
         }
@@ -264,8 +312,123 @@ mod tests {
 
     fn focus_branch(area: Area, children: Vec<WidgetRef>) -> WidgetRef {
         WidgetRef::new_with_inner(Box::new(FocusBranch {
-            uid: WidgetUid::new(), area, children, visible: true,
+            uid: WidgetUid::new(), area, children, visible: true, events: Vec::new(),
         }))
+    }
+
+    fn input_fixture() -> (Cx, MiniAppHostAreaRef, WidgetRef, Area, Area) {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let area = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            crate::shared::script_mod(vm);
+            super::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppHostArea {} });
+            WidgetRef::script_from_value(vm, value).as_mini_app_host_area()
+        });
+        let list = DrawList::new(&mut cx);
+        let guest_focus = Area::Rect(RectArea { draw_list_id: list.id(), rect_id: 0, redraw_id: 1 });
+        let composer_focus = Area::Rect(RectArea { draw_list_id: list.id(), rect_id: 1, redraw_id: 1 });
+        let host = focus_branch(guest_focus, Vec::new());
+        area.set_host(Some(host.clone()));
+        (cx, area, host, guest_focus, composer_focus)
+    }
+
+    fn focus_input(cx: &mut Cx, focus: Area) {
+        cx.set_key_focus(focus);
+        cx.action(0_u8);
+        cx.handle_actions();
+        assert_eq!(cx.key_focus(), focus);
+    }
+
+    #[test]
+    fn shared_host_template_starts_with_permission_help_hidden() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let (host, errors) = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            crate::shared::script_mod(vm);
+            vm.bx.captured_errors = Some(Vec::new());
+            super::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppHost {} });
+            let host = WidgetRef::script_from_value(vm, value);
+            (host, vm.take_errors())
+        });
+        assert!(errors.is_empty(), "shared mini-app host template failed to initialize: {errors:?}");
+        let help = host.widget(&cx, ids!(permission_help));
+        let review = host.button(&cx, ids!(permission_review));
+        assert!(!help.is_empty(), "the shared host owns the recovery banner");
+        assert!(!help.visible(), "ordinary mini-app launches need no recovery banner");
+        assert_eq!(review.text(), "Review permission");
+        assert!(!host.widget(&cx, ids!(splash)).is_empty());
+        help.set_visible(&mut cx, true);
+        assert!(help.visible());
+        assert_eq!(review.text(), "Review permission");
+    }
+
+    #[test]
+    fn composer_text_does_not_reach_the_mini_apps_provenance_guard() {
+        let (mut cx, area, host, guest_focus, composer_focus) = input_fixture();
+        for input in [
+            Event::KeyDown(KeyEvent { key_code: KeyCode::KeyA, ..Default::default() }),
+            Event::KeyUp(KeyEvent { key_code: KeyCode::KeyA, ..Default::default() }),
+            Event::TextInput(TextInputEvent { input: "private typed draft".into(), ..Default::default() }),
+            Event::TextInput(TextInputEvent { input: "private pasted draft".into(), was_paste: true, ..Default::default() }),
+            Event::TextRangeReplace(TextRangeReplaceEvent {
+                start: 0, end: 5, text: "private replacement".into(), replaced_text: None, fallback_to_insert: false,
+            }),
+        ] {
+            area.borrow_mut().unwrap().input_errors_shown.clear();
+            focus_input(&mut cx, composer_focus);
+            area.handle_event(&mut cx, &input, &mut Scope::empty());
+            assert!(area.borrow().unwrap().input_errors_shown.is_empty(), "another widget's text must not label this app");
+            assert!(host.borrow::<FocusBranch>().unwrap().events.is_empty());
+
+            focus_input(&mut cx, guest_focus);
+            area.handle_event(&mut cx, &input, &mut Scope::empty());
+            // This fake host has no running instance. Reaching its input guard
+            // must therefore fail before private contents are exposed to it.
+            assert!(area.borrow().unwrap().input_errors_shown.contains("Mini-app input context is unavailable."));
+            assert!(host.borrow::<FocusBranch>().unwrap().events.is_empty(), "guest text requires provenance before delivery");
+        }
+    }
+
+    #[test]
+    fn navigation_and_button_keys_are_delivered_without_private_data_labels() {
+        let (mut cx, area, host, guest_focus, composer_focus) = input_fixture();
+        focus_input(&mut cx, composer_focus);
+        area.handle_event(&mut cx, &Event::KeyDown(KeyEvent { key_code: KeyCode::ReturnKey, ..Default::default() }), &mut Scope::empty());
+        assert!(host.borrow::<FocusBranch>().unwrap().events.is_empty());
+
+        focus_input(&mut cx, guest_focus);
+        for key_code in [KeyCode::Space, KeyCode::ReturnKey, KeyCode::Tab, KeyCode::Escape] {
+            let key = KeyEvent { key_code, ..Default::default() };
+            area.handle_event(&mut cx, &Event::KeyDown(key), &mut Scope::empty());
+            area.handle_event(&mut cx, &Event::KeyUp(key), &mut Scope::empty());
+        }
+        assert_eq!(host.borrow::<FocusBranch>().unwrap().events, ["KeyDown", "KeyUp", "KeyDown", "KeyUp", "KeyDown", "KeyUp", "KeyDown", "KeyUp"]);
+        assert!(area.borrow().unwrap().input_errors_shown.is_empty(), "button and navigation keys must not require a private-data context");
+    }
+
+    #[test]
+    fn drag_and_drop_contents_only_enter_the_host_under_the_pointer() {
+        use std::sync::{Arc, Mutex};
+        let (_cx, _area, host, _, _) = input_fixture();
+        let rect = Rect { pos: dvec2(100.0, 200.0), size: dvec2(300.0, 400.0) };
+        let items = Arc::new(vec![DragItem::String { value: "private dropped text".into(), internal_id: None }]);
+        for (abs, expected) in [(dvec2(150.0, 250.0), true), (dvec2(50.0, 250.0), false), (dvec2(150.0, 650.0), false)] {
+            let drag = Event::Drag(DragEvent {
+                abs, items: items.clone(), modifiers: Default::default(),
+                handled: Arc::new(Mutex::new(false)), response: Arc::new(Mutex::new(DragResponse::None)),
+            });
+            let drop = Event::Drop(DropEvent {
+                abs, items: items.clone(), modifiers: Default::default(), handled: Arc::new(Mutex::new(false)),
+            });
+            assert_eq!(host_receives_input(&host, &drag, Area::Empty, rect), expected);
+            assert_eq!(host_receives_input(&host, &drop, Area::Empty, rect), expected);
+        }
+        // The host's keyboard focus never changes which surface owns a drop.
+        assert!(!host_receives_input(&host, &Event::Drop(DropEvent {
+            abs: dvec2(50.0, 250.0), items, modifiers: Default::default(), handled: Arc::new(Mutex::new(false)),
+        }), host.area(), rect));
     }
 
     #[test]

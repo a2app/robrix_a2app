@@ -616,6 +616,14 @@ pub fn init() {
     if let Err(error) = persistence::save_registry_state(&persisted) {
         error!("Could not save bundled mini-app update tracking: {error}");
     }
+    // Known bundled code and an empty, stopped sandbox can start fresh after
+    // the old launch/input tracking falsely marked them private. History and
+    // sandboxes containing saved data keep their original protection.
+    for manifest in registry.iter().filter(|manifest| !super::information_flow::manifest_has_private_source(manifest)) {
+        if let Err(error) = super::information_flow::reconcile_builtin_manifest(manifest) {
+            error!("Could not restore bundled mini-app provenance for {}: {error}", manifest.id);
+        }
+    }
     let permissions = persistence::load_permissions();
     a2app_core::permissions::publish_snapshot(permissions.snapshot(&registry));
     crate::a2app::matrix::publish_permission_policy(&permissions);
@@ -707,6 +715,7 @@ pub enum A2AppOp {
     /// into that room's RoomScreen pane instead of the generic host modal.
     OpenApp { app_id: MiniAppId, room_id: Option<OwnedRoomId>, in_room_pane: bool },
     OpenPublicApp(MiniAppId),
+    ReviewFlow(a2app_core::information_flow::ContextId),
     OpenAppFromContext { context: a2app_core::information_flow::ContextId, flow_epoch: u64, app_id: MiniAppId, room_id: OwnedRoomId },
     CloseHostPane,
     ForceStop(MiniAppId),
@@ -837,6 +846,7 @@ pub enum RoomAction {
 pub enum A2AppRuntimeAction {
     VersionsChanged(MiniAppId),
     Uninstalled(MiniAppId),
+    ReviewFlow(a2app_core::information_flow::ContextId),
     #[default]
     None,
 }
@@ -1579,6 +1589,15 @@ fn stop_app_everywhere(cx: &mut Cx, ui: &WidgetRef, app_id: &str) {
 
 fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
     match op {
+        A2AppOp::ReviewFlow(context) => {
+            // Park the modal instance so its pending action remains reviewable.
+            host_pane(cx, ui).close_active(cx, true);
+            with_a2app(|state| state.foreground_app = None);
+            ui.modal(cx, ids!(mini_app_host_modal)).close(cx);
+            cx.action(NavigationBarAction::GoToMiniApps);
+            cx.action(A2AppRuntimeAction::ReviewFlow(context));
+            ui.redraw(cx);
+        }
         A2AppOp::OpenAppFromContext { context, flow_epoch, app_id, room_id } => {
             let result = super::information_flow::current_context(&context).and_then(|()| {
                 a2app_core::information_flow::commit_exact_action_for_activation(&context, flow_epoch, &a2app_core::information_flow::SensitiveAction {
@@ -1823,6 +1842,14 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             let switched = with_a2app(|state| {
                 let mut manifest = state.registry.get(&app_id).cloned()?;
                 let (version, source) = persistence::load_version(&app_id, &stamp)?;
+                // A current bundled default does not make old source public.
+                // Restore its retained floor before making it executable.
+                if let Err(error) = manifest_flow_context(&manifest)
+                    .and_then(|_| a2app_core::information_flow::restore_app_code_provenance(&app_id))
+                {
+                    enqueue_popup_notification(error, PopupKind::Error, Some(5.0));
+                    return None;
+                }
                 if let Err(error) = archive_current(&mut manifest) {
                     enqueue_popup_notification(error, PopupKind::Error, Some(5.0));
                     return None;
@@ -3205,6 +3232,18 @@ fn install_version(cx: &mut Cx, ui: &WidgetRef, updated: MiniAppManifest, done: 
     });
     publish_grants(cx);
     let was_running = stop_for_restart(cx, ui, &updated);
+    if !super::information_flow::manifest_has_private_source(&updated) {
+        // All app instances have stopped. Retire source-inspection contexts
+        // too, so an empty stock sandbox does not inherit an edit's activation.
+        for snapshot in a2app_core::information_flow::contexts().unwrap_or_default().into_iter()
+            .filter(|snapshot| snapshot.context.app() == Some(updated.id.as_str()))
+        {
+            let _ = a2app_core::information_flow::remove_context_for_activation(&snapshot.context, snapshot.epoch);
+        }
+        if let Err(error) = super::information_flow::reconcile_builtin_manifest(&updated) {
+            enqueue_popup_notification(error, PopupKind::Error, Some(8.0));
+        }
+    }
     cx.action(A2AppRuntimeAction::VersionsChanged(updated.id.clone()));
     enqueue_popup_notification(reopen_hint(done, was_running), PopupKind::Success, Some(5.0));
     ui.redraw(cx);
@@ -7509,6 +7548,31 @@ fn post_ai_reply(room_id: &OwnedRoomId, text: String, answer_id: Option<u64>) {
 #[cfg(test)]
 mod permission_tests {
     use super::*;
+
+    #[test]
+    fn installing_stock_retires_source_inspection_before_recovering_empty_storage() {
+        use a2app_core::information_flow as flow;
+        let stock = builtin::stock("room-info").unwrap();
+        let previous_account = super::super::information_flow::TEST_ACCOUNT.with(|account|
+            account.replace(Some("@stock-install:test".into())));
+        let previous_state = A2APP.with(|state| state.replace(None));
+        initialize_background_test(stock.clone());
+        let context = super::super::information_flow::record_source_edit(&stock).unwrap();
+        assert!(flow::context_epoch(&context).is_ok());
+        assert!(!flow::labels(&context).unwrap().is_empty());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        install_version(&mut cx, &WidgetRef::empty(), stock.clone(), "Restored built-in".into());
+        let stopped = flow::context_epoch(&context).is_err();
+        flow::register_context(&context).unwrap();
+        let label = flow::labels(&context).unwrap();
+        let history = flow::code_labels(&stock.id).unwrap();
+        flow::remove_context(&context).unwrap();
+        A2APP.with(|state| { state.replace(previous_state); });
+        super::super::information_flow::TEST_ACCOUNT.with(|account| { account.replace(previous_account); });
+        assert!(stopped, "metadata inspection must not keep a retired stock activation alive");
+        assert!(label.is_empty());
+        assert!(history.contains(&flow::Source::Account { account: "@stock-install:test".into() }));
+    }
 
     const SOURCE: &str = "!source:example.org";
     const TARGET: &str = "!target:example.org";

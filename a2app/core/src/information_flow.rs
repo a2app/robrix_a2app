@@ -5,9 +5,10 @@
 //! This applies to the whole context, including encoded or model-derived output;
 //! it does not depend on inspecting request text. There is no declassification.
 //!
-//! Runtime storage is compartmentalized by account, app and room. Code and
-//! legacy shared-storage provenance remain an inherited app-wide floor. Labels
-//! and integrity influences persist outside the jail before input is delivered.
+//! Runtime storage is compartmentalized by account, app and room. Source-code
+//! provenance remains an inherited app-wide floor; retired shared-storage files
+//! are never mounted in a new compartment. Labels and integrity influences
+//! persist outside the jail before input is delivered.
 
 use std::{
     cell::RefCell,
@@ -161,13 +162,31 @@ impl Registry {
     pub fn register_context_with_legacy_data(&mut self, context: &ContextId, legacy_private_data: bool) -> Result<(), String> {
         self.check_healthy()?;
         validate_context(context)?;
-        if self.contexts.contains(context) { return self.labels(context).map(|_| ()); }
+        let needs_source_registration = context.app().is_some_and(|app| self.metadata.code.get(app)
+            .is_none_or(|provenance| legacy_private_data && provenance == &StoredProvenance::default()));
+        if self.contexts.contains(context) && !needs_source_registration { return self.labels(context).map(|_| ()); }
         let mut next = self.metadata.clone();
         if let Some(app) = context.app() {
             if !next.code.contains_key(app) {
-                let unknown = legacy_private_data || has_existing_data(&self.root.join("app_data").join(app))?;
-                next.code.insert(app.to_owned(), StoredProvenance::legacy(unknown));
+                // Retired app_data files are kept for user-managed recovery,
+                // but are never delivered to a new compartment. Their mere
+                // presence does not make independently known code private.
+                next.code.insert(app.to_owned(), StoredProvenance::legacy(legacy_private_data));
+            } else if legacy_private_data && next.code.get(app) == Some(&StoredProvenance::default()) {
+                // A verified stock working copy may have been replaced by
+                // unrecorded source since its last launch. Preserve archived
+                // sources and protect any additional unknown input, even if
+                // this compartment is already registered.
+                let mut provenance = next.historical_code.get(app).cloned().unwrap_or_default();
+                let unknown = StoredProvenance::legacy(true);
+                provenance.label.extend(unknown.label);
+                provenance.influences.extend(unknown.influences);
+                next.code.insert(app.to_owned(), provenance);
             }
+        }
+        if self.contexts.contains(context) {
+            if next != self.metadata { self.persist(next)?; }
+            return self.labels(context).map(|_| ());
         }
         if !next.contexts.iter().any(|entry| &entry.context == context) {
             // Unrecorded data in a compartment is never treated as public,
@@ -336,13 +355,57 @@ impl Registry {
     pub fn code_labels(&self, app: &str) -> Result<Label, String> {
         self.check_healthy()?;
         validate_app(app)?;
-        self.metadata.code.get(app).map(|entry| entry.label.clone())
-            .ok_or_else(|| "Missing app code provenance; register its origin first.".into())
+        let mut label = self.metadata.code.get(app).map(|entry| entry.label.clone())
+            .ok_or("Missing app code provenance; register its origin first.")?;
+        if let Some(history) = self.metadata.historical_code.get(app) { label.extend(history.label.iter().cloned()); }
+        Ok(label)
     }
 
     pub fn code_influences(&self, app: &str) -> Result<Influences, String> {
         self.code_labels(app)?;
-        Ok(self.metadata.code.get(app).unwrap().influences.clone())
+        let mut influences = self.metadata.code.get(app).unwrap().influences.clone();
+        if let Some(history) = self.metadata.historical_code.get(app) { influences.extend(history.influences.iter().cloned()); }
+        Ok(influences)
+    }
+
+    /// Trusted host replacement by this build's exact built-in source.
+    ///
+    /// Archive the old code floor for history reads/restores. Running contexts
+    /// and compartments with saved files retain their complete old provenance;
+    /// only stopped, empty compartments start fresh with the known stock code.
+    /// The caller must verify the complete working manifest against the stock
+    /// built into the executable before invoking this recovery operation.
+    pub fn reconcile_builtin_code(&mut self, app: &str) -> Result<(), String> {
+        self.check_healthy()?;
+        validate_app(app)?;
+        let old_code = self.metadata.code.get(app).cloned().unwrap_or_default();
+        let mut next = self.metadata.clone();
+        if old_code != StoredProvenance::default() {
+            let history = next.historical_code.entry(app.into()).or_default();
+            history.label.extend(old_code.label.iter().cloned());
+            history.influences.extend(old_code.influences.iter().cloned());
+        }
+        for entry in next.contexts.iter_mut().filter(|entry| entry.context.app() == Some(app)) {
+            if !self.contexts.contains(&entry.context) && !has_existing_data(&storage::context_path(&self.root, &entry.context))? {
+                entry.provenance = StoredProvenance::default();
+            } else {
+                entry.provenance.label.extend(old_code.label.iter().cloned());
+                entry.provenance.influences.extend(old_code.influences.iter().cloned());
+            }
+        }
+        next.code.insert(app.into(), StoredProvenance::default());
+        if next == self.metadata { return Ok(()); }
+        self.persist(next)
+    }
+
+    /// Restore the archived floor before executing any historical source.
+    ///
+    /// History is not assumed public because the current working copy has
+    /// been replaced with stock code. Call before installing a saved version.
+    pub fn restore_app_code_provenance(&mut self, app: &str) -> Result<(), String> {
+        self.code_labels(app)?;
+        let history = self.metadata.historical_code.get(app).cloned().unwrap_or_default();
+        self.join_code(app, history)
     }
 
     fn join_code(&mut self, app: &str, incoming: StoredProvenance) -> Result<(), String> {
@@ -656,6 +719,14 @@ pub fn code_influences(app: &str) -> Result<Influences, String> {
     with_registry(|registry| registry.code_influences(app))
 }
 
+pub fn reconcile_builtin_code(app: &str) -> Result<(), String> {
+    with_registry(|registry| registry.reconcile_builtin_code(app))
+}
+
+pub fn restore_app_code_provenance(app: &str) -> Result<(), String> {
+    with_registry(|registry| registry.restore_app_code_provenance(app))
+}
+
 pub fn add_code_sources(app: &str, sources: impl IntoIterator<Item = Source>) -> Result<(), String> {
     with_registry(|registry| registry.add_code_sources(app, sources))
 }
@@ -950,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_app_storage_with_no_provenance_is_unknown_private() {
+    fn retired_legacy_storage_does_not_taint_a_fresh_compartment() {
         let root = TestRoot::new();
         let storage = root.0.join("app_data/test");
         fs::create_dir_all(&storage).unwrap();
@@ -958,9 +1029,195 @@ mod tests {
         let mut registry = root.registry();
         let context = app("test", "alice", "room-a");
         registry.register_context(&context).unwrap();
+        assert!(registry.labels(&context).unwrap().is_empty());
+        assert!(registry.code_labels("test").unwrap().is_empty());
+        assert!(registry.ensure_allowed(&context, &site()).is_ok());
+        assert_ne!(registry.context_storage_path(&context).unwrap(), storage);
+        assert_eq!(fs::read_to_string(storage.join("old-memory")).unwrap(), "private");
+        let public = ContextId::PublicApp { account: "alice".into(), app: "test".into() };
+        registry.register_context(&public).unwrap();
+        assert!(registry.labels(&public).unwrap().is_empty());
+        assert_ne!(registry.context_storage_path(&public).unwrap(), storage);
+        assert_ne!(registry.context_storage_path(&public).unwrap(), registry.context_storage_path(&context).unwrap());
+    }
+
+    #[test]
+    fn unrecorded_compartment_files_still_block_sharing() {
+        let root = TestRoot::new();
+        let context = app("test", "alice", "room-a");
+        let path = storage::context_path(&root.0, &context);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("private-memory"), "private").unwrap();
+        let mut registry = root.registry();
+        registry.register_context(&context).unwrap();
         assert_eq!(registry.labels(&context).unwrap(), [Source::UnknownPrivate].into_iter().collect());
         assert!(registry.ensure_allowed(&context, &site()).is_err());
-        assert!(registry.ensure_allowed(&context, &room_recipient("alice", "room-a")).is_err());
+        let public = ContextId::PublicApp { account: "alice".into(), app: "test".into() };
+        registry.register_context(&public).unwrap();
+        assert!(registry.labels(&public).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_app_source_remains_a_floor_in_every_compartment() {
+        let root = TestRoot::new();
+        let context = app("test", "alice", "room-a");
+        let mut registry = root.registry();
+        registry.register_context_with_legacy_data(&context, true).unwrap();
+        assert!(registry.code_labels("test").unwrap().contains(&Source::UnknownPrivate));
+        assert!(registry.ensure_allowed(&context, &site()).is_err());
+        let public = ContextId::PublicApp { account: "alice".into(), app: "test".into() };
+        assert!(registry.register_context(&public).is_err());
+    }
+
+    #[test]
+    fn verified_stock_recovers_empty_compartments_and_protects_historical_code() {
+        let root = TestRoot::new();
+        let context = app("test", "alice", "room-a");
+        let mut registry = root.registry();
+        registry.register_context_with_legacy_data(&context, true).unwrap();
+        registry.add_sources(&context, [Source::Account { account: "alice".into() }]).unwrap();
+        registry.remove_context(&context);
+        registry.reconcile_builtin_code("test").unwrap();
+        registry.register_context(&context).unwrap();
+        assert!(registry.labels(&context).unwrap().is_empty());
+        assert!(registry.influences(&context).unwrap().is_empty());
+        assert!(registry.ensure_allowed(&context, &site()).is_ok());
+        assert!(registry.code_labels("test").unwrap().contains(&Source::UnknownPrivate));
+        assert!(registry.code_influences("test").unwrap().contains(&Influence::Unknown));
+        assert!(registry.ensure_labels_allowed(&registry.code_labels("test").unwrap(), &site()).is_err());
+        let public = ContextId::PublicApp { account: "alice".into(), app: "test".into() };
+        registry.register_context(&public).unwrap();
+        assert!(registry.labels(&public).unwrap().is_empty());
+        registry.restore_app_code_provenance("test").unwrap();
+        assert!(registry.labels(&context).unwrap().contains(&Source::UnknownPrivate));
+        assert!(registry.labels(&public).is_err(), "restoring private history must invalidate public execution");
+        drop(registry);
+        let mut restored = root.registry();
+        restored.register_context(&context).unwrap();
+        assert!(restored.labels(&context).unwrap().contains(&Source::UnknownPrivate));
+        assert!(restored.register_context(&public).is_err());
+    }
+
+    #[test]
+    fn stock_replacement_never_clears_running_memory_or_saved_files() {
+        let root = TestRoot::new();
+        let live = app("test", "alice", "room-a");
+        let saved = app("test", "alice", "room-b");
+        let public = ContextId::PublicApp { account: "alice".into(), app: "test".into() };
+        let mut registry = root.registry();
+        for context in [&live, &saved, &public] { registry.register_context(context).unwrap(); }
+        let source = room_source("alice", "room-b");
+        registry.add_sources(&live, [source.clone()]).unwrap();
+        registry.add_code_sources("test", [source.clone()]).unwrap();
+        registry.add_code_influences("test", [Influence::Unknown]).unwrap();
+        for context in [&saved, &public] {
+            let path = storage::context_path(&root.0, context);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("saved"), "private").unwrap();
+            registry.remove_context(context);
+        }
+        let epoch = registry.context_epoch(&live).unwrap();
+        registry.reconcile_builtin_code("test").unwrap();
+        assert_eq!(registry.context_epoch(&live).unwrap(), epoch);
+        assert_eq!(registry.labels(&live).unwrap(), [source.clone()].into());
+        assert!(registry.influences(&live).unwrap().contains(&Influence::Unknown));
+        assert!(registry.ensure_allowed(&live, &site()).is_err());
+        registry.register_context(&saved).unwrap();
+        assert_eq!(registry.labels(&saved).unwrap(), [source.clone()].into());
+        assert!(registry.ensure_allowed(&saved, &site()).is_err());
+        assert!(registry.register_context(&public).is_err());
+        for context in [&saved, &public] {
+            assert_eq!(fs::read_to_string(storage::context_path(&root.0, context).join("saved")).unwrap(), "private");
+        }
+        drop(registry);
+        let mut restored = root.registry();
+        assert!(restored.register_context(&public).is_err());
+        restored.register_context(&saved).unwrap();
+        assert_eq!(restored.labels(&saved).unwrap(), [source].into());
+        let fresh = app("test", "alice", "room-c");
+        restored.register_context(&fresh).unwrap();
+        assert!(restored.labels(&fresh).unwrap().is_empty());
+    }
+
+    #[test]
+    fn schema_two_without_a_history_archive_keeps_its_code_floor() {
+        let root = TestRoot::new();
+        let context = app("test", "alice", "room-a");
+        let mut registry = root.registry();
+        registry.register_context_with_legacy_data(&context, true).unwrap();
+        drop(registry);
+        let path = root.0.join(METADATA_FILE);
+        let mut old: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        old.as_object_mut().unwrap().remove("historical_code");
+        fs::write(path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let mut restored = root.registry();
+        restored.register_context(&context).unwrap();
+        assert!(restored.labels(&context).unwrap().contains(&Source::UnknownPrivate));
+        assert!(restored.ensure_allowed(&context, &site()).is_err());
+    }
+
+    #[test]
+    fn unrecorded_private_source_cannot_reuse_a_verified_stock_floor() {
+        let root = TestRoot::new();
+        let context = app("test", "alice", "room-a");
+        let source = room_source("alice", "room-b");
+        let mut registry = root.registry();
+        registry.register_context(&context).unwrap();
+        registry.add_code_sources("test", [source.clone()]).unwrap();
+        registry.remove_context(&context);
+        registry.reconcile_builtin_code("test").unwrap();
+        registry.register_context(&context).unwrap();
+        assert!(registry.labels(&context).unwrap().is_empty());
+        let epoch = registry.context_epoch(&context).unwrap();
+        registry.register_context_with_legacy_data(&context, true).unwrap();
+        assert_eq!(registry.context_epoch(&context).unwrap(), epoch);
+        let label = registry.labels(&context).unwrap();
+        assert!(label.contains(&source));
+        assert!(label.contains(&Source::UnknownPrivate));
+        assert!(registry.influences(&context).unwrap().contains(&Influence::Unknown));
+        assert!(registry.ensure_allowed(&context, &site()).is_err());
+        registry.remove_context(&context);
+        registry.register_context_with_legacy_data(&context, true).unwrap();
+        assert_eq!(registry.labels(&context).unwrap(), label);
+        let public = ContextId::PublicApp { account: "alice".into(), app: "test".into() };
+        assert!(registry.register_context(&public).is_err());
+    }
+
+    #[test]
+    fn an_unrecorded_nonstock_source_without_history_is_unknown() {
+        let root = TestRoot::new();
+        let context = app("test", "alice", "room-a");
+        let mut registry = root.registry();
+        registry.reconcile_builtin_code("test").unwrap();
+        registry.register_context_with_legacy_data(&context, true).unwrap();
+        assert_eq!(registry.labels(&context).unwrap(), [Source::UnknownPrivate].into());
+        assert_eq!(registry.influences(&context).unwrap(), [Influence::Unknown].into());
+        assert!(registry.ensure_allowed(&context, &site()).is_err());
+    }
+
+    #[test]
+    fn known_public_generated_source_keeps_its_recorded_influences() {
+        for influence in [Influence::Model("local-provider".into()), Influence::MiniApp { account: "alice".into(), app: "generator".into() }] {
+            let root = TestRoot::new();
+            let context = app("test", "alice", "room-a");
+            let mut registry = root.registry();
+            registry.add_code_influences("test", [influence.clone()]).unwrap();
+            registry.register_context_with_legacy_data(&context, true).unwrap();
+            assert!(registry.labels(&context).unwrap().is_empty());
+            assert_eq!(registry.influences(&context).unwrap(), [influence].into());
+            registry.register_context_with_legacy_data(&context, true).unwrap();
+            assert!(registry.labels(&context).unwrap().is_empty());
+            assert!(registry.ensure_allowed(&context, &site()).is_ok());
+        }
+    }
+
+    #[test]
+    fn archived_code_requires_a_current_code_entry() {
+        let root = TestRoot::new();
+        let mut metadata = Metadata::default();
+        metadata.historical_code.insert("test".into(), StoredProvenance::legacy(true));
+        fs::write(root.0.join(METADATA_FILE), serde_json::to_vec(&metadata).unwrap()).unwrap();
+        assert!(Registry::open(&root.0).is_err());
     }
 
     #[test]

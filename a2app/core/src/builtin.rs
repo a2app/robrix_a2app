@@ -236,7 +236,7 @@ fn permissions_for(id: &str) -> Vec<String> {
         "reminder" => &["notifications"],
         "keyword-alert" => &["matrix-room-watch", "notifications"],
         "room-peek" => &["matrix-room-info", "matrix-room-read", "matrix-room-send", "robrix-navigation", "matrix-room-watch"],
-        "roll-call" => &["matrix-profile", "matrix-room-send"],
+        "roll-call" => &["matrix-room-send"],
         "room-info" => &["matrix-room-info"],
         "room-members" | "room-threads" => &["matrix-room-read", "robrix-navigation", "matrix-room-watch"],
         "search" => &["matrix-room-read", "matrix-rooms-list", "matrix-rooms-read", "robrix-navigation"],
@@ -278,7 +278,6 @@ fn reasons_for(id: &str) -> std::collections::BTreeMap<String, String> {
             ("matrix-room-watch", "Shows new messages, typing, edits and reactions as they arrive."),
         ],
         "roll-call" => &[
-            ("matrix-profile", "Shows who is rolling."),
             ("matrix-room-send", "Posts your roll into this room."),
         ],
         "room-info" => &[

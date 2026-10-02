@@ -46,6 +46,7 @@ pub fn spec(id: &str) -> Option<&'static ProviderSpec> {
 /// A provider's display name, falling back to the raw id so a provider
 /// configured by hand (octos knows more than we list) still reads sensibly.
 pub fn label_for(id: &str) -> String {
+    if id == super::claude_code::ID { return super::claude_code::LABEL.into(); }
     spec(id).map(|p| p.label.to_string()).unwrap_or_else(|| id.to_string())
 }
 
@@ -59,6 +60,8 @@ pub enum KeySource {
     Environment,
     /// `octos auth login` put it in octos's auth store.
     AuthStore,
+    /// The installed Claude Code CLI owns its subscription login.
+    ClaudeCode,
     /// Needs no key at all (a local Ollama).
     None,
     /// A legacy standalone ACP command. Protected Robrix provider lists never
@@ -102,6 +105,7 @@ impl ConfiguredProvider {
                 format!("From your environment · {}", super::key_env_for(&self.id))
             }
             KeySource::AuthStore => "Signed in with `octos auth login`".to_string(),
+            KeySource::ClaudeCode => "Signed in with Claude Code · No API key needed".to_string(),
             KeySource::None => "Runs locally — no key needed".to_string(),
             KeySource::AgentCommand => {
                 format!("ROBRIX_AGENT_CMD={}", agent_command().unwrap_or_default())
@@ -184,14 +188,15 @@ fn keys_in_config() -> Vec<String> {
 /// mask). The config is checked first for the same reason [`octos_providers_marked`]
 /// ranks it first: a key this app saved is the more specific answer.
 pub fn key_for(id: &str) -> Option<String> {
+    if id == super::claude_code::ID { return None; }
     let var = super::key_env_for(id);
     read_config()
         .get("env_vars")
         .and_then(|vars| vars.get(&var))
         .and_then(|v| v.as_str())
+        .filter(|key| !key.trim().is_empty())
         .map(str::to_string)
-        .or_else(|| std::env::var(&var).ok())
-        .filter(|k| !k.trim().is_empty())
+        .or_else(|| std::env::var(&var).ok().filter(|key| !key.trim().is_empty()))
 }
 
 /// Legacy standalone ACP pseudo-id; protected provider lists do not use it.
@@ -205,7 +210,7 @@ pub fn in_use_id() -> Option<String> {
     if let Some(id) = session_provider() {
         return Some(id);
     }
-    super::provider_from_octos_config()
+    default_provider()
         .or_else(|| super::provider_from_env().map(str::to_string))
         .or_else(super::provider_from_auth_store)
 }
@@ -217,7 +222,7 @@ pub fn in_use_id() -> Option<String> {
 /// the page marks the model provider independently of the worker runtime.
 pub fn list() -> Vec<ConfiguredProvider> {
     let in_use = in_use_id();
-    let saved_default = super::provider_from_octos_config();
+    let saved_default = default_provider();
     octos_providers_marked(in_use, saved_default)
 }
 
@@ -231,24 +236,32 @@ fn octos_providers_marked(
     // Gathered in precedence order, first mention winning: a key we saved is
     // more specific than the same provider showing up via the environment.
     let mut candidates: Vec<(String, KeySource)> = Vec::new();
+    if super::claude_code::status() == super::claude_code::Status::Ready {
+        candidates.push((super::claude_code::ID.into(), KeySource::ClaudeCode));
+    }
     candidates.extend(keys_in_config().into_iter().map(|id| (id, KeySource::Config)));
-    if let Some(id) = super::provider_from_env() {
-        candidates.push((id.to_string(), KeySource::Environment));
-    }
-    if let Some(id) = super::provider_from_auth_store() {
-        candidates.push((id, KeySource::AuthStore));
-    }
-    // A provider named in the config whose key lives somewhere we can't see
-    // (a keychain marker, say) is still selected — list it rather than
-    // showing an empty picker next to a working setup.
+    candidates.extend(super::PROVIDER_KEY_ENVS.iter().filter_map(|(name, id)| {
+        std::env::var(name).ok().filter(|key| !key.trim().is_empty())
+            .map(|_| (id.to_string(), KeySource::Environment))
+    }));
+    candidates.extend(super::model_transport::auth_store_providers().into_iter().map(|id| (id, KeySource::AuthStore)));
+    // A saved or session selection is not evidence that a catalog provider
+    // has a credential. Only an actual auth-store login can add a keyed row
+    // after config and environment discovery; Ollama needs no credential.
     if let Some(id) = saved_default.clone() {
-        let source = if id == "ollama" { KeySource::None } else { KeySource::AuthStore };
-        candidates.push((id, source));
+        if id == "ollama" {
+            candidates.push((id, KeySource::None));
+        } else if id != super::claude_code::ID && spec(&id).is_none() {
+            candidates.push((id, KeySource::AuthStore));
+        }
     }
     if let Some(id) = active.clone() {
         if !candidates.iter().any(|(candidate, _)| candidate == &id) {
-            let source = if id == "ollama" { KeySource::None } else { KeySource::AuthStore };
-            candidates.push((id, source));
+            if id == "ollama" {
+                candidates.push((id, KeySource::None));
+            } else if id != super::claude_code::ID && spec(&id).is_none() {
+                candidates.push((id, KeySource::AuthStore));
+            }
         }
     }
 
@@ -284,7 +297,7 @@ pub fn config_display_path() -> String {
 /// Whether the guarded transport has a model provider to select. Choosing a
 /// worker executable alone supplies neither a provider nor its credentials.
 pub fn any_configured() -> bool {
-    in_use_id().is_some()
+    list().iter().any(|provider| provider.active)
 }
 
 /// The provider picked for THIS SESSION only, overriding the saved default.
@@ -311,7 +324,9 @@ pub fn session_provider() -> Option<String> {
 
 /// The provider saved in octos's config — what a fresh launch starts with.
 pub fn default_provider() -> Option<String> {
-    super::provider_from_octos_config()
+    read_config().get("robrix_provider").and_then(|value| value.as_str())
+        .filter(|id| *id == super::claude_code::ID).map(str::to_string)
+        .or_else(super::provider_from_octos_config)
 }
 
 /// What a generation started right now would actually use.
@@ -370,11 +385,21 @@ fn reconcile_model(
     }
 }
 
-/// Makes `id` the saved default. Only the `provider` field moves (plus the
-/// model rule in [`reconcile_model`]); the keys and every other setting stay
-/// exactly as they were.
+/// Makes `id` the saved default, preserving API credentials.
+///
+/// Claude Code is a Robrix-owned choice beside the Octos provider field, so
+/// choosing the subscription retains the previous API provider and model.
 pub fn set_active(id: &str) -> Result<(), String> {
+    if id == super::claude_code::ID {
+        if super::claude_code::status() != super::claude_code::Status::Ready {
+            return Err("Check your Claude Code sign-in before selecting your subscription.".into());
+        }
+        return write_config(|config| {
+            config.insert("robrix_provider".into(), serde_json::json!(super::claude_code::ID));
+        });
+    }
     write_config(|config| {
+        config.remove("robrix_provider");
         let prior = config.get("provider").and_then(|p| p.as_str()).map(str::to_owned);
         config.insert("provider".to_string(), serde_json::json!(id));
         reconcile_model(config, id, prior.as_deref());
@@ -383,6 +408,9 @@ pub fn set_active(id: &str) -> Result<(), String> {
 
 /// Saves a key for `id` and makes it active — the "add a provider" path.
 pub fn save_key(id: &str, key: &str) -> Result<(), String> {
+    if id == super::claude_code::ID {
+        return Err("Claude Code uses its own sign-in, without an API key.".into());
+    }
     let key = key.trim();
     if key.is_empty() {
         return Err("Paste a key first".to_string());
@@ -402,6 +430,7 @@ pub fn save_key(id: &str, key: &str) -> Result<(), String> {
     }
     let var = super::key_env_for(id);
     write_config(|config| {
+        config.remove("robrix_provider");
         let vars = config
             .entry("env_vars")
             .or_insert_with(|| serde_json::json!({}));
@@ -443,6 +472,7 @@ mod tests {
         let _guard = super::super::CONFIG_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _claude_status = super::super::claude_code::test_status(super::super::claude_code::Status::NotInstalled);
         struct Restore {
             env: Vec<(&'static str, Option<std::ffi::OsString>)>,
             provider: Option<String>,
@@ -490,6 +520,165 @@ mod tests {
 
     fn config_json() -> serde_json::Value {
         read_config()
+    }
+
+    #[test]
+    fn claude_subscription_selection_survives_restart_without_rewriting_octos() {
+        with_temp_config(|| {
+            let _status = super::super::claude_code::test_status(super::super::claude_code::Status::Ready);
+            save_key("openai", "sk-cloud-fixture").unwrap();
+            write_config(|config| { config.insert("model".into(), serde_json::json!("cloud-model-fixture")); }).unwrap();
+            set_active(super::super::claude_code::ID).unwrap();
+            let config = config_json();
+            assert_eq!(config.get("robrix_provider").and_then(|value| value.as_str()), Some(super::super::claude_code::ID));
+            assert_eq!(config.get("provider").and_then(|value| value.as_str()), Some("openai"));
+            assert_eq!(config.get("model").and_then(|value| value.as_str()), Some("cloud-model-fixture"));
+            assert_eq!(key_for("openai").as_deref(), Some("sk-cloud-fixture"));
+            clear_session();
+            assert_eq!(in_use_id().as_deref(), Some(super::super::claude_code::ID));
+            assert_eq!(default_provider().as_deref(), Some(super::super::claude_code::ID));
+            assert_eq!(super::super::prefs::Backend::detect(), super::super::prefs::Backend::ClaudeCode);
+            let knobs = super::super::prefs::Backend::detect().knobs();
+            let model = knobs.iter().find(|knob| knob.id == super::super::prefs::KnobId::Model).unwrap();
+            assert_eq!(model.value_at(1).as_deref(), Some("opus"));
+            assert_eq!(model.value_at(2).as_deref(), Some("sonnet"));
+            let effort = knobs.iter().find(|knob| knob.id == super::super::prefs::KnobId::Effort).unwrap();
+            assert_eq!(effort.options.last().unwrap().1, "high");
+            let rows = list();
+            let local = rows.iter().find(|row| row.id == super::super::claude_code::ID).unwrap();
+            assert_eq!(local.source, KeySource::ClaudeCode);
+            assert!(local.active && local.is_default);
+            assert!(!local.editable() && !local.external());
+            assert!(!rows.iter().find(|row| row.id == "openai").unwrap().is_default);
+            assert!(any_configured());
+            assert!(save_key(super::super::claude_code::ID, "sk-ignored").is_err());
+            set_active("openai").unwrap();
+            assert!(config_json().get("robrix_provider").is_none());
+            assert_eq!(in_use_id().as_deref(), Some("openai"));
+            assert_eq!(config_json().get("model").and_then(|value| value.as_str()), Some("cloud-model-fixture"));
+            set_active(super::super::claude_code::ID).unwrap();
+            save_key("anthropic", "sk-ant-fixture").unwrap();
+            assert!(config_json().get("robrix_provider").is_none());
+            assert_eq!(in_use_id().as_deref(), Some("anthropic"));
+        });
+    }
+
+    #[test]
+    fn a_local_subscription_is_not_ready_merely_because_it_was_selected() {
+        with_temp_config(|| {
+            let _status = super::super::claude_code::test_status(super::super::claude_code::Status::Ready);
+            assert!(!any_configured(), "installation does not select a provider automatically");
+            set_active(super::super::claude_code::ID).unwrap();
+            for status in [super::super::claude_code::Status::NotInstalled, super::super::claude_code::Status::SignedOut, super::super::claude_code::Status::Unavailable] {
+                let _status = super::super::claude_code::test_status(status);
+                assert_eq!(in_use_id().as_deref(), Some(super::super::claude_code::ID));
+                assert!(!list().iter().any(|row| row.id == super::super::claude_code::ID));
+                assert!(!any_configured());
+                assert!(set_active(super::super::claude_code::ID).is_err());
+            }
+        });
+    }
+
+    #[test]
+    fn missing_or_empty_keys_do_not_configure_catalog_providers() {
+        with_temp_config(|| {
+            assert!(list().is_empty());
+            assert!(!any_configured());
+            for value in [serde_json::Value::Null, serde_json::json!(""), serde_json::json!(" \n\t "), serde_json::json!(false)] {
+                write_config(|config| {
+                    config.insert("env_vars".into(), serde_json::Value::Object(
+                        super::super::PROVIDER_KEY_ENVS.iter().map(|(name, _)| ((*name).into(), value.clone())).collect(),
+                    ));
+                }).unwrap();
+                assert!(list().is_empty());
+                for provider in CATALOG { assert!(key_for(provider.id).is_none()); }
+                assert!(!any_configured());
+            }
+        });
+    }
+
+    #[test]
+    fn selecting_an_unconfigured_provider_does_not_invent_a_saved_key_or_login() {
+        with_temp_config(|| {
+            for provider in CATALOG {
+                clear_session();
+                set_active(provider.id).unwrap();
+                assert!(list().is_empty(), "a saved selection has no credential: {}", provider.id);
+                assert!(!any_configured());
+                set_session(provider.id);
+                assert!(list().is_empty(), "a session selection has no credential: {}", provider.id);
+                assert!(!any_configured());
+            }
+        });
+    }
+
+    #[test]
+    fn empty_config_keys_fall_back_to_environment_credentials() {
+        with_temp_config(|| {
+            write_config(|config| {
+                config.insert("provider".into(), serde_json::json!("openai"));
+                config.insert("env_vars".into(), serde_json::json!({"OPENAI_API_KEY":" \n\t "}));
+            }).unwrap();
+            unsafe { std::env::set_var("OPENAI_API_KEY", "sk-environment"); }
+            assert_eq!(key_for("openai").as_deref(), Some("sk-environment"));
+            let rows = list();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, "openai");
+            assert_eq!(rows[0].source, KeySource::Environment);
+            assert!(rows[0].active && rows[0].is_default);
+            assert!(!rows[0].editable());
+            assert!(any_configured());
+        });
+    }
+
+    #[test]
+    fn every_environment_provider_is_available_for_selection() {
+        with_temp_config(|| {
+            unsafe {
+                std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-environment");
+                std::env::set_var("OPENAI_API_KEY", "sk-environment");
+                std::env::set_var("GEMINI_API_KEY", " \t ");
+            }
+            let rows = list();
+            assert_eq!(rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), vec!["anthropic", "openai"]);
+            assert!(rows.iter().all(|row| row.source == KeySource::Environment));
+            assert_eq!(rows.iter().filter(|row| row.active).count(), 1);
+            assert!(rows[0].active);
+            set_session("openai");
+            assert!(list().iter().find(|row| row.id == "openai").unwrap().active);
+            set_session("gemini");
+            assert!(!list().iter().any(|row| row.id == "gemini"));
+            assert!(!any_configured(), "a different provider's credential cannot satisfy a selected provider");
+        });
+    }
+
+    #[test]
+    fn a_selected_secondary_auth_login_is_listed_but_an_expired_one_is_not() {
+        with_temp_config(|| {
+            let path = super::super::model_transport::auth_store_path().unwrap();
+            let write_auth = |token: &str, expiry: serde_json::Value| std::fs::write(&path, serde_json::json!({"credentials":{
+                "anthropic":{"access_token":"fixture-anthropic"},
+                "openai":{"access_token":token,"expires_at":expiry},
+            }}).to_string()).unwrap();
+            write_auth("fixture-openai", serde_json::Value::Null);
+            let rows = list();
+            assert_eq!(rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), vec!["anthropic", "openai"]);
+            let openai = rows.iter().find(|row| row.id == "openai").unwrap();
+            assert_eq!(openai.source, KeySource::AuthStore);
+            assert!(!openai.active && !openai.is_default);
+            set_active("openai").unwrap();
+            let rows = list();
+            let openai = rows.iter().find(|row| row.id == "openai").unwrap();
+            assert_eq!(openai.source, KeySource::AuthStore);
+            assert!(openai.active && openai.is_default);
+            assert!(any_configured());
+            write_auth("fixture-openai", serde_json::json!("2000-01-01T00:00:00Z"));
+            assert!(!list().iter().any(|row| row.id == "openai"));
+            assert!(!any_configured());
+            write_auth(" \n\t ", serde_json::Value::Null);
+            assert!(!list().iter().any(|row| row.id == "openai"));
+            assert!(!any_configured());
+        });
     }
 
     /// "Use for now" and "make default" are separate on purpose: trying a

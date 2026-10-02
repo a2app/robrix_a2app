@@ -9,6 +9,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 
 use makepad_widgets::*;
+use makepad_widgets::makepad_platform::event::finger::{TAP_COUNT_DISTANCE, TouchState};
 use makepad_code_editor::code_view::CodeViewWidgetExt;
 use matrix_sdk::ruma::OwnedRoomId;
 
@@ -30,7 +31,9 @@ use crate::app::ConfirmDeleteAction;
 use crate::shared::confirmation_modal::ConfirmationModalContent;
 use crate::shared::popup_list::{enqueue_popup_notification, PopupKind};
 use crate::shared::speech_text_input::SpeechTextInputWidgetExt;
+use crate::shared::password_input::PasswordTextInputWidgetExt;
 use crate::shared::room_picker_modal::{RoomPickerContent, RoomPickerModalAction};
+use crate::shared::hover_highlight::handle_hover_hit_with_test;
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -384,12 +387,12 @@ script_mod! {
     }
 
     mod.widgets.MiniAppRadio = RadioButton {
-        width: 22, height: 22
+        width: 20, height: 20
         padding: 0, margin: 0
         align: Align{x: 0.5, y: 0.5}
         text: ""
         draw_bg +: {
-            size: 18.0
+            size: 20.0
             color: (COLOR_PRIMARY)
             color_hover: (COLOR_PRIMARY)
             color_active: (COLOR_PRIMARY)
@@ -421,52 +424,115 @@ script_mod! {
 
         width: Fill, height: Fit
         flow: Right
-        spacing: 8
+        spacing: 10
         align: Align{y: 0.5}
-        padding: Inset{top: 6, bottom: 6, left: 10, right: 10}
+        padding: Inset{top: 7, bottom: 7, left: 16, right: 12}
+        grab_key_focus: false
+        draw_bg +: { color: #0000, border_radius: 5.0 }
 
-        // The gutter holds the row's one verb: pick a set-up provider, or add a key.
-        View {
-            width: 32, height: 32
-            flow: Overlay
-            align: Align{x: 0.5, y: 0.5}
-            provider_pick := mod.widgets.MiniAppRadio {}
-            provider_add := mod.widgets.MiniAppGhostButton {
-                visible: false,
-                draw_icon +: { svg: (ICON_ADD), color: (COLOR_ACTIVE_PRIMARY) }
-            }
-        }
         View {
             width: Fill, height: Fit
-            flow: Down
-            spacing: 1
-            provider_name := Label {
-                width: Fill, height: Fit
-                padding: 0, margin: 0
-                draw_text +: {
-                    text_style: theme.font_bold {font_size: 11},
-                    color: (COLOR_TEXT)
+            flow: Right
+            spacing: 10
+            align: Align{y: 0.0}
+
+            // Anchor both controls to the title, independently of wrapped status text.
+            View {
+                width: 24, height: 24
+                margin: Inset{top: -1}
+                flow: Overlay
+                align: Align{x: 0.5, y: 0.5}
+                provider_pick := mod.widgets.MiniAppRadio {}
+                provider_add := RobrixIconButton {
+                    visible: false,
+                    width: 20, height: 20
+                    padding: 0, margin: 0, spacing: 0
+                    align: Align{x: 0.5, y: 0.5}
+                    icon_walk: Walk{width: 10, height: 10, margin: 0}
+                    draw_icon +: { svg: (ICON_ADD) }
+                    draw_bg +: {
+                        border_radius: 10.0
+                        border_size: 0.5
+                        border_color: (COLOR_ACTIVE_PRIMARY_DARKER)
+                        border_color_hover: #0C5DAA
+                        border_color_down: #0C5DAA
+                    }
                 }
             }
-            provider_detail := Label {
+
+            View {
                 width: Fill, height: Fit
-                flow: Flow.Right{wrap: true}
-                padding: 0, margin: 0
-                draw_text +: {
-                    text_style: REGULAR_TEXT {font_size: 10},
-                    color: (MESSAGE_TEXT_COLOR)
+                flow: Down
+                spacing: 6
+                provider_name := Label {
+                    width: Fill, height: Fit
+                    flow: Flow.Right{wrap: true}
+                    padding: 0, margin: 0
+                    draw_text +: {
+                        text_style: theme.font_bold {font_size: 13.5, line_spacing: 1.0},
+                        color: (COLOR_TEXT)
+                    }
+                }
+                provider_detail := Html {
+                    width: Fill, height: Fit
+                    flow: Flow.Right{wrap: true, row_align: RowAlign.Center}
+                    align: Align{y: 0.5}
+                    padding: 0, margin: 0
+                    selectable: false
+                    font_size: 10
+                    font_color: (MESSAGE_TEXT_COLOR)
+                    text_style_normal: REGULAR_TEXT {font_size: 10}
+                    text_style_fixed: theme.font_code {font_size: 10}
+                    draw_text +: { color: (MESSAGE_TEXT_COLOR) }
+                    draw_block +: { code_color: #xededed }
+                    inline_code_padding: Inset{left: 3, right: 3, top: 1, bottom: 1}
+                    inline_code_margin: 0
+                    fixed_font_size_scale: 1.0
+                    font := mod.widgets.MatrixHtmlSpan {}
+                    body: ""
                 }
             }
         }
-        provider_replace_button := RobrixNeutralIconButton {
+        provider_actions := View {
             visible: false,
-            padding: 8,
-            icon_walk: Walk{width: 0, height: 0, margin: 0}
-            text: "Replace key"
+            width: Fit, height: Fit
+            flow: Right
+            spacing: 10
+            align: Align{x: 1.0, y: 0.5}
+            provider_change_button := RobrixNeutralIconButton {
+                visible: false,
+                enable_long_press: true
+                height: 28
+                padding: Inset{left: 10, right: 10}
+                align: Align{x: 0.5, y: 0.5}
+                icon_walk: Walk{width: 0, height: 0, margin: 0}
+                text: "Change Key"
+            }
+            provider_forget_button := RobrixNegativeIconButton {
+                visible: false,
+                enable_long_press: true
+                width: 28, height: 28
+                padding: 0, margin: 0, spacing: 0
+                align: Align{x: 0.5, y: 0.5}
+                icon_walk: Walk{width: 16, height: 16, margin: 0}
+                draw_icon +: { svg: (ICON_TRASH) }
+                text: ""
+            }
         }
-        provider_forget_button := mod.widgets.MiniAppGhostButton {
-            visible: false,
-            draw_icon +: { svg: (ICON_TRASH), color: (COLOR_FG_DANGER_RED) }
+        animator: Animator {
+            bg_hover: {
+                default: @off
+                off: AnimatorState {
+                    redraw: true
+                    from: {all: Snap}
+                    apply: { draw_bg: {color: #0000} }
+                }
+                on: AnimatorState {
+                    redraw: true
+                    from: {all: Snap}
+                    apply: { draw_bg: {color: (COLOR_LIST_ROW_HOVER)} }
+                }
+            }
         }
     }
 
@@ -1221,6 +1287,8 @@ script_mod! {
 
         providers_pane := ScrollYView {
             visible: false,
+            cursor: MouseCursor.Arrow
+            grab_key_focus: false
             width: Fill, height: Fill
             flow: Down
             spacing: 10
@@ -1263,10 +1331,9 @@ script_mod! {
                     flow: Right
                     spacing: 8
                     align: Align{y: 0.5}
-                    key_input := RobrixTextInput {
+                    key_input := PasswordTextInput {
                         width: Fill { max: 500 }, height: Fit
-                        empty_text: "Paste the provider's API key…"
-                        is_password: true
+                        text_input +: { empty_text: "Paste the provider's API key…" }
                     }
                     key_save_button := RobrixPositiveIconButton {
                         padding: 8,
@@ -1277,6 +1344,87 @@ script_mod! {
                         padding: 8,
                         icon_walk: Walk{width: 0, height: 0, margin: 0}
                         text: "Cancel"
+                    }
+                }
+            }
+
+            claude_setup_section := View {
+                visible: false,
+                width: Fill, height: Fit
+                flow: Down
+                spacing: 8
+                padding: 6
+
+                SubsectionLabel { text: "Claude Code setup" }
+                Label {
+                    width: Fill, height: Fit
+                    flow: Flow.Right{wrap: true}
+                    padding: 0
+                    text: "Connect your own Claude Pro or Max subscription using Claude Code on this computer."
+                    draw_text +: { text_style: REGULAR_TEXT {font_size: 10}, color: (MESSAGE_TEXT_COLOR) }
+                }
+                Label {
+                    width: Fill, height: Fit
+                    flow: Flow.Right{wrap: true}
+                    padding: 0
+                    text: "1. Install Claude Code if it isn't installed."
+                    draw_text +: { text_style: REGULAR_TEXT {font_size: 10}, color: (MESSAGE_TEXT_COLOR) }
+                }
+                claude_install_button := RobrixNeutralIconButton {
+                    icon_walk: Walk{width: 0, height: 0, margin: 0}
+                    text: "Install instructions"
+                }
+                Label {
+                    width: Fill, height: Fit
+                    flow: Flow.Right{wrap: true}
+                    padding: 0
+                    text: "2. Run this command in a terminal to sign in with your Claude account:"
+                    draw_text +: { text_style: REGULAR_TEXT {font_size: 10}, color: (MESSAGE_TEXT_COLOR) }
+                }
+                View {
+                    width: Fill, height: Fit
+                    flow: Right
+                    spacing: 8
+                    align: Align{y: 0.5}
+                    Label {
+                        padding: 0
+                        text: "claude auth login"
+                        draw_text +: { text_style: theme.font_code {font_size: 10}, color: (COLOR_TEXT) }
+                    }
+                    claude_copy_login_button := RobrixNeutralIconButton {
+                        icon_walk: Walk{width: 0, height: 0, margin: 0}
+                        text: "Copy command"
+                    }
+                }
+                Label {
+                    width: Fill, height: Fit
+                    flow: Flow.Right{wrap: true}
+                    padding: 0
+                    text: "3. Return here, check your sign-in, then choose Use Claude Code."
+                    draw_text +: { text_style: REGULAR_TEXT {font_size: 10}, color: (MESSAGE_TEXT_COLOR) }
+                }
+                claude_setup_status := Label {
+                    width: Fill, height: Fit
+                    flow: Flow.Right{wrap: true}
+                    padding: 0
+                    draw_text +: { text_style: REGULAR_TEXT {font_size: 10}, color: (MESSAGE_TEXT_COLOR) }
+                }
+                View {
+                    width: Fill, height: Fit
+                    flow: Flow.Right{wrap: true}
+                    spacing: 8
+                    claude_check_button := RobrixNeutralIconButton {
+                        icon_walk: Walk{width: 0, height: 0, margin: 0}
+                        text: "Check sign-in"
+                    }
+                    claude_use_button := RobrixPositiveIconButton {
+                        visible: false,
+                        icon_walk: Walk{width: 0, height: 0, margin: 0}
+                        text: "Use Claude Code"
+                    }
+                    claude_done_button := RobrixNeutralIconButton {
+                        icon_walk: Walk{width: 0, height: 0, margin: 0}
+                        text: "Done"
                     }
                 }
             }
@@ -1297,7 +1445,7 @@ script_mod! {
                     text_style: REGULAR_TEXT {font_size: 9.5},
                     color: (MESSAGE_TEXT_COLOR)
                 }
-                text: "Robrix selects the model and keeps its credentials, including when a separate Octos process runs the agent. Configure a local Ollama provider and model explicitly in octos's config file."
+                text: "Claude Code uses your existing Claude sign-in; no API key is needed. API providers use the keys you configure here. Configure a local Ollama provider and model explicitly in octos's config file."
             }
         }
 
@@ -1791,42 +1939,163 @@ fn provenance_source_label(source: &a2app_core::versions::AcquisitionSource) -> 
     }
 }
 
-#[derive(Script, ScriptHook, Widget)]
+fn claude_code_detail(status: a2app_agent::claude_code::Status) -> &'static str {
+    use a2app_agent::claude_code::Status;
+    match status {
+        Status::Checking => "Set up Claude Code · checking your sign-in…",
+        Status::NotInstalled => "Set up Claude Code · uses your Claude subscription",
+        Status::SignedOut => "Set up Claude Code · sign in without an API key",
+        Status::Ready => "Signed in to Claude Code · no API key needed",
+        Status::Unavailable => "Set up Claude Code · check installation and sign-in",
+    }
+}
+
+fn provider_detail_html(detail: &str, has_key: bool, active: bool) -> String {
+    if !has_key && let Some(hint) = detail.strip_prefix("Tap to set up · key looks like ") {
+        return format!("<font color=\"#106fcc\">Tap to set up</font> · key looks like <code>{}</code>", htmlize::escape_text(hint));
+    }
+    if active {
+        for status in ["In use now", "In use"] {
+            if let Some(rest) = detail.strip_prefix(status).and_then(|rest| rest.strip_prefix(" · ")) {
+                return format!("<font color=\"#138808\">✅ {status}</font> · {}", htmlize::escape_text(rest));
+            }
+        }
+    }
+    let detail = htmlize::escape_text(detail);
+    if has_key { detail.into_owned() } else { format!("<font color=\"#106fcc\">{detail}</font>") }
+}
+
+#[derive(Script, ScriptHook, Widget, Animator)]
 pub struct MiniAppProviderRow {
+    #[source] source: ScriptObjectRef,
     #[deref] view: View,
+    #[apply_default] animator: Animator,
     #[rust] provider_id: String,
+    #[rust] has_key: bool,
+    #[rust] editable: bool,
+    #[rust] press_cancelled: bool,
 }
 
 impl Widget for MiniAppProviderRow {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if !self.view.visible && event.requires_visibility() {
+            return;
+        }
+        if self.animator_handle_event(cx, event).must_redraw() {
+            self.redraw(cx);
+        }
+        let area = self.view.area();
+        let claim_before = event.pointer_claimed_area();
+        // The row owns Add and Select clicks; secondary controls keep their own actions.
+        let (change_rect, forget_rect) = if self.has_key && self.editable {
+            (self.view.widget(cx, ids!(provider_change_button)).area().clipped_rect(cx),
+                self.view.widget(cx, ids!(provider_forget_button)).area().clipped_rect(cx))
+        } else {
+            (Rect::default(), Rect::default())
+        };
+        let hit = handle_hover_hit_with_test(self, cx, event, area, claim_before, false, |abs, rect, inset| {
+            Inset::rect_contains_with_inset(abs, rect, inset)
+                && !change_rect.contains(abs) && !forget_rect.contains(abs)
+        });
+        let mut add_state: Option<&[LiveId; 2]> = match event {
+            Event::MouseMove(e) if cx.fingers.first_mouse_button.is_none() => {
+                Some(if claim_before.is_empty() && area.clipped_rect(cx).contains(e.abs) {
+                    ids!(hover.on)
+                } else {
+                    ids!(hover.off)
+                })
+            }
+            _ => None,
+        };
+        match hit {
+            Hit::FingerHoverIn(_) => {
+                cx.set_cursor(MouseCursor::Hand);
+                add_state = Some(ids!(hover.on));
+            }
+            Hit::FingerHoverOut(_) => add_state = Some(ids!(hover.off)),
+            Hit::FingerDown(fe) => {
+                self.press_cancelled = false;
+                add_state = Some(if fe.is_primary_hit() { ids!(hover.down) } else { ids!(hover.off) });
+            }
+            Hit::FingerMove(fe) => {
+                if (fe.abs - fe.abs_start).length() >= TAP_COUNT_DISTANCE {
+                    self.press_cancelled = true;
+                }
+                add_state = Some(if self.press_cancelled || !fe.is_over { ids!(hover.off) } else { ids!(hover.down) });
+            }
+            Hit::FingerUp(fe) => {
+                if !self.press_cancelled && fe.is_over && fe.is_primary_hit() && fe.was_tap() {
+                    let action = if self.has_key {
+                        MiniAppsScreenAction::ProviderUse(self.provider_id.clone())
+                    } else {
+                        MiniAppsScreenAction::ProviderEnterKey(self.provider_id.clone())
+                    };
+                    cx.action(action);
+                }
+                add_state = Some(if !self.press_cancelled && fe.device.has_hovers() && fe.is_over {
+                    ids!(hover.on)
+                } else {
+                    ids!(hover.off)
+                });
+                self.press_cancelled = false;
+            }
+            _ => {}
+        }
+        if matches!(event, Event::Scroll(_) | Event::ClearHover | Event::MouseLeave(_) | Event::WindowLostFocus(_)) {
+            self.press_cancelled = true;
+            self.animator_play(cx, ids!(bg_hover.off));
+            add_state = Some(ids!(hover.off));
+        }
         self.view.handle_event(cx, event, scope);
+        // Mirror the row's pointer feedback after the button has handled its own events.
+        if !self.has_key && let Some(state) = add_state
+            && let Some(mut button) = self.view.button(cx, ids!(provider_add)).borrow_mut()
+        {
+            button.animator_play(cx, state);
+        }
         if let Event::Actions(actions) = event {
-            if self.view.radio_button(cx, ids!(provider_pick)).clicked(actions) {
+            if self.has_key && self.view.radio_button(cx, ids!(provider_pick)).clicked(actions) {
                 cx.action(MiniAppsScreenAction::ProviderUse(self.provider_id.clone()));
-            } else if self.view.button(cx, ids!(provider_add)).clicked(actions)
-                || self.view.button(cx, ids!(provider_replace_button)).clicked(actions)
+            } else if (!self.has_key && self.view.button(cx, ids!(provider_add)).clicked(actions))
+                || (self.has_key && self.editable && self.view.button(cx, ids!(provider_change_button)).clicked(actions))
             {
                 cx.action(MiniAppsScreenAction::ProviderEnterKey(self.provider_id.clone()));
-            } else if self.view.button(cx, ids!(provider_forget_button)).clicked(actions) {
+            } else if self.has_key && self.editable && self.view.button(cx, ids!(provider_forget_button)).clicked(actions) {
                 cx.action(MiniAppsScreenAction::ProviderForget(self.provider_id.clone()));
             }
         }
     }
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        // Keep names and credential details intact when the actions no longer fit beside them.
+        let is_narrow = cx.peek_walk_turtle(walk).size.x < 480.0;
+        self.view.layout.flow = if is_narrow { Flow::Down } else { Flow::right() };
+        self.view.layout.spacing = if is_narrow { 4.0 } else { 10.0 };
+        if let Some(mut actions) = self.view.view(cx, ids!(provider_actions)).borrow_mut() {
+            actions.walk.width = if is_narrow { Size::fill() } else { Size::fit() };
+        }
         self.view.draw_walk(cx, scope, walk)
     }
 }
 
 impl MiniAppProviderRow {
     fn populate(&mut self, cx: &mut Cx, id: &str, label: &str, detail: &str, has_key: bool, active: bool, editable: bool) {
+        if has_key && !self.has_key
+            && let Some(mut button) = self.view.button(cx, ids!(provider_add)).borrow_mut()
+        {
+            button.animator_cut(cx, ids!(hover.off));
+        }
         self.provider_id = id.to_string();
+        self.has_key = has_key;
+        self.editable = editable;
         self.view.label(cx, ids!(provider_name)).set_text(cx, label);
-        self.view.label(cx, ids!(provider_detail)).set_text(cx, detail);
+        let mut detail_html = self.view.html(cx, ids!(provider_detail));
+        detail_html.set_text(cx, &provider_detail_html(detail, has_key, active));
         self.view.widget(cx, ids!(provider_pick)).set_visible(cx, has_key);
-        self.view.radio_button(cx, ids!(provider_pick)).set_active(cx, active, Animate::No);
+        self.view.radio_button(cx, ids!(provider_pick)).set_active(cx, has_key && active, Animate::No);
         self.view.widget(cx, ids!(provider_add)).set_visible(cx, !has_key);
-        self.view.widget(cx, ids!(provider_replace_button)).set_visible(cx, active && editable);
-        self.view.widget(cx, ids!(provider_forget_button)).set_visible(cx, editable);
+        self.view.widget(cx, ids!(provider_actions)).set_visible(cx, has_key && editable);
+        self.view.widget(cx, ids!(provider_change_button)).set_visible(cx, has_key && editable);
+        self.view.widget(cx, ids!(provider_forget_button)).set_visible(cx, has_key && editable);
     }
 }
 
@@ -1902,6 +2171,7 @@ pub struct MiniAppsScreen {
     #[rust] diff_lines: Vec<DiffLine>,
     /// The provider awaiting a pasted key, if any.
     #[rust] key_entry: Option<String>,
+    #[rust] key_focus_pending: bool,
     /// The installed app the create bar's text reads as a rewrite of, and
     /// whether the user overrode that to create a new app anyway.
     #[rust] modify_target: Option<(MiniAppId, String)>,
@@ -1920,13 +2190,36 @@ impl Widget for MiniAppsScreen {
             && actions.iter().any(|action| matches!(action.downcast_ref(), Some(NavigationBarAction::GoToMiniApps)))
         {
             self.set_pane(cx, Pane::List);
+            if let Some(context) = actions.iter().find_map(|action| match action.downcast_ref::<A2AppRuntimeAction>() {
+                Some(A2AppRuntimeAction::ReviewFlow(context)) => Some(context),
+                _ => None,
+            }) {
+                self.view.data_sharing(cx, ids!(sharing_editor)).review_context(cx, context);
+                self.set_pane(cx, Pane::Sharing);
+            }
             return;
+        }
+        if self.pane == Pane::Providers {
+            // Share entry presses with scrolling, while leaving form controls their own gestures.
+            let list_rect = self.view.widget(cx, ids!(providers_list)).area().clipped_rect(cx);
+            let share_press = match event {
+                Event::MouseDown(e) => Some(list_rect.contains(e.abs)),
+                Event::TouchUpdate(e) if e.touches.iter().any(|touch| touch.state == TouchState::Start) => {
+                    Some(e.touches.iter().any(|touch| touch.state == TouchState::Start && list_rect.contains(touch.abs)))
+                }
+                _ => None,
+            };
+            if let Some(share_press) = share_press {
+                let share_press = share_press && event.pointer_claimed_area().is_empty();
+                let mut pane = self.view.view(cx, ids!(providers_pane));
+                script_apply_eval!(cx, pane, { capture_overload: #(share_press) });
+            }
         }
         self.view.handle_event(cx, event, scope);
 
-        // Console output streams in on Signal events; keep it painting.
+        // Console output and provider discovery arrive on Signal events.
         if let Event::Signal = event
-            && with_a2app(|state| state.console.active).unwrap_or(false)
+            && (self.pane == Pane::Providers || with_a2app(|state| state.console.active).unwrap_or(false))
         {
             self.view.redraw(cx);
         }
@@ -2294,10 +2587,11 @@ impl Widget for MiniAppsScreen {
         if self.view.button(cx, ids!(providers_back_button)).clicked(actions) {
             self.go_back(cx);
         }
-        if self.view.button(cx, ids!(key_save_button)).clicked(actions)
+        if (self.view.button(cx, ids!(key_save_button)).clicked(actions)
+            || self.view.password_text_input(cx, ids!(key_input)).returned(actions).is_some())
             && let Some(provider) = self.key_entry.clone()
         {
-            let key = self.view.text_input(cx, ids!(key_input)).text();
+            let key = self.view.password_text_input(cx, ids!(key_input)).text();
             let key = key.trim().to_string();
             if key.is_empty() {
                 enqueue_popup_notification("Paste the key first.", PopupKind::Warning, Some(3.0));
@@ -2313,6 +2607,28 @@ impl Widget for MiniAppsScreen {
         }
         if self.view.button(cx, ids!(key_cancel_button)).clicked(actions) {
             self.close_key_entry(cx);
+        }
+        if self.pane == Pane::Providers && self.view.widget(cx, ids!(claude_setup_section)).visible() {
+            if self.view.button(cx, ids!(claude_copy_login_button)).clicked(actions) {
+                cx.copy_to_clipboard("claude auth login");
+                enqueue_popup_notification("Claude Code sign-in command copied.", PopupKind::Success, Some(3.0));
+            }
+            if self.view.button(cx, ids!(claude_check_button)).clicked(actions) {
+                a2app_agent::claude_code::refresh();
+                self.view.redraw(cx);
+            }
+            if self.view.button(cx, ids!(claude_use_button)).clicked(actions)
+                && a2app_agent::claude_code::status() == a2app_agent::claude_code::Status::Ready
+            {
+                self.use_provider(cx, a2app_agent::claude_code::ID.into());
+                self.close_key_entry(cx);
+            }
+            if self.view.button(cx, ids!(claude_install_button)).clicked(actions) {
+                crate::utils::open_url("https://code.claude.com/docs/en/quickstart");
+            }
+            if self.view.button(cx, ids!(claude_done_button)).clicked(actions) {
+                self.close_key_entry(cx);
+            }
         }
 
         // ----- source, diff, and editor panes -----
@@ -2352,6 +2668,10 @@ impl Widget for MiniAppsScreen {
                     self.draw_console_list(cx, &mut list);
                 }
             }
+        }
+        if self.key_focus_pending {
+            self.key_focus_pending = false;
+            self.view.password_text_input(cx, ids!(key_input)).set_key_focus(cx);
         }
         DrawStep::done()
     }
@@ -2423,6 +2743,12 @@ impl MiniAppsScreen {
         // A hidden editor would still get key events.
         if self.pane == Pane::Edit && pane != Pane::Edit {
             cx.set_key_focus(Area::Empty);
+        }
+        if self.pane == Pane::Providers && pane != Pane::Providers {
+            self.close_key_entry(cx);
+        }
+        if pane == Pane::Providers && self.pane != Pane::Providers {
+            a2app_agent::claude_code::refresh();
         }
         self.pane = pane;
         let show = |p: Pane| self.pane == p;
@@ -2596,18 +2922,29 @@ impl MiniAppsScreen {
     }
 
     fn enter_key(&mut self, cx: &mut Cx, provider_id: String) {
+        self.close_key_entry(cx);
+        if provider_id == a2app_agent::claude_code::ID {
+            self.view.widget(cx, ids!(claude_setup_section)).set_visible(cx, true);
+            a2app_agent::claude_code::refresh();
+            self.view.redraw(cx);
+            return;
+        }
         self.view.label(cx, ids!(key_entry_label))
             .set_text(cx, &format!("API key for {}", a2app_agent::providers::label_for(&provider_id)));
         self.key_entry = Some(provider_id);
         self.view.widget(cx, ids!(key_entry_section)).set_visible(cx, true);
-        self.view.text_input(cx, ids!(key_input)).set_text(cx, "");
+        self.view.password_text_input(cx, ids!(key_input)).set_text(cx, "");
+        self.key_focus_pending = true;
         self.view.redraw(cx);
     }
 
     fn close_key_entry(&mut self, cx: &mut Cx) {
         self.key_entry = None;
-        self.view.text_input(cx, ids!(key_input)).set_text(cx, "");
+        self.key_focus_pending = false;
+        self.view.password_text_input(cx, ids!(key_input)).set_text(cx, "");
+        cx.set_key_focus(Area::Empty);
         self.view.widget(cx, ids!(key_entry_section)).set_visible(cx, false);
+        self.view.widget(cx, ids!(claude_setup_section)).set_visible(cx, false);
         self.view.redraw(cx);
     }
 
@@ -2715,6 +3052,9 @@ impl MiniAppsScreen {
                 if let Some(blocker) = blocker {
                     self.view.label(cx, ids!(providers_blocker)).set_text(cx, &blocker.headline());
                 }
+                let status = a2app_agent::claude_code::status();
+                self.view.label(cx, ids!(claude_setup_status)).set_text(cx, claude_code_detail(status));
+                self.view.widget(cx, ids!(claude_use_button)).set_visible(cx, status == a2app_agent::claude_code::Status::Ready);
             }
             Pane::Access => {
                 let selection = self.view.permission_scope_editor(cx, ids!(access_scope)).selection();
@@ -2877,16 +3217,29 @@ impl MiniAppsScreen {
                     }
                     item.draw_all(cx, &mut Scope::empty());
                 };
-                // The full catalog first, each row showing its own state...
+                // Subscription sign-in is a separate option from an Anthropic API key.
+                match configured.iter().find(|p| p.id == a2app_agent::claude_code::ID) {
+                    Some(p) => draw_row(cx, list, &p.id, &p.label, &p.detail(), true, p.active, false),
+                    None => {
+                        let detail = claude_code_detail(a2app_agent::claude_code::status());
+                        let detail = detail.strip_prefix("Set up Claude Code")
+                            .map(|rest| format!("Tap to set up{rest}"))
+                            .unwrap_or_else(|| detail.to_string());
+                        draw_row(cx, list, a2app_agent::claude_code::ID, a2app_agent::claude_code::LABEL,
+                            &detail, false, false, false);
+                    }
+                }
+                // The full API-key catalog, each row showing its own state...
                 for spec in a2app_agent::providers::CATALOG {
                     match configured.iter().find(|p| p.id == spec.id) {
                         Some(p) => draw_row(cx, list, spec.id, spec.label, &p.detail(), true, p.active, p.editable()),
-                        None => draw_row(cx, list, spec.id, spec.label, "Not set up", false, false, false),
+                        None => draw_row(cx, list, spec.id, spec.label, &format!("Tap to set up · key looks like {}", spec.hint), false, false, false),
                     }
                 }
-                // ...then anything configured outside the catalog (a local
-                // Ollama, or a ROBRIX_AGENT_CMD override).
-                for p in configured.iter().filter(|p| !a2app_agent::providers::CATALOG.iter().any(|s| s.id == p.id)) {
+                // ...then anything configured outside the catalog, such as
+                // a local Ollama provider.
+                for p in configured.iter().filter(|p| p.id != a2app_agent::claude_code::ID
+                    && !a2app_agent::providers::CATALOG.iter().any(|s| s.id == p.id)) {
                     draw_row(cx, list, &p.id, &p.label, &p.detail(), true, p.active, p.editable());
                 }
             }
@@ -2927,6 +3280,39 @@ mod picker_tests {
     use crate::a2app::room_app_picker::{RoomAppPickerAction, RoomAppPickerWidgetRefExt};
     use crate::home::navigation_tab_bar::NavigationBarAction;
     use crate::utils::RoomNameId;
+
+    #[test]
+    fn app_permission_review_opens_attention_and_discards_stale_subpane_actions() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let context = a2app_core::information_flow::ContextId::App {
+            account: "@review:example.org".into(), app: "roll-call".into(), room: Some("!review:example.org".into()),
+        };
+        let previous = super::super::information_flow::TEST_ACCOUNT.with(|account| account.replace(Some(context.account().into())));
+        let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
+        screen.set_pane(&mut cx, Pane::Info);
+        let stale_open = screen.view.button(&cx, ids!(info_open_button)).widget_uid();
+        let navigation = cx.capture_actions(|cx| {
+            cx.action(NavigationBarAction::GoToMiniApps);
+            cx.action(A2AppRuntimeAction::ReviewFlow(context));
+            cx.widget_action(stale_open, ButtonAction::Clicked(Default::default()));
+        });
+        let emitted = cx.capture_actions(|cx| screen.handle_event(cx, &Event::Actions(navigation), &mut Scope::empty()));
+        super::super::information_flow::TEST_ACCOUNT.with(|account| { account.replace(previous); });
+        assert_eq!(screen.pane, Pane::Sharing);
+        assert!(screen.view.widget(&cx, ids!(sharing_pane)).visible());
+        assert_eq!(screen.view.permission_choices(&cx, ids!(sharing_editor.page_choice)).selected_item(), 1);
+        assert!(!emitted.iter().any(|action| action.downcast_ref::<A2AppOp>().is_some()), "reviewing cannot launch an app or approve a permission");
+        screen.go_back(&mut cx);
+        assert_eq!(screen.pane, Pane::List);
+    }
 
     #[test]
     fn explicit_mini_apps_navigation_opens_the_list_and_clears_cached_subpane_history() {
@@ -3528,6 +3914,107 @@ fn background_app_open_action(binding: &a2app_core::background::JobBinding) -> R
 #[cfg(test)]
 mod access_tests {
     use super::*;
+
+    #[test]
+    fn provider_rows_offer_add_until_configured_and_change_for_saved_keys() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppProviderRow {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let mut row = widget.borrow_mut::<MiniAppProviderRow>().unwrap();
+        let add_uid = row.view.button(&cx, ids!(provider_add)).widget_uid();
+        let change_uid = row.view.button(&cx, ids!(provider_change_button)).widget_uid();
+        let forget_uid = row.view.button(&cx, ids!(provider_forget_button)).widget_uid();
+        assert_eq!(row.view.button(&cx, ids!(provider_change_button)).text(), "Change Key");
+        for (has_key, active, editable) in [(false, false, false), (true, false, true), (true, true, true), (true, true, false), (false, false, false)] {
+            row.populate(&mut cx, "openai", "OpenAI", "", has_key, active, editable);
+            assert_eq!(row.view.widget(&cx, ids!(provider_pick)).visible(), has_key);
+            assert_eq!(row.view.widget(&cx, ids!(provider_add)).visible(), !has_key);
+            assert_eq!(row.view.widget(&cx, ids!(provider_change_button)).visible(), has_key && editable);
+            assert_eq!(row.view.widget(&cx, ids!(provider_forget_button)).visible(), has_key && editable);
+            for (uid, enabled, forget) in [(add_uid, !has_key, false), (change_uid, has_key && editable, false), (forget_uid, has_key && editable, true)] {
+                let click = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+                let emitted = cx.capture_actions(|cx| row.handle_event(cx, &Event::Actions(click), &mut Scope::empty()));
+                let action = emitted.iter().find_map(|action| action.downcast_ref::<MiniAppsScreenAction>());
+                match (enabled, forget, action) {
+                    (false, _, None) => {},
+                    (true, false, Some(MiniAppsScreenAction::ProviderEnterKey(id))) => assert_eq!(id, "openai"),
+                    (true, true, Some(MiniAppsScreenAction::ProviderForget(id))) => assert_eq!(id, "openai"),
+                    _ => panic!("provider control emitted an action inconsistent with its configuration"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn provider_key_entry_clears_on_cancel_and_back() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
+        for leave_page in [false, true] {
+            screen.set_pane(&mut cx, Pane::Providers);
+            screen.enter_key(&mut cx, "openai".into());
+            assert!(screen.view.widget(&cx, ids!(key_entry_section)).visible());
+            assert_eq!(screen.key_entry.as_deref(), Some("openai"));
+            let input = screen.view.password_text_input(&cx, ids!(key_input));
+            input.set_text(&mut cx, "unsaved-key");
+            let button = if leave_page { ids!(providers_back_button) } else { ids!(key_cancel_button) };
+            let uid = screen.view.button(&cx, button).widget_uid();
+            let click = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+            screen.handle_event(&mut cx, &Event::Actions(click), &mut Scope::empty());
+            assert!(screen.key_entry.is_none());
+            assert!(input.text().is_empty());
+            assert!(!screen.view.widget(&cx, ids!(key_entry_section)).visible());
+            if leave_page { assert_eq!(screen.pane, Pane::List); }
+        }
+    }
+
+    #[test]
+    fn provider_claude_code_setup_never_opens_or_retains_an_api_key_editor() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
+        screen.set_pane(&mut cx, Pane::Providers);
+        screen.enter_key(&mut cx, "anthropic".into());
+        screen.view.password_text_input(&cx, ids!(key_input)).set_text(&mut cx, "unsaved-key");
+        screen.enter_key(&mut cx, a2app_agent::claude_code::ID.into());
+        assert!(screen.view.widget(&cx, ids!(claude_setup_section)).visible());
+        assert!(!screen.view.widget(&cx, ids!(key_entry_section)).visible());
+        assert!(screen.key_entry.is_none());
+        assert!(!screen.key_focus_pending);
+        assert!(screen.view.password_text_input(&cx, ids!(key_input)).text().is_empty());
+        let done = screen.view.button(&cx, ids!(claude_done_button)).widget_uid();
+        let click = cx.capture_actions(|cx| cx.widget_action(done, ButtonAction::Clicked(Default::default())));
+        screen.handle_event(&mut cx, &Event::Actions(click), &mut Scope::empty());
+        assert!(!screen.view.widget(&cx, ids!(claude_setup_section)).visible());
+        screen.enter_key(&mut cx, a2app_agent::claude_code::ID.into());
+        screen.enter_key(&mut cx, "openai".into());
+        assert!(!screen.view.widget(&cx, ids!(claude_setup_section)).visible());
+        assert_eq!(screen.key_entry.as_deref(), Some("openai"));
+        screen.enter_key(&mut cx, a2app_agent::claude_code::ID.into());
+        screen.go_back(&mut cx);
+        assert_eq!(screen.pane, Pane::List);
+        assert!(!screen.view.widget(&cx, ids!(claude_setup_section)).visible());
+    }
 
     #[test]
     fn builtin_update_badge_tracks_pending_updates_and_clears_when_rows_are_reused() {

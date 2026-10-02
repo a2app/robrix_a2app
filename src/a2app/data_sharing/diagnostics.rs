@@ -4,6 +4,73 @@ pub(super) fn bullets(labels: &[String]) -> String {
     labels.iter().map(|label| format!("• {label}")).collect::<Vec<_>>().join("\n")
 }
 
+fn unresolved_sharing_decisions(decisions: Vec<FlowDecision>, account: &str) -> Vec<FlowDecision> {
+    let mut seen = std::collections::BTreeSet::new();
+    decisions.into_iter().rev().filter(|decision| decision.context.account() == account)
+        .filter(|decision| seen.insert((decision.context.clone(), decision.recipient.clone())))
+        .filter(|decision| !decision.allowed).collect()
+}
+
+fn unresolved_action_decisions(decisions: Vec<ActionDecision>, snapshots: &[ContextSnapshot], account: &str) -> Vec<ActionDecision> {
+    let mut seen = std::collections::BTreeSet::new();
+    decisions.into_iter().rev().filter(|decision| decision.context.account() == account)
+        .filter(|decision| seen.insert((decision.context.clone(), decision.action.kind.clone(), decision.action.target.clone())))
+        .filter(|decision| !decision.allowed && snapshots.iter().any(|snapshot|
+            snapshot.epoch != 0 && snapshot.context == decision.context && snapshot.epoch == decision.epoch)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(room: &str, epoch: u64) -> ContextSnapshot {
+        ContextSnapshot {
+            context: ContextId::App { account: "alice".into(), app: "dice".into(), room: Some(room.into()) }, epoch,
+            label: [Source::Account { account: "alice".into() }].into(), clearance: None,
+            influences: [Influence::InternetOrigin("https://example.org".into())].into(),
+        }
+    }
+
+    #[test]
+    fn sharing_attention_keeps_only_latest_status_per_compartment_and_destination() {
+        let first = snapshot("one", 7);
+        let second = snapshot("two", 0);
+        let blocked = FlowDecision {
+            context: first.context, epoch: first.epoch, recipient: Recipient::NetworkOrigin("https://example.org".into()),
+            sources: first.label.clone(), denied_sources: first.label, allowed: false,
+        };
+        let other_room = FlowDecision { context: second.context, epoch: second.epoch, ..blocked.clone() };
+        let allowed = FlowDecision { allowed: true, denied_sources: Default::default(), ..blocked.clone() };
+        let other_site = FlowDecision { recipient: Recipient::NetworkOrigin("https://other.example".into()), ..blocked.clone() };
+        let mut latest = other_site.clone();
+        latest.denied_sources.insert(Source::Room { account: "alice".into(), room: "three".into() });
+        let decisions = unresolved_sharing_decisions(vec![blocked, other_room.clone(), allowed, other_site, latest.clone()], "alice");
+        assert_eq!(decisions, vec![latest, other_room], "successful retries supersede denials without merging room or website identities");
+    }
+
+    #[test]
+    fn action_attention_removes_successful_stopped_and_superseded_requests() {
+        let active = snapshot("one", 7);
+        let stopped = snapshot("two", 0);
+        let blocked = ActionDecision {
+            context: active.context.clone(), epoch: active.epoch,
+            action: flow::SensitiveAction { kind: "network.GET".into(), target: "https://example.org".into() },
+            influences: active.influences.clone(), allowed: false,
+            request: Some(flow::ActionRequest { id: 1, payload: "{}".into() }),
+        };
+        let allowed = ActionDecision { allowed: true, ..blocked.clone() };
+        let stopped_request = ActionDecision { context: stopped.context.clone(), epoch: 6, ..blocked.clone() };
+        let old_activation = ActionDecision {
+            epoch: 6, action: flow::SensitiveAction { kind: "network.PUT".into(), target: "https://example.org".into() }, ..blocked.clone()
+        };
+        let mut older = blocked.clone();
+        older.action.kind = "network.POST".into();
+        let latest = ActionDecision { request: Some(flow::ActionRequest { id: 2, payload: "{\"body\":\"latest\"}".into() }), ..older.clone() };
+        let decisions = unresolved_action_decisions(vec![blocked, older, allowed, stopped_request, old_activation, latest.clone()], &[active, stopped], "alice");
+        assert_eq!(decisions, vec![latest]);
+    }
+}
+
 fn review_payload(payload: &str) -> String {
     // Render direction-changing/invisible controls explicitly. Literal JSON
     // backslashes are already escaped, so a user can distinguish the contents.
@@ -31,7 +98,7 @@ impl DataSharing {
     fn selected_context(&self, cx: &Cx) -> Result<&ContextId, String> {
         self.view.drop_down(cx, ids!(context_choice)).selected_item().checked_sub(1)
             .and_then(|index| self.snapshots.get(index))
-            .map(|snapshot| &snapshot.context).ok_or_else(|| "Start a mini-app or agent, then choose it above.".into())
+            .map(|snapshot| &snapshot.context).ok_or_else(|| "Choose the mini-app or agent that may share this data.".into())
     }
 
     fn selected_decision(&self, _cx: &Cx) -> Option<&FlowDecision> {
@@ -81,8 +148,8 @@ impl DataSharing {
     pub(super) fn authority_action(&self, cx: &Cx) -> Result<A2AppOp, String> {
         let decision = self.selected_action(cx)
             .ok_or("Choose a blocked action to review.")?;
-        let snapshot = self.snapshots.iter().find(|snapshot| snapshot.context == decision.context && snapshot.epoch == decision.epoch)
-            .ok_or("This context is no longer active. Restart it and review the new request.")?;
+        let snapshot = self.snapshots.iter().find(|snapshot| snapshot.epoch != 0 && snapshot.context == decision.context && snapshot.epoch == decision.epoch)
+            .ok_or("This app or agent has stopped. Run it again and review its new request.")?;
         let session = match self.view.permission_choices(cx, ids!(action_session)).selected_item() {
             0 => {
                 let request = decision.request.as_ref().ok_or("This operation has no exact contents to review. Retry it to capture a request, or explicitly choose a session permission.")?;
@@ -93,7 +160,7 @@ impl DataSharing {
             }
             1 => AuthoritySession::RoomSession {
                 account: decision.context.account().to_string(),
-                room: decision.context.room().ok_or("This context has no room. Choose Until Robrix closes.")?.to_string(),
+                room: decision.context.room().ok_or("This app has no attached room. Choose Until Robrix closes.")?.to_string(),
             },
             2 => AuthoritySession::RobrixSession,
             _ => return Err("Select a session for this action permission.".into()),
@@ -105,26 +172,27 @@ impl DataSharing {
     }
 
     pub(super) fn refresh_diagnostics(&mut self, cx: &mut Cx) {
-        let snapshots = flow::contexts().unwrap_or_default().into_iter()
+        // Sharing rules apply to a saved compartment across restarts.
+        //
+        // Action approvals still require its current, nonzero activation epoch.
+        let snapshots = flow::retained_contexts().unwrap_or_default().into_iter()
             .filter(|snapshot| snapshot.context.account() == self.account).collect::<Vec<_>>();
         let previous = self.selected_context(cx).ok().cloned();
         if self.snapshots != snapshots {
-            let labels = std::iter::once("Choose a running mini-app or agent".into())
-                .chain(snapshots.iter().map(|snapshot| self.context_choice_label(&snapshot.context))).collect();
+            let labels = std::iter::once("Choose a mini-app or agent".into())
+                .chain(snapshots.iter().map(|snapshot| format!("{}{}", self.context_choice_label(&snapshot.context), if snapshot.epoch == 0 { " (stopped)" } else { "" }))).collect();
             self.view.drop_down(cx, ids!(context_choice)).set_labels(cx, labels);
             let index = previous.as_ref().and_then(|context| snapshots.iter().position(|snapshot| &snapshot.context == context)).map(|index| index + 1).unwrap_or(0);
             self.snapshots = snapshots;
             self.view.drop_down(cx, ids!(context_choice)).set_selected_item(cx, index);
         }
-        let decisions = flow::recent_decisions().unwrap_or_default().into_iter().rev()
-            .filter(|decision| decision.context.account() == self.account).collect::<Vec<_>>();
+        let decisions = unresolved_sharing_decisions(flow::recent_decisions().unwrap_or_default(), &self.account);
         if self.decisions != decisions {
             self.decision_selection = self.selected_decision(cx).and_then(|selected|
                 decisions.iter().position(|decision| decision == selected)).map(|index| index + 1).unwrap_or(0);
             self.decisions = decisions;
         }
-        let decisions = flow::recent_action_decisions().unwrap_or_default().into_iter().rev()
-            .filter(|decision| !decision.allowed && decision.context.account() == self.account).collect::<Vec<_>>();
+        let decisions = unresolved_action_decisions(flow::recent_action_decisions().unwrap_or_default(), &self.snapshots, &self.account);
         if self.action_decisions != decisions {
             self.action_selection = self.selected_action(cx).and_then(|selected|
                 decisions.iter().position(|decision| decision == selected)).map(|index| index + 1).unwrap_or(0);
@@ -152,22 +220,30 @@ impl DataSharing {
                 let sources = snapshot.label.iter().map(|source| self.source_label(source)).collect::<Vec<_>>();
                 let influences = snapshot.influences.iter().map(|influence| self.influence_label(influence)).collect::<Vec<_>>();
                 let clearance = if snapshot.clearance.is_some() { "Public mode: this app cannot receive private room or account data." } else { "Robrix remembers where data came from before the app or agent receives it." };
-                format!("{}\n{clearance}\nData it may know:\n{}\nContent that may influence its actions:\n{}",
+                let activation = if snapshot.epoch == 0 { "Stopped. Sharing rules will apply when you run it again." } else { "Currently running." };
+                format!("{}\n{activation}\n{clearance}\nData it may know:\n{}\nContent that may influence its actions:\n{}",
                     self.context_label(&snapshot.context), if sources.is_empty() { "None".into() } else { bullets(&sources) },
                     if influences.is_empty() { "None".into() } else { bullets(&influences) })
             }
-            None => "Choose a mini-app or agent under Sharing rules to see the data it may know. Start it first if it is not listed.".into(),
+            None => "Choose a mini-app or agent under Sharing rules to see the data it may know.".into(),
         };
         self.view.label(cx, ids!(context_details)).set_text(cx, &details);
         let decision = self.selected_decision(cx);
         let details = decision.map(|decision| {
-            let blocked = decision.denied_sources.iter().map(|source| self.source_label(source)).collect::<Vec<_>>();
+            let blocked = decision.denied_sources.iter().map(|source| self.source_choice_label(source)).collect::<Vec<_>>();
             format!("{}\nDestination: {}\n{}",
-                self.context_label(&decision.context), self.recipient_label(&decision.recipient),
+                self.context_choice_label(&decision.context), self.recipient_choice_label(&decision.recipient),
                 if decision.allowed { "Sharing was allowed for every data source when checked.".into() }
-                else { format!("Data sources that blocked sharing:\n{}\n\n{}", bullets(&blocked), self.sharing_remedy(&decision.denied_sources, &decision.recipient)) })
+                else { format!("Data needing permission:\n{}\n\n{}", bullets(&blocked), self.sharing_remedy(&decision.denied_sources, &decision.recipient)) })
         }).unwrap_or_else(|| if self.decisions.is_empty() { "No sharing requests have been checked in this account yet.".into() } else { "Choose a sharing decision to see its destination and the exact reason it was allowed or blocked.".into() });
         self.view.label(cx, ids!(decision_details)).set_text(cx, &details);
+        let identifiers = decision.map(|decision| format!("{}\nDestination: {}\nData sources:\n{}",
+            self.context_label(&decision.context), self.recipient_label(&decision.recipient),
+            bullets(&decision.denied_sources.iter().map(|source| self.source_label(source)).collect::<Vec<_>>()))).unwrap_or_default();
+        self.view.label(cx, ids!(decision_identifiers)).set_text(cx, &identifiers);
+        self.view.widget(cx, ids!(decision_identifiers)).set_visible(cx, self.decision_identifiers_open && !identifiers.is_empty());
+        self.view.widget(cx, ids!(decision_identifiers_toggle)).set_visible(cx, !identifiers.is_empty());
+        self.view.button(cx, ids!(decision_identifiers_toggle)).set_text(cx, if self.decision_identifiers_open { "Hide identifiers" } else { "Show identifiers" });
         let blocked = decision.map(|decision| decision.denied_sources.iter().cloned().collect::<Vec<_>>()).unwrap_or_default();
         if blocked != self.blocked_sources {
             let labels = blocked.iter().map(|source| self.source_choice_label(source)).collect();
@@ -176,9 +252,14 @@ impl DataSharing {
             self.view.permission_choices(cx, ids!(blocked_source_choice)).set_selected_item(cx, 0);
         }
         self.view.widget(cx, ids!(review_section)).set_visible(cx, !self.blocked_sources.is_empty());
+        let review_problem = self.sharing_review_problem(cx);
+        self.view.button(cx, ids!(review_button)).set_enabled(cx, review_problem.is_none());
+        self.view.widget(cx, ids!(review_button)).set_disabled(cx, review_problem.is_some());
+        self.view.widget(cx, ids!(review_problem)).set_visible(cx, review_problem.is_some() && !self.blocked_sources.is_empty());
+        self.view.label(cx, ids!(review_problem)).set_text(cx, review_problem.as_deref().unwrap_or_default());
         let action = self.selected_action(cx);
         let details = action.map(|decision| {
-            let snapshot = self.snapshots.iter().find(|snapshot| snapshot.context == decision.context && snapshot.epoch == decision.epoch);
+            let snapshot = self.snapshots.iter().find(|snapshot| snapshot.epoch != 0 && snapshot.context == decision.context && snapshot.epoch == decision.epoch);
             let influences = snapshot.map(|snapshot| &snapshot.influences).unwrap_or(&decision.influences);
             let labels = influences.iter().map(|influence| self.influence_label(influence)).collect::<Vec<_>>();
             let warning = if self.view.permission_choices(cx, ids!(action_session)).selected_item() == 0 {
@@ -208,7 +289,7 @@ impl DataSharing {
         self.view.label(cx, ids!(action_details)).set_text(cx, &details);
         self.view.widget(cx, ids!(authority_button)).set_visible(cx, action.is_some());
         let can_approve = action.is_some_and(|decision| {
-            self.snapshots.iter().any(|snapshot| snapshot.context == decision.context && snapshot.epoch == decision.epoch)
+            self.snapshots.iter().any(|snapshot| snapshot.epoch != 0 && snapshot.context == decision.context && snapshot.epoch == decision.epoch)
                 && match self.view.permission_choices(cx, ids!(action_session)).selected_item() {
                     0 => decision.request.is_some(),
                     1 => decision.context.room().is_some(),
@@ -224,6 +305,7 @@ impl DataSharing {
     }
 
     pub(super) fn review_decision(&mut self, cx: &mut Cx) -> Result<(), String> {
+        if let Some(problem) = self.sharing_review_problem(cx) { return Err(problem); }
         let decision = self.selected_decision(cx)
             .ok_or("Select a blocked sharing decision.")?.clone();
         let source = self.blocked_sources.get(self.view.permission_choices(cx, ids!(blocked_source_choice)).selected_item())
@@ -235,9 +317,9 @@ impl DataSharing {
             self.sources.len() - 1
         };
         self.view.drop_down(cx, ids!(source_choice)).set_selected_item(cx, index);
-        if let Some(index) = self.snapshots.iter().position(|snapshot| snapshot.context == decision.context && snapshot.epoch == decision.epoch) {
+        if let Some(index) = self.snapshots.iter().position(|snapshot| snapshot.context == decision.context) {
             self.view.drop_down(cx, ids!(context_choice)).set_selected_item(cx, index + 1);
-        } else { return Err("This context is no longer active. Its sources remain protected; restart it before adding a context rule.".into()); }
+        } else { return Err("This mini-app or agent's saved data is no longer available. Run it again, then review its new request.".into()); }
         self.view.permission_choices(cx, ids!(reader_kind)).set_selected_item(cx, 0);
         self.view.permission_choices(cx, ids!(sharing_lifetime)).set_selected_item(cx, 0);
         match &decision.recipient {
@@ -267,6 +349,26 @@ impl DataSharing {
         self.view.permission_choices(cx, ids!(page_choice)).set_selected_item(cx, 0);
         self.update_page(cx);
         Ok(())
+    }
+
+    fn sharing_review_problem(&self, cx: &Cx) -> Option<String> {
+        let decision = self.selected_decision(cx)?;
+        let source = self.blocked_sources.get(self.view.permission_choices(cx, ids!(blocked_source_choice)).selected_item())?;
+        match source {
+            Source::UnknownPrivate => return Some("Robrix cannot identify where this old data or app source came from. It stays protected. For a public task, use an unchanged built-in app with separately tracked public data.".into()),
+            Source::Account { account } | Source::Room { account, .. } if account != &self.account => return Some("Sign in to the account that owns this data to review its sharing permission.".into()),
+            _ => {}
+        }
+        if !self.snapshots.iter().any(|snapshot| snapshot.context == decision.context) {
+            return Some("This mini-app or agent's saved data is no longer available. Run it again, then review its new request.".into());
+        }
+        match &decision.recipient {
+            Recipient::External => Some("This app has not identified a destination for the data. It must choose a specific website or room before you can allow sharing.".into()),
+            Recipient::MatrixRoom { account, .. } if account != &self.account => Some("This destination belongs to a different account. Sign in to that account and try again.".into()),
+            Recipient::MatrixRoom { room, .. } if !self.rooms.iter().any(|(id, _)| id == room) => Some("You no longer belong to the destination room. Join it again before allowing sharing.".into()),
+            Recipient::ModelProvider(id) if self.model.as_ref().is_none_or(|model| &model.id != id) => Some("Your AI service has changed. Restart the agent and review its new request.".into()),
+            _ => None,
+        }
     }
 
     fn room_label(&self, room: &str) -> String {

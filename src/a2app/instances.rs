@@ -171,10 +171,6 @@ fn spawn(cx: &mut Cx, manifest: &MiniAppManifest, _grants: &[String], key: &Inst
                 // Public code and storage are checked before evaluating a
                 // single instruction. Its empty clearance cannot be raised.
                 a2app_core::information_flow::set_clearance(&context, Some(Default::default()))?;
-            } else if let Some(room) = &key.1 {
-                a2app_core::information_flow::add_sources(&context, [super::information_flow::room_source(&context, room.as_str())])?;
-            } else {
-                a2app_core::information_flow::add_sources(&context, [super::information_flow::account_source(&context)])?;
             }
             Ok(context)
         })

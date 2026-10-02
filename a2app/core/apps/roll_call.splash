@@ -2,13 +2,11 @@
 // icon: 🎲
 // tint: #7C6CF0
 // description: Rolls dice and can post the result to the room.
-// permissions: matrix-profile, matrix-room-send
-// why-matrix-profile: Shows who is rolling.
+// permissions: matrix-room-send
 // why-matrix-room-send: Posts your roll into this room.
 
 let die_a = 1
 let die_b = 1
-let roller = "You"
 
 fn roll(){
     let t = floor(time_now() * 997.0)
@@ -23,7 +21,7 @@ fn roll(){
 
 fn post(){
     let total = die_a + die_b
-    let msg = "🎲 " + roller + " rolled " + die_a + " + " + die_b + " = " + total
+    let msg = "🎲 Rolled " + die_a + " + " + die_b + " = " + total
     ui.note.set_text("Posting…")
     host.request("matrix.send_message", {body: msg}, fn(r){
         if r.is_ok {
@@ -34,32 +32,10 @@ fn post(){
     })
 }
 
-fn load_profile(){
-    host.request("matrix.profile", nil, fn(r){
-        if r.is_ok {
-            roller = r.data.display_name
-            ui.who.set_text("Rolling as " + roller)
-            return nil
-        }
-        roller = "Someone"
-        ui.who.set_text("Rolling anonymously")
-    })
-}
-
-fn on_permissions_changed(caps){
-    load_profile()
-}
-
-let _boot = start_timeout(0.05, || load_profile())
-
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
     col := ScrollYView{
         width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
-        who := Label{
-            text: "Rolling as you" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
-            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
-        }
         RoundedView{
             width: Fill height: Fit align: Align{x: 0.5, y: 0.5} padding: 16 flow: Down spacing: 6
             show_bg: true
