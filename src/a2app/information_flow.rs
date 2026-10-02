@@ -30,14 +30,32 @@ pub fn agent_context(room: &str) -> Result<ContextId, String> {
 pub fn prepare_agent(room: &str) -> Result<ContextId, String> {
     let context = agent_context(room)?;
     flow::register_context(&context)?;
-    // A fresh session starts knowing only its own room: agent memory is
-    // per-session, so a source a previous session joined (a legacy app's
-    // `UnknownPrivate` code from `list_apps`, a room since left) must not
-    // permanently wedge this one.
-    flow::reset_agent_session_provenance(&context)?;
     flow::add_sources(&context, [room_source(&context, room)])?;
     flow::add_influences(&context, [flow::Influence::RoomContent { account: context_account(&context).into(), room: room.into() }])?;
     Ok(context)
+}
+
+/// Starts a fresh agent session. The agent's per-session memory does not
+/// survive a restart, so a source a previous session joined (a legacy app's
+/// `UnknownPrivate` code from `list_apps`, a room since left) must not
+/// permanently wedge this one. Only [`start_ai_session`] calls this, once per
+/// session; every later tool call uses [`prepare_agent`], which never resets.
+pub fn begin_agent_session(room: &str) -> Result<ContextId, String> {
+    let context = agent_context(room)?;
+    flow::register_context(&context)?;
+    flow::begin_agent_session(&context)?;
+    Ok(context)
+}
+
+/// Appends the re-ask instruction to a flow refusal caused by a grown label.
+/// The agent must not retry the same call: it asks again with the newly
+/// revealed need so the user can approve it for the rest of the turn.
+pub fn with_task_reask_hint(error: String) -> String {
+    if error.contains("Information flow blocked") {
+        format!("{error} This refusal is because the label grew since the last permission request. Call request_task_permissions again with the new need (the room, URL or mini-app tool this task now requires); a need already declined this turn must not be requested again.")
+    } else {
+        error
+    }
 }
 
 /// The baseline sharing rules an AI room cannot function without.
@@ -372,6 +390,35 @@ mod tests {
         for room in ["!one:s", "!two:s", "!three:s", "!four:s", "!five:s"] {
             assert!(label.contains(&Source::Room { account: "@owner:server".into(), room: room.into() }));
         }
+    }
+
+    #[test]
+    fn prepare_agent_keeps_provenance_gained_during_the_turn() {
+        let account = format!("prepare-agent-reset-{}", std::process::id());
+        TEST_ACCOUNT.with(|account_ref| *account_ref.borrow_mut() = Some(account.clone()));
+        let room = "!prepare-agent-reset:example.org".to_string();
+        let context = prepare_agent(&room).unwrap();
+        let read_source = Source::Room { account: account.clone(), room: "!read-mid-turn:example.org".into() };
+        a2app_core::information_flow::add_sources(&context, [read_source.clone()]).unwrap();
+        // A later read, fetch or app-tool call runs `prepare_agent` again; it
+        // must not drop a source the agent already holds.
+        let again = prepare_agent(&room).unwrap();
+        TEST_ACCOUNT.with(|account_ref| *account_ref.borrow_mut() = None);
+        assert_eq!(context, again);
+        assert!(a2app_core::information_flow::labels(&context).unwrap().contains(&read_source),
+            "a mid-turn prepare_agent must not reset the agent's information-flow label");
+    }
+
+    #[test]
+    fn a_flow_refusal_tells_the_agent_to_re_ask_for_the_new_need() {
+        let refusal = String::from("Information flow blocked: this context has private data that is not allowed to reach this recipient. Review the blocked flow in Mini Apps.");
+        let hint = with_task_reask_hint(refusal);
+        assert!(hint.contains("request_task_permissions"));
+        assert!(hint.contains("label grew"));
+        // An unresolvable unknown-source refusal must not send the agent in a
+        // re-ask loop: no sharing rule can ever release it.
+        let unknown = String::from("Stored data with unknown sources cannot be shared.");
+        assert_eq!(with_task_reask_hint(unknown.clone()), unknown);
     }
 
     #[test]

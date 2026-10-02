@@ -454,6 +454,27 @@ impl Registry {
         self.join_code(app, StoredProvenance { label, influences })
     }
 
+    /// Joins an app's shared code provenance into `receiver`, fail-closed: an
+    /// app whose code has `UnknownPrivate`/`Unknown` provenance taints the
+    /// receiver rather than having those sources silently dropped. Metadata
+    /// listings do not call this; only paths that expose app code do.
+    pub fn join_code_labels(&mut self, app: &str, receiver: &ContextId) -> Result<(), String> {
+        let labels = self.code_labels(app)?;
+        self.add_sources(receiver, labels)?;
+        let influences = self.code_influences(app)?;
+        self.add_influences(receiver, influences)
+    }
+
+    /// Drops a stale session's accumulated provenance, then restores the
+    /// baseline own-room source and influence. Only a fresh session start
+    /// calls this; ordinary tool calls must never reset the label.
+    pub fn begin_agent_session(&mut self, context: &ContextId) -> Result<(), String> {
+        self.reset_agent_session_provenance(context)?;
+        let room = context.room().ok_or("An agent session context needs a room.")?;
+        self.add_sources(context, [Source::Room { account: context.account().into(), room: room.into() }])?;
+        self.add_influences(context, [Influence::RoomContent { account: context.account().into(), room: room.into() }])
+    }
+
     pub fn remove_context(&mut self, context: &ContextId) {
         self.forget_exact_actions(context);
         self.pending_effects.retain(|pending| &pending.review.context != context);
@@ -682,6 +703,12 @@ pub fn reset_agent_session_provenance(context: &ContextId) -> Result<(), String>
     with_registry(|registry| registry.reset_agent_session_provenance(context))
 }
 
+/// Drop a fresh agent session's accumulated provenance and restore its own
+/// room baseline; see [`Registry::begin_agent_session`].
+pub fn begin_agent_session(context: &ContextId) -> Result<(), String> {
+    with_registry(|registry| registry.begin_agent_session(context))
+}
+
 pub fn join_labels(context: &ContextId, label: &Label) -> Result<(), String> {
     add_sources(context, label.iter().cloned())
 }
@@ -848,6 +875,10 @@ pub fn add_code_influences(app: &str, influences: impl IntoIterator<Item = Influ
 
 pub fn record_app_code_from(app: &str, context: &ContextId) -> Result<(), String> {
     with_registry(|registry| registry.record_app_code_from(app, context))
+}
+
+pub fn join_code_labels(app: &str, receiver: &ContextId) -> Result<(), String> {
+    with_registry(|registry| registry.join_code_labels(app, receiver))
 }
 
 pub fn grant_sharing(source: Source, recipient: Recipient, reader: ReaderScope, duration: SharingDuration) -> Result<u64, String> {
@@ -1347,6 +1378,41 @@ mod tests {
         metadata.historical_code.insert("test".into(), StoredProvenance::legacy(true));
         fs::write(root.0.join(METADATA_FILE), serde_json::to_vec(&metadata).unwrap()).unwrap();
         assert!(Registry::open(&root.0).is_err());
+    }
+
+    #[test]
+    fn joining_unknown_code_provenance_fails_closed_while_a_listing_does_not() {
+        let root = TestRoot::new();
+        let storage = root.0.join("app_data/legacy");
+        fs::create_dir_all(&storage).unwrap();
+        fs::write(storage.join("old-memory"), "private").unwrap();
+        let mut registry = root.registry();
+        let receiver = agent("alice", "room-a");
+        registry.register_context(&receiver).unwrap();
+        // Registering the app records its code provenance as UnknownPrivate.
+        let app_context = app("legacy", "alice", "room-a");
+        registry.register_context_with_legacy_data(&app_context, false).unwrap();
+        assert!(registry.code_labels("legacy").unwrap().contains(&Source::UnknownPrivate));
+        // A metadata listing only adds its own account source; the receiver
+        // stays clean and can still reach the model provider.
+        assert!(registry.labels(&receiver).unwrap().is_empty());
+        assert!(registry.ensure_allowed(&receiver, &site()).is_ok());
+        // A path that reads the app's code joins the unknown source fail-closed.
+        registry.join_code_labels("legacy", &receiver).unwrap();
+        assert!(registry.labels(&receiver).unwrap().contains(&Source::UnknownPrivate));
+        assert!(registry.ensure_allowed(&receiver, &site()).is_err());
+    }
+
+    #[test]
+    fn begin_agent_session_leaves_only_the_own_room_in_the_label() {
+        let root = TestRoot::new();
+        let mut registry = root.registry();
+        let context = agent("alice", "room-a");
+        registry.register_context(&context).unwrap();
+        registry.add_sources(&context, [room_source("alice", "room-b"), Source::Account { account: "alice".into() }]).unwrap();
+        registry.begin_agent_session(&context).unwrap();
+        assert_eq!(registry.labels(&context).unwrap(), [room_source("alice", "room-a")].into_iter().collect());
+        assert_eq!(registry.influences(&context).unwrap(), [Influence::RoomContent { account: "alice".into(), room: "room-a".into() }].into_iter().collect());
     }
 
     #[test]

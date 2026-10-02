@@ -2764,20 +2764,11 @@ fn manifest_flow_context(manifest: &MiniAppManifest) -> Result<a2app_core::infor
 }
 
 /// Reading an app listing or source does not read its room compartments.
+/// Fail-closed: an app whose code carries legacy/unknown provenance taints
+/// the receiver. The metadata-only `list_apps` path does not call this.
 fn join_manifest_code(manifest: &MiniAppManifest, receiver: &a2app_core::information_flow::ContextId) -> Result<(), String> {
     manifest_flow_context(manifest)?;
-    let mut labels = a2app_core::information_flow::code_labels(&manifest.id)?;
-    // An app whose code carries legacy/unknown provenance must not poison the
-    // receiver's label with `Source::UnknownPrivate`, which can never be
-    // shared: a listing exposes app metadata, not the code, and one such app
-    // would wedge every later model call and room write for this agent.
-    if labels.remove(&a2app_core::information_flow::Source::UnknownPrivate) {
-        log!("AI Rooms: app {} has unknown code provenance; not joining it into the agent's flow label.", manifest.id);
-    }
-    a2app_core::information_flow::add_sources(receiver, labels)?;
-    let influences = a2app_core::information_flow::code_influences(&manifest.id)?;
-    let influences = influences.into_iter().filter(|influence| *influence != a2app_core::information_flow::Influence::Unknown);
-    a2app_core::information_flow::add_influences(receiver, influences)
+    a2app_core::information_flow::join_code_labels(&manifest.id, receiver)
 }
 
 fn manifest_name_for_popup(manifest: &MiniAppManifest) -> String {
@@ -7199,7 +7190,7 @@ fn attach_ai_session(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, _name: 
 /// including the next member prompt after an explicit Stop.
 #[cfg(unix)]
 fn start_ai_session(state: &mut A2AppState, room_id: &OwnedRoomId, prefs: AgentPrefs) -> Result<AiSession, String> {
-    let context = super::information_flow::prepare_agent(room_id.as_str())?;
+    let context = super::information_flow::begin_agent_session(room_id.as_str())?;
     let epoch = a2app_core::information_flow::context_epoch(&context)?;
     // A fresh room must not have to prompt for the directory, its own
     // transcript, or the installed mini-app list. Applied here (not only on
@@ -7880,7 +7871,7 @@ fn run_ai_read_tool(
         Ok(context)
     }) {
         Ok(context) => context,
-        Err(error) => { let _ = answer.send(Err(error)); return; }
+        Err(error) => { let _ = answer.send(Err(super::information_flow::with_task_reask_hint(error))); return; }
     };
     if !room_policy_allows(target, RoomAccess::Read) {
         let _ = answer.send(Err("Reading this room is blocked in Mini Apps permissions.".into()));
@@ -8148,7 +8139,7 @@ fn post_ai_room_message(
         Ok(context)
     }) {
         Ok(context) => context,
-        Err(error) => { let _ = answer.send(Err(error)); return; }
+        Err(error) => { let _ = answer.send(Err(super::information_flow::with_task_reask_hint(error))); return; }
     };
     let id = NEXT_AI_TOOL_ID.fetch_add(1, Ordering::Relaxed);
     with_a2app(|state| {
@@ -8219,15 +8210,15 @@ fn run_ai_list_apps(
             })
             .unwrap_or_default();
             let value = serde_json::json!({ "apps": apps });
-            let manifests = with_a2app(|state| state.registry.iter().cloned().collect::<Vec<_>>()).unwrap_or_default();
             let record = super::information_flow::agent_context(room_id.as_str()).and_then(|context| {
-                for manifest in manifests {
-                    join_manifest_code(&manifest, &context)?;
-                }
+                // `list_apps` exposes names and descriptions, not code, so it
+                // does not join the apps' code labels: one app with unknown
+                // provenance must not wedge the listing. Paths that actually
+                // read an app's code join it fail-closed (`join_manifest_code`).
                 a2app_core::information_flow::add_sources(&context, [super::information_flow::account_source(&context)])?;
                 super::information_flow::record_response(&context, &value)
             });
-            if let Err(error) = record { let _ = answer.send(Err(error)); return; }
+            if let Err(error) = record { let _ = answer.send(Err(super::information_flow::with_task_reask_hint(error))); return; }
             let text = value.to_string();
             note_ai_tool_call(room_id, "list_apps", true, "");
             let _ = answer.send(Ok(text));
@@ -8344,7 +8335,7 @@ fn run_ai_launch_app_granted(
                 a2app_core::information_flow::transfer(&from, &to)?;
                 a2app_core::information_flow::transfer(&to, &from)
             });
-            if let Err(error) = transfer { let _ = answer.send(Err(error)); return; }
+            if let Err(error) = transfer { let _ = answer.send(Err(super::information_flow::with_task_reask_hint(error))); return; }
             // Dock it into this room exactly as a freshly built app is docked
             // (`resolve_session_generation`), so "launch" lands where the
             // conversation is.
@@ -8527,7 +8518,7 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
         }
         Ok(())
     });
-    if let Err(error) = recorded { answer_session_job(job, Err(error)); return; }
+    if let Err(error) = recorded { answer_session_job(job, Err(super::information_flow::with_task_reask_hint(error))); return; }
 
     // The job is the only place the call's arguments exist, so this is where
     // the human-readable target detail is computed and pinned to the call's
@@ -8741,7 +8732,7 @@ fn run_ai_list_mini_app_tools(
         }
         Ok::<(), String>(())
     }).unwrap_or_else(|| Err("Tool registry is unavailable.".into()));
-    if let Err(error) = transfer { let _ = answer.send(Err(error)); return; }
+    if let Err(error) = transfer { let _ = answer.send(Err(super::information_flow::with_task_reask_hint(error))); return; }
     let text = serde_json::json!({ "tools": tools }).to_string();
     note_ai_tool_call(room_id, "list_mini_app_tools", true, "");
     let _ = answer.send(Ok(text));
@@ -8792,7 +8783,7 @@ fn run_app_tool_invocation(
             "app_activation": a2app_core::information_flow::context_epoch(&to)? }))?;
         Ok(from)
     });
-    let context = match transfer { Ok(context) => context, Err(error) => { let _ = answer.send(Err(error)); return; } };
+    let context = match transfer { Ok(context) => context, Err(error) => { let _ = answer.send(Err(super::information_flow::with_task_reask_hint(error))); return; } };
     let call_id = NEXT_APP_TOOL_CALL_ID.fetch_add(1, Ordering::Relaxed);
     let audit = a2app_core::protection_audit::Attempt::start(&context, None, a2app_core::protection_audit::ActivityKind::ToolCall);
     with_a2app(|state| {
@@ -8855,7 +8846,7 @@ fn run_ai_fetch(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, url: String,
     });
     let (context, request) = match prepared {
         Ok(prepared) => prepared,
-        Err(error) => { let _ = answer.send(Err(error)); return; }
+        Err(error) => { let _ = answer.send(Err(super::information_flow::with_task_reask_hint(error))); return; }
     };
     let subject = agent_subject(room_id.as_str());
     let consent = with_a2app(|state| {
@@ -8911,7 +8902,7 @@ fn run_network_access(
         let recipient = a2app_core::information_flow::Recipient::network_origin(url)?;
         a2app_core::information_flow::ensure_allowed(&context, &recipient)
     });
-    if let Err(error) = allowed { let _ = answer.send(Err(error)); return; }
+    if let Err(error) = allowed { let _ = answer.send(Err(super::information_flow::with_task_reask_hint(error))); return; }
     let subject = agent_subject(room_id.as_str());
     let verdict = with_a2app(|state| {
         if state.permissions.is_restricted(&subject) {
