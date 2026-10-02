@@ -76,12 +76,17 @@ user exactly as you write them, so keep them simple and use no markup or links.
 Read the result before doing anything else:
 
 - `granted` — those needs are approved and last until this turn ends.
-- `declined` — the user said no. Do not ask again this turn. Change the plan
-  or explain what you cannot do.
+- `partial` — some needs were approved and some were not. Use what was
+  approved and say in your reply what was not.
+- `blocked` — every need was blocked by room/space protection or not offered,
+  so nothing was granted. Say so and stop.
+- `declined` — the user said no to the requested needs. Do not ask for those
+  again this turn. Change the plan or explain what you cannot do.
 - `blocked_by_room_policy` — a room's protection forbids it. Say which room
   and stop.
 - `not_offered` or `invalid_target` — the need was wrong (an unknown
-  capability, an unjoined room, a malformed URL). Fix the need or drop it.
+  capability, an unjoined room, a malformed URL, an unknown app tool). Fix the
+  need or drop it.
 
 If the work reveals a need you did not plan for, you may call
 `request_task_permissions` again, but only for the new need: you get at most
