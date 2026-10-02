@@ -90,6 +90,11 @@ pub struct A2AppPersistedState {
     /// `Ask` or `Deny` from being silently re-granted on the next session.
     #[serde(default)]
     pub permission_defaults_applied: std::collections::BTreeSet<String>,
+    /// `(room, recipient)` pairs whose default sharing rules have already
+    /// been applied. The marker keeps a rule the user revoked in the Data
+    /// Sharing editor from being recreated on a later session.
+    #[serde(default)]
+    pub default_sharing_applied: std::collections::BTreeSet<String>,
 }
 
 pub fn save_registry_state(state: &A2AppPersistedState) -> Result<()> {

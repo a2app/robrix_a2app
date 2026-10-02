@@ -60,38 +60,68 @@ pub fn with_task_reask_hint(error: String) -> String {
 
 /// The baseline sharing rules an AI room cannot function without.
 ///
-/// A freshly created AI room starts with no sharing rules, so its very first
-/// model call and its own reply/activity/turn state events are refused with
-/// "Information flow blocked". Grant the room's own content — plus the
-/// account's room directory and account-level metadata (the installed-app
-/// list) that its default tools read — to the currently configured model
-/// service and to the homeserver origin, so an AI room works out of the box.
+/// A freshly created AI room starts with no sharing rules, so its first model
+/// call and its own reply/activity rows would be refused with "Information flow
+/// blocked". The defaults are exactly:\n///
+/// - the room/space directory to the current model provider, and the room's
+///   own source to the current model provider;
+/// - the room's own source and the directory to the homeserver origin and to
+///   the room itself. These four are plumbing: the reply and activity writes
+///   are checked against the whole label, so the room's own output cannot be
+///   written back unless the sources it holds are allowed to reach the room
+///   and the homeserver that stores the unencrypted state.
 ///
-/// Rules are additive and idempotent: an exact rule that already exists is
-/// skipped, so this is safe to call on every session start — which is also how
-/// a newly selected model gets its own rule. A rule the user later revokes in
-/// the Data Sharing editor stays revoked until this runs again.
-pub fn ensure_agent_default_sharing(context: &ContextId, room: &str, model: Option<&str>, homeserver: Option<&str>) {
-    let mut recipients = Vec::new();
+/// The account source is deliberately not defaulted: account-level data such
+/// as the installed-app list is covered by the information-flow rules the
+/// task prompt derives when a task reads it.
+///
+/// Apply once per `(room, recipient)`: `applied` is the persisted marker set,
+/// so a new model provider gets its own rules while a rule the user revoked
+/// is not recreated. Returns whether any marker was newly recorded.
+pub fn ensure_agent_default_sharing(
+    context: &ContextId,
+    room: &str,
+    model: Option<&str>,
+    homeserver: Option<&str>,
+    applied: &mut std::collections::BTreeSet<String>,
+) -> bool {
+    let own_room_source = room_source(context, room);
+    let directory = directory_source(context);
+    let own_room = Recipient::MatrixRoom { account: context_account(context).into(), room: room.into() };
+    // The exact default set: (recipient, source) pairs, one marker per
+    // recipient because each recipient's source set is fixed.
+    let mut rules: Vec<(Recipient, Source)> = Vec::new();
     if let Some(model) = model.filter(|model| !model.is_empty()) {
-        recipients.push(Recipient::ModelProvider(model.to_string()));
+        let provider = Recipient::ModelProvider(model.to_string());
+        rules.push((provider.clone(), directory.clone()));
+        rules.push((provider, own_room_source.clone()));
     }
-    if let Some(homeserver) = homeserver {
-        if let Ok(recipient) = Recipient::network_origin(homeserver) {
-            recipients.push(recipient);
+    if let Some(homeserver) = homeserver.and_then(|homeserver| Recipient::network_origin(homeserver).ok()) {
+        rules.push((homeserver.clone(), own_room_source.clone()));
+        rules.push((homeserver, directory.clone()));
+    }
+    rules.push((own_room.clone(), own_room_source));
+    rules.push((own_room, directory));
+
+    let mut changed = false;
+    // Group by recipient: the marker guards the recipient's whole rule set, so
+    // the first session applies all of them and a later session applies none.
+    let mut by_recipient: std::collections::BTreeMap<Recipient, Vec<Source>> = std::collections::BTreeMap::new();
+    for (recipient, source) in rules {
+        by_recipient.entry(recipient).or_default().push(source);
+    }
+    for (recipient, sources) in by_recipient {
+        let marker = format!("{room}|{}", serde_json::to_string(&recipient).unwrap_or_default());
+        if !applied.insert(marker) {
+            // This recipient's defaults were already applied once; a revoked
+            // rule stays revoked.
+            continue;
         }
-    }
-    // The agent's own room: the automatic same-room rule only covers the
-    // room's own source, so once the label has grown to include the directory
-    // or account sources, a read/post/cursor write to this room would be
-    // refused unless those are allowed here too.
-    recipients.push(Recipient::MatrixRoom { account: context_account(context).into(), room: room.into() });
-    if recipients.is_empty() {
-        return;
-    }
-    for source in [room_source(context, room), directory_source(context), account_source(context)] {
-        for recipient in &recipients {
-            if flow::sharing_allows_for_reader(&source, recipient, context).unwrap_or(false) {
+        changed = true;
+        for source in sources {
+            // The same-room source/recipient pair is implicitly allowed, so it
+            // needs no stored grant; skip anything already covered.
+            if flow::sharing_allows_for_reader(&source, &recipient, context).unwrap_or(false) {
                 continue;
             }
             // A grant can only fail on a registry write; surface it, since the
@@ -106,6 +136,7 @@ pub fn ensure_agent_default_sharing(context: &ContextId, room: &str, model: Opti
             }
         }
     }
+    changed
 }
 
 /// User-supplied source is private account input, including future versions.
@@ -419,6 +450,59 @@ mod tests {
         // re-ask loop: no sharing rule can ever release it.
         let unknown = String::from("Stored data with unknown sources cannot be shared.");
         assert_eq!(with_task_reask_hint(unknown.clone()), unknown);
+    }
+
+    #[test]
+    fn default_sharing_is_directory_and_own_room_only_and_applied_once() {
+        let account = format!("default-sharing-{}", std::process::id());
+        TEST_ACCOUNT.with(|account_ref| *account_ref.borrow_mut() = Some(account.clone()));
+        let room = "!default-sharing:example.org";
+        let context = prepare_agent(room).unwrap();
+        let provider = format!("provider-default-{}", std::process::id());
+        let homeserver = "https://hs.default.sharing.example.org";
+        let mut applied = std::collections::BTreeSet::new();
+        assert!(ensure_agent_default_sharing(&context, room, Some(&provider), Some(homeserver), &mut applied));
+
+        let reader = ReaderScope::Context(context.clone());
+        let grants: Vec<_> = a2app_core::information_flow::sharing_grants().unwrap()
+            .into_iter().filter(|grant| grant.reader == reader).collect();
+        let own = room_source(&context, room);
+        let directory = directory_source(&context);
+        let model = Recipient::ModelProvider(provider.clone());
+        let hs = Recipient::network_origin(homeserver).unwrap();
+        let own_room = Recipient::MatrixRoom { account: account.clone(), room: room.into() };
+        let expected = [
+            (directory.clone(), model.clone()),
+            (own.clone(), model.clone()),
+            (own.clone(), hs.clone()),
+            (directory.clone(), hs.clone()),
+            (directory.clone(), own_room.clone()),
+        ];
+        assert_eq!(grants.len(), expected.len(), "exactly the documented defaults");
+        for (source, recipient) in &expected {
+            assert!(grants.iter().any(|grant| &grant.source == source && &grant.recipient == recipient),
+                "missing {source:?} -> {recipient:?}");
+        }
+        // The own-room source to the own room is implicitly allowed, so it
+        // needs no stored rule.
+        assert!(a2app_core::information_flow::sharing_allows_for_reader(&own, &own_room, &context).unwrap());
+        assert!(!grants.iter().any(|grant| matches!(grant.source, Source::Account { .. })),
+            "account-level data must not be shared by default");
+
+        // Revoking one rule and re-running the defaults for the same recipient
+        // must not recreate it.
+        let revoked = grants.iter().find(|grant| grant.source == directory && grant.recipient == model).unwrap().id;
+        a2app_core::information_flow::revoke_sharing(revoked).unwrap();
+        assert!(!ensure_agent_default_sharing(&context, room, Some(&provider), Some(homeserver), &mut applied));
+        assert!(!a2app_core::information_flow::sharing_grants().unwrap().iter().any(|grant| grant.id == revoked));
+
+        // A newly selected provider gets its own rules without touching the old ones.
+        let provider_two = format!("provider-two-{}", std::process::id());
+        assert!(ensure_agent_default_sharing(&context, room, Some(&provider_two), Some(homeserver), &mut applied));
+        let grants = a2app_core::information_flow::sharing_grants().unwrap();
+        assert!(grants.iter().any(|grant| grant.source == directory
+            && grant.recipient == Recipient::ModelProvider(provider_two.clone())));
+        TEST_ACCOUNT.with(|account_ref| *account_ref.borrow_mut() = None);
     }
 
     #[test]
