@@ -223,8 +223,9 @@ broker; the embedded backend uses the session-scoped MCP server
    immediately from the create response). A marked room gets its session.
 3. **Forward**: member text messages after the saved forwarding cursor (room
    account data `rs.robius.robrix.ai_session_data`) are sent to the session as
-   prompts; the first prompt after a (re)start carries a short plaintext
-   transcript preamble for context.
+   prompts. The prompt carries the new messages only; the agent reads the
+   room's own history through the `read_room_messages` / `read_older_messages`
+   tools, which are permission-gated like any other read.
 4. **Answer**: the agent calls Robrix's own MCP tools — `send_message` (posts
    an `ai_reply`), `launch_splash_app` (runs the mini-app generation pipeline),
    or `list_apps`/`launch_app` (find and run an app that already exists) — or
@@ -272,23 +273,28 @@ granted, and shows **one** modal: the agent's own plain-language paragraph plus
 a collapsible Details list of the exact items. The permission grants and the
 sharing rules they imply are applied together, for the agent's own subject,
 for **this turn only** — no durable or `Always` grant comes from this tool, and
-the turn's end revokes everything. "Not now" is remembered by plan until the
-turn closes, so a looping agent cannot re-ask. A need that appears mid-task is
-not requested again; the agent proceeds with what it has and says in its reply
-what it could not do. The per-call prompts remain the fallback for anything the
-agent did not list. The plan model, resolver and atomic apply live in
-`a2app/core/src/task_grants.rs`; the prompt is
+the turn's end revokes everything. "Not now" is remembered for the turn by
+what the plan needs, independent of the agent's own need labels: a later
+request with the same needs, or a subset, is declined without a modal, while a
+request that adds a new need is shown. A turn may make at most three requests,
+so a looping agent cannot re-ask forever. The per-call prompts remain the
+fallback for anything the agent did not list. The plan model, resolver and
+atomic apply live in `a2app/core/src/task_grants.rs`; the prompt is
 `src/a2app/task_permission_prompt.rs`.
 
 **The room and space directory is on by default.** `list_rooms`,
-`list_spaces`, `space_info` and `list_space_rooms` are granted when an AI
-room's session starts (unless the user has denied that group), so the agent can
-name real rooms without asking first. Directory results carry no message
-content but are still other people's words, so they are labelled with a single
-`Source::RoomDirectory` source and the `RoomDirectory` influence: one provider
-rule covers the whole directory, and other recipients do not inherit every
-listed room. Rooms with a Deny read policy are filtered out of directory
-results, so a protected room's name never reaches the model.
+`list_spaces`, `space_info` and `list_space_rooms` are granted once, on an AI
+room's first session start (unless the user has denied that group), so the
+agent can name real rooms without asking first. A persisted per-room marker
+means the defaults are never re-applied: once the user sets one of those
+groups back to Ask or Deny, that choice sticks across sessions. The room's own
+messages, its info, and the installed-app list are **not** defaulted; they go
+through `request_task_permissions` like any other need. Directory results carry
+no message content but are still other people's words, so they are labelled
+with a single `Source::RoomDirectory` source and the `RoomDirectory` influence:
+one provider rule covers the whole directory, and other recipients do not
+inherit every listed room. Rooms with a Deny read policy are filtered out of
+directory results, so a protected room's name never reaches the model.
 
 `launch_splash_app` is create-only: it never rewrites an installed app. Running
 an app that already exists is `launch_app`'s job — list the ids with

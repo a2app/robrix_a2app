@@ -5506,38 +5506,41 @@ fn is_directory_kind(kind: &ReadToolKind) -> bool {
     )
 }
 
-/// Grants the capabilities an AI room needs to orient itself — the room
-/// directory (`list_rooms` / `list_spaces` / `space_info` / `list_space_rooms`),
-/// the room's own transcript and metadata, and the installed mini-app list —
-/// unless the user has an explicit answer for a group. A stored Deny is the
-/// kill switch and is never overridden; each grant only turns an untouched
-/// `Ask` default into `Granted`, so a revoked group is not silently
-/// re-granted here.
+/// Grants an AI room the room/space directory (`list_rooms`, `list_spaces`,
+/// `space_info`, `list_space_rooms`) once, on its first session start, unless
+/// the user has an explicit answer for a group. A stored Deny is the kill
+/// switch and is never overridden; the persisted per-room marker means a user
+/// who sets a group back to `Ask` or `Deny` keeps that choice on every later
+/// session. The room's own transcript and metadata, and the installed-app
+/// list, are not defaulted: they go through `request_task_permissions`.
 #[cfg(unix)]
 fn apply_ai_room_capability_defaults(state: &mut A2AppState, room_id: &OwnedRoomId) {
+    if !state.persisted.permission_defaults_applied.insert(room_id.to_string()) {
+        return;
+    }
+    state.registry_dirty = true;
+    let changed = apply_directory_capability_defaults(&mut state.permissions, room_id);
+    if changed {
+        state.mark_perms_dirty();
+    }
+}
+
+/// Applies the one-time directory defaults to a permission store. Returns
+/// whether anything changed. Split out from [`apply_ai_room_capability_defaults`]
+/// so the once-per-room behavior is unit-testable.
+#[cfg(unix)]
+fn apply_directory_capability_defaults(permissions: &mut PermissionStore, room_id: &OwnedRoomId) -> bool {
     let subject = agent_subject(room_id.as_str());
     let mut changed = false;
     for cap_id in a2app_core::task_grants::DIRECTORY_CAP_IDS {
         let Some(cap) = a2app_core::capabilities::by_id(cap_id) else { continue };
         let Some(group) = cap.group else { continue };
-        if state.permissions.state(&subject, group) == GrantState::Ask {
-            state.permissions.set(&subject, group, GrantState::Granted);
+        if permissions.state(&subject, group) == GrantState::Ask {
+            permissions.set(&subject, group, GrantState::Granted);
             changed = true;
         }
     }
-    // The room's own transcript and metadata are the reason the AI room
-    // exists, and `AppLaunch` also covers `apps.list`, so the agent can see
-    // which mini-apps exist before it asks to run one. A stored Deny is still
-    // respected, so an explicit revocation is not silently undone.
-    for group in [Permission::MatrixRoomRead, Permission::MatrixRoomInfo, Permission::AppLaunch] {
-        if state.permissions.state(&subject, group) == GrantState::Ask {
-            state.permissions.set(&subject, group, GrantState::Granted);
-            changed = true;
-        }
-    }
-    if changed {
-        state.mark_perms_dirty();
-    }
+    changed
 }
 
 /// Starts an AI room's session if it isn't already running. Started idle
@@ -8183,6 +8186,37 @@ mod permission_tests {
         };
         assert_eq!(parked_rooms(&write), (Some(SOURCE.into()), Some(TARGET.into())));
         assert_eq!(parked_capability(&write).unwrap().id, "matrix.rooms.message.send");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_defaults_run_once_per_room_and_leave_other_groups_alone() {
+        let room: OwnedRoomId = SOURCE.try_into().unwrap();
+        let subject = agent_subject(SOURCE);
+        // A stored Deny on a directory group is never overridden.
+        let mut permissions = PermissionStore::default();
+        let denied_group = a2app_core::capabilities::by_id("matrix.rooms.list").unwrap().group.unwrap();
+        permissions.set(&subject, denied_group, GrantState::Denied);
+        apply_directory_capability_defaults(&mut permissions, &room);
+        assert_eq!(permissions.state(&subject, denied_group), GrantState::Denied);
+        for cap_id in a2app_core::task_grants::DIRECTORY_CAP_IDS {
+            let group = a2app_core::capabilities::by_id(cap_id).unwrap().group.unwrap();
+            if group != denied_group {
+                assert_eq!(permissions.state(&subject, group), GrantState::Granted, "{cap_id}");
+            }
+        }
+        // The room's own reads and the app list are not defaulted.
+        for group in [Permission::MatrixRoomRead, Permission::MatrixRoomInfo, Permission::AppLaunch] {
+            assert_eq!(permissions.state(&subject, group), GrantState::Ask, "{group:?}");
+        }
+        // The persisted per-room marker is what makes a later Ask stick: the
+        // wrapper returns before re-applying when the room is already marked.
+        let mut applied = BTreeSet::new();
+        assert!(applied.insert(SOURCE.to_string()), "first session applies the defaults");
+        let a_group = a2app_core::capabilities::by_id("matrix.spaces.list").unwrap().group.unwrap();
+        permissions.set(&subject, a_group, GrantState::Ask);
+        assert!(!applied.insert(SOURCE.to_string()), "a later session is already marked");
+        assert_eq!(permissions.state(&subject, a_group), GrantState::Ask, "the user's Ask survives a restart");
     }
 
     #[cfg(unix)]
