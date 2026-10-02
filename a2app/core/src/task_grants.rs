@@ -1043,6 +1043,21 @@ mod tests {
         }
     }
 
+    /// A lookup whose context already holds sources, as it would after an
+    /// earlier read in the same turn.
+    struct GrownLookup {
+        grown: Vec<Source>,
+    }
+
+    impl FlowLookup for GrownLookup {
+        fn already_allowed(&self, _source: &Source, _recipient: &Recipient, _reader: &ContextId) -> bool {
+            false
+        }
+        fn context_sources(&self, _context: &ContextId) -> Vec<Source> {
+            self.grown.clone()
+        }
+    }
+
     const DECLARED: &[&str] = &[
         "matrix.room.messages.read",
         "matrix.rooms.messages.read",
@@ -1076,6 +1091,27 @@ mod tests {
 
     fn request(needs: Vec<TaskNeed>) -> TaskRequest {
         TaskRequest { task: "Weekly digest of #ops".into(), explanation: "I'll read and post.".into(), needs }
+    }
+
+    #[test]
+    fn a_second_request_after_the_label_grew_shows_the_new_flow_as_needs_grant() {
+        let mut store = PermissionStore::default();
+        store.set_matrix_write(true);
+        let joined = |room: &str| matches!(room, "!ai:example.org" | "!ops:example.org");
+        let grown = Source::Room { account: "alice".into(), room: "!read-earlier:example.org".into() };
+        let lookup = GrownLookup { grown: vec![grown.clone()] };
+        let plan = resolve(&request(vec![TaskNeed::Capability { id: "n1".into(),
+            capability: "matrix.rooms.message.send".into(), targets: vec!["!ops:example.org".into()], why: None }]),
+            &inputs(&store, &joined, &lookup)).unwrap();
+        // The agent already read this source, so the second request must show
+        // the flow it now needs (to the provider and to its own room) so the
+        // user can approve the grown label rather than failing forever.
+        for recipient in [Recipient::ModelProvider("provider".into()),
+            Recipient::MatrixRoom { account: "alice".into(), room: "!ai:example.org".into() }] {
+            let item = plan.items.iter().find(|item| matches!(&item.action, PlanAction::Flow { source, recipient: item_recipient }
+                if source == &grown && item_recipient == &recipient)).expect("the grown source must produce a flow item");
+            assert_eq!(item.state, ItemState::NeedsGrant);
+        }
     }
 
     #[test]
