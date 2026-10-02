@@ -875,17 +875,27 @@ mod tests {
 
     #[test]
     fn retired_session_queue_and_activation_cannot_reach_its_replacement() {
-        use a2app_core::information_flow::{Registry, ContextId, Source, SensitiveAction, AuthoritySession};
+        use a2app_core::information_flow::ContextId;
+        // Agent (AI-room) sessions and mini-app (App) contexts both use the
+        // exact-action review for a cross-room post; the agent's own-room
+        // reply/activity output is the only exemption.
+        retired_session_queue_and_activation_cannot_reach_its_replacement_for(
+            ContextId::Agent { account: "alice".into(), room: "!same:example.org".into() },
+            ContextId::Agent { account: "bob".into(), room: "!same:example.org".into() },
+        );
+        retired_session_queue_and_activation_cannot_reach_its_replacement_for(
+            ContextId::App { account: "alice".into(), app: "tool".into(), room: Some("!same:example.org".into()) },
+            ContextId::App { account: "bob".into(), app: "tool".into(), room: Some("!same:example.org".into()) },
+        );
+    }
+
+    fn retired_session_queue_and_activation_cannot_reach_its_replacement_for(context: a2app_core::information_flow::ContextId, other_account: a2app_core::information_flow::ContextId) {
+        use a2app_core::information_flow::{Registry, Source, SensitiveAction, AuthoritySession};
         let root = std::env::temp_dir().join(format!("robrix-session-stop-{}-{}", std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         let mut registry = Registry::open(&root).unwrap();
-        // App contexts (mini-apps) still use the exact-action review; agent
-        // (AI-room) sessions bypass it (see `Registry::action_decision`), so
-        // exercise the review's retirement here with an app context.
-        let context = ContextId::App { account: "alice".into(), app: "tool".into(), room: Some("!same:example.org".into()) };
-        let other_account = ContextId::App { account: "bob".into(), app: "tool".into(), room: Some("!same:example.org".into()) };
         let source = Source::Room { account: "alice".into(), room: "!private:example.org".into() };
-        let action = SensitiveAction { kind: "ai.reply.write".into(), target: "!same:example.org".into() };
+        let action = SensitiveAction { kind: "matrix.rooms.message.send".into(), target: "!other:example.org".into() };
         registry.register_context(&context).unwrap();
         registry.register_context(&other_account).unwrap();
         registry.add_sources(&context, [source.clone()]).unwrap();
