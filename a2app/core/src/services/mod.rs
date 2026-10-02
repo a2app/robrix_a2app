@@ -849,6 +849,11 @@ impl Broker {
         if capability.flow_contract().is_none() {
             return respond(cx, reply, Err("This service has no information-flow contract."));
         }
+        if req.service == "network.http" && args["url"].as_str()
+            .is_none_or(|url| crate::information_flow::Recipient::network_origin(url).is_err())
+        {
+            return respond(cx, reply, Err("Enter a complete website address starting with http:// or https://, without a username or password."));
+        }
         let context = permission_context(&req.service, &args, instance_room.as_deref());
         let collection = is_room_collection(capability);
         let denied = if collection && req.service != "matrix.space_rooms" {

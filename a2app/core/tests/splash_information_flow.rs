@@ -12,6 +12,7 @@ use a2app_core::{
     services::{self, Broker, BrokerAsk, BrokerCtx, HostAction, PaneState, Reply},
 };
 use makepad_widgets::{*, splash::Splash, splash_host::SplashHostRequest, widget_async::CxSplashVmExt};
+use makepad_widgets::{makepad_script::ScriptFnRef, widget_async::CxWidgetToScriptCallExt};
 
 const ACCOUNT: &str = "@owner:test";
 const ROOM: &str = "!private:test";
@@ -46,6 +47,7 @@ struct Harness {
     root: PathBuf,
     review_effects: bool,
     network_bodies: VecDeque<String>,
+    matrix_replies: HashMap<String, VecDeque<serde_json::Value>>,
 }
 
 impl Harness {
@@ -59,7 +61,7 @@ impl Harness {
             cx, broker: Broker::new(), apps: AppRegistry::default(), permissions: PermissionStore::default(),
             flow: RefCell::new(Registry::open(&root).unwrap()), contexts: HashMap::new(), panes: HashMap::new(), foreground_app: None,
             splashes: Vec::new(), stock_hosts: Vec::new(),
-            attempted_bodies: RefCell::new(Vec::new()), root, review_effects: false, network_bodies: VecDeque::new(),
+            attempted_bodies: RefCell::new(Vec::new()), root, review_effects: false, network_bodies: VecDeque::new(), matrix_replies: HashMap::new(),
         }
     }
 
@@ -240,6 +242,44 @@ impl Harness {
         called
     }
 
+    fn call_json(&mut self, app: &WidgetRef, name: &str, text: &str, json: &str) -> bool {
+        let source = app.borrow::<Splash>().unwrap().view.source.clone();
+        let vm_id = self.cx.script_ref_vm_id(&source).unwrap();
+        let args = self.cx.with_script_vm_id(vm_id, |vm| {
+            let text = vm.new_string_with(|_, out| out.push_str(text));
+            let object = makepad_widgets::makepad_script::json::JsonParserThread::default().read_json(json, &mut vm.bx.heap);
+            [text, object]
+        });
+        self.call(app, name, &args)
+    }
+
+    fn widget_click(&mut self, app: &WidgetRef, text: &str, args: &[ScriptValue]) {
+        fn find(root: &WidgetRef, text: &str) -> Option<WidgetRef> {
+            if root.text() == text { return Some(root.clone()); }
+            let mut children = Vec::new();
+            root.children(&mut |_, child| children.push(child));
+            children.into_iter().find_map(|child| find(&child, text))
+        }
+        let widget = find(app, text).expect("the actual stock control exists");
+        let source = app.borrow::<Splash>().unwrap().view.source.clone();
+        let vm_id = self.cx.script_ref_vm_id(&source).unwrap();
+        let (source, callback) = self.cx.with_script_vm_id(vm_id, |vm| {
+            let source = widget.script_source();
+            let value = vm.bx.heap.value(source, id!(on_click).into(), NoTrap);
+            assert!(!value.is_nil(), "{text} has its real guest click callback");
+            let callback = ScriptFnRef::script_from_value(vm, value);
+            let source = vm.bx.heap.new_object_ref(source);
+            (source, callback)
+        });
+        self.cx.widget_to_script_call(widget.widget_uid(), NIL, source, callback, args);
+        self.cx.with_vm_and_async(|_| {});
+        self.assert_callback_errors(text);
+    }
+
+    fn queue_matrix_reply(&mut self, capability: &str, data: serde_json::Value) {
+        self.matrix_replies.entry(capability.into()).or_default().push_back(data);
+    }
+
     fn assert_callback_errors(&mut self, operation: &str) {
         let logged = CALLBACK_ERRORS.with(|errors| std::mem::take(&mut *errors.borrow_mut()));
         assert!(logged.is_empty(), "{operation} synchronous callback errors: {logged:?}");
@@ -317,7 +357,9 @@ impl Harness {
                     }
                     BrokerAsk::Matrix { reply, capability, call, .. } => {
                         audit.services.push(capability.into());
-                        self.reply(reply, &matrix_fixture(&call).to_string());
+                        audit.matrix_args.push(matrix_recipe(&call));
+                        let data = self.matrix_replies.get_mut(capability).and_then(VecDeque::pop_front).unwrap_or_else(|| matrix_fixture(&call));
+                        self.reply(reply, &data.to_string());
                     }
                     BrokerAsk::Network { reply, args, .. } => {
                         audit.services.push("network.http".into());
@@ -342,7 +384,9 @@ impl Harness {
                         audit.actions.push(match action {
                             HostAction::OpenRoom { .. } => "room", HostAction::JumpToEvent { .. } => "event",
                             HostAction::OpenThread { .. } => "thread", HostAction::ShowUser { .. } => "user",
-                            HostAction::OpenSpace { .. } => "space", _ => "host",
+                            HostAction::OpenSpace { .. } => "space", HostAction::ClosePane => "close",
+                            HostAction::SetSide { .. } => "side", HostAction::BreakOut => "break_out",
+                            HostAction::Minimize => "minimize", HostAction::Restore => "restore", _ => "host",
                         }.into());
                         self.reply(reply, "{}");
                     }
@@ -516,6 +560,20 @@ struct StockAudit {
     notifications: Vec<String>,
     completions: Vec<(u64, bool)>,
     write_setups: usize,
+    matrix_args: Vec<String>,
+}
+
+fn matrix_recipe(call: &services::MatrixServiceCall) -> String {
+    use services::MatrixServiceCall::*;
+    match call {
+        Join { room, .. } => format!("join:{room}"),
+        InviteRespond { room_id, accept } => format!("invite:{room_id}:{accept}"),
+        RoomFlag { flag, on } => format!("flag:{flag:?}:{on}"),
+        Search { scope, server, .. } => format!("search:{}:{server}", match scope {
+            services::SearchScope::Attached => "attached", services::SearchScope::AllJoined => "all", services::SearchScope::Rooms(_) => "picked",
+        }),
+        _ => String::new(),
+    }
 }
 
 fn matrix_fixture(call: &services::MatrixServiceCall) -> serde_json::Value {
@@ -537,7 +595,7 @@ fn matrix_fixture(call: &services::MatrixServiceCall) -> serde_json::Value {
         Permalink { .. } => serde_json::json!({"url":"https://matrix.to/#/!private:test/$message:test"}),
         Successor => serde_json::json!({"upgraded":false,"room_id":null}),
         RoomsList | RoomsSearch { .. } => serde_json::json!({"rooms":[room]}),
-        Search { .. } => serde_json::json!({"results":[message],"searched_rooms":1,"server_used":false}),
+        Search { server, .. } => serde_json::json!({"results":[message],"searched_rooms":1,"server_used":server}),
         Invites => serde_json::json!({"invites":[{"room_id":"!invite:test","name":"Invited room","inviter_name":"Alice","inviter":"@alice:test","is_space":false,"is_direct":false}]}),
         RoomPreview { .. } => serde_json::json!({"name":"Preview room","topic":"Fixture topic","member_count":2,"join_rule":"public"}),
         Spaces => serde_json::json!({"spaces":[{"space_id":"!space:test","name":"Test Space","topic":"Fixture topic","member_count":2}]}),
@@ -547,7 +605,7 @@ fn matrix_fixture(call: &services::MatrixServiceCall) -> serde_json::Value {
         UserProfile { user_id } => serde_json::json!({"user_id":user_id,"display_name":"Alice","has_avatar":false,"ignored":false}),
         DmFind { .. } => serde_json::json!({"room_id":ROOM,"name":"Private room"}),
         Device => serde_json::json!({"device_id":"TEST","name":"Test device","verified":true}),
-        AccountInfo => serde_json::json!({"user_id":ACCOUNT,"homeserver":"https://homeserver.test","account_management_url":null}),
+        AccountInfo => serde_json::json!({"user_id":ACCOUNT,"homeserver":"https://homeserver.test","account_management_url":"https://homeserver.test/account?tab=profile"}),
         IgnoredUsers => serde_json::json!({"users":["@alice:test"]}),
         Join { .. } => serde_json::json!({"knocked":false,"room_id":ROOM}),
         _ => serde_json::json!({"event_id":"$posted:test","added":true}),
@@ -572,10 +630,20 @@ fn response_room_sources(value: &serde_json::Value, sources: &mut Vec<Source>) {
 
 #[test]
 fn every_stock_app_runs_real_boot_and_finishes_parked_permission_callbacks() {
+    run_every_stock_app(false);
+}
+
+#[test]
+fn every_stock_app_finishes_its_primary_action_with_strict_permissions() {
+    run_every_stock_app(true);
+}
+
+fn run_every_stock_app(strict: bool) {
     let stock = a2app_core::builtin::builtin_apps();
     assert_eq!(stock.len(), 19);
     for manifest in stock {
         let mut host = Harness::new();
+        host.permissions.set_strict(strict);
         let errors = makepad_widgets::splash::validate_splash_body(&mut host.cx, &manifest.source, false);
         assert!(errors.is_empty(), "{} script errors: {errors:?}", manifest.id);
         let (app, _) = host.launch_stock_permissions(&manifest.id, false, false);
@@ -636,9 +704,9 @@ fn every_stock_app_runs_real_boot_and_finishes_parked_permission_callbacks() {
             "account" | "inspector" | "room-pins" | "room-tools" | "spaces" | "inbox" | "room-stats" | "watcher" => (1, 1),
             _ => (1, 0),
         };
-        eprintln!("stock permission audit: {} initial={} action={} initial_reviews={} action_reviews={}",
-            manifest.id, initial_prompts, audit.prompts.len() - initial_prompts, initial_reviews, audit.reviews - initial_reviews);
-        assert_eq!((initial_prompts, audit.prompts.len() - initial_prompts), expected,
+        eprintln!("stock permission audit: {} strict={} initial={} action={} initial_reviews={} action_reviews={}",
+            manifest.id, strict, initial_prompts, audit.prompts.len() - initial_prompts, initial_reviews, audit.reviews - initial_reviews);
+        if !strict { assert_eq!((initial_prompts, audit.prompts.len() - initial_prompts), expected,
             "{} initial and primary-action permission groups: {:?}", manifest.id, audit.prompts);
         let expected_reviews = match manifest.id.as_str() {
             "room-peek" | "presence" | "room-stats" => (1, 1),
@@ -648,6 +716,10 @@ fn every_stock_app_runs_real_boot_and_finishes_parked_permission_callbacks() {
         };
         assert_eq!((initial_reviews, audit.reviews - initial_reviews), expected_reviews,
             "{} must finish each reviewed sink without repeated reviews", manifest.id);
+        }
+        assert!(audit.prompts.len() <= manifest.permissions.len(), "{} exceeds its finite declared group budget", manifest.id);
+        assert!(audit.prompts.iter().all(|permission| manifest.declares(*permission)), "{} prompts only for its declared groups", manifest.id);
+        assert!(audit.reviews <= 3, "{} exceeds the finite review budget for its primary path", manifest.id);
         if matches!(manifest.id.as_str(), "reminder" | "keyword-alert" | "website-watch") {
             assert_eq!(audit.completions, [(41, true)], "{} completes its actual background callback", manifest.id);
             assert_eq!(audit.notifications.len(), 2, "foreground setup and unattended match both report");
@@ -1084,6 +1156,251 @@ fn stock_website_session_grants_survive_retirement_and_post_a_later_new_match() 
         "foreground test and both newly matched scheduled runs send the actual room-report request");
     assert_eq!((audit.prompts.len(), audit.reviews, audit.write_setups), grants,
         "declared ability and explicit session sharing/action grants survive task instance retirement");
+}
+
+#[test]
+fn stock_spaces_unjoined_room_join_and_knock_finish_and_reuse_their_grants() {
+    for knocked in [false, true] {
+        let mut host = Harness::new();
+        let room = serde_json::json!({"room_id":"!candidate:test","name":"Candidate room","topic":"","member_count":2,"is_space":false,"joined":false});
+        host.queue_matrix_reply("matrix.space.rooms.list", serde_json::json!({"rooms":[room.clone()]}));
+        if !knocked {
+            let mut joined = room;
+            joined["joined"] = true.into();
+            for _ in 0..2 { host.queue_matrix_reply("matrix.space.rooms.list", serde_json::json!({"rooms":[joined.clone()]})); }
+        }
+        for _ in 0..2 { host.queue_matrix_reply("matrix.rooms.join", serde_json::json!({"knocked":knocked,"room_id":"!candidate:test"})); }
+        let (app, _) = host.launch_stock_permissions("spaces", false, false);
+        host.boot();
+        let mut audit = StockAudit::default();
+        host.settle_stock(&app, "spaces", &mut audit);
+        assert!(host.call(&app, "tap_item", &[0_u32.into()]));
+        host.settle_stock(&app, "spaces", &mut audit);
+        assert_eq!(app.widget(&host.cx, ids!(preview_line)).text(), "2 members · Fixture topic · public");
+        host.broker.forget_app("spaces");
+        assert!(host.call(&app, "join_room", &[]));
+        host.settle_stock(&app, "spaces", &mut audit);
+        let expected = if knocked { "Knocked. You're in once someone lets you in." } else { "Joined! Tap it in the list to open it." };
+        assert_eq!(app.widget(&host.cx, ids!(join_note)).text(), expected);
+        assert!(audit.matrix_args.contains(&"join:!candidate:test".into()));
+        let grants = (audit.prompts.len(), audit.reviews, audit.write_setups);
+        host.broker.forget_app("spaces");
+        assert!(host.call(&app, "join_room", &[]));
+        host.settle_stock(&app, "spaces", &mut audit);
+        assert_eq!(app.widget(&host.cx, ids!(join_note)).text(), expected);
+        assert_eq!(audit.matrix_args.iter().filter(|recipe| recipe.as_str() == "join:!candidate:test").count(), 2);
+        assert_eq!((audit.prompts.len(), audit.reviews, audit.write_setups), grants);
+    }
+}
+
+#[test]
+fn stock_inbox_decline_finishes_and_reuses_its_membership_grant() {
+    let mut host = Harness::new();
+    let (app, _) = host.launch_stock_permissions("inbox", false, false);
+    host.boot();
+    let mut audit = StockAudit::default();
+    host.settle_stock(&app, "inbox", &mut audit);
+    for index in 0..2 {
+        host.broker.forget_app("inbox");
+        assert!(host.call(&app, "pick_invite", &[0_u32.into()]));
+        assert!(host.call(&app, "answer_invite", &[false.into()]));
+        let grants = (audit.prompts.len(), audit.reviews, audit.write_setups);
+        host.settle_stock(&app, "inbox", &mut audit);
+        assert_eq!(app.widget(&host.cx, ids!(status)).text(), "Declined the invite to Invited room");
+        if index == 1 { assert_eq!((audit.prompts.len(), audit.reviews, audit.write_setups), grants); }
+    }
+    assert_eq!(audit.matrix_args.iter().filter(|recipe| recipe.as_str() == "invite:!invite:test:false").count(), 2);
+}
+
+#[test]
+fn stock_room_tools_other_flags_and_upgraded_room_complete_and_reuse_grants() {
+    let mut host = Harness::new();
+    host.queue_matrix_reply("matrix.room.successor.read", serde_json::json!({"upgraded":true,"room_id":"!successor:test"}));
+    let (app, _) = host.launch_stock_permissions("room-tools", false, false);
+    host.boot();
+    let mut audit = StockAudit::default();
+    host.settle_stock(&app, "room-tools", &mut audit);
+    for (index, on, off, recipe) in [
+        (1_u32, "Marked low priority.", "Back to normal priority.", "LowPriority"),
+        (2_u32, "Marked unread.", "Unread flag cleared.", "Unread"),
+    ] {
+        host.broker.forget_app("room-tools");
+        assert!(host.call(&app, "toggle", &[index.into()]));
+        host.settle_stock(&app, "room-tools", &mut audit);
+        assert_eq!(app.widget(&host.cx, ids!(status)).text(), on);
+        let grants = (audit.prompts.len(), audit.reviews, audit.write_setups);
+        host.broker.forget_app("room-tools");
+        assert!(host.call(&app, "toggle", &[index.into()]));
+        host.settle_stock(&app, "room-tools", &mut audit);
+        assert_eq!(app.widget(&host.cx, ids!(status)).text(), off);
+        assert!(audit.matrix_args.contains(&format!("flag:{recipe}:true")));
+        assert!(audit.matrix_args.contains(&format!("flag:{recipe}:false")));
+        assert_eq!((audit.prompts.len(), audit.reviews, audit.write_setups), grants);
+    }
+    assert!(app.widget(&host.cx, ids!(upgraded_wrap)).visible());
+    assert!(host.call(&app, "open_successor", &[]));
+    host.settle_stock(&app, "room-tools", &mut audit);
+    let grants = (audit.prompts.len(), audit.reviews, audit.write_setups);
+    host.broker.forget_app("room-tools");
+    assert!(host.call(&app, "open_successor", &[]));
+    host.settle_stock(&app, "room-tools", &mut audit);
+    assert_eq!(audit.actions, ["room", "room"]);
+    assert_eq!((audit.prompts.len(), audit.reviews, audit.write_setups), grants);
+}
+
+#[test]
+fn stock_inspector_pane_controls_finish_and_reuse_their_control_grant() {
+    let mut host = Harness::new();
+    let (app, _) = host.launch_stock_permissions("inspector", false, false);
+    host.boot();
+    let mut audit = StockAudit::default();
+    host.settle_stock(&app, "inspector", &mut audit);
+    for side in ["top", "bottom", "left", "right"] {
+        host.broker.forget_app("inspector");
+        assert!(host.call_json(&app, "pane_call", "ui.pane.set_side", &serde_json::json!({"side":side}).to_string()));
+        host.settle_stock(&app, "inspector", &mut audit);
+    }
+    let grants = (audit.prompts.len(), audit.reviews, audit.write_setups);
+    for service in ["ui.pane.break_out", "ui.pane.minimize", "ui.pane.restore"] {
+        host.broker.forget_app("inspector");
+        assert!(host.call_strings(&app, "pane_call", &[service]));
+        host.settle_stock(&app, "inspector", &mut audit);
+    }
+    host.broker.forget_app("inspector");
+    assert!(host.call(&app, "minimize_briefly", &[]));
+    host.settle_stock(&app, "inspector", &mut audit);
+    host.boot(); // Dispatch the actual saved restore timer without a wall-clock sleep.
+    host.settle_stock(&app, "inspector", &mut audit);
+    host.broker.forget_app("inspector");
+    assert!(host.call_strings(&app, "pane_call", &["ui.pane.close"]));
+    host.settle_stock(&app, "inspector", &mut audit);
+    assert_eq!(audit.actions, ["side", "side", "side", "side", "break_out", "minimize", "restore", "minimize", "restore", "close"]);
+    assert_eq!(app.widget(&host.cx, ids!(pane_state)).text(), "foreground yes");
+    assert_eq!((audit.prompts.len(), audit.reviews, audit.write_setups), grants);
+}
+
+#[test]
+fn stock_search_all_rooms_and_server_variants_finish_and_reuse_their_read_grant() {
+    let mut host = Harness::new();
+    let (app, _) = host.launch_stock_permissions("search", false, false);
+    host.boot();
+    let mut audit = StockAudit::default();
+    host.settle_stock(&app, "search", &mut audit);
+    assert!(host.call_strings(&app, "set_mode", &["all"]));
+    for server in [false, true] {
+        host.widget_click(&app, "Ask the server too", &[server.into()]);
+        for index in 0..2 {
+            host.broker.forget_app("search");
+            assert!(host.call_strings(&app, "run_search", &["release"]));
+            let grants = (audit.prompts.len(), audit.reviews, audit.write_setups);
+            host.settle_stock(&app, "search", &mut audit);
+            assert!(audit.matrix_args.contains(&format!("search:all:{server}")));
+            assert_eq!(app.widget(&host.cx, ids!(status)).text(), if server { "1 result in 1 room · server included" } else { "1 result in 1 room" });
+            if index == 1 { assert_eq!((audit.prompts.len(), audit.reviews, audit.write_setups), grants); }
+        }
+    }
+    assert_eq!(audit.services.iter().filter(|service| service.as_str() == "matrix.rooms.messages.search").count(), 4);
+}
+
+#[test]
+fn stock_account_management_reviews_the_browser_origin_and_finishes_its_original_callback() {
+    let mut host = Harness::new();
+    let (app, context) = host.launch_stock_permissions("account", false, false);
+    host.boot();
+    let mut audit = StockAudit::default();
+    host.settle_stock(&app, "account", &mut audit);
+    assert!(app.widget(&host.cx, ids!(manage_wrap)).visible());
+    // Strict mode asks before normally auto-granted browser abilities and
+    // keeps the original callback alive through ability + flow review.
+    host.permissions.set_strict(true);
+    host.permissions.set("account", Permission::OpenUrl, GrantState::Ask);
+    host.publish_grants(&app, "account");
+    assert!(host.call(&app, "open_manage", &[]));
+    let mut parked = None;
+    for ask in host.process() {
+        match ask {
+            BrokerAsk::Prompt { app_id, perm: Permission::OpenUrl, request: Some(request), .. } => {
+                assert_eq!(app_id, "account");
+                assert!(parked.replace(request).is_none());
+                audit.prompts.push(Permission::OpenUrl);
+            }
+            BrokerAsk::Used { .. } => {},
+            BrokerAsk::Prompt { perm, request, .. } => panic!("unexpected permission {perm:?} with original {}", request.map(|request| request.service).unwrap_or_default()),
+            BrokerAsk::FlowReview { review, .. } => panic!("Account browser ability already granted; flow review allowed={} group={:?}", review.allowed, host.permissions.state("account", Permission::OpenUrl)),
+            _ => panic!("Account Manage must first request its declared browser ability"),
+        }
+    }
+    host.permissions.set("account", Permission::OpenUrl, GrantState::Granted);
+    host.publish_grants(&app, "account");
+    let (request, review) = effect_review(host.dispatch(Some(parked.expect("original Account Manage request is parked"))));
+    audit.reviews += 1;
+    let args: serde_json::Value = serde_json::from_str(&request.args_json).unwrap();
+    assert_eq!(args["url"], "https://homeserver.test/account?tab=profile");
+    assert_eq!(review.recipient, Some(Recipient::network_origin("https://homeserver.test").unwrap()));
+    assert_eq!(review.action.as_ref().unwrap().kind, "device.url.open");
+    assert_eq!(review.action.as_ref().unwrap().target, "https://homeserver.test");
+    assert!(review.payload.contains("https://homeserver.test/account?tab=profile"));
+    assert!(review.sources.contains(&Source::Account { account: ACCOUNT.into() }));
+    host.flow.borrow_mut().approve_effect_session(&review, SharingDuration::RobrixSession).unwrap();
+    host.flow.borrow_mut().commit_effect_for_activation(&context, review.epoch, review.recipient.as_ref(), review.action.as_ref(), &args).unwrap();
+    // The real broker opens the native browser immediately after this gate.
+    // Fixture its completion so integration tests never launch an external app.
+    let outcome = makepad_widgets::splash_host::splash_host_respond(&mut host.cx, request.heap_key, request.req_id, Ok("{}"));
+    assert_eq!(outcome, makepad_widgets::splash_host::SplashRespondOutcome::Delivered);
+    host.settle_stock(&app, "account", &mut audit);
+    assert_eq!(app.widget(&host.cx, ids!(server_line)).text(), "https://homeserver.test");
+
+    let grants = (audit.prompts.len(), audit.reviews, host.flow.borrow().authorities().unwrap());
+    assert!(host.call(&app, "open_manage", &[]));
+    let requests = makepad_widgets::splash_host::take_splash_host_requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.service, "url.open");
+    let args: serde_json::Value = serde_json::from_str(&request.args_json).unwrap();
+    let cap = a2app_core::capabilities::for_service(&request.service).unwrap();
+    assert_eq!(host.permissions.effective_capability_in_context(host.apps.get("account").unwrap(), cap,
+        services::permission_context(&request.service, &args, context.room())), a2app_core::permissions::Effective::Granted);
+    let contract = cap.flow_contract().unwrap();
+    let recipient = contract.recipient(ACCOUNT, None, &args, Some("https://homeserver.test")).unwrap();
+    let action = contract.sensitive_action(cap.id, &args, None);
+    let epoch = host.flow.borrow().context_epoch(&context).unwrap();
+    let reviewed = host.flow.borrow_mut().prepare_effect_for_activation(&context, epoch, recipient.as_ref(), action.as_ref(), &args).unwrap();
+    assert!(reviewed.allowed, "same exact browser origin and action use the approved session");
+    host.flow.borrow_mut().commit_effect_for_activation(&context, epoch, recipient.as_ref(), action.as_ref(), &args).unwrap();
+    let outcome = makepad_widgets::splash_host::splash_host_respond(&mut host.cx, request.heap_key, request.req_id, Ok("{}"));
+    assert_eq!(outcome, makepad_widgets::splash_host::SplashRespondOutcome::Delivered);
+    host.settle_stock(&app, "account", &mut audit);
+    assert_eq!(app.widget(&host.cx, ids!(server_line)).text(), "https://homeserver.test");
+    assert_eq!((audit.prompts.len(), audit.reviews, host.flow.borrow().authorities().unwrap()), grants);
+}
+
+#[test]
+fn stock_website_test_explains_malformed_saved_urls_before_requesting_permission() {
+    for invalid in ["example.com", "https://alice:secret@example.com/", "ftp://example.com/"] {
+        let mut host = Harness::new();
+        let (app, _) = host.launch_stock_permissions("website-watch", false, false);
+        assert!(host.call(&app, "on_app_resize", &[460_f64.into(), 700_f64.into()]));
+        app.text_input(&host.cx, ids!(url_input)).set_text(&mut host.cx, invalid);
+        assert!(host.call(&app, "save", &[]));
+        assert!(host.call(&app, "test_website", &[]));
+        for _ in 0..3 { assert!(host.process().is_empty(), "{invalid} cannot raise a permission prompt or perform HTTP"); }
+        assert_eq!(app.widget(&host.cx, ids!(status)).text(), "Enter a complete website address starting with http:// or https://, without a username or password.");
+        assert!(!host.stock_callbacks_paused());
+        host.assert_callback_errors(invalid);
+        let failures = host.broker.failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].error, app.widget(&host.cx, ids!(status)).text());
+        assert_eq!(host.permissions.state("website-watch", Permission::Network), GrantState::Ask);
+        app.text_input(&host.cx, ids!(url_input)).set_text(&mut host.cx, "https://example.com/");
+        assert!(host.call(&app, "save", &[]));
+        assert!(host.call(&app, "test_website", &[]));
+        let mut audit = StockAudit::default();
+        host.settle_stock(&app, "website-watch", &mut audit);
+        assert_eq!(audit.services, ["network.http"]);
+        assert_eq!(audit.notifications.len(), 1);
+        assert!(audit.completions.is_empty());
+        assert_eq!(app.widget(&host.cx, ids!(status)).text(), "Test report shown. This website is ready for scheduled checks.");
+    }
 }
 
 #[test]

@@ -32,6 +32,8 @@ pub enum FlowOutput {
     TargetRoom,
     /// The actual HTTP origin; checked again by the host network worker.
     Network,
+    /// HTTP(S) browser links have an exact origin; other schemes are external.
+    Browser,
     /// Plaintext, caller-controlled arguments to the account's homeserver.
     MatrixServer,
     /// Search remains local unless {server: true} was requested.
@@ -79,7 +81,8 @@ pub fn contract(id: &str) -> Option<FlowContract> {
             => (S::Account, O::Local, true, false),
         "device.auth.check" => (S::Account, O::Local, false, true),
         "device.clipboard.write" => (S::None, O::Clipboard, false, true),
-        "device.url.open" | "device.files.save"
+        "device.url.open" => (S::None, O::Browser, false, true),
+        "device.files.save"
         | "device.share" => (S::None, O::External, false, true),
         "ipc.send" | "ipc.self.send" => (S::Account, O::Peer(FlowPeer::Ipc), false, false),
         "ipc.post" => (S::None, O::Peer(FlowPeer::Ipc), false, false),
@@ -157,6 +160,7 @@ impl FlowContract {
             FlowOutput::Clipboard => Some(Recipient::Clipboard),
             FlowOutput::TargetRoom => Some(Recipient::MatrixRoom { account: account.into(), room: target_room.ok_or("No destination room.")?.into() }),
             FlowOutput::Network => Some(Recipient::network_origin(args["url"].as_str().ok_or("No network destination.")?)?),
+            FlowOutput::Browser => Some(browser_recipient(args)?),
             FlowOutput::MatrixServer => Some(server()?),
             FlowOutput::MatrixSearch if args["server"].as_bool() == Some(true) => Some(server()?),
             FlowOutput::MatrixPagination if args["before"].as_str().is_some_and(|value| !value.trim().is_empty()) => Some(server()?),
@@ -170,13 +174,28 @@ impl FlowContract {
         self.privileged_effect.then(|| crate::information_flow::SensitiveAction {
             kind: capability.into(),
             target: match self.output {
-                FlowOutput::MatrixServer if capability == "matrix.user.dm.open" => "host",
-                FlowOutput::TargetRoom | FlowOutput::MatrixServer => target_room.unwrap_or("host"),
-                FlowOutput::External => "external",
-                FlowOutput::Clipboard => "clipboard",
-                FlowOutput::Peer(_) => args["app_id"].as_str().unwrap_or("apps"),
-                _ => "host",
-            }.into(),
+                FlowOutput::Browser => match browser_recipient(args) {
+                    Ok(crate::information_flow::Recipient::NetworkOrigin(origin)) => origin,
+                    _ => args["url"].as_str().unwrap_or("external").into(),
+                },
+                FlowOutput::MatrixServer if capability == "matrix.user.dm.open" => "host".into(),
+                FlowOutput::TargetRoom | FlowOutput::MatrixServer => target_room.unwrap_or("host").into(),
+                FlowOutput::External => "external".into(),
+                FlowOutput::Clipboard => "clipboard".into(),
+                FlowOutput::Peer(_) => args["app_id"].as_str().unwrap_or("apps").into(),
+                _ => "host".into(),
+            },
         })
+    }
+}
+
+fn browser_recipient(args: &serde_json::Value) -> Result<crate::information_flow::Recipient, String> {
+    use crate::information_flow::Recipient;
+    let destination = args["url"].as_str().ok_or("No browser destination.")?;
+    let url = url::Url::parse(destination).map_err(|_| "Invalid browser destination.".to_owned())?;
+    if matches!(url.scheme(), "http" | "https") {
+        Recipient::network_origin(destination)
+    } else {
+        Ok(Recipient::External)
     }
 }

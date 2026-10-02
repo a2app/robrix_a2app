@@ -52,7 +52,7 @@ pub enum Recipient {
     /// Host-defined identity of the actual model endpoint and credentials.
     ModelProvider(String),
     MatrixRoom { account: String, room: String },
-    /// An uncontrolled recipient, such as the clipboard or an exported file.
+    /// An uncontrolled recipient, such as an exported file or a non-HTTP link.
     External,
     /// The local system clipboard; other applications may read copied text.
     Clipboard,

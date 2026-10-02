@@ -62,8 +62,8 @@ impl Registry {
             return Ok(EffectReview { id: 0, context: context.clone(), epoch, recipient: recipient.cloned(), action: action.cloned(),
                 sources, denied_sources, influences, payload: "".into(), allowed: true });
         }
-        if sources.contains(&Source::UnknownPrivate) { return Err("This app has older private data whose source is unknown. It cannot be shared through a permission prompt.".into()); }
-        if recipient == Some(&Recipient::External) { return Err("This request has no specific destination and cannot share private data through a permission prompt.".into()); }
+        if denied_sources.contains(&Source::UnknownPrivate) { return Err("This app has older private data whose source is unknown. It cannot be shared through a permission prompt.".into()); }
+        if recipient == Some(&Recipient::External) && !denied_sources.is_empty() { return Err("This request has no specific destination and cannot share private data through a permission prompt.".into()); }
         let payload: std::sync::Arc<str> = integrity::canonical_payload(payload)?.into();
         let mut review = EffectReview { id: 0, context: context.clone(), epoch, recipient: recipient.cloned(), action: action.cloned(),
             sources, denied_sources, influences, payload, allowed: false };
@@ -302,7 +302,13 @@ mod tests {
             assert!(local.allowed); assert_eq!(local.id, 0);
         }
         assert!(registry.pending_effects.is_empty());
-        assert!(registry.prepare_effect_for_activation(&context, epoch, None, Some(&action()), &payload).is_err());
+        let local = registry.prepare_effect_for_activation(&context, epoch, None, Some(&action()), &serde_json::json!({"screen":"rooms"})).unwrap();
+        assert!(!local.allowed);
+        registry.approve_effect_once(&local).unwrap();
+        registry.commit_effect_for_activation(&context, epoch, None, Some(&action()), &serde_json::json!({"screen":"rooms"})).unwrap();
+        for recipient in [recipient(), Recipient::Clipboard, Recipient::External] {
+            assert!(registry.prepare_effect_for_activation(&context, epoch, Some(&recipient), Some(&action()), &serde_json::json!({"body":"private"})).is_err());
+        }
     }
 
     #[test]
@@ -333,6 +339,106 @@ mod tests {
         registry.approve_effect_once(&retry).unwrap(); registry.close_room_session("alice", "room-a").unwrap();
         assert!(registry.approve_effect_once(&retry).is_err());
         assert!(registry.commit_effect_for_activation(&context, epoch, Some(&Recipient::Clipboard), Some(&action), &payload).is_err());
+    }
+
+    fn browser(args: &serde_json::Value) -> (Recipient, SensitiveAction) {
+        let capability = crate::capabilities::for_service("url.open").unwrap();
+        let contract = capability.flow_contract().unwrap();
+        (contract.recipient("alice", None, args, None).unwrap().unwrap(),
+            contract.sensitive_action(capability.id, args, None).unwrap())
+    }
+
+    #[test]
+    fn browser_once_approval_captures_the_full_url_and_cannot_open_changed_links() {
+        let root = TestRoot::new(); let mut registry = root.registry(); let context = context();
+        private(&mut registry, &context); let epoch = registry.context_epoch(&context).unwrap();
+        let payload = serde_json::json!({"url":"https://example.com/manage?token=private#device"});
+        let (recipient, action) = browser(&payload);
+        let review = registry.prepare_effect_for_activation(&context, epoch, Some(&recipient), Some(&action), &payload).unwrap();
+        assert!(!review.allowed); assert_eq!(review.denied_sources.len(), 2);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&review.payload).unwrap(), payload);
+        registry.approve_effect_once(&review).unwrap();
+        for url in ["https://example.com/changed?token=private#device", "https://other.example/manage?token=private#device"] {
+            let changed = serde_json::json!({"url":url}); let (recipient, action) = browser(&changed);
+            assert!(registry.commit_effect_for_activation(&context, epoch, Some(&recipient), Some(&action), &changed).is_err());
+        }
+        registry.commit_effect_for_activation(&context, epoch, Some(&recipient), Some(&action), &payload).unwrap();
+        assert!(registry.commit_effect_for_activation(&context, epoch, Some(&recipient), Some(&action), &payload).is_err());
+        assert!(registry.sharing_grants().unwrap().is_empty()); assert!(registry.authorities().unwrap().is_empty());
+    }
+
+    #[test]
+    fn public_browser_session_authority_does_not_cover_other_origins() {
+        let root = TestRoot::new(); let mut registry = root.registry(); let context = context();
+        registry.register_context(&context).unwrap();
+        registry.add_influences(&context, [Influence::Unknown]).unwrap();
+        let epoch = registry.context_epoch(&context).unwrap();
+        let payload = serde_json::json!({"url":"https://Example.COM:443/first"});
+        let (recipient, action) = browser(&payload);
+        let review = registry.prepare_effect_for_activation(&context, epoch, Some(&recipient), Some(&action), &payload).unwrap();
+        assert!(!review.allowed); assert!(review.sources.is_empty()); assert!(review.denied_sources.is_empty());
+        registry.approve_effect_session(&review, SharingDuration::RobrixSession).unwrap();
+        let same_origin = serde_json::json!({"url":"https://example.com/second?query=public"});
+        let (same_recipient, same_action) = browser(&same_origin);
+        registry.commit_effect_for_activation(&context, epoch, Some(&same_recipient), Some(&same_action), &same_origin).unwrap();
+        for url in ["https://other.example/first", "http://example.com/first", "https://example.com:8443/first"] {
+            let changed = serde_json::json!({"url":url});
+            let (recipient, action) = browser(&changed);
+            let review = registry.prepare_effect_for_activation(&context, epoch, Some(&recipient), Some(&action), &changed).unwrap();
+            assert!(review.denied_sources.is_empty(), "public contents need no sharing grant");
+            assert!(!review.allowed, "action authority must require review for another browser origin");
+        }
+        assert!(registry.sharing_grants().unwrap().is_empty(), "this regression must exercise integrity independently of private sharing");
+    }
+
+    #[test]
+    fn browser_session_choice_covers_only_its_origin_action_and_reviewed_influences() {
+        let root = TestRoot::new(); let mut registry = root.registry(); let context = context();
+        private(&mut registry, &context); let epoch = registry.context_epoch(&context).unwrap();
+        let payload = serde_json::json!({"url":"https://Example.COM:443/manage?token=private"});
+        let (recipient, action) = browser(&payload);
+        let review = registry.prepare_effect_for_activation(&context, epoch, Some(&recipient), Some(&action), &payload).unwrap();
+        registry.approve_effect_session(&review, SharingDuration::RobrixSession).unwrap();
+        let changed = serde_json::json!({"url":"https://example.com/devices?device=two"});
+        let (same_recipient, same_action) = browser(&changed);
+        assert_eq!(recipient, same_recipient); assert_eq!(action, same_action);
+        registry.commit_effect_for_activation(&context, epoch, Some(&same_recipient), Some(&same_action), &changed).unwrap();
+        for url in ["http://example.com/manage", "https://example.com:8443/manage", "https://other.example/manage"] {
+            let changed = serde_json::json!({"url":url}); let (recipient, action) = browser(&changed);
+            let review = registry.prepare_effect_for_activation(&context, epoch, Some(&recipient), Some(&action), &changed).unwrap();
+            assert!(!review.allowed); assert_eq!(review.denied_sources.len(), 2);
+        }
+        let post = SensitiveAction { kind: "network.POST".into(), target: "https://example.com".into() };
+        assert!(registry.commit_effect_for_activation(&context, epoch, Some(&recipient), Some(&post), &changed).is_err());
+        registry.add_influences(&context, [Influence::InternetOrigin("https://new.example".into())]).unwrap();
+        let fresh = registry.prepare_effect_for_activation(&context, epoch, Some(&recipient), Some(&action), &payload).unwrap();
+        assert!(!fresh.allowed); assert!(fresh.denied_sources.is_empty());
+        registry.end_session().unwrap(); registry.register_context(&context).unwrap();
+        assert!(registry.ensure_allowed(&context, &recipient).is_err());
+    }
+
+    #[test]
+    fn non_http_links_refuse_private_data_and_public_action_choices_keep_exact_targets() {
+        let root = TestRoot::new(); let mut registry = root.registry(); let context = context();
+        registry.register_context(&context).unwrap();
+        registry.add_influences(&context, [Influence::Unknown]).unwrap();
+        let epoch = registry.context_epoch(&context).unwrap();
+        let payload = serde_json::json!({"url":"mailto:alice@example.com?subject=Hello"});
+        let (recipient, action) = browser(&payload);
+        assert_eq!(recipient, Recipient::External);
+        let review = registry.prepare_effect_for_activation(&context, epoch, Some(&recipient), Some(&action), &payload).unwrap();
+        assert!(!review.allowed); assert!(review.denied_sources.is_empty());
+        registry.approve_effect_session(&review, SharingDuration::RobrixSession).unwrap();
+        registry.commit_effect_for_activation(&context, epoch, Some(&recipient), Some(&action), &payload).unwrap();
+        let changed = serde_json::json!({"url":"mailto:bob@example.com?subject=Hello"});
+        let (other_recipient, other_action) = browser(&changed);
+        assert_eq!(recipient, other_recipient); assert_ne!(action, other_action);
+        assert!(registry.commit_effect_for_activation(&context, epoch, Some(&other_recipient), Some(&other_action), &changed).is_err());
+        registry.add_sources(&context, [Source::Account { account: "alice".into() }]).unwrap();
+        for payload in [payload, changed, serde_json::json!({"url":"file:///private/data"})] {
+            let (recipient, action) = browser(&payload);
+            assert!(registry.prepare_effect_for_activation(&context, epoch, Some(&recipient), Some(&action), &payload).is_err());
+        }
     }
 
     #[test]

@@ -530,7 +530,36 @@ mod tests {
         }
         let clipboard = for_service("clipboard.write").unwrap().flow_contract().unwrap();
         assert_eq!(clipboard.recipient("alice", None, &serde_json::json!({"text":"copied"}), None).unwrap(), Some(crate::information_flow::Recipient::Clipboard));
-        assert_eq!(for_service("url.open").unwrap().flow_contract().unwrap().output, FlowOutput::External);
+        assert_eq!(for_service("url.open").unwrap().flow_contract().unwrap().output, FlowOutput::Browser);
+    }
+
+    #[test]
+    fn browser_links_resolve_exact_origins_without_releasing_other_schemes() {
+        use crate::information_flow::{Recipient, SensitiveAction};
+        let capability = for_service("url.open").unwrap();
+        let contract = capability.flow_contract().unwrap();
+        let args = serde_json::json!({"url":"https://Example.COM:443/manage?token=private#device"});
+        assert_eq!(contract.recipient("alice", None, &args, None).unwrap(), Some(Recipient::NetworkOrigin("https://example.com".into())));
+        assert_eq!(contract.sensitive_action(capability.id, &args, None), Some(SensitiveAction {
+            kind: "device.url.open".into(), target: "https://example.com".into(),
+        }));
+        for destination in ["http://example.com/manage", "https://example.com:8443/manage"] {
+            let args = serde_json::json!({"url":destination});
+            let origin = Recipient::network_origin(destination).unwrap();
+            assert_eq!(contract.recipient("alice", None, &args, None).unwrap(), Some(origin.clone()));
+            let Recipient::NetworkOrigin(origin) = origin else { unreachable!() };
+            assert_eq!(contract.sensitive_action(capability.id, &args, None).unwrap().target, origin);
+        }
+        for destination in ["https://alice:secret@example.com/manage", "https://alice@example.com/manage", "https://:secret@example.com/manage", "https://%61lice@example.com/manage", "https://", "not a URL"] {
+            assert!(contract.recipient("alice", None, &serde_json::json!({"url":destination}), None).is_err());
+        }
+        assert!(contract.recipient("alice", None, &serde_json::json!({}), None).is_err());
+        for destination in ["mailto:alice@example.com?subject=Hello", "file:///private/data", "custom-app:open/item"] {
+            let args = serde_json::json!({"url":destination});
+            assert_eq!(contract.recipient("alice", None, &args, None).unwrap(), Some(Recipient::External));
+            assert_eq!(contract.sensitive_action(capability.id, &args, None).unwrap().target, destination);
+        }
+        assert_eq!(for_service("files.save").unwrap().flow_contract().unwrap().output, FlowOutput::External);
     }
 
     #[test]

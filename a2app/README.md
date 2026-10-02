@@ -437,7 +437,8 @@ mediates network, Matrix operations, clipboard/export, app IPC and tool
 arguments/results. Uncontrolled exports are refused once private data is
 present. Navigation to joined rooms, spaces and Robrix screens stays local;
 user/event/thread/link navigation may query the Matrix server and checks sharing
-with that exact origin. Clipboard copying has an explicit reviewed destination.
+with that exact origin. Clipboard copying and HTTP(S) browser links have explicit
+reviewed destinations.
 Source restrictions transfer across app/agent
 boundaries before delivery. Normal app navigation transfers provenance to
 the opened app. Each account/app/room combination has a separate filesystem
