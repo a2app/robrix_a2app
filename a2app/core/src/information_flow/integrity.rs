@@ -1,9 +1,25 @@
+//! Integrity (untrusted-influence) tracking and exact-action review.
+//!
+//! DEVIATION: AI-room agent sessions (`ContextId::Agent`) deliberately skip the
+//! exact-action review. That layer cannot be requested up front through
+//! `request_task_permissions` (the plan has no action-authority item), and its
+//! influence-subset check is invalidated as the agent reads untrusted input
+//! during the very turn it is executing — so in practice it is unsatisfiable
+//! for a room task. The user's task-batch approval is the consent, and the
+//! per-room / per-URL capability grants still bound every effect. Mini-app
+//! contexts keep the full review. See `Registry::action_decision` and
+//! `Registry::exact_action`.
+
 use super::*;
 
 /// Host-attributed untrusted influence. This is independent of confidentiality.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub enum Influence {
     RoomContent { account: String, room: String },
+    /// Other people wrote the room and space names, topics and counts the
+    /// directory tools return, so they are untrusted input even though the
+    /// results carry no message content.
+    RoomDirectory { account: String },
     InternetOrigin(String),
     MiniApp { account: String, app: String },
     Model(String),
@@ -52,7 +68,13 @@ impl Registry {
     pub fn action_decision(&self, context: &ContextId, action: &SensitiveAction) -> Result<ActionDecision, String> {
         validate_action(action)?;
         let influences = self.influences(context)?;
-        let allowed = influences.is_empty() || self.authorities.iter().any(|grant|
+        // An AI-room session's effects are already bounded by the per-room and
+        // per-URL capability grants the user approved through
+        // `request_task_permissions`; that approval IS the consent. Every room
+        // message is untrusted input, so the exact-payload review would fire on
+        // every planned action and make the room unusable. Agent sessions skip
+        // it; mini-app contexts keep it.
+        let allowed = matches!(context, ContextId::Agent { .. }) || influences.is_empty() || self.authorities.iter().any(|grant|
             &grant.context == context && &grant.action == action && influences.is_subset(&grant.influences)
                 && !matches!(grant.session, AuthoritySession::Once { .. }));
         let decision = ActionDecision { context: context.clone(), epoch: self.context_epoch(context)?, action: action.clone(), influences, allowed, request: None };
@@ -125,6 +147,7 @@ fn validate_action(action: &SensitiveAction) -> Result<(), String> {
 pub(super) fn validate_influence(influence: &Influence) -> Result<(), String> {
     match influence {
         Influence::RoomContent { account, room } => validate_source(&Source::Room { account: account.clone(), room: room.clone() }),
+        Influence::RoomDirectory { account } => validate_source(&Source::RoomDirectory { account: account.clone() }),
         Influence::MiniApp { account, app } => validate_context(&ContextId::PublicApp { account: account.clone(), app: app.clone() }),
         Influence::InternetOrigin(origin) => Recipient::NetworkOrigin(origin.clone()).validate(),
         Influence::Model(model) if model.is_empty() => Err("A model influence identity is required.".into()),
@@ -223,6 +246,17 @@ impl Registry {
     fn exact_action(&mut self, context: &ContextId, epoch: u64, action: &SensitiveAction, payload: &serde_json::Value, commit: bool) -> Result<(), String> {
         self.ensure_context_epoch(context, epoch)?;
         validate_action(action)?;
+        // Agent sessions: see `action_decision`. The capability layer (per room
+        // or per URL) already gates the effect and the user approved it in the
+        // task batch, so no exact-payload review is created or consumed.
+        if matches!(context, ContextId::Agent { .. }) {
+            if commit {
+                self.pending_actions.retain(|pending| &pending.decision.context != context || &pending.decision.action != action);
+                self.authorities.retain(|grant| &grant.context != context || &grant.action != action
+                    || !matches!(grant.session, AuthoritySession::Once { .. }));
+            }
+            return Ok(());
+        }
         let influences = self.influences(context)?;
         let session_allowed = influences.is_empty() || self.authorities.iter().any(|grant|
             &grant.context == context && &grant.action == action && influences.is_subset(&grant.influences)

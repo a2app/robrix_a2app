@@ -36,6 +36,8 @@ pub mod protection_audit;
 pub mod background;
 /// The tagged catalog of every ability, layered over the permission groups.
 pub mod capabilities;
+/// Upfront task permission requests: resolved plans and their atomic apply.
+pub mod task_grants;
 /// Built-in sample apps.
 pub mod builtin;
 /// On-disk persistence for apps, grants, and registry state.

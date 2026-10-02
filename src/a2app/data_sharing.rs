@@ -740,7 +740,7 @@ impl DataSharing {
         match flow::sharing_grants() {
             Ok(grants) => {
                 self.grants = grants.into_iter().filter(|grant| match &grant.source {
-                    Source::Account { account } | Source::Room { account, .. } => account == &self.account,
+                    Source::Account { account } | Source::Room { account, .. } | Source::RoomDirectory { account } => account == &self.account,
                     Source::UnknownPrivate => false,
                 }).collect();
                 self.view.widget(cx, ids!(sharing_error)).set_visible(cx, false);

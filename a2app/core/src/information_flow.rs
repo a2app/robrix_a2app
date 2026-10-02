@@ -35,6 +35,14 @@ use storage::{Metadata, StoredContext, StoredProvenance};
 pub enum Source {
     Account { account: String },
     Room { account: String, room: String },
+    /// The account's room and space directory (names, ids, counts) as
+    /// returned by the AI agent's default `list_rooms` / `list_spaces` /
+    /// `space_info` / `list_space_rooms` tools. Directory results carry no
+    /// message content, but they are account data written by other people,
+    /// so they remain untrusted and need a source of their own: one provider
+    /// rule covers the whole directory and other recipients do not inherit
+    /// every listed room.
+    RoomDirectory { account: String },
     /// Existing private storage whose sources cannot be recovered safely.
     UnknownPrivate,
 }
@@ -390,6 +398,28 @@ impl Registry {
         Ok(())
     }
 
+    /// Reset a fresh agent session's accumulated provenance to the empty label.
+    ///
+    /// Agent memory is per-session and does not survive a restart (the
+    /// embedded backend uses an in-memory store and the confined child uses a
+    /// disposable per-session workspace), so a previous session's label is not
+    /// a record of live data. Carrying it forward only lets one bad join — a
+    /// legacy app's `Source::UnknownPrivate` code provenance picked up by
+    /// `list_apps` — permanently wedge every later model call and room write.
+    /// The caller re-adds the baseline room source immediately after.
+    pub fn reset_agent_session_provenance(&mut self, context: &ContextId) -> Result<(), String> {
+        self.check_healthy()?;
+        if !matches!(context, ContextId::Agent { .. }) {
+            return Err("Only an agent session context may have its provenance reset.".into());
+        }
+        let mut next = self.metadata.clone();
+        let Some(entry) = next.contexts.iter_mut().find(|entry| &entry.context == context) else {
+            return Ok(());
+        };
+        entry.provenance = StoredProvenance::default();
+        self.persist(next)
+    }
+
     pub fn close_room_session(&mut self, account: &str, room: &str) -> Result<(), String> {
         self.check_healthy()?;
         self.close_exact_room(account, room);
@@ -445,6 +475,7 @@ fn validate_source(source: &Source) -> Result<(), String> {
     match source {
         Source::Account { account } if account.is_empty() => Err("A source account identity is required.".into()),
         Source::Room { account, room } if account.is_empty() || room.is_empty() => Err("A source account and room identity are required.".into()),
+        Source::RoomDirectory { account } if account.is_empty() => Err("A source account identity is required.".into()),
         _ => Ok(()),
     }
 }
@@ -476,6 +507,7 @@ fn provenance_for_sources(sources: impl IntoIterator<Item = Source>) -> StoredPr
     let label: Label = sources.into_iter().collect();
     let influences = label.iter().filter_map(|source| match source {
         Source::Room { account, room } => Some(Influence::RoomContent { account: account.clone(), room: room.clone() }),
+        Source::RoomDirectory { account } => Some(Influence::RoomDirectory { account: account.clone() }),
         Source::UnknownPrivate => Some(Influence::Unknown),
         Source::Account { .. } => None,
     }).collect();
@@ -550,6 +582,12 @@ pub fn register_context_with_legacy_data(context: &ContextId, legacy_private_dat
 
 pub fn add_sources(context: &ContextId, sources: impl IntoIterator<Item = Source>) -> Result<(), String> {
     with_registry(|registry| registry.add_sources(context, sources))
+}
+
+/// Drop a fresh agent session's accumulated provenance; see
+/// [`Registry::reset_agent_session_provenance`].
+pub fn reset_agent_session_provenance(context: &ContextId) -> Result<(), String> {
+    with_registry(|registry| registry.reset_agent_session_provenance(context))
 }
 
 pub fn join_labels(context: &ContextId, label: &Label) -> Result<(), String> {
@@ -678,6 +716,20 @@ pub fn revoke_sharing(id: u64) -> Result<bool, String> {
 
 pub fn sharing_grants() -> Result<Vec<SharingGrant>, String> {
     with_registry(|registry| registry.sharing_grants())
+}
+
+/// Whether `source` may already reach `recipient` for this exact agent/reader
+/// context, without joining any new source into the context's label. Used by
+/// the upfront task-plan resolver to turn a needed information-flow rule into
+/// `AlreadyAllowed` instead of `NeedsGrant`; enforcement still happens where it
+/// always did (the guarded model transport and the room/network workers).
+pub fn sharing_allows_for_reader(source: &Source, recipient: &Recipient, reader: &ContextId) -> Result<bool, String> {
+    with_registry(|registry| {
+        registry.check_healthy()?;
+        recipient.validate()?;
+        validate_source(source)?;
+        Ok(registry.source_allowed(source, recipient, Some(reader)))
+    })
 }
 
 pub fn close_room_session(account: &str, room: &str) -> Result<(), String> {

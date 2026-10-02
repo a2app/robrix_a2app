@@ -76,7 +76,7 @@ pub enum Status {
 }
 
 /// How much harm a misuse could do, for the user's read of the row.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Risk {
     Low,
     Medium,
