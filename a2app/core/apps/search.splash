@@ -8,6 +8,9 @@
 // why-matrix-rooms-read: Searches messages across the rooms you pick.
 // why-robrix-navigation: Jumps to a result you tap.
 
+let rooms_loading = false
+let rooms_loaded = false
+
 let mode = "room"
 let attached = false
 let server = false
@@ -28,7 +31,7 @@ fn sync_mode(){
     ui.mode_pick.set_text(mode_label("pick", "Pick rooms"))
     ui.mode_room.set_visible(attached)
     ui.room_list_wrap.set_visible(mode == "pick")
-    if mode == "pick" && rooms.len() == 0 { load_rooms() }
+    if mode == "pick" && !rooms_loaded { load_rooms() }
 }
 
 fn set_mode(m){
@@ -37,9 +40,13 @@ fn set_mode(m){
 }
 
 fn load_rooms(){
+    if rooms_loading { return nil }
+    rooms_loading = true
     rooms_line = "Loading rooms…"
     ui.room_list.render()
     host.request("matrix.rooms_list", nil, fn(r){
+        rooms_loading = false
+        rooms_loaded = r.is_ok
         rooms = []
         if r.is_ok {
             for it in r.data.rooms {

@@ -42,8 +42,8 @@ script_mod! {
             width: Fill, height: Fill, flow: Down, spacing: 12, padding: 15
             rules_page := View {
                 width: Fill, height: Fit, flow: Down, spacing: 12
-                SubsectionLabel { text: "Where private data can go", margin: 0 }
-                PermissionOptionLabel { text: "Mini-apps and agents need a sharing rule before sending private room or account data to another destination." }
+                SubsectionLabel { text: "Saved permissions", margin: 0 }
+                PermissionOptionLabel { text: "Apps ask directly when they need permission. Review saved sharing rules and action approvals here. Needs attention shows blocked requests; History records previous checks." }
                 new_rule := RobrixPositiveIconButton { text: "Add sharing rule", padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0} }
                 current_rules := PermissionOptionLabel {}
                 sharing_error := PermissionOptionLabel { visible: false, draw_text +: { color: (COLOR_FG_DANGER_RED) } }
@@ -86,7 +86,7 @@ script_mod! {
                 }
                 destination_step := View {
                     visible: false, width: Fill, height: Fit, flow: Down, spacing: 10
-                    recipient_kind := PermissionChoices { labels: ["My configured AI service", "A website", "Another room"] }
+                    recipient_kind := PermissionChoices { labels: ["My configured AI service", "A website", "Another room", "The system clipboard"] }
                     model_section := View {
                         width: Fill, height: Fit, flow: Down, spacing: 8
                         model_description := PermissionOptionLabel {}
@@ -103,6 +103,10 @@ script_mod! {
                         target_room := PermissionDropDown {}
                         PermissionOptionLabel { text: "Data may be included in messages and other operations in this room. Its read and write permissions still apply." }
                     }
+                    clipboard_section := View {
+                        visible: false, width: Fill, height: Fit, flow: Down
+                        PermissionOptionLabel { text: "Other apps on this device may read data copied to the system clipboard." }
+                    }
                 }
                 review_step := View {
                     visible: false, width: Fill, height: Fit, flow: Down, spacing: 10
@@ -116,7 +120,7 @@ script_mod! {
                     rule_preview := PermissionOptionLabel {}
                     rule_identifiers_toggle := TextButton { text: "Show identifiers" }
                     rule_identifiers := PermissionOptionLabel { visible: false }
-                    PermissionOptionLabel { text: "Allowing sharing may send private room or account data off this device to the destination shown. If several data sources are used together, each must allow that destination." }
+                    PermissionOptionLabel { text: "Allowing sharing sends private room or account data to the destination shown. If several data sources are used together, each must allow that destination." }
                 }
                 wizard_error := PermissionOptionLabel { visible: false, draw_text +: { color: (COLOR_FG_DANGER_RED) } }
                 View {
@@ -147,7 +151,7 @@ script_mod! {
                         decision_identifiers := PermissionOptionLabel { visible: false }
                         review_section := View {
                             width: Fill, height: Fit, flow: Down, spacing: 8
-                            PermissionOptionLabel { text: "Which blocked data source do you want to review?" }
+                            blocked_source_prompt := PermissionOptionLabel { text: "Which data source do you want to review?" }
                             blocked_source_choice := PermissionChoices {}
                             review_button := TextButton { text: "Review sharing rule" }
                             review_problem := PermissionOptionLabel { visible: false }
@@ -717,6 +721,7 @@ impl DataSharing {
             2 => self.rooms.get(self.view.drop_down(cx, ids!(target_room)).selected_item())
                 .map(|(room, _)| Recipient::MatrixRoom { account: self.account.clone(), room: room.clone() })
                 .ok_or_else(|| "Select a joined destination room.".into()),
+            3 => Ok(Recipient::Clipboard),
             _ => Err("Select a recipient type.".into()),
         }
     }
@@ -726,6 +731,7 @@ impl DataSharing {
         self.view.widget(cx, ids!(model_section)).set_visible(cx, kind == 0);
         self.view.widget(cx, ids!(network_section)).set_visible(cx, kind == 1);
         self.view.widget(cx, ids!(room_section)).set_visible(cx, kind == 2);
+        self.view.widget(cx, ids!(clipboard_section)).set_visible(cx, kind == 3);
         if kind == 1 {
             let preview = match self.selected_recipient(cx) {
                 Ok(Recipient::NetworkOrigin(origin)) => format!("Recipient: {origin}"),
@@ -810,6 +816,7 @@ impl DataSharing {
                 format!("Matrix room: {name} ({room}) · {account}")
             }
             Recipient::External => "Unrestricted external sharing (remove to protect this source)".into(),
+            Recipient::Clipboard => "System clipboard · other apps on this device may read it".into(),
         }
     }
 
@@ -1150,6 +1157,10 @@ mod tests {
         assert_eq!(editor.selected_recipient(&cx).unwrap(), Recipient::NetworkOrigin("https://blocked.example:8443".into()));
         editor.decisions[0].recipient = Recipient::ModelProvider("stale-model-identity".into());
         assert!(editor.review_decision(&mut cx).is_err());
+        editor.decisions[0].recipient = Recipient::Clipboard;
+        editor.review_decision(&mut cx).unwrap();
+        assert_eq!(editor.selected_recipient(&cx).unwrap(), Recipient::Clipboard);
+        assert!(editor.view.widget(&cx, ids!(clipboard_section)).visible());
     }
 
     #[test]
@@ -1368,7 +1379,7 @@ mod tests {
         let snapshot = context_fixture();
         let recipient = Recipient::NetworkOrigin("https://example.org".into());
         let text = editor.sharing_remedy(&snapshot.label, &recipient);
-        assert!(text.contains("Sharing rules"));
+        assert!(text.contains("Sharing needs your approval"));
         assert!(text.contains("Review sharing rule"));
         assert!(text.contains("Allow sharing"));
         assert!(editor.sharing_remedy(&[Source::UnknownPrivate].into(), &recipient).contains("No sharing rule"));

@@ -28,6 +28,7 @@ pub enum FlowOutput {
     /// Local UI or state confined to the current compartment.
     Local,
     External,
+    Clipboard,
     TargetRoom,
     /// The actual HTTP origin; checked again by the host network worker.
     Network,
@@ -77,7 +78,8 @@ pub fn contract(id: &str) -> Option<FlowContract> {
         "device.clipboard.read" | "device.files.pick"
             => (S::Account, O::Local, true, false),
         "device.auth.check" => (S::Account, O::Local, false, true),
-        "device.clipboard.write" | "device.url.open" | "device.files.save"
+        "device.clipboard.write" => (S::None, O::Clipboard, false, true),
+        "device.url.open" | "device.files.save"
         | "device.share" => (S::None, O::External, false, true),
         "ipc.send" | "ipc.self.send" => (S::Account, O::Peer(FlowPeer::Ipc), false, false),
         "ipc.post" => (S::None, O::Peer(FlowPeer::Ipc), false, false),
@@ -116,9 +118,10 @@ pub fn contract(id: &str) -> Option<FlowContract> {
         | "on_room_message" | "on_room_message_changed" | "on_room_reaction"
         | "on_room_typing" | "on_room_receipt" | "on_room_members_changed"
             => (S::AttachedRoom, O::Local, true, false),
-        "host.nav.room" | "host.nav.event" | "host.nav.thread" | "host.nav.user"
-        | "host.nav.space" | "host.nav.screen" | "host.nav.link"
-            => (S::None, O::External, false, true),
+        "host.nav.room" | "host.nav.space" | "host.nav.screen"
+            => (S::None, O::Local, false, true),
+        "host.nav.event" | "host.nav.thread" | "host.nav.user" | "host.nav.link"
+            => (S::None, O::MatrixServer, false, true),
         "host.composer.insert" | "host.composer.reply_to"
             => (S::None, O::TargetRoom, false, true),
         "host.nav.app" | "apps.launch" => (S::None, O::Peer(FlowPeer::App), false, true),
@@ -151,6 +154,7 @@ impl FlowContract {
         let server = || Recipient::network_origin(homeserver.ok_or("No homeserver destination.")?);
         Ok(match self.output {
             FlowOutput::External => Some(Recipient::External),
+            FlowOutput::Clipboard => Some(Recipient::Clipboard),
             FlowOutput::TargetRoom => Some(Recipient::MatrixRoom { account: account.into(), room: target_room.ok_or("No destination room.")?.into() }),
             FlowOutput::Network => Some(Recipient::network_origin(args["url"].as_str().ok_or("No network destination.")?)?),
             FlowOutput::MatrixServer => Some(server()?),
@@ -169,6 +173,7 @@ impl FlowContract {
                 FlowOutput::MatrixServer if capability == "matrix.user.dm.open" => "host",
                 FlowOutput::TargetRoom | FlowOutput::MatrixServer => target_room.unwrap_or("host"),
                 FlowOutput::External => "external",
+                FlowOutput::Clipboard => "clipboard",
                 FlowOutput::Peer(_) => args["app_id"].as_str().unwrap_or("apps"),
                 _ => "host",
             }.into(),

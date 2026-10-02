@@ -37,7 +37,7 @@ use a2app_agent::prefs::AgentPrefs;
 
 use crate::a2app::host_pane::{MiniAppHostPaneAction, MiniAppHostPaneWidgetRefExt};
 use crate::a2app::permission_prompt::{
-    MiniAppPermissionPromptWidgetRefExt, PermissionPromptAction, PromptInfo, ToolPreview,
+    MiniAppPermissionPromptWidgetRefExt, PermissionPromptAction, PermissionPromptResponse, PromptInfo, FlowPromptInfo, ToolPreview,
 };
 use crate::room::room_pane::{self, RoomPaneKind, RoomPaneOp};
 use crate::a2app::instances::{self, MiniAppInstanceAction, Surface};
@@ -243,6 +243,7 @@ pub struct PromptToolGrant {
 
 /// A runtime permission prompt waiting for (or showing to) the user.
 pub struct PermissionPrompt {
+    id: u64,
     /// The permission-store subject the answer is recorded for: an installed
     /// app's id, or an AI room's agent key (see [`agent_subject`]). One
     /// decision, one subject — a mini-app and a room's AI can never answer
@@ -254,6 +255,38 @@ pub struct PermissionPrompt {
     pub parked: Vec<ParkedRequest>,
     /// For an `mcp-tools` prompt: the tool under review.
     pub tool: Option<PromptToolGrant>,
+    flow: Option<FlowContinuation>,
+    enable_writes: bool,
+    activations: Vec<(usize, u64, a2app_core::information_flow::ContextId, u64)>,
+}
+
+static NEXT_PERMISSION_PROMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_permission_prompt_id() -> u64 {
+    NEXT_PERMISSION_PROMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+enum FlowContinuation {
+    Bridge { request: SplashHostRequest, review: a2app_core::information_flow::EffectReview, allow_once: bool },
+    Worker(super::effect_review::WorkerReview),
+}
+
+impl FlowContinuation {
+    fn review(&self) -> &a2app_core::information_flow::EffectReview {
+        match self { Self::Bridge { review, .. } => review, Self::Worker(worker) => &worker.review }
+    }
+
+    fn allow_once(&self) -> bool {
+        match self { Self::Bridge { allow_once, .. } => *allow_once, Self::Worker(worker) => worker.allow_once }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Worker(worker) if worker.is_cancelled())
+    }
+
+    fn approve(&self, approve: impl FnOnce(&a2app_core::information_flow::EffectReview) -> Result<(), String>) -> Result<(), String> {
+        match self { Self::Bridge { review, .. } => approve(review), Self::Worker(worker) => worker.approve(approve) }
+    }
 }
 
 /// The state of the AI generation console shown in the Mini Apps screen.
@@ -980,7 +1013,7 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     instances::flush_pending(cx);
 
     let mut ops: Vec<A2AppOp> = Vec::new();
-    let mut prompt_answers: Vec<PermissionPromptAction> = Vec::new();
+    let mut prompt_answers: Vec<PermissionPromptResponse> = Vec::new();
     let mut matrix_results: Vec<A2AppMatrixResult> = Vec::new();
     let mut network_results: Vec<HostNetworkResult> = Vec::new();
     let mut pane_actions: Vec<MiniAppHostPaneAction> = Vec::new();
@@ -1054,7 +1087,7 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
                 ops.push(op.clone());
                 continue;
             }
-            if let Some(answer) = action.downcast_ref::<PermissionPromptAction>() {
+            if let Some(answer) = action.downcast_ref::<PermissionPromptResponse>() {
                 prompt_answers.push(answer.clone());
                 continue;
             }
@@ -1186,7 +1219,8 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
         ui.redraw(cx);
     }
 
-    for answer in prompt_answers {
+    for answer in prompt_answers.into_iter().take(1) {
+        sweep_permission_prompts(cx, ui);
         answer_permission_prompt(cx, ui, answer);
     }
     for pane_action in pane_actions {
@@ -1246,12 +1280,16 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
         }
     });
     process_broker(cx, ui);
+    sweep_permission_prompts(cx, ui);
+    for worker in super::effect_review::take_pending() {
+        queue_flow_prompt(cx, ui, FlowContinuation::Worker(worker));
+    }
 
     // An action the user took that was refused or failed gets a popup that
     // says why, on top of the script's own error handling.
     for failure in with_a2app(|state| state.broker.failures()).unwrap_or_default() {
         super::background::record_failure(failure.heap_key, &failure.error);
-        if !failure.show_popup { continue; }
+        if !failure.show_popup || failure.error == "This request was not approved." { continue; }
         let services::ServiceFailure { app_id, error, .. } = failure;
         let name = with_a2app(|state| state.registry.get(&app_id).map(|a| a.name.clone()))
             .flatten()
@@ -2648,7 +2686,7 @@ fn finish_generated_app(cx: &mut Cx, ui: &WidgetRef, mut pending: PendingGenerat
             state.generation_context = None; state.generation_epoch = None;
             if awaiting_review {
                 state.failed_request = Some(pending.request.clone());
-                state.console.status = "Build complete. Review its exact contents in Data sharing and action review, then select Retry to install this saved build.".into();
+                state.console.status = "Build complete. Review its exact contents in Advanced permissions, then select Retry to install this saved build.".into();
                 state.pending_generated = Some(pending);
             } else { state.console.status = format!("Failed: {reason}"); }
         });
@@ -2732,6 +2770,13 @@ fn process_broker(cx: &mut Cx, ui: &WidgetRef) {
 
 fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
     match ask {
+        BrokerAsk::EnableWrites { app_id, perm, request } => {
+            queue_permission_prompt(cx, ui, app_id, perm, ParkedRequest::Bridge(Some(request)), None);
+        }
+        BrokerAsk::FlowReview { request, review } => {
+            let allow_once = !request.service.starts_with("matrix.") && request.service != "network.http";
+            queue_flow_prompt(cx, ui, FlowContinuation::Bridge { request, review, allow_once });
+        }
         BrokerAsk::Prompt { app_id, perm, request, tool } => {
             let grant = tool.map(|t| PromptToolGrant {
                 full_name: t.full_name,
@@ -3447,14 +3492,135 @@ fn queue_permission_prompt(
         return;
     }
     with_a2app(|state| {
+        let rooms = parked_rooms(&parked);
+        let activation = match &parked {
+            ParkedRequest::Bridge(Some(request)) => super::information_flow::context_for_heap(request.heap_key).ok()
+                .and_then(|context| a2app_core::information_flow::context_epoch(&context).ok()
+                    .map(|epoch| (request.heap_key, request.req_id, context, epoch))),
+            _ => None,
+        };
+        let enable_writes = parked_can_enable_writes(state, &subject, perm, &parked);
+        let network = parked_network_url(&parked).and_then(|url| a2app_core::information_flow::Recipient::network_origin(&url).ok());
+        let matches = |prompt: &PermissionPrompt| prompt.flow.is_none() && prompt.subject == subject && prompt.perm == perm
+            && prompt.tool.as_ref().map(|tool| (&tool.full_name, &tool.content_hash)) == tool.as_ref().map(|tool| (&tool.full_name, &tool.content_hash))
+            && prompt.parked.first().is_some_and(|request| parked_rooms(request) == rooms
+                && parked_network_url(request).and_then(|url| a2app_core::information_flow::Recipient::network_origin(&url).ok()) == network);
+        if let Some(prompt) = state.active_prompt.as_mut().filter(|prompt| matches(prompt)) {
+            prompt.parked.push(parked);
+            prompt.activations.extend(activation);
+            return;
+        }
+        if let Some(prompt) = state.prompts.iter_mut().find(|prompt| matches(prompt)) {
+            prompt.parked.push(parked);
+            prompt.activations.extend(activation);
+            return;
+        }
         state.prompts.push_back(PermissionPrompt {
+            id: next_permission_prompt_id(),
             subject,
             perm,
             parked: vec![parked],
             tool,
+            flow: None,
+            enable_writes,
+            activations: activation.into_iter().collect(),
         });
     });
     show_next_permission_prompt(cx, ui);
+}
+
+fn queue_flow_prompt(cx: &mut Cx, ui: &WidgetRef, flow: FlowContinuation) {
+    let review = flow.review();
+    if super::information_flow::current_context(&review.context).is_err()
+        || !instances::context_can_prompt(&review.context, review.epoch)
+    {
+        refuse_flow(cx, flow, "Open this mini-app to review the permission it needs.");
+        return;
+    }
+    let subject = review.context.app().unwrap_or_default().to_owned();
+    let perm = review.action.as_ref().and_then(|action| a2app_core::capabilities::by_id(&action.kind))
+        .and_then(|capability| capability.group).unwrap_or(Permission::Network);
+    with_a2app(|state| state.prompts.push_back(PermissionPrompt {
+        id: next_permission_prompt_id(), subject, perm, parked: Vec::new(), tool: None, flow: Some(flow), enable_writes: false, activations: Vec::new(),
+    }));
+    show_next_permission_prompt(cx, ui);
+}
+
+fn refuse_flow(cx: &mut Cx, flow: FlowContinuation, reason: &str) {
+    match flow {
+        FlowContinuation::Worker(worker) => worker.finish(Err(reason.into())),
+        FlowContinuation::Bridge { request, review, .. } => {
+            let _ = a2app_core::information_flow::cancel_effect(review.id);
+            if a2app_core::information_flow::ensure_context_epoch(&review.context, review.epoch).is_ok()
+                && super::information_flow::context_for_heap(request.heap_key).as_ref() == Ok(&review.context)
+            {
+                with_a2app(|state| state.broker.declined(&request));
+                services::respond(cx, Reply { heap_key: request.heap_key, req_id: request.req_id }, Err(reason));
+            }
+        }
+    }
+}
+
+fn replay_bridge_request(cx: &mut Cx, ui: &WidgetRef, request: SplashHostRequest) {
+    let asks = with_a2app(|state| {
+        let A2AppState { broker, registry, permissions, foreground_app, .. } = state;
+        let is_docked = |app_id: &str| instances::is_foreground(app_id);
+        let desktop_view = effective_is_desktop(cx);
+        let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
+        let room_name = |id: &str| room_display_name(rooms.as_ref()?, id);
+        broker.dispatch_after_grant(cx, BrokerCtx {
+            registry, permissions, foreground_app: foreground_app.as_deref(),
+            is_docked: &is_docked, is_running: &instances::is_running,
+            pane_state: &instances::pane_state, storage_path: &compartment_storage_path,
+            room_name: &room_name, desktop_view,
+            check_flow: &super::information_flow::check_request,
+            check_response: &super::information_flow::check_response,
+        }, request)
+    }).unwrap_or_default();
+    for ask in asks { apply_broker_ask(cx, ui, ask); }
+}
+
+fn bridge_activation_is_live(request: &SplashHostRequest, activations: &[(usize, u64, a2app_core::information_flow::ContextId, u64)]) -> bool {
+    activations.iter().find(|(heap, id, _, _)| *heap == request.heap_key && *id == request.req_id)
+        .is_some_and(|(_, _, context, epoch)| a2app_core::information_flow::ensure_context_epoch(context, *epoch).is_ok()
+            && super::information_flow::context_for_heap(request.heap_key).as_ref() == Ok(context))
+}
+
+fn bridge_activation_can_prompt(request: &SplashHostRequest, activations: &[(usize, u64, a2app_core::information_flow::ContextId, u64)]) -> bool {
+    bridge_activation_is_live(request, activations) && activations.iter()
+        .find(|(heap, id, _, _)| *heap == request.heap_key && *id == request.req_id)
+        .is_some_and(|(_, _, context, epoch)| instances::context_can_prompt(context, *epoch))
+}
+
+fn retain_live_bridge_requests(prompt: &mut PermissionPrompt) {
+    let activations = &prompt.activations;
+    prompt.parked.retain(|parked| match parked {
+        ParkedRequest::Bridge(Some(request)) => bridge_activation_can_prompt(request, activations),
+        _ => true,
+    });
+}
+
+fn sweep_permission_prompts(cx: &mut Cx, ui: &WidgetRef) {
+    let stale = with_a2app(|state| {
+        let prompt = state.active_prompt.as_ref()?;
+        let stale = if let Some(flow) = &prompt.flow {
+            let review = flow.review();
+            a2app_core::information_flow::ensure_context_epoch(&review.context, review.epoch).is_err()
+                || !instances::context_can_prompt(&review.context, review.epoch)
+                || flow.is_cancelled()
+        } else {
+            !prompt.parked.iter().any(|parked| match parked {
+                ParkedRequest::Bridge(Some(request)) => bridge_activation_can_prompt(request, &prompt.activations),
+                _ => true,
+            })
+        };
+        if stale { state.active_prompt.take() } else { None }
+    }).flatten();
+    if let Some(mut prompt) = stale {
+        if let Some(flow) = prompt.flow.take() { refuse_flow(cx, flow, "This permission request was cancelled."); }
+        ui.modal(cx, ids!(a2app_permission_modal)).close(cx);
+        show_next_permission_prompt(cx, ui);
+    }
 }
 
 /// The tool name an AI session job maps to (the name the model called).
@@ -3617,13 +3783,15 @@ fn refuse_parked_request(cx: &mut Cx, perm: Permission, parked: ParkedRequest) {
 #[cfg(unix)]
 fn refuse_room_prompts(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
     let subject = agent_subject(room_id.as_str());
-    let (parked, was_active) = with_a2app(|state| {
+    let (parked, flows, was_active) = with_a2app(|state| {
         let mut parked: Vec<(Permission, ParkedRequest)> = Vec::new();
+        let mut flows = Vec::new();
         let mut was_active = false;
         if state.active_prompt.as_ref().is_some_and(|p| p.subject == subject) {
             if let Some(p) = state.active_prompt.take() {
                 let perm = p.perm;
                 parked.extend(p.parked.into_iter().map(|q| (perm, q)));
+                flows.extend(p.flow);
                 was_active = true;
             }
         }
@@ -3633,13 +3801,15 @@ fn refuse_room_prompts(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
         for p in mine {
             let perm = p.perm;
             parked.extend(p.parked.into_iter().map(|q| (perm, q)));
+            flows.extend(p.flow);
         }
-        (parked, was_active)
+        (parked, flows, was_active)
     })
     .unwrap_or_default();
     for (perm, request) in parked {
         refuse_parked_request(cx, perm, request);
     }
+    for flow in flows { refuse_flow(cx, flow, "This permission request was cancelled."); }
     if was_active {
         ui.modal(cx, ids!(a2app_permission_modal)).close(cx);
         show_next_permission_prompt(cx, ui);
@@ -3648,26 +3818,118 @@ fn refuse_room_prompts(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
 
 fn show_next_permission_prompt(cx: &mut Cx, ui: &WidgetRef) {
     let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
-    let info = with_a2app(|state| {
-        if state.active_prompt.is_some() {
-            return None;
+    loop {
+        let Some(mut prompt) = with_a2app(|state| {
+            if state.active_prompt.is_some() { None } else { state.prompts.pop_front() }
+        }).flatten() else { return };
+        retain_live_bridge_requests(&mut prompt);
+        if prompt.flow.is_none() && prompt.parked.is_empty() { continue; }
+        if let Some(flow) = prompt.flow.as_mut() {
+            if flow.is_cancelled() {
+                refuse_flow(cx, prompt.flow.take().unwrap(), "This permission request was cancelled.");
+                continue;
+            }
+            let review = flow.review();
+            let payload = serde_json::from_str(&review.payload);
+            let updated = payload.map_err(|_| "This permission request is invalid.".to_owned())
+                .and_then(|payload| a2app_core::information_flow::prepare_effect_for_activation(
+                    &review.context, review.epoch, review.recipient.as_ref(), review.action.as_ref(), &payload));
+            let updated = match updated {
+                Ok(updated) if instances::context_can_prompt(&updated.context, updated.epoch) => updated,
+                Ok(_) => { refuse_flow(cx, prompt.flow.take().unwrap(), "Reopen this mini-app to continue."); continue; }
+                Err(error) => { refuse_flow(cx, prompt.flow.take().unwrap(), &error); continue; }
+            };
+            match flow {
+                FlowContinuation::Bridge { review, .. } => *review = updated,
+                FlowContinuation::Worker(worker) => worker.review = updated,
+            }
+            if flow.review().allowed {
+                resume_flow(cx, ui, prompt.flow.take().unwrap());
+                continue;
+            }
+            let mut info = with_a2app(|state| flow_prompt_info(state, rooms.as_ref(), flow)).unwrap();
+            info.prompt_id = prompt.id;
+            with_a2app(|state| state.active_prompt = Some(prompt));
+            ui.mini_app_permission_prompt(cx, ids!(a2app_permission_modal.content)).show_flow(cx, &info);
+        } else {
+            let granted = with_a2app(|state| prompt_already_granted(state, &prompt)).unwrap_or(false);
+            if granted && prompt.parked.iter().all(|request| matches!(request, ParkedRequest::Bridge(_))) {
+                for parked in prompt.parked {
+                    if let ParkedRequest::Bridge(Some(request)) = parked { replay_bridge_request(cx, ui, request); }
+                }
+                continue;
+            }
+            let mut info = with_a2app(|state| prompt_info_for(state, rooms.as_ref(), &prompt.subject,
+                prompt.perm, &prompt.parked, prompt.tool.as_ref())).unwrap();
+            info.enable_writes = prompt.enable_writes;
+            info.prompt_id = prompt.id;
+            with_a2app(|state| state.active_prompt = Some(prompt));
+            ui.mini_app_permission_prompt(cx, ids!(a2app_permission_modal.content)).show(cx, &info);
         }
-        let prompt = state.prompts.pop_front()?;
-        let info = prompt_info_for(
-            state,
-            rooms.as_ref(),
-            &prompt.subject,
-            prompt.perm,
-            &prompt.parked,
-            prompt.tool.as_ref(),
-        );
-        state.active_prompt = Some(prompt);
-        Some(info)
+        ui.modal(cx, ids!(a2app_permission_modal)).open(cx);
+        return;
+    }
+}
+
+fn prompt_already_granted(state: &A2AppState, prompt: &PermissionPrompt) -> bool {
+    prompt.parked.iter().all(|parked| {
+        let (origin, target) = parked_rooms(parked);
+        let context = PermissionContext { origin_room: origin.as_deref(), target_room: target.as_deref() };
+        if let Some(url) = parked_network_url(parked) { return state.permissions.is_url_allowed(&prompt.subject, &url, context); }
+        if let Some(tool) = &prompt.tool {
+            return state.permissions.has_scoped_tool_grant(&prompt.subject, &tool.full_name, &tool.content_hash, context);
+        }
+        let Some(manifest) = state.registry.get(&prompt.subject) else { return false };
+        if let Some(capability) = parked_capability(parked) {
+            if services::is_room_collection(capability) {
+                state.permissions.effective_collection_capability_in_context(manifest, capability, context) == Effective::Granted
+            } else { state.permissions.effective_capability_in_context(manifest, capability, context) == Effective::Granted }
+        } else { state.permissions.effective_for_in_context(&prompt.subject, |permission| manifest.declares(permission), prompt.perm, context) == Effective::Granted }
     })
-    .flatten();
-    let Some(info) = info else { return };
-    ui.mini_app_permission_prompt(cx, ids!(a2app_permission_modal.content)).show(cx, &info);
-    ui.modal(cx, ids!(a2app_permission_modal)).open(cx);
+}
+
+fn flow_prompt_info(state: &A2AppState, rooms: Option<&RoomsListRef>, flow: &FlowContinuation) -> FlowPromptInfo {
+    use a2app_core::information_flow::{Recipient, Source};
+    let review = flow.review();
+    let manifest = review.context.app().and_then(|app| state.registry.get(app));
+    let room_name = |room: &str| rooms.and_then(|rooms| room_display_name(rooms, room)).unwrap_or_else(|| room.into());
+    let destination = match review.recipient.as_ref() {
+        Some(Recipient::MatrixRoom { room, .. }) => format!("Room: {}", room_name(room)),
+        Some(Recipient::NetworkOrigin(origin)) => {
+            let is_server = crate::sliding_sync::get_client().is_some_and(|client|
+                Recipient::network_origin(client.homeserver().as_str()).as_ref() == Ok(&Recipient::NetworkOrigin(origin.clone())));
+            format!("{}: {origin}", if is_server { "Your Matrix server" } else { "Website" })
+        }
+        Some(Recipient::ModelProvider(_)) => "Your AI service".into(),
+        Some(Recipient::Clipboard) => "System clipboard (other apps can read copied text)".into(),
+        Some(Recipient::External) => "External destination".into(),
+        None => "Robrix".into(),
+    };
+    let action = review.action.as_ref().and_then(|action| a2app_core::capabilities::by_id(&action.kind))
+        .or_else(|| serde_json::from_str::<serde_json::Value>(&review.payload).ok()
+            .and_then(|payload| payload["operation"].as_str().and_then(a2app_core::capabilities::by_id)))
+        .map(|capability| capability.title.to_string()).unwrap_or_else(|| "Share data to continue".into());
+    FlowPromptInfo {
+        prompt_id: 0,
+        app_name: manifest.map(|manifest| manifest.name.clone()).unwrap_or_else(|| "Mini-app".into()),
+        app_icon: manifest.map(|manifest| manifest.icon.clone()).unwrap_or_default(),
+        action, destination,
+        sources: review.sources.iter().map(|source| match source {
+            Source::Account { .. } => "Your account data or text entered in this app".into(),
+            Source::Room { room, .. } => format!("Data from {}", room_name(room)),
+            Source::UnknownPrivate => "Older private data with an unknown source".into(),
+        }).collect(),
+        payload: serde_json::from_str::<serde_json::Value>(&review.payload)
+            .and_then(|value| serde_json::to_string_pretty(&value)).unwrap_or_else(|_| review.payload.to_string()),
+        allow_once: flow.allow_once(),
+    }
+}
+
+fn resume_flow(cx: &mut Cx, ui: &WidgetRef, flow: FlowContinuation) {
+    match flow {
+        FlowContinuation::Worker(worker) => worker.finish(Ok(())),
+        FlowContinuation::Bridge { request, .. } => replay_bridge_request(cx, ui, request),
+    }
 }
 
 /// The verb phrase a permission prompt shows for one parked AI tool call —
@@ -3846,6 +4108,23 @@ fn parked_rooms(parked: &ParkedRequest) -> (Option<String>, Option<String>) {
     }
 }
 
+fn parked_can_enable_writes(state: &A2AppState, subject: &str, permission: Permission, parked: &ParkedRequest) -> bool {
+    let Some(manifest) = state.registry.get(subject) else { return false };
+    let (origin, target) = parked_rooms(parked);
+    let context = PermissionContext { origin_room: origin.as_deref(), target_room: target.as_deref() };
+    if let Some(capability) = parked_capability(parked) {
+        return services::can_enable_writes(&state.permissions, manifest, capability, context);
+    }
+    if let ParkedRequest::Bridge(Some(request)) = parked {
+        if request.service == "permissions.request" {
+            let args: serde_json::Value = serde_json::from_str(&request.args_json).unwrap_or_default();
+            return args["perm"].as_str().and_then(Permission::from_str) == Some(permission)
+                && services::can_enable_permission_writes(&state.permissions, manifest, permission, context);
+        }
+    }
+    false
+}
+
 fn parked_capability(parked: &ParkedRequest) -> Option<&'static a2app_core::capabilities::Capability> {
     match parked {
         ParkedRequest::Bridge(Some(request)) => {
@@ -3921,6 +4200,7 @@ fn prompt_info_for(
             .and_then(|r| room_display_name(r, room))
             .unwrap_or_else(|| room.to_string());
         return PromptInfo {
+            prompt_id: 0,
             app_name: format!("AI in {room_name}"),
             app_icon: String::from("🤖"),
             perm,
@@ -3928,7 +4208,7 @@ fn prompt_info_for(
             capability: Some(ai_prompt_action(rooms, perm, parked)),
             agent: true,
             tool: tool_preview,
-            room_id, origin_room_id, network_url, can_allow_once,
+            room_id, origin_room_id, network_url, can_allow_once, collection: parked.iter().filter_map(parked_capability).any(services::is_room_collection), enable_writes: false,
         };
     }
     let (app_name, app_icon, reason) = state.registry.get(subject)
@@ -3962,7 +4242,8 @@ fn prompt_info_for(
         })
         .map(|c| c.title.to_string())
     };
-    PromptInfo { app_name, app_icon, perm, reason, capability, agent: false, tool: tool_preview, room_id, origin_room_id, network_url, can_allow_once }
+    PromptInfo { prompt_id: 0, app_name, app_icon, perm, reason, capability, agent: false, tool: tool_preview, room_id, origin_room_id, network_url, can_allow_once,
+        collection: parked.iter().filter_map(parked_capability).any(services::is_room_collection), enable_writes: false }
 }
 
 /// Answers one session tool call with a finished result, whatever variant it
@@ -3999,12 +4280,57 @@ fn ai_tool_refused_text(perm: Permission) -> String {
     )
 }
 
-fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromptAction) {
+fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, response: PermissionPromptResponse) {
+    if !with_a2app(|state| state.active_prompt.as_ref().is_some_and(|prompt| prompt.id == response.prompt_id)).unwrap_or(false) { return; }
+    let answer = response.answer;
     ui.modal(cx, ids!(a2app_permission_modal)).close(cx);
-    let Some(Some(prompt)) = with_a2app(|state| state.active_prompt.take()) else { return };
+    let Some(Some(mut prompt)) = with_a2app(|state| state.active_prompt.take()) else { return };
 
     if matches!(answer, PermissionPromptAction::None) {
         with_a2app(|state| state.active_prompt = Some(prompt));
+        return;
+    }
+    if let Some(mut flow) = prompt.flow.take() {
+        let result = flow.approve(|review| super::information_flow::current_context(&review.context)
+            .and_then(|_| if !instances::context_can_prompt(&review.context, review.epoch) {
+                Err("This mini-app is no longer open. Reopen it to continue.".into())
+            } else {
+                match answer {
+                    PermissionPromptAction::AllowFlowOnce if flow.allow_once() => a2app_core::information_flow::approve_effect_once(review),
+                    PermissionPromptAction::AllowFlowSession => a2app_core::information_flow::approve_effect_session(review, a2app_core::information_flow::SharingDuration::RobrixSession),
+                    _ => Err("This request was not approved.".into()),
+                }
+            }));
+        match result {
+            Ok(()) => resume_flow(cx, ui, flow),
+            Err(error) => {
+                // Data can arrive while the review is open. Keep the exact
+                // operation waiting and require a fresh answer for new sources.
+                let updated = matches!(answer, PermissionPromptAction::AllowFlowOnce | PermissionPromptAction::AllowFlowSession)
+                    && !flow.is_cancelled() && refresh_flow_capture(&mut flow).unwrap_or(false);
+                if updated && flow.review().allowed { resume_flow(cx, ui, flow); }
+                else if updated {
+                    prompt.id = next_permission_prompt_id();
+                    prompt.flow = Some(flow);
+                    with_a2app(|state| state.prompts.push_front(prompt));
+                } else { refuse_flow(cx, flow, &error); }
+            }
+        }
+        show_next_permission_prompt(cx, ui);
+        ui.redraw(cx);
+        return;
+    }
+    let parked_count = prompt.parked.len();
+    retain_live_bridge_requests(&mut prompt);
+    if prompt.parked.is_empty() || prompt.parked.len() != parked_count {
+        // An answer belongs to the displayed batch. Retired requests cannot
+        // grant authority or redirect that answer onto a surviving request.
+        if !prompt.parked.is_empty() {
+            prompt.id = next_permission_prompt_id();
+            with_a2app(|state| state.prompts.push_front(prompt));
+        }
+        show_next_permission_prompt(cx, ui);
+        ui.redraw(cx);
         return;
     }
     let (origin, target) = prompt.parked.first().map(parked_rooms).unwrap_or_default();
@@ -4016,6 +4342,11 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
     let granted = match answer {
         PermissionPromptAction::AllowScoped { scope, duration, network } => {
             let result = with_a2app(|state| {
+                if prompt.enable_writes && !state.permissions.matrix_write() {
+                    let can_enable = prompt.parked.iter().all(|parked|
+                        parked_can_enable_writes(state, &prompt.subject, prompt.perm, parked));
+                    if !can_enable { return Err("Room or app permissions changed. Review them before enabling room changes.".into()); }
+                }
                 let result = if let Some(url) = &network_url {
                     state.permissions.allow_network(&prompt.subject,
                         network.unwrap_or_else(|| NetworkScope::ExactUrl(url.clone())),
@@ -4024,9 +4355,10 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
                     state.permissions.grant_scoped_tool(&prompt.subject, &tool.full_name,
                         &tool.content_hash, scope, duration, origin.as_deref())
                 } else {
-                    state.permissions.grant_scoped(&prompt.subject, prompt.perm, capability,
+                    state.permissions.grant_scoped(&prompt.subject, prompt.perm, None,
                         scope, duration, origin.as_deref())
                 };
+                if result.is_ok() && prompt.enable_writes { state.permissions.set_matrix_write(true); }
                 state.perms_dirty = true;
                 result
             }).unwrap_or_else(|| Err("Permissions are unavailable.".into()));
@@ -4081,6 +4413,7 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
             });
             false
         }
+        PermissionPromptAction::AllowFlowOnce | PermissionPromptAction::AllowFlowSession => false,
         PermissionPromptAction::None => unreachable!(),
     };
     if let Some(id) = temporary_grant {
@@ -4093,10 +4426,22 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
 
     let subject = prompt.subject.clone();
     let perm = prompt.perm;
+    if once && prompt.parked.len() > 1 {
+        let rest = prompt.parked.split_off(1);
+        with_a2app(|state| state.prompts.push_front(PermissionPrompt {
+            id: next_permission_prompt_id(),
+            subject: subject.clone(), perm, parked: rest, tool: prompt.tool.clone(), flow: None,
+            enable_writes: prompt.enable_writes, activations: prompt.activations.clone(),
+        }));
+    }
     // Replay or refuse everything parked behind this prompt.
+    let activations = prompt.activations;
     for parked in prompt.parked {
         match parked {
             ParkedRequest::Bridge(request) => {
+                if let Some(request) = request.as_ref()
+                    && !bridge_activation_is_live(request, &activations)
+                { continue; }
                 if granted {
                     if let Some(request) = request {
                         let asks = with_a2app(|state| {
@@ -4168,10 +4513,27 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
     ui.redraw(cx);
 }
 
-/// Pushes a changed grant into the app's live isolate: network changes
-/// stop the app (the net runtime is baked in at VM alloc); anything else
-/// just gets the new caps list plus an `on_permissions_changed` call.
-fn apply_permission_to_running(cx: &mut Cx, ui: &WidgetRef, app_id: &str, perm: Permission) {
+fn refresh_flow_capture(flow: &mut FlowContinuation) -> Result<bool, String> {
+    let review = flow.review();
+    super::information_flow::current_context(&review.context)?;
+    if !instances::context_can_prompt(&review.context, review.epoch) { return Ok(false); }
+    let payload = serde_json::from_str(&review.payload).map_err(|_| "This permission request is invalid.".to_owned())?;
+    let updated = a2app_core::information_flow::prepare_effect_for_activation(
+        &review.context, review.epoch, review.recipient.as_ref(), review.action.as_ref(), &payload)?;
+    if updated == *review { return Ok(false); }
+    if review.id != updated.id { let _ = a2app_core::information_flow::cancel_effect(review.id); }
+    match flow {
+        FlowContinuation::Bridge { review, .. } => *review = updated,
+        FlowContinuation::Worker(worker) => worker.review = updated,
+    }
+    Ok(true)
+}
+
+/// Update the live app without retiring its pending callbacks.
+///
+/// Network authority is checked by the host for each request; isolated VMs
+/// always keep native networking disabled, including after a grant changes.
+fn apply_permission_to_running(cx: &mut Cx, _ui: &WidgetRef, app_id: &str, perm: Permission) {
     // The mcp-tools answer is a kill switch, so a Deny takes back the tools
     // the app already installed on a room's agent, not just future ones.
     #[cfg(unix)]
@@ -4183,17 +4545,7 @@ fn apply_permission_to_running(cx: &mut Cx, ui: &WidgetRef, app_id: &str, perm: 
         return;
     }
     let grants = a2app_core::permissions::snapshot_grants_for(app_id);
-    if perm == Permission::Network {
-        let Some(Some(manifest)) = with_a2app(|state| state.registry.get(app_id).cloned()) else { return };
-        if stop_for_restart(cx, ui, &manifest) {
-            enqueue_popup_notification(
-                format!("\"{}\" was stopped; open it again with its new network access.", manifest.name),
-                PopupKind::Info, Some(5.0),
-            );
-        }
-    } else {
-        instances::update_app_caps(cx, app_id, grants);
-    }
+    instances::update_app_caps(cx, app_id, grants);
 }
 
 /// Whether `app_id` may offer tools to a room's agent right now: the same
@@ -6034,7 +6386,8 @@ fn run_ai_read_tool(
                 state.ai_reads.insert(id, (room_id.clone(), kind.clone(), answer));
             });
             let authorization = with_a2app(|state| {
-                let auth = matrix::policy::MatrixAuthorization::new(&subject, cap.id, Some(room_id.as_str()), &state.permissions).with_flow(flow_context.clone());
+                let mut auth = matrix::policy::MatrixAuthorization::new(&subject, cap.id, Some(room_id.as_str()), &state.permissions).with_flow(flow_context.clone());
+                auth.target_room = target_room.as_ref().map(ToString::to_string).or_else(|| Some(room_id.to_string()));
                 auth
             });
             submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::ToolRead {
@@ -7550,6 +7903,116 @@ mod permission_tests {
     use super::*;
 
     #[test]
+    fn network_permission_changes_keep_the_public_activation_and_pending_callback() {
+        use a2app_core::information_flow as flow;
+        use makepad_widgets::widget_async::CxSplashVmExt;
+        let previous_account = super::super::information_flow::TEST_ACCOUNT.with(|account|
+            account.replace(Some("@network-lifecycle:test".into())));
+        let previous_state = A2APP.with(|state| state.replace(None));
+        let mut manifest = builtin::stock("public-web").unwrap();
+        manifest.id = "runtime-public-network-lifecycle".into();
+        manifest.source = format!("fn on_permissions_changed(caps) {{ ui.status.set_text(\"Permissions updated.\") }}\n{}", manifest.source);
+        // This test app has host-recorded public code, like a generated app
+        // whose source contained no private data.
+        flow::add_code_influences(&manifest.id, [flow::Influence::MiniApp { account: "@network-lifecycle:test".into(), app: "public-test-source".into() }]).unwrap();
+        initialize_background_test(manifest.clone());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let template = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            super::super::host_set::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppHost {} });
+            vm.bx.heap.new_object_ref(value.as_object().unwrap())
+        });
+        instances::set_host_template(template);
+        let key = (manifest.id.clone(), None);
+        let host = instances::ensure_public(&mut cx, &manifest, &[]).unwrap();
+        makepad_widgets::widget_tree::set_ui_root(&mut cx, &host);
+        host.widget(&cx, ids!(status));
+        host.widget(&cx, ids!(result));
+        let heap = instances::heap_of(&key).unwrap();
+        let context = instances::context_of_key(&key).unwrap();
+        let epoch = flow::context_epoch(&context).unwrap();
+        let lifetime = instances::lifetime_of_heap(heap).unwrap();
+        let splash = host.widget(&cx, ids!(splash));
+        assert!(splash.borrow_mut::<Splash>().unwrap().call_script_fn(&mut cx, id!(fetch_example), &[]));
+        cx.with_vm_and_async(|_| {});
+        let request = makepad_widgets::splash_host::take_splash_host_requests().into_iter()
+            .find(|request| request.heap_key == heap && request.service == "network.http").unwrap();
+        with_a2app(|state| { state.permissions.set(&manifest.id, Permission::Network, GrantState::Granted); });
+        apply_permission_to_running(&mut cx, &WidgetRef::empty(), &manifest.id, Permission::Network);
+        cx.with_vm_and_async(|_| {});
+        assert_eq!(instances::heap_of(&key), Some(heap));
+        assert_eq!(flow::context_epoch(&context).unwrap(), epoch);
+        assert!(lifetime.load(std::sync::atomic::Ordering::Acquire));
+        assert!(std::sync::Arc::ptr_eq(&lifetime, &instances::lifetime_of_heap(heap).unwrap()));
+        assert_eq!(instances::host_of(&key).unwrap(), host);
+        assert_eq!(host.widget(&cx, ids!(status)).text(), "Permissions updated.");
+        let source = splash.borrow::<Splash>().unwrap().view.source.clone();
+        let vm_id = cx.script_ref_vm_id(&source).unwrap();
+        cx.with_script_vm_id(vm_id, |vm| {
+            assert!(vm.cx().script_data.std.host_io_only(), "granting network must retain the host-only I/O guard");
+            assert!(vm.cx().script_data.std.net.is_none(), "native networking stays disabled");
+        });
+        assert_eq!(makepad_widgets::splash_host::splash_host_respond(&mut cx, heap, request.req_id,
+            Ok(r#"{"status":200,"body":"Public callback survived","headers":{}}"#)),
+            makepad_widgets::splash_host::SplashRespondOutcome::Delivered);
+        cx.with_vm_and_async(|_| {});
+        assert_eq!(host.widget(&cx, ids!(result)).text(), "Public callback survived");
+        instances::quit_app(&mut cx, &manifest.id);
+        instances::clear_host_template();
+        A2APP.with(|state| { state.replace(previous_state); });
+        super::super::information_flow::TEST_ACCOUNT.with(|account| { account.replace(previous_account); });
+        makepad_widgets::splash_host::take_splash_host_requests();
+    }
+
+    #[test]
+    fn repeated_group_requests_share_one_session_choice_and_stale_answers_cannot_grant_the_next() {
+        let previous = A2APP.with(|state| state.replace(None));
+        let manifest = builtin::stock("room-peek").unwrap();
+        initialize_background_test(manifest.clone());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let ui = WidgetRef::empty();
+        for _ in 0..3 {
+            queue_permission_prompt(&mut cx, &ui, manifest.id.clone(), Permission::MatrixRoomRead,
+                ParkedRequest::Bridge(None), None);
+        }
+        let id = with_a2app(|state| {
+            assert!(state.prompts.is_empty());
+            let prompt = state.active_prompt.as_ref().unwrap();
+            assert_eq!(prompt.parked.len(), 3);
+            prompt.id
+        }).unwrap();
+        queue_permission_prompt(&mut cx, &ui, manifest.id.clone(), Permission::MatrixRoomWatch,
+            ParkedRequest::Bridge(None), None);
+        answer_permission_prompt(&mut cx, &ui, PermissionPromptResponse {
+            prompt_id: id,
+            answer: PermissionPromptAction::AllowScoped { scope: RoomScope::room(SOURCE), duration: GrantDuration::RobrixSession, network: None },
+        });
+        with_a2app(|state| {
+            let context = PermissionContext { origin_room: Some(SOURCE), target_room: Some(SOURCE) };
+            for capability in ["matrix.room.messages.read", "matrix.room.members.read"] {
+                assert_eq!(state.permissions.effective_capability_in_context(&manifest,
+                    a2app_core::capabilities::by_id(capability).unwrap(), context), Effective::Granted);
+            }
+            assert_eq!(state.permissions.effective_capability_in_context(&manifest,
+                a2app_core::capabilities::by_id("matrix.room.messages.read").unwrap(),
+                PermissionContext { origin_room: Some(TARGET), target_room: Some(TARGET) }), Effective::NeedsPrompt);
+            assert_ne!(state.active_prompt.as_ref().unwrap().id, id);
+        });
+        answer_permission_prompt(&mut cx, &ui, PermissionPromptResponse {
+            prompt_id: id,
+            answer: PermissionPromptAction::AllowScoped { scope: RoomScope::AllRooms, duration: GrantDuration::Always, network: None },
+        });
+        with_a2app(|state| {
+            assert!(state.active_prompt.is_some(), "an old button action must leave the new prompt open");
+            assert!(state.permissions.scoped_grants(&manifest.id).iter().all(|grant| grant.permission != Permission::MatrixRoomWatch.as_str()));
+        });
+        A2APP.with(|state| { state.replace(previous); });
+    }
+
+    #[test]
     fn installing_stock_retires_source_inspection_before_recovering_empty_storage() {
         use a2app_core::information_flow as flow;
         let stock = builtin::stock("room-info").unwrap();
@@ -7606,6 +8069,214 @@ mod permission_tests {
             args_json: args.to_string(),
             may_prompt: true,
         }))
+    }
+
+    #[test]
+    fn retired_bridge_answer_cannot_enable_room_writes_or_create_a_grant() {
+        let previous = A2APP.with(|state| state.replace(None));
+        struct Restore(Option<A2AppState>);
+        impl Drop for Restore {
+            fn drop(&mut self) { A2APP.with(|state| { state.replace(self.0.take()); }); }
+        }
+        let _restore = Restore(previous);
+        let manifest = builtin::stock("roll-call").unwrap();
+        let subject = manifest.id.clone();
+        initialize_background_test(manifest.clone());
+        let parked = bridge("matrix.send_message", serde_json::json!({"body":"retired fixture"}), Some(SOURCE));
+        let capability = parked_capability(&parked).unwrap();
+        let context = PermissionContext { origin_room: Some(SOURCE), target_room: Some(SOURCE) };
+        let id = next_permission_prompt_id();
+        with_a2app(|state| {
+            assert!(services::can_enable_writes(&state.permissions, &manifest, capability, context));
+            state.active_prompt = Some(PermissionPrompt { id, subject: subject.clone(), perm: Permission::MatrixRoomSend,
+                parked: vec![parked], tool: None, flow: None, enable_writes: true,
+                activations: vec![(0, 1, a2app_core::information_flow::ContextId::App {
+                    account: "retired-fixture".into(), app: subject.clone(), room: Some(SOURCE.into()),
+                }, 1)],
+            });
+            state.perms_dirty = false;
+        });
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        answer_permission_prompt(&mut cx, &WidgetRef::empty(), PermissionPromptResponse { prompt_id: id,
+            answer: PermissionPromptAction::AllowScoped { scope: RoomScope::AllRooms, duration: GrantDuration::RobrixSession, network: None },
+        });
+        with_a2app(|state| {
+            assert!(!state.permissions.matrix_write());
+            assert!(state.permissions.room_send_grants(&subject).is_empty());
+            assert!(!state.perms_dirty);
+            assert!(state.active_prompt.is_none());
+            assert!(state.prompts.is_empty());
+        });
+    }
+
+    #[test]
+    fn setup_write_prompt_enables_its_room_grant_and_rechecks_new_denials() {
+        use a2app_core::information_flow as flow;
+        let previous_account = super::super::information_flow::TEST_ACCOUNT.with(|account|
+            account.replace(Some("@write-setup:test".into())));
+        let previous_state = A2APP.with(|state| state.replace(None));
+        let mut manifest = builtin::stock("roll-call").unwrap();
+        manifest.id = "runtime-write-setup".into();
+        manifest.capabilities = vec!["matrix.room.message.send".into()];
+        manifest.source = r#"
+fn setup(){
+    host.request("permissions.request", {perm:"matrix-room-send"}, fn(r){
+        let answer = "denied"
+        if r.is_ok && r.data.granted { answer = "granted" }
+        ui.note.set_text(answer)
+    })
+}
+View{note := Label{text:"waiting"}}
+"#.into();
+        initialize_background_test(manifest.clone());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let (template, root) = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            super::super::host_set::script_mod(vm);
+            let template = script_eval!(vm, { mod.widgets.MiniAppHost {} });
+            let template = vm.bx.heap.new_object_ref(template.as_object().unwrap());
+            let root = script_eval!(vm, { mod.widgets.View {} });
+            (template, WidgetRef::script_from_value(vm, root))
+        });
+        makepad_widgets::widget_tree::set_ui_root(&mut cx, &root);
+        instances::set_host_template(template);
+        let key = (manifest.id.clone(), Some(SOURCE.try_into().unwrap()));
+        let host = instances::ensure(&mut cx, &key, &manifest, &[]).unwrap();
+        instances::adopt(&mut cx, &key, root.widget_uid(), instances::Surface::Modal).unwrap();
+        host.widget(&cx, ids!(note));
+        let context = instances::context_of_key(&key).unwrap();
+        let epoch = flow::context_epoch(&context).unwrap();
+        let heap = instances::heap_of(&key).unwrap();
+        let capability = a2app_core::capabilities::by_id("matrix.room.message.send").unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for blocker in ["none", "room", "app", "capability"] {
+            with_a2app(|state| state.permissions = PermissionStore::default());
+            assert!(host.widget(&cx, ids!(splash)).borrow_mut::<Splash>().unwrap()
+                .call_script_fn(&mut cx, id!(setup), &[]));
+            cx.with_vm_and_async(|_| {});
+            let request = makepad_widgets::splash_host::take_splash_host_requests().into_iter()
+                .find(|request| request.heap_key == heap && request.service == "permissions.request").unwrap();
+            let request_id = request.req_id;
+            let parked = ParkedRequest::Bridge(Some(request));
+            let id = next_permission_prompt_id();
+            with_a2app(|state| {
+                assert!(parked_can_enable_writes(state, &manifest.id, Permission::MatrixRoomSend, &parked));
+                state.active_prompt = Some(PermissionPrompt { id, subject: manifest.id.clone(), perm: Permission::MatrixRoomSend,
+                    parked: vec![parked], tool: None, flow: None, enable_writes: true,
+                    activations: vec![(heap, request_id, context.clone(), epoch)],
+                });
+                match blocker {
+                    "room" => state.permissions.set_room_policy(SOURCE, RoomAccess::Write, PolicyDecision::Deny),
+                    "app" => state.permissions.set(&manifest.id, Permission::MatrixRoomSend, GrantState::Denied),
+                    "capability" => state.permissions.set_capability(&manifest.id, capability.id, GrantState::Denied),
+                    _ => {},
+                }
+            });
+            answer_permission_prompt(&mut cx, &WidgetRef::empty(), PermissionPromptResponse { prompt_id: id,
+                answer: PermissionPromptAction::AllowScoped { scope: RoomScope::room(SOURCE), duration: GrantDuration::RobrixSession, network: None },
+            });
+            cx.with_vm_and_async(|_| {});
+            with_a2app(|state| {
+                let context = PermissionContext { origin_room: Some(SOURCE), target_room: Some(SOURCE) };
+                if blocker == "none" {
+                    assert!(state.permissions.matrix_write());
+                    assert_eq!(state.permissions.effective_capability_in_context(&manifest, capability, context), Effective::Granted);
+                    assert_eq!(state.permissions.effective_capability_in_context(&manifest, capability,
+                        PermissionContext { target_room: Some(TARGET), ..context }), Effective::NeedsPrompt);
+                } else {
+                    assert!(!state.permissions.matrix_write(), "{blocker} denial must prevent enabling room changes");
+                    assert!(state.permissions.room_send_grants(&manifest.id).is_empty());
+                    assert_eq!(state.permissions.effective_capability_in_context(&manifest, capability, context), Effective::Denied);
+                }
+                assert!(state.active_prompt.is_none());
+                assert!(state.prompts.is_empty());
+            });
+            assert_eq!(host.widget(&cx, ids!(note)).text(), if blocker == "none" {"granted"} else {"denied"});
+            assert_eq!(instances::heap_of(&key), Some(heap), "setup keeps the original callback activation");
+        }
+        }));
+        instances::quit_app(&mut cx, &manifest.id);
+        instances::clear_host_template();
+        A2APP.with(|state| { state.replace(previous_state); });
+        super::super::information_flow::TEST_ACCOUNT.with(|account| { account.replace(previous_account); });
+        makepad_widgets::splash_host::take_splash_host_requests();
+        if let Err(error) = result { std::panic::resume_unwind(error); }
+    }
+
+    #[test]
+    fn data_arriving_during_review_renews_the_dialog_and_preserves_the_worker() {
+        use a2app_core::information_flow as flow;
+        use std::{future::Future, task::{Context, Poll, Waker}};
+        let _queue_guard = super::super::effect_review::TEST_LOCK.lock().unwrap();
+        let previous_account = super::super::information_flow::TEST_ACCOUNT.with(|account|
+            account.replace(Some("@renewed-review:test".into())));
+        let previous_state = A2APP.with(|state| state.replace(None));
+        let mut manifest = builtin::stock("roll-call").unwrap();
+        manifest.id = "runtime-renewed-flow-review".into();
+        manifest.permissions.push(Permission::ClipboardWrite.as_str().into());
+        flow::add_code_influences(&manifest.id, [flow::Influence::MiniApp { account: "@renewed-review:test".into(), app: "fixture".into() }]).unwrap();
+        initialize_background_test(manifest.clone());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let (template, root) = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            super::super::host_set::script_mod(vm);
+            let template = script_eval!(vm, { mod.widgets.MiniAppHost {} });
+            let template = vm.bx.heap.new_object_ref(template.as_object().unwrap());
+            let root = script_eval!(vm, { mod.widgets.View {} });
+            (template, WidgetRef::script_from_value(vm, root))
+        });
+        makepad_widgets::widget_tree::set_ui_root(&mut cx, &root);
+        instances::set_host_template(template);
+        let key = (manifest.id.clone(), Some(SOURCE.try_into().unwrap()));
+        instances::ensure(&mut cx, &key, &manifest, &[]).unwrap();
+        instances::adopt(&mut cx, &key, root.widget_uid(), instances::Surface::Modal).unwrap();
+        let context = instances::context_of_key(&key).unwrap();
+        let epoch = flow::context_epoch(&context).unwrap();
+        let recipient = flow::Recipient::Clipboard;
+        let action = flow::SensitiveAction { kind: "device.clipboard.write".into(), target: "clipboard".into() };
+        let payload = serde_json::json!({"text":"immutable reviewed contents"});
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            flow::add_sources(&context, [flow::Source::Account { account: context.account().into() }]).unwrap();
+            let capture = flow::prepare_effect_for_activation(&context, epoch, Some(&recipient), Some(&action), &payload).unwrap();
+            let mut waiter = Box::pin(super::super::effect_review::request(capture.clone(), true));
+            let mut task = Context::from_waker(Waker::noop());
+            assert!(waiter.as_mut().poll(&mut task).is_pending());
+            let worker = super::super::effect_review::take_pending().pop().unwrap();
+            let old_id = next_permission_prompt_id();
+            with_a2app(|state| state.active_prompt = Some(PermissionPrompt { id: old_id, subject: manifest.id.clone(), perm: Permission::ClipboardWrite,
+                parked: Vec::new(), tool: None, flow: Some(FlowContinuation::Worker(worker)), enable_writes: false, activations: Vec::new(),
+            }));
+            let arrived = flow::Source::Room { account: context.account().into(), room: TARGET.into() };
+            flow::add_sources(&context, [arrived.clone()]).unwrap();
+            answer_permission_prompt(&mut cx, &WidgetRef::empty(), PermissionPromptResponse { prompt_id: old_id, answer: PermissionPromptAction::AllowFlowOnce });
+            let renewed_id = with_a2app(|state| {
+                let prompt = state.active_prompt.as_ref().unwrap();
+                assert_ne!(prompt.id, old_id);
+                let review = prompt.flow.as_ref().unwrap().review();
+                assert_ne!(review.id, capture.id);
+                assert!(review.sources.contains(&arrived));
+                assert_eq!(review.payload, capture.payload);
+                prompt.id
+            }).unwrap();
+            assert!(waiter.as_mut().poll(&mut task).is_pending(), "new data must renew review without failing the original worker");
+            answer_permission_prompt(&mut cx, &WidgetRef::empty(), PermissionPromptResponse { prompt_id: old_id, answer: PermissionPromptAction::AllowFlowSession });
+            assert!(waiter.as_mut().poll(&mut task).is_pending(), "an answer from the old dialog cannot approve the renewed one");
+            assert!(flow::check_effect_for_activation(&context, epoch, Some(&recipient), Some(&action), &payload).is_err());
+            answer_permission_prompt(&mut cx, &WidgetRef::empty(), PermissionPromptResponse { prompt_id: renewed_id, answer: PermissionPromptAction::AllowFlowOnce });
+            assert!(matches!(waiter.as_mut().poll(&mut task), Poll::Ready(Ok(()))));
+            flow::commit_effect_for_activation(&context, epoch, Some(&recipient), Some(&action), &payload).unwrap();
+            assert!(flow::commit_effect_for_activation(&context, epoch, Some(&recipient), Some(&action), &payload).is_err());
+        }));
+        instances::quit_app(&mut cx, &manifest.id);
+        instances::clear_host_template();
+        A2APP.with(|state| { state.replace(previous_state); });
+        super::super::information_flow::TEST_ACCOUNT.with(|account| { account.replace(previous_account); });
+        makepad_widgets::splash_host::take_splash_host_requests();
+        if let Err(error) = result { std::panic::resume_unwind(error); }
     }
 
     #[test]

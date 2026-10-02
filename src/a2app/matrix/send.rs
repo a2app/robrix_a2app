@@ -14,7 +14,7 @@ pub(super) async fn message(room_id: OwnedRoomId, body: String) -> Result<String
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
     let content = RoomMessageEventContent::text_plain(body);
-    super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::to_value(&content).map_err(|_| "Cannot review message content.")?)?;
+    super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::to_value(&content).map_err(|_| "Cannot review message content.")?).await?;
     super::policy::audit_room_operation(room_id.as_str(), room.send(content)).await
         .map_err(|e| format!("couldn't send the message: {e}"))?;
     Ok(String::from("{}"))
@@ -31,7 +31,7 @@ pub(super) async fn reply(
     super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
-    super::policy::ensure_server_output(client.homeserver().as_str())?;
+    super::policy::ensure_server_output(client.homeserver().as_str()).await?;
     // A thread post isn't a reply to the root, so it gets no mention; a plain
     // reply mentions its target the way the composer does.
     let reply = if in_thread {
@@ -42,8 +42,8 @@ pub(super) async fn reply(
     let content = super::policy::audit_server_operation(client.homeserver().as_str(), room.make_reply_event(RoomMessageEventContentWithoutRelation::text_plain(body), reply)).await
         .map_err(|e| format!("couldn't build the reply: {e}"))?;
     super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
-    super::policy::ensure_server_output(client.homeserver().as_str())?;
-    super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::to_value(&content).map_err(|_| "Cannot review reply content.")?)?;
+    super::policy::ensure_server_output(client.homeserver().as_str()).await?;
+    super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::to_value(&content).map_err(|_| "Cannot review reply content.")?).await?;
     let sent = super::policy::audit_room_operation(room_id.as_str(), room.send(content)).await
         .map_err(|e| format!("couldn't send the reply: {e}"))?;
     Ok(serde_json::json!({ "event_id": sent.response.event_id }).to_string())
@@ -57,7 +57,7 @@ pub(super) async fn react(room_id: OwnedRoomId, event_id: OwnedEventId, key: Str
     super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
-    super::policy::ensure_server_output(client.homeserver().as_str())?;
+    super::policy::ensure_server_output(client.homeserver().as_str()).await?;
     // Page through the event's reactions until we find our own with this key.
     let mut from = None;
     let mine = loop {
@@ -66,7 +66,7 @@ pub(super) async fn react(room_id: OwnedRoomId, event_id: OwnedEventId, key: Str
             include_relations: IncludeRelations::RelationsOfType(RelationType::Annotation),
             ..Default::default()
         };
-        super::policy::ensure_server_output(client.homeserver().as_str())?;
+        super::policy::ensure_server_output(client.homeserver().as_str()).await?;
         let page = super::policy::audit_server_operation(client.homeserver().as_str(), room.relations(event_id.clone(), opts)).await
             .map_err(|e| format!("couldn't load the reactions: {e}"))?;
         let found = page.chunk.iter().find_map(|event| {
@@ -82,17 +82,17 @@ pub(super) async fn react(room_id: OwnedRoomId, event_id: OwnedEventId, key: Str
         from = page.prev_batch_token;
     };
     super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
-    super::policy::ensure_server_output(client.homeserver().as_str())?;
+    super::policy::ensure_server_output(client.homeserver().as_str()).await?;
     let added = match mine {
         Some(reaction_id) => {
-            super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::json!({ "remove_reaction": reaction_id, "event_id": event_id, "key": key }))?;
+            super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::json!({ "remove_reaction": reaction_id, "event_id": event_id, "key": key })).await?;
             super::policy::audit_server_operation(client.homeserver().as_str(), room.redact(&reaction_id, None, None)).await
                 .map_err(|e| format!("couldn't remove the reaction: {e}"))?;
             false
         }
         None => {
             let content = ReactionEventContent::new(Annotation::new(event_id, key));
-            super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::to_value(&content).map_err(|_| "Cannot review reaction content.")?)?;
+            super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::to_value(&content).map_err(|_| "Cannot review reaction content.")?).await?;
             super::policy::audit_room_operation(room_id.as_str(), room.send(content)).await
                 .map_err(|e| format!("couldn't send the reaction: {e}"))?;
             true
@@ -109,8 +109,8 @@ pub(super) async fn typing(room_id: OwnedRoomId, typing: bool) -> Result<String,
     super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
-    super::policy::ensure_server_output(client.homeserver().as_str())?;
-    super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::json!({ "typing": typing }))?;
+    super::policy::ensure_server_output(client.homeserver().as_str()).await?;
+    super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::json!({ "typing": typing })).await?;
     super::policy::audit_server_operation(client.homeserver().as_str(), room.typing_notice(typing)).await
         .map_err(|e| format!("couldn't send the typing notice: {e}"))?;
     Ok(String::from("{}"))
@@ -125,10 +125,10 @@ pub(super) async fn read_receipt(room_id: OwnedRoomId, event_id: Option<OwnedEve
     super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
-    super::policy::ensure_server_output(client.homeserver().as_str())?;
+    super::policy::ensure_server_output(client.homeserver().as_str()).await?;
     let receipt_type = preferred_receipt_type();
     if let Some(event_id) = event_id {
-        super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::json!({ "event_id": event_id, "type": receipt_type, "thread": "unthreaded" }))?;
+        super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::json!({ "event_id": event_id, "type": receipt_type, "thread": "unthreaded" })).await?;
         super::policy::audit_server_operation(client.homeserver().as_str(), room.send_single_receipt(receipt_type, ReceiptThread::Unthreaded, event_id)).await
             .map_err(|e| format!("couldn't send the read receipt: {e}"))?;
         return Ok(String::from("{}"));
@@ -154,8 +154,8 @@ pub(super) async fn read_receipt(room_id: OwnedRoomId, event_id: Option<OwnedEve
         receipts.public_read_receipt(latest)
     };
     super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
-    super::policy::ensure_server_output(client.homeserver().as_str())?;
-    super::policy::commit_sensitive_target(room_id.as_str(), &payload)?;
+    super::policy::ensure_server_output(client.homeserver().as_str()).await?;
+    super::policy::commit_sensitive_target(room_id.as_str(), &payload).await?;
     super::policy::audit_server_operation(client.homeserver().as_str(), room.send_multiple_receipts(receipts)).await
         .map_err(|e| format!("couldn't mark the room as read: {e}"))?;
     Ok(String::from("{}"))
@@ -165,8 +165,8 @@ pub(super) async fn pin(room_id: OwnedRoomId, event_id: OwnedEventId, pinned: bo
     super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
-    super::policy::ensure_server_output(client.homeserver().as_str())?;
-    super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::json!({ "event_id": event_id, "pinned": pinned }))?;
+    super::policy::ensure_server_output(client.homeserver().as_str()).await?;
+    super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::json!({ "event_id": event_id, "pinned": pinned })).await?;
     let result = if pinned {
         super::policy::audit_server_operation(client.homeserver().as_str(), room.pin_event(&event_id)).await
     } else {
@@ -180,9 +180,9 @@ pub(super) async fn room_flag(room_id: OwnedRoomId, flag: RoomFlag, on: bool) ->
     super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
-    super::policy::ensure_server_output(client.homeserver().as_str())?;
+    super::policy::ensure_server_output(client.homeserver().as_str()).await?;
     let flag_name = match flag { RoomFlag::Favorite => "favorite", RoomFlag::LowPriority => "low_priority", RoomFlag::Unread => "unread" };
-    super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::json!({ "flag": flag_name, "on": on }))?;
+    super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::json!({ "flag": flag_name, "on": on })).await?;
     let result = match flag {
         RoomFlag::Favorite => super::policy::audit_server_operation(client.homeserver().as_str(), room.set_is_favourite(on, None)).await,
         RoomFlag::LowPriority => super::policy::audit_server_operation(client.homeserver().as_str(), room.set_is_low_priority(on, None)).await,

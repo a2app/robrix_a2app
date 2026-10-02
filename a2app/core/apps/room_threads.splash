@@ -7,6 +7,15 @@
 // why-robrix-navigation: Opens the thread you're reading in Robrix.
 // why-matrix-room-watch: Refreshes as new messages arrive.
 
+let watch_pending = false
+let watch_ready = false
+
+let threads_loading = false
+let threads_loaded = false
+let thread_loading = ""
+let thread_request = 0
+let thread_loaded = false
+
 let items = []
 let open_id = ""
 let replies = []
@@ -18,7 +27,11 @@ let reply_empty = ""
 fn show_header(){ ui.header.set_text(status + live_note) }
 
 fn load(){
+    if threads_loading { return nil }
+    threads_loading = true
     host.request("matrix.room_threads", {limit: 20}, fn(r){
+        threads_loading = false
+        threads_loaded = r.is_ok
         if r.is_ok {
             items = r.data.threads
             empty_msg = "No threads in this room yet."
@@ -37,7 +50,16 @@ fn load(){
 }
 
 fn load_thread(){
-    host.request("matrix.thread_replies", {event_id: open_id, limit: 50}, fn(r){
+    if open_id == "" || thread_loading == open_id { return nil }
+    let requested_id = open_id
+    thread_loading = requested_id
+    thread_request += 1
+    let request_id = thread_request
+    host.request("matrix.thread_replies", {event_id: requested_id, limit: 50}, fn(r){
+        if request_id != thread_request { return nil }
+        thread_loading = ""
+        if open_id != requested_id { return nil }
+        thread_loaded = r.is_ok
         replies = []
         if r.is_ok {
             if r.data.root != nil { replies.push(r.data.root) }
@@ -71,6 +93,7 @@ fn reply_line(m){
 fn open_thread(i){
     if i >= items.len() { return nil }
     open_id = items[i].event_id
+    thread_loaded = false
     replies = []
     reply_empty = ""
     ui.thread_header.set_text("Loading…")
@@ -82,6 +105,8 @@ fn open_thread(i){
 
 fn show_list(){
     open_id = ""
+    thread_loading = ""
+    thread_request += 1
     ui.thread_wrap.set_visible(false)
     ui.list_wrap.set_visible(true)
     load()
@@ -102,15 +127,23 @@ fn on_room_message(json){
 }
 
 fn watch(){
+    if watch_pending || watch_ready { return nil }
+    watch_pending = true
     host.request("events.subscribe", {event: "on_room_message"}, fn(r){
+        watch_pending = false
+        watch_ready = r.is_ok
         if r.is_ok { live_note = "" } else { live_note = " · live updates off: " + r.error }
         show_header()
     })
 }
 
 fn on_permissions_changed(caps){
-    if open_id != "" { load_thread() } else { load() }
-    watch()
+    if open_id != "" {
+        if !thread_loaded { load_thread() }
+    } else {
+        if !threads_loaded { load() }
+    }
+    if host.has("on_room_message") { watch() } else { watch_ready = false }
 }
 
 let _boot = start_timeout(0.05, || {

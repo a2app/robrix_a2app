@@ -58,12 +58,15 @@ fn save(){
 fn finish(run, success, text){
     busy = false
     show_status(text)
-    host.request("background.complete", {run_id: run, success: success})
+    if run > 0 { host.request("background.complete", {run_id: run, success: success}) }
 }
 
-fn on_background(json){
-    let run = json.parse_json().run_id
-    if busy { finish(run, false, "A website check is already running.") return nil }
+fn check_website(run){
+    if busy {
+        show_status("A website check is already running.")
+        if run > 0 { host.request("background.complete", {run_id: run, success: false}) }
+        return nil
+    }
     busy = true
     show_status("Checking the saved website…")
     host.request("network.http", {url: config.url, method: "GET"}, fn(r){
@@ -77,31 +80,44 @@ fn on_background(json){
             return nil
         }
         let found = r.data.body.split(config.keyword).len() > 1
-        if !found {
+        if !found && run > 0 {
             matched = false
             fs.write("/website_match.json", "false")
             finish(run, true, "Keyword is absent. The next new match will be reported.")
             return nil
         }
-        if matched { finish(run, true, "Keyword is still present; already reported.") return nil }
+        if matched && run > 0 { finish(run, true, "Keyword is still present; already reported.") return nil }
         let message = "Website Watch found '" + config.keyword + "' at " + config.url
+        if run == 0 { message = "Website Watch test for '" + config.keyword + "' at " + config.url }
         if config.post {
             host.request("matrix.send_message", {body: message}, fn(out){
                 if !out.is_ok { finish(run, false, out.error) return nil }
-                matched = true
-                fs.write("/website_match.json", "true")
-                finish(run, true, "Match posted to this room.")
+                if run > 0 {
+                    matched = true
+                    fs.write("/website_match.json", "true")
+                }
+                let text = "Match posted to this room."
+                if run == 0 { text = "Test report posted. This website and room are ready for scheduled checks." }
+                finish(run, true, text)
             })
         } else {
             host.request("notify.post", {body: message}, fn(out){
                 if !out.is_ok { finish(run, false, out.error) return nil }
-                matched = true
-                fs.write("/website_match.json", "true")
-                finish(run, true, "Match reported in a Robrix popup.")
+                if run > 0 {
+                    matched = true
+                    fs.write("/website_match.json", "true")
+                }
+                let text = "Match reported in a Robrix popup."
+                if run == 0 { text = "Test report shown. This website is ready for scheduled checks." }
+                finish(run, true, text)
             })
         }
     })
 }
+
+fn test_website(){ check_website(0) }
+
+fn on_background(json){ check_website(json.parse_json().run_id) }
 
 fn on_app_resize(width, height){
     if initialized { return nil }
@@ -125,7 +141,8 @@ View{
         keyword_input := TextInput{width: Fill empty_text: "Keyword or phrase"}
         post_button := Button{text: "Report: Robrix popup" on_click: || toggle_post()}
         Button{text: "Save configuration" on_click: || save()}
-        status := Label{text: "Default: example.com, keyword Example Domain, popup. Run now from Background tasks to test permissions." width: Fill draw_text +: {color: #x2A7F92 text_style: theme.font_regular{font_size: 12}}}
-        Label{text: "Internet access can share this instance's room data with the website. Review internet and data-sharing permissions first. For room posting, keep this app open, Run now, review the current blocked action, then retry. Action approvals do not survive a stopped worker. Use popups for unattended checks. Saving settings does not grant permissions. Robrix must be running for checks and popups." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
+        Button{text: "Test saved website and report" on_click: || test_website()}
+        status := Label{text: "Default: example.com, keyword Example Domain, popup. Save settings, then test the saved website and report before scheduling checks." width: Fill draw_text +: {color: #x2A7F92 text_style: theme.font_regular{font_size: 12}}}
+        Label{text: "Save your settings, then test the website and report while this app is open. A test sends one report even if the keyword is absent or already reported. Choose session permission in each review to allow scheduled checks and reports until Robrix closes. The website may receive data this instance has read; each review shows the destination. Automated runs do not open permission dialogs. Robrix must be running." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
     }
 }

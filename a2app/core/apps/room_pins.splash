@@ -7,6 +7,12 @@
 // why-robrix-navigation: Jumps to a pinned message you tap.
 // why-matrix-room-info: Refreshes when the pins change.
 
+let watch_pending = false
+let watch_ready = false
+
+let pins_loading = false
+let pins_loaded = false
+
 let items = []
 let status = "Loading…"
 let live_note = ""
@@ -15,7 +21,11 @@ let empty_msg = "Nothing to show. This app needs to be opened from a room, and n
 fn show_header(){ ui.header.set_text(status + live_note) }
 
 fn load(){
+    if pins_loading { return nil }
+    pins_loading = true
     host.request("matrix.pinned_events", nil, fn(r){
+        pins_loading = false
+        pins_loaded = r.is_ok
         if r.is_ok {
             items = r.data.pinned
             empty_msg = "No pinned messages in this room yet."
@@ -36,15 +46,19 @@ fn on_room_pins_changed(json){
 }
 
 fn watch(){
+    if watch_pending || watch_ready { return nil }
+    watch_pending = true
     host.request("events.subscribe", {event: "on_room_pins_changed"}, fn(r){
+        watch_pending = false
+        watch_ready = r.is_ok
         if r.is_ok { live_note = "" } else { live_note = " · live updates off: " + r.error }
         show_header()
     })
 }
 
 fn on_permissions_changed(caps){
-    load()
-    watch()
+    if !pins_loaded { load() }
+    if host.has("on_room_pins_changed") { watch() } else { watch_ready = false }
 }
 
 fn jump_to_pin(i){

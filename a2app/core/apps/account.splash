@@ -9,6 +9,15 @@
 // why-open-url: Opens your homeserver's account management page.
 // why-robrix-navigation: Opens the DM you already have with a user you look up.
 
+let profile_loading = false
+let profile_loaded = false
+let device_loading = false
+let device_loaded = false
+let account_loading = false
+let account_loaded = false
+let ignored_loading = false
+let ignored_loaded = false
+
 let ignored = []
 let ignored_note = "Loading…"
 let manage_url = nil
@@ -19,8 +28,12 @@ fn or_blank(name, fallback){
     return name
 }
 
-fn load(){
+fn load_profile(){
+    if profile_loading { return nil }
+    profile_loading = true
     host.request("matrix.profile", nil, fn(r){
+        profile_loading = false
+        profile_loaded = r.is_ok
         if !r.is_ok {
             ui.me_name.set_text("Signed in")
             ui.me_id.set_text(r.error)
@@ -29,7 +42,15 @@ fn load(){
         ui.me_name.set_text(or_blank(r.data.display_name, "(no display name)"))
         ui.me_id.set_text(r.data.user_id)
     })
+
+}
+
+fn load_device(){
+    if device_loading { return nil }
+    device_loading = true
     host.request("matrix.device", nil, fn(r){
+        device_loading = false
+        device_loaded = r.is_ok
         if !r.is_ok {
             ui.device_line.set_text(r.error)
             return nil
@@ -38,7 +59,15 @@ fn load(){
         if r.data.verified { state = "verified" }
         ui.device_line.set_text(or_blank(r.data.name, "(unnamed)") + " · " + r.data.device_id + " · " + state)
     })
+
+}
+
+fn load_account(){
+    if account_loading { return nil }
+    account_loading = true
     host.request("matrix.account_info", nil, fn(r){
+        account_loading = false
+        account_loaded = r.is_ok
         if !r.is_ok {
             ui.server_line.set_text(r.error)
             ui.manage_wrap.set_visible(false)
@@ -48,7 +77,15 @@ fn load(){
         manage_url = r.data.account_management_url
         ui.manage_wrap.set_visible(manage_url != nil)
     })
+
+}
+
+fn load_ignored(){
+    if ignored_loading { return nil }
+    ignored_loading = true
     host.request("matrix.ignored_users", nil, fn(r){
+        ignored_loading = false
+        ignored_loaded = r.is_ok
         if r.is_ok {
             ignored = r.data.users
             ignored_note = "Nobody is ignored."
@@ -60,6 +97,13 @@ fn load(){
         }
         ui.ignored_list.render()
     })
+}
+
+fn load(){
+    load_profile()
+    load_device()
+    load_account()
+    load_ignored()
 }
 
 fn open_manage(){
@@ -117,7 +161,12 @@ fn lookup_ignored(i){
     lookup(ignored[i])
 }
 
-fn on_permissions_changed(caps){ load() }
+fn on_permissions_changed(caps){
+    if !profile_loaded { load_profile() }
+    if !device_loaded { load_device() }
+    if !account_loaded { load_account() }
+    if !ignored_loaded { load_ignored() }
+}
 
 let _boot = start_timeout(0.05, || load())
 

@@ -10,6 +10,15 @@
 // why-robrix-navigation: Opens the upgraded room when you tap.
 
 // `on` stays nil until the first toggle succeeds (or matrix.unread answers).
+let unread_loading = false
+let unread_loaded = false
+let pins_loading = false
+let pins_loaded = false
+let messages_loading = false
+let messages_loaded = false
+let successor_loading = false
+let successor_loaded = false
+
 let flags = [
     {service: "matrix.favorite", on: nil, on_text: "Unfavorite", off_text: "Favorite", done_on: "Added to favorites.", done_off: "Removed from favorites."},
     {service: "matrix.low_priority", on: nil, on_text: "Normal priority", off_text: "Low priority", done_on: "Marked low priority.", done_off: "Back to normal priority."},
@@ -49,7 +58,11 @@ fn toggle(i){
 }
 
 fn load_unread(){
+    if unread_loading { return nil }
+    unread_loading = true
     host.request("matrix.unread", nil, fn(r){
+        unread_loading = false
+        unread_loaded = r.is_ok
         if r.is_ok { flags[2].on = r.data.marked_unread }
         show_flags()
     })
@@ -68,10 +81,16 @@ fn pin_line(m){
 }
 
 fn load_pins(){
+    if pins_loading { return nil }
+    pins_loading = true
     host.request("matrix.pinned_events", nil, fn(r){
+        pins_loading = false
+        pins_loaded = r.is_ok
         pins = []
         if r.is_ok {
             for p in r.data.pinned { pins.push(p.event_id) }
+            // A branch ending in a loop needs an explicit result.
+            nil
         } else {
             ui.status.set_text(r.error)
         }
@@ -80,7 +99,11 @@ fn load_pins(){
 }
 
 fn load_messages(){
+    if messages_loading { return nil }
+    messages_loading = true
     host.request("matrix.read_messages", {limit: 15}, fn(r){
+        messages_loading = false
+        messages_loaded = r.is_ok
         if r.is_ok {
             messages = r.data.messages
             empty_note = "No messages in this room yet."
@@ -139,7 +162,11 @@ fn copy_latest(){
 }
 
 fn load_successor(){
+    if successor_loading { return nil }
+    successor_loading = true
     host.request("matrix.successor", nil, fn(r){
+        successor_loading = false
+        successor_loaded = r.is_ok
         successor = ""
         if r.is_ok && r.data.upgraded { successor = r.data.room_id }
         if successor.is_nil() { successor = "" }
@@ -160,7 +187,10 @@ fn load_all(){
     load_successor()
 }
 
-fn on_permissions_changed(caps){ load_all() }
+fn on_permissions_changed(caps){ if !unread_loaded { load_unread() }
+    if !pins_loaded { load_pins() }
+    if !messages_loaded { load_messages() }
+    if !successor_loaded { load_successor() } }
 
 let _boot = start_timeout(0.05, || load_all())
 

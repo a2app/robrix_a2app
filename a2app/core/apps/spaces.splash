@@ -8,6 +8,15 @@
 // why-robrix-navigation: Opens a room you tap.
 // why-matrix-membership: Joins a room when you tap Join.
 
+let spaces_loading = false
+let spaces_loaded = false
+let rooms_loading = ""
+let rooms_request = 0
+let rooms_loaded = false
+let info_loading = ""
+let info_request = 0
+let info_loaded = false
+
 let items = []
 let trail = []
 let empty_note = ""
@@ -62,10 +71,15 @@ fn clear_list(){
 }
 
 fn load_spaces(){
+    if spaces_loading { return nil }
+    spaces_loading = true
     show_level()
     clear_list()
     ui.status.set_text("Loading your spaces…")
     host.request("matrix.spaces", nil, fn(r){
+        spaces_loading = false
+        spaces_loaded = r.is_ok
+        if trail.len() > 0 { return nil }
         if r.is_ok {
             items = []
             for s in r.data.spaces {
@@ -82,10 +96,20 @@ fn load_spaces(){
 }
 
 fn load_rooms(){
+    if trail.len() == 0 { return nil }
     let cur = trail[trail.len() - 1]
+    if rooms_loading == cur.space_id { return nil }
+    rooms_loading = cur.space_id
+    rooms_request += 1
+    let request_id = rooms_request
     clear_list()
     ui.status.set_text("Loading rooms…")
     host.request("matrix.space_rooms", {space_id: cur.space_id}, fn(r){
+        if request_id != rooms_request { return nil }
+        rooms_loading = ""
+        if trail.len() == 0 { return nil }
+        if trail[trail.len() - 1].space_id != cur.space_id { return nil }
+        rooms_loaded = r.is_ok
         if r.is_ok {
             items = r.data.rooms
             empty_note = "This space has no rooms yet."
@@ -98,13 +122,19 @@ fn load_rooms(){
     })
 }
 
-fn open_current(){
+fn load_info(){
+    if trail.len() == 0 { return nil }
     let cur = trail[trail.len() - 1]
-    show_level()
-    ui.space_title.set_text(cur.name)
-    ui.space_line.set_text("Loading…")
-    ui.space_topic.set_text("")
+    if info_loading == cur.space_id { return nil }
+    info_loading = cur.space_id
+    info_request += 1
+    let request_id = info_request
     host.request("matrix.space_info", {space_id: cur.space_id}, fn(r){
+        if request_id != info_request { return nil }
+        info_loading = ""
+        if trail.len() == 0 { return nil }
+        if trail[trail.len() - 1].space_id != cur.space_id { return nil }
+        info_loaded = r.is_ok
         if !r.is_ok {
             ui.space_line.set_text(r.error)
             return nil
@@ -113,6 +143,17 @@ fn open_current(){
         ui.space_line.set_text("" + r.data.member_count + " " + plural(r.data.member_count, "member") + " · " + n + " " + plural(n, "room") + " · " + r.data.join_rule)
         ui.space_topic.set_text(r.data.topic)
     })
+}
+
+fn open_current(){
+    let cur = trail[trail.len() - 1]
+    info_loaded = false
+    rooms_loaded = false
+    show_level()
+    ui.space_title.set_text(cur.name)
+    ui.space_line.set_text("Loading…")
+    ui.space_topic.set_text("")
+    load_info()
     load_rooms()
 }
 
@@ -126,6 +167,10 @@ fn reload(){
 
 fn go_back(){
     trail.pop()
+    rooms_loading = ""
+    rooms_request += 1
+    info_loading = ""
+    info_request += 1
     reload()
 }
 
@@ -177,7 +222,14 @@ fn join_room(){
     })
 }
 
-fn on_permissions_changed(caps){ reload() }
+fn on_permissions_changed(caps){
+    if trail.len() == 0 {
+        if !spaces_loaded { load_spaces() }
+    } else {
+        if !info_loaded { load_info() }
+        if !rooms_loaded { load_rooms() }
+    }
+}
 
 let _boot = start_timeout(0.05, || {
     host.request("env", nil, fn(r){

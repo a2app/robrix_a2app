@@ -189,7 +189,7 @@ fn integrity_transfer_persists_and_authority_matches_exact_reviewed_action() {
 }
 
 #[test]
-fn later_influences_require_fresh_review_and_context_close_revokes_authority() {
+fn later_influences_require_fresh_review_and_session_end_revokes_authority() {
     let root = TestRoot::new();
     let mut registry = root.registry();
     let context = app("alice", "private");
@@ -206,6 +206,9 @@ fn later_influences_require_fresh_review_and_context_close_revokes_authority() {
     assert!(registry.ensure_action_allowed(&context, &action()).is_err());
     registry.grant_authority_checked(&context, action(), AuthoritySession::RobrixSession, &reviewed).unwrap();
     registry.remove_context(&context);
+    registry.register_context(&context).unwrap();
+    assert!(registry.ensure_action_allowed(&context, &action()).is_ok());
+    registry.end_session().unwrap();
     registry.register_context(&context).unwrap();
     assert!(registry.authorities().unwrap().is_empty());
     assert!(registry.ensure_action_allowed(&context, &action()).is_err());
@@ -302,9 +305,12 @@ fn late_activation_drop_does_not_remove_reopened_context_or_authority() {
     assert!(registry.ensure_action_allowed(&context, &action()).is_ok());
     registry.remove_context_for_activation(&context, current).unwrap();
     assert!(registry.context_epoch(&context).is_err());
-    assert!(registry.authorities().unwrap().is_empty());
+    assert_eq!(registry.authorities().unwrap().len(), 1, "session permission keeps its selected duration");
     registry.register_context(&context).unwrap();
     assert_eq!(registry.labels(&context).unwrap(), [source()].into());
+    assert!(registry.ensure_action_allowed(&context, &action()).is_ok());
+    registry.end_session().unwrap();
+    assert!(registry.authorities().unwrap().is_empty());
 }
 
 #[test]

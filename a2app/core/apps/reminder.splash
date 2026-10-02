@@ -33,13 +33,16 @@ fn save(){
     show_status("Saved in this context. Set its schedule or alarm in Mini Apps > Background tasks.")
 }
 
-fn on_background(json){
-    let run = json.parse_json().run_id
+fn show_reminder(run){
     host.request("notify.post", {title: "Reminder", body: message}, fn(r){
         if r.is_ok { show_status("Reminder shown.") } else { show_status(r.error) }
-        host.request("background.complete", {run_id: run, success: r.is_ok})
+        if run > 0 { host.request("background.complete", {run_id: run, success: r.is_ok}) }
     })
 }
+
+fn test_reminder(){ show_reminder(0) }
+
+fn on_background(json){ show_reminder(json.parse_json().run_id) }
 
 fn on_app_resize(width, height){
     if initialized { return nil }
@@ -58,7 +61,9 @@ View{
         Label{text: "Use an interval for a regular check-in or break, or a one-time alarm for a deadline. Each account, room or space keeps its own reminder." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 12}}}
         message_input := TextInput{width: Fill empty_text: "Time for a break."}
         Button{text: "Save reminder" on_click: || save()}
+        Button{text: "Test saved reminder" on_click: || test_reminder()}
         status := Label{text: "Set a schedule in Mini Apps > Background tasks. Default reminder: Time for a break." width: Fill draw_text +: {color: #x8A5FB0 text_style: theme.font_regular{font_size: 12}}}
+        Label{text: "Save your reminder, then test it and allow notifications for this session or longer before scheduling it." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
         Label{text: "Reminders appear as Robrix popups while Robrix is running. An overdue alarm runs once after reopening; missed recurring intervals are combined into one run. This is not an OS alarm and cannot wake a closed or suspended app." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
     }
 }

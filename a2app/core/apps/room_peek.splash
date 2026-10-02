@@ -9,6 +9,14 @@
 // why-robrix-navigation: Jumps to a message you tap.
 // why-matrix-room-watch: Shows new messages, typing, edits and reactions as they arrive.
 
+let subscribed_events = []
+let pending_events = []
+
+let room_loading = false
+let room_loaded = false
+let messages_loading = false
+let messages_loaded = false
+
 let room_name = ""
 let room_line = "Loading…"
 let live_note = ""
@@ -25,7 +33,11 @@ fn show_room(){
 }
 
 fn load_room(){
+    if room_loading { return nil }
+    room_loading = true
     host.request("matrix.room_info", nil, fn(r){
+        room_loading = false
+        room_loaded = r.is_ok
         if r.is_ok {
             room_name = r.data.room_name
             room_line = "" + r.data.member_count + " members"
@@ -61,7 +73,11 @@ fn fetch_reactions(){
 }
 
 fn load_messages(){
+    if messages_loading { return nil }
+    messages_loading = true
     host.request("matrix.read_messages", {limit: 15}, fn(r){
+        messages_loading = false
+        messages_loaded = r.is_ok
         let old = messages
         let pending = rx_queue
         messages = []
@@ -78,6 +94,8 @@ fn load_messages(){
                 }
                 messages.push(m)
             }
+            // A branch ending in a loop needs an explicit result.
+            nil
         } else {
             empty_line = r.error
         }
@@ -182,11 +200,25 @@ fn on_room_members_changed(json){
 }
 
 fn subscribe(name){
+    for event in subscribed_events { if event == name { return nil } }
+    for event in pending_events { if event == name { return nil } }
+    pending_events.push(name)
     host.request("events.subscribe", {event: name}, fn(r){
+        pending_events.retain(|event| event != name)
+        if r.is_ok { subscribed_events.push(name) }
         if r.is_ok || live_note != "" { return nil }
         live_note = "live updates off: " + r.error
         show_room()
     })
+}
+
+fn watch_granted(){
+    subscribed_events.retain(|event| host.has(event))
+    if host.has("on_room_message") { subscribe("on_room_message") }
+    if host.has("on_room_members_changed") { subscribe("on_room_members_changed") }
+    if host.has("on_room_typing") { subscribe("on_room_typing") }
+    if host.has("on_room_reaction") { subscribe("on_room_reaction") }
+    if host.has("on_room_message_changed") { subscribe("on_room_message_changed") }
 }
 
 fn watch(){
@@ -204,9 +236,9 @@ fn on_app_resize(w, h){
 }
 
 fn on_permissions_changed(caps){
-    load_room()
-    load_messages()
-    watch()
+    if !room_loaded { load_room() }
+    if !messages_loaded { load_messages() }
+    watch_granted()
 }
 
 let _boot = start_timeout(0.05, || {

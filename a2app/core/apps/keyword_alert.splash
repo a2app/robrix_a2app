@@ -55,6 +55,17 @@ fn on_background(json){
     })
 }
 
+fn test_alert(){
+    host.request("permissions.request", {perm: "matrix-room-watch"}, fn(r){
+        if !r.is_ok { show_status(r.error) return nil }
+        if !r.data.granted { show_status("Allow this app to watch this room before scheduling alerts.") return nil }
+        host.request("notify.post", {title: "Keyword Alert", body: "Test alert for '" + keyword + "'."}, fn(out){
+            if out.is_ok { show_status("Test alert shown. This room is ready for scheduled keyword alerts.") }
+            else { show_status(out.error) }
+        })
+    })
+}
+
 fn on_app_resize(width, height){
     if initialized { return nil }
     initialized = true
@@ -72,7 +83,9 @@ View{
         Label{text: "Watch for a project release, an incident tag, or any literal case-sensitive phrase. Your own messages are ignored. One popup summarizes each matching batch." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 12}}}
         keyword_input := TextInput{width: Fill empty_text: "release"}
         Button{text: "Save keyword" on_click: || save()}
+        Button{text: "Set up and test saved keyword" on_click: || test_alert()}
         status := Label{text: "Default keyword: release. Enable New room messages in Background tasks for this same room." width: Fill draw_text +: {color: #xD9822B text_style: theme.font_regular{font_size: 12}}}
+        Label{text: "Save a keyword, then set up and test alerts. Allow room watching and notifications for this session or longer before scheduling this room's task." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
         Label{text: "Uses new messages delivered by Robrix's live room timeline, with bounded message previews. It does not replay offline history, edits or messages dropped while a run is busy. Read protection and notification permissions always apply." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
     }
 }

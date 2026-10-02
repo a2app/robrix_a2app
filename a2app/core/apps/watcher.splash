@@ -7,6 +7,9 @@
 // why-notifications: Tells you when a message matches a rule.
 // why-matrix-room-send: Posts your reply when a rule says to.
 
+let watch_pending = false
+let watch_ready = false
+
 let rules = []
 let hits = []
 let last_reply = ""
@@ -49,7 +52,11 @@ fn show_status(){
 }
 
 fn subscribe(){
+    if watch_pending || watch_ready { return nil }
+    watch_pending = true
     host.request("events.subscribe", {event: "on_room_message"}, fn(r){
+        watch_pending = false
+        watch_ready = r.is_ok
         if r.is_ok {
             watch_line = "Watching this room."
         } else {
@@ -59,7 +66,15 @@ fn subscribe(){
     })
 }
 
-fn on_permissions_changed(caps){ subscribe() }
+fn on_permissions_changed(caps){
+    if host.has("on_room_message") {
+        subscribe()
+    } else {
+        watch_ready = false
+        watch_line = "Not watching: permission is off."
+        show_status()
+    }
+}
 
 fn add_rule(){
     let keyword = ui.keyword_input.text().trim()
@@ -67,17 +82,24 @@ fn add_rule(){
         ui.status.set_text("Type a keyword to watch for first.")
         return nil
     }
+    let reply = ui.reply_input.text().trim()
     rules.push({
         keyword: keyword
         pattern: keyword_pattern(keyword)
         notify: !ui.silent_toggle.checked()
-        reply: ui.reply_input.text().trim()
+        reply: reply
     })
     save()
     ui.keyword_input.set_text("")
     ui.reply_input.set_text("")
     ui.rule_list.render()
     show_status()
+    if reply != "" && !host.has("matrix.room.message.send") {
+        host.request("permissions.request", {perm: "matrix-room-send"}, fn(r){
+            if !r.is_ok { ui.status.set_text(r.error) return nil }
+            if !r.data.granted { ui.status.set_text("Rule saved. Automatic replies need permission to post to this room.") }
+        })
+    }
 }
 
 fn remove_rule(i){

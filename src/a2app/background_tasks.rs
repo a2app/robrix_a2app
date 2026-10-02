@@ -183,12 +183,12 @@ script_mod! {
                         padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Permissions"
                     }
                     task_sharing := RobrixNeutralIconButton {
-                        padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Data sharing"
+                        padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Advanced permissions"
                     }
                 }
                 room_action_help := mod.widgets.PermissionOptionLabel {
                     visible: false
-                    text: "To review a blocked action, keep the mini-app open in its room, return here and choose Run now. Then review the action in Data sharing and retry. Background tasks cannot ask for permission while running."
+                    text: "To review a blocked action, keep the mini-app open in its room, return here and choose Run now. Then review the action in Advanced permissions and retry. Background tasks cannot ask for permission while running."
                 }
             }
             show_help := RobrixNeutralIconButton {

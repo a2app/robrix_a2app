@@ -236,7 +236,7 @@ pub(crate) async fn rooms(space_id: OwnedRoomId) -> Result<String, String> {
     // Each page is one /hierarchy request; stop at the end or at the row cap.
     loop {
         check_space()?;
-        super::policy::ensure_server_output(homeserver.as_str())?;
+        super::policy::ensure_server_output(homeserver.as_str()).await?;
         super::policy::audit_server_operation(homeserver.as_str(), list.paginate()).await
             .map_err(|e| format!("couldn't load the space's rooms: {e}"))?;
         let done = matches!(list.pagination_state(), SpaceRoomListPaginationState::Idle { end_reached: true });

@@ -7,6 +7,12 @@
 // why-matrix-room-watch: Updates who is typing and reading as it happens.
 // why-robrix-navigation: Opens a person you tap, or jumps to the message they read.
 
+let subscribed_events = []
+let pending_events = []
+
+let receipts_loading = false
+let receipts_loaded = false
+
 let rows = []
 let cells = []
 let bodies = []
@@ -67,7 +73,11 @@ fn fetch_next(){
 }
 
 fn load(){
+    if receipts_loading { return nil }
+    receipts_loading = true
     host.request("matrix.read_receipts", nil, fn(r){
+        receipts_loading = false
+        receipts_loaded = r.is_ok
         if r.is_ok {
             rows = r.data.receipts
             if rows.len() == 0 {
@@ -124,17 +134,28 @@ fn on_room_receipt(json){
     refresh()
 }
 
-fn watch(){
-    ui.typing.set_text("Nobody is typing")
-    host.request("events.subscribe", {event: "on_room_typing"}, on_watch)
-    host.request("events.subscribe", {event: "on_room_receipt"}, on_watch)
+fn subscribe(name){
+    for event in subscribed_events { if event == name { return nil } }
+    for event in pending_events { if event == name { return nil } }
+    pending_events.push(name)
+    host.request("events.subscribe", {event: name}, fn(r){
+        pending_events.retain(|event| event != name)
+        if r.is_ok { subscribed_events.push(name) }
+        if !r.is_ok { ui.typing.set_text("Live updates are off: " + r.error) }
+    })
 }
 
-fn on_watch(r){ if !r.is_ok { ui.typing.set_text("Live updates are off: " + r.error) } }
+fn watch(){
+    ui.typing.set_text("Nobody is typing")
+    subscribe("on_room_typing")
+    subscribe("on_room_receipt")
+}
 
 fn on_permissions_changed(caps){
-    load()
-    watch()
+    if !receipts_loaded { load() }
+    subscribed_events.retain(|event| host.has(event))
+    if host.has("on_room_typing") { subscribe("on_room_typing") }
+    if host.has("on_room_receipt") { subscribe("on_room_receipt") }
 }
 
 fn tap_cell(i){

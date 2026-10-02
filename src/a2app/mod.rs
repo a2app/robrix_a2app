@@ -26,6 +26,7 @@ pub mod host_set;
 /// The registry of live (app, room) instances that surfaces adopt and release.
 pub mod instances;
 pub mod information_flow;
+mod effect_review;
 pub mod data_sharing;
 pub mod protection_inspector;
 pub mod background_tasks;

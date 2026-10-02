@@ -577,12 +577,15 @@ script_mod! {
                 show_bg: true
                 draw_bg +: { color: (COLOR_BG_PREVIEW), border_radius: 8.0 }
                 SubsectionLabel { text: "Permissions and privacy", margin: 0 }
+                mod.widgets.PermissionOptionLabel {
+                    text: "Apps ask before reading private data or sending. Your choices normally last until Robrix closes."
+                }
                 global_write_enabled := RobrixSettingsToggle {
                     width: Fill, height: Fit
                     padding: Inset{left: 15}
                     active: false
                     draw_bg +: { size: 21 }
-                    text: "Allow room writes"
+                    text: "Allow apps to send or change rooms"
                     draw_text +: { text_style: REGULAR_TEXT {font_size: 10.5}, color: (COLOR_TEXT) }
                 }
                 mod.widgets.PermissionOptionLabel {
@@ -602,7 +605,7 @@ script_mod! {
                     }
                     sharing_button := RobrixNeutralIconButton {
                         padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                        text: "Data sharing…"
+                        text: "Advanced permissions…"
                     }
                     inspect_protection_button := RobrixNeutralIconButton {
                         padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
@@ -933,7 +936,7 @@ script_mod! {
                     text_style: REGULAR_TEXT {font_size: 9.5},
                     color: (MESSAGE_TEXT_COLOR)
                 }
-                text: "This app is running: permission changes apply immediately; changing network access stops it, so open it again afterwards."
+                text: "This app is running. Permission changes apply immediately, and approved requests continue in the same app."
             }
             no_perms_label := Label {
                 visible: false,
@@ -945,7 +948,7 @@ script_mod! {
                 }
                 text: "This app declares no permissions: it can only draw its own UI and use its private storage."
             }
-            mod.widgets.PermissionOptionLabel { text: "Choose what this mini-app can do. Room blocks and data sharing rules still apply to every permission." }
+            mod.widgets.PermissionOptionLabel { text: "Apps ask directly when they need permission. Review your choices here; blocked rooms and spaces stay protected." }
             ability_details := RobrixNeutralIconButton {
                 padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
                 text: "Show individual abilities"
@@ -1146,7 +1149,7 @@ script_mod! {
                         width: Fill, height: Fit, flow: Down, spacing: 8, padding: 14
                         draw_bg +: { color: (COLOR_BG_PREVIEW), border_radius: 8.0 }
                         protection_write_enabled := RobrixSettingsToggle {
-                            width: Fill, height: Fit, text: "Allow room writes"
+                            width: Fill, height: Fit, text: "Allow apps to send or change rooms"
                         }
                         write_default_summary := mod.widgets.PermissionOptionLabel {}
                         change_write_default := RobrixNeutralIconButton {
@@ -1165,7 +1168,7 @@ script_mod! {
                     global_read := PermissionChoices {
                         labels: ["Use each app's permissions", "Allow in every room", "Only in rooms I allow", "Block all room reads"]
                     }
-                    mod.widgets.PermissionOptionLabel { text: "Changes apply immediately. A blocked room or space stays blocked. Blocking new reads does not remove data an app already received; manage that under Data sharing." }
+                    mod.widgets.PermissionOptionLabel { text: "Changes apply immediately. A blocked room or space stays blocked. Blocking new reads does not remove data an app already received; manage that under Advanced permissions." }
                 }
                 write_defaults := View {
                     visible: false, width: Fill, height: Fit, flow: Down, spacing: 12
@@ -1174,7 +1177,7 @@ script_mod! {
                         labels: ["Use each app's permissions", "Allow in every room", "Only in rooms I allow"]
                     }
                     write_defaults_off := mod.widgets.PermissionOptionLabel {
-                        visible: false, text: "Room writes are off. Go Back and turn on Allow room writes to change these settings."
+                        visible: false, text: "Room writes are off. Go Back and turn on Allow apps to send or change rooms to change these settings."
                     }
                     mod.widgets.PermissionOptionLabel { text: "Changes apply immediately. A blocked room or space always stays blocked." }
                 }
@@ -1280,7 +1283,7 @@ script_mod! {
                     padding: 8, draw_icon +: { svg: (ICON_JUMP) }
                     icon_walk: Walk{width: 14, height: 14, margin: 0}, text: "Back"
                 }
-                TitleLabel { width: Fill, margin: 0, flow: Flow.Right{wrap: true}, text: "Private data sharing" }
+                TitleLabel { width: Fill, margin: 0, flow: Flow.Right{wrap: true}, text: "Advanced permissions" }
             }
             sharing_editor := mod.widgets.DataSharing {}
         }
@@ -1762,16 +1765,22 @@ impl MiniAppPermissionRow {
             Effective::Denied => ("Blocked", crate::shared::styles::COLOR_FG_DANGER_RED),
             Effective::Undeclared => ("Undeclared", crate::shared::styles::COLOR_FG_DISABLED),
         };
-        let (scoped_count, writes_blocked) = with_a2app(|state| (
+        let (scoped, websites, writes_blocked) = with_a2app(|state| (
             state.permissions.scoped_grants(app_id).into_iter()
-                .filter(|grant| grant.permission == perm.as_str()).count(),
+                .filter(|grant| grant.permission == perm.as_str()).cloned().collect::<Vec<_>>(),
+            if perm == Permission::Network { state.permissions.network_grants(app_id).into_iter().cloned().collect() } else { Vec::new() },
             !state.permissions.matrix_write() && a2app_core::capabilities::in_group(perm)
                 .any(|cap| cap.status == a2app_core::capabilities::Status::RefusedBySwitch),
         )).unwrap_or_default();
         let (state_text, color) = if writes_blocked {
-            ("Room writes blocked · Allow room writes is off", crate::shared::styles::COLOR_FG_DANGER_RED)
+            ("Room changes are turned off", crate::shared::styles::COLOR_FG_DANGER_RED)
         } else { (state_text, color) };
-        let state_text = if scoped_count > 0 { format!("{state_text} · {scoped_count} saved allowances") } else { state_text.to_string() };
+        let (state_text, color) = if effective != Effective::Denied && !writes_blocked && (!scoped.is_empty() || !websites.is_empty()) {
+            let mut choices = scoped.iter().map(|grant| format!("{} · {}{}", scope_label(cx, &grant.scope), duration_label(grant.duration),
+                if grant.capability.is_some() { " · specific ability" } else { "" })).collect::<Vec<_>>();
+            choices.extend(websites.iter().map(|grant| format!("{} · {}", network_scope_label(&grant.network), duration_label(grant.duration))));
+            (format!("Allowed: {}", choices.join("; ")), crate::shared::styles::COLOR_FG_ACCEPT_GREEN)
+        } else { (state_text.to_string(), color) };
         let mut state_label = self.view.label(cx, ids!(perm_state));
         script_apply_eval!(cx, state_label, {
             text: #(state_text),
@@ -1826,7 +1835,7 @@ impl MiniAppCapabilityRow {
             } else if permissions.is_restricted(app_id) {
                 Some(String::from("Blocked · mini-app is stopped"))
             } else if cap.status == a2app_core::capabilities::Status::RefusedBySwitch && !permissions.matrix_write() {
-                Some(String::from("Blocked · Allow room writes is off"))
+                Some(String::from("Blocked · Allow apps to send or change rooms is off"))
             } else {
                 cap.group.filter(|group| permissions.state(app_id, *group) == GrantState::Denied)
                     .map(|group| format!("Blocked · {} permission group", group.title()))

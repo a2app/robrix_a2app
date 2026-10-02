@@ -26,7 +26,7 @@ cargo run --features a2app
 - **Per-app isolation**: each app runs in its own Splash isolate with nothing
   by default: no filesystem beyond its private jail, no network, no host access.
   Capabilities are declared in the app's manifest, prompted at first use
-  (Allow selected / Allow once / Block permission / Not now), revocable at any time, and a
+  (Allow for this session / Allow once / Block permission / Not now), revocable at any time, and a
   request-flooding app gets stopped and restricted.
 - **Matrix services**, each behind its own permission group: the attached
   room (info, messages, older history, one event, threads and replies,
@@ -93,7 +93,7 @@ cargo run --features a2app
 
 ## Managing access
 
-The Mini Apps screen keeps **Allow room writes** at the top. Turning it off
+The Mini Apps screen keeps **Allow apps to send or change rooms** at the top. Turning it off
 blocks every mini-app and agent from writing to rooms and disables their room
 write controls, while keeping saved rules. **Room and space access** starts with
 the current reading and writing settings and saved rules. Choose **Change** to
@@ -107,11 +107,16 @@ saved allowances. **Add an allowance…** opens room, website and duration choic
 asks for the agent's room and then the permission to edit. Opening or cancelling
 an editor does not grant access.
 
-Request prompts start with **Allow once** and **Not now**. Choose **Remember this
-permission…** to see scope and duration. Website access starts with the exact
-requested address; broader website options require an explicit selection.
+Request prompts show the app, task, rooms or website, and duration. **Allow for
+this session** grants the declared permission group for those rooms until Robrix
+closes; website access covers only the displayed HTTP(S) origin. Collection
+permissions cover your rooms and spaces while retaining room protection filters.
+**More options…** exposes **Allow once**, narrower website/room scopes, permanent
+choices, and blocking. Duplicate requests share one prompt and pending requests
+continue automatically after approval. If room changes are off, the first write
+can explicitly **Enable and allow**, provided no other rule blocks it.
 
-**Data sharing** has **Rules**, **Needs attention**, and **History** views. Adding
+**Advanced permissions** has **Rules**, **Needs attention**, and **History** views. Adding
 a rule walks through data and app, destination, then duration and a final review.
 Blocked actions retain an exact review before approval. **Background tasks**
 shows task cards with Pause/Resume, Edit, and Details; new tasks walk through
@@ -190,7 +195,7 @@ Linux `keychain:` references use Octos's existing `~/.octos/secrets` store,
 including credentials scoped to a profile. Credentials remain in Robrix's
 host process and are never supplied to the confined worker.
 
-Run with `cargo run --features a2app` (or `a2app-embedded-agent`), then use **Data sharing** to allow the configured model recipient for the sources the
+Run with `cargo run --features a2app` (or `a2app-embedded-agent`), then use **Advanced permissions** to allow the configured model recipient for the sources the
 agent or generator needs. A local endpoint also needs explicit source consent;
 Robrix cannot guarantee that the service itself will not forward data.
 
@@ -354,9 +359,12 @@ that room is closed; restarting a mini-app isolate does not end a Robrix
 session grant. Session allowances never reach disk. Allow Once authorizes
 only the pending request, including its asynchronous completion. Subscriptions
 and requests to enable a permission use a selected duration instead.
+Explicit action and sharing session choices also survive restarting that same
+app context, so recurring background workers keep the permission the user chose.
+New private sources, destinations or untrusted influences still need review.
 
 Global, room and ancestor-space blocks always override allowlists and app
-grants. Read and write are independent. The **Allow room writes** master switch
+grants. Read and write are independent. The **Allow apps to send or change rooms** master switch
 pauses all room writes and disables individual write editors, retaining their
 saved rules and the previous write default for when the switch is enabled again.
 Read and write defaults each support **Only in rooms I allow**:
@@ -392,8 +400,8 @@ actual homeserver origin before a request is sent, even in encrypted rooms.
 Cached event reads stay local; ordinary messages use the destination room's
 normal encryption and sharing checks.
 
-Mini Apps → **Data sharing** manages source-to-recipient allowances
-for a configured model service, an exact HTTP(S) origin, or a Matrix room.
+Mini Apps → **Advanced permissions** manages source-to-recipient allowances
+for a configured model service, an exact HTTP(S) origin, a Matrix room, or the clipboard.
 Choose one app in the current account, one exact app/room or agent context,
 or explicitly all readers. Rules can last for a room session, until Robrix
 closes, or persistently. Session rules stay in memory; closing the selected
@@ -409,7 +417,9 @@ Opening a mini-app does not itself read room or account data. Robrix records
 actual service responses, hooks and input before delivering them. Keyboard
 input belongs only to the focused app; typing in the room composer does not
 mark other apps as private. A blocked app offers **Review permission** to open
-its request directly while keeping the instance running. Sharing rules remain
+its request directly while keeping the instance running. Foreground requests
+normally show a direct prompt combining private sources, destination and exact
+action, then continue the pending operation after approval. Sharing rules remain
 reviewable after an app stops; exact action approval requires its live instance.
 
 The design follows the established floating-label approach described by
@@ -424,8 +434,11 @@ that their formal proofs establish the security of Robrix.
 `host_io_only` mode disables direct native networking, shared IPC and native
 exports in mini-app isolates, including nested isolates. Robrix's broker
 mediates network, Matrix operations, clipboard/export, app IPC and tool
-arguments/results. Uncontrolled exports and navigation are refused once
-private data is present; source restrictions transfer across app/agent
+arguments/results. Uncontrolled exports are refused once private data is
+present. Navigation to joined rooms, spaces and Robrix screens stays local;
+user/event/thread/link navigation may query the Matrix server and checks sharing
+with that exact origin. Clipboard copying has an explicit reviewed destination.
+Source restrictions transfer across app/agent
 boundaries before delivery. Normal app navigation transfers provenance to
 the opened app. Each account/app/room combination has a separate filesystem
 jail and persistent provenance. Current source-code provenance is inherited by
@@ -473,15 +486,19 @@ with direct access to the relevant sharing rule.
 
 Action approval captures the reviewed influence set and live activation.
 **This exact action once** also captures the complete host-owned request
-contents. The trusted review shows those contents; approval permits one unchanged
-retry and is consumed immediately before the effect starts. It does not replay
-the request automatically. Changed contents, a different target, cancellation,
+contents. A foreground prompt can approve sharing and the sensitive action
+together. Its primary **Allow for this session** authorizes the displayed known
+sources and operation/target until Robrix closes. **Allow this request once**
+releases only that captured effect and creates no sharing rule. Both continue
+the waiting request automatically. The advanced history
+review still authorizes one unchanged manual retry. Approval is consumed
+immediately before the effect starts. Changed contents, a different target, cancellation,
 revocation or a new activation cannot reuse that approval. Explicit room-session
 and Robrix-session choices remain available for repeated operations of the same
 kind to the same target, including different contents. These approvals authorize
 actions; source-to-recipient sharing rules still independently protect private data.
-New influence, a closed context, a closed room session or explicit revocation
-can invalidate it. No app can endorse its own content or reset these labels.
+New influences, ending the selected room or Robrix session, or explicit revocation
+invalidate session authority. No app can endorse its own content or reset these labels.
 This constrains actions influenced by prompt injection; it does not classify
 instructions as malicious or make remote content trustworthy. Diagnostic
 history is bounded, local and metadata-only; request/response bodies are not

@@ -140,7 +140,7 @@ fn message_permission(binding: &JobBinding, manifest: &MiniAppManifest) -> Resul
         }
         if state.permissions.effective_capability_in_context(manifest, cap,
             PermissionContext { origin_room: Some(room.as_str()), target_room: Some(room.as_str()) }) != Effective::Granted {
-            return Err("Room-message input is not allowed for this mini-app in this room. Open Mini Apps > App Info and allow its room-message capability for this room; also check Room and space protection.".into());
+            return Err("Room watching needs permission. Open this app in the task's room and use its setup or Test action before running the background task.".into());
         }
         Ok(())
     }).ok_or("Mini Apps is unavailable.")?
@@ -401,8 +401,10 @@ pub fn record_failure(heap: usize, error: &str) {
     let Ok(account) = current_account() else { return };
     let current = instances::context_of_heap(heap).and_then(|context| flow::context_epoch(&context).ok().map(|epoch| (context, epoch)));
     let mut error = error.chars().take(4096).collect::<String>();
-    if error.contains("Data sharing") || error.contains("sensitive action") || error.contains("untrusted") {
-        error.push_str(" Open the task's app and keep it open, choose Run now, review the current blocked action in Data sharing, and retry from that live app. A stopped run's one-time approval cannot be reused.");
+    if error == flow::EFFECT_REVIEW_REQUIRED || error.contains("Advanced permissions")
+        || error.contains("Data sharing") || error.contains("sensitive action") || error.contains("untrusted")
+    {
+        error.push_str(" Open the task's app and test this action while it is visible. Choose Allow for this session before running the background task again. Automated runs do not open permission dialogs.");
     }
     with(|state| {
         let ids = state.last_owners.iter().filter(|(_, (owner_heap, epoch, context))|
@@ -641,7 +643,9 @@ View{width: Fill height: Fill}
         assert!(complete(&mut fixture.cx, heap, run.run_id, true).is_err(), "completion cannot replay");
         assert!(instances::heap_of(&key).is_none(), "a hidden completed worker cannot retain timers outside its run");
         record_failure(heap, a2app_core::information_flow::ACTION_REVIEW_REQUIRED);
-        assert!(snapshot().unwrap()[0].status.contains("keep it open"), "the host denial remains attributed after hidden-worker retirement");
+        assert!(snapshot().unwrap()[0].status.contains("while it is visible"), "the host denial remains attributed after hidden-worker retirement");
+        record_failure(heap, flow::EFFECT_REVIEW_REQUIRED);
+        assert!(snapshot().unwrap()[0].status.contains("Allow for this session"), "combined effect denials explain foreground session setup");
         finish_failure_drain();
         record_failure(heap, "An unrelated later error");
         assert!(!snapshot().unwrap()[0].status.contains("unrelated"));

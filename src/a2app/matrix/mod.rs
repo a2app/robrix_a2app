@@ -141,8 +141,13 @@ impl A2AppMatrixResult {
 impl A2AppMatrixRequest {
     pub fn authorized(self, subject: String, capability: &str, origin_room: Option<String>, consent: Box<PermissionStore>, flow_context: a2app_core::information_flow::ContextId) -> Self {
         let flow_epoch = a2app_core::information_flow::context_epoch(&flow_context).ok();
+        let target_room = self.room_target().map(|(room, _, _)| room).or_else(|| match &self {
+            Self::SpaceRooms { space_id, .. } => Some(space_id.to_string()),
+            Self::RoomPreview { room, .. } | Self::Join { room, .. } => Some(room.to_string()),
+            _ => origin_room.clone(),
+        });
         Self::Authorized {
-            authorization: MatrixAuthorization { subject, capability: capability.to_string(), origin_room, consent, flow_context: Some(flow_context), flow_epoch },
+            authorization: MatrixAuthorization { subject, capability: capability.to_string(), origin_room, target_room, consent, flow_context: Some(flow_context), flow_epoch },
             request: Box::new(self),
         }
     }
@@ -427,7 +432,7 @@ async fn run_matrix_request(request: A2AppMatrixRequest, authorization: Option<M
         return;
     }
     if let Some((room, access, reply)) = &target {
-        if let Err(error) = policy::ensure_room_access(room, *access) {
+        if let Err(error) = policy::review_room_access(room, *access).await {
             if let Some(reply) = reply {
                 Cx::post_action(A2AppMatrixResult {
                     reply: *reply, result: Err(error), authorization,
@@ -635,7 +640,7 @@ async fn run_matrix_request(request: A2AppMatrixRequest, authorization: Option<M
                     // Search terms are plaintext to the homeserver even when
                     // their source was an encrypted room. Room output consent
                     // does not authorize this distinct network recipient.
-                    policy::ensure_server_output(client.homeserver().as_str())?;
+                    policy::ensure_server_output(client.homeserver().as_str()).await?;
                     let response = policy::audit_server_operation(client.homeserver().as_str(), client.send(Request::new(categories))).await
                         .map_err(|e| format!("server search failed: {e}"))?;
                     server_used = true;

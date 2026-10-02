@@ -893,9 +893,8 @@ mod tests {
         let new_epoch = registry.context_epoch(&context).unwrap();
         assert_ne!(new_epoch, old_epoch);
         assert!(registry.labels(&context).unwrap().contains(&source), "Stop never clears source history");
-        assert!(registry.ensure_action_allowed_for_activation(&context, new_epoch, &action).is_err(), "the previous authority is retired");
-        registry.grant_authority(&context, action.clone(), AuthoritySession::RobrixSession).unwrap();
-        assert!(registry.ensure_action_allowed_for_activation(&context, old_epoch, &action).is_err(), "new consent cannot revive queued Matrix work");
+        assert!(registry.ensure_action_allowed_for_activation(&context, new_epoch, &action).is_ok(), "explicit session permission keeps its selected duration");
+        assert!(registry.ensure_action_allowed_for_activation(&context, old_epoch, &action).is_err(), "session permission cannot revive queued Matrix work");
         assert!(registry.remove_context_for_activation(&context, old_epoch).is_err(), "late old teardown cannot remove the replacement");
         assert!(registry.ensure_context_epoch(&context, new_epoch).is_ok());
         assert!(registry.ensure_context_epoch(&other_account, other_epoch).is_ok());

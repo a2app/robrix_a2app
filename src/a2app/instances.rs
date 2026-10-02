@@ -257,6 +257,13 @@ pub fn is_foreground(app_id: &str) -> bool {
     with_registry(|registry| registry.instances.iter().any(|((app, _), instance)| app == app_id && instance.foreground()))
 }
 
+/// Permission dialogs belong to the requesting activation and visible surface.
+pub fn context_can_prompt(context: &a2app_core::information_flow::ContextId, epoch: u64) -> bool {
+    with_registry(|registry| registry.instances.values().any(|instance|
+        &instance.flow_context == context && instance.flow_epoch == epoch
+            && instance.foreground() && !instance.background_running))
+}
+
 fn refresh_prompt_state(cx: &mut Cx, key: &InstanceKey) {
     let running = with_registry(|registry| registry.instances.get(key).map(|instance| instance.background_running));
     if let Some(running) = running { set_background_running(cx, key, running); }

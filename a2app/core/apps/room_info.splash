@@ -5,10 +5,17 @@
 // permissions: matrix-room-info
 // why-matrix-room-info: Shows this room's name, topic, and settings.
 
+let info_loading = false
+let info_loaded = false
+
 let loaded = false
 
 fn load(){
+    if info_loading { return nil }
+    info_loading = true
     host.request("matrix.room_info", nil, fn(r){
+        info_loading = false
+        info_loaded = r.is_ok
         if r.is_ok {
             loaded = true
             ui.room_name.set_text(r.data.room_name)
@@ -33,7 +40,7 @@ fn load(){
 }
 
 fn on_permissions_changed(caps){
-    load()
+    if !info_loaded { load() }
 }
 
 let _boot = start_timeout(0.05, || load())

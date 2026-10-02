@@ -66,7 +66,7 @@ impl Registry {
 
     pub fn ensure_action_allowed(&self, context: &ContextId, action: &SensitiveAction) -> Result<(), String> {
         if self.action_decision(context, action)?.allowed { Ok(()) }
-        else { Err("Your approval is needed for this action. Open Mini Apps > Data sharing > Needs attention to review it.".into()) }
+        else { Err("Your approval is needed for this action. Open Mini Apps > Advanced permissions > Needs attention to review it.".into()) }
     }
 
     pub fn recent_action_decisions(&self) -> Result<Vec<ActionDecision>, String> {
@@ -117,7 +117,7 @@ impl Registry {
     }
 }
 
-fn validate_action(action: &SensitiveAction) -> Result<(), String> {
+pub(super) fn validate_action(action: &SensitiveAction) -> Result<(), String> {
     if action.kind.is_empty() || action.target.is_empty() || action.kind.len() > 256 || action.target.len() > 8192 { return Err("An exact action kind and target are required.".into()); }
     Ok(())
 }
@@ -154,11 +154,11 @@ pub(super) struct PendingAction {
 const MAX_EXACT_PAYLOAD: usize = 64 * 1024;
 const MAX_PENDING_ACTIONS: usize = 64;
 
-pub const ACTION_REVIEW_REQUIRED: &str = "Your approval is needed for this action. Open Mini Apps > Data sharing > Needs attention, review it and choose Allow this exact action once. Then try the same action again.";
+pub const ACTION_REVIEW_REQUIRED: &str = "Your approval is needed for this action. Open Mini Apps > Advanced permissions > Needs attention, review it and choose Allow this exact action once. Then try the same action again.";
 
 /// Bound allocation and nesting before sorting/serializing untrusted JSON.
 /// Object order has no meaning; arrays, numbers and strings retain their value.
-fn canonical_payload(value: &serde_json::Value) -> Result<String, String> {
+pub(super) fn canonical_payload(value: &serde_json::Value) -> Result<String, String> {
     fn measure(value: &serde_json::Value, depth: usize, remaining: &mut usize) -> Result<(), String> {
         if depth > 32 { return Err("The action is too deeply nested to review safely.".into()); }
         let size = match value {
@@ -243,7 +243,7 @@ impl Registry {
                 // Keep an operation-only denial so the UI can still offer an
                 // explicitly broader session choice. It cannot approve once.
                 self.action_decision(context, action)?;
-                return Err(format!("{error} No one-time permission was created. Reduce the contents, or explicitly allow this operation and target for a session in Mini Apps > Data sharing and action review."));
+                return Err(format!("{error} No one-time permission was created. Reduce the contents, or explicitly allow this operation and target for a session in Mini Apps > Advanced permissions and action review."));
             }
         };
         let existing = self.pending_actions.iter().find(|pending| {

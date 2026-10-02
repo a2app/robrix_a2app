@@ -101,37 +101,41 @@ pub async fn run(
     let epoch = flow::context_epoch(&context)?;
     let action = request.sensitive_action()?;
     let payload = request.review_payload()?;
-    let authorize = || {
+    let recipient = Recipient::network_origin(request.url.as_str())?;
+    let authorize_permission = || -> Result<(), String> {
         if lifetime.as_ref().is_some_and(|alive| !alive.load(Ordering::Acquire)) {
             return Err("This mini-app instance is no longer running.".into());
         }
         super::information_flow::current_context(&context)?;
-        let recipient = Recipient::network_origin(request.url.as_str())?;
-        flow::ensure_allowed_for_activation(&context, epoch, &recipient)?;
+        flow::ensure_context_epoch(&context, epoch)?;
         if !super::matrix::policy::network_allowed(&subject, origin_room.as_deref(), request.url.as_str(), &consent) {
             return Err("Internet permission is no longer granted for this request.".into());
         }
         Ok(())
     };
     // Even the hostname can encode private content. Check before DNS or queueing.
-    authorize()?;
+    authorize_permission()?;
     let Recipient::NetworkOrigin(origin) = Recipient::network_origin(request.url.as_str())? else { unreachable!() };
     // DNS success, failure and timing are outside inputs too. Record the
     // influence before any lookup; a write may now need explicit action review.
     flow::add_influences_for_activation(&context, epoch, [Influence::InternetOrigin(origin)])?;
+    let review = flow::prepare_effect_for_activation(&context, epoch, Some(&recipient), action.as_ref(), &payload)?;
+    super::effect_review::request(review, true).await?;
+    let committed = AtomicBool::new(false);
+    let authorize = || -> Result<(), String> {
+        authorize_permission()?;
+        if !committed.load(Ordering::Acquire) { flow::check_effect_for_activation(&context, epoch, Some(&recipient), action.as_ref(), &payload)?; }
+        Ok(())
+    };
     authorize()?;
-    if let Some(action) = &action {
-        flow::check_exact_action_for_activation(&context, epoch, action, &payload)?;
-    }
     let _permit = REQUESTS.try_acquire().map_err(|_| "Too many active mini-app HTTP requests.".to_string())?;
     let addresses = tokio::time::timeout(Duration::from_secs(5), public_addresses(&request.url)).await
         .map_err(|_| "DNS resolution timed out.".to_string())??;
     let mut attempt = None;
     let commit = || {
         authorize()?;
-        if let Some(action) = &action {
-            flow::commit_exact_action_for_activation(&context, epoch, action, &payload)?;
-        }
+        flow::commit_effect_for_activation(&context, epoch, Some(&recipient), action.as_ref(), &payload)?;
+        committed.store(true, Ordering::Release);
         attempt = Some(a2app_core::protection_audit::Attempt::start(&context,
             Some(Recipient::network_origin(request.url.as_str())?), a2app_core::protection_audit::ActivityKind::HttpRequest));
         Ok(())

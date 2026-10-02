@@ -27,8 +27,10 @@ const SCHEMA_VERSION: u32 = 2;
 mod sharing;
 mod integrity;
 mod storage;
+mod effects;
 pub use sharing::{ReaderScope, SharingDuration, SharingGrant, FlowDecision};
 pub use integrity::{Influence, Influences, SensitiveAction, AuthoritySession, ActionAuthority, ActionDecision, ActionRequest, ACTION_REVIEW_REQUIRED};
+pub use effects::{EffectReview, EFFECT_REVIEW_REQUIRED};
 use storage::{Metadata, StoredContext, StoredProvenance};
 
 /// A private source identified by the host, never by an app-supplied argument.
@@ -52,6 +54,8 @@ pub enum Recipient {
     MatrixRoom { account: String, room: String },
     /// An uncontrolled recipient, such as the clipboard or an exported file.
     External,
+    /// The local system clipboard; other applications may read copied text.
+    Clipboard,
 }
 
 impl Recipient {
@@ -132,6 +136,7 @@ pub struct Registry {
     session_grants: Vec<SharingGrant>,
     authorities: Vec<ActionAuthority>,
     pending_actions: VecDeque<integrity::PendingAction>,
+    pending_effects: VecDeque<effects::PendingEffect>,
     next_ephemeral_id: u64,
     decisions: RefCell<VecDeque<FlowDecision>>,
     action_decisions: RefCell<VecDeque<ActionDecision>>,
@@ -148,7 +153,7 @@ impl Registry {
         };
         storage::validate_metadata(&metadata)?;
         Ok(Self {
-            root, metadata, contexts: BTreeSet::new(), context_epochs: BTreeMap::new(), session_grants: Vec::new(), authorities: Vec::new(), pending_actions: VecDeque::new(),
+            root, metadata, contexts: BTreeSet::new(), context_epochs: BTreeMap::new(), session_grants: Vec::new(), authorities: Vec::new(), pending_actions: VecDeque::new(), pending_effects: VecDeque::new(),
             next_ephemeral_id: 1 << 63, decisions: RefCell::new(VecDeque::new()),
             action_decisions: RefCell::new(VecDeque::new()), persistence_error: None,
         })
@@ -441,9 +446,13 @@ impl Registry {
 
     pub fn remove_context(&mut self, context: &ContextId) {
         self.forget_exact_actions(context);
+        self.pending_effects.retain(|pending| &pending.review.context != context);
         self.contexts.remove(context);
         self.context_epochs.remove(context);
-        self.authorities.retain(|grant| &grant.context != context);
+        // A stopped worker loses its exact approvals. Explicit session choices
+        // keep their advertised duration when that same context starts again.
+        self.authorities.retain(|grant| &grant.context != context
+            || !matches!(grant.session, AuthoritySession::Once { .. }));
     }
 
     /// A late destructor must never retire a newer activation of this identity.
@@ -456,6 +465,7 @@ impl Registry {
     pub fn close_room_session(&mut self, account: &str, room: &str) -> Result<(), String> {
         self.check_healthy()?;
         self.close_exact_room(account, room);
+        self.pending_effects.retain(|pending| pending.review.context.account() != account || pending.review.context.room() != Some(room));
         self.session_grants.retain(|grant| !matches!(&grant.duration,
             SharingDuration::RoomSession { account: a, room: r } if a == account && r == room));
         self.authorities.retain(|grant| !matches!(&grant.session,
@@ -468,6 +478,7 @@ impl Registry {
         self.session_grants.clear();
         self.authorities.clear();
         self.pending_actions.clear();
+        self.pending_effects.clear();
         self.action_decisions.borrow_mut().clear();
         self.contexts.clear();
         self.context_epochs.clear();
@@ -661,6 +672,30 @@ pub fn context_storage_path(context: &ContextId) -> Result<PathBuf, String> {
 
 pub fn context_epoch(context: &ContextId) -> Result<u64, String> {
     with_registry(|registry| registry.context_epoch(context))
+}
+
+pub fn prepare_effect_for_activation(context: &ContextId, epoch: u64, recipient: Option<&Recipient>, action: Option<&SensitiveAction>, payload: &serde_json::Value) -> Result<EffectReview, String> {
+    with_registry(|registry| registry.prepare_effect_for_activation(context, epoch, recipient, action, payload))
+}
+
+pub fn check_effect_for_activation(context: &ContextId, epoch: u64, recipient: Option<&Recipient>, action: Option<&SensitiveAction>, payload: &serde_json::Value) -> Result<(), String> {
+    with_registry(|registry| registry.check_effect_for_activation(context, epoch, recipient, action, payload))
+}
+
+pub fn approve_effect_once(review: &EffectReview) -> Result<(), String> {
+    with_registry(|registry| registry.approve_effect_once(review))
+}
+
+pub fn approve_effect_session(review: &EffectReview, duration: SharingDuration) -> Result<(), String> {
+    with_registry(|registry| registry.approve_effect_session(review, duration))
+}
+
+pub fn commit_effect_for_activation(context: &ContextId, epoch: u64, recipient: Option<&Recipient>, action: Option<&SensitiveAction>, payload: &serde_json::Value) -> Result<(), String> {
+    with_registry(|registry| registry.commit_effect_for_activation(context, epoch, recipient, action, payload))
+}
+
+pub fn cancel_effect(id: u64) -> Result<bool, String> {
+    with_registry(|registry| registry.cancel_effect(id))
 }
 
 pub fn ensure_context_epoch(context: &ContextId, epoch: u64) -> Result<(), String> {

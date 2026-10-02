@@ -98,7 +98,7 @@ async fn protected_event_with_relations(
         // relations are empty. Keep that network fallback explicit here.
         return Ok(cached);
     }
-    super::policy::ensure_server_output(room.client().homeserver().as_str())?;
+    super::policy::ensure_server_output(room.client().homeserver().as_str()).await?;
     super::policy::audit_server_operation(room.client().homeserver().as_str(), room.load_or_fetch_event_with_relations(event_id, filter, None)).await
         .map_err(|e| format!("couldn't load the event: {e}"))
 }
@@ -142,7 +142,7 @@ pub(crate) async fn older_messages(room_id: OwnedRoomId, before: Option<OwnedEve
     if let Some(anchor) = &anchor {
         // /context splits its budget across both sides of the anchor.
         super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Read)?;
-        if caller_selected_anchor { super::policy::ensure_server_output(client.homeserver().as_str())?; }
+        if caller_selected_anchor { super::policy::ensure_server_output(client.homeserver().as_str()).await?; }
         let context = super::policy::audit_server_operation(client.homeserver().as_str(), room.event_with_context(anchor, true, (limit as u32 * 2).into(), None)).await
             .map_err(|e| format!("couldn't load older messages: {e}"))?;
         out.extend(context.events_before.iter().filter_map(as_message).map(|m| {

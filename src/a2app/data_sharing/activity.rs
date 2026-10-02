@@ -9,7 +9,11 @@ impl DataSharing {
         if *recipient == Recipient::External {
             return "The app has not identified a destination for this data. It must choose a specific website or room before you can allow sharing.".into();
         }
-        let mut text = "Sharing rules need your approval. In Needs attention, select a data source and choose Review sharing rule. Check the destination and duration before choosing Allow sharing. Repeat for each source, then return to the app and try again.".to_string();
+        let mut text = if blocked.len() == 1 {
+            "Sharing needs your approval. Choose Review sharing rule, check the destination and duration, then choose Allow sharing. Return to the app and try again."
+        } else {
+            "Sharing rules need your approval. In Needs attention, select a data source and choose Review sharing rule. Check the destination and duration before choosing Allow sharing. Repeat for each source, then return to the app and try again."
+        }.to_string();
         if blocked.iter().any(|source| match source { Source::Room { account, .. } | Source::Account { account } => account != &self.account, Source::UnknownPrivate => false }) {
             text.push_str("\nSome data belongs to another account. Sign in to that account to review its sharing permission.");
         }

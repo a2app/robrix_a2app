@@ -161,9 +161,9 @@ impl Registry {
 }
 
 fn denied_message(denied: &Label, recipient: &Recipient) -> String {
-    if denied.contains(&Source::UnknownPrivate) { "Robrix cannot identify the source of this app's private data. Open Mini Apps > Data sharing > Needs attention for details." }
-    else if *recipient == Recipient::External { "This app cannot export private data without a specific destination. Open Mini Apps > Data sharing > Needs attention for details." }
-    else { "This app needs permission to share private data with this destination. Open Mini Apps > Data sharing > Needs attention to review it." }.into()
+    if denied.contains(&Source::UnknownPrivate) { "Robrix cannot identify the source of this app's private data. Open Mini Apps > Advanced permissions > Needs attention for details." }
+    else if *recipient == Recipient::External { "This app cannot export private data without a specific destination. Open Mini Apps > Advanced permissions > Needs attention for details." }
+    else { "This app needs permission to share private data with this destination. Open Mini Apps > Advanced permissions > Needs attention to review it." }.into()
 }
 
 pub(super) fn validate_grant(grant: &SharingGrant) -> Result<(), String> {

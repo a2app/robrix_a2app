@@ -50,6 +50,7 @@ pub struct MatrixAuthorization {
     pub subject: String,
     pub capability: String,
     pub origin_room: Option<String>,
+    pub target_room: Option<String>,
     pub consent: Box<PermissionStore>,
     pub flow_context: Option<ContextId>,
     pub flow_epoch: Option<u64>,
@@ -67,6 +68,7 @@ impl MatrixAuthorization {
         Self {
             subject: subject.to_string(), capability: capability.to_string(),
             origin_room: origin_room.map(str::to_string), consent: Box::new(store.clone()),
+            target_room: origin_room.map(str::to_string),
             flow_context: None,
             flow_epoch: None,
         }
@@ -85,17 +87,46 @@ impl MatrixAuthorization {
             self.flow_epoch.ok_or("Missing information-flow activation.")?)
     }
 
+    fn check_current_permission(&self) -> Result<(), String> {
+        self.check_context()?;
+        if with_current_policy(|store| self.permits_request(store)) { Ok(()) }
+        else { Err(ROOM_ACCESS_DENIED.into()) }
+    }
+
+    fn permits_request(&self, store: &PermissionStore) -> bool {
+        let Some(cap) = a2app_core::capabilities::by_id(&self.capability) else { return false };
+        if !a2app_core::services::is_room_collection(cap) { return self.permits(store, self.target_room.as_deref()); }
+        let context = PermissionContext { origin_room: self.origin_room.as_deref(), target_room: self.target_room.as_deref() };
+        // Collection consent starts a filtered query; it does not grant its
+        // root or every returned room. Keep the broker's space-root deny gate.
+        let decision = |store: &PermissionStore| {
+            if cap.id == "matrix.space.rooms.list" && store.capability_room_policy(cap, context) == PolicyDecision::Deny {
+                Effective::Denied
+            } else {
+                store.effective_collection_capability_for_in_context(&self.subject, |_| true, |_| true, cap, context)
+            }
+        };
+        decision(&self.consent) == Effective::Granted
+            && match decision(store) {
+                Effective::Granted => true,
+                Effective::NeedsPrompt => self.consent.has_request_once(&self.subject, cap.id, context),
+                Effective::Denied | Effective::Undeclared => false,
+            }
+    }
+
     pub fn check_flow(&self, room: Option<&str>, access: RoomAccess) -> Result<(), String> {
         let context = self.flow_context.as_ref().ok_or("Missing host information-flow context.")?;
         self.check_context()?;
         let epoch = self.flow_epoch.ok_or("Missing information-flow activation.")?;
         // A read's room/event/search parameters can carry private data too.
         // Recheck their destination after queuing, just like a write body.
-        if let Some(room) = room {
+        let final_write = access == RoomAccess::Write && a2app_core::capabilities::by_id(&self.capability)
+            .and_then(|capability| capability.flow_contract()).is_some_and(|contract| contract.privileged_effect);
+        if let Some(room) = room.filter(|_| !final_write) {
             flow::ensure_allowed_for_activation(context, epoch, &Recipient::MatrixRoom {
                 account: context.account().into(), room: room.into(),
             })?;
-        } else if access == RoomAccess::Write {
+        } else if room.is_none() && access == RoomAccess::Write {
             return Err("Missing output room.".into());
         }
         Ok(())
@@ -202,15 +233,21 @@ pub fn commit_flow_action(context: &ContextId, action: &SensitiveAction, payload
 
 /// Matrix query parameters are plaintext output to the homeserver even when
 /// their target room is encrypted. Require sharing with that exact origin.
-pub fn ensure_server_output(url: &str) -> Result<(), String> {
+pub async fn ensure_server_output(url: &str) -> Result<(), String> {
     ensure_live_activation()?;
-    AUTHORIZATION.try_with(|authorization| {
-        let context = authorization.flow_context.as_ref().ok_or("Missing host information-flow context.")?;
-        authorization.check_context()?;
-        let recipient = Recipient::network_origin(url)?;
-        flow::ensure_allowed_for_activation(context,
-            authorization.flow_epoch.ok_or("Missing information-flow activation.")?, &recipient)
-    }).map_err(|_| "Missing host information-flow authorization.".to_string())?
+    let authorization = AUTHORIZATION.try_with(Clone::clone)
+        .map_err(|_| "Missing host information-flow authorization.".to_string())?;
+    let context = authorization.flow_context.as_ref().ok_or("Missing host information-flow context.")?;
+    authorization.check_current_permission()?;
+    let epoch = authorization.flow_epoch.ok_or("Missing information-flow activation.")?;
+    let recipient = Recipient::network_origin(url)?;
+    if flow::ensure_allowed_for_activation(context, epoch, &recipient).is_err() {
+        let payload = serde_json::json!({ "destination": url, "operation": authorization.capability });
+        let review = flow::prepare_effect_for_activation(context, epoch, Some(&recipient), None, &payload)?;
+        crate::a2app::effect_review::request(review, false).await?;
+    }
+    authorization.check_current_permission()?;
+    flow::ensure_allowed_for_activation(context, epoch, &recipient)
 }
 
 pub fn room_access_allowed(room: &str, access: RoomAccess) -> bool {
@@ -251,16 +288,43 @@ pub fn ensure_room_access(room: &str, access: RoomAccess) -> Result<(), String> 
 }
 
 /// Recheck a host-defined sensitive target immediately before its effect.
-pub fn commit_sensitive_target(target: &str, payload: &serde_json::Value) -> Result<(), String> {
+pub async fn commit_sensitive_target(target: &str, payload: &serde_json::Value) -> Result<(), String> {
     ensure_live_activation()?;
-    AUTHORIZATION.try_with(|auth| {
-        let context = auth.flow_context.as_ref().ok_or("Missing host information-flow context.")?;
-        auth.check_context()?;
-        flow::commit_exact_action_for_activation(context,
-            auth.flow_epoch.ok_or("Missing information-flow activation.")?, &SensitiveAction {
-            kind: auth.capability.clone(), target: target.into(),
-        }, payload)
-    }).map_err(|_| "Missing host information-flow authorization.".to_string())?
+    let auth = AUTHORIZATION.try_with(Clone::clone)
+        .map_err(|_| "Missing host information-flow authorization.".to_string())?;
+    let context = auth.flow_context.as_ref().ok_or("Missing host information-flow context.")?;
+    auth.check_current_permission()?;
+    let epoch = auth.flow_epoch.ok_or("Missing information-flow activation.")?;
+    let action = SensitiveAction { kind: auth.capability.clone(), target: target.into() };
+    let contract = a2app_core::capabilities::by_id(&auth.capability)
+        .and_then(|capability| capability.flow_contract()).ok_or("Missing information-flow contract.")?;
+    let homeserver = crate::sliding_sync::get_client().map(|client| client.homeserver().to_string());
+    let recipient = contract.recipient(context.account(), Some(target), payload, homeserver.as_deref())?;
+    let review = flow::prepare_effect_for_activation(context, epoch, recipient.as_ref(), Some(&action), payload)?;
+    crate::a2app::effect_review::request(review, true).await?;
+    auth.check_current_permission()?;
+    if contract.output == a2app_core::capabilities::FlowOutput::TargetRoom {
+        ensure_room_access(target, RoomAccess::Write)?;
+    }
+    flow::commit_effect_for_activation(context, epoch, recipient.as_ref(), Some(&action), payload)
+}
+
+/// Resolve sharing consent before a read whose parameters target another room.
+pub async fn review_room_access(room: &str, access: RoomAccess) -> Result<(), String> {
+    let auth = AUTHORIZATION.try_with(Clone::clone).ok();
+    let Some(auth) = auth.filter(|_| access == RoomAccess::Read) else { return ensure_room_access(room, access) };
+    auth.check_context()?;
+    let permitted = with_current_policy(|store| store.room_policy(Some(room), access) != PolicyDecision::Deny && auth.permits(store, Some(room)));
+    if !permitted { return Err(ROOM_ACCESS_DENIED.into()); }
+    let context = auth.flow_context.as_ref().ok_or("Missing host information-flow context.")?;
+    let recipient = Recipient::MatrixRoom { account: context.account().into(), room: room.into() };
+    let epoch = auth.flow_epoch.ok_or("Missing information-flow activation.")?;
+    if flow::ensure_allowed_for_activation(context, epoch, &recipient).is_err() {
+        let payload = serde_json::json!({ "room": room, "operation": auth.capability });
+        let review = flow::prepare_effect_for_activation(context, epoch, Some(&recipient), None, &payload)?;
+        crate::a2app::effect_review::request(review, false).await?;
+    }
+    ensure_room_access(room, access)
 }
 
 pub fn global_room_access_allowed(room: &str, access: RoomAccess) -> bool {
@@ -364,21 +428,68 @@ mod tests {
     }
 
     #[test]
+    fn collection_worker_keeps_child_subset_consent_without_authorizing_its_root() {
+        for capability in ["matrix.space.rooms.list", "matrix.rooms.messages.search"] {
+            let cap = a2app_core::capabilities::by_id(capability).unwrap();
+            let mut store = PermissionStore::default();
+            store.set_global_policy(RoomAccess::Read, PolicyDecision::Ask);
+            let grant = store.grant_scoped("app", cap.group.unwrap(), Some(capability),
+                RoomScope::room("!child:s"), GrantDuration::RobrixSession, None).unwrap();
+            let mut auth = MatrixAuthorization::new("app", capability, Some("!origin:s"), &store);
+            let root = if capability == "matrix.space.rooms.list" { "!space:s" } else { "!origin:s" };
+            auth.target_room = Some(root.into());
+            assert!(auth.permits_request(&store), "{capability}");
+            assert!(!auth.permits(&store, Some(root)));
+            assert!(auth.permits(&store, Some("!child:s")));
+            assert!(!auth.permits(&store, Some("!sibling:s")));
+            let response = r#"{"rooms":[{"room_id":"!child:s"},{"room_id":"!sibling:s"}]}"#;
+            let filtered: serde_json::Value = serde_json::from_str(&filter_read_result(response, &store, Some(&auth)).unwrap()).unwrap();
+            assert_eq!(filtered["rooms"], serde_json::json!([{ "room_id": "!child:s" }]));
+
+            let mut denied_child = store.clone();
+            denied_child.set_room_policy("!child:s", RoomAccess::Read, PolicyDecision::Deny);
+            assert!(!auth.permits(&denied_child, Some("!child:s")));
+            let filtered: serde_json::Value = serde_json::from_str(&filter_read_result(response, &denied_child, Some(&auth)).unwrap()).unwrap();
+            assert!(filtered["rooms"].as_array().unwrap().is_empty());
+
+            let mut revoked = store.clone();
+            revoked.remove_scoped_grant(grant);
+            assert!(!auth.permits_request(&revoked));
+            let mut denied = store.clone();
+            denied.set_capability("app", capability, GrantState::Denied);
+            assert!(!auth.permits_request(&denied));
+            let mut denied = store.clone();
+            denied.set_global_policy(RoomAccess::Read, PolicyDecision::Deny);
+            assert!(!auth.permits_request(&denied));
+            if capability == "matrix.space.rooms.list" {
+                store.set_space_policy("!space:s", RoomAccess::Read, PolicyDecision::Deny);
+                assert!(!auth.permits_request(&store));
+            }
+        }
+    }
+
+    #[test]
     fn revocation_cancels_pending_reads_but_a_consumed_once_receipt_remains_valid() {
         let mut store = PermissionStore::default();
         let grant = store.grant_scoped("app", Permission::MatrixRoomsRead, Some("matrix.rooms.messages.read"),
             RoomScope::room("!allowed:s"), GrantDuration::Always, None).unwrap();
-        let durable = MatrixAuthorization::new("app", "matrix.rooms.messages.read", Some("!origin:s"), &store);
+        let mut durable = MatrixAuthorization::new("app", "matrix.rooms.messages.read", Some("!origin:s"), &store);
+        durable.target_room = Some("!allowed:s".into());
+        assert!(durable.permits_request(&store));
         store.remove_scoped_grant(grant);
+        assert!(!durable.permits_request(&store));
         assert!(!durable.permits(&store, Some("!allowed:s")));
         let once = store.grant_scoped("app", Permission::MatrixRoomsRead, Some("matrix.rooms.messages.read"),
             RoomScope::room("!allowed:s"), GrantDuration::RobrixSession, None).unwrap();
         store.mark_request_once(once);
-        let receipt = MatrixAuthorization::new("app", "matrix.rooms.messages.read", Some("!origin:s"), &store);
+        let mut receipt = MatrixAuthorization::new("app", "matrix.rooms.messages.read", Some("!origin:s"), &store);
+        receipt.target_room = Some("!allowed:s".into());
         store.remove_scoped_grant(once);
+        assert!(receipt.permits_request(&store));
         assert!(receipt.permits(&store, Some("!allowed:s")));
         assert!(!receipt.permits(&store, Some("!elsewhere:s")));
         store.set_room_policy("!allowed:s", RoomAccess::Read, PolicyDecision::Deny);
+        assert!(!receipt.permits_request(&store));
         assert!(!receipt.permits(&store, Some("!allowed:s")));
     }
 
@@ -412,9 +523,9 @@ mod tests {
         assert!(!network_permitted(&store, &store, "app", None, "https://example.com/path"));
     }
 
-    #[test]
-    fn homeserver_output_needs_host_flow_authorization() {
-        assert!(ensure_server_output("https://matrix.example").is_err());
+    #[tokio::test]
+    async fn homeserver_output_needs_host_flow_authorization() {
+        assert!(ensure_server_output("https://matrix.example").await.is_err());
         let authorization = MatrixAuthorization::new("app", "matrix.room.event.read", Some("!room:s"), &PermissionStore::default());
         assert!(authorization.check_flow(Some("!room:s"), RoomAccess::Read).is_err());
     }

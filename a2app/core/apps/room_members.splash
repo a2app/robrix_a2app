@@ -7,6 +7,12 @@
 // why-robrix-navigation: Opens the profile of a member you tap.
 // why-matrix-room-watch: Refreshes the list as people join or leave.
 
+let watch_pending = false
+let watch_ready = false
+
+let members_loading = false
+let members_loaded = false
+
 let items = []
 let status = "Loading…"
 let live_note = ""
@@ -14,7 +20,11 @@ let live_note = ""
 fn show_header(){ ui.header.set_text(status + live_note) }
 
 fn load(){
+    if members_loading { return nil }
+    members_loading = true
     host.request("matrix.room_members", {limit: 60}, fn(r){
+        members_loading = false
+        members_loaded = r.is_ok
         if r.is_ok {
             items = r.data.members
             status = "" + r.data.count + " members · tap one for their profile"
@@ -32,15 +42,19 @@ fn on_room_members_changed(json){
 }
 
 fn watch(){
+    if watch_pending || watch_ready { return nil }
+    watch_pending = true
     host.request("events.subscribe", {event: "on_room_members_changed"}, fn(r){
+        watch_pending = false
+        watch_ready = r.is_ok
         if r.is_ok { live_note = "" } else { live_note = " · live updates off: " + r.error }
         show_header()
     })
 }
 
 fn on_permissions_changed(caps){
-    load()
-    watch()
+    if !members_loaded { load() }
+    if host.has("on_room_members_changed") { watch() } else { watch_ready = false }
 }
 
 fn open_member(i){

@@ -7,6 +7,14 @@
 // why-robrix-navigation: Opens a room you tap.
 // why-matrix-membership: Accepts or declines an invite when you tap a button.
 
+let subscribed_events = []
+let pending_events = []
+
+let invites_loading = false
+let invites_loaded = false
+let unread_loading = false
+let unread_loaded = false
+
 let invites = []
 let unread = []
 let invite_note = "Loading…"
@@ -80,7 +88,11 @@ fn answer_invite(accept){
 }
 
 fn load_invites(){
+    if invites_loading { return nil }
+    invites_loading = true
     host.request("matrix.invites", nil, fn(r){
+        invites_loading = false
+        invites_loaded = r.is_ok
         if r.is_ok {
             invites = r.data.invites
             invite_note = "No pending invites."
@@ -96,7 +108,11 @@ fn load_invites(){
 }
 
 fn load_unread(){
+    if unread_loading { return nil }
+    unread_loading = true
     host.request("matrix.rooms_list", nil, fn(r){
+        unread_loading = false
+        unread_loaded = r.is_ok
         if !r.is_ok {
             unread = []
             unread_note = r.error
@@ -153,9 +169,21 @@ fn on_unread_totals_changed(json){
 }
 
 fn subscribe(name){
+    for event in subscribed_events { if event == name { return nil } }
+    for event in pending_events { if event == name { return nil } }
+    pending_events.push(name)
     host.request("events.subscribe", {event: name}, fn(r){
+        pending_events.retain(|event| event != name)
+        if r.is_ok { subscribed_events.push(name) }
         if !r.is_ok { ui.status.set_text("Live updates are off: " + r.error) }
     })
+}
+
+fn watch_granted(){
+    subscribed_events.retain(|event| host.has(event))
+    if host.has("on_invite_received") { subscribe("on_invite_received") }
+    if host.has("on_rooms_changed") { subscribe("on_rooms_changed") }
+    if host.has("on_unread_totals_changed") { subscribe("on_unread_totals_changed") }
 }
 
 fn watch(){
@@ -166,8 +194,9 @@ fn watch(){
 }
 
 fn on_permissions_changed(caps){
-    load_all()
-    watch()
+    if !invites_loaded { load_invites() }
+    if !unread_loaded { load_unread() }
+    watch_granted()
 }
 
 let _boot = start_timeout(0.05, || {

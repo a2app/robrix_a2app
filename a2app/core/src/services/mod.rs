@@ -303,6 +303,10 @@ pub fn parse_app_tool_request(
 
 /// Work only the host can do, returned from [`Broker::process`].
 pub enum BrokerAsk {
+    /// Keep the original callback pending while the host reviews this exact effect.
+    FlowReview { request: SplashHostRequest, review: crate::information_flow::EffectReview },
+    /// Explicit setup choice when the master write switch is the only block.
+    EnableWrites { app_id: MiniAppId, perm: Permission, request: SplashHostRequest },
     /// Finish only the run belonging to this requesting isolate/activation.
     BackgroundComplete { reply: Reply, run_id: u64, success: bool },
     /// HTTP is executed by the host after checking the current source labels.
@@ -470,7 +474,7 @@ pub struct BrokerCtx<'a> {
     pub room_name: &'a dyn Fn(&str) -> Option<String>,
     pub desktop_view: bool,
     /// Host-trusted provenance and output checks, before service side effects.
-    pub check_flow: &'a dyn Fn(&SplashHostRequest, &crate::capabilities::Capability, &serde_json::Value, &AppRegistry) -> Result<(), String>,
+    pub check_flow: &'a dyn Fn(&SplashHostRequest, &crate::capabilities::Capability, &serde_json::Value, &AppRegistry) -> Result<Option<crate::information_flow::EffectReview>, String>,
     /// Revalidate the live context and record returned sources before callbacks.
     pub check_response: &'a dyn Fn(Reply, &str) -> Result<(), String>,
 }
@@ -507,6 +511,26 @@ pub fn is_room_collection(capability: &crate::capabilities::Capability) -> bool 
         | "matrix.rooms.messages.search" | "matrix.spaces.list" | "matrix.space.rooms.list"
         | "on_rooms_changed" | "on_invite_received" | "on_unread_totals_changed"
     )
+}
+
+/// Turning on writes is offered only when no app or room rule also blocks it.
+pub fn can_enable_writes(store: &PermissionStore, manifest: &crate::manifest::MiniAppManifest,
+    capability: &crate::capabilities::Capability, context: PermissionContext<'_>) -> bool
+{
+    if store.matrix_write() || capability.status != crate::capabilities::Status::RefusedBySwitch { return false; }
+    let Some(permission) = capability.group else { return false };
+    if !manifest.declares(permission) || !manifest.declares_capability(capability) { return false; }
+    let mut enabled = store.clone();
+    enabled.set_matrix_write(true);
+    !matches!(enabled.effective_capability_in_context(manifest, capability, context), Effective::Denied | Effective::Undeclared)
+}
+
+/// A setup request can enable writes for an available declared group ability.
+pub fn can_enable_permission_writes(store: &PermissionStore, manifest: &crate::manifest::MiniAppManifest,
+    permission: Permission, context: PermissionContext<'_>) -> bool
+{
+    crate::capabilities::in_group(permission).any(|capability|
+        capability.is_available() && can_enable_writes(store, manifest, capability, context))
 }
 
 /// A group query describes whether this instance can already use a declared
@@ -834,6 +858,10 @@ impl Broker {
         };
         if denied
         {
+            if may_prompt && can_enable_writes(ctx.permissions, &manifest, capability, context) {
+                asks.push(BrokerAsk::EnableWrites { app_id: manifest.id.clone(), perm: capability.group.unwrap(), request: req });
+                return;
+            }
             return Self::respond_policy_denied(cx, &req, ctx.permissions, &manifest, capability, context);
         }
         // Same-app IPC is inside one sandbox: no permission involved.
@@ -896,8 +924,17 @@ impl Broker {
             self.notable.remove(&(reply.heap_key, reply.req_id));
         }
 
-        if let Err(error) = (ctx.check_flow)(&req, capability, &args, ctx.registry) {
-            return respond(cx, reply, Err(&error));
+        match (ctx.check_flow)(&req, capability, &args, ctx.registry) {
+            Ok(None) => {}
+            Ok(Some(review)) if may_prompt => {
+                asks.push(BrokerAsk::FlowReview { request: req, review });
+                return;
+            }
+            Ok(Some(review)) => {
+                let _ = crate::information_flow::cancel_effect(review.id);
+                return respond(cx, reply, Err(crate::information_flow::EFFECT_REVIEW_REQUIRED));
+            }
+            Err(error) => return respond(cx, reply, Err(&error)),
         }
 
         match req.service.as_str() {
@@ -992,6 +1029,10 @@ impl Broker {
                 let Some(perm) = args["perm"].as_str().and_then(Permission::from_str) else {
                     return respond(cx, reply, Err("unknown permission"));
                 };
+                if may_prompt && can_enable_permission_writes(ctx.permissions, &manifest, perm, context) {
+                    asks.push(BrokerAsk::EnableWrites { app_id: manifest.id.clone(), perm, request: req });
+                    return;
+                }
                 match permission_request_status(ctx.permissions, &manifest, perm, context) {
                     Effective::Granted => respond(cx, reply, Ok("{\"granted\": true}")),
                     Effective::Denied => respond(cx, reply, Ok("{\"granted\": false}")),

@@ -9,6 +9,9 @@
 
 let depth = 300
 let loading = false
+let loaded = false
+let power_loading = false
+let power_loaded = false
 let load_error = ""
 let empty_note = "Counting…"
 let bar_w = 320
@@ -154,6 +157,7 @@ fn compute(){
 
 fn finish(){
     loading = false
+    loaded = load_error == ""
     empty_note = "No messages in this room yet."
     if load_error != "" { empty_note = load_error }
     compute()
@@ -207,7 +211,15 @@ fn load(){
         load_error = r.error
         finish()
     })
+    load_power()
+}
+
+fn load_power(){
+    if power_loading { return nil }
+    power_loading = true
     host.request("matrix.power_levels", nil, fn(r){
+        power_loading = false
+        power_loaded = r.is_ok
         if !r.is_ok {
             ui.power_line.set_text(r.error)
             return nil
@@ -261,7 +273,10 @@ fn on_app_resize(w, h){
     ui.sender_list.render()
 }
 
-fn on_permissions_changed(caps){ load() }
+fn on_permissions_changed(caps){
+    if !loaded { load() }
+    if !power_loaded { load_power() }
+}
 
 let _boot = start_timeout(0.05, || load())
 

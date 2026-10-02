@@ -252,6 +252,8 @@ impl DataSharing {
             self.view.permission_choices(cx, ids!(blocked_source_choice)).set_selected_item(cx, 0);
         }
         self.view.widget(cx, ids!(review_section)).set_visible(cx, !self.blocked_sources.is_empty());
+        self.view.widget(cx, ids!(blocked_source_prompt)).set_visible(cx, self.blocked_sources.len() > 1);
+        self.view.widget(cx, ids!(blocked_source_choice)).set_visible(cx, self.blocked_sources.len() > 1);
         let review_problem = self.sharing_review_problem(cx);
         self.view.button(cx, ids!(review_button)).set_enabled(cx, review_problem.is_none());
         self.view.widget(cx, ids!(review_button)).set_disabled(cx, review_problem.is_some());
@@ -338,6 +340,7 @@ impl DataSharing {
                 self.view.drop_down(cx, ids!(target_room)).set_selected_item(cx, index);
             }
             Recipient::External => return Err("Unrestricted external sharing cannot be approved here.".into()),
+            Recipient::Clipboard => self.view.permission_choices(cx, ids!(recipient_kind)).set_selected_item(cx, 3),
         }
         self.update_recipient_form(cx);
         self.update_diagnostic_details(cx);
@@ -404,6 +407,7 @@ impl DataSharing {
                 .map(|model| model.label.clone()).unwrap_or_else(|| "Other AI service".into()),
             Recipient::MatrixRoom { room, .. } => format!("Room · {}", self.room_name(room)),
             Recipient::External => "Unrestricted sharing".into(),
+            Recipient::Clipboard => "System clipboard".into(),
         }
     }
 

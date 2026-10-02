@@ -50,7 +50,8 @@ fn cost_of(service: &str) -> f64 {
         // the isolate, so a script polling these in a loop is still a script
         // the host has to keep up with.
         "env" | "permissions.query" | "events.subscribe" | "events.unsubscribe"
-        | "ui.pane.read" | "host.prefs" | "device.info" | "ipc.apps_list" => 1.0,
+        | "ui.pane.read" | "host.prefs" | "device.info" | "ipc.apps_list"
+        | "background.complete" => 1.0,
         // Touch host state or another isolate.
         "notify.post" | "notify.clear" | "clipboard.write" | "ipc.send" | "ipc.post" => 1.0,
         // Leave the process: network, a child process, the OS.
@@ -259,6 +260,22 @@ mod tests {
             "a 60-call loop must be refused somewhere"
         );
         assert!(l.refusals("t") > 0);
+    }
+
+    #[test]
+    fn background_reports_can_acknowledge_completed_work() {
+        let mut limiter = AbuseLimiter::default();
+        // Two immediate website checks, including changed-page reports, fit
+        // the normal burst budget and can both finish their scheduled run.
+        for _ in 0..2 {
+            for service in ["network.http", "matrix.send_message", "background.complete"] {
+                assert!(matches!(limiter.check("website-watch", service, false), Verdict::Allow),
+                    "a completed run must be able to acknowledge its work: {service}");
+            }
+        }
+        assert!(drain(&mut limiter, "background.complete", 60).iter()
+            .any(|verdict| matches!(verdict, Verdict::Refuse(_))),
+            "completion requests still have a bounded budget");
     }
 
     /// Keep slamming into the limit and the host stops asking nicely.

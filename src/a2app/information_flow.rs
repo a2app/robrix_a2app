@@ -162,7 +162,7 @@ fn collect_room_id_list(account: &str, value: &serde_json::Value, sources: &mut 
 }
 
 /// Runs after ordinary capability authorization, before any service executes.
-pub fn check_request(request: &SplashHostRequest, capability: &Capability, args: &serde_json::Value, registry: &a2app_core::manifest::AppRegistry) -> Result<(), String> {
+pub fn check_request(request: &SplashHostRequest, capability: &Capability, args: &serde_json::Value, registry: &a2app_core::manifest::AppRegistry) -> Result<Option<flow::EffectReview>, String> {
     let context = context_for_heap(request.heap_key)?;
     let (app, room) = match &context {
         ContextId::App { app, room, .. } => (app.as_str(), room.as_deref()),
@@ -177,24 +177,22 @@ pub fn check_request(request: &SplashHostRequest, capability: &Capability, args:
     }
     let contract = capability.flow_contract().ok_or("This service has no information-flow contract.")?;
     let target = services::permission_context(&request.service, args, room).target_room;
-    check_output(&context, contract, args, target)?;
-    record_contract_source(&context, contract, room, target, registry)?;
     // Deferred Matrix/network/UI effects capture their resolved contents at
     // the final sink. Immediate platform effects commit this immutable call.
-    let deferred = request.service.starts_with("matrix.")
+    let deferred = request.service.starts_with("matrix.") || request.service == "network.http"
         || matches!(capability.id, "host.composer.insert" | "host.composer.reply_to" | "host.nav.app");
-    if !deferred && let Some(action) = contract.sensitive_action(capability.id, args, target) {
-        flow::commit_exact_action_for_activation(&context, flow::context_epoch(&context)?, &action, args)?;
+    let final_effect = deferred && (contract.privileged_effect || request.service == "network.http");
+    if !final_effect {
+        let homeserver = crate::sliding_sync::get_client().map(|client| client.homeserver().to_string());
+        let recipient = contract.recipient(context_account(&context), target, args, homeserver.as_deref())?;
+        let action = (!deferred).then(|| contract.sensitive_action(capability.id, args, target)).flatten();
+        let epoch = flow::context_epoch(&context)?;
+        let review = flow::prepare_effect_for_activation(&context, epoch, recipient.as_ref(), action.as_ref(), args)?;
+        if !review.allowed { return Ok(Some(review)); }
+        flow::commit_effect_for_activation(&context, epoch, recipient.as_ref(), action.as_ref(), args)?;
     }
-    Ok(())
-}
-
-fn check_output(context: &ContextId, contract: FlowContract, args: &serde_json::Value, target: Option<&str>) -> Result<(), String> {
-    let homeserver = crate::sliding_sync::get_client().map(|client| client.homeserver().to_string());
-    if let Some(recipient) = contract.recipient(context_account(context), target, args, homeserver.as_deref())? {
-        flow::ensure_allowed(context, &recipient)?;
-    }
-    Ok(())
+    record_contract_source(&context, contract, room, target, registry)?;
+    Ok(None)
 }
 
 fn record_contract_source(

@@ -515,6 +515,25 @@ mod tests {
     }
 
     #[test]
+    fn local_navigation_and_clipboard_have_distinct_release_destinations() {
+        for service in ["nav.room", "nav.space", "nav.screen"] {
+            let contract = for_service(service).unwrap().flow_contract().unwrap();
+            assert_eq!(contract.output, FlowOutput::Local);
+            assert!(contract.privileged_effect);
+            assert_eq!(contract.recipient("alice", Some("room-a"), &serde_json::json!({}), None).unwrap(), None);
+        }
+        for service in ["nav.event", "nav.thread", "nav.user", "nav.link"] {
+            let contract = for_service(service).unwrap().flow_contract().unwrap();
+            assert_eq!(contract.output, FlowOutput::MatrixServer);
+            assert_eq!(contract.recipient("alice", Some("room-a"), &serde_json::json!({}), Some("https://matrix.example/")).unwrap(), Some(crate::information_flow::Recipient::NetworkOrigin("https://matrix.example".into())));
+            assert!(contract.privileged_effect);
+        }
+        let clipboard = for_service("clipboard.write").unwrap().flow_contract().unwrap();
+        assert_eq!(clipboard.recipient("alice", None, &serde_json::json!({"text":"copied"}), None).unwrap(), Some(crate::information_flow::Recipient::Clipboard));
+        assert_eq!(for_service("url.open").unwrap().flow_contract().unwrap().output, FlowOutput::External);
+    }
+
+    #[test]
     fn every_builtin_host_request_and_hook_has_a_contract() {
         for app in crate::builtin::builtin_apps() {
             // Stock scripts use literal service/hook names. Check their real

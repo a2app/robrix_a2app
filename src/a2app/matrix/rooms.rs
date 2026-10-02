@@ -97,7 +97,7 @@ pub(super) async fn preview(room: OwnedRoomOrAliasId, mut via: Vec<OwnedServerNa
     let target = resolve_room_id(&client, &room, &mut via).await?;
     ensure_room_access(target.as_str(), RoomAccess::Read)?;
     let room = OwnedRoomOrAliasId::from(target);
-    super::policy::ensure_server_output(client.homeserver().as_str())?;
+    super::policy::ensure_server_output(client.homeserver().as_str()).await?;
     let preview = super::policy::audit_server_operation(client.homeserver().as_str(), client.get_room_preview(&room, via)).await
         .map_err(|e| format!("couldn't preview the room: {e}"))?;
     ensure_room_access(preview.room_id.as_str(), RoomAccess::Read)?;
@@ -120,7 +120,7 @@ pub(super) async fn resolve_room_id(client: &matrix_sdk::Client, room: &OwnedRoo
         return OwnedRoomId::try_from(room.as_str()).map_err(|_| "invalid room id".to_string());
     }
     let alias = <&RoomAliasId>::try_from(room.as_str()).map_err(|_| "invalid room alias")?;
-    super::policy::ensure_server_output(client.homeserver().as_str())?;
+    super::policy::ensure_server_output(client.homeserver().as_str()).await?;
     let resolved = super::policy::audit_server_operation(client.homeserver().as_str(), client.resolve_room_alias(alias)).await
         .map_err(|e| format!("couldn't resolve the room alias: {e}"))?;
     for server in resolved.servers {

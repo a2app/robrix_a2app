@@ -8,6 +8,18 @@
 // why-robrix-observe: Logs which room and screen you switch to, so you can see what an app would see.
 // why-device-info: Shows what this device reports about itself.
 
+let subscribed_events = []
+let pending_events = []
+
+let pane_loading = false
+let pane_loaded = false
+let env_loading = false
+let env_loaded = false
+let prefs_loading = false
+let prefs_loaded = false
+let device_loading = false
+let device_loaded = false
+
 let events = []
 let pane = nil
 
@@ -40,7 +52,11 @@ fn show_pane(){
 }
 
 fn read_pane(){
+    if pane_loading { return nil }
+    pane_loading = true
     host.request("ui.pane.read", nil, fn(r){
+        pane_loading = false
+        pane_loaded = r.is_ok
         if !r.is_ok {
             ui.pane_line.set_text(r.error)
             return nil
@@ -51,7 +67,11 @@ fn read_pane(){
 }
 
 fn read_env(){
+    if env_loading { return nil }
+    env_loading = true
     host.request("env", nil, fn(r){
+        env_loading = false
+        env_loaded = r.is_ok
         if !r.is_ok {
             ui.env_line.set_text(r.error)
             return nil
@@ -66,7 +86,11 @@ fn read_env(){
 }
 
 fn read_prefs(){
+    if prefs_loading { return nil }
+    prefs_loading = true
     host.request("host.prefs", nil, fn(r){
+        prefs_loading = false
+        prefs_loaded = r.is_ok
         if !r.is_ok {
             ui.prefs_line.set_text(r.error)
             return nil
@@ -81,7 +105,11 @@ fn show_prefs(p){
 }
 
 fn read_device(){
+    if device_loading { return nil }
+    device_loading = true
     host.request("device.info", nil, fn(r){
+        device_loading = false
+        device_loaded = r.is_ok
         if !r.is_ok {
             ui.device_line.set_text(r.error)
             return nil
@@ -147,9 +175,21 @@ fn on_navigation_changed(json){
 }
 
 fn subscribe(name){
+    for event in subscribed_events { if event == name { return nil } }
+    for event in pending_events { if event == name { return nil } }
+    pending_events.push(name)
     host.request("events.subscribe", {event: name}, fn(r){
+        pending_events.retain(|event| event != name)
+        if r.is_ok { subscribed_events.push(name) }
         if !r.is_ok { log(name + ": " + r.error) }
     })
+}
+
+fn watch_granted(){
+    subscribed_events.retain(|event| host.has(event))
+    if host.has("on_prefs_changed") { subscribe("on_prefs_changed") }
+    if host.has("on_active_room_changed") { subscribe("on_active_room_changed") }
+    if host.has("on_navigation_changed") { subscribe("on_navigation_changed") }
 }
 
 fn watch(){
@@ -166,8 +206,11 @@ fn load(){
 }
 
 fn on_permissions_changed(caps){
-    load()
-    watch()
+    if !pane_loaded { read_pane() }
+    if !env_loaded { read_env() }
+    if !prefs_loaded { read_prefs() }
+    if !device_loaded { read_device() }
+    watch_granted()
 }
 
 let _boot = start_timeout(0.05, || {
