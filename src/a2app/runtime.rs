@@ -5571,6 +5571,12 @@ fn run_request_task_permissions(    cx: &mut Cx,
         let Ok(room) = OwnedRoomId::try_from(id) else { return false };
         client.get_room(&room).is_some()
     };
+    // A tool need is valid only if a mini-app registered that name in this
+    // room; match `full_name` or `raw_name` as `task_prompt_info` does.
+    let app_tool_exists = |tool: &str| {
+        with_a2app(|state| state.app_tools.values().any(|reg| reg.full_name == tool || reg.raw_name == tool))
+            .unwrap_or(false)
+    };
     let inputs = ResolveInputs {
         task_id,
         subject: &subject,
@@ -5582,6 +5588,7 @@ fn run_request_task_permissions(    cx: &mut Cx,
         homeserver_recipient,
         joined: &joined,
         declared_capabilities: AI_ROOM_SESSION_CAP_IDS,
+        app_tool_exists: &app_tool_exists,
         store: &store,
         flow: &task_grants::GlobalFlow,
     };
@@ -5707,7 +5714,7 @@ fn task_prompt_info(
         .any(|item| item.state.is_grantable() && item.risk >= a2app_core::capabilities::Risk::High)
         .then(|| "This plan includes broad or high-risk access. Review the details before allowing.".to_string());
     TaskPromptInfo {
-        explanation: format!("\u{201c}{}\u{201d}", plan.explanation),
+        explanation: format!("The assistant says: \u{201c}{}\u{201d}", plan.explanation),
         items,
         risk,
     }
@@ -5832,6 +5839,48 @@ fn task_reason_label(reason: TaskReason) -> &'static str {
     }
 }
 
+/// Takes the permission store out of the runtime state for an operation that
+/// must not run while the state is borrowed (a task apply, which also writes
+/// the information-flow registry). Restores it on drop, so a panic or an
+/// early return never loses the store.
+#[cfg(unix)]
+struct PermissionStoreGuard {
+    store: Option<PermissionStore>,
+}
+
+#[cfg(unix)]
+impl PermissionStoreGuard {
+    fn take() -> Self {
+        Self { store: with_a2app(|state| std::mem::take(&mut state.permissions)) }
+    }
+
+    fn store(&mut self) -> &mut PermissionStore {
+        self.store.as_mut().expect("the permission store guard was already restored")
+    }
+
+    /// Restores the store and runs `after` with it back in the state.
+    fn restore(mut self, after: impl FnOnce(&mut A2AppState)) {
+        let store = self.store.take().expect("the permission store guard was already restored");
+        with_a2app(|state| {
+            state.permissions = store;
+            state.mark_perms_dirty();
+            after(state);
+        });
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PermissionStoreGuard {
+    fn drop(&mut self) {
+        if let Some(store) = self.store.take() {
+            with_a2app(|state| {
+                state.permissions = store;
+                state.mark_perms_dirty();
+            });
+        }
+    }
+}
+
 /// Applies the user's answer to one task prompt. "Not now" is remembered by
 /// plan hash until the turn closes; Allow applies exactly the checked items as
 /// one atomic, turn-scoped batch.
@@ -5857,8 +5906,8 @@ fn answer_task_prompt(cx: &mut Cx, ui: &WidgetRef, action: TaskPermissionAction)
     };
     // Apply outside the state borrow: information-flow rules live in their own
     // registry, and a partial apply is rolled back by `task_grants::apply`.
-    let mut store = with_a2app(|state| std::mem::take(&mut state.permissions)).unwrap_or_default();
-    let result = task_grants::apply(&plan, &approved, &mut store, &task_grants::GlobalFlowApply);
+    let mut guard = PermissionStoreGuard::take();
+    let result = task_grants::apply(&plan, &approved, guard.store(), &task_grants::GlobalFlowApply);
     let mut applied = None;
     let outcome = match result {
         Ok(task) => {
@@ -5872,9 +5921,7 @@ fn answer_task_prompt(cx: &mut Cx, ui: &WidgetRef, action: TaskPermissionAction)
             Err(message)
         }
     };
-    with_a2app(|state| {
-        state.permissions = store;
-        state.mark_perms_dirty();
+    guard.restore(|state| {
         if let Some(task) = applied {
             state.task_ledger.insert(task);
         }
@@ -5904,14 +5951,11 @@ fn revoke_task_grants(room_id: &OwnedRoomId) {
     if tasks.is_empty() {
         return;
     }
-    let mut store = with_a2app(|state| std::mem::take(&mut state.permissions)).unwrap_or_default();
+    let mut guard = PermissionStoreGuard::take();
     for task in &tasks {
-        task_grants::rollback(task, &mut store, &task_grants::GlobalFlowApply);
+        task_grants::rollback(task, guard.store(), &task_grants::GlobalFlowApply);
     }
-    with_a2app(|state| {
-        state.permissions = store;
-        state.mark_perms_dirty();
-    });
+    guard.restore(|_| {});
 }
 
 /// Takes every task prompt pending for a room (without a UI handle), so a
@@ -10374,6 +10418,49 @@ View{note := Label{text:"waiting"}}
         assert_eq!(parked_network_url(&parked).as_deref(), Some(url));
         assert_eq!(parked_rooms(&parked), (Some(SOURCE.into()), Some(SOURCE.into())));
         assert_eq!(parked_capability(&parked).unwrap().id, "network.http");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_reads_are_blocked_by_the_group_and_filtered_by_room_deny() {
+        let subject = agent_subject(SOURCE);
+        let cap = a2app_core::capabilities::by_id("matrix.rooms.list").unwrap();
+        let group = cap.group.unwrap();
+        let context = PermissionContext { origin_room: Some(SOURCE), target_room: Some(SOURCE) };
+        let verdict = |store: &PermissionStore| store.effective_collection_capability_for_in_context(
+            &subject, |_| true, |_| true, cap, context,
+        );
+        let mut permissions = PermissionStore::default();
+        assert_eq!(verdict(&permissions), Effective::NeedsPrompt);
+        // A Deny on the directory group is the kill switch for the whole call.
+        permissions.set(&subject, group, GrantState::Denied);
+        assert_eq!(verdict(&permissions), Effective::Denied);
+        // A room whose read policy is Deny never appears in a directory result.
+        permissions.set_room_policy(TARGET, RoomAccess::Read, PolicyDecision::Deny);
+        let filtered = matrix::policy::filter_read_result(
+            &serde_json::json!({ "rooms": [
+                { "room_id": SOURCE, "name": "Kept" },
+                { "room_id": TARGET, "name": "Hidden" },
+            ] }).to_string(),
+            &permissions, None,
+        ).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&filtered).unwrap();
+        let rooms = value["rooms"].as_array().unwrap();
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0]["room_id"], SOURCE);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_store_guard_restores_the_store_on_drop() {
+        initialize_state(AppRegistry::new(Vec::new()), PermissionStore::default(), A2AppPersistedState::default(), Default::default());
+        with_a2app(|state| state.permissions.set("guard-test", Permission::Network, GrantState::Granted)).unwrap();
+        let mut guard = PermissionStoreGuard::take();
+        // A different entry, as an apply would add; the original must survive.
+        guard.store().set("guard-test", Permission::Camera, GrantState::Denied);
+        drop(guard);
+        let restored = with_a2app(|state| state.permissions.state("guard-test", Permission::Network)).unwrap();
+        assert_eq!(restored, GrantState::Granted, "an early return or panic must not lose the store");
     }
 
     #[cfg(unix)]

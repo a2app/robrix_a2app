@@ -243,7 +243,7 @@ impl PlanAction {
                 }
             }),
             Self::Network { url, .. } => Some(url.clone()),
-            Self::Tool { tool, .. } => Some(tool.clone()),
+            Self::Tool { tool, .. } => Some(if tool.is_empty() { "Unnamed mini-app tool".to_string() } else { tool.clone() }),
             Self::Flow { source, recipient } => Some(format!("{} → {}", flow_source_label(source), flow_recipient_label(recipient))),
         }
     }
@@ -433,6 +433,10 @@ pub struct ResolveInputs<'a> {
     pub joined: &'a dyn Fn(&str) -> bool,
     /// The capability ids this session offers; anything else is not offered.
     pub declared_capabilities: &'a [&'a str],
+    /// Whether a mini-app tool name matches one registered in this room. The
+    /// runtime supplies it (matching `full_name` or `raw_name`, as
+    /// `task_prompt_info` does); tests supply a fake.
+    pub app_tool_exists: &'a dyn Fn(&str) -> bool,
     pub store: &'a PermissionStore,
     pub flow: &'a dyn FlowLookup,
 }
@@ -481,20 +485,19 @@ pub fn resolve(request: &TaskRequest, inputs: &ResolveInputs<'_>) -> Result<Task
                 }
                 // A hard room/space block always wins; the item is shown as
                 // blocked with Robrix's own reason, never granted.
-                let mut blocked = None;
+                let mut blocked = false;
                 for target in all_targets {
                     let context = PermissionContext { origin_room: Some(inputs.room), target_room: Some(target) };
-                    if let Some((access, evaluation)) = inputs.store.capability_room_evaluation(cap, context)
+                    if let Some((_, evaluation)) = inputs.store.capability_room_evaluation(cap, context)
                         && evaluation.decision == crate::permissions::PolicyDecision::Deny
                     {
-                        blocked = Some(evaluation.reason.public_message(access));
+                        blocked = true;
                         break;
                     }
                 }
                 let action = scoped_action_for(group, cap, selection.room_scope());
-                if let Some(reason) = blocked {
+                if blocked {
                     items.push(PlanItem { id: id.clone(), origin: ItemOrigin::Requested, action, state: ItemState::Blocked(TaskReason::BlockedByRoomPolicy), why, risk: cap.risk });
-                    let _ = reason; // the public message is rendered by the UI from the policy evaluation
                     continue;
                 }
                 // Already granted at every target means the user sees nothing.
@@ -539,9 +542,10 @@ pub fn resolve(request: &TaskRequest, inputs: &ResolveInputs<'_>) -> Result<Task
             TaskNeed::AppTool { id, tool, why } => {
                 let why = cleaned_why(why.as_deref());
                 let tool = tool.trim().to_string();
-                let exists = inputs.declared_capabilities.iter().any(|_| true) && !tool.is_empty();
-                // The name is validated against the room's live app tools by
-                // the runtime before apply; an empty name is never valid.
+                // The name is checked against the room's live app tools, the
+                // same way `task_prompt_info` resolves one to its label; a
+                // name that matches nothing can never be granted.
+                let exists = !tool.is_empty() && (inputs.app_tool_exists)(&tool);
                 let state = if !exists { ItemState::NotOffered(TaskReason::InvalidTarget) } else { ItemState::NeedsGrant };
                 items.push(PlanItem { id: id.clone(), origin: ItemOrigin::Requested,
                     action: PlanAction::Tool { tool, scope: RoomScope::room(inputs.room) }, state, why, risk: Risk::High });
@@ -1016,15 +1020,36 @@ impl TaskLedger {
 pub fn outcome(plan: &TaskPlan, approved: &BTreeSet<String>) -> serde_json::Value {
     let mut granted = Vec::new();
     let mut not_granted = Vec::new();
+    let mut satisfied = 0usize;
+    let mut blocked = 0usize;
     for item in &plan.items {
-        if approved.contains(&item.id) && item.state.is_grantable() {
-            granted.push(serde_json::Value::String(item.id.clone()));
-        } else if let Some(reason) = item.not_granted_reason() {
-            not_granted.push(serde_json::json!({ "id": item.id, "reason": reason.as_str() }));
+        match &item.state {
+            // An already-allowed item counts as satisfied: the agent can use it
+            // without a new grant, so it is not a declination.
+            ItemState::AlreadyAllowed => {
+                satisfied += 1;
+                granted.push(serde_json::Value::String(item.id.clone()));
+            }
+            ItemState::NeedsGrant if approved.contains(&item.id) => {
+                satisfied += 1;
+                granted.push(serde_json::Value::String(item.id.clone()));
+            }
+            ItemState::NeedsGrant => {
+                not_granted.push(serde_json::json!({ "id": item.id, "reason": TaskReason::Declined.as_str() }));
+            }
+            ItemState::Blocked(reason) | ItemState::NotOffered(reason) => {
+                blocked += 1;
+                not_granted.push(serde_json::json!({ "id": item.id, "reason": reason.as_str() }));
+            }
         }
     }
-    let status = if not_granted.is_empty() && !granted.is_empty() { "granted" }
-        else if granted.is_empty() { "declined" }
+    // `granted`: every item is satisfied (granted or already allowed).
+    // `blocked`: every item is blocked by policy or not offered.
+    // `declined`: the user said no to every requested item and nothing was
+    // blocked by policy. `partial`: any other mix.
+    let status = if satisfied == plan.items.len() { "granted" }
+        else if blocked == plan.items.len() { "blocked" }
+        else if satisfied == 0 && blocked == 0 { "declined" }
         else { "partial" };
     serde_json::json!({
         "task_id": plan.task_id,
@@ -1103,6 +1128,10 @@ mod tests {
         "matrix.space.rooms.list",
     ];
 
+    fn all_tools_exist(_tool: &str) -> bool {
+        true
+    }
+
     fn inputs<'a>(store: &'a PermissionStore, joined: &'a dyn Fn(&str) -> bool, flow: &'a dyn FlowLookup) -> ResolveInputs<'a> {
         let context = ContextId::Agent { account: "alice".into(), room: "!ai:example.org".into() };
         // The context has to outlive `inputs`; leak a small clone so the test
@@ -1119,6 +1148,7 @@ mod tests {
             homeserver_recipient: Some(Recipient::network_origin("https://hs.example.org").unwrap()),
             joined,
             declared_capabilities: DECLARED,
+            app_tool_exists: &all_tools_exist,
             store,
             flow,
         }
@@ -1367,6 +1397,33 @@ mod tests {
     }
 
     #[test]
+    fn outcome_status_counts_already_allowed_and_separates_blocked_from_declined() {
+        let make = |states: Vec<ItemState>| {
+            let context = ContextId::Agent { account: "a".into(), room: "r".into() };
+            let items = states.into_iter().enumerate().map(|(index, state)| PlanItem {
+                id: format!("n{index}"), origin: ItemOrigin::Requested, risk: Risk::Low,
+                action: PlanAction::Network { url: "https://example.com/".into(), scope: RoomScope::room("r") },
+                state, why: None,
+            }).collect();
+            TaskPlan { task_id: 1, subject: "s".into(), context, epoch: 1, title: "t".into(),
+                explanation: "e".into(), plan_hash: [0; 32], needs_fingerprint: [0; 32], items }
+        };
+        let empty = BTreeSet::new();
+        // Everything already allowed is granted, not declined.
+        let value = outcome(&make(vec![ItemState::AlreadyAllowed]), &empty);
+        assert_eq!(value["status"], "granted");
+        // Everything blocked is blocked, not declined.
+        let value = outcome(&make(vec![ItemState::Blocked(TaskReason::BlockedByRoomPolicy)]), &empty);
+        assert_eq!(value["status"], "blocked");
+        // A requested need the user said no to is declined.
+        let value = outcome(&make(vec![ItemState::NeedsGrant]), &empty);
+        assert_eq!(value["status"], "declined");
+        // A mix is partial.
+        let value = outcome(&make(vec![ItemState::AlreadyAllowed, ItemState::Blocked(TaskReason::NotOffered)]), &empty);
+        assert_eq!(value["status"], "partial");
+    }
+
+    #[test]
     fn an_applied_task_needs_no_further_prompt() {
         // A two-room read-and-post task resolves to one prompt; once approved,
         // the same task resolves with nothing left to ask.
@@ -1390,6 +1447,25 @@ mod tests {
         let second = resolve(&request(needs()), &inputs(&store, &joined, &applied_lookup)).unwrap();
         assert!(!second.needs_prompt(), "the approved task must not prompt again");
         assert!(second.items.iter().all(|item| !item.state.is_grantable()));
+    }
+
+    #[test]
+    fn a_failed_apply_rolls_back_already_granted_permissions() {
+        let mut store = PermissionStore::default();
+        store.set_matrix_write(true);
+        let joined = |room: &str| matches!(room, "!ai:example.org" | "!ops:example.org");
+        let lookup = FakeLookup { allowed: Default::default() };
+        let plan = resolve(&request(vec![TaskNeed::Capability { id: "n1".into(),
+            capability: "matrix.rooms.messages.read".into(), targets: vec!["!ops:example.org".into()], why: None }]),
+            &inputs(&store, &joined, &lookup)).unwrap();
+        let approved: BTreeSet<String> = plan.items.iter().map(|item| item.id.clone()).collect();
+        let flow = FakeFlow::new();
+        // The information-flow grant is the last thing applied; failing it must
+        // roll back the permission grant already made for `n1`.
+        flow.fail_next.set(true);
+        let result = apply(&plan, &approved, &mut store, &flow);
+        assert!(matches!(result, Err(ApplyError::Failed { .. })));
+        assert!(store.scoped_grants(&plan.subject).is_empty(), "a partial apply must leave no permission grant");
     }
 
     #[test]
