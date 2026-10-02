@@ -24,10 +24,10 @@ launching mini-apps.
 
 Everything else: work out the whole task, then call `request_task_permissions`
 **once** with every need. Do not call a gated tool first, and do not split one
-task across several requests. Every read in the batch also authorises the data
-you read to reach the writes and websites in the same batch; Robrix adds those
-information-flow rules to the same prompt itself, so list reads together with
-the outputs that depend on them.
+task across several requests. You do not list information-flow rules yourself —
+Robrix derives them from the reads and outputs you name. Every read in the batch
+also authorises the data you read to reach the writes and websites in the same
+batch, so list reads together with the outputs that depend on them.
 
 ## Capability ids (use these exactly; never invent one)
 

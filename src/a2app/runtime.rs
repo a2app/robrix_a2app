@@ -60,7 +60,7 @@ use crate::utils::RoomNameId;
 #[cfg(unix)]
 use a2app_core::information_flow::{Recipient, Source};
 #[cfg(unix)]
-use a2app_core::task_grants::{self, ItemState, ResolveInputs, TaskLedger, TaskPlan, TaskReason};
+use a2app_core::task_grants::{self, ItemOrigin, ItemState, ResolveInputs, TaskLedger, TaskPlan, TaskReason};
 #[cfg(unix)]
 use crate::a2app::ai::session::{AiSession, PromptOutcome, SessionJob, SessionUpdate};
 #[cfg(unix)]
@@ -5713,10 +5713,15 @@ fn task_prompt_info(
         .iter()
         .any(|item| item.state.is_grantable() && item.risk >= a2app_core::capabilities::Risk::High)
         .then(|| "This plan includes broad or high-risk access. Review the details before allowing.".to_string());
+    let has_implied = plan.items.iter().any(|item| matches!(item.origin, ItemOrigin::Implied { .. }));
     TaskPromptInfo {
         explanation: format!("The assistant says: \u{201c}{}\u{201d}", plan.explanation),
         items,
         risk,
+        // The derived flow rules are shown as their own group, so the user can
+        // tell what Robrix added apart from what the agent asked for.
+        sharing_heading: has_implied.then(|| "Information sharing this requires".to_string()),
+        sharing_summary: has_implied.then(|| "Lets what the assistant reads reach your AI service and this room.".to_string()),
     }
 }
 
