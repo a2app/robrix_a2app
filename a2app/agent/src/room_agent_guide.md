@@ -68,8 +68,8 @@ Write `explanation` as one coherent paragraph for the person who must approve
 it: say what you want to do, and what data you need in order to do it (which
 rooms, which websites, which mini-app tools). Use room names, not ids. Do not
 describe the mechanism, and do not promise anything beyond the needs you
-listed. Give each need a short `why` in your own words; both are shown to the
-user exactly as you write them, so keep them simple and use no markup or links.
+listed. This paragraph is shown to the user exactly as you write it, so keep
+it simple and use no markup or links.
 
 ## After the request
 
