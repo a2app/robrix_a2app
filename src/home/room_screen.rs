@@ -130,6 +130,7 @@ script_mod! {
         width: Fill, height: Fit,
         flow: Flow.Right{wrap: true},
         spacing: 8,
+        wrap_spacing: 8,
         margin: Inset{top: 8, bottom: 2}
 
         mini_app_attachment := mod.widgets.MiniAppAttachmentAction {}
