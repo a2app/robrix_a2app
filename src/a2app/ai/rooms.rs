@@ -865,7 +865,6 @@ async fn post_notice(room: &Room, content: &AiReplyContent, flow_context: &Conte
     let payload = serde_json::json!({
         "room_id": room.room_id().to_string(),
         "text": content.text,
-        "formatted": content.formatted,
     });
     policy::commit_flow_action(flow_context, &action, &payload)?;
     let recipient = flow::Recipient::MatrixRoom { account: flow_context.account().into(), room: room.room_id().to_string() };

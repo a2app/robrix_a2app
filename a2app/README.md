@@ -334,9 +334,12 @@ rules.
 visible output in the room the user is already talking to, and confidentiality
 (the room and homeserver sharing rules) still applies. Every other effect — a
 cross-room post, a non-GET network request, an app-tool call, app generation —
-raises the exact-content review once untrusted influence is present. A
-cross-room post or fetch after reading untrusted content therefore pauses for a
-per-action review; that is intended.
+raises the exact-content review once untrusted influence is present. The host
+shows the exact target and the captured payload in the same modal as a task
+plan, parks the tool call, and resumes it when the user approves; if the
+context reads more while the modal is open, the stale approval no longer
+matches and a fresh review is shown. A cross-room post or fetch after reading
+untrusted content therefore pauses for a per-action review; that is intended.
 
 **Re-asking.** A gated read, fetch or post refused because the label grew
 returns an error telling the agent to ask again with the new need. The agent
