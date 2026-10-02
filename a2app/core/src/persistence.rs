@@ -85,6 +85,11 @@ pub struct A2AppPersistedState {
     /// Unix timestamp (secs) of when each app was last opened, for "recents".
     #[serde(default)]
     pub recents: BTreeMap<MiniAppId, u64>,
+    /// AI rooms whose one-time directory capability defaults have already
+    /// been applied. The marker is what keeps a user setting a group back to
+    /// `Ask` or `Deny` from being silently re-granted on the next session.
+    #[serde(default)]
+    pub permission_defaults_applied: std::collections::BTreeSet<String>,
 }
 
 pub fn save_registry_state(state: &A2AppPersistedState) -> Result<()> {
