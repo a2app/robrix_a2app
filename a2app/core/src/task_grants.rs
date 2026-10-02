@@ -311,6 +311,11 @@ pub struct TaskPlan {
     /// SHA-256 over the displayed plan. Recomputed by the runtime before
     /// applying; a mismatch means the plan changed under the modal.
     pub plan_hash: [u8; 32],
+    /// SHA-256 over the resolved items' exact action and origin kind only,
+    /// independent of `task_id`, item ids, `why`, `title`, `explanation`,
+    /// `epoch` and `state`. Two requests for the same needs share this even
+    /// when the agent renames its need labels, so "Not now" sticks.
+    pub needs_fingerprint: [u8; 32],
 }
 
 impl TaskPlan {
@@ -325,10 +330,37 @@ impl TaskPlan {
         self.grantable().next().is_some()
     }
 
-    /// Recomputes and stores the canonical hash. Called once at the end of
+    /// Recomputes and stores the canonical hashes. Called once at the end of
     /// resolution.
     pub fn seal(&mut self) {
         self.plan_hash = self.compute_hash();
+        self.needs_fingerprint = self.compute_needs_fingerprint();
+    }
+
+    /// The stable identity of what this plan asks for, ignoring the agent's
+    /// labels: one key per item from its exact action and whether it was
+    /// requested or implied. Implied `because` ids are intentionally excluded
+    /// so a renamed need does not defeat a dismissal.
+    pub fn need_keys(&self) -> BTreeSet<String> {
+        self.items
+            .iter()
+            .map(|item| format!("{}|{}", item_key(&item.action), match &item.origin {
+                ItemOrigin::Requested => "requested",
+                ItemOrigin::Implied { .. } => "implied",
+            }))
+            .collect()
+    }
+
+    /// The fingerprint keyed into the per-room "Not now" memory.
+    pub fn compute_needs_fingerprint(&self) -> [u8; 32] {
+        let mut needs: Vec<String> = self.need_keys().into_iter().collect();
+        needs.sort();
+        let mut hasher = Sha256::new();
+        for need in needs {
+            hasher.update(need.as_bytes());
+            hasher.update(b"\0");
+        }
+        hasher.finalize().into()
     }
 
     /// The hash of exactly the fields the user saw. Independent of map order.
@@ -604,6 +636,7 @@ pub fn resolve(request: &TaskRequest, inputs: &ResolveInputs<'_>) -> Result<Task
         explanation: clean_text(&request.explanation, MAX_EXPLANATION_CHARS),
         items,
         plan_hash: [0; 32],
+        needs_fingerprint: [0; 32],
     };
     plan.seal();
     Ok(plan)
@@ -1115,6 +1148,30 @@ mod tests {
     }
 
     #[test]
+    fn needs_fingerprint_ignores_agent_labels_and_new_needs_differ() {
+        let mut store = PermissionStore::default();
+        store.set_matrix_write(true);
+        let joined = |room: &str| matches!(room, "!ai:example.org" | "!ops:example.org" | "!leads:example.org");
+        let lookup = FakeLookup { allowed: Default::default() };
+        let send = |id: &str| TaskNeed::Capability { id: id.into(), capability: "matrix.rooms.message.send".into(),
+            targets: vec!["!leads:example.org".into()], why: Some("post the digest".into()) };
+        let first = resolve(&TaskRequest { task: "Digest".into(), explanation: "first wording".into(), needs: vec![send("n1")] },
+            &inputs(&store, &joined, &lookup)).unwrap();
+        // A rename of the need id and of the prose must not defeat "Not now".
+        let renamed = resolve(&TaskRequest { task: "Another title".into(), explanation: "different wording".into(), needs: vec![send("z9")] },
+            &inputs(&store, &joined, &lookup)).unwrap();
+        assert_eq!(first.needs_fingerprint, renamed.needs_fingerprint);
+        assert!(renamed.need_keys().is_subset(&first.need_keys()));
+        // A request containing something new is a strict superset and is not
+        // covered by the earlier dismissal.
+        let more = resolve(&TaskRequest { task: "Digest plus".into(), explanation: "more".into(), needs: vec![send("a"),
+            TaskNeed::Capability { id: "b".into(), capability: "matrix.rooms.messages.read".into(),
+                targets: vec!["!ops:example.org".into()], why: None }] }, &inputs(&store, &joined, &lookup)).unwrap();
+        assert!(!more.need_keys().is_subset(&first.need_keys()));
+        assert!(first.need_keys().is_subset(&more.need_keys()));
+    }
+
+    #[test]
     fn a_read_and_post_task_resolves_to_one_prompt_of_exact_items() {
         let mut store = PermissionStore::default();
         store.set_matrix_write(true);
@@ -1263,7 +1320,7 @@ mod tests {
     #[test]
     fn the_plan_hash_detects_a_changed_plan() {
         let mut plan = TaskPlan { task_id: 1, subject: "s".into(), context: ContextId::Agent { account: "a".into(), room: "r".into() },
-            epoch: 1, title: "t".into(), explanation: "e".into(), items: Vec::new(), plan_hash: [0; 32] };
+            epoch: 1, title: "t".into(), explanation: "e".into(), items: Vec::new(), plan_hash: [0; 32], needs_fingerprint: [0; 32] };
         plan.seal();
         let hash = plan.plan_hash;
         plan.title.push('!');
@@ -1337,7 +1394,7 @@ mod tests {
     fn unchecking_a_read_drops_the_flow_rules_that_depend_on_it() {
         let plan = TaskPlan {
             task_id: 1, subject: "s".into(), context: ContextId::Agent { account: "a".into(), room: "r".into() },
-            epoch: 1, title: "t".into(), explanation: "e".into(), plan_hash: [0; 32],
+            epoch: 1, title: "t".into(), explanation: "e".into(), plan_hash: [0; 32], needs_fingerprint: [0; 32],
             items: vec![
                 PlanItem { id: "n1".into(), origin: ItemOrigin::Requested, risk: Risk::High, why: None,
                     action: PlanAction::Network { url: "https://example.com/".into(), scope: RoomScope::room("r") }, state: ItemState::NeedsGrant },

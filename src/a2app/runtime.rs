@@ -6,7 +6,7 @@
 //! [`A2AppOp`] actions, which [`process`] applies centrally.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -479,11 +479,15 @@ pub struct A2AppState {
     /// Task ids are unique for the process; the tool echoes one back.
     #[cfg(unix)]
     next_task_id: u64,
-    /// (room id, plan hash) pairs the user said "Not now" to. Unlike
-    /// `dismissed_prompts`, this memory is cleared when the turn closes, so a
-    /// later request can ask again.
+    /// The user's per-room "Not now" memory for task plans, keyed by
+    /// `(room id, needs fingerprint)`: the exact set of need keys dismissed.
+    /// Cleared when the turn closes, so a later request can ask again.
     #[cfg(unix)]
-    dismissed_task_plans: HashSet<(String, [u8; 32])>,
+    dismissed_task_plans: HashMap<(String, [u8; 32]), BTreeSet<String>>,
+    /// How many `request_task_permissions` calls a room has made this turn.
+    /// Capped so a looping agent cannot re-ask forever; cleared on turn close.
+    #[cfg(unix)]
+    task_request_counts: HashMap<String, u32>,
     /// (app, permission) pairs the user said "Not Now" to this session.
     /// The key is the subject: an app id or an AI room's agent key.
     pub dismissed_prompts: HashSet<(String, Permission)>,
@@ -650,7 +654,8 @@ fn initialize_state(registry: AppRegistry, permissions: PermissionStore, persist
             #[cfg(unix)]
             next_task_id: 0,
             #[cfg(unix)]
-            dismissed_task_plans: HashSet::new(),
+            dismissed_task_plans: HashMap::new(),
+            task_request_counts: HashMap::new(),
             dismissed_prompts: HashSet::new(),
             dismissed_net_hosts: HashSet::new(),
             generation: None,
@@ -3939,8 +3944,7 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, answer: PermissionPromp
 /// request, resolve it into the exact plan Robrix will show, and either park
 /// it behind the task modal or answer at once when nothing needs the user.
 #[cfg(unix)]
-fn run_request_task_permissions(
-    cx: &mut Cx,
+fn run_request_task_permissions(    cx: &mut Cx,
     ui: &WidgetRef,
     room_id: &OwnedRoomId,
     request: serde_json::Value,
@@ -3950,6 +3954,21 @@ fn run_request_task_permissions(
         Ok(context) => context,
         Err(error) => { let _ = answer.send(Err(error)); return; }
     };
+    // Cap the number of requests a turn can make, so a looping agent cannot
+    // keep raising the modal. Every call counts, including malformed ones.
+    let over_limit = with_a2app(|state| {
+        !count_task_request(&mut state.task_request_counts, room_id.as_str())
+    })
+    .unwrap_or(true);
+    if over_limit {
+        let message = String::from(
+            "This turn has already made three permission requests, so no more will be shown. \
+             Do as much as you can with what you have and explain in your reply what you could not do.",
+        );
+        note_ai_tool_call(room_id, "request_task_permissions", false, "Request limit reached");
+        let _ = answer.send(Err(message));
+        return;
+    }
     let request = match task_grants::parse_request(&request) {
         Ok(request) => request,
         Err(error) => { let _ = answer.send(Err(error)); return; }
@@ -4004,7 +4023,7 @@ fn run_request_task_permissions(
         return;
     }
     let dismissed = with_a2app(|state| {
-        state.dismissed_task_plans.contains(&(room_id.to_string(), plan.plan_hash))
+        task_plan_is_dismissed(&state.dismissed_task_plans, room_id.as_str(), &plan.need_keys())
     })
     .unwrap_or(false);
     if dismissed {
@@ -4016,6 +4035,29 @@ fn run_request_task_permissions(
         state.task_prompts.push_back(TaskPrompt { room_id: room_id.clone(), plan, answer });
     });
     show_next_task_prompt(cx, ui);
+}
+
+/// Records one task request for `room` and returns whether it is within the
+/// per-turn cap. Every call counts, including malformed ones.
+#[cfg(unix)]
+fn count_task_request(counts: &mut HashMap<String, u32>, room: &str) -> bool {
+    let count = counts.entry(room.to_string()).or_insert(0);
+    *count += 1;
+    *count <= 3
+}
+
+/// Whether a plan's needs are already covered by a dismissed request for the
+/// room: equal or a subset is dismissed, a strict superset is a new request.
+#[cfg(unix)]
+fn task_plan_is_dismissed(
+    dismissed: &HashMap<(String, [u8; 32]), BTreeSet<String>>,
+    room: &str,
+    needs: &BTreeSet<String>,
+) -> bool {
+    dismissed
+        .iter()
+        .filter(|((dismissed_room, _), _)| dismissed_room == room)
+        .any(|(_, dismissed_needs)| needs.is_subset(dismissed_needs))
 }
 
 /// Shows the next task prompt, if none is already open. Task prompts are
@@ -4229,7 +4271,7 @@ fn answer_task_prompt(cx: &mut Cx, ui: &WidgetRef, action: TaskPermissionAction)
     let approved = match action {
         TaskPermissionAction::NotNow => {
             with_a2app(|state| {
-                state.dismissed_task_plans.insert((room_id.to_string(), plan.plan_hash));
+                state.dismissed_task_plans.insert((room_id.to_string(), plan.needs_fingerprint), plan.need_keys());
             });
             note_ai_tool_call(&room_id, "request_task_permissions", false, "Declined");
             std::collections::BTreeSet::new()
@@ -4272,7 +4314,8 @@ fn answer_task_prompt(cx: &mut Cx, ui: &WidgetRef, action: TaskPermissionAction)
 #[cfg(unix)]
 fn revoke_task_grants(room_id: &OwnedRoomId) {
     let tasks: Vec<task_grants::AppliedTask> = with_a2app(|state| {
-        state.dismissed_task_plans.retain(|(room, _)| room != room_id.as_str());
+        state.dismissed_task_plans.retain(|(room, _), _| room != room_id.as_str());
+        state.task_request_counts.remove(room_id.as_str());
         let ids: Vec<u64> = state
             .task_ledger
             .tasks()
@@ -8153,5 +8196,27 @@ mod permission_tests {
         assert_eq!(parked_network_url(&parked).as_deref(), Some(url));
         assert_eq!(parked_rooms(&parked), (Some(SOURCE.into()), Some(SOURCE.into())));
         assert_eq!(parked_capability(&parked).unwrap().id, "network.http");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_request_cap_is_per_room_and_dismissal_covers_subsets() {
+        let mut counts = HashMap::new();
+        for _ in 0..3 {
+            assert!(count_task_request(&mut counts, SOURCE), "three requests are allowed");
+        }
+        assert!(!count_task_request(&mut counts, SOURCE), "the fourth request in a turn is refused");
+        assert!(count_task_request(&mut counts, TARGET), "another room keeps its own budget");
+
+        let original: BTreeSet<String> = ["needs:a", "needs:b"].into_iter().map(String::from).collect();
+        let mut dismissed = HashMap::new();
+        dismissed.insert((SOURCE.to_string(), [7; 32]), original.clone());
+        // The same needs renamed (different fingerprint) are still covered.
+        assert!(task_plan_is_dismissed(&dismissed, SOURCE, &original));
+        assert!(task_plan_is_dismissed(&dismissed, SOURCE, &["needs:a".to_string()].into_iter().collect()));
+        // One new need makes it a strict superset, which is a new request.
+        let with_new: BTreeSet<String> = ["needs:a", "needs:b", "needs:c"].into_iter().map(String::from).collect();
+        assert!(!task_plan_is_dismissed(&dismissed, SOURCE, &with_new));
+        assert!(!task_plan_is_dismissed(&dismissed, TARGET, &["needs:a".to_string()].into_iter().collect()));
     }
 }
