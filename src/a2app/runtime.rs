@@ -353,6 +353,38 @@ pub struct TaskPrompt {
     pub answer: Sender<Result<String, String>>,
 }
 
+/// A parked agent effect waiting on the exact-action review. The same modal
+/// that shows task plans shows the exact target and host-captured payload;
+/// Allow grants the captured once-authority and resumes the effect, Not now
+/// refuses it.
+#[cfg(unix)]
+pub struct ExactReviewPrompt {
+    pub room_id: OwnedRoomId,
+    pub context: a2app_core::information_flow::ContextId,
+    pub epoch: u64,
+    pub action: a2app_core::information_flow::SensitiveAction,
+    pub payload: serde_json::Value,
+    pub expected: a2app_core::information_flow::Influences,
+    pub request_id: u64,
+    pub info: TaskPromptInfo,
+    pub resume: ExactResume,
+}
+
+/// What to run once an exact-action review is approved.
+#[cfg(unix)]
+pub enum ExactResume {
+    /// Re-run the parked tool job (a cross-room post or an app generation).
+    Job(SessionJob),
+    /// Re-run an app-tool invocation after its provenance transfers; the
+    /// transfers are idempotent, so the commit matches the captured set.
+    AppTool {
+        tool: String,
+        arguments: serde_json::Map<String, serde_json::Value>,
+        display_name: String,
+        answer: Sender<Result<String, String>>,
+    },
+}
+
 /// The state of the AI generation console shown in the Mini Apps screen.
 #[derive(Default)]
 pub struct GenConsole {
@@ -642,6 +674,12 @@ pub struct A2AppState {
     pub task_prompts: VecDeque<TaskPrompt>,
     #[cfg(unix)]
     pub active_task: Option<TaskPrompt>,
+    /// Parked exact-action reviews, in their own queue and shown ahead of
+    /// task prompts, one at a time.
+    #[cfg(unix)]
+    pub exact_reviews: VecDeque<ExactReviewPrompt>,
+    #[cfg(unix)]
+    pub active_exact_review: Option<ExactReviewPrompt>,
     /// Exactly what each live task applied, so the turn's end, session
     /// teardown and the AI panel's Revoke can drop it.
     #[cfg(unix)]
@@ -862,6 +900,10 @@ fn initialize_state(registry: AppRegistry, permissions: PermissionStore, persist
             task_prompts: VecDeque::new(),
             #[cfg(unix)]
             active_task: None,
+            #[cfg(unix)]
+            exact_reviews: VecDeque::new(),
+            #[cfg(unix)]
+            active_exact_review: None,
             #[cfg(unix)]
             task_ledger: TaskLedger::default(),
             #[cfg(unix)]
@@ -4432,6 +4474,13 @@ fn refuse_room_prompts(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
 }
 
 fn show_next_permission_prompt(cx: &mut Cx, ui: &WidgetRef) {
+    // Exact-action reviews and task prompts show ahead of single-permission
+    // prompts, one modal at a time; reviews come first.
+    #[cfg(unix)]
+    if with_a2app(|state| state.active_exact_review.is_none() && !state.exact_reviews.is_empty()).unwrap_or(false) {
+        show_next_exact_review(cx, ui);
+        return;
+    }
     // Task prompts show ahead of single-permission prompts, one modal at a time.
     #[cfg(unix)]
     if with_a2app(|state| state.active_task.is_none() && !state.task_prompts.is_empty()).unwrap_or(false) {
@@ -5650,7 +5699,7 @@ fn show_next_task_prompt(cx: &mut Cx, ui: &WidgetRef) {
     // "General" rather than `!abc:server`.
     let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
     let info = with_a2app(|state| {
-        if state.active_task.is_some() || state.active_prompt.is_some() {
+        if state.active_task.is_some() || state.active_prompt.is_some() || state.active_exact_review.is_some() {
             return None;
         }
         let prompt = state.task_prompts.pop_front()?;
@@ -5666,6 +5715,25 @@ fn show_next_task_prompt(cx: &mut Cx, ui: &WidgetRef) {
             .collect();
         let info = task_prompt_info(&prompt.plan, rooms.as_ref(), model.as_ref(), &tool_names);
         state.active_task = Some(prompt);
+        Some(info)
+    })
+    .flatten();
+    let Some(info) = info else { return };
+    ui.task_permission_prompt(cx, ids!(task_permission_modal.content)).show(cx, &info);
+    ui.modal(cx, ids!(task_permission_modal)).open(cx);
+}
+
+/// Shows the next parked exact-action review, if none is already open. Reviews
+/// are shown ahead of task plans, one modal at a time.
+#[cfg(unix)]
+fn show_next_exact_review(cx: &mut Cx, ui: &WidgetRef) {
+    let info = with_a2app(|state| {
+        if state.active_exact_review.is_some() || state.active_prompt.is_some() {
+            return None;
+        }
+        let prompt = state.exact_reviews.pop_front()?;
+        let info = prompt.info.clone();
+        state.active_exact_review = Some(prompt);
         Some(info)
     })
     .flatten();
@@ -5891,6 +5959,17 @@ impl Drop for PermissionStoreGuard {
 /// one atomic, turn-scoped batch.
 #[cfg(unix)]
 fn answer_task_prompt(cx: &mut Cx, ui: &WidgetRef, action: TaskPermissionAction) {
+    // An exact-action review uses the same modal; handle it first.
+    if let Some(review) = with_a2app(|state| state.active_exact_review.take()).flatten() {
+        ui.modal(cx, ids!(task_permission_modal)).close(cx);
+        if matches!(action, TaskPermissionAction::None) {
+            with_a2app(|state| state.active_exact_review = Some(review));
+            return;
+        }
+        answer_exact_review(cx, ui, review, matches!(action, TaskPermissionAction::Allow(_)));
+        ui.redraw(cx);
+        return;
+    }
     ui.modal(cx, ids!(task_permission_modal)).close(cx);
     let Some(Some(prompt)) = with_a2app(|state| state.active_task.take()) else { return };
     if matches!(action, TaskPermissionAction::None) {
@@ -5937,10 +6016,71 @@ fn answer_task_prompt(cx: &mut Cx, ui: &WidgetRef, action: TaskPermissionAction)
     ui.redraw(cx);
 }
 
+/// Applies the user's answer to one exact-action review. Allow grants the
+/// captured once-authority and resumes the effect; Not now refuses it. If the
+/// influence set grew while the modal was open, the old approval no longer
+/// matches and a fresh review is raised instead of failing forever.
+#[cfg(unix)]
+fn answer_exact_review(cx: &mut Cx, ui: &WidgetRef, review: ExactReviewPrompt, approved: bool) {
+    let ExactReviewPrompt { room_id, context, epoch, action, payload, expected, request_id, resume, .. } = review;
+    if !approved {
+        let _ = a2app_core::information_flow::cancel_exact_action(request_id);
+        refuse_exact_resume(resume,
+            String::from("The user did not allow this action. Do not retry it; tell the user what you could not do."));
+        show_next_permission_prompt(cx, ui);
+        return;
+    }
+    if a2app_core::information_flow::grant_exact_action_for_activation(&context, request_id, &expected, epoch).is_ok() {
+        resume_exact(cx, ui, room_id, resume);
+        show_next_permission_prompt(cx, ui);
+        return;
+    }
+    // Influence grew between the review and the answer. Capture a fresh
+    // request for the current label and show it again.
+    let _ = a2app_core::information_flow::cancel_exact_action(request_id);
+    match a2app_core::information_flow::check_exact_action_for_activation(&context, epoch, &action, &payload) {
+        Ok(()) => {
+            resume_exact(cx, ui, room_id, resume);
+            show_next_permission_prompt(cx, ui);
+        }
+        Err(error) => {
+            if let Some((new_request, new_expected)) = pending_exact_decision(&context, epoch, &action) {
+                let info = exact_review_info(&action, &payload);
+                with_a2app(|state| state.exact_reviews.push_back(ExactReviewPrompt {
+                    room_id, context, epoch, action, payload, expected: new_expected,
+                    request_id: new_request, info, resume,
+                }));
+                show_next_exact_review(cx, ui);
+            } else {
+                refuse_exact_resume(resume, error);
+                show_next_permission_prompt(cx, ui);
+            }
+        }
+    }
+}
 /// Revokes every task grant a room applied and forgets its "Not now" memory.
+/// Also refuses any exact-action review parked for the room, so a serve
+/// thread waiting on one never hangs across a turn or teardown.
 /// Called when the turn closes, when the session stops, and on room close.
 #[cfg(unix)]
 fn revoke_task_grants(room_id: &OwnedRoomId) {
+    let reviews: Vec<ExactReviewPrompt> = with_a2app(|state| {
+        let (mine, rest): (Vec<_>, Vec<_>) = state.exact_reviews.drain(..).partition(|review| &review.room_id == room_id);
+        state.exact_reviews = rest.into_iter().collect();
+        let mut pending = mine;
+        if state.active_exact_review.as_ref().is_some_and(|review| &review.room_id == room_id) {
+            if let Some(review) = state.active_exact_review.take() {
+                pending.push(review);
+            }
+        }
+        pending
+    })
+    .unwrap_or_default();
+    for review in reviews {
+        let _ = a2app_core::information_flow::cancel_exact_action(review.request_id);
+        refuse_exact_resume(review.resume,
+            String::from("The turn ended before this action was reviewed. Retry it if it is still needed."));
+    }
     let tasks: Vec<task_grants::AppliedTask> = with_a2app(|state| {
         state.dismissed_task_plans.retain(|(room, _), _| room != room_id.as_str());
         state.task_request_counts.remove(room_id.as_str());
@@ -6012,7 +6152,25 @@ fn refuse_room_tasks(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
         let message = task_grants::outcome(&prompt.plan, &std::collections::BTreeSet::new()).to_string();
         let _ = prompt.answer.send(Ok(message));
     }
-    if was_active {
+    let (reviews, review_was_active) = with_a2app(|state| {
+        let (mine, rest): (Vec<_>, Vec<_>) = state.exact_reviews.drain(..).partition(|review| &review.room_id == room_id);
+        state.exact_reviews = rest.into_iter().collect();
+        let mut pending = mine;
+        let mut was_active = false;
+        if state.active_exact_review.as_ref().is_some_and(|review| &review.room_id == room_id) {
+            if let Some(review) = state.active_exact_review.take() {
+                pending.push(review);
+                was_active = true;
+            }
+        }
+        (pending, was_active)
+    })
+    .unwrap_or_default();
+    for review in reviews {
+        let _ = a2app_core::information_flow::cancel_exact_action(review.request_id);
+        refuse_exact_resume(review.resume, String::from("The request was cancelled before this action was reviewed."));
+    }
+    if was_active || review_was_active {
         ui.modal(cx, ids!(task_permission_modal)).close(cx);
         show_next_permission_prompt(cx, ui);
     }
@@ -8583,6 +8741,125 @@ fn run_ai_generation(
     }
 }
 
+/// The exact action a parked agent job performs, with the payload the worker
+/// commits with, or `None` for a job with no exact-action layer.
+#[cfg(unix)]
+fn session_job_exact_action(
+    room_id: &OwnedRoomId,
+    job: &SessionJob,
+) -> Option<(a2app_core::information_flow::SensitiveAction, serde_json::Value)> {
+    use a2app_core::information_flow::SensitiveAction;
+    match job {
+        SessionJob::PostRoomMessage { room_id: target, text, .. } => Some((
+            SensitiveAction { kind: "matrix.rooms.message.send".into(), target: target.clone() },
+            serde_json::json!({ "room_id": target, "text": text }),
+        )),
+        SessionJob::LaunchSplashApp { description, .. } => Some((
+            SensitiveAction { kind: "apps.generate".into(), target: room_id.to_string() },
+            serde_json::json!({ "description": description, "room_id": room_id.to_string() }),
+        )),
+        _ => None,
+    }
+}
+
+/// The newest pending host capture for `(context, epoch, action)`.
+#[cfg(unix)]
+fn pending_exact_decision(
+    context: &a2app_core::information_flow::ContextId,
+    epoch: u64,
+    action: &a2app_core::information_flow::SensitiveAction,
+) -> Option<(u64, a2app_core::information_flow::Influences)> {
+    a2app_core::information_flow::recent_action_decisions().ok()?.into_iter().rev().find_map(|decision| {
+        if &decision.context == context && decision.epoch == epoch && &decision.action == action {
+            decision.request.map(|request| (request.id, decision.influences))
+        } else {
+            None
+        }
+    })
+}
+
+/// What the exact-action review modal shows: the exact target and the
+/// host-captured payload, with no agent-authored prose.
+#[cfg(unix)]
+fn exact_review_info(
+    action: &a2app_core::information_flow::SensitiveAction,
+    payload: &serde_json::Value,
+) -> TaskPromptInfo {
+    let title = match action.kind.as_str() {
+        "matrix.rooms.message.send" => format!("Post a message into room {}", action.target),
+        "apps.generate" => format!("Build and run a mini-app in room {}", action.target),
+        "mcp.tools.call" => format!("Call the mini-app tool \u{201c}{}\u{201d}", action.target),
+        other => format!("Run {other} against {}", action.target),
+    };
+    TaskPromptInfo {
+        explanation: String::from(
+            "The assistant wants to do this, and it may have been influenced by content it read. \
+             Review exactly what it will do before allowing it.",
+        ),
+        items: vec![TaskItemView {
+            id: "exact".to_string(),
+            title,
+            detail: format!("Target: {}\n{}", action.target, serde_json::to_string_pretty(payload).unwrap_or_default()),
+            chip: String::from("Needs review"),
+            why: None,
+            grantable: true,
+            checked: true,
+        }],
+        risk: Some(String::from(
+            "Approving allows exactly this one action. If the assistant reads more first, it asks again.",
+        )),
+        sharing_heading: None,
+        sharing_summary: None,
+    }
+}
+
+/// Checks an agent job's exact action. Returns the job to run when it may
+/// proceed, or `None` after parking it behind the exact-action modal.
+#[cfg(unix)]
+fn park_exact_review_if_needed(
+    cx: &mut Cx,
+    ui: &WidgetRef,
+    room_id: &OwnedRoomId,
+    job: SessionJob,
+) -> Option<SessionJob> {
+    let Some((action, payload)) = session_job_exact_action(room_id, &job) else { return Some(job) };
+    let Ok(context) = super::information_flow::agent_context(room_id.as_str()) else { return Some(job) };
+    let Ok(epoch) = a2app_core::information_flow::context_epoch(&context) else { return Some(job) };
+    if a2app_core::information_flow::check_exact_action_for_activation(&context, epoch, &action, &payload).is_ok() {
+        return Some(job);
+    }
+    // The check failed for a reason other than review (for example a restarted
+    // context) when there is no captured request to review.
+    let Some((request_id, expected)) = pending_exact_decision(&context, epoch, &action) else { return Some(job) };
+    let info = exact_review_info(&action, &payload);
+    with_a2app(|state| state.exact_reviews.push_back(ExactReviewPrompt {
+        room_id: room_id.clone(), context, epoch, action, payload, expected, request_id, info,
+        resume: ExactResume::Job(job),
+    }));
+    show_next_exact_review(cx, ui);
+    None
+}
+
+/// Refuses a parked effect (turn cancelled, session gone, room closed), so a
+/// serve thread never hangs on an unanswered review.
+#[cfg(unix)]
+fn refuse_exact_resume(resume: ExactResume, message: String) {
+    match resume {
+        ExactResume::Job(job) => answer_session_job(job, Err(message)),
+        ExactResume::AppTool { answer, .. } => { let _ = answer.send(Err(message)); }
+    }
+}
+
+/// Resumes the effect after its review is approved.
+#[cfg(unix)]
+fn resume_exact(cx: &mut Cx, ui: &WidgetRef, room_id: OwnedRoomId, resume: ExactResume) {
+    match resume {
+        ExactResume::Job(job) => execute_session_job(cx, ui, &room_id, job),
+        ExactResume::AppTool { tool, arguments, display_name, answer } =>
+            run_app_tool_invocation(cx, ui, &room_id, tool, arguments, display_name, answer),
+    }
+}
+
 /// Runs one tool call the room's agent made, on the UI thread, and sends the
 /// result back to the serve thread that called the tool.
 #[cfg(unix)]
@@ -8617,6 +8894,10 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
         Ok(())
     });
     if let Err(error) = recorded { answer_session_job(job, Err(super::information_flow::with_task_reask_hint(error))); return; }
+
+    // After provenance is recorded, an effect that needs exact-action review
+    // is parked behind the review modal instead of being dispatched.
+    let Some(job) = park_exact_review_if_needed(cx, ui, room_id, job) else { return };
 
     // The job is the only place the call's arguments exist, so this is where
     // the human-readable target detail is computed and pinned to the call's
@@ -8742,7 +9023,7 @@ fn run_mini_app_tool_call(
     .unwrap_or(Effective::NeedsPrompt);
     match decided {
         Effective::Granted => {
-            run_app_tool_invocation(cx, room_id, tool, arguments, display_name, answer);
+            run_app_tool_invocation(cx, ui, room_id, tool, arguments, display_name, answer);
         }
         Effective::NeedsPrompt => {
             let grant = with_a2app(|state| {
@@ -8842,6 +9123,7 @@ fn run_ai_list_mini_app_tools(
 #[cfg(unix)]
 fn run_app_tool_invocation(
     cx: &mut Cx,
+    ui: &WidgetRef,
     room_id: &OwnedRoomId,
     tool: String,
     arguments: serde_json::Map<String, serde_json::Value>,
@@ -8874,14 +9156,35 @@ fn run_app_tool_invocation(
         a2app_core::information_flow::transfer(&from, &to)?;
         // Tool metadata and the fact of invocation are observable to the agent too.
         a2app_core::information_flow::transfer(&to, &from)?;
-        a2app_core::information_flow::commit_exact_action_for_activation(&from,
-            a2app_core::information_flow::context_epoch(&from)?, &a2app_core::information_flow::SensitiveAction {
-            kind: "mcp.tools.call".into(), target: tool.clone(),
-        }, &serde_json::json!({ "tool": tool, "arguments": arguments, "app_id": app_id,
-            "app_activation": a2app_core::information_flow::context_epoch(&to)? }))?;
-        Ok(from)
+        let app_activation = a2app_core::information_flow::context_epoch(&to)?;
+        Ok((from, app_activation))
     });
-    let context = match transfer { Ok(context) => context, Err(error) => { let _ = answer.send(Err(super::information_flow::with_task_reask_hint(error))); return; } };
+    let (context, app_activation) = match transfer { Ok(value) => value, Err(error) => { let _ = answer.send(Err(super::information_flow::with_task_reask_hint(error))); return; } };
+    // An app-tool call is a privileged effect: after untrusted influence it is
+    // parked behind the exact-action review. The transfers above are
+    // idempotent, so the resumed invocation commits against the same set.
+    let action = a2app_core::information_flow::SensitiveAction { kind: "mcp.tools.call".into(), target: tool.clone() };
+    let exact_payload = serde_json::json!({
+        "tool": tool.clone(), "arguments": arguments.clone(), "app_id": app_id.clone(),
+        "app_activation": app_activation,
+    });
+    let epoch = a2app_core::information_flow::context_epoch(&context).unwrap_or(0);
+    match a2app_core::information_flow::commit_exact_action_for_activation(&context, epoch, &action, &exact_payload) {
+        Ok(()) => {}
+        Err(error) => {
+            if let Some((request_id, expected)) = pending_exact_decision(&context, epoch, &action) {
+                let info = exact_review_info(&action, &exact_payload);
+                with_a2app(|state| state.exact_reviews.push_back(ExactReviewPrompt {
+                    room_id: room_id.clone(), context, epoch, action, payload: exact_payload, expected, request_id, info,
+                    resume: ExactResume::AppTool { tool, arguments, display_name, answer },
+                }));
+                show_next_exact_review(cx, ui);
+                return;
+            }
+            let _ = answer.send(Err(super::information_flow::with_task_reask_hint(error)));
+            return;
+        }
+    }
     let call_id = NEXT_APP_TOOL_CALL_ID.fetch_add(1, Ordering::Relaxed);
     let audit = a2app_core::protection_audit::Attempt::start(&context, None, a2app_core::protection_audit::ActivityKind::ToolCall);
     with_a2app(|state| {
@@ -10410,6 +10713,40 @@ View{note := Label{text:"waiting"}}
         permissions.set(&subject, a_group, GrantState::Ask);
         assert!(!applied.insert(SOURCE.to_string()), "a later session is already marked");
         assert_eq!(permissions.state(&subject, a_group), GrantState::Ask, "the user's Ask survives a restart");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_jobs_expose_the_worker_exact_action_and_payload() {
+        let room: OwnedRoomId = SOURCE.try_into().unwrap();
+        let (answer, _) = std::sync::mpsc::channel();
+        let post = SessionJob::PostRoomMessage { room_id: TARGET.into(), text: "hello".into(), answer };
+        let (action, payload) = session_job_exact_action(&room, &post).unwrap();
+        assert_eq!(action.kind, "matrix.rooms.message.send");
+        assert_eq!(action.target, TARGET);
+        assert_eq!(payload, serde_json::json!({ "room_id": TARGET, "text": "hello" }));
+
+        let (answer, _) = std::sync::mpsc::channel();
+        let generate = SessionJob::LaunchSplashApp { description: "an app".into(), answer };
+        let (action, payload) = session_job_exact_action(&room, &generate).unwrap();
+        assert_eq!(action.kind, "apps.generate");
+        assert_eq!(action.target, SOURCE);
+        assert_eq!(payload, serde_json::json!({ "description": "an app", "room_id": SOURCE }));
+
+        let (answer, _) = std::sync::mpsc::channel();
+        assert!(session_job_exact_action(&room, &SessionJob::SendRoomMessage { text: "x".into(), answer }).is_none(),
+            "the own-room reply is exempt and has no exact action");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_review_info_shows_the_exact_target_and_payload() {
+        let action = a2app_core::information_flow::SensitiveAction { kind: "matrix.rooms.message.send".into(), target: TARGET.into() };
+        let info = exact_review_info(&action, &serde_json::json!({ "room_id": TARGET, "text": "hello" }));
+        assert_eq!(info.items.len(), 1);
+        assert!(info.items[0].detail.contains(TARGET));
+        assert!(info.items[0].detail.contains("hello"));
+        assert!(info.items[0].grantable && info.items[0].checked, "the exact item starts checked");
     }
 
     #[cfg(unix)]

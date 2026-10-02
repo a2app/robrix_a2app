@@ -144,6 +144,23 @@ fn closing_the_owning_room_cancels_pending_review_and_approval() {
 }
 
 #[test]
+fn influence_growth_raises_a_fresh_review_instead_of_failing_forever() {
+    let (_root, mut registry, context, epoch, action) = setup();
+    let payload = serde_json::json!({ "text": "message" });
+    let first = pending(&mut registry, &context, epoch, &action, &payload);
+    // Content read after the review: the old approval no longer matches.
+    registry.add_influences(&context, [Influence::InternetOrigin("https://new.example".into())]).unwrap();
+    assert!(registry.grant_exact_action_for_activation(&context, first.request.as_ref().unwrap().id, &first.influences, epoch).is_err(),
+        "an approval captured before new influence must not authorize the action");
+    // A fresh check captures the grown influence set and is reviewable.
+    assert!(registry.check_exact_action_for_activation(&context, epoch, &action, &payload).is_err());
+    let fresh = registry.recent_action_decisions().unwrap().pop().unwrap();
+    assert_ne!(fresh.influences, first.influences);
+    approve(&mut registry, &fresh);
+    registry.commit_exact_action_for_activation(&context, epoch, &action, &payload).unwrap();
+}
+
+#[test]
 fn app_contexts_keep_the_same_exact_review() {
     let (_root, mut registry, context, epoch, action) = setup_app();
     let payload = serde_json::json!({ "text": "reviewed" });
