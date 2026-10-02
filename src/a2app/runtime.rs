@@ -5607,9 +5607,12 @@ fn start_ai_session(state: &mut A2AppState, room_id: &OwnedRoomId, prefs: AgentP
             .map(|recipient| recipient.id);
         let homeserver = crate::sliding_sync::get_client()
             .map(|client| client.homeserver().to_string());
-        super::information_flow::ensure_agent_default_sharing(
+        if super::information_flow::ensure_agent_default_sharing(
             &context, room_id.as_str(), model.as_deref(), homeserver.as_deref(),
-        );
+            &mut state.persisted.default_sharing_applied,
+        ) {
+            state.registry_dirty = true;
+        }
         for reg in state.app_tools.values().filter(|reg| &reg.room_id == room_id) {
             transfer_app_tool_provenance(state, &reg.app_id, reg.heap_key, room_id)?;
         }
