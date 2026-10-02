@@ -176,21 +176,21 @@ async fn send_ai_state_event(
     policy::ensure_room_access(room.room_id().as_str(), RoomAccess::Write)?;
     use matrix_sdk::ruma::api::client::state::send_state_event;
     use matrix_sdk::utils::IntoRawStateEventContent;
+    let config = room.client().request_config().disable_retry();
+    ensure_ai_state_output(room, flow_context)?;
+    // Activity rows are the agent's own-room visible output, so they take the
+    // `ai.activity.write` exemption from exact-action review (see
+    // `agent_own_room_output_exempt`); the confidentiality check above still
+    // governs what may be written. A row targeting any other room would not be
+    // exempt.
+    let action = flow::SensitiveAction { kind: "ai.activity.write".into(), target: room.room_id().to_string() };
+    policy::commit_flow_action(flow_context, &action, &content)?;
     let request = send_state_event::v3::Request::new_raw(
         room.room_id().to_owned(),
         event_type.into(),
         state_key.to_owned(),
         content.into_raw_state_event_content(),
     );
-    let config = room.client().request_config().disable_retry();
-    ensure_ai_state_output(room, flow_context)?;
-    // The integrity/action-review gate is intentionally NOT applied here: the
-    // agent's own turn and activity rows in its own room are the assistant's
-    // visible output, not a privileged cross-room or network effect. Every
-    // room message and directory result is untrusted input, so requiring an
-    // exact-payload review for each row would make the AI room unusable. The
-    // confidentiality check above (room + homeserver-origin sharing) still
-    // governs what may be written.
     let recipient = flow::Recipient::network_origin(room.client().homeserver().as_str()).ok();
     policy::audit_flow_operation(flow_context, recipient, room.client()
         .send(request)
@@ -757,7 +757,6 @@ fn next_reply_state_key() -> String {
 
 /// Review authored content exactly while treating the host timestamp as
 /// transport metadata. Retrying never changes the approved text or receipts.
-#[cfg(test)]
 fn reply_review_payload(content: &AiReplyContent) -> Result<serde_json::Value, String> {
     let mut content = serde_json::to_value(content).map_err(|_| "Cannot review AI reply content.")?;
     content["createdAt"] = "Host timestamp assigned when sent".into();
@@ -802,10 +801,12 @@ async fn post_reply(room: &Room, content: &AiReplyContent, flow_context: &Contex
     );
     let config = room.client().request_config().disable_retry();
     ensure_ai_state_output(room, flow_context)?;
-    // As with `send_ai_state_event`, the agent's own reply in its own room is
-    // its visible output, not a privileged effect: untrusted room input must
-    // not force an exact-payload review on every answer. Confidentiality (the
-    // room and homeserver-origin sharing rules) still governs the write.
+    // The reply is the agent's own-room visible output, so it takes the
+    // `ai.reply.write` exemption from exact-action review (see
+    // `agent_own_room_output_exempt`); the room and homeserver sharing rules
+    // above still govern the write.
+    let action = flow::SensitiveAction { kind: "ai.reply.write".into(), target: room.room_id().to_string() };
+    policy::commit_flow_action(flow_context, &action, &reply_review_payload(content)?)?;
     let recipient = flow::Recipient::network_origin(room.client().homeserver().as_str()).ok();
     match policy::audit_flow_operation(flow_context, recipient, room.client().send(request).with_request_config(config)).await {
         Ok(response) => {
@@ -856,14 +857,17 @@ async fn post_notice(room: &Room, content: &AiReplyContent, flow_context: &Conte
         None => RoomMessageEventContent::notice_plain(format!("{NOTICE_PROVENANCE_PREFIX}{}", content.text)),
     };
     policy::ensure_room_flow_output(flow_context, room.room_id().as_str())?;
-    // The exact-target capability (`matrix.rooms.message.send`, scoped to this
-    // room) is what gates a cross-room post: the runtime checks the per-room
-    // verdict before this worker ever runs, and the `request_task_permissions`
-    // batch is the user's explicit, per-room consent. The integrity/action-
-    // review gate is therefore not repeated here — every room message is
-    // untrusted input, so it would otherwise force a second exact-payload
-    // review on every planned post. The flow check above still governs which
-    // sources may reach this room.
+    // A cross-room post is a privileged effect, not the agent's own-room
+    // output: after untrusted influence it needs an exact-action review of
+    // this destination and body. The own-room reply/activity exemption does
+    // not apply here (see `agent_own_room_output_exempt`).
+    let action = flow::SensitiveAction { kind: "matrix.rooms.message.send".into(), target: room.room_id().to_string() };
+    let payload = serde_json::json!({
+        "room_id": room.room_id().to_string(),
+        "text": content.text,
+        "formatted": content.formatted,
+    });
+    policy::commit_flow_action(flow_context, &action, &payload)?;
     let recipient = flow::Recipient::MatrixRoom { account: flow_context.account().into(), room: room.room_id().to_string() };
     match policy::audit_flow_operation(flow_context, Some(recipient), room.send(message)).await {
         Ok(response) => {

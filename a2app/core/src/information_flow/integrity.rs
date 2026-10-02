@@ -1,14 +1,12 @@
 //! Integrity (untrusted-influence) tracking and exact-action review.
 //!
-//! DEVIATION: AI-room agent sessions (`ContextId::Agent`) deliberately skip the
-//! exact-action review. That layer cannot be requested up front through
-//! `request_task_permissions` (the plan has no action-authority item), and its
-//! influence-subset check is invalidated as the agent reads untrusted input
-//! during the very turn it is executing — so in practice it is unsatisfiable
-//! for a room task. The user's task-batch approval is the consent, and the
-//! per-room / per-URL capability grants still bound every effect. Mini-app
-//! contexts keep the full review. See `Registry::action_decision` and
-//! `Registry::exact_action`.
+//! Every context, including an AI-room agent session, needs an exact-action
+//! review once untrusted influence is present. The one exemption is an
+//! agent's own-room reply and activity rows (`ai.reply.write` /
+//! `ai.activity.write` targeting its own room): those are the assistant's
+//! visible output in the room the user is already talking to, and
+//! confidentiality (the room and homeserver sharing rules) still applies to
+//! them. See [`agent_own_room_output_exempt`].
 
 use super::*;
 
@@ -68,13 +66,10 @@ impl Registry {
     pub fn action_decision(&self, context: &ContextId, action: &SensitiveAction) -> Result<ActionDecision, String> {
         validate_action(action)?;
         let influences = self.influences(context)?;
-        // An AI-room session's effects are already bounded by the per-room and
-        // per-URL capability grants the user approved through
-        // `request_task_permissions`; that approval IS the consent. Every room
-        // message is untrusted input, so the exact-payload review would fire on
-        // every planned action and make the room unusable. Agent sessions skip
-        // it; mini-app contexts keep it.
-        let allowed = matches!(context, ContextId::Agent { .. }) || influences.is_empty() || self.authorities.iter().any(|grant|
+        // Every context, including an agent session, needs a review once it
+        // holds untrusted influence. The sole exemption is the agent's own
+        // visible output in its own room; see `agent_own_room_output_exempt`.
+        let allowed = influences.is_empty() || agent_own_room_output_exempt(context, action) || self.authorities.iter().any(|grant|
             &grant.context == context && &grant.action == action && influences.is_subset(&grant.influences)
                 && !matches!(grant.session, AuthoritySession::Once { .. }));
         let decision = ActionDecision { context: context.clone(), epoch: self.context_epoch(context)?, action: action.clone(), influences, allowed, request: None };
@@ -142,6 +137,16 @@ impl Registry {
 fn validate_action(action: &SensitiveAction) -> Result<(), String> {
     if action.kind.is_empty() || action.target.is_empty() || action.kind.len() > 256 || action.target.len() > 8192 { return Err("An exact action kind and target are required.".into()); }
     Ok(())
+}
+
+/// An agent's reply and activity rows are the visible output of the room the
+/// user is already talking to. They are written back into the agent's own
+/// room, so they skip exact-action review; the confidentiality check (the room
+/// and homeserver origin sharing rules) still governs them. Every other kind
+/// and target, including those same kinds targeting another room, is reviewed.
+fn agent_own_room_output_exempt(context: &ContextId, action: &SensitiveAction) -> bool {
+    let ContextId::Agent { room, .. } = context else { return false };
+    matches!(action.kind.as_str(), "ai.reply.write" | "ai.activity.write") && action.target == *room
 }
 
 pub(super) fn validate_influence(influence: &Influence) -> Result<(), String> {
@@ -246,10 +251,10 @@ impl Registry {
     fn exact_action(&mut self, context: &ContextId, epoch: u64, action: &SensitiveAction, payload: &serde_json::Value, commit: bool) -> Result<(), String> {
         self.ensure_context_epoch(context, epoch)?;
         validate_action(action)?;
-        // Agent sessions: see `action_decision`. The capability layer (per room
-        // or per URL) already gates the effect and the user approved it in the
-        // task batch, so no exact-payload review is created or consumed.
-        if matches!(context, ContextId::Agent { .. }) {
+        // The agent's own-room reply and activity rows are its visible output,
+        // not a privileged cross-room or network effect; confidentiality still
+        // applies at the sink. No other kind or target is exempt.
+        if agent_own_room_output_exempt(context, action) {
             if commit {
                 self.pending_actions.retain(|pending| &pending.decision.context != context || &pending.decision.action != action);
                 self.authorities.retain(|grant| &grant.context != context || &grant.action != action

@@ -7922,10 +7922,7 @@ mod permission_tests {
         let path = std::env::temp_dir().join(format!("robrix-generation-review-{}-{}", std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         let mut registry = flow::Registry::open(&path).unwrap();
-        // An app context, not an agent context: agent sessions bypass the
-        // exact-action review, so this exercises the review's mechanics (which
-        // still apply to mini-app contexts).
-        let context = flow::ContextId::App { account: "alice".into(), app: "tool".into(), room: Some(SOURCE.into()) };
+        let context = flow::ContextId::Agent { account: "alice".into(), room: SOURCE.into() };
         registry.register_context(&context).unwrap();
         registry.add_influences(&context, [flow::Influence::Model("provider".into())]).unwrap();
         let mut pending = PendingGeneratedApp {
