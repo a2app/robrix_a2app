@@ -300,6 +300,51 @@ one provider rule covers the whole directory, and other recipients do not
 inherit every listed room. Rooms with a Deny read policy are filtered out of
 directory results, so a protected room's name never reaches the model.
 
+**Implied information-flow rules.** For every plan, Robrix adds flow rules the
+agent did not list:
+
+- every source the agent already holds, plus every source it will read, may
+  reach the model provider (the model sees what it reads);
+- those sources may also reach the homeserver origin and the agent's own room,
+  because replies and activity rows are unencrypted Matrix state written back
+  to the room and the whole-label output check would otherwise refuse them;
+- each named output (a post target, a fetched origin) is allowed to receive the
+  sources that feed the task;
+- a target-room read adds a rule to that room's server, because the query
+  leaves Robrix;
+- the rows are pre-checked, shown under an "Information sharing this requires"
+  heading, and each is tagged with the reads that cause it; unchecking a read
+  drops the rules that depend on it (`dependent_approval`);
+- they last until the turn ends.
+
+**What is on by default.** Grants: the four directory tools listed above and
+nothing else. Sharing: the `RoomDirectory` source and the room's own source to
+the current model provider, plus the room's own source and the `RoomDirectory`
+to the homeserver origin and to the room itself (reply/activity plumbing). The
+provider is the configured endpoint, and it therefore sees the names, unread
+counts, tags and topics of every room and DM the user can list, plus the room's
+own content. Nothing account-level, such as the installed-app list, is shared
+by default. Every rule is `Permanent` and visible in the Data Sharing editor;
+the once-per-room and once-per-recipient markers mean a rule the user revokes
+there stays revoked, and a newly selected model provider gets only its own
+rules.
+
+**Exact-action review.** Only an agent's own-room `ai.reply.write` and
+`ai.activity.write` rows skip the exact-action review: they are the assistant's
+visible output in the room the user is already talking to, and confidentiality
+(the room and homeserver sharing rules) still applies. Every other effect — a
+cross-room post, a non-GET network request, an app-tool call, app generation —
+raises the exact-content review once untrusted influence is present. A
+cross-room post or fetch after reading untrusted content therefore pauses for a
+per-action review; that is intended.
+
+**Re-asking.** A gated read, fetch or post refused because the label grew
+returns an error telling the agent to ask again with the new need. The agent
+may make at most three requests per turn, and each after the first must contain
+a need not already declined. "Not now" is remembered by the plan's needs, so a
+re-labeled request with the same needs, or a subset, is refused without a modal
+and only a strict superset re-prompts.
+
 `launch_splash_app` is create-only: it never rewrites an installed app. Running
 an app that already exists is `launch_app`'s job — list the ids with
 `list_apps`, then launch one. (The Mini Apps screen's own create bar still

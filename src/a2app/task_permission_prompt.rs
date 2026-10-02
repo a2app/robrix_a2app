@@ -45,6 +45,14 @@ script_mod! {
             text: "Details (0 items)"
             icon_walk: Walk{width: 0, height: 0, margin: 0}
         }
+        sharing_heading := mod.widgets.TaskPromptBody {
+            visible: false
+            margin: Inset{top: 10}
+        }
+        sharing_summary := mod.widgets.TaskPromptBody {
+            visible: false
+            margin: Inset{top: 2, bottom: 4}
+        }
         details := ScrollYView {
             visible: false
             width: Fill, height: 340, flow: Down
@@ -108,6 +116,10 @@ pub struct TaskPromptInfo {
     pub items: Vec<TaskItemView>,
     /// Robrix's own warning, shown only for high-risk or unusually broad asks.
     pub risk: Option<String>,
+    /// The "Information sharing this requires" heading and its one-line
+    /// summary, shown only when the plan derived implied flow rules.
+    pub sharing_heading: Option<String>,
+    pub sharing_summary: Option<String>,
 }
 
 /// The user's answer, emitted as a global action for the runtime to apply.
@@ -224,6 +236,18 @@ impl TaskPermissionPromptRef {
                 inner.view.widget(cx, ids!(risk_strip)).set_visible(cx, true);
             }
             None => inner.view.widget(cx, ids!(risk_strip)).set_visible(cx, false),
+        }
+        match (&info.sharing_heading, &info.sharing_summary) {
+            (Some(heading), Some(summary)) => {
+                inner.view.label(cx, ids!(sharing_heading)).set_text(cx, heading);
+                inner.view.label(cx, ids!(sharing_summary)).set_text(cx, summary);
+                inner.view.widget(cx, ids!(sharing_heading)).set_visible(cx, true);
+                inner.view.widget(cx, ids!(sharing_summary)).set_visible(cx, true);
+            }
+            _ => {
+                inner.view.widget(cx, ids!(sharing_heading)).set_visible(cx, false);
+                inner.view.widget(cx, ids!(sharing_summary)).set_visible(cx, false);
+            }
         }
         inner.apply_expanded(cx);
         inner.view.redraw(cx);
