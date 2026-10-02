@@ -1,11 +1,10 @@
 //! The upfront task permission prompt: one modal per task, showing the agent's
-//! own plain-language explanation and a collapsible, exact Details list.
+//! own plain-language explanation and a collapsible Details list of exactly
+//! what Robrix will grant.
 //!
-//! This is the agent-authored-text surface: its explanation and each `why` are
-//! shown verbatim, exactly as `tool_label` shows an app's tool text on the
-//! `mcp-tools` prompt. The agent writes the paragraph; Robrix contributes the
-//! exact, checkable items below it, and what the user checks is what is
-//! applied. There is no generated recap sentence and no interpolated title.
+//! Only the explanation comes from the agent. The Details list is Robrix's
+//! own: the exact capability, scope, URL or tool for each row, with no agent
+//! prose. What the user checks is what is applied.
 
 use makepad_widgets::*;
 
@@ -49,10 +48,6 @@ script_mod! {
             visible: false
             margin: Inset{top: 10}
         }
-        sharing_summary := mod.widgets.TaskPromptBody {
-            visible: false
-            margin: Inset{top: 2, bottom: 4}
-        }
         details := ScrollYView {
             visible: false
             width: Fill, height: 340, flow: Down
@@ -64,7 +59,6 @@ script_mod! {
                     padding: Inset{top: 6, bottom: 6}
                     check := RobrixSettingsCheckBox {}
                     detail := mod.widgets.TaskPromptBody { visible: false }
-                    rationale := mod.widgets.TaskPromptBody { visible: false }
                     LineH { height: 1 }
                 }
             }
@@ -100,8 +94,6 @@ pub struct TaskItemView {
     pub detail: String,
     /// The state chip (Already allowed, Will be granted, Blocked and why).
     pub chip: String,
-    /// The agent's own `why`, shown verbatim and labelled as its words.
-    pub why: Option<String>,
     /// Whether this item starts checked. Already-allowed and non-grantable
     /// items start unchecked and disabled, so Allow never re-grants them.
     pub grantable: bool,
@@ -116,10 +108,9 @@ pub struct TaskPromptInfo {
     pub items: Vec<TaskItemView>,
     /// Robrix's own warning, shown only for high-risk or unusually broad asks.
     pub risk: Option<String>,
-    /// The "Information sharing this requires" heading and its one-line
-    /// summary, shown only when the plan derived implied flow rules.
+    /// The "Information sharing this requires" heading, shown only when the
+    /// plan derived implied flow rules; the rows below it carry the detail.
     pub sharing_heading: Option<String>,
-    pub sharing_summary: Option<String>,
 }
 
 /// The user's answer, emitted as a global action for the runtime to apply.
@@ -185,13 +176,6 @@ impl Widget for TaskPermissionPrompt {
                     row.widget(cx, ids!(check)).set_disabled(cx, !item.grantable);
                     row.label(cx, ids!(detail)).set_text(cx, &item.detail);
                     row.widget(cx, ids!(detail)).set_visible(cx, !item.detail.is_empty());
-                    match &item.why {
-                        Some(why) => {
-                            row.label(cx, ids!(rationale)).set_text(cx, &format!("The AI's own words: \u{201c}{why}\u{201d}"));
-                            row.widget(cx, ids!(rationale)).set_visible(cx, true);
-                        }
-                        None => row.widget(cx, ids!(rationale)).set_visible(cx, false),
-                    }
                     row.draw_all(cx, scope);
                 }
             }
@@ -237,17 +221,12 @@ impl TaskPermissionPromptRef {
             }
             None => inner.view.widget(cx, ids!(risk_strip)).set_visible(cx, false),
         }
-        match (&info.sharing_heading, &info.sharing_summary) {
-            (Some(heading), Some(summary)) => {
+        match &info.sharing_heading {
+            Some(heading) => {
                 inner.view.label(cx, ids!(sharing_heading)).set_text(cx, heading);
-                inner.view.label(cx, ids!(sharing_summary)).set_text(cx, summary);
                 inner.view.widget(cx, ids!(sharing_heading)).set_visible(cx, true);
-                inner.view.widget(cx, ids!(sharing_summary)).set_visible(cx, true);
             }
-            _ => {
-                inner.view.widget(cx, ids!(sharing_heading)).set_visible(cx, false);
-                inner.view.widget(cx, ids!(sharing_summary)).set_visible(cx, false);
-            }
+            None => inner.view.widget(cx, ids!(sharing_heading)).set_visible(cx, false),
         }
         inner.apply_expanded(cx);
         inner.view.redraw(cx);

@@ -3543,9 +3543,8 @@ fn complete_app_tool_call(
         let _ = pending.answer.send(Err(error.clone()));
         return services::respond(cx, reply, Err(&error));
     }
-    let summary: String = text.chars().take(200).collect();
-    let detail = finish_ai_tool_call(&pending.room_id, &pending.display_name, ok, &summary);
-    push_ai_tool_receipt(&pending.room_id, &pending.display_name, detail, ok, &summary);
+    let detail = finish_ai_tool_call(&pending.room_id, &pending.display_name, ok, text);
+    push_ai_tool_receipt(&pending.room_id, &pending.display_name, detail, ok, text);
     let _ = if ok {
         pending.answer.send(Ok(text.to_string()))
     } else {
@@ -5771,7 +5770,6 @@ fn task_prompt_info(
             title: task_item_title(&item.action, &name_of, model_label, &tool_name_of),
             detail: task_item_detail(&item.action, &name_of, model_label, &tool_name_of),
             chip: task_item_chip(&item.state),
-            why: item.why.clone(),
             grantable: item.state.is_grantable(),
             checked: item.state.is_grantable(),
         })
@@ -5783,13 +5781,14 @@ fn task_prompt_info(
         .then(|| "This plan includes broad or high-risk access. Review the details before allowing.".to_string());
     let has_implied = plan.items.iter().any(|item| matches!(item.origin, ItemOrigin::Implied { .. }));
     TaskPromptInfo {
-        explanation: format!("The assistant says: \u{201c}{}\u{201d}", plan.explanation),
+        // Only the assistant's own paragraph. Robrix's framing is the modal
+        // title and the detail rows below, never a label on the agent's words.
+        explanation: plan.explanation.clone(),
         items,
         risk,
         // The derived flow rules are shown as their own group, so the user can
         // tell what Robrix added apart from what the agent asked for.
         sharing_heading: has_implied.then(|| "Information sharing this requires".to_string()),
-        sharing_summary: has_implied.then(|| "Lets what the assistant reads reach your AI service and this room.".to_string()),
     }
 }
 
@@ -5867,16 +5866,16 @@ fn task_item_detail(
     match action {
         PlanAction::Scoped { scope, .. } => match scope {
             RoomScope::AllRooms => "all rooms".to_string(),
-            RoomScope::Selection { rooms, spaces } => {
-                let mut parts: Vec<String> = Vec::new();
-                if !rooms.is_empty() {
-                    parts.push(format!("rooms: {}", rooms.iter().map(|id| name_of(id)).collect::<Vec<_>>().join(", ")));
-                }
-                if !spaces.is_empty() {
-                    parts.push(format!("spaces: {}", spaces.iter().map(|id| name_of(id)).collect::<Vec<_>>().join(", ")));
-                }
-                parts.join(" · ")
-            }
+            // The row's title already names the operation ("Messages in another
+            // room"), so the detail is just the resolved targets — adding
+            // "rooms:"/"spaces:" here duplicated the noun and disagreed about
+            // singular/plural.
+            RoomScope::Selection { rooms, spaces } => rooms
+                .iter()
+                .chain(spaces.iter())
+                .map(|id| name_of(id))
+                .collect::<Vec<_>>()
+                .join(", "),
         },
         PlanAction::Flow { source, recipient } => format!(
             "{} \u{2192} {}",
@@ -7879,7 +7878,7 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
                         // so this finds no running row and does nothing; no
                         // receipt chip either way (the result never reached
                         // the model through Robrix).
-                        let summary: String = summary.chars().take(200).collect();
+                        let summary: String = summary.chars().collect();
                         log!(
                             "AI Rooms: room {room_id}'s agent tool {name} finished (ok: {ok}{}).",
                             if summary.is_empty() { String::new() } else { format!(": {summary}") }
@@ -8801,7 +8800,6 @@ fn exact_review_info(
             title,
             detail: format!("Target: {}\n{}", action.target, serde_json::to_string_pretty(payload).unwrap_or_default()),
             chip: String::from("Needs review"),
-            why: None,
             grantable: true,
             checked: true,
         }],
@@ -8809,7 +8807,6 @@ fn exact_review_info(
             "Approving allows exactly this one action. If the assistant reads more first, it asks again.",
         )),
         sharing_heading: None,
-        sharing_summary: None,
     }
 }
 
@@ -9443,15 +9440,14 @@ fn ai_now_millis() -> u64 {
 /// name), so the room's live tool log shows each call finishing.
 #[cfg(unix)]
 fn note_ai_tool_call(room_id: &OwnedRoomId, name: &str, ok: bool, summary: &str) {
-    // Keep enough of the result for the turn card's expanded body; the receipt
-    // chip truncates independently. The old 48-char cap cut JSON results
-    // mid-token and made them unreadable.
-    let summary: String = summary.chars().take(240).collect();
+    // The summary is rendered for the turn card by `finish_ai_tool_call` (and
+    // independently truncated for the receipt chip), so a raw JSON result is
+    // formatted once there rather than stored and re-parsed later.
     // `finish_ai_tool_call` returns the target detail recorded for the call
     // when its job reached the UI thread, so the receipt chip names the same
     // room/space/app the live row did.
-    let detail = finish_ai_tool_call(room_id, name, ok, &summary);
-    push_ai_tool_receipt(room_id, name, detail, ok, &summary);
+    let detail = finish_ai_tool_call(room_id, name, ok, summary);
+    push_ai_tool_receipt(room_id, name, detail, ok, summary);
 }
 
 /// Adds one finished call to the room's pending receipt list, shown on the
@@ -9473,7 +9469,7 @@ fn push_ai_tool_receipt(
                 name: name.to_string(),
                 detail,
                 ok,
-                summary: summary.chars().take(48).collect(),
+                summary: crate::a2app::ai_room_events::format_tool_result(name, summary).chars().take(160).collect(),
             });
         }
     });
@@ -9497,7 +9493,7 @@ fn finish_ai_tool_call(room_id: &OwnedRoomId, name: &str, ok: bool, summary: &st
         let call = &mut calls[pos];
         call.status = AiTurnToolStatus::Done;
         call.ok = ok;
-        call.summary = summary.chars().take(240).collect();
+        call.summary = crate::a2app::ai_room_events::format_tool_result(name, summary).chars().take(600).collect();
         detail_out = call.detail.clone();
         true
     });
@@ -10803,6 +10799,19 @@ View{note := Label{text:"waiting"}}
         drop(guard);
         let restored = with_a2app(|state| state.permissions.state("guard-test", Permission::Network)).unwrap();
         assert_eq!(restored, GrantState::Granted, "an early return or panic must not lose the store");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_item_detail_lists_target_names_without_a_repeated_noun() {
+        let action = a2app_core::task_grants::PlanAction::Scoped {
+            permission: "matrix-rooms-read".into(),
+            capability: "matrix.rooms.messages.read".into(),
+            scope: RoomScope::Selection { rooms: vec![TARGET.into()], spaces: Vec::new() },
+        };
+        let detail = task_item_detail(&action, &|id: &str| id.to_string(), None, &|_tool: &str| None::<String>);
+        assert_eq!(detail, TARGET);
+        assert!(!detail.contains("rooms:"), "the title already names the kind");
     }
 
     #[cfg(unix)]

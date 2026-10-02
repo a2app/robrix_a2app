@@ -688,7 +688,7 @@ pub fn ai_turn_tool_label(call: &AiTurnToolCall) -> String {
         AiTurnToolStatus::Done => ai_tool_display_name(&call.name),
     };
     let detail = detail_suffix(call.detail.as_deref());
-    let summary = readable_tool_summary(&call.summary);
+    let summary = format_tool_result(&call.name, &call.summary);
     match call.status {
         AiTurnToolStatus::Started => format!("· {action}{detail}…"),
         AiTurnToolStatus::Done => {
@@ -733,6 +733,167 @@ fn readable_tool_summary(summary: &str) -> String {
         let mut out: String = collapsed.chars().take(MAX).collect();
         out.push('…');
         out
+    }
+}
+
+/// Render a tool result so it can actually be read in the narrow turn card.
+///
+/// Known Robrix tools are reduced to the names, senders and statuses the
+/// reader cares about, one item per line, instead of the raw JSON value. The
+/// result is idempotent: already-formatted text (and plain text) passes
+/// through unchanged, and raw JSON from an older row is space-separated so it
+/// wraps rather than clipping mid-token.
+pub fn format_tool_result(name: &str, summary: &str) -> String {
+    let summary = summary.trim();
+    if summary.is_empty() {
+        return String::new();
+    }
+    let json_like = summary.starts_with('{') || summary.starts_with('[');
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(summary) else {
+        // Truncated JSON (a stored cap) or an older row: pull out what we can
+        // without a full parse, then fall back to space-separated text.
+        return if json_like {
+            format_truncated_json(summary).unwrap_or_else(|| readable_tool_summary(summary))
+        } else {
+            summary.to_string()
+        };
+    };
+    match format_json_result(&value) {
+        Some(formatted) if !formatted.is_empty() => formatted,
+        _ => {
+            let _ = name;
+            format_truncated_json(summary).unwrap_or_else(|| readable_tool_summary(summary))
+        }
+    }
+}
+
+/// A best-effort legible form for JSON that does not parse (typically because
+/// a stored copy was truncated). It scans the text for the same fields the
+/// full formatter uses, so a cut-off result still shows names and senders
+/// instead of a JSON blob.
+fn format_truncated_json(summary: &str) -> Option<String> {
+    let names = quoted_values(summary, "name");
+    if !names.is_empty() {
+        return Some(names.iter().map(|name| format!("• {name}")).collect::<Vec<_>>().join("\n"));
+    }
+    let senders = quoted_values(summary, "sender");
+    if !senders.is_empty() {
+        let bodies = quoted_values(summary, "body");
+        return Some(senders.iter().enumerate().map(|(index, sender)| {
+            let body = bodies.get(index).map(String::as_str).unwrap_or("");
+            let body: String = body.chars().take(80).collect();
+            format!("• {sender}: {body}")
+        }).collect::<Vec<_>>().join("\n"));
+    }
+    quoted_values(summary, "status").first().map(|status| task_status_text(status))
+}
+
+/// The string values for `"key"` in `json`, without requiring it to parse.
+fn quoted_values(json: &str, key: &str) -> Vec<String> {
+    let needle = format!("\"{key}\"");
+    let mut values = Vec::new();
+    let mut search_from = 0;
+    while let Some(relative) = json[search_from..].find(&needle) {
+        let key_end = search_from + relative + needle.len();
+        let Some(colon_relative) = json[key_end..].find(':') else { break };
+        let value_start = key_end + colon_relative + 1;
+        let rest = json[value_start..].trim_start();
+        let leading = json[value_start..].len() - rest.len();
+        let Some(after_quote) = rest.strip_prefix('"') else {
+            search_from = value_start + leading;
+            continue;
+        };
+        match after_quote.find('"') {
+            Some(end) => {
+                values.push(after_quote[..end].to_string());
+                search_from = value_start + leading + 1 + end + 1;
+            }
+            None => {
+                // A value cut off by truncation: keep what is left.
+                values.push(after_quote.to_string());
+                break;
+            }
+        }
+    }
+    values
+}
+
+/// The legible form of a tool result, keyed off the result's shape rather than
+/// the tool's name. The name a call carries is the agent's own `title`, which
+/// need not match the raw MCP name, so shape matching is what actually
+/// catches every call (including an agent-finished call overwriting the host's
+/// summary with the same result).
+fn format_json_result(value: &serde_json::Value) -> Option<String> {
+    let array = |key: &str| value.get(key).filter(|entry| entry.is_array()).map(named_items).unwrap_or_default();
+    let rooms = array("rooms");
+    let spaces = array("spaces");
+    if !rooms.is_empty() || !spaces.is_empty() {
+        return Some([rooms, spaces].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("\n"));
+    }
+    if value.get("messages").is_some_and(|messages| messages.is_array()) {
+        return Some(message_items(value));
+    }
+    let apps = array("apps");
+    if !apps.is_empty() {
+        return Some(apps);
+    }
+    let tools = array("tools");
+    if !tools.is_empty() {
+        return Some(tools);
+    }
+    if value.get("task_id").is_some() && value.get("status").is_some() {
+        return Some(task_outcome_text(value));
+    }
+    // A single room/space/details object: show its name rather than its JSON.
+    value.get("name").and_then(|name| name.as_str()).map(|name| format!("• {name}"))
+}
+
+/// One bullet per row, using the row's display name (falling back to its id
+/// only when the result carries no name).
+fn named_items(value: &serde_json::Value) -> String {
+    let rows: Vec<serde_json::Value> = value.as_array().cloned().unwrap_or_else(|| vec![value.clone()]);
+    rows.iter()
+        .filter_map(|row| {
+            row.get("name").and_then(|name| name.as_str())
+                .or_else(|| row.get("raw_name").and_then(|name| name.as_str()))
+                .or_else(|| row.get("room_id").and_then(|id| id.as_str()))
+                .or_else(|| row.get("space_id").and_then(|id| id.as_str()))
+                .map(|label| format!("• {label}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One bullet per message, naming the sender rather than its Matrix id.
+fn message_items(value: &serde_json::Value) -> String {
+    let Some(messages) = value.get("messages").and_then(|messages| messages.as_array()) else { return String::new() };
+    messages
+        .iter()
+        .map(|message| {
+            let sender = message.get("sender").and_then(|sender| sender.as_str())
+                .or_else(|| message.get("sender_id").and_then(|sender| sender.as_str()))
+                .unwrap_or("someone");
+            let body = message.get("body").and_then(|body| body.as_str()).unwrap_or("");
+            let body: String = body.chars().take(80).collect();
+            format!("• {sender}: {body}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The one-word status of a `request_task_permissions` result.
+fn task_outcome_text(value: &serde_json::Value) -> String {
+    value.get("status").and_then(|status| status.as_str()).map(task_status_text).unwrap_or_default()
+}
+
+/// The legible wording for a task-plan status token.
+fn task_status_text(status: &str) -> String {
+    match status {
+        "granted" => String::from("Granted"),
+        "partial" => String::from("Partly granted"),
+        "declined" => String::from("Declined"),
+        "blocked" => String::from("Blocked"),
+        other => other.to_string(),
     }
 }
 
@@ -960,7 +1121,7 @@ pub fn ai_tool_call_label(content: &AiToolCallContent) -> String {
         AiToolCallStatus::Done => ai_tool_display_name(&content.name),
     };
     let detail = detail_suffix(content.detail.as_deref());
-    let summary = readable_tool_summary(&content.summary);
+    let summary = format_tool_result(&content.name, &content.summary);
     match content.status {
         AiToolCallStatus::Started => format!("⚙ {action}{detail}…"),
         AiToolCallStatus::Done => {
@@ -1040,6 +1201,33 @@ mod tests {
             created_at: 0,
         };
         assert_eq!(ai_tool_call_label(&content), "✓ Read messages in “General”");
+    }
+
+    /// Tool results render as names and prose, never as a raw JSON blob.
+    #[test]
+    fn tool_results_render_names_and_prose_not_json() {
+        let rooms = format_tool_result("list_rooms",
+            r#"{"rooms":[{"room_id":"!a:s","name":"General"},{"room_id":"!b:s","name":"Random"}]}"#);
+        assert_eq!(rooms, "• General\n• Random");
+        let messages = format_tool_result("read_room_messages",
+            r#"{"messages":[{"sender":"zcorpan","sender_id":"@zcorpan:mozilla.org","body":"hello there"}]}"#);
+        assert_eq!(messages, "• zcorpan: hello there");
+        assert_eq!(format_tool_result("request_task_permissions",
+            r#"{"task_id":1,"status":"granted","granted":["n1"]}"#), "Granted");
+        // Plain text passes through, and the transform is idempotent.
+        assert_eq!(format_tool_result("send_message", "Posted to the room."), "Posted to the room.");
+        assert_eq!(format_tool_result("list_rooms", &rooms), rooms);
+        // The agent's own ACP title is not the raw tool name; the result is
+        // still formatted from its shape.
+        assert_eq!(format_tool_result("Listed your rooms", r#"{"rooms":[{"name":"General"}]}"#), "• General");
+        // An unknown tool's JSON still wraps instead of clipping mid-token.
+        let unknown = format_tool_result("mystery", r#"{"a":1,"b":2}"#);
+        assert!(!unknown.contains(r#"{"a":1"#), "{unknown}");
+        // A truncated stored result still shows names and bodies, not JSON.
+        let truncated = r#"{"rooms": [{"room_id": "!a:s", "name": "test seven", "is_direct": false}, {"room_id": "!b:s", "name": "Random"#;
+        assert_eq!(format_tool_result("Listed your rooms", truncated), "• test seven\n• Random");
+        let messages = r#"{"messages": [{"sender": "zcorpan", "sender_id": "@z:m.org", "body": "https:"#;
+        assert_eq!(format_tool_result("Read messages", messages), "• zcorpan: https:");
     }
 
     /// A turn card's title and per-call lines reflect the running/done state,
