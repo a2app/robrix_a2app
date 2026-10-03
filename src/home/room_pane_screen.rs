@@ -10,9 +10,10 @@ use crate::{
     profile::user_profile::UserProfileSlidingPaneWidgetExt,
     room::{
         room_members_list::{RoomMembersChanged, RoomMembersFetchAction, RoomMembersListAction, RoomMembersListWidgetRefExt, show_member_profile},
-        pane_dock::set_pane_header,
+        pane_dock::{SavedPaneContent, populate_content, restore_content, save_content, set_pane_header},
         pinned_messages_list::PinnedMessagesListWidgetRefExt,
-        room_pane::{RoomPaneKind, RoomPaneOp, RoomPaneRequest, mini_app_panes},
+        room_pane::{self, RoomPaneKind, RoomPaneOp, RoomPaneRequest, mini_app_panes},
+        threads_list::ThreadsListWidgetRefExt,
     },
     sliding_sync::{MatrixRequest, submit_async_request},
     utils::RoomNameId,
@@ -55,10 +56,11 @@ script_mod! {
             content := View {
                 width: Fill, height: Fill
                 flow: Down
-                padding: Inset{top: 8, right: 10, bottom: 8, left: 10}
+                padding: Inset{top: 8, right: 0, bottom: 8, left: 10}
                 room_members := mod.widgets.RoomMembersList { visible: false }
                 pinned_messages := mod.widgets.PinnedMessagesList { visible: false }
                 mini_app_host := mod.widgets.MiniAppHostArea { visible: false }
+                threads := mod.widgets.ThreadsList { visible: false }
             }
         }
 
@@ -98,6 +100,7 @@ pub struct RoomPaneScreen {
 
 impl Drop for RoomPaneScreen {
     fn drop(&mut self) {
+        self.save_popped_out_state();
         mini_app_panes::release_all_shown_by(self.widget_uid());
     }
 }
@@ -207,8 +210,6 @@ impl RoomPaneScreen {
     pub fn set_displayed(&mut self, cx: &mut Cx, room_name_id: &RoomNameId, kind: RoomPaneKind) -> bool {
         let is_same = self.displayed.as_ref()
             .is_some_and(|(r, k)| r.room_id() == room_name_id.room_id() && *k == kind);
-        let members = self.view.child_by_path(ids!(content.room_members)).as_room_members_list();
-        let pinned_messages = self.view.child_by_path(ids!(content.pinned_messages)).as_pinned_messages_list();
         if !is_same {
             self.hide_displayed(cx);
         }
@@ -216,29 +217,31 @@ impl RoomPaneScreen {
         self.view.label(cx, ids!(pane_room)).set_text(cx, &room_name_id.to_string());
         self.view.child_by_path(ids!(content.room_members)).set_visible(cx, kind == RoomPaneKind::Members);
         self.view.child_by_path(ids!(content.pinned_messages)).set_visible(cx, kind == RoomPaneKind::PinnedMessages);
+        self.view.child_by_path(ids!(content.threads)).set_visible(cx, kind == RoomPaneKind::Threads);
         let host_area = self.view.widget(cx, ids!(content.mini_app_host));
         host_area.set_visible(cx, matches!(kind, RoomPaneKind::MiniApp(_)));
         self.displayed = Some((room_name_id.clone(), kind.clone()));
-        match &kind {
-            // Also re-fetch upon re-showing, in case we missed changes while hidden.
-            RoomPaneKind::Members => {
-                members.set_members(cx, room_name_id, None);
-                self.fetch_members(false);
+        if let RoomPaneKind::MiniApp(app_id) = &kind {
+            // A vacated screen is about to close, so it must not take its app back.
+            let room_id = room_name_id.room_id();
+            if !self.is_vacated
+                && !mini_app_panes::is_shown_by(room_id, app_id, self.widget_uid())
+                && !mini_app_panes::attach(cx, &host_area, self.widget_uid(), room_id, app_id, None, false)
+            {
+                self.is_vacated = true;
+                cx.widget_action(self.widget_uid(), RoomPaneScreenAction::Closed { room_name_id: room_name_id.clone(), kind });
+                return false;
             }
-            RoomPaneKind::PinnedMessages => pinned_messages.set_room(cx, room_name_id),
-            RoomPaneKind::MiniApp(app_id) => {
-                // A vacated screen is about to close, so it must not take its app back.
-                let room_id = room_name_id.room_id();
-                if !self.is_vacated
-                    && !mini_app_panes::is_shown_by(room_id, app_id, self.widget_uid())
-                    && !mini_app_panes::attach(cx, &host_area, self.widget_uid(), room_id, app_id, None, false)
-                {
-                    self.is_vacated = true;
-                    cx.widget_action(self.widget_uid(), RoomPaneScreenAction::Closed { room_name_id: room_name_id.clone(), kind });
-                    return false;
-                }
+        } else {
+            // If we just popped out or hid a room pane, restore its previous state/content.
+            let frame = self.view.child_by_path(ids!(pane_screen_content));
+            match room_pane::take_popped_out_state(room_name_id.room_id(), &kind) {
+                Some(saved) => restore_content(cx, &frame, room_name_id, saved, &None),
+                None => populate_content(cx, &kind, &frame, room_name_id, &None),
             }
         }
+        // Also re-fetch members upon re-showing the pane, in case we missed some membership changes.
+        self.fetch_members(false);
         self.redraw(cx);
         true
     }
@@ -298,12 +301,32 @@ impl RoomPaneScreen {
         }
     }
 
-    /// Stops displaying this screen's pane. Its mini-app, if any, is parked.
+    /// Saves and returns the state of this displayed pane, which takes its data subscription with it.
+    fn save_state(&self) -> Option<SavedPaneContent> {
+        let (_, kind) = self.displayed.as_ref()?;
+        Some(save_content(kind, &self.view.child_by_path(ids!(pane_screen_content))))
+    }
+
+    /// Saves our displayed pane's state for the next time it's shown.
+    fn save_popped_out_state(&self) {
+        if self.is_vacated {
+            return;
+        }
+        if let Some((room_name_id, kind)) = self.displayed.as_ref()
+            && let Some(saved) = self.save_state()
+        {
+            room_pane::save_popped_out_state(room_name_id.room_id(), kind, saved);
+        }
+    }
+
+    /// Stops displaying this screen's pane, keeping its state in case it's shown again.
     pub fn hide_displayed(&mut self, cx: &mut Cx) {
+        self.save_popped_out_state();
         self.detach_mini_app(cx, false);
         self.view.user_profile_sliding_pane(cx, ids!(user_profile_sliding_pane)).reset(cx);
         self.view.child_by_path(ids!(content.room_members)).as_room_members_list().reset(cx);
         self.view.child_by_path(ids!(content.pinned_messages)).as_pinned_messages_list().reset(cx);
+        self.view.child_by_path(ids!(content.threads)).as_threads_list().reset(cx);
         self.displayed = None;
         self.is_vacated = false;
     }
@@ -339,5 +362,46 @@ impl RoomPaneScreenRef {
         if let Some(mut inner) = self.borrow_mut() {
             inner.hide_displayed(cx);
         }
+    }
+
+    /// Returns the state of this screen's pane, e.g., for docking it back into its timeline.
+    /// See [`RoomPaneScreen::save_state()`].
+    pub fn save_state(&self) -> Option<SavedPaneContent> {
+        self.borrow()?.save_state()
+    }
+
+    /// Returns the saved state only if this screen currently displays the requested pane.
+    pub fn save_state_for(&self, room_id: &ruma::RoomId, kind: &RoomPaneKind) -> Option<SavedPaneContent> {
+        let inner = self.borrow()?;
+        let (displayed_room, displayed_kind) = inner.displayed.as_ref()?;
+        if displayed_room.room_id() != room_id || displayed_kind != kind {
+            return None;
+        }
+        inner.save_state()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saving_requested_pane_ignores_a_different_room_or_kind() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            let pane_type = RoomPaneScreen::register_widget(vm);
+            let value = script_eval!(vm, { #(pane_type) {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let screen = widget.as_room_pane_screen();
+        let room = RoomNameId::empty("!pane-state:example.org".try_into().unwrap());
+        let other_room: ruma::OwnedRoomId = "!other-pane:example.org".try_into().unwrap();
+        assert!(screen.save_state_for(room.room_id(), &RoomPaneKind::PinnedMessages).is_none());
+        widget.borrow_mut::<RoomPaneScreen>().unwrap().displayed = Some((room.clone(), RoomPaneKind::Members));
+        assert!(screen.save_state_for(room.room_id(), &RoomPaneKind::PinnedMessages).is_none());
+        widget.borrow_mut::<RoomPaneScreen>().unwrap().displayed = Some((room.clone(), RoomPaneKind::PinnedMessages));
+        assert!(screen.save_state_for(&other_room, &RoomPaneKind::PinnedMessages).is_none());
+        assert!(matches!(screen.save_state_for(room.room_id(), &RoomPaneKind::PinnedMessages), Some(SavedPaneContent::PinnedMessages(_))));
     }
 }

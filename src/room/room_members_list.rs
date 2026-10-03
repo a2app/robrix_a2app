@@ -10,11 +10,11 @@ use makepad_widgets::*;
 use matrix_sdk::{room::{RoomMember, RoomMemberRole}, ruma::{OwnedRoomId, events::room::{member::MembershipState, power_levels::UserPowerLevel}}};
 
 use crate::{
-    avatar_cache,
     profile::{
         user_profile::{UserProfile, UserProfileAndRoomId, UserProfilePaneInfo, UserProfileSlidingPaneRef, member_display_name, role_name},
         user_profile_cache,
     },
+    room::pane_dock::FRAME_PADDING,
     shared::{avatar::AvatarWidgetRefExt, list_rows::{handle_row_actions, status_row}, room_filter_input_bar::RoomFilterInputBarWidgetRefExt},
     utils::RoomNameId,
 };
@@ -29,11 +29,13 @@ script_mod! {
         color_hover: (COLOR_LIST_ROW_HOVER)
 
         member_filter_bar := mod.widgets.RoomFilterInputBar {
+            margin: Inset{right: #(FRAME_PADDING)}
             input +: { text_input +: { empty_text: "Filter members..." } }
         }
 
         member_count_label := Label {
             width: Fill, height: Fit
+            margin: Inset{right: #(FRAME_PADDING)}
             padding: Inset{left: 4, right: 4}
             max_lines: 1, text_overflow: Ellipsis
             draw_text +: { color: #737373, text_style: REGULAR_TEXT {font_size: 8.5} }
@@ -43,6 +45,9 @@ script_mod! {
         members_list := PortalList {
             width: Fill, height: Fill
             flow: Down
+            // The list has the right padding instead of the pane, so its scroll bar sits at the pane's edge.
+            padding: Inset{right: #(FRAME_PADDING)}
+            scroll_bar: ListScrollBar {}
             auto_tail: false
             keep_invisible: false
 
@@ -138,11 +143,12 @@ fn role_text(member: &RoomMember) -> Cow<'static, str> {
     }
 }
 
-/// The state of a [`RoomMembersList`] that is saved and restored along with its room's timeline.
-#[derive(Clone, Default)]
+/// The state of a [`RoomMembersList`] that is saved and restored.
+#[derive(Default)]
 pub struct SavedRoomMembersList {
     filter_text: String,
     first_id_and_scroll: (usize, f64),
+    pub(super) members: Option<Arc<Vec<RoomMember>>>,
 }
 
 #[derive(Script, ScriptHook, Widget)]
@@ -168,8 +174,6 @@ pub struct RoomMembersList {
     #[rust] hover_colored: HashSet<usize>,
     /// The indices of the rows whose content is up to date, which needn't be set again when drawn.
     #[rust] populated_rows: HashSet<usize>,
-    /// Whether all avatars were fully drawn, i.e., none are still being fetched.
-    #[rust(true)] is_fully_drawn: bool,
 }
 
 impl Widget for RoomMembersList {
@@ -177,11 +181,6 @@ impl Widget for RoomMembersList {
         // A list that hasn't been given a room yet has nothing to do.
         if self.room_name_id.is_none() { return }
         self.view.handle_event(cx, event, scope);
-
-        if !self.is_fully_drawn && matches!(event, Event::Signal) {
-            avatar_cache::process_avatar_updates(cx);
-            self.redraw(cx);
-        }
 
         let Event::Actions(actions) = event else { return };
 
@@ -215,7 +214,6 @@ impl Widget for RoomMembersList {
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         let status = self.status();
-        let mut fully_drawn = true;
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             let list_ref = item.as_portal_list();
             let Some(mut list) = list_ref.borrow_mut() else { continue };
@@ -239,8 +237,6 @@ impl Widget for RoomMembersList {
                         let avatar_url = entry.member.avatar_url().map(|u| u.to_owned());
                         if row.avatar(cx, ids!(avatar)).show_user(cx, avatar_url.as_ref(), &entry.name) {
                             self.populated_rows.insert(index);
-                        } else {
-                            fully_drawn = false;
                         }
                     }
                     // Applying a color redraws the row, so only do so when its hover state changes.
@@ -255,7 +251,6 @@ impl Widget for RoomMembersList {
                 row.draw_all(cx, scope);
             }
         }
-        self.is_fully_drawn = fully_drawn;
         DrawStep::done()
     }
 }
@@ -357,6 +352,7 @@ impl RoomMembersListRef {
             filter_text: inner.filter_text.clone(),
             // Members may not have arrived to apply the last restored position to.
             first_id_and_scroll: inner.pending_scroll.unwrap_or((list.first_id(), list.scroll_position())),
+            members: inner.members.clone(),
         }
     }
 
@@ -369,6 +365,7 @@ impl RoomMembersListRef {
         inner.view.child_by_path(ids!(member_filter_bar)).as_room_filter_input_bar().set_text(cx, &saved.filter_text);
         inner.filter_text = saved.filter_text;
         inner.pending_scroll = Some(saved.first_id_and_scroll);
+        inner.set_members(cx, room_name_id, saved.members);
     }
 
     /// See [`RoomMembersList::set_members()`].

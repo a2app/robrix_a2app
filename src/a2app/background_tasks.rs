@@ -323,7 +323,7 @@ impl Widget for BackgroundTasks {
             self.view.check_box(cx, ids!(reviewed_version)).set_active(cx, false, Animate::No);
             self.update_form(cx);
         }
-        if let Some(index) = self.view.drop_down(cx, ids!(context_choice)).changed(actions) {
+        if let Some(index) = self.view.drop_down2(cx, ids!(context_choice)).changed(actions) {
             self.selected_context_id = index.checked_sub(1).and_then(|index| self.contexts.get(index)).map(|choice| choice.context.clone());
             self.update_form(cx);
         }
@@ -623,10 +623,10 @@ impl BackgroundTasks {
         if let Some(selected) = selected && !self.contexts.iter().any(|choice| &choice.context == selected) {
             self.contexts.push(ContextChoice { context: selected.clone(), label: format!("Unavailable: {}", self.context_label(selected)), available: false });
         }
-        self.view.drop_down(cx, ids!(context_choice)).set_labels(cx, std::iter::once("Choose where this task runs…".into()).chain(self.contexts.iter().map(|choice| choice.label.clone())).collect());
+        self.view.drop_down2(cx, ids!(context_choice)).set_labels(cx, std::iter::once("Choose where this task runs…".into()).chain(self.contexts.iter().map(|choice| choice.label.clone())).collect());
         let index = selected.and_then(|selected| self.contexts.iter().position(|choice| &choice.context == selected)).map(|index| index + 1)
             .unwrap_or_else(|| usize::from(self.contexts.len() == 1));
-        self.view.drop_down(cx, ids!(context_choice)).set_selected_item(cx, index);
+        self.view.drop_down2(cx, ids!(context_choice)).set_selected_item(cx, index);
         self.selected_context_id = index.checked_sub(1).and_then(|index| self.contexts.get(index)).map(|choice| choice.context.clone());
     }
 
@@ -937,8 +937,8 @@ mod tests {
         editor.contexts.push(ContextChoice { context: binding.context, label: "Room: Test".into(), available: true });
         editor.view.permission_choices(cx, ids!(app_choice)).set_labels(cx, vec!["Reminder".into()]);
         editor.view.permission_choices(cx, ids!(app_choice)).set_selected_item(cx, 0);
-        editor.view.drop_down(cx, ids!(context_choice)).set_labels(cx, vec!["Choose".into(), "Room: Test".into()]);
-        editor.view.drop_down(cx, ids!(context_choice)).set_selected_item(cx, 1);
+        editor.view.drop_down2(cx, ids!(context_choice)).set_labels(cx, vec!["Choose".into(), "Room: Test".into()]);
+        editor.view.drop_down2(cx, ids!(context_choice)).set_selected_item(cx, 1);
         editor.view.text_input(cx, ids!(interval_value)).set_text(cx, "5");
         editor.view.permission_choices(cx, ids!(interval_unit)).set_selected_item(cx, 1);
         editor.view.permission_choices(cx, ids!(schedule_choice)).set_selected_item(cx, 5);

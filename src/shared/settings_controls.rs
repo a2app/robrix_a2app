@@ -36,63 +36,61 @@ script_mod! {
         text_style_normal: MESSAGE_TEXT_STYLE { font_size: 11 },
     }
 
-    // A single item within a Robrix-styled settings DropDown popup menu.
-    mod.widgets.RobrixSettingsPopupMenuItem = PopupMenuItem {
-        width: Fill, height: Fit
-        align: Align{y: 0.5}
-        padding: Inset{top: 8, bottom: 8, left: 28, right: 14}
+    // A DropDown2 styled to match other Robrix settings controls.
+    mod.widgets.RobrixSettingsDropDown = DropDown2Flat {
+        width: 218, height: (mod.widgets.SETTINGS_BUTTON_HEIGHT),
+        padding: Inset{top: 8, bottom: 8, left: 12, right: 30}
+        margin: Inset{left: 5, top: 5, bottom: 5}
+        align: Align{x: 0.0, y: 0.5}
 
-        draw_text +: {
+        item_height: (mod.widgets.SETTINGS_BUTTON_HEIGHT),
+        item_padding: Inset{left: 28, right: 14}
+        popup_padding: 4,
+        popup_min_width: 260,
+
+        draw_popup_bg +: {
+            color: (COLOR_PRIMARY),
+            border_color: (COLOR_SECONDARY_DARKER),
+            border_size: 1.0,
+            border_radius: 4.0,
+        }
+
+        draw_item +: {
+            color: (COLOR_PRIMARY),
+            color_hover: (COLOR_BG_PREVIEW),
+            color_active: (COLOR_BG_PREVIEW),
+            mark_color: uniform(COLOR_ACTIVE_PRIMARY_DARKER),
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, 3.0)
+                sdf.fill(self.color.mix(self.color_active, self.active).mix(self.color_hover, self.hover))
+
+                // Keep the selected option marked while another row is hovered.
+                let c = vec2(12.0, self.rect_size.y * 0.5)
+                sdf.move_to(c.x - 3.0, c.y - 1.0)
+                sdf.line_to(c.x, c.y + 3.0)
+                sdf.line_to(c.x + 4.0, c.y - 3.0)
+                sdf.stroke(self.mark_color * self.active, 1.5)
+                return sdf.result
+            }
+        }
+
+        draw_item_text +: {
             color: (MESSAGE_TEXT_COLOR),
             color_hover: (MESSAGE_TEXT_COLOR),
             color_active: (COLOR_ACTIVE_PRIMARY_DARKER),
             text_style: SETTINGS_REGULAR_TEXT_STYLE {},
         }
 
-        draw_bg +: {
-            color: (COLOR_PRIMARY),
-            color_hover: (COLOR_BG_PREVIEW),
-            color_active: (COLOR_BG_PREVIEW),
-            border_color: vec4(0.0, 0.0, 0.0, 0.0),
-            border_color_hover: vec4(0.0, 0.0, 0.0, 0.0),
-            border_color_active: vec4(0.0, 0.0, 0.0, 0.0),
-            border_size: 0.0,
-            border_radius: 3.0,
-            mark_color: vec4(0.0, 0.0, 0.0, 0.0),
-            mark_color_active: (COLOR_ACTIVE_PRIMARY_DARKER),
+        draw_scroll_arrow +: {
+            color: (MESSAGE_TEXT_COLOR),
         }
-    }
-
-    // The popup list shown when a RobrixSettingsDropDown is opened.
-    mod.widgets.RobrixSettingsPopupMenu = PopupMenu {
-        width: 260, height: Fit
-        padding: 4,
-
-        menu_item: mod.widgets.RobrixSettingsPopupMenuItem{}
-
-        draw_bg +: {
-            color: (COLOR_PRIMARY),
-            border_color: (COLOR_SECONDARY_DARKER),
-            border_size: 1.0,
-            border_radius: 4.0,
-        }
-    }
-
-    // A DropDown styled to match other Robrix settings controls.
-    mod.widgets.RobrixSettingsDropDown = DropDownFlat {
-        width: 218, height: (mod.widgets.SETTINGS_BUTTON_HEIGHT),
-        padding: Inset{top: 8, bottom: 8, left: 12, right: 30}
-        margin: Inset{left: 5, top: 5, bottom: 5}
-        align: Align{x: 0.0, y: 0.5}
-
-        popup_menu: mod.widgets.RobrixSettingsPopupMenu {}
 
         draw_text +: {
             color: (MESSAGE_TEXT_COLOR),
             color_hover: (MESSAGE_TEXT_COLOR),
             color_focus: (MESSAGE_TEXT_COLOR),
             color_down: (MESSAGE_TEXT_COLOR),
-            color_disabled: (COLOR_FG_DISABLED),
             text_style: SETTINGS_REGULAR_TEXT_STYLE {},
         }
 
@@ -105,16 +103,16 @@ script_mod! {
             border_color_hover: (COLOR_ACTIVE_PRIMARY),
             border_color_focus: (COLOR_ACTIVE_PRIMARY_DARKER),
             border_color_down: (COLOR_ACTIVE_PRIMARY_DARKER),
+            border_color_disabled: uniform(COLOR_SECONDARY_DARKER),
             border_size: 1.0,
             border_radius: 4.0,
             arrow_color: (MESSAGE_TEXT_COLOR),
             arrow_color_hover: (COLOR_ACTIVE_PRIMARY_DARKER),
-            arrow_color_focus: (COLOR_ACTIVE_PRIMARY_DARKER),
-            arrow_color_down: (COLOR_ACTIVE_PRIMARY_DARKER),
+            arrow_color_focus: uniform(COLOR_ACTIVE_PRIMARY_DARKER),
+            arrow_color_down: uniform(COLOR_ACTIVE_PRIMARY_DARKER),
+            arrow_color_disabled: uniform(COLOR_SECONDARY_DARKER),
 
-            // The base DropDownFlat shader draws the arrow BEFORE the box,
-            // so the box fill paints over it. Override to draw the rounded
-            // rect first and then the arrow on top.
+            // Match the arrow size and state colors of the other settings controls.
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
 

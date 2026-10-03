@@ -1406,7 +1406,7 @@ fn open_in_room_pane(cx: &mut Cx, app_id: MiniAppId, room_id: OwnedRoomId) {
     }
     room_pane::request(cx, room_id.clone(), kind.clone(), RoomPaneOp::Open);
     // If no dock is showing the room, a running app would otherwise only show as a chip there.
-    room_pane::dock_when_shown(cx, crate::sliding_sync::TimelineKind::MainRoom { room_id }, kind);
+    room_pane::dock_when_shown(cx, crate::sliding_sync::TimelineKind::MainRoom { room_id }, kind, None);
 }
 
 /// Invalidate queued watch events when the OS suspends the app.

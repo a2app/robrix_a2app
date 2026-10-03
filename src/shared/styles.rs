@@ -159,6 +159,11 @@ script_mod! {
     // What a rooms list entry or timeline message darkens to on hover or press.
     mod.widgets.COLOR_LIST_ITEM_BG_HOVER = #f4f4f4
 
+    // Every scroll bar uses this styling.
+    mod.widgets.ScrollBar.draw_bg.color = #00000040
+    mod.widgets.ScrollBar.draw_bg.color_hover = #00000060
+    mod.widgets.ScrollBar.draw_bg.color_drag = #00000080
+
     mod.widgets.COLOR_ACTIVE_PRIMARY = #0f88fe
 
     mod.widgets.COLOR_ACTIVE_PRIMARY_DARKER = #106fcc
@@ -170,7 +175,19 @@ script_mod! {
     mod.widgets.COLOR_BG_LAVENDER_HOVER = #xE8E1FA
     mod.widgets.COLOR_BG_LAVENDER_DOWN = #xE1D7F7
 
+    // The darker lavender of an "active"/selected room action button,
+    // a button whose corresponding room pane is currently shown.
+    mod.widgets.COLOR_BG_LAVENDER_SELECTED = #x7C5BD7
+    mod.widgets.COLOR_BG_LAVENDER_SELECTED_HOVER = #x7451D5
+    mod.widgets.COLOR_BG_LAVENDER_SELECTED_DOWN = #x6B46D2
+
     mod.widgets.COLOR_BG_PREVIEW_HOVER = #CDEDDF
+
+    // A thread's summary beneath its root message, whose reply count color the threads list uses too.
+    mod.widgets.COLOR_THREAD_SUMMARY_BG = #FFF4E5
+    mod.widgets.COLOR_THREAD_SUMMARY_BG_HOVER = #FFEACC
+    mod.widgets.COLOR_THREAD_SUMMARY_BORDER = #E8C99A
+    mod.widgets.COLOR_THREAD_SUMMARY_REPLY_COUNT = #A35A00
 
     mod.widgets.COLOR_AVATAR_BG = #52b2ac
 
@@ -227,6 +244,12 @@ script_mod! {
     }
 
 
+    // The scroll bar used by all lists (like portallists).
+    mod.widgets.ListScrollBar = ScrollBar { bar_size: 9 }
+
+    // Set the position for scroll bars in the multiline text input
+    mod.widgets.TEXT_INPUT_SCROLL_BAR_INSET = Inset{top: 3, right: 3, bottom: 3}
+
     // A text input widget styled for Robrix.
     mod.widgets.RobrixTextInput = TextInput {
         width: Fill, height: Fit
@@ -234,15 +257,7 @@ script_mod! {
         align: Align{y: 0.5}
         margin: 0,
         padding: 10,
-
-        // For multiline text inputs, we want to show a light-colored scroll bar.
-        scroll_bar +: {
-            draw_bg +: {
-                color: #00000040
-                color_hover: #00000060
-                color_drag: #00000080
-            }
-        }
+        scroll_bar_inset: (mod.widgets.TEXT_INPUT_SCROLL_BAR_INSET)
 
         draw_bg +: {
             border_radius: 4.0 // was previously 2.0
@@ -405,6 +420,8 @@ pub const COLOR_TEXT_WARNING_NOT_FOUND: Vec4 = vec4(0.584, 0.219, 0.0, 1.0);
 pub const COLOR_BG_PREVIEW:            Vec4 = vec4(0.941, 0.961, 1.0, 1.0);
 /// #CDEDDF
 pub const COLOR_BG_PREVIEW_HOVER:      Vec4 = vec4(0.804, 0.929, 0.875, 1.0);
+/// The same as `SMALL_STATE_TEXT_COLOR` in the DSL above: #888888
+pub const SMALL_STATE_TEXT_COLOR:      Vec4 = vec4(0.533, 0.533, 0.533, 1.0);
 
 /// Applies positive (green) button styling to the given button.
 pub fn apply_positive_button_style(cx: &mut Cx, button: &mut ButtonRef) {

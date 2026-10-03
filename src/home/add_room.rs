@@ -151,6 +151,8 @@ script_mod! {
         }
 
         error_view := View {
+            width: Fill
+            height: Fit
             padding: 10
             error_text := Label {
                 width: Fill, height: Fit

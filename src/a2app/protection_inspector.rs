@@ -203,21 +203,21 @@ impl Widget for ProtectionInspector {
         if self.view.button(cx, ids!(refresh)).clicked(actions) {
             self.configure(cx);
             return;
-        } else if let Some(index) = self.view.drop_down(cx, ids!(target)).changed(actions) {
+        } else if let Some(index) = self.view.drop_down2(cx, ids!(target)).changed(actions) {
             self.selected_target_id = index.checked_sub(1).and_then(|index| self.targets.get(index)).map(|target| target.0.clone());
             self.choosing_target = false;
             self.showing_retained = false;
             self.update_details(cx);
             self.reset_scroll(cx);
             return;
-        } else if let Some(index) = self.view.drop_down(cx, ids!(subject)).changed(actions) {
+        } else if let Some(index) = self.view.drop_down2(cx, ids!(subject)).changed(actions) {
             self.selected_subject_choice = index.checked_sub(1).and_then(|index| self.subjects.get(index)).cloned();
             self.choosing_subject = false;
             self.showing_context = false;
             self.update_details(cx);
             self.reset_scroll(cx);
             return;
-        } else if self.view.drop_down(cx, ids!(capability)).changed(actions).is_some() {
+        } else if self.view.drop_down2(cx, ids!(capability)).changed(actions).is_some() {
             self.update_details(cx);
             return;
         }
@@ -364,8 +364,8 @@ impl ProtectionInspector {
         let mut target_labels = vec!["Choose a room or space…".into()];
         target_labels.extend(self.targets.iter().map(|(_, name, space)|
             format!("{}: {name}", if *space { "Space" } else { "Room" })));
-        self.view.drop_down(cx, ids!(target)).set_labels(cx, target_labels);
-        self.view.drop_down(cx, ids!(target)).set_selected_item(cx,
+        self.view.drop_down2(cx, ids!(target)).set_labels(cx, target_labels);
+        self.view.drop_down2(cx, ids!(target)).set_selected_item(cx,
             self.targets.iter().position(|target| Some(&target.0) == self.selected_target_id.as_ref()).map(|index| index + 1).unwrap_or(0));
 
         self.subjects = self.snapshots.iter().map(|snapshot| {
@@ -397,15 +397,15 @@ impl ProtectionInspector {
                 None => app_name(&subject.subject),
             }
         }));
-        self.view.drop_down(cx, ids!(subject)).set_labels(cx, subject_labels);
+        self.view.drop_down2(cx, ids!(subject)).set_labels(cx, subject_labels);
         self.selected_subject_choice = previous_subject.and_then(|previous| self.subjects.iter().find(|subject|
             subject.subject == previous.subject && subject.context == previous.context).cloned());
-        self.view.drop_down(cx, ids!(subject)).set_selected_item(cx,
+        self.view.drop_down2(cx, ids!(subject)).set_selected_item(cx,
             self.subjects.iter().position(|subject| self.selected_subject_choice.as_ref() == Some(subject)).map(|index| index + 1).unwrap_or(0));
-        let previous_capability = if self.configured { self.view.drop_down(cx, ids!(capability)).selected_item() }
+        let previous_capability = if self.configured { self.view.drop_down2(cx, ids!(capability)).selected_item() }
             else { capabilities::CATALOG.iter().position(|cap| cap.id == "matrix.rooms.messages.read").unwrap_or(0) };
-        self.view.drop_down(cx, ids!(capability)).set_labels(cx, capabilities::CATALOG.iter().map(|cap| cap.title.to_string()).collect());
-        self.view.drop_down(cx, ids!(capability)).set_selected_item(cx, previous_capability);
+        self.view.drop_down2(cx, ids!(capability)).set_labels(cx, capabilities::CATALOG.iter().map(|cap| cap.title.to_string()).collect());
+        self.view.drop_down2(cx, ids!(capability)).set_selected_item(cx, previous_capability);
         self.configured = true;
         self.view.label(cx, ids!(snapshot_status)).set_text(cx, "Checked just now. Refresh after changing settings or running an app.");
         self.update_details(cx);
@@ -440,7 +440,7 @@ impl ProtectionInspector {
         self.capability_control = None;
         let target = self.selected_target(cx).cloned();
         let subject = self.selected_subject(cx).cloned();
-        let cap = capabilities::CATALOG.get(self.view.drop_down(cx, ids!(capability)).selected_item());
+        let cap = capabilities::CATALOG.get(self.view.drop_down2(cx, ids!(capability)).selected_item());
         let details = target.as_ref().and_then(|(room, _, space)| with_a2app(|state| {
             let read = explain_room_rules(&state.permissions, RoomAccess::Read, room, *space, |id| self.room_label(id));
             let write = explain_room_rules(&state.permissions, RoomAccess::Write, room, *space, |id| self.room_label(id));
@@ -468,7 +468,7 @@ impl ProtectionInspector {
             format!("{}: {name}", if *space { "Space" } else { "Room" })).unwrap_or_default());
         self.view.label(cx, ids!(target_details)).set_text(cx, target_hint);
         self.view.label(cx, ids!(subject_title)).set_text(cx,
-            &self.view.drop_down(cx, ids!(subject)).borrow().map(|choice| choice.selected_item_label()).unwrap_or_default());
+            &self.view.drop_down2(cx, ids!(subject)).selected_label());
         let context_text = subject.as_ref().map(|subject| {
             let activity = if subject.active { "Running when last checked." } else { "Not running when last checked. Starting it again requires fresh session and data-sharing checks." };
             let clearance = if matches!(subject.context, Some(ContextId::PublicApp { .. })) {
@@ -721,8 +721,8 @@ mod tests {
         editor.update_page(&mut cx);
         assert!(editor.view.widget(&cx, ids!(target_picker)).visible());
         assert!(!editor.view.widget(&cx, ids!(room_page)).visible());
-        let uid = editor.view.drop_down(&cx, ids!(target)).widget_uid();
-        let actions = cx.capture_actions(|cx| cx.widget_action(uid, DropDownAction::Select(1)));
+        let uid = editor.view.drop_down2(&cx, ids!(target)).widget_uid();
+        let actions = cx.capture_actions(|cx| cx.widget_action(uid, DropDown2Action::Select(1)));
         editor.handle_event(&mut cx, &Event::Actions(actions), &mut Scope::empty());
         assert!(!editor.view.widget(&cx, ids!(target_picker)).visible());
         assert!(editor.view.widget(&cx, ids!(room_page)).visible());
@@ -743,8 +743,8 @@ mod tests {
         assert!(editor.view.widget(&cx, ids!(subject_page)).visible());
         assert!(editor.view.widget(&cx, ids!(subject_picker)).visible());
         assert!(!editor.view.widget(&cx, ids!(subject_check)).visible());
-        let uid = editor.view.drop_down(&cx, ids!(subject)).widget_uid();
-        let actions = cx.capture_actions(|cx| cx.widget_action(uid, DropDownAction::Select(1)));
+        let uid = editor.view.drop_down2(&cx, ids!(subject)).widget_uid();
+        let actions = cx.capture_actions(|cx| cx.widget_action(uid, DropDown2Action::Select(1)));
         editor.handle_event(&mut cx, &Event::Actions(actions), &mut Scope::empty());
         assert!(!editor.view.widget(&cx, ids!(subject_picker)).visible());
         assert!(editor.view.widget(&cx, ids!(subject_check)).visible());

@@ -96,7 +96,7 @@ fn exact_review_exposes_direction_controls_without_confusing_literal_escapes() {
 
 impl DataSharing {
     fn selected_context(&self, cx: &Cx) -> Result<&ContextId, String> {
-        self.view.drop_down(cx, ids!(context_choice)).selected_item().checked_sub(1)
+        self.view.drop_down2(cx, ids!(context_choice)).selected_item().checked_sub(1)
             .and_then(|index| self.snapshots.get(index))
             .map(|snapshot| &snapshot.context).ok_or_else(|| "Choose the mini-app or agent that may share this data.".into())
     }
@@ -114,7 +114,7 @@ impl DataSharing {
     pub(super) fn selected_reader(&self, cx: &Cx) -> Result<ReaderScope, String> {
         match self.view.permission_choices(cx, ids!(reader_kind)).selected_item() {
             0 => Ok(ReaderScope::Context(self.selected_context(cx)?.clone())),
-            1 => self.apps.get(self.view.drop_down(cx, ids!(reader_app)).selected_item())
+            1 => self.apps.get(self.view.drop_down2(cx, ids!(reader_app)).selected_item())
                 .map(|(app, _)| ReaderScope::App { account: self.account.clone(), app: app.clone() })
                 .ok_or_else(|| "Select an installed mini-app.".into()),
             2 if !self.account.is_empty() => Ok(ReaderScope::AllReaders),
@@ -125,7 +125,7 @@ impl DataSharing {
     fn selected_duration(&self, cx: &Cx) -> Result<SharingDuration, String> {
         match self.view.permission_choices(cx, ids!(sharing_lifetime)).selected_item() {
             0 => Ok(SharingDuration::RobrixSession),
-            1 => self.rooms.get(self.view.drop_down(cx, ids!(lifetime_room)).selected_item())
+            1 => self.rooms.get(self.view.drop_down2(cx, ids!(lifetime_room)).selected_item())
                 .map(|(room, _)| SharingDuration::RoomSession { account: self.account.clone(), room: room.clone() })
                 .ok_or_else(|| "Select the room whose close will end this rule.".into()),
             2 => Ok(SharingDuration::Permanent),
@@ -181,10 +181,10 @@ impl DataSharing {
         if self.snapshots != snapshots {
             let labels = std::iter::once("Choose a mini-app or agent".into())
                 .chain(snapshots.iter().map(|snapshot| format!("{}{}", self.context_choice_label(&snapshot.context), if snapshot.epoch == 0 { " (stopped)" } else { "" }))).collect();
-            self.view.drop_down(cx, ids!(context_choice)).set_labels(cx, labels);
+            self.view.drop_down2(cx, ids!(context_choice)).set_labels(cx, labels);
             let index = previous.as_ref().and_then(|context| snapshots.iter().position(|snapshot| &snapshot.context == context)).map(|index| index + 1).unwrap_or(0);
             self.snapshots = snapshots;
-            self.view.drop_down(cx, ids!(context_choice)).set_selected_item(cx, index);
+            self.view.drop_down2(cx, ids!(context_choice)).set_selected_item(cx, index);
         }
         let decisions = unresolved_sharing_decisions(flow::recent_decisions().unwrap_or_default(), &self.account);
         if self.decisions != decisions {
@@ -317,12 +317,12 @@ impl DataSharing {
         let index = if let Some(index) = self.sources.iter().position(|(candidate, _)| candidate == &source) { index }
         else {
             self.sources.push((source.clone(), self.source_label(&source)));
-            self.view.drop_down(cx, ids!(source_choice)).set_labels(cx, self.sources.iter().map(|(source, _)| self.source_choice_label(source)).collect());
+            self.view.drop_down2(cx, ids!(source_choice)).set_labels(cx, self.sources.iter().map(|(source, _)| self.source_choice_label(source)).collect());
             self.sources.len() - 1
         };
-        self.view.drop_down(cx, ids!(source_choice)).set_selected_item(cx, index);
+        self.view.drop_down2(cx, ids!(source_choice)).set_selected_item(cx, index);
         if let Some(index) = self.snapshots.iter().position(|snapshot| snapshot.context == decision.context) {
-            self.view.drop_down(cx, ids!(context_choice)).set_selected_item(cx, index + 1);
+            self.view.drop_down2(cx, ids!(context_choice)).set_selected_item(cx, index + 1);
         } else { return Err("This mini-app or agent's saved data is no longer available. Run it again, then review its new request.".into()); }
         self.view.permission_choices(cx, ids!(reader_kind)).set_selected_item(cx, 0);
         self.view.permission_choices(cx, ids!(sharing_lifetime)).set_selected_item(cx, 0);
@@ -339,7 +339,7 @@ impl DataSharing {
                 if account != &self.account { return Err("The recipient belongs to a different account.".into()); }
                 let index = self.rooms.iter().position(|(id, _)| id == room).ok_or("The destination room is no longer joined.")?;
                 self.view.permission_choices(cx, ids!(recipient_kind)).set_selected_item(cx, 2);
-                self.view.drop_down(cx, ids!(target_room)).set_selected_item(cx, index);
+                self.view.drop_down2(cx, ids!(target_room)).set_selected_item(cx, index);
             }
             Recipient::External => return Err("Unrestricted external sharing cannot be approved here.".into()),
             Recipient::Clipboard => self.view.permission_choices(cx, ids!(recipient_kind)).set_selected_item(cx, 3),

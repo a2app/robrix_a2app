@@ -365,11 +365,11 @@ impl Widget for DataSharing {
             self.activity_selection = None;
             self.history_limit = 20;
         }
-        if self.view.drop_down(cx, ids!(source_choice)).changed(actions).is_some()
-            || self.view.drop_down(cx, ids!(context_choice)).changed(actions).is_some()
-            || self.view.drop_down(cx, ids!(reader_app)).changed(actions).is_some()
-            || self.view.drop_down(cx, ids!(target_room)).changed(actions).is_some()
-            || self.view.drop_down(cx, ids!(lifetime_room)).changed(actions).is_some()
+        if self.view.drop_down2(cx, ids!(source_choice)).changed(actions).is_some()
+            || self.view.drop_down2(cx, ids!(context_choice)).changed(actions).is_some()
+            || self.view.drop_down2(cx, ids!(reader_app)).changed(actions).is_some()
+            || self.view.drop_down2(cx, ids!(target_room)).changed(actions).is_some()
+            || self.view.drop_down2(cx, ids!(lifetime_room)).changed(actions).is_some()
             || self.view.text_input(cx, ids!(network_url)).changed(actions).is_some()
             || self.view.permission_choices(cx, ids!(reader_kind)).changed(actions).is_some()
             || self.view.permission_choices(cx, ids!(recipient_kind)).changed(actions).is_some()
@@ -665,9 +665,9 @@ impl DataSharing {
         self.activity_key = None;
         self.view.permission_choices(cx, ids!(action_session)).set_selected_item(cx, 0);
         let previous_source = self.selected_source(cx).ok();
-        let previous_app = self.apps.get(self.view.drop_down(cx, ids!(reader_app)).selected_item()).map(|(id, _)| id.clone());
-        let previous_target = self.rooms.get(self.view.drop_down(cx, ids!(target_room)).selected_item()).map(|(id, _)| id.clone());
-        let previous_expiry = self.rooms.get(self.view.drop_down(cx, ids!(lifetime_room)).selected_item()).map(|(id, _)| id.clone());
+        let previous_app = self.apps.get(self.view.drop_down2(cx, ids!(reader_app)).selected_item()).map(|(id, _)| id.clone());
+        let previous_target = self.rooms.get(self.view.drop_down2(cx, ids!(target_room)).selected_item()).map(|(id, _)| id.clone());
+        let previous_expiry = self.rooms.get(self.view.drop_down2(cx, ids!(lifetime_room)).selected_item()).map(|(id, _)| id.clone());
         let account = super::information_flow::account().unwrap_or_default();
         let account_changed = self.account != account;
         self.account = account;
@@ -692,11 +692,11 @@ impl DataSharing {
                 .filter(|(_, _, space)| !space).map(|(id, name, _)| (id, name)).collect()
         } else { Vec::new() };
         self.apps = with_a2app(|state| state.registry.iter().map(|app| (app.id.clone(), app.name.clone())).collect()).unwrap_or_default();
-        self.view.drop_down(cx, ids!(reader_app)).set_labels(cx, self.apps.iter().map(|(_, name)| name.clone()).collect());
-        self.view.drop_down(cx, ids!(reader_app)).set_selected_item(cx,
+        self.view.drop_down2(cx, ids!(reader_app)).set_labels(cx, self.apps.iter().map(|(_, name)| name.clone()).collect());
+        self.view.drop_down2(cx, ids!(reader_app)).set_selected_item(cx,
             previous_app.filter(|_| !account_changed).and_then(|app| self.apps.iter().position(|(id, _)| id == &app)).unwrap_or(0));
-        self.view.drop_down(cx, ids!(lifetime_room)).set_labels(cx, self.rooms.iter().map(|(_, name)| name.clone()).collect());
-        self.view.drop_down(cx, ids!(lifetime_room)).set_selected_item(cx,
+        self.view.drop_down2(cx, ids!(lifetime_room)).set_labels(cx, self.rooms.iter().map(|(_, name)| name.clone()).collect());
+        self.view.drop_down2(cx, ids!(lifetime_room)).set_selected_item(cx,
             previous_expiry.filter(|_| !account_changed).and_then(|room| self.rooms.iter().position(|(id, _)| id == &room)).unwrap_or(0));
         self.sources.clear();
         if !self.account.is_empty() {
@@ -715,11 +715,11 @@ impl DataSharing {
                 }
             }
         }
-        self.view.drop_down(cx, ids!(source_choice)).set_labels(cx, self.sources.iter().map(|(source, _)| self.source_choice_label(source)).collect());
-        self.view.drop_down(cx, ids!(source_choice)).set_selected_item(cx,
+        self.view.drop_down2(cx, ids!(source_choice)).set_labels(cx, self.sources.iter().map(|(source, _)| self.source_choice_label(source)).collect());
+        self.view.drop_down2(cx, ids!(source_choice)).set_selected_item(cx,
             previous_source.filter(|_| !account_changed).and_then(|source| self.sources.iter().position(|(candidate, _)| candidate == &source)).unwrap_or(0));
-        self.view.drop_down(cx, ids!(target_room)).set_labels(cx, self.rooms.iter().map(|(_, name)| name.clone()).collect());
-        self.view.drop_down(cx, ids!(target_room)).set_selected_item(cx,
+        self.view.drop_down2(cx, ids!(target_room)).set_labels(cx, self.rooms.iter().map(|(_, name)| name.clone()).collect());
+        self.view.drop_down2(cx, ids!(target_room)).set_selected_item(cx,
             previous_target.filter(|_| !account_changed).and_then(|room| self.rooms.iter().position(|(id, _)| id == &room)).unwrap_or(0));
         let prefs = with_a2app(|state| state.agent_prefs.clone()).unwrap_or_else(a2app_agent::prefs::load_agent_prefs);
         match a2app_agent::model_transport::current_recipient(&prefs) {
@@ -741,7 +741,7 @@ impl DataSharing {
     }
 
     fn selected_source(&self, cx: &Cx) -> Result<Source, String> {
-        self.sources.get(self.view.drop_down(cx, ids!(source_choice)).selected_item())
+        self.sources.get(self.view.drop_down2(cx, ids!(source_choice)).selected_item())
             .map(|(source, _)| source.clone()).ok_or_else(|| "Sign in and select a data source.".into())
     }
 
@@ -750,7 +750,7 @@ impl DataSharing {
             0 => self.model.as_ref().map(|model| Recipient::ModelProvider(model.id.clone()))
                 .ok_or_else(|| "Configure a supported AI model service first.".into()),
             1 => Recipient::network_origin(self.view.text_input(cx, ids!(network_url)).text().trim()),
-            2 => self.rooms.get(self.view.drop_down(cx, ids!(target_room)).selected_item())
+            2 => self.rooms.get(self.view.drop_down2(cx, ids!(target_room)).selected_item())
                 .map(|(room, _)| Recipient::MatrixRoom { account: self.account.clone(), room: room.clone() })
                 .ok_or_else(|| "Select a joined destination room.".into()),
             3 => Ok(Recipient::Clipboard),
@@ -1064,8 +1064,8 @@ mod tests {
         editor.sources.push((source.clone(), "Private room".into()));
         editor.rooms.push(("!source:example.org".into(), "Private room".into()));
         editor.snapshots.push(snapshot.clone());
-        editor.view.drop_down(&cx, ids!(context_choice)).set_labels(&mut cx, vec!["Choose an app".into(), "This agent".into()]);
-        editor.view.drop_down(&cx, ids!(context_choice)).set_selected_item(&mut cx, 1);
+        editor.view.drop_down2(&cx, ids!(context_choice)).set_labels(&mut cx, vec!["Choose an app".into(), "This agent".into()]);
+        editor.view.drop_down2(&cx, ids!(context_choice)).set_selected_item(&mut cx, 1);
         editor.view.permission_choices(&cx, ids!(reader_kind)).set_selected_item(&mut cx, 2);
         editor.view.permission_choices(&cx, ids!(sharing_lifetime)).set_selected_item(&mut cx, 2);
         editor.begin_rule(&mut cx);
@@ -1128,8 +1128,8 @@ mod tests {
         let source = snapshot.label.first().unwrap().clone();
         editor.sources.push((source.clone(), "Source".into()));
         editor.snapshots.push(snapshot.clone());
-        editor.view.drop_down(&cx, ids!(context_choice)).set_labels(&mut cx, vec!["Select context".into(), "Fixture context".into()]);
-        editor.view.drop_down(&cx, ids!(context_choice)).set_selected_item(&mut cx, 1);
+        editor.view.drop_down2(&cx, ids!(context_choice)).set_labels(&mut cx, vec!["Select context".into(), "Fixture context".into()]);
+        editor.view.drop_down2(&cx, ids!(context_choice)).set_selected_item(&mut cx, 1);
         editor.apps.push(("weather".into(), "Weather".into()));
         editor.rooms.push(("!expiry:example.org".into(), "Expiry".into()));
         editor.rooms.push(("!source:example.org".into(), "Private room".into()));
@@ -1179,8 +1179,8 @@ mod tests {
         let snapshot = context_fixture();
         let action = flow::SensitiveAction { kind: "network.POST".into(), target: "https://example.org".into() };
         editor.snapshots.push(snapshot.clone());
-        editor.view.drop_down(&cx, ids!(context_choice)).set_labels(&mut cx, vec!["Select context".into(), "Fixture context".into()]);
-        editor.view.drop_down(&cx, ids!(context_choice)).set_selected_item(&mut cx, 1);
+        editor.view.drop_down2(&cx, ids!(context_choice)).set_labels(&mut cx, vec!["Select context".into(), "Fixture context".into()]);
+        editor.view.drop_down2(&cx, ids!(context_choice)).set_selected_item(&mut cx, 1);
         editor.action_decisions.push(ActionDecision {
             context: snapshot.context.clone(), epoch: snapshot.epoch, action: action.clone(), influences: snapshot.influences.clone(), allowed: false,
             request: None,
@@ -1212,8 +1212,8 @@ mod tests {
         editor.account = "@alice:example.org".into();
         let snapshot = context_fixture();
         editor.snapshots.push(snapshot.clone());
-        editor.view.drop_down(&cx, ids!(context_choice)).set_labels(&mut cx, vec!["Select context".into(), "Fixture context".into()]);
-        editor.view.drop_down(&cx, ids!(context_choice)).set_selected_item(&mut cx, 1);
+        editor.view.drop_down2(&cx, ids!(context_choice)).set_labels(&mut cx, vec!["Select context".into(), "Fixture context".into()]);
+        editor.view.drop_down2(&cx, ids!(context_choice)).set_selected_item(&mut cx, 1);
         let source = snapshot.label.first().unwrap().clone();
         editor.decisions.push(FlowDecision {
             context: snapshot.context.clone(), epoch: snapshot.epoch, recipient: Recipient::NetworkOrigin("https://blocked.example:8443".into()),
@@ -1253,7 +1253,7 @@ mod tests {
             });
             snapshot.epoch = epoch;
             editor.snapshots.push(snapshot);
-            editor.view.drop_down(&cx, ids!(context_choice)).set_labels(&mut cx, vec!["Select context".into(), "Fixture context".into()]);
+            editor.view.drop_down2(&cx, ids!(context_choice)).set_labels(&mut cx, vec!["Select context".into(), "Fixture context".into()]);
             editor.decision_selection = 1;
             editor.update_diagnostic_details(&mut cx);
             assert!(!editor.view.widget(&cx, ids!(review_button)).disabled(&cx));

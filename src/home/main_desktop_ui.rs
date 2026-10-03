@@ -207,6 +207,10 @@ impl MainDesktopUI {
     fn focus_or_create_tab(&mut self, cx: &mut Cx, room: SelectedRoom) {
         // Do nothing if the room to select is already created and focused.
         if self.most_recently_selected_room.as_ref().is_some_and(|sr| sr == &room) {
+            if matches!(room, SelectedRoom::RoomPane { .. }) {
+                // A pane that was popped out into a focused dock tab needs to be initialized.
+                self.init_tab_if_needed(cx, room.tab_id());
+            }
             return;
         }
 
@@ -293,8 +297,8 @@ impl MainDesktopUI {
             self.init_all_visible_tabs(cx);
             return;
         };
-        // If we're closing a thread timeline, free up its resources & bkgd async tasks.
-        room_being_closed.close_thread_timeline(cx);
+        // Free up this screen's cached pane data or thread timeline and its background tasks.
+        room_being_closed.drop_resources(cx);
         Self::close_pane_content(cx, &dock.item(tab_id), &room_being_closed);
         self.room_order.retain(|sr| sr != &room_being_closed);
 
@@ -340,7 +344,7 @@ impl MainDesktopUI {
         for (tab_id, room) in self.open_rooms.iter() {
             #[cfg(feature = "a2app")]
             crate::a2app::runtime::on_room_closed(cx, room.room_id());
-            room.close_thread_timeline(cx);
+            room.drop_resources(cx);
             Self::close_pane_content(cx, &dock.item(*tab_id), room);
             dock.close_tab(cx, *tab_id);
         }
@@ -771,9 +775,11 @@ impl WidgetMatchEvent for MainDesktopUI {
                 let timeline_kind = room_pane::popped_out_from(room_name_id.room_id(), &kind);
                 let pane_tab_id = SelectedRoom::RoomPane { room_name_id: room_name_id.clone(), kind: kind.clone() }.tab_id();
                 let screen = room_pane::timeline_screen(&room_name_id, &timeline_kind);
+                let pane_screen = self.view.dock(cx, ids!(dock)).item(pane_tab_id).as_room_pane_screen();
+                let saved = pane_screen.save_state();
                 // Let go of the pane's content first, as the room's screen may dock it right away.
-                self.view.dock(cx, ids!(dock)).item(pane_tab_id).as_room_pane_screen().vacate(cx);
-                room_pane::dock_when_shown(cx, timeline_kind, kind);
+                pane_screen.vacate(cx);
+                room_pane::dock_when_shown(cx, timeline_kind, kind, saved);
                 // Use the room's existing tab, which has the room's current name.
                 let screen = self.open_rooms.get(&screen.tab_id()).cloned().unwrap_or(screen);
                 self.focus_or_create_tab(cx, screen);

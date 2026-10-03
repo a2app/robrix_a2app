@@ -4,7 +4,7 @@ use makepad_widgets::*;
 
 use crate::{
     app::AppState,
-    settings::app_preferences::{AppPreferences, AppPreferencesAction, AppPreferencesGlobal, MarkAsReadBehavior, ReadReceiptsPrivacy, ThumbnailMaxHeight, UiZoom, ViewModeOverride},
+    settings::{is_settings_screen_shown, app_preferences::{AppPreferences, AppPreferencesAction, AppPreferencesGlobal, MarkAsReadBehavior, ReadReceiptsPrivacy, ThumbnailMaxHeight, UiZoom, ViewModeOverride}},
     shared::popup_list::{enqueue_popup_notification, PopupKind},
 };
 
@@ -197,6 +197,8 @@ script_mod! {
                     autocapitalize: None,
                     autocorrect: Disabled,
                     is_read_only: true
+                    // Starts out disabled because it's read-only by default.
+                    animator +: { disabled: { default: @on } }
                 }
 
                 Label {
@@ -373,10 +375,12 @@ impl Widget for AppSettings {
 
 impl AppSettings {
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions, scope: &mut Scope) {
+        // A hidden settings screen can't be clicked, but certainly actions (non-interactive)
+        // should still be handled even if the settings screen isn't shown.
+        let is_shown = is_settings_screen_shown(scope);
         let app_state = scope.data.get_mut::<AppState>().unwrap();
 
-        let view_mode_dropdown = self.view.drop_down(cx, ids!(view_mode_dropdown));
-        if let Some(index) = view_mode_dropdown.changed(actions) {
+        if is_shown && let Some(index) = self.view.drop_down2(cx, ids!(view_mode_dropdown)).changed(actions) {
             let new_mode = ViewModeOverride::from_index(index);
             if new_mode != app_state.app_prefs.view_mode {
                 app_state.app_prefs.view_mode = new_mode;
@@ -389,11 +393,9 @@ impl AppSettings {
             }
         }
 
-        let ui_zoom_minus = self.view.button(cx, ids!(ui_zoom_minus_button));
-        let ui_zoom_plus = self.view.button(cx, ids!(ui_zoom_plus_button));
         let ui_zoom_input = self.view.text_input(cx, ids!(ui_zoom_input));
 
-        if ui_zoom_minus.clicked(actions) {
+        if is_shown && self.view.button(cx, ids!(ui_zoom_minus_button)).clicked(actions) {
             let new_zoom = app_state.app_prefs.ui_zoom.zoom_out_by(UiZoom::BUTTON_STEP);
             if new_zoom != app_state.app_prefs.ui_zoom {
                 app_state.app_prefs.ui_zoom = new_zoom;
@@ -401,7 +403,7 @@ impl AppSettings {
             }
         }
 
-        if ui_zoom_plus.clicked(actions) {
+        if is_shown && self.view.button(cx, ids!(ui_zoom_plus_button)).clicked(actions) {
             let new_zoom = app_state.app_prefs.ui_zoom.zoom_in_by(UiZoom::BUTTON_STEP);
             if new_zoom != app_state.app_prefs.ui_zoom {
                 app_state.app_prefs.ui_zoom = new_zoom;
@@ -443,9 +445,9 @@ impl AppSettings {
             }
         }
 
-        let send_toggle = self.view.check_box(cx, ids!(send_on_cmd_enter_toggle));
-        if let Some(cmd_enter_active) = send_toggle.changed(actions) {
-            // The toggle's "active" state is the invsert of `send_on_enter`.
+        if is_shown && let Some(cmd_enter_active) = self.view.check_box(cx, ids!(send_on_cmd_enter_toggle)).changed(actions)
+        {
+            // The toggle's "active" state is the invert of `send_on_enter`.
             let new_send_on_enter = !cmd_enter_active;
             if new_send_on_enter != app_state.app_prefs.send_on_enter {
                 app_state.app_prefs.send_on_enter = new_send_on_enter;
@@ -459,14 +461,15 @@ impl AppSettings {
             }
         }
 
-        let radios = self.view.radio_button_set(cx, ids_array!(
-            thumb_small_radio,
-            thumb_medium_radio,
-            thumb_large_radio,
-            thumb_custom_radio,
-        ));
         let custom_input = self.view.text_input(cx, ids!(thumb_custom_input));
-        if let Some(selected) = radios.selected(cx, actions) {
+        if is_shown
+            && let Some(selected) = self.view.radio_button_set(cx, ids_array!(
+                thumb_small_radio,
+                thumb_medium_radio,
+                thumb_large_radio,
+                thumb_custom_radio,
+            )).selected(cx, actions)
+        {
             let existing_custom = match app_state.app_prefs.thumbnail_max_height {
                 ThumbnailMaxHeight::Custom(v) => Some(v),
                 _ => parse_custom_thumb_height(&custom_input.text()),
@@ -496,8 +499,7 @@ impl AppSettings {
             }
         }
 
-        let receipts_privacy_dropdown = self.view.drop_down(cx, ids!(read_receipts_privacy_dropdown));
-        if let Some(index) = receipts_privacy_dropdown.changed(actions) {
+        if is_shown && let Some(index) = self.view.drop_down2(cx, ids!(read_receipts_privacy_dropdown)).changed(actions) {
             let new_privacy = ReadReceiptsPrivacy::from_index(index);
             if new_privacy != app_state.app_prefs.read_receipts_privacy {
                 app_state.app_prefs.read_receipts_privacy = new_privacy;
@@ -511,8 +513,7 @@ impl AppSettings {
             }
         }
 
-        let mark_as_read_dropdown = self.view.drop_down(cx, ids!(mark_as_read_dropdown));
-        if let Some(index) = mark_as_read_dropdown.changed(actions) {
+        if is_shown && let Some(index) = self.view.drop_down2(cx, ids!(mark_as_read_dropdown)).changed(actions) {
             let new_behavior = MarkAsReadBehavior::from_index(index);
             if new_behavior != app_state.app_prefs.mark_as_read_behavior {
                 app_state.app_prefs.mark_as_read_behavior = new_behavior;
@@ -526,8 +527,7 @@ impl AppSettings {
             }
         }
 
-        let show_receipts_toggle = self.view.check_box(cx, ids!(show_read_receipts_toggle));
-        if let Some(show) = show_receipts_toggle.changed(actions) {
+        if is_shown && let Some(show) = self.view.check_box(cx, ids!(show_read_receipts_toggle)).changed(actions) {
             if show != app_state.app_prefs.show_read_receipts {
                 app_state.app_prefs.show_read_receipts = show;
                 Self::update_toggle_description(cx, &self.view, ids!(show_read_receipts_description), show, SHOW_READ_RECEIPTS_DESC);
@@ -540,8 +540,8 @@ impl AppSettings {
             }
         }
 
-        let show_typing_toggle = self.view.check_box(cx, ids!(show_typing_notices_toggle));
-        if let Some(show) = show_typing_toggle.changed(actions)
+        if is_shown
+            && let Some(show) = self.view.check_box(cx, ids!(show_typing_notices_toggle)).changed(actions)
             && show != app_state.app_prefs.show_typing_notices
         {
             app_state.app_prefs.show_typing_notices = show;
@@ -554,8 +554,8 @@ impl AppSettings {
             );
         }
 
-        let send_typing_toggle = self.view.check_box(cx, ids!(send_typing_notices_toggle));
-        if let Some(send) = send_typing_toggle.changed(actions)
+        if is_shown
+            && let Some(send) = self.view.check_box(cx, ids!(send_typing_notices_toggle)).changed(actions)
             && send != app_state.app_prefs.send_typing_notices
         {
             app_state.app_prefs.send_typing_notices = send;
@@ -665,13 +665,13 @@ impl AppSettings {
     ///
     /// This is safe to call from `on_after_apply` since it doesn't use `cx.with_vm`.
     fn populate_safe(cx: &mut Cx, view: &View, prefs: &AppPreferences) {
-        view.drop_down(cx, ids!(view_mode_dropdown))
+        view.drop_down2(cx, ids!(view_mode_dropdown))
             .set_selected_item(cx, prefs.view_mode.to_index());
 
-        view.drop_down(cx, ids!(read_receipts_privacy_dropdown))
+        view.drop_down2(cx, ids!(read_receipts_privacy_dropdown))
             .set_selected_item(cx, prefs.read_receipts_privacy.to_index());
         Self::update_read_receipts_privacy_description(cx, view, prefs.read_receipts_privacy);
-        view.drop_down(cx, ids!(mark_as_read_dropdown))
+        view.drop_down2(cx, ids!(mark_as_read_dropdown))
             .set_selected_item(cx, prefs.mark_as_read_behavior.to_index());
         Self::update_mark_as_read_description(cx, view, prefs.mark_as_read_behavior);
         Self::update_toggle_description(cx, view, ids!(show_read_receipts_description), prefs.show_read_receipts, SHOW_READ_RECEIPTS_DESC);

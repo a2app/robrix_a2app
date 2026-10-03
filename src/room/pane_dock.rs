@@ -23,6 +23,7 @@ use super::{
     pinned_messages_list::{PinnedMessagesListWidgetRefExt, SavedPinnedMessagesList},
     room_members_list::{RoomMembersListRef, RoomMembersListWidgetRefExt, SavedRoomMembersList},
     room_pane::{self, PaneLayout, PaneSide, RoomPaneKind, RoomPaneOp, RoomPaneRequest, RoomPanesPending, mini_app_panes},
+    threads_list::{SavedThreadsList, ThreadsListWidgetRefExt},
 };
 
 script_mod! {
@@ -150,7 +151,7 @@ script_mod! {
         content := View {
             width: Fill, height: Fill
             flow: Down
-            padding: Inset{top: #(CONTENT_TOP_PADDING), right: #(FRAME_PADDING), bottom: #(FRAME_PADDING), left: #(FRAME_PADDING)}
+            padding: Inset{top: #(CONTENT_TOP_PADDING), right: 0, bottom: #(FRAME_PADDING), left: #(FRAME_PADDING)}
         }
     }
 
@@ -298,6 +299,9 @@ script_mod! {
                 border_size: 1.0
             }
         }
+        threads_pane: mod.widgets.RoomPaneFrame {
+            content +: { threads := mod.widgets.ThreadsList {} }
+        }
     }
 }
 
@@ -305,7 +309,7 @@ script_mod! {
 const PANE_ICON_SIZE: f64 = 16.0;
 const PANE_ICON_MARGIN: f64 = 2.0;
 /// The padding on either side of a pane's frame, and beneath its content.
-const FRAME_PADDING: f64 = 10.0;
+pub(crate) const FRAME_PADDING: f64 = 10.0;
 /// The space above a pane's content, which is a bit more for a tall pane on the left or right side.
 const CONTENT_TOP_PADDING: f64 = 6.0;
 const VERTICAL_CONTENT_TOP_PADDING: f64 = 12.0;
@@ -342,7 +346,7 @@ const CHIP_RIGHT_MARGIN: f64 = 16.0;
 fn header_button_ids(kind: &RoomPaneKind) -> &'static [&'static [LiveId]] {
     match kind {
         RoomPaneKind::MiniApp(_) => MINI_APP_HEADER_BUTTONS,
-        RoomPaneKind::Members | RoomPaneKind::PinnedMessages => HEADER_BUTTONS,
+        RoomPaneKind::Members | RoomPaneKind::PinnedMessages | RoomPaneKind::Threads => HEADER_BUTTONS,
     }
 }
 
@@ -358,8 +362,8 @@ const MIN_CENTER_SIZE: f64 = 150.0;
 /// A timeline's room members: `None` until they're fetched, or the error if that failed.
 type TimelineMembers = Option<Result<Arc<Vec<RoomMember>>, String>>;
 
-/// Shows the given room's info in the content of the given pane.
-fn populate_content(
+/// Shows the given room's info in the content of the given pane (or popped-out pane screen).
+pub fn populate_content(
     cx: &mut Cx,
     kind: &RoomPaneKind,
     frame: &WidgetRef,
@@ -376,6 +380,9 @@ fn populate_content(
         }
         // A mini-app is attached once, when its pane is created.
         RoomPaneKind::MiniApp(_) => {}
+        RoomPaneKind::Threads => {
+            frame.child_by_path(ids!(content.threads)).as_threads_list().set_room(cx, room_name_id);
+        }
     }
 }
 
@@ -391,15 +398,19 @@ fn show_members(cx: &mut Cx, list: &RoomMembersListRef, room_name_id: &RoomNameI
 }
 
 /// The saved state of a pane's content.
-#[derive(Clone)]
-enum SavedPaneContent {
+///
+/// This is saved and then restored when the pane is hidden and then shown,
+/// popped-out and then returned, or docked elsewhere, or its timeline is hidden/shown.
+pub enum SavedPaneContent {
     Members(SavedRoomMembersList),
     PinnedMessages(SavedPinnedMessagesList),
     /// A mini-app keeps its own state in its instance, which is parked while its pane is saved.
     MiniApp,
+    Threads(SavedThreadsList),
 }
 
-fn save_content(kind: &RoomPaneKind, frame: &WidgetRef) -> SavedPaneContent {
+/// Returns the state of the content in the given pane (or popped-out pane screen).
+pub fn save_content(kind: &RoomPaneKind, frame: &WidgetRef) -> SavedPaneContent {
     match kind {
         RoomPaneKind::Members => SavedPaneContent::Members(
             frame.child_by_path(ids!(content.room_members)).as_room_members_list().save_state()
@@ -408,10 +419,16 @@ fn save_content(kind: &RoomPaneKind, frame: &WidgetRef) -> SavedPaneContent {
             frame.child_by_path(ids!(content.pinned_messages)).as_pinned_messages_list().save_state()
         ),
         RoomPaneKind::MiniApp(_) => SavedPaneContent::MiniApp,
+        RoomPaneKind::Threads => SavedPaneContent::Threads(
+            frame.child_by_path(ids!(content.threads)).as_threads_list().save_state()
+        ),
     }
 }
 
-fn restore_content(
+/// Restores the given saved state into the content of the given pane (or popped-out pane screen).
+///
+/// The containing room's members list must also be provided since certain panes don't have that.
+pub fn restore_content(
     cx: &mut Cx,
     frame: &WidgetRef,
     room_name_id: &RoomNameId,
@@ -429,16 +446,38 @@ fn restore_content(
                 .restore_state(cx, room_name_id, saved);
         }
         SavedPaneContent::MiniApp => {}
+        SavedPaneContent::Threads(saved) => {
+            frame.child_by_path(ids!(content.threads)).as_threads_list()
+                .restore_state(cx, room_name_id, saved);
+        }
     }
 }
 
 /// The state of a docked pane that is saved and restored along with its timeline.
-#[derive(Clone)]
 pub struct SavedRoomPane {
     kind: RoomPaneKind,
     layout: PaneLayout,
     weight: Option<f64>,
     content: SavedPaneContent,
+}
+
+impl SavedRoomPane {
+    /// Drops this pane's loaded data and stops its data subscription.
+    pub fn drop_data(&mut self) {
+        match &mut self.content {
+            // A mini-app's running state is owned by its parked instance.
+            SavedPaneContent::MiniApp => {}
+            SavedPaneContent::Members(saved) => saved.members = None,
+            SavedPaneContent::PinnedMessages(saved) => {
+                saved.messages = None;
+                saved.list.subscription = None;
+            }
+            SavedPaneContent::Threads(saved) => {
+                saved.threads = None;
+                saved.list.subscription = None;
+            }
+        }
+    }
 }
 
 /// Sets the icon and title of the given pane (or popped-out pane) based on the given `kind`.
@@ -454,6 +493,10 @@ pub fn set_pane_header(cx: &mut Cx, pane: &WidgetRef, kind: &RoomPaneKind) {
         }
         RoomPaneKind::PinnedMessages => {
             script_apply_eval!(cx, icon, { draw_icon +: { svg: (mod.widgets.ICON_PIN) } });
+            None
+        }
+        RoomPaneKind::Threads => {
+            script_apply_eval!(cx, icon, { draw_icon +: { svg: (mod.widgets.ICON_REPLY_IN_THREAD) } });
             None
         }
         RoomPaneKind::MiniApp(app_id) => Some(mini_app_panes::app_glyph(app_id).unwrap_or_default()),
@@ -542,6 +585,7 @@ pub struct RoomPaneDock {
     #[rust] chips: Vec<MiniAppChip>,
     /// The mini-app revision that our chips were last synced to.
     #[rust] chips_revision: Option<u64>,
+    #[live] threads_pane: Option<LivePtr>,
     #[rust] room_name_id: Option<RoomNameId>,
     /// The timeline that this dock's panes belong to.
     #[rust] timeline_kind: Option<TimelineKind>,
@@ -842,9 +886,9 @@ impl RoomPaneDock {
     /// and shows chips for any mini-apps of our room that are running without being shown anywhere.
     fn dock_pending(&mut self, cx: &mut Cx) {
         let Some(timeline_kind) = self.timeline_kind.clone() else { return };
-        for kind in room_pane::take_pending(&timeline_kind) {
+        for (kind, saved) in room_pane::take_pending(&timeline_kind) {
             if !self.has_pane(&kind) {
-                self.create_pane(cx, kind, room_pane::last_layout(), None, None, false);
+                self.create_pane(cx, kind, room_pane::last_layout(), None, saved, false);
             }
         }
         self.place_panes(cx, true);
@@ -907,9 +951,14 @@ impl RoomPaneDock {
 
     /// Pops the given pane out into its own tab (desktop) or view (mobile).
     fn pop_out(&mut self, cx: &mut Cx, room_name_id: &RoomNameId, kind: RoomPaneKind) {
+        let saved = self.panes.iter()
+            .find(|pane| pane.kind == kind)
+            .map(|pane| save_content(&kind, &pane.frame));
         self.remove_pane(cx, &kind, true, false);
-        if let Some(timeline_kind) = self.timeline_kind.clone() {
-            room_pane::pop_out(cx, self.widget_uid(), room_name_id, kind, timeline_kind);
+        if let Some(timeline_kind) = self.timeline_kind.clone()
+            && let Some(saved) = saved
+        {
+            room_pane::pop_out(cx, self.widget_uid(), room_name_id, kind, timeline_kind, saved);
         }
     }
 
@@ -1009,6 +1058,7 @@ impl RoomPaneDock {
     }
 
     /// Returns the state of our panes, to be restored when our timeline is shown again.
+    /// This takes their data subscriptions, so only call this right before clearing our panes.
     fn save_state(&self) -> Vec<SavedRoomPane> {
         self.panes.iter()
             .map(|pane| SavedRoomPane {
@@ -1063,6 +1113,7 @@ impl RoomPaneDock {
             RoomPaneKind::Members => self.members_pane,
             RoomPaneKind::PinnedMessages => self.pinned_messages_pane,
             RoomPaneKind::MiniApp(_) => self.mini_app_pane,
+            RoomPaneKind::Threads => self.threads_pane,
         }
     }
 
@@ -1109,7 +1160,7 @@ impl RoomPaneDock {
                     return false;
                 }
             }
-            RoomPaneKind::Members | RoomPaneKind::PinnedMessages => {
+            RoomPaneKind::Members | RoomPaneKind::PinnedMessages | RoomPaneKind::Threads => {
                 match content {
                     Some(content) => restore_content(cx, &frame, &room_name_id, content, &self.room_members),
                     None => populate_content(cx, &kind, &frame, &room_name_id, &self.room_members),
@@ -1181,9 +1232,15 @@ impl RoomPaneDock {
             PaneSide::Right => script_apply_eval!(cx, button, { draw_icon +: { svg: (mod.widgets.ICON_CARET_RIGHT) } }),
         }
         let top = if pane.layout.side.is_vertical() { VERTICAL_CONTENT_TOP_PADDING } else { CONTENT_TOP_PADDING };
+        // Add enough right padding for the content to not interfere with the scroll bar.
+        let right = match pane.layout.side {
+            PaneSide::Left => DIVIDER_THICKNESS,
+            PaneSide::Top | PaneSide::Bottom => DIVIDER_THICKNESS * 0.5,
+            PaneSide::Right => 0.0,
+        };
         let mut content = pane.frame.widget(cx, ids!(content));
         script_apply_eval!(cx, content, {
-            padding: mod.prelude.widgets.Inset{top: #(top), right: #(FRAME_PADDING), bottom: #(FRAME_PADDING), left: #(FRAME_PADDING)}
+            padding: mod.prelude.widgets.Inset{top: #(top), right: #(right), bottom: #(FRAME_PADDING), left: #(FRAME_PADDING)}
         });
     }
 
@@ -1708,8 +1765,7 @@ impl RoomPaneEdge {
         self.draw_divider.color = self.divider_color(Divider::Border);
         self.draw_divider.draw_abs(cx, border);
 
-        // The border's hit strip runs along the whole border, only as thick as a grab handle, so over the timeline
-        // it doesn't reach its scroll bar; any slop is added on our panes' side (see `grab_inset()`).
+        // The border can be grabbed anywhere along it, within a grab handle's thickness (plus `grab_inset()`).
         let center = border.pos + border.size * 0.5;
         let hit_rect = if vertical {
             Rect { pos: dvec2(center.x - GRAB_THICKNESS * 0.5, border.pos.y), size: dvec2(GRAB_THICKNESS, border.size.y) }
@@ -1758,24 +1814,23 @@ impl RoomPaneEdge {
         }
     }
 
-    /// Slop beside the border's strip, only on our panes' side of it, as the timeline's scroll bar is on the other side.
+    /// Extra grab room beside the border, on whichever side has no scroll bar next to it.
     fn grab_inset(&self, slop: f64) -> Inset {
         let mut inset = Inset::default();
         match self.side {
-            PaneSide::Left => inset.left = slop,
-            PaneSide::Right => inset.right = slop,
+            PaneSide::Left | PaneSide::Right => inset.right = slop,
             PaneSide::Top => inset.top = slop,
             PaneSide::Bottom => inset.bottom = slop,
         }
         inset
     }
 
-    /// Slop on both sides of a split's strip, which has a pane on each side.
+    /// Extra grab room beside a split, but not on the left of a vertical split, where the pane's scroll bar is.
     fn split_inset(&self, slop: f64) -> Inset {
         if self.side.is_vertical() {
             Inset::default().with_top(slop).with_bottom(slop)
         } else {
-            Inset::default().with_left(slop).with_right(slop)
+            Inset::default().with_right(slop)
         }
     }
 
