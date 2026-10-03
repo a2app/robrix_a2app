@@ -24,7 +24,10 @@ fn load(){
     if fs.exists("/website_watch.json") {
         let saved = fs.read("/website_watch.json").parse_json()
         if saved.is_object() {
-            if saved.url.is_string() && saved.keyword.is_string() && (saved.post == true || saved.post == false) {
+            if saved.url.is_string() && saved.keyword.is_string() && (saved.post == true || saved.post == false)
+                && saved.url.trim() != "" && saved.keyword.trim() != ""
+                && saved.url.len() <= 2048 && saved.keyword.len() <= 200
+            {
                 config = saved
             }
         }
@@ -97,7 +100,7 @@ fn check_website(run){
                     fs.write("/website_match.json", "true")
                 }
                 let text = "Match posted to this room."
-                if run == 0 { text = "Test report posted. This website and room are ready for scheduled checks." }
+                if run == 0 { text = "Test report posted to this room." }
                 finish(run, true, text)
             })
         } else {
@@ -108,7 +111,7 @@ fn check_website(run){
                     fs.write("/website_match.json", "true")
                 }
                 let text = "Match reported in a Robrix popup."
-                if run == 0 { text = "Test report shown. This website is ready for scheduled checks." }
+                if run == 0 { text = "Test report shown in a Robrix popup." }
                 finish(run, true, text)
             })
         }
@@ -143,6 +146,6 @@ View{
         Button{text: "Save configuration" on_click: || save()}
         Button{text: "Test saved website and report" on_click: || test_website()}
         status := Label{text: "Default: example.com, keyword Example Domain, popup. Save settings, then test the saved website and report before scheduling checks." width: Fill draw_text +: {color: #x2A7F92 text_style: theme.font_regular{font_size: 12}}}
-        Label{text: "Save your settings, then test the website and report while this app is open. A test sends one report even if the keyword is absent or already reported. Choose session permission in each review to allow scheduled checks and reports until Robrix closes. The website may receive data this instance has read; each review shows the destination. Automated runs do not open permission dialogs. Robrix must be running." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
+        Label{text: "Save your settings, then test the website and report while this app is open. A test sends one report even if the keyword is absent or already reported. Choose Until you quit Robrix or Forever and Approve in the prompts before scheduling checks and reports. Each prompt shows what will happen and where. Automated runs do not open permission dialogs. Robrix must be running." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
     }
 }

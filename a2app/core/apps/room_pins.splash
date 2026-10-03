@@ -12,11 +12,12 @@ let watch_ready = false
 
 let pins_loading = false
 let pins_loaded = false
+let live_refresh_pending = false
 
 let items = []
 let status = "Loading…"
 let live_note = ""
-let empty_msg = "Nothing to show. This app needs to be opened from a room, and needs your permission to read it."
+let empty_msg = "Loading pinned messages…"
 
 fn show_header(){ ui.header.set_text(status + live_note) }
 
@@ -33,7 +34,7 @@ fn load(){
             if items.len() == 0 { status = "No pinned messages" }
         } else {
             items = []
-            empty_msg = "Nothing to show. This app needs to be opened from a room, and needs your permission to read it."
+            empty_msg = r.error
             status = r.error
         }
         show_header()
@@ -42,7 +43,15 @@ fn load(){
 }
 
 fn on_room_pins_changed(json){
-    load()
+    schedule_live_refresh()
+}
+
+fn schedule_live_refresh(){
+    if live_refresh_pending { return nil }
+    live_refresh_pending = start_timeout(1.0, || {
+        live_refresh_pending = false
+        if pins_loading { schedule_live_refresh() } else { load() }
+    }) != nil
 }
 
 fn watch(){
@@ -75,15 +84,15 @@ let _boot = start_timeout(0.05, || {
 
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
-    col := View{
-        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
+    col := ScrollYView{
+        width: Fill height: Fill flow: Down spacing: 10 padding: 14
         header := Label{
             text: "Loading…" padding: 0 margin: 0
             width: Fill
             draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
         }
         item_list := ScrollYView{
-            width: Fill height: Fill flow: Down spacing: 5
+            width: Fill height: Fill{min: 80} flow: Down spacing: 5
             on_item_tap: |i| jump_to_pin(i)
             on_render: || {
                 if items.len() == 0 {

@@ -30,7 +30,7 @@ fn fetch_example(){
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
     ScrollYView{
-        width: Fill{max: 620.0} height: Fill flow: Down spacing: 12 padding: 16
+        width: Fill height: Fill flow: Down spacing: 12 padding: 16
         Label{
             text: "Public Web" width: Fill
             draw_text +: {color: #x1C274C text_style: theme.font_bold{font_size: 22}}

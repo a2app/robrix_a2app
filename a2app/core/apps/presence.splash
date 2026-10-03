@@ -17,6 +17,15 @@ let rows = []
 let cells = []
 let bodies = []
 let pending = ""
+let fetch_scheduled = false
+let typing_line = "Nobody is typing"
+let live_note = ""
+
+fn show_typing(){
+    let line = typing_line
+    if live_note != "" { line = line + "\n" + live_note }
+    ui.typing.set_text(line)
+}
 
 fn ago(ts){
     if ts.is_nil() { return "" }
@@ -39,7 +48,7 @@ fn refresh(){
     cells = []
     for row in rows {
         let body = body_of(row.event_id)
-        if body.is_nil() { body = "…" }
+        if body.is_nil() { body = "Tap to open this message" }
         let who = row.name
         let when = ago(row.ts)
         if when != "" { who = who + "  ·  " + when }
@@ -49,9 +58,9 @@ fn refresh(){
     ui.receipt_list.render()
 }
 
-// One matrix.event lookup in flight at a time, for the top rows only.
+// Pace the top rows' message lookups so cached replies cannot exhaust the budget.
 fn fetch_next(){
-    if pending != "" { return nil }
+    if pending != "" || fetch_scheduled { return nil }
     let n = min(rows.len(), 10)
     let i = 0
     while i < n {
@@ -62,10 +71,14 @@ fn fetch_next(){
             host.request("matrix.event", {event_id: id}, fn(r){
                 let text = "(couldn't load this message)"
                 if r.is_ok { text = r.data.body }
-                bodies.push({event_id: id, body: text})
+                bodies.push({event_id: id, body: text, loaded: r.is_ok})
+                while bodies.len() > 100 { bodies.remove(0) }
                 pending = ""
                 refresh()
-                fetch_next()
+                fetch_scheduled = start_timeout(1.0, || {
+                    fetch_scheduled = false
+                    fetch_next()
+                }) != nil
             })
             return nil
         }
@@ -108,7 +121,8 @@ fn on_room_typing(json){
     let line = "Nobody is typing"
     if ev.typing.len() > 0 { line = names + " is typing…" }
     if ev.typing.len() > 1 { line = names + " are typing…" }
-    ui.typing.set_text(line)
+    typing_line = line
+    show_typing()
 }
 
 fn on_room_receipt(json){
@@ -140,22 +154,34 @@ fn subscribe(name){
     pending_events.push(name)
     host.request("events.subscribe", {event: name}, fn(r){
         pending_events.retain(|event| event != name)
-        if r.is_ok { subscribed_events.push(name) }
-        if !r.is_ok { ui.typing.set_text("Live updates are off: " + r.error) }
+        if r.is_ok {
+            subscribed_events.push(name)
+            if subscribed_events.len() == 2 { live_note = "" }
+        } else { live_note = "Live updates are off: " + r.error }
+        show_typing()
     })
 }
 
 fn watch(){
-    ui.typing.set_text("Nobody is typing")
+    show_typing()
     subscribe("on_room_typing")
     subscribe("on_room_receipt")
 }
 
 fn on_permissions_changed(caps){
     if !receipts_loaded { load() }
+    if host.has("matrix.room.event.read") {
+        bodies.retain(|body| body.loaded)
+        fetch_next()
+    }
     subscribed_events.retain(|event| host.has(event))
     if host.has("on_room_typing") { subscribe("on_room_typing") }
     if host.has("on_room_receipt") { subscribe("on_room_receipt") }
+}
+
+fn reload(){
+    bodies.retain(|body| body.loaded)
+    load()
 }
 
 fn tap_cell(i){
@@ -177,8 +203,8 @@ let _boot = start_timeout(0.05, || {
 
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
-    col := View{
-        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
+    col := ScrollYView{
+        width: Fill height: Fill flow: Down spacing: 10 padding: 14
         RoundedView{
             width: Fill height: Fit padding: 10
             show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
@@ -192,7 +218,7 @@ View{
             draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
         }
         receipt_list := ScrollYView{
-            width: Fill height: Fill flow: Down spacing: 0
+            width: Fill height: Fill{min: 80} flow: Down spacing: 0
             on_item_tap: |i| tap_cell(i)
             on_render: || {
                 for c in cells {
@@ -218,6 +244,10 @@ View{
                     }
                 }
             }
+        }
+        View{
+            width: Fill height: Fit flow: Right align: Align{x: 0.5}
+            Button{ text: "Refresh" on_click: || reload() draw_text +: { color: #x1C274C } }
         }
     }
 }

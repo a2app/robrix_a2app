@@ -12,10 +12,12 @@ let watch_ready = false
 
 let members_loading = false
 let members_loaded = false
+let live_refresh_pending = false
 
 let items = []
 let status = "Loading…"
 let live_note = ""
+let empty_msg = "Loading members…"
 
 fn show_header(){ ui.header.set_text(status + live_note) }
 
@@ -27,10 +29,15 @@ fn load(){
         members_loaded = r.is_ok
         if r.is_ok {
             items = r.data.members
+            empty_msg = "No members to show."
             status = "" + r.data.count + " members · tap one for their profile"
+            if r.data.count > items.len() {
+                status = "Showing " + items.len() + " of " + r.data.count + " members · tap one for their profile"
+            }
         } else {
             items = []
             status = r.error
+            empty_msg = r.error
         }
         show_header()
         ui.item_list.render()
@@ -38,7 +45,15 @@ fn load(){
 }
 
 fn on_room_members_changed(json){
-    load()
+    schedule_live_refresh()
+}
+
+fn schedule_live_refresh(){
+    if live_refresh_pending { return nil }
+    live_refresh_pending = start_timeout(1.0, || {
+        live_refresh_pending = false
+        if members_loading { schedule_live_refresh() } else { load() }
+    }) != nil
 }
 
 fn watch(){
@@ -77,20 +92,20 @@ let _boot = start_timeout(0.05, || {
 
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
-    col := View{
-        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
+    col := ScrollYView{
+        width: Fill height: Fill flow: Down spacing: 10 padding: 14
         header := Label{
             text: "Loading…" padding: 0 margin: 0
             width: Fill
             draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
         }
         item_list := ScrollYView{
-            width: Fill height: Fill flow: Down spacing: 5
+            width: Fill height: Fill{min: 80} flow: Down spacing: 5
             on_item_tap: |i| open_member(i)
             on_render: || {
                 if items.len() == 0 {
                     Label{
-                        text: "Nothing to show. This app needs to be opened from a room, and needs your permission to read it."
+                        text: empty_msg
                         width: Fill padding: 0 margin: 0
                         draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
                     }

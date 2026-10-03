@@ -15,7 +15,7 @@ let power_loaded = false
 let load_error = ""
 let empty_note = "Counting…"
 let bar_w = 320
-// The newest batch comes without timestamps, so it's kept apart from the older pages.
+// Keep the newest batch apart so it supplies the first history-page anchor.
 let latest = []
 let older = []
 let senders = []
@@ -23,6 +23,7 @@ let top = []
 let day_items = []
 let first_ts = 0
 let last_ts = 0
+let timed_count = 0
 let day_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
 fn zeros(n){
@@ -111,12 +112,12 @@ fn show(){
     ui.status.set_text(line)
     let h = peak(hours)
     let d = peak(days)
-    if older.len() == 0 {
-        ui.range_line.set_text("No message times yet: the newest batch arrives without them.")
+    if timed_count == 0 {
+        ui.range_line.set_text("No message times to show yet.")
         ui.hour_line.set_text("Busiest hour: unknown")
         ui.day_line.set_text("Busiest weekday: unknown")
     } else {
-        ui.range_line.set_text(date_str(first_ts) + " to " + date_str(last_ts) + " · times known for " + older.len() + " of " + total())
+        ui.range_line.set_text(date_str(first_ts) + " to " + date_str(last_ts) + " · times known for " + timed_count + " of " + total())
         ui.hour_line.set_text("Busiest hour: " + pad(h) + ":00 UTC · " + msgs(hours[h]))
         ui.day_line.set_text("Busiest weekday: " + day_names[d] + " · " + msgs(days[d]))
     }
@@ -125,20 +126,25 @@ fn show(){
     ui.day_bars.render()
 }
 
+fn count_message(m){
+    count_sender(m)
+    if m.ts.is_nil() || m.ts <= 0 { return nil }
+    timed_count += 1
+    hours[hour_of(m.ts)] += 1
+    days[(floor(m.ts / 86400000) + 4) % 7] += 1
+    if first_ts == 0 || m.ts < first_ts { first_ts = m.ts }
+    if m.ts > last_ts { last_ts = m.ts }
+}
+
 fn compute(){
     senders = []
     hours = zeros(24)
     days = zeros(7)
     first_ts = 0
     last_ts = 0
-    for m in latest { count_sender(m) }
-    for m in older {
-        count_sender(m)
-        hours[hour_of(m.ts)] += 1
-        days[(floor(m.ts / 86400000) + 4) % 7] += 1
-        if first_ts == 0 || m.ts < first_ts { first_ts = m.ts }
-        if m.ts > last_ts { last_ts = m.ts }
-    }
+    timed_count = 0
+    for m in latest { count_message(m) }
+    for m in older { count_message(m) }
     let n = min(8, senders.len())
     top = []
     let i = 0
@@ -184,7 +190,11 @@ fn page(){
         for m in older { merged.push(m) }
         older = merged
         if r.data.has_more && got.len() > 0 {
-            page()
+            // Each page costs 5 tokens; allow the 6-per-second budget to refill.
+            if start_timeout(1.0, || page()).is_nil() {
+                load_error = "Couldn't continue loading. Tap Refresh to try again."
+                finish()
+            }
             return nil
         }
         finish()
@@ -269,7 +279,7 @@ fn set_depth(d){
 }
 
 fn on_app_resize(w, h){
-    bar_w = min(w, 460) - 44
+    bar_w = max(6, w - 44)
     ui.sender_list.render()
 }
 
@@ -283,7 +293,7 @@ let _boot = start_timeout(0.05, || load())
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
     col := ScrollYView{
-        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
+        width: Fill height: Fill flow: Down spacing: 10 padding: 14
         status := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
         range_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
         View{
@@ -294,8 +304,8 @@ View{
             Button{ text: "Refresh" on_click: || load() draw_text +: { color: #x1C274C } }
         }
         Label{ text: "TOP SENDERS · tap one for their profile" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
-        sender_list := View{
-            width: Fill height: Fit flow: Down spacing: 5
+        sender_list := ScrollYView{
+            width: Fill height: Fill{min: 80} flow: Down spacing: 5
             on_item_tap: |i| open_sender(i)
             on_render: || {
                 if top.len() == 0 {

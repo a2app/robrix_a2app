@@ -22,6 +22,7 @@ let ignored = []
 let ignored_note = "Loading…"
 let manage_url = nil
 let dm_room = nil
+let lookup_request = 0
 
 fn or_blank(name, fallback){
     if name == nil || name == "" { return fallback }
@@ -70,6 +71,7 @@ fn load_account(){
         account_loaded = r.is_ok
         if !r.is_ok {
             ui.server_line.set_text(r.error)
+            manage_url = nil
             ui.manage_wrap.set_visible(false)
             return nil
         }
@@ -124,7 +126,10 @@ fn lookup(t){
     ui.dm_line.set_text("")
     ui.dm_wrap.set_visible(false)
     dm_room = nil
+    lookup_request += 1
+    let request_id = lookup_request
     host.request("matrix.user_profile", {user_id: id}, fn(r){
+        if request_id != lookup_request { return nil }
         if !r.is_ok {
             ui.lookup_line.set_text(r.error)
             return nil
@@ -135,6 +140,7 @@ fn lookup(t){
         ui.lookup_line.set_text(line)
     })
     host.request("matrix.dm_find", {user_id: id}, fn(r){
+        if request_id != lookup_request { return nil }
         if !r.is_ok {
             ui.dm_line.set_text(r.error)
             return nil
@@ -162,10 +168,10 @@ fn lookup_ignored(i){
 }
 
 fn on_permissions_changed(caps){
-    if !profile_loaded { load_profile() }
-    if !device_loaded { load_device() }
-    if !account_loaded { load_account() }
-    if !ignored_loaded { load_ignored() }
+    if !profile_loaded && host.has("matrix.profile.read") { load_profile() }
+    if !device_loaded && host.has("matrix.account.device.read") { load_device() }
+    if !account_loaded && host.has("matrix.account.info.read") { load_account() }
+    if !ignored_loaded && host.has("matrix.account.ignored.read") { load_ignored() }
 }
 
 let _boot = start_timeout(0.05, || load())
@@ -173,7 +179,7 @@ let _boot = start_timeout(0.05, || load())
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
     col := ScrollYView{
-        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
+        width: Fill height: Fill flow: Down spacing: 10 padding: 14
         View{
             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
             Label{
@@ -257,7 +263,7 @@ View{
             draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
         }
         ignored_list := ScrollYView{
-            width: Fill height: Fit{max: FitBound.Abs(140.0)} flow: Down spacing: 4
+            width: Fill height: Fill{min: 80} flow: Down spacing: 4
             on_item_tap: |i| lookup_ignored(i)
             on_render: || {
                 if ignored.len() == 0 {

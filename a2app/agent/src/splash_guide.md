@@ -40,22 +40,24 @@ let count = 0
 fn show(){ ui.display.set_text("" + count) }
 
 View{
-    width: Fill height: Fit flow: Down spacing: 14 padding: 16
-    align: Align{x: 0.5}
-    Label{
-        text: "Counter" padding: 0 margin: 0
-        draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }
-    }
-    RoundedView{ width: Fill height: Fit align: Align{x: 0.5, y: 0.5} padding: 26
-        show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
-        display := Label{
-            text: "0"
-            draw_text +: { color: #x0f88fe text_style: theme.font_bold{font_size: 52} }
+    width: Fill height: Fill flow: Down
+    ScrollYView{
+        width: Fill height: Fill flow: Down spacing: 14 padding: 16 align: Align{x: 0.5}
+        Label{
+            text: "Counter" padding: 0 margin: 0
+            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }
         }
-    }
-    View{width: Fill height: Fit flow: Right spacing: 10 align: Align{x: 0.5}
-        Button{text: "−" width: 90 on_click: || { count -= 1 show() }}
-        Button{text: "+" width: 90 on_click: || { count += 1 show() }}
+        RoundedView{ width: Fill height: Fit align: Align{x: 0.5, y: 0.5} padding: 26
+            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
+            display := Label{
+                text: "0"
+                draw_text +: { color: #x0f88fe text_style: theme.font_bold{font_size: 52} }
+            }
+        }
+        View{width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 10 align: Align{x: 0.5}
+            Button{text: "−" width: 90 on_click: || { count -= 1 show() }}
+            Button{text: "+" width: 90 on_click: || { count += 1 show() }}
+        }
     }
 }
 ```
@@ -66,20 +68,36 @@ View{
   or a number), `flow: Down|Right|Overlay`, `spacing: N`,
   `padding: N` or `padding: Inset{top: N, bottom: N, left: N, right: N}`,
   `margin` (same forms), `align: Align{x: 0..1, y: 0..1}`.
-- The root View should be `width: Fill height: Fit flow: Down` with padding.
-- `ScrollYView{...}` scrolls vertically (give it a fixed `height: N`).
+- The root View should be `width: Fill height: Fill flow: Down`.
+- `ScrollYView{...}` scrolls vertically. A full-pane column uses
+  `width: Fill height: Fill`; controls use `height: Fit`, and its main result
+  list uses `height: Fill{min: 80}` to consume the remaining height. The minimum
+  keeps a usable list viewport in short panes; it is not a height limit.
 - Color literals: `#ffffff`, `#x1C274C` (with alpha: `#xffffff55`).
 
 ## The app runs at ANY size (split screen, resizable windows)
 
 The host may show the app fullscreen on a phone-shaped window, in one pane of
 a split screen (content as narrow as ~190 or as short as ~250), or in a wide
-desktop window (~1600). Two tools make a layout survive all of that:
+desktop window (~1600). Use the entire available pane:
 
-- Cap and center the whole column so wide windows don't stretch it: wrap the
-  content in `View{width: Fill height: Fit flow: Down align: Align{x: 0.5}
-  col := View{width: Fill{max: 520.0} height: Fit flow: Down ...}}`.
-  `Fill{max: N}` fills the host up to N points, then stays capped.
+- Keep the root and its content column `width: Fill height: Fill`. Do not cap
+  the whole column's width or give result lists fixed heights such as 300.
+- Make the content column itself a `ScrollYView`, so its controls remain
+  reachable when their natural height plus a minimum list viewport exceeds
+  the pane. A plain bounded `View` around overflowing controls prevents an
+  ancestor scrollbar from measuring that overflow. Nested bounded wrappers
+  must scroll too when their contents can exceed their height.
+- A primary scrolling result list uses `height: Fill{min: 80}`; it grows with
+  the pane. For multi-section forms, noninteractive dynamic lists can instead
+  use `View{height: Fit}` inside one full-pane scroll column. Tappable lists
+  with `on_item_tap` should remain `ScrollYView` so dragging an item scrolls
+  that list. If several lists share a pane, a secondary picker can use
+  `height: Fit{max: FitBound.Rel{base: Base.Full, factor: 0.3}}` while the main
+  list fills the remainder. This bound follows the pane height automatically.
+- Use wrapping `Flow.Right{wrap: true}` for groups of Fit action buttons. Keep
+  input-plus-submit rows `flow: Right`: a Fill child in a wrapping row consumes
+  all remaining row width, pushing later buttons to another row.
 - Define the optional hook `fn on_app_resize(w, h){ ... }` — the host calls it
   with the content box (points) on open and on every size change. Fonts and
   fixed sizes can NOT change at runtime, so pre-declare alternate layouts as
@@ -186,7 +204,7 @@ Prefer a named container with `on_render` and explicit re-render calls:
 ```splash
 let laps = []
 lap_list := ScrollYView{
-    width: Fill height: 220 flow: Down spacing: 6
+    width: Fill height: Fill{min: 80} flow: Down spacing: 6
     on_render: || {
         if laps.len() == 0 { glass.Body{text: "Nothing yet." width: Fill} }
         else {
@@ -204,7 +222,7 @@ To make rows tappable put ONE handler on the list itself:
 
 ```splash
 lap_list := ScrollYView{
-    width: Fill height: 220 flow: Down spacing: 6
+    width: Fill height: Fill{min: 80} flow: Down spacing: 6
     on_item_tap: |i| open_lap(i)
     on_render: || { for lap in laps { glass.ListRow{ ... } } }
 }
@@ -1001,16 +1019,18 @@ idempotency where the destination supports it.
 ## Hard rules
 
 1. Reply with the COMPLETE script; it must be self-contained and runnable.
-2. Exactly one root `View{` as the last expression.
+2. Exactly one root `View{` or `ScrollYView{` as the last expression. Prefer a
+   full-pane View containing a full-pane ScrollYView content column.
 3. Never use: `use`, `import`, `Root`, `Window`, `live_design`, `sys.`,
    `fetch`, `Image{`, `<` JSX `>`, CSS, or HTML. Network only through
    `host.request("network.http", ...)` as above; ambient `mod.net` is disabled.
 4. Every interactive element updates the UI through `ui.<name>.set_*` /
    `.render()` calls — never assume a mutation redraws by itself.
 5. Keep it small: under ~150 lines. Polished and readable at ANY host size:
-   width-capped + centered for wide windows (`Fill{max: N}` + `align`), and
-   usable in a narrow or short split-screen pane (`fn on_app_resize` +
-   pre-declared tiers when fixed sizes must change).
+   fill the available pane in both dimensions, give primary lists the remaining
+   height, and make overflowing controls scroll in short panes. Never impose
+   fixed result-list heights or cap the entire content column's width. Use
+   `fn on_app_resize` + pre-declared tiers when fixed sizes must change.
 6. Declare every capability you use in the header (`// permissions:`), ask
    for the least you need, and give each one a `// why-<perm>:` reason.
 7. The app MUST work with every permission denied or revoked mid-run: real

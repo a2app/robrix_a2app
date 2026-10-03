@@ -19,6 +19,7 @@ let rooms_line = "Loading rooms…"
 let picked = []
 let results = []
 let searched = false
+let search_request = 0
 
 fn mode_label(m, text){
     if mode == m { return "● " + text }
@@ -97,10 +98,21 @@ fn empty_line(){
 }
 
 fn on_results(r){
-    searched = true
+    searched = r.is_ok
     if r.is_ok {
         results = r.data.results
-        let note = "" + results.len() + " " + plural(results.len(), "result") + " in " + r.data.searched_rooms + " " + plural(r.data.searched_rooms, "room")
+        let note = "" + results.len() + " " + plural(results.len(), "result")
+        // Count only rooms represented in the permitted results.
+        let result_rooms = []
+        for result in results {
+            let seen = false
+            for room in result_rooms { if room == result.room_id { seen = true } }
+            if !seen { result_rooms.push(result.room_id) }
+        }
+        if result_rooms.len() > 0 {
+            let room_count = result_rooms.len()
+            note = note + " in " + room_count + " " + plural(room_count, "room")
+        }
         if r.data.server_used { note = note + " · server included" }
         ui.status.set_text(note)
     } else {
@@ -108,6 +120,15 @@ fn on_results(r){
         ui.status.set_text(r.error)
     }
     ui.result_list.render()
+}
+
+fn request_search(service, args){
+    search_request += 1
+    let request_id = search_request
+    host.request(service, args, fn(r){
+        if request_id != search_request { return nil }
+        on_results(r)
+    })
 }
 
 fn run_search(t){
@@ -118,7 +139,7 @@ fn run_search(t){
     }
     ui.status.set_text("Searching…")
     if mode == "room" {
-        host.request("matrix.search_room", {query: query, limit: 40, server: server}, on_results)
+        request_search("matrix.search_room", {query: query, limit: 40, server: server})
         return nil
     }
     if mode == "pick" {
@@ -126,10 +147,10 @@ fn run_search(t){
             ui.status.set_text("Pick at least one room first.")
             return nil
         }
-        host.request("matrix.search_rooms", {query: query, room_ids: picked, limit: 40, server: server}, on_results)
+        request_search("matrix.search_rooms", {query: query, room_ids: picked, limit: 40, server: server})
         return nil
     }
-    host.request("matrix.search_rooms", {query: query, limit: 40, server: server}, on_results)
+    request_search("matrix.search_rooms", {query: query, limit: 40, server: server})
 }
 
 fn open_result(i){
@@ -140,7 +161,7 @@ fn open_result(i){
 }
 
 fn on_permissions_changed(caps){
-    sync_mode()
+    if mode == "pick" && !rooms_loaded && host.has("matrix.rooms.list") { load_rooms() }
 }
 
 let _boot = start_timeout(0.05, || {
@@ -153,8 +174,8 @@ let _boot = start_timeout(0.05, || {
 
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
-    col := View{
-        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
+    col := ScrollYView{
+        width: Fill height: Fill flow: Down spacing: 10 padding: 14
         View{
             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
             q := TextInput{
@@ -188,7 +209,7 @@ View{
                 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
             }
             room_list := ScrollYView{
-                width: Fill height: 160 flow: Down spacing: 3
+                width: Fill height: Fit{max: FitBound.Rel{base: Base.Full, factor: 0.3}} flow: Down spacing: 3
                 on_item_tap: |i| toggle_pick(i)
                 on_render: || {
                     if rooms.len() == 0 {
@@ -217,7 +238,7 @@ View{
             draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
         }
         result_list := ScrollYView{
-            width: Fill height: Fill flow: Down spacing: 5
+            width: Fill height: Fill{min: 80.0} flow: Down spacing: 5
             on_item_tap: |i| open_result(i)
             on_render: || {
                 if results.len() == 0 {

@@ -9,6 +9,7 @@
 
 let keyword = "release"
 let initialized = false
+let test_pending = false
 let status = "Ready. Configure and run this app from Background tasks."
 
 fn show_status(text){
@@ -56,11 +57,15 @@ fn on_background(json){
 }
 
 fn test_alert(){
+    if test_pending { return nil }
+    test_pending = true
+    let test_keyword = keyword
     host.request("permissions.request", {perm: "matrix-room-watch"}, fn(r){
-        if !r.is_ok { show_status(r.error) return nil }
-        if !r.data.granted { show_status("Allow this app to watch this room before scheduling alerts.") return nil }
-        host.request("notify.post", {title: "Keyword Alert", body: "Test alert for '" + keyword + "'."}, fn(out){
-            if out.is_ok { show_status("Test alert shown. This room is ready for scheduled keyword alerts.") }
+        if !r.is_ok { test_pending = false show_status(r.error) return nil }
+        if !r.data.granted { test_pending = false show_status("Room watching was not allowed. Test again when you want to allow alerts.") return nil }
+        host.request("notify.post", {title: "Keyword Alert", body: "Test alert for '" + test_keyword + "'."}, fn(out){
+            test_pending = false
+            if out.is_ok { show_status("Test alert shown for '" + test_keyword + "'.") }
             else { show_status(out.error) }
         })
     })
@@ -85,7 +90,7 @@ View{
         Button{text: "Save keyword" on_click: || save()}
         Button{text: "Set up and test saved keyword" on_click: || test_alert()}
         status := Label{text: "Default keyword: release. Enable New room messages in Background tasks for this same room." width: Fill draw_text +: {color: #xD9822B text_style: theme.font_regular{font_size: 12}}}
-        Label{text: "Save a keyword, then set up and test alerts. Allow room watching and notifications for this session or longer before scheduling this room's task." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
+        Label{text: "Save a keyword, then set up and test alerts. Choose Until you quit Robrix or Forever and Approve for room watching and notifications before scheduling this room's task." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
         Label{text: "Uses new messages delivered by Robrix's live room timeline, with bounded message previews. It does not replay offline history, edits or messages dropped while a run is busy. Read protection and notification permissions always apply." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
     }
 }

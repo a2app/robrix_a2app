@@ -7,6 +7,7 @@
 
 let die_a = 1
 let die_b = 1
+let posting = false
 
 fn roll(){
     let t = floor(time_now() * 997.0)
@@ -20,10 +21,13 @@ fn roll(){
 }
 
 fn post(){
+    if posting { return nil }
     let total = die_a + die_b
     let msg = "🎲 Rolled " + die_a + " + " + die_b + " = " + total
+    posting = true
     ui.note.set_text("Posting…")
     host.request("matrix.send_message", {body: msg}, fn(r){
+        posting = false
         if r.is_ok {
             ui.note.set_text("Posted to the room!")
             return nil
@@ -35,13 +39,13 @@ fn post(){
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
     col := ScrollYView{
-        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
+        width: Fill height: Fill flow: Down spacing: 10 padding: 14
         RoundedView{
             width: Fill height: Fit align: Align{x: 0.5, y: 0.5} padding: 16 flow: Down spacing: 6
             show_bg: true
             draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
             dice := Label{
-                text: "1  ●  1" padding: 0 margin: 0
+                text: "1  ●  1" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
                 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 44} }
             }
             total := Label{
@@ -50,7 +54,7 @@ View{
             }
         }
         View{
-            width: Fill height: Fit flow: Right spacing: 10 align: Align{x: 0.5}
+            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 10 align: Align{x: 0.5}
             Button{
                 text: "Roll" on_click: || roll()
                 draw_text +: { color: #x1C274C }

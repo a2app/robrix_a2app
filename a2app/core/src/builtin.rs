@@ -77,6 +77,74 @@ fn migrate_default_declarations(manifest: &mut MiniAppManifest, stock: &MiniAppM
     manifest.normalize_permissions();
 }
 
+// A comment-only edit still creates a customized version, so it correctly
+// does not adopt later defaults wholesale. Recognize the old, locally archived
+// Search template before repairing its known fixed-height layout in place.
+// Executable edits and imported Stock claims never qualify for this repair.
+fn source_without_comment_lines(source: &str) -> String {
+    source.lines().filter(|line| {
+        let line = line.trim_start();
+        !line.is_empty() && !line.starts_with("//")
+    }).collect::<Vec<_>>().join("\n")
+}
+
+fn legacy_search_layout(source: &str) -> Option<String> {
+    let fragments = [
+        ("View{\n    width: Fill height: Fit flow: Down align: Align{x: 0.5}",
+         "View{\n    width: Fill height: Fill flow: Down align: Align{x: 0.5}"),
+        ("col := View{\n        width: Fill{max: 520.0} height: Fit flow: Down spacing: 10 padding: 14",
+         "col := ScrollYView{\n        width: Fill height: Fill flow: Down spacing: 10 padding: 14"),
+        ("result_list := ScrollYView{\n            width: Fill height: 300 flow: Down spacing: 5",
+         "result_list := ScrollYView{\n            width: Fill height: Fill{min: 80.0} flow: Down spacing: 5"),
+    ];
+    // The complete old layout must match. Do not rewrite arbitrary custom
+    // widgets merely because they happen to have a 300-pixel dimension.
+    if !fragments.iter().all(|(old, _)| source.matches(old).count() == 1) {
+        return None;
+    }
+    let mut updated = source.to_string();
+    for (old, new) in fragments { updated = updated.replacen(old, new, 1); }
+    updated = updated.replacen(
+        "room_list := ScrollYView{\n                width: Fill height: 160 flow: Down spacing: 3",
+        "room_list := ScrollYView{\n                width: Fill height: Fit{max: FitBound.Rel{base: Base.Full, factor: 0.3}} flow: Down spacing: 3",
+        1,
+    );
+    Some(updated)
+}
+
+fn repair_legacy_search(
+    manifest: &mut MiniAppManifest,
+    stock: &MiniAppManifest,
+    at_unix: u64,
+    offset_secs: i64,
+    host_version: Option<&str>,
+    host_revision: Option<&str>,
+) -> anyhow::Result<()> {
+    if manifest.id != "search" { return Ok(()); }
+    let Some(source) = legacy_search_layout(&manifest.source) else { return Ok(()) };
+    let mut working = manifest.clone();
+    working.source = source_without_comment_lines(&working.source);
+    migrate_default_declarations(&mut working, stock);
+    let known_template = crate::persistence::list_versions(&manifest.id).into_iter()
+        .filter(|version| version.origin == VersionOrigin::Stock && !version.imported)
+        .filter_map(|version| local_stock_snapshot(&manifest.id, &version.stamp))
+        .any(|snapshot| {
+            let mut previous = snapshot_manifest(stock, &snapshot);
+            previous.source = source_without_comment_lines(&previous.source);
+            migrate_default_declarations(&mut previous, stock);
+            matches_default(&working, &previous)
+        });
+    if !known_template { return Ok(()); }
+    let parent = manifest.current_version.clone();
+    manifest.source = source;
+    let mut version = crate::versions::new_version(manifest, VersionOrigin::Legacy,
+        "Robrix repaired the built-in Search layout; local edits preserved", parent.as_deref(), at_unix, offset_secs);
+    version.host_version = host_version.filter(|version| !version.is_empty()).map(str::to_string);
+    version.host_revision = host_revision.filter(|revision| !revision.is_empty()).map(str::to_string);
+    manifest.current_version = Some(crate::persistence::append_version(manifest, version)?);
+    Ok(())
+}
+
 /// Reconciles a shipped default while preserving the user's customized branch.
 ///
 /// New defaults form their own Stock lineage. Untouched apps adopt them;
@@ -134,6 +202,7 @@ pub fn reconcile_builtin_with_host(
     if !matches_current_stock && !follows_previous {
         crate::persistence::ensure_current_version(&mut manifest, VersionOrigin::Legacy,
             "Saved customized copy (date not recorded)", 0, 0)?;
+        repair_legacy_search(&mut manifest, stock, at_unix, offset_secs, host_version, host_revision)?;
     }
     // Reuse an already archived default when a state-file save was interrupted.
     let existing = if previous_fingerprint.as_deref() == Some(fingerprint.as_str()) {

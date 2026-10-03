@@ -19,6 +19,7 @@ let prefs_loading = false
 let prefs_loaded = false
 let device_loading = false
 let device_loaded = false
+let resize_pending = false
 
 let events = []
 let pane = nil
@@ -49,6 +50,8 @@ fn show_pane(){
     if side.is_nil() { side = "none" }
     ui.pane_line.set_text(pane.surface + " · side " + side + " · " + floor(pane.width) + "×" + floor(pane.height))
     ui.pane_state.set_text("foreground " + yes_no(pane.foreground))
+    ui.dock_controls.set_visible(pane.surface == "dock")
+    ui.dock_note.set_visible(pane.surface != "dock")
 }
 
 fn read_pane(){
@@ -132,8 +135,15 @@ fn pane_call(service, args){
 }
 
 fn minimize_briefly(){
-    pane_call("ui.pane.minimize", nil)
-    let _restore = start_timeout(5.0, || pane_call("ui.pane.restore", nil))
+    host.request("ui.pane.minimize", nil, fn(r){
+        if !r.is_ok {
+            log("Minimize: " + r.error)
+            ui.pane_state.set_text(r.error)
+            return nil
+        }
+        // Start the five seconds after permission and minimization have completed.
+        let _restore = start_timeout(5.0, || pane_call("ui.pane.restore", nil))
+    })
 }
 
 fn on_focus_changed(json){
@@ -151,8 +161,12 @@ fn on_surface_changed(json){
 }
 
 fn on_app_resize(w, h){
-    read_env()
-    read_pane()
+    if resize_pending { return nil }
+    resize_pending = start_timeout(0.5, || {
+        resize_pending = false
+        read_env()
+        read_pane()
+    }) != nil
 }
 
 fn on_prefs_changed(json){
@@ -221,7 +235,7 @@ let _boot = start_timeout(0.05, || {
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
     col := ScrollYView{
-        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
+        width: Fill height: Fill flow: Down spacing: 10 padding: 14
         RoundedView{
             width: Fill height: Fit flow: Down spacing: 4 padding: 12
             show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
@@ -229,8 +243,8 @@ View{
             env_line := Label{ text: "…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
             pane_line := Label{ text: "…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} } }
             pane_state := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
-            View{
-                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 6 margin: Inset{top: 4}
+            dock_controls := View{
+                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 6 margin: Inset{top: 4} visible: false
                 Button{ text: "Top" on_click: || pane_call("ui.pane.set_side", {side: "top"}) draw_text +: { color: #x1C274C } }
                 Button{ text: "Bottom" on_click: || pane_call("ui.pane.set_side", {side: "bottom"}) draw_text +: { color: #x1C274C } }
                 Button{ text: "Left" on_click: || pane_call("ui.pane.set_side", {side: "left"}) draw_text +: { color: #x1C274C } }
@@ -238,8 +252,13 @@ View{
                 Button{ text: "Pop out" on_click: || pane_call("ui.pane.break_out", nil) draw_text +: { color: #x1C274C } }
                 Button{ text: "Minimize" on_click: || pane_call("ui.pane.minimize", nil) draw_text +: { color: #x1C274C } }
                 Button{ text: "Minimize for 5 s" on_click: || minimize_briefly() draw_text +: { color: #x1C274C } }
-                Button{ text: "Close app" on_click: || pane_call("ui.pane.close", nil) draw_text +: { color: #xB91C1C } }
             }
+            dock_note := Label{
+                text: "Pane movement and minimizing are available for apps docked in a room."
+                visible: false width: Fill padding: 0 margin: 0
+                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 11} }
+            }
+            Button{ text: "Close app" on_click: || pane_call("ui.pane.close", nil) draw_text +: { color: #xB91C1C } }
         }
         RoundedView{
             width: Fill height: Fit flow: Down spacing: 4 padding: 12
@@ -258,8 +277,8 @@ View{
             text: "EVENTS · newest first" width: Fill padding: 0 margin: 0
             draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
         }
-        event_list := ScrollYView{
-            width: Fill height: 300 flow: Down spacing: 3
+        event_list := View{
+            width: Fill height: Fit flow: Down spacing: 3
             on_render: || {
                 if events.len() == 0 {
                     Label{

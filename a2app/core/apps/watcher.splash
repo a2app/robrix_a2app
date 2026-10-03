@@ -9,10 +9,16 @@
 
 let watch_pending = false
 let watch_ready = false
+let watch_generation = 0
+let test_pending = false
+let pending_test = nil
+let action_queue = []
+let action_pending = false
+let actions_paused = false
+let action_generation = 0
 
 let rules = []
 let hits = []
-let last_reply = ""
 let watch_line = "Starting…"
 let metas = ["\\", ".", "*", "+", "?", "(", ")", "[", "]", "{", "}", "|", "^", "$"]
 
@@ -21,7 +27,17 @@ fn save(){ fs.write("/rules.json", rules.to_json()) }
 fn load(){
     if fs.exists("/rules.json") {
         let parsed = fs.read("/rules.json").parse_json()
-        if parsed.is_array() { rules = parsed }
+        if parsed.is_array() {
+            for rule in parsed {
+                if rule.is_object() && rule.keyword.is_string() && rule.reply.is_string()
+                    && (rule.notify == true || rule.notify == false)
+                    && rule.keyword.trim() != "" && rule.keyword.len() <= 100 && rule.reply.len() <= 4096
+                {
+                    rules.push({keyword: rule.keyword, pattern: keyword_pattern(rule.keyword), notify: rule.notify, reply: rule.reply})
+                }
+            }
+            nil
+        }
     }
 }
 
@@ -48,13 +64,16 @@ fn show_status(){
     if !host.has("matrix.room.message.send") {
         line = line + " Replies are off until this app may send to the room."
     }
+    if actions_paused { line = line + " Automatic actions are paused. Test a rule to resume them." }
     ui.status.set_text(line)
 }
 
 fn subscribe(){
     if watch_pending || watch_ready { return nil }
     watch_pending = true
+    let generation = watch_generation
     host.request("events.subscribe", {event: "on_room_message"}, fn(r){
+        if generation != watch_generation { return nil }
         watch_pending = false
         watch_ready = r.is_ok
         if r.is_ok {
@@ -62,7 +81,12 @@ fn subscribe(){
         } else {
             watch_line = "Not watching: " + r.error
         }
-        show_status()
+        if pending_test.is_object() {
+            let test = pending_test
+            pending_test = nil
+            if r.is_ok { run_rule_test(test) }
+            else { finish_test("Test stopped: " + r.error) }
+        } else { show_status() }
     })
 }
 
@@ -70,19 +94,32 @@ fn on_permissions_changed(caps){
     if host.has("on_room_message") {
         subscribe()
     } else {
+        watch_generation = watch_generation + 1
+        action_generation = action_generation + 1
+        if watch_ready || action_pending { actions_paused = true }
+        action_queue = []
+        action_pending = false
+        watch_pending = false
         watch_ready = false
         watch_line = "Not watching: permission is off."
-        show_status()
+        if pending_test.is_object() {
+            pending_test = nil
+            finish_test("Room watching was not allowed. Test the rule again when you want to allow it.")
+        } else if !test_pending { show_status() }
     }
 }
 
 fn add_rule(){
     let keyword = ui.keyword_input.text().trim()
-    if keyword == "" {
-        ui.status.set_text("Type a keyword to watch for first.")
+    if keyword == "" || keyword.len() > 100 {
+        ui.status.set_text("Enter a keyword between 1 and 100 characters.")
         return nil
     }
     let reply = ui.reply_input.text().trim()
+    if reply.len() > 4096 {
+        ui.status.set_text("Keep the reply within 4096 characters.")
+        return nil
+    }
     rules.push({
         keyword: keyword
         pattern: keyword_pattern(keyword)
@@ -94,12 +131,50 @@ fn add_rule(){
     ui.reply_input.set_text("")
     ui.rule_list.render()
     show_status()
-    if reply != "" && !host.has("matrix.room.message.send") {
-        host.request("permissions.request", {perm: "matrix-room-send"}, fn(r){
-            if !r.is_ok { ui.status.set_text(r.error) return nil }
-            if !r.data.granted { ui.status.set_text("Rule saved. Automatic replies need permission to post to this room.") }
+}
+
+fn finish_test(text){
+    test_pending = false
+    pending_test = nil
+    ui.status.set_text(text)
+}
+
+fn complete_test(text){
+    actions_paused = false
+    finish_test(text)
+    run_next_action()
+}
+
+fn test_reply(test){
+    if test.reply == "" { complete_test("Test notification shown.") return nil }
+    host.request("matrix.send_message", {body: test.reply}, fn(r){
+        if r.is_ok { complete_test("Test reply posted to this room.") }
+        else { finish_test("Test reply failed: " + r.error) }
+    })
+}
+
+fn run_rule_test(test){
+    if test.notify {
+        host.request("notify.post", {title: "Watcher test", body: "Test alert for '" + test.keyword + "'."}, fn(r){
+            if !r.is_ok { finish_test("Test notification failed: " + r.error) return nil }
+            test_reply(test)
         })
+    } else { test_reply(test) }
+}
+
+fn test_rule(rule){
+    if test_pending { return nil }
+    if !rule.notify && rule.reply == "" {
+        ui.status.set_text("This rule has no notification or reply to test.")
+        return nil
     }
+    let test = {keyword: rule.keyword, notify: rule.notify, reply: rule.reply}
+    test_pending = true
+    ui.status.set_text("Testing '" + test.keyword + "'…")
+    if !watch_ready {
+        pending_test = test
+        subscribe()
+    } else { run_rule_test(test) }
 }
 
 fn remove_rule(i){
@@ -116,26 +191,50 @@ fn rule_line(rule){
     return line
 }
 
-// Own messages and our own replies never match, so a rule can't loop on itself.
+// Pace automatic requests and stop a denied burst after its first failure.
+fn run_next_action(){
+    if action_pending || actions_paused || !watch_ready || action_queue.len() == 0 { return nil }
+    let action = action_queue[0]
+    action_queue.remove(0)
+    action_pending = true
+    let generation = action_generation
+    host.request(action.service, action.args, fn(r){
+        if generation != action_generation { return nil }
+        if !r.is_ok {
+            actions_paused = true
+            action_queue = []
+            ui.status.set_text("Automatic actions paused: " + r.error + " Test a rule to try again.")
+        }
+        start_timeout(1.0, || {
+            if generation != action_generation { return nil }
+            action_pending = false
+            run_next_action()
+        })
+    })
+}
+
+fn queue_action(service, args){
+    if actions_paused { return nil }
+    if action_queue.len() >= 32 {
+        ui.status.set_text("Watcher is busy. Some automatic replies or notifications were skipped.")
+        return nil
+    }
+    action_queue.push({service: service, args: args})
+    run_next_action()
+}
+
+// Own messages never match, so a rule can't loop on its own replies.
 fn check(m){
     if m.is_own { return nil }
-    if m.body == last_reply { return nil }
     let line = m.sender_name + ": " + m.body
     for rule in rules {
         if regex(rule.pattern, "i").test(m.body) {
             hits.push(line)
             if rule.notify {
-                host.request("notify.post", {title: "Watcher: " + rule.keyword, body: line}, fn(r){
-                    if !r.is_ok { ui.status.set_text("Notification failed: " + r.error) }
-                })
+                queue_action("notify.post", {title: "Watcher: " + rule.keyword, body: line})
             }
             if rule.reply.len() > 0 {
-                if host.has("matrix.room.message.send") {
-                    last_reply = rule.reply
-                    host.request("matrix.send_message", {body: rule.reply}, fn(r){
-                        if !r.is_ok { ui.status.set_text("Reply failed: " + r.error) }
-                    })
-                }
+                queue_action("matrix.send_message", {body: rule.reply})
             }
         }
     }
@@ -157,7 +256,7 @@ let _boot = start_timeout(0.05, || {
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
     col := ScrollYView{
-        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
+        width: Fill height: Fill flow: Down spacing: 10 padding: 14
         status := Label{
             text: "Starting…" width: Fill padding: 0 margin: 0
             draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
@@ -177,12 +276,11 @@ View{
             }
         }
         Label{
-            text: "Rules  ·  tap one to remove it" padding: 0 margin: 0
+            text: "Rules" padding: 0 margin: 0
             draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
         }
-        rule_list := ScrollYView{
-            width: Fill height: 150 flow: Down spacing: 5
-            on_item_tap: |i| remove_rule(i)
+        rule_list := View{
+            width: Fill height: Fit flow: Down spacing: 5
             on_render: || {
                 if rules.len() == 0 {
                     Label{
@@ -190,7 +288,10 @@ View{
                         draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
                     }
                 } else {
+                    let i = 0
                     for rule in rules {
+                        let index = i
+                        i = i + 1
                         RoundedView{
                             width: Fill height: Fit flow: Down spacing: 2 padding: 8
                             show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
@@ -202,17 +303,28 @@ View{
                                 text: rule_line(rule) width: Fill padding: 0 margin: 0
                                 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 11} }
                             }
+                            View{
+                                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
+                                Button{text: "Test rule" on_click: || test_rule(rule)}
+                                Button{text: "Remove rule" on_click: || remove_rule(index)}
+                            }
                         }
                     }
+                    nil
                 }
             }
+        }
+        Label{
+            text: "Test a rule to show its notification and post its saved reply to this room. Choose Until you quit Robrix or Forever and Approve in the prompts to permit future matching messages. Adding a rule only saves it."
+            width: Fill padding: 0 margin: 0
+            draw_text +: {color: #x66708F text_style: theme.font_regular{font_size: 11}}
         }
         Label{
             text: "Recent matches" padding: 0 margin: 0
             draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
         }
-        hit_list := ScrollYView{
-            width: Fill height: 140 flow: Down spacing: 4
+        hit_list := View{
+            width: Fill height: Fit flow: Down spacing: 4
             on_render: || {
                 if hits.len() == 0 {
                     Label{

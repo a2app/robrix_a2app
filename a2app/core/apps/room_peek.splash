@@ -14,14 +14,18 @@ let pending_events = []
 
 let room_loading = false
 let room_loaded = false
+let room_refresh_pending = false
 let messages_loading = false
 let messages_loaded = false
+let messages_reload_pending = false
+let sending = false
 
 let room_name = ""
 let room_line = "Loading…"
 let live_note = ""
 let empty_line = "Loading…"
 let messages = []
+let messages_during_read = []
 let rx_queue = []
 let rx_busy = false
 
@@ -59,6 +63,10 @@ fn index_of(list, id){
 
 // One matrix.event a second: each costs 5 of a 30 token budget refilling 6 a second.
 fn fetch_reactions(){
+    if rx_queue.len() == 0 {
+        rx_busy = false
+        return nil
+    }
     let id = rx_queue[0]
     rx_queue.remove(0)
     host.request("matrix.event", {event_id: id}, fn(r){
@@ -75,9 +83,12 @@ fn fetch_reactions(){
 fn load_messages(){
     if messages_loading { return nil }
     messages_loading = true
+    messages_during_read = []
     host.request("matrix.read_messages", {limit: 15}, fn(r){
         messages_loading = false
         messages_loaded = r.is_ok
+        let live = messages_during_read
+        messages_during_read = []
         let old = messages
         let pending = rx_queue
         messages = []
@@ -85,6 +96,11 @@ fn load_messages(){
         if r.is_ok {
             empty_line = "No messages yet."
             for m in r.data.messages {
+                let live_index = index_of(live, m.event_id)
+                if live_index >= 0 {
+                    messages.push(live[live_index])
+                    continue
+                }
                 let i = index_of(old, m.event_id)
                 if i >= 0 {
                     m.reactions = old[i].reactions
@@ -99,10 +115,30 @@ fn load_messages(){
         } else {
             empty_line = r.error
         }
+        for m in live {
+            if index_of(messages, m.event_id) < 0 { messages.push(m) }
+        }
+        // Merge only events delivered during this read, ordered oldest first.
+        let i = 1
+        while i < messages.len() {
+            let j = i
+            while j > 0 && messages[j].ts < messages[j - 1].ts {
+                let previous = messages[j - 1]
+                messages[j - 1] = messages[j]
+                messages[j] = previous
+                j -= 1
+            }
+            i += 1
+        }
+        while messages.len() > 15 { messages.remove(0) }
         for id in pending {
             if index_of(messages, id) >= 0 { rx_queue.push(id) }
         }
         ui.msg_list.render()
+        if messages_reload_pending {
+            messages_reload_pending = false
+            let _reload = start_timeout(1.0, || load_messages())
+        }
         if rx_busy || rx_queue.len() == 0 { return nil }
         rx_busy = true
         fetch_reactions()
@@ -127,17 +163,21 @@ fn jump_to_message(i){
 }
 
 fn send_msg(){
-    let body = ui.msg_input.text().trim()
+    if sending { return nil }
+    let draft = ui.msg_input.text()
+    let body = draft.trim()
     if body == "" {
         ui.send_note.set_text("Type a message first.")
         return nil
     }
+    sending = true
     ui.send_note.set_text("Sending…")
     host.request("matrix.send_message", {body: body}, fn(r){
+        sending = false
         if r.is_ok {
             ui.send_note.set_text("Sent!")
-            ui.msg_input.set_text("")
-            load_messages()
+            if ui.msg_input.text() == draft { ui.msg_input.set_text("") }
+            if messages_loading { messages_reload_pending = true } else { load_messages() }
             return nil
         }
         ui.send_note.set_text(r.error)
@@ -147,8 +187,13 @@ fn send_msg(){
 fn on_room_message(json){
     let batch = json.parse_json()
     for m in batch {
+        if index_of(messages, m.event_id) >= 0 { continue }
         m.reactions = []
         messages.push(m)
+        if messages_loading {
+            messages_during_read.push(m)
+            while messages_during_read.len() > 15 { messages_during_read.remove(0) }
+        }
     }
     while messages.len() > 15 { messages.remove(0) }
     ui.msg_list.render()
@@ -176,11 +221,12 @@ fn on_room_reaction(json){
             let delta = -1
             if p.added { delta = 1 }
             rx[j].count += delta
+            if p.is_own { rx[j].mine = p.added }
             found = true
         }
         j += 1
     }
-    if !found && p.added { rx.push({key: p.key count: 1 mine: false}) }
+    if !found && p.added { rx.push({key: p.key count: 1 mine: p.is_own}) }
     rx.retain(|x| x.count > 0)
     ui.msg_list.render()
 }
@@ -196,7 +242,15 @@ fn on_room_message_changed(json){
 }
 
 fn on_room_members_changed(json){
-    load_room()
+    schedule_room_refresh()
+}
+
+fn schedule_room_refresh(){
+    if room_refresh_pending { return nil }
+    room_refresh_pending = start_timeout(1.0, || {
+        room_refresh_pending = false
+        if room_loading { schedule_room_refresh() } else { load_room() }
+    }) != nil
 }
 
 fn subscribe(name){
@@ -205,7 +259,13 @@ fn subscribe(name){
     pending_events.push(name)
     host.request("events.subscribe", {event: name}, fn(r){
         pending_events.retain(|event| event != name)
-        if r.is_ok { subscribed_events.push(name) }
+        if r.is_ok {
+            subscribed_events.push(name)
+            if subscribed_events.len() == 5 {
+                live_note = ""
+                show_room()
+            }
+        }
         if r.is_ok || live_note != "" { return nil }
         live_note = "live updates off: " + r.error
         show_room()
@@ -249,8 +309,8 @@ let _boot = start_timeout(0.05, || {
 
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
-    col := View{
-        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
+    col := ScrollYView{
+        width: Fill height: Fill flow: Down spacing: 10 padding: 14
         title_wrap := View{
             width: Fill height: Fit
             room_title := Label{
@@ -263,7 +323,7 @@ View{
             draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
         }
         msg_list := ScrollYView{
-            width: Fill height: Fill flow: Down spacing: 6
+            width: Fill height: Fill{min: 80} flow: Down spacing: 6
             on_item_tap: |i| jump_to_message(i)
             on_render: || {
                 if messages.len() == 0 {

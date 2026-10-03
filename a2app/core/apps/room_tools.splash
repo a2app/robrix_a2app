@@ -9,7 +9,7 @@
 // why-clipboard-write: Copies a room or message link when you tap.
 // why-robrix-navigation: Opens the upgraded room when you tap.
 
-// `on` stays nil until the first toggle succeeds (or matrix.unread answers).
+// Flags stay unknown until matrix.unread answers or a change succeeds.
 let unread_loading = false
 let unread_loaded = false
 let pins_loading = false
@@ -20,12 +20,14 @@ let successor_loading = false
 let successor_loaded = false
 
 let flags = [
-    {service: "matrix.favorite", on: nil, on_text: "Unfavorite", off_text: "Favorite", done_on: "Added to favorites.", done_off: "Removed from favorites."},
-    {service: "matrix.low_priority", on: nil, on_text: "Normal priority", off_text: "Low priority", done_on: "Marked low priority.", done_off: "Back to normal priority."},
-    {service: "matrix.mark_unread", on: nil, on_text: "Clear unread", off_text: "Mark unread", done_on: "Marked unread.", done_off: "Unread flag cleared."}
+    {service: "matrix.favorite", on: nil, pending: false, revision: 0, on_text: "Unfavorite", off_text: "Favorite", done_on: "Added to favorites.", done_off: "Removed from favorites."},
+    {service: "matrix.low_priority", on: nil, pending: false, revision: 0, on_text: "Normal priority", off_text: "Low priority", done_on: "Marked low priority.", done_off: "Back to normal priority."},
+    {service: "matrix.mark_unread", on: nil, pending: false, revision: 0, on_text: "Clear unread", off_text: "Mark unread", done_on: "Marked unread.", done_off: "Unread flag cleared."}
 ]
 let messages = []
 let pins = []
+let pending_pins = []
+let pins_revision = 0
 let successor = ""
 let empty_note = "Loading…"
 
@@ -42,14 +44,27 @@ fn show_flags(){
 }
 
 fn toggle(i){
+    if flags[i].pending { return nil }
+    if i < 2 && (flags[0].pending || flags[1].pending) { return nil }
     let want = true
     if !flags[i].on.is_nil() { want = !flags[i].on }
+    flags[i].pending = true
     host.request(flags[i].service, {on: want}, fn(r){
+        flags[i].pending = false
         if !r.is_ok {
             ui.status.set_text(r.error)
             return nil
         }
         flags[i].on = want
+        flags[i].revision = flags[i].revision + 1
+        if want && i == 0 {
+            flags[1].on = false
+            flags[1].revision = flags[1].revision + 1
+        }
+        if want && i == 1 {
+            flags[0].on = false
+            flags[0].revision = flags[0].revision + 1
+        }
         let note = flags[i].done_off
         if want { note = flags[i].done_on }
         ui.status.set_text(note)
@@ -60,10 +75,19 @@ fn toggle(i){
 fn load_unread(){
     if unread_loading { return nil }
     unread_loading = true
+    let favorite_revision = flags[0].revision
+    let priority_revision = flags[1].revision
+    let unread_revision = flags[2].revision
     host.request("matrix.unread", nil, fn(r){
         unread_loading = false
         unread_loaded = r.is_ok
-        if r.is_ok { flags[2].on = r.data.marked_unread }
+        if r.is_ok {
+            if !flags[0].pending && flags[0].revision == favorite_revision { flags[0].on = r.data.favorite }
+            if !flags[1].pending && flags[1].revision == priority_revision { flags[1].on = r.data.low_priority }
+            if !flags[2].pending && flags[2].revision == unread_revision { flags[2].on = r.data.marked_unread }
+        } else {
+            ui.status.set_text(r.error)
+        }
         show_flags()
     })
 }
@@ -83,8 +107,10 @@ fn pin_line(m){
 fn load_pins(){
     if pins_loading { return nil }
     pins_loading = true
+    let revision = pins_revision
     host.request("matrix.pinned_events", nil, fn(r){
         pins_loading = false
+        if revision != pins_revision { return nil }
         pins_loaded = r.is_ok
         pins = []
         if r.is_ok {
@@ -119,14 +145,18 @@ fn load_messages(){
 fn toggle_pin(i){
     if i >= messages.len() { return nil }
     let id = messages[i].event_id
+    for pending in pending_pins { if pending == id { return nil } }
     let want = !is_pinned(id)
+    pending_pins.push(id)
     host.request("matrix.pin", {event_id: id, pinned: want}, fn(r){
+        pending_pins.retain(|pending| pending != id)
         if !r.is_ok {
             ui.status.set_text(r.error)
             return nil
         }
+        pins_revision += 1
         if want {
-            pins.push(id)
+            if !is_pinned(id) { pins.push(id) }
             ui.status.set_text("Pinned.")
         } else {
             pins.retain(|p| p != id)
@@ -169,6 +199,7 @@ fn load_successor(){
         successor_loaded = r.is_ok
         successor = ""
         if r.is_ok && r.data.upgraded { successor = r.data.room_id }
+        if !r.is_ok { ui.status.set_text(r.error) }
         if successor.is_nil() { successor = "" }
         ui.upgraded_wrap.set_visible(successor != "")
     })
@@ -187,17 +218,19 @@ fn load_all(){
     load_successor()
 }
 
-fn on_permissions_changed(caps){ if !unread_loaded { load_unread() }
-    if !pins_loaded { load_pins() }
-    if !messages_loaded { load_messages() }
-    if !successor_loaded { load_successor() } }
+fn on_permissions_changed(caps){
+    if !unread_loaded && host.has("matrix.room.unread.read") { load_unread() }
+    if !pins_loaded && host.has("matrix.room.pins.read") { load_pins() }
+    if !messages_loaded && host.has("matrix.room.messages.read") { load_messages() }
+    if !successor_loaded && host.has("matrix.room.successor.read") { load_successor() }
+}
 
 let _boot = start_timeout(0.05, || load_all())
 
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
-    col := View{
-        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
+    col := ScrollYView{
+        width: Fill height: Fill flow: Down spacing: 10 padding: 14
         status := Label{
             text: "Each button changes this room only when you tap it." width: Fill padding: 0 margin: 0
             draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
@@ -227,7 +260,7 @@ View{
             draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
         }
         msg_list := ScrollYView{
-            width: Fill height: Fill flow: Down spacing: 5
+            width: Fill height: Fill{min: 80} flow: Down spacing: 5
             on_item_tap: |i| toggle_pin(i)
             on_render: || {
                 if messages.len() == 0 {

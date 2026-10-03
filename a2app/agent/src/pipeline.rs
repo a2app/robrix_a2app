@@ -605,8 +605,13 @@ fn guide_section(slim: bool) -> String {
 /// app that only works phone-shaped is a broken deliverable.
 const RESPONSIVE_POLICY: &str = "The app MUST lay out well and stay fully usable at ANY host size — \
      fullscreen phone, a narrow (~190pt) or short (~250pt) split-screen pane, \
-     or a wide desktop window. Cap+center the content column with \
-     `width: Fill{max: N}` under an `align: Align{x: 0.5}` parent, and when \
+     or a wide desktop window. Fill the available pane: root and content column \
+     use `width: Fill height: Fill`, controls use `height: Fit`, and primary \
+     scrolling lists use `height: Fill{min: 80}` for the remaining space. Make \
+     the content column itself a ScrollYView so controls remain reachable in \
+     short panes. Never cap the whole content column's width or use fixed \
+     result-list heights. Keep tappable dynamic lists as ScrollYView so item \
+     dragging scrolls correctly. When \
      fixed sizes or fonts must differ by size, define `fn on_app_resize(w, h)` \
      and toggle pre-declared tier Views (see the guide's \"runs at ANY size\" \
      section).";

@@ -21,7 +21,7 @@ let invite_note = "Loading…"
 let unread_note = "Loading…"
 let pick_id = ""
 let pick_name = ""
-let pick_verb = ""
+let invite_answer_loading = false
 
 fn plural(n, word){
     if "" + n == "1" { return word }
@@ -72,17 +72,22 @@ fn pick_invite(i){
 }
 
 fn answer_invite(accept){
-    if pick_id == "" { return nil }
-    pick_verb = "Declined"
-    if accept { pick_verb = "Accepted" }
+    if pick_id == "" || invite_answer_loading { return nil }
+    let answered_id = pick_id
+    let answered_name = pick_name
+    let verb = "Declined"
+    if accept { verb = "Accepted" }
+    invite_answer_loading = true
     ui.pick_note.set_text("One moment…")
-    host.request("matrix.invite_respond", {room_id: pick_id, accept: accept}, fn(r){
+    host.request("matrix.invite_respond", {room_id: answered_id, accept: accept}, fn(r){
+        invite_answer_loading = false
         if !r.is_ok {
-            ui.pick_note.set_text(r.error)
+            if pick_id == answered_id { ui.pick_note.set_text(r.error) }
+            ui.status.set_text(r.error)
             return nil
         }
-        ui.pick_note.set_text("")
-        ui.status.set_text(pick_verb + " the invite to " + pick_name)
+        if pick_id == answered_id { ui.pick_note.set_text("") }
+        ui.status.set_text(verb + " the invite to " + answered_name)
         load_invites()
     })
 }
@@ -194,8 +199,8 @@ fn watch(){
 }
 
 fn on_permissions_changed(caps){
-    if !invites_loaded { load_invites() }
-    if !unread_loaded { load_unread() }
+    if !invites_loaded && host.has("matrix.rooms.invites.list") { load_invites() }
+    if !unread_loaded && host.has("matrix.rooms.list") { load_unread() }
     watch_granted()
 }
 
@@ -206,8 +211,8 @@ let _boot = start_timeout(0.05, || {
 
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
-    col := View{
-        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
+    col := ScrollYView{
+        width: Fill height: Fill flow: Down spacing: 10 padding: 14
         View{
             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
             totals := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
@@ -216,7 +221,7 @@ View{
         status := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
         invite_head := Label{ text: "INVITES" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
         invite_list := ScrollYView{
-            width: Fill height: Fit{max: FitBound.Abs(140.0)} flow: Down spacing: 5
+            width: Fill height: Fit{max: FitBound.Rel{base: Base.Full, factor: 0.35}} flow: Down spacing: 5
             on_item_tap: |i| pick_invite(i)
             on_render: || {
                 if invites.len() == 0 {
@@ -246,7 +251,7 @@ View{
                 show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
                 pick_title := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 14} } }
                 View{
-                    width: Fill height: Fit flow: Right spacing: 8
+                    width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
                     Button{ text: "Accept" on_click: || answer_invite(true) draw_text +: { color: #x138808 } }
                     Button{ text: "Decline" on_click: || answer_invite(false) draw_text +: { color: #xB91C1C } }
                 }
@@ -255,7 +260,7 @@ View{
         }
         unread_head := Label{ text: "UNREAD" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
         unread_list := ScrollYView{
-            width: Fill height: Fill flow: Down spacing: 5
+            width: Fill height: Fill{min: 80} flow: Down spacing: 5
             on_item_tap: |i| open_room(i)
             on_render: || {
                 if unread.len() == 0 {

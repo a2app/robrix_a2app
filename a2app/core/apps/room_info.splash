@@ -48,7 +48,7 @@ let _boot = start_timeout(0.05, || load())
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
     col := ScrollYView{
-        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
+        width: Fill height: Fill flow: Down spacing: 10 padding: 14
         room_name := Label{
             text: "Loading…" padding: 0 margin: 0
             width: Fill

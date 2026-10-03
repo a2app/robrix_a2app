@@ -15,13 +15,14 @@ let threads_loaded = false
 let thread_loading = ""
 let thread_request = 0
 let thread_loaded = false
+let live_refresh_pending = false
 
 let items = []
 let open_id = ""
 let replies = []
 let status = "Loading…"
 let live_note = ""
-let empty_msg = "Nothing to show. This app needs to be opened from a room, and needs your permission to read it."
+let empty_msg = "Loading threads…"
 let reply_empty = ""
 
 fn show_header(){ ui.header.set_text(status + live_note) }
@@ -41,7 +42,7 @@ fn load(){
             if items.len() == 0 { status = "No threads yet" }
         } else {
             items = []
-            empty_msg = "Nothing to show. This app needs to be opened from a room, and needs your permission to read it."
+            empty_msg = r.error
             status = r.error
         }
         show_header()
@@ -119,11 +120,19 @@ fn open_in_robrix(){
 }
 
 fn on_room_message(json){
-    if open_id != "" {
-        load_thread()
-        return nil
-    }
-    load()
+    schedule_live_refresh()
+}
+
+fn schedule_live_refresh(){
+    if live_refresh_pending { return nil }
+    live_refresh_pending = start_timeout(1.0, || {
+        live_refresh_pending = false
+        if threads_loading || thread_loading != "" {
+            schedule_live_refresh()
+        } elif open_id != "" {
+            load_thread()
+        } else { load() }
+    }) != nil
 }
 
 fn watch(){
@@ -153,17 +162,17 @@ let _boot = start_timeout(0.05, || {
 
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
-    col := View{
-        width: Fill{max: 460.0} height: Fill flow: Down spacing: 10 padding: 14
-        list_wrap := View{
-            width: Fill height: Fill flow: Down spacing: 10
+    col := ScrollYView{
+        width: Fill height: Fill flow: Down spacing: 10 padding: 14
+        list_wrap := ScrollYView{
+            width: Fill height: Fill{min: 120} flow: Down spacing: 10
             header := Label{
                 text: "Loading…" padding: 0 margin: 0
                 width: Fill
                 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
             }
             item_list := ScrollYView{
-                width: Fill height: Fill flow: Down spacing: 5
+                width: Fill height: Fill{min: 80} flow: Down spacing: 5
                 on_item_tap: |i| open_thread(i)
                 on_render: || {
                     if items.len() == 0 {
@@ -200,8 +209,8 @@ View{
                 }
             }
         }
-        thread_wrap := View{
-            width: Fill height: Fill flow: Down spacing: 10 visible: false
+        thread_wrap := ScrollYView{
+            width: Fill height: Fill{min: 120} flow: Down spacing: 10 visible: false
             View{
                 width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 6
                 Button{
@@ -219,7 +228,7 @@ View{
                 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
             }
             reply_list := ScrollYView{
-                width: Fill height: Fill flow: Down spacing: 5
+                width: Fill height: Fill{min: 80} flow: Down spacing: 5
                 on_render: || {
                     if replies.len() == 0 {
                         Label{
