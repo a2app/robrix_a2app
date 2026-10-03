@@ -313,6 +313,9 @@ pub enum BrokerAsk {
     Network { reply: Reply, app_id: MiniAppId, room: Option<String>, args: serde_json::Value, consent: Box<PermissionStore> },
     /// Queue a runtime-permission prompt. `request`, when present, is parked
     /// until the user answers (re-dispatch on allow, deny-respond on deny).
+    /// One explicit setup request for several declared permission groups.
+    /// The host returns one result after every item has been decided.
+    PermissionBatch { app_id: MiniAppId, request: SplashHostRequest, perms: Vec<Permission> },
     Prompt {
         app_id: MiniAppId,
         perm: Permission,
@@ -541,7 +544,7 @@ pub fn can_enable_permission_writes(store: &PermissionStore, manifest: &crate::m
 /// A group query describes whether this instance can already use a declared
 /// capability. It does not create a group grant: every subsequent operation
 /// still checks its own capability and actual room target.
-fn permission_request_status(
+pub fn permission_request_status(
     store: &PermissionStore,
     manifest: &crate::manifest::MiniAppManifest,
     permission: Permission,
@@ -564,6 +567,49 @@ fn permission_request_status(
         all_denied &= effective == Effective::Denied;
     }
     if any && all_denied { Effective::Denied } else { base }
+}
+
+/// Setup covers every declared ability in the requested group. One previously
+/// approved ability must not hide another ability that still needs consent.
+pub fn permission_setup_status(store: &PermissionStore, manifest: &crate::manifest::MiniAppManifest,
+    permission: Permission, context: PermissionContext<'_>) -> Effective
+{
+    let base = store.effective_for_in_context(&manifest.id, |p| manifest.declares(p), permission, context);
+    if matches!(base, Effective::Denied | Effective::Undeclared) { return base; }
+    let mut any = false;
+    let mut blocked = false;
+    let mut pending = false;
+    for capability in crate::capabilities::in_group(permission)
+        .filter(|cap| cap.is_available() && manifest.declares_capability(cap))
+    {
+        any = true;
+        let effective = if is_room_collection(capability) {
+            store.effective_collection_capability_in_context(manifest, capability, context)
+        } else { store.effective_capability_in_context(manifest, capability, context) };
+        pending |= effective == Effective::NeedsPrompt;
+        blocked |= matches!(effective, Effective::Denied | Effective::Undeclared);
+    }
+    if blocked { Effective::Denied } else if pending { Effective::NeedsPrompt } else if any { Effective::Granted } else { base }
+}
+
+/// Validate the entire batch before the host can create any consent.
+pub fn permission_batch_groups(args: &serde_json::Value, manifest: &crate::manifest::MiniAppManifest,
+    origin_room: Option<&str>) -> Result<Vec<Permission>, String>
+{
+    let values = args["perms"].as_array().filter(|values| !values.is_empty() && values.len() <= 32)
+        .ok_or("Choose between one and 32 permissions for setup.")?;
+    let mut perms = Vec::new();
+    for value in values {
+        let perm = value.as_str().and_then(Permission::from_str).ok_or("Unknown setup permission.")?;
+        if !manifest.declares(perm) { return Err(format!("This app does not declare {}.", perm.as_str())); }
+        if perm == Permission::Network { return Err("Internet access needs a specific website request.".into()); }
+        if origin_room.is_none() && matches!(perm, Permission::MatrixRoomRead | Permission::MatrixRoomInfo
+            | Permission::MatrixRoomWatch | Permission::MatrixRoomSend | Permission::MatrixRoomInteract
+            | Permission::MatrixRoomManage | Permission::MatrixRoomInvite | Permission::MatrixRoomAppData)
+        { return Err("Open this mini-app from a room to use these features.".into()); }
+        if !perms.contains(&perm) { perms.push(perm); }
+    }
+    Ok(perms)
 }
 
 pub struct Broker {
@@ -1040,6 +1086,24 @@ impl Broker {
                 respond(cx, reply, Ok(&serde_json::Value::Object(map).to_string()));
             }
             "permissions.request" => {
+                if args.get("perms").is_some() {
+                    let perms = match permission_batch_groups(&args, &manifest, instance_room.as_deref()) {
+                        Ok(perms) => perms,
+                        Err(error) => return respond(cx, reply, Err(&error)),
+                    };
+                    // This asks only about declared access, never approves a
+                    // future outgoing effect or an unspecified Internet host.
+                    // Actual effects retain their separate IFC sink checks.
+                    if may_prompt {
+                        asks.push(BrokerAsk::PermissionBatch { app_id: manifest.id.clone(), request: req, perms });
+                    } else {
+                        let answers: serde_json::Map<String, serde_json::Value> = perms.iter().map(|perm|
+                            (perm.as_str().into(), (permission_setup_status(ctx.permissions, &manifest, *perm, context) == Effective::Granted).into())).collect();
+                        let granted = answers.values().all(|answer| answer.as_bool() == Some(true));
+                        respond(cx, reply, Ok(&serde_json::json!({ "granted": granted, "permissions": answers }).to_string()));
+                    }
+                    return;
+                }
                 let Some(perm) = args["perm"].as_str().and_then(Permission::from_str) else {
                     return respond(cx, reply, Err("unknown permission"));
                 };
@@ -1718,6 +1782,45 @@ mod room_context_tests {
         assert_eq!(store.effective_capability_in_context(&manifest, denied, context), Effective::Denied);
         store.set_global_policy(RoomAccess::Read, PolicyDecision::Deny);
         assert_eq!(permission_request_status(&store, &manifest, Permission::MatrixRoomRead, context), Effective::Denied);
+    }
+
+    #[test]
+    fn setup_validates_every_permission_before_returning_a_batch() {
+        let manifest = permission_manifest(&[Permission::MatrixRoomRead, Permission::MatrixProfile, Permission::Network], &[]);
+        let room = Some("!room:s");
+        let groups = permission_batch_groups(&serde_json::json!({ "perms": ["matrix-room-read", "matrix-profile", "matrix-room-read"] }), &manifest, room).unwrap();
+        assert_eq!(groups, vec![Permission::MatrixRoomRead, Permission::MatrixProfile]);
+        for args in [
+            serde_json::json!({ "perms": [] }),
+            serde_json::json!({ "perms": "matrix-profile" }),
+            serde_json::json!({ "perms": ["matrix-profile", "location"] }),
+            serde_json::json!({ "perms": ["matrix-profile", "network"] }),
+            serde_json::json!({ "perms": ["matrix-profile", 7] }),
+            serde_json::json!({ "perms": vec!["matrix-profile"; 33] }),
+        ] { assert!(permission_batch_groups(&args, &manifest, room).is_err()); }
+        assert!(permission_batch_groups(&serde_json::json!({ "perms": ["matrix-room-read"] }), &manifest, None).is_err());
+        assert_eq!(permission_batch_groups(&serde_json::json!({ "perms": ["matrix-profile"] }), &manifest, None).unwrap(), vec![Permission::MatrixProfile]);
+    }
+
+    #[test]
+    fn setup_requires_all_declared_abilities_and_hard_denials_take_precedence() {
+        let manifest = permission_manifest(&[Permission::MatrixRoomRead], &["matrix.room.messages.read", "matrix.room.members.read"]);
+        let mut store = PermissionStore::default();
+        let context = PermissionContext { origin_room: Some("!room:s"), target_room: Some("!room:s") };
+        let first = store.grant_scoped(&manifest.id, Permission::MatrixRoomRead, Some("matrix.room.messages.read"),
+            crate::permissions::RoomScope::room("!room:s"), crate::permissions::GrantDuration::RobrixSession, context.origin_room).unwrap();
+        assert_eq!(permission_request_status(&store, &manifest, Permission::MatrixRoomRead, context), Effective::Granted);
+        assert_eq!(permission_setup_status(&store, &manifest, Permission::MatrixRoomRead, context), Effective::NeedsPrompt);
+        store.set_capability(&manifest.id, "matrix.room.members.read", crate::permissions::GrantState::Denied);
+        assert_eq!(permission_setup_status(&store, &manifest, Permission::MatrixRoomRead, context), Effective::Denied);
+        store.remove_scoped_grant(first);
+        assert_eq!(permission_setup_status(&store, &manifest, Permission::MatrixRoomRead, context), Effective::Denied);
+        store.set_capability(&manifest.id, "matrix.room.members.read", crate::permissions::GrantState::Ask);
+        store.grant_scoped(&manifest.id, Permission::MatrixRoomRead, None,
+            crate::permissions::RoomScope::room("!room:s"), crate::permissions::GrantDuration::RobrixSession, context.origin_room).unwrap();
+        assert_eq!(permission_setup_status(&store, &manifest, Permission::MatrixRoomRead, context), Effective::Granted);
+        store.set_room_policy("!room:s", RoomAccess::Read, PolicyDecision::Deny);
+        assert_eq!(permission_setup_status(&store, &manifest, Permission::MatrixRoomRead, context), Effective::Denied);
     }
 }
 

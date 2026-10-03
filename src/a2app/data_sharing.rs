@@ -43,7 +43,7 @@ script_mod! {
             rules_page := View {
                 width: Fill, height: Fit, flow: Down, spacing: 12
                 SubsectionLabel { text: "Saved permissions", margin: 0 }
-                PermissionOptionLabel { text: "Apps ask directly when they need permission. Review saved sharing rules and action approvals here. Needs attention shows blocked requests; History records previous checks." }
+                PermissionOptionLabel { text: "Apps ask directly when they need permission. You can remove an app's approvals from its regular Permissions panel. This optional advanced view shows sharing rules, action approvals, blocked requests, and previous checks." }
                 new_rule := RobrixPositiveIconButton { text: "Add sharing rule", padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0} }
                 current_rules := PermissionOptionLabel {}
                 sharing_error := PermissionOptionLabel { visible: false, draw_text +: { color: (COLOR_FG_DANGER_RED) } }
@@ -53,12 +53,12 @@ script_mod! {
             rule_details_page := View {
                 visible: false, width: Fill, height: Fit, flow: Down, spacing: 12
                 rule_back := TextButton { text: "Back to rules" }
-                SubsectionLabel { text: "Sharing permission", margin: 0 }
+                SubsectionLabel { text: "Saved approval", margin: 0 }
                 saved_rule_details := PermissionOptionLabel {}
                 saved_identifiers_toggle := TextButton { text: "Show identifiers" }
                 saved_identifiers := PermissionOptionLabel { visible: false }
                 remove_button := RobrixNegativeIconButton { text: "Remove this permission", padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0} }
-                PermissionOptionLabel { text: "Removing permission stops future requests and cancels active private-data work. It cannot recall anything already sent." }
+                PermissionOptionLabel { text: "Removing this approval stops affected work. Reopen the app or repeat your agent request to continue. Other approvals may still apply; Block this permission in the app's Permissions panel turns the feature off. Your saved data is kept; data already sent cannot be recalled." }
             }
             wizard := View {
                 visible: false, width: Fill, height: Fit, flow: Down, spacing: 12

@@ -470,6 +470,10 @@ pub struct PermissionStore {
     /// grant when its last scoped allowance expires or is removed.
     #[serde(default)]
     scoped_ask: BTreeMap<String, BTreeSet<String>>,
+    /// An explicit Ask again choice must prompt even where shared room rules
+    /// normally skip consent. This differs from an expired narrowed grant.
+    #[serde(default)]
+    explicit_review: BTreeMap<String, BTreeSet<String>>,
     #[serde(default)]
     network: Vec<NetworkGrant>,
     #[serde(skip)]
@@ -837,6 +841,14 @@ impl PermissionStore {
         self.tool_denied.contains(&(subject.to_string(), tool.to_string()))
     }
 
+    /// A fresh user-initiated attempt can review refused tools again while
+    /// preserving the unchanged tools the user already approved.
+    pub fn clear_tool_denials_for(&mut self, subject: &str) -> bool {
+        let before = self.tool_denied.len();
+        self.tool_denied.retain(|(owner, _)| owner != subject);
+        self.tool_denied.len() != before
+    }
+
     /// Whether `subject` holds any answer that lasts only for this session —
     /// a one-time allow (group, host or tool) or a one-time refusal. A UI
     /// offering to forget them needs to know they exist: nothing else lists
@@ -968,6 +980,7 @@ impl PermissionStore {
         self.scoped.clear();
         self.session_scoped.clear();
         self.scoped_ask.clear();
+        self.explicit_review.clear();
         self.network.clear();
         self.session_network.clear();
         self.request_once.clear();
@@ -981,6 +994,51 @@ impl PermissionStore {
         self.strict = false;
         self.matrix_write = false;
         self.room_policies = None;
+    }
+
+    /// Forget one subject's consent without changing room protection, its
+    /// audit history, usage receipts, or a separate abuse restriction.
+    pub fn reset_subject(&mut self, subject: &str) {
+        for permission in Permission::ALL { self.ask_again(subject, permission); }
+        let ids = self.scoped.iter().chain(&self.session_scoped)
+            .filter(|grant| grant.subject == subject).map(|grant| grant.id).collect::<Vec<_>>();
+        for id in ids { self.remove_scoped_grant(id); }
+        self.grants.remove(subject);
+        self.cap_overrides.remove(subject);
+        self.until.remove(subject);
+        self.scoped_ask.remove(subject);
+        self.explicit_review.remove(subject);
+    }
+
+    /// Withdraw every saved answer and allowance for a permission group.
+    /// Normal-tier abilities must also ask on their next use: removing a
+    /// narrowed allowance must never restore an automatic global grant.
+    pub fn ask_again(&mut self, subject: &str, permission: Permission) {
+        self.set(subject, permission, GrantState::Ask);
+        self.once.remove(&(subject.to_string(), permission));
+        if let Some(expiries) = self.until.get_mut(subject) { expiries.remove(permission.as_str()); }
+        if let Some(overrides) = self.cap_overrides.get_mut(subject) {
+            overrides.retain(|id, _| crate::capabilities::by_id(id).is_none_or(|cap| cap.group != Some(permission)));
+        }
+        let ids = self.scoped.iter().chain(&self.session_scoped)
+            .filter(|grant| grant.subject == subject && grant.permission == permission.as_str())
+            .map(|grant| grant.id).collect::<Vec<_>>();
+        for id in ids { self.remove_scoped_grant(id); }
+        match permission {
+            Permission::Network => {
+                self.net_hosts.remove(subject);
+                self.net_once.retain(|(owner, _)| owner != subject);
+                let ids = self.network.iter().chain(&self.session_network)
+                    .filter(|grant| grant.subject == subject).map(|grant| grant.id).collect::<Vec<_>>();
+                for id in ids { self.remove_network_grant(id); }
+            }
+            Permission::MatrixRoomsRead => { self.read_rooms.remove(subject); }
+            Permission::MatrixRoomsSend => { self.send_rooms.remove(subject); }
+            Permission::McpTools => { self.clear_tool_grants_for(subject); }
+            _ => {}
+        }
+        self.scoped_ask.entry(subject.to_string()).or_default().insert(permission.as_str().to_string());
+        self.explicit_review.entry(subject.to_string()).or_default().insert(permission.as_str().to_string());
     }
 
     /// Bars an app from running after it abused the host bridge. This is the
@@ -1057,6 +1115,7 @@ impl PermissionStore {
         self.scoped.retain(|g| g.subject != app_id);
         self.session_scoped.retain(|g| g.subject != app_id);
         self.scoped_ask.remove(app_id);
+        self.explicit_review.remove(app_id);
         self.network.retain(|g| g.subject != app_id);
         self.session_network.retain(|g| g.subject != app_id);
         self.clear_once_for(app_id);
@@ -1151,11 +1210,16 @@ impl PermissionStore {
         match (stored, perm.tier()) {
             (GrantState::Granted, _) => Effective::Granted,
             (GrantState::Denied, _) => Effective::Denied,
+            (GrantState::Ask, _) if self.needs_explicit_review(subject, perm) => Effective::NeedsPrompt,
             // Strict mode stops normal tiers auto-granting: everything has to
             // be allowed on purpose.
             (GrantState::Ask, Tier::Normal) if !self.strict => Effective::Granted,
             (GrantState::Ask, _) => Effective::NeedsPrompt,
         }
+    }
+
+    fn needs_explicit_review(&self, subject: &str, permission: Permission) -> bool {
+        self.explicit_review.get(subject).is_some_and(|permissions| permissions.contains(permission.as_str()))
     }
 
     /// Whether the permission is usable right now (prompt-pending counts as
@@ -1336,6 +1400,136 @@ impl PermissionStore {
         let apps = self.apps_declaring(registry, perm);
         let allowed = apps.iter().filter(|(_, e)| *e == Effective::Granted).count();
         (allowed, apps.len())
+    }
+}
+
+#[cfg(test)]
+mod consent_reset_tests {
+    use super::*;
+
+    #[test]
+    fn retrying_tool_denials_preserves_approved_tools_and_other_subjects() {
+        let mut store = PermissionStore::default();
+        store.allow_tool("app", "approved", "content");
+        store.allow_tool_once("app", "once", "content");
+        store.deny_tool("app", "refused");
+        store.deny_tool("other", "refused");
+        assert!(store.clear_tool_denials_for("app"));
+        assert!(!store.is_tool_denied("app", "refused"));
+        assert!(store.is_tool_denied("other", "refused"));
+        assert_eq!(store.tool_grant("app", "approved"), Some("content"));
+        assert!(store.has_tool_once("app", "once"));
+        assert!(!store.clear_tool_denials_for("app"));
+    }
+
+    #[test]
+    fn subject_reset_keeps_receipts_other_apps_and_room_safety() {
+        let mut store = PermissionStore::default();
+        store.set_matrix_write(true);
+        store.set_room_policy("!protected", RoomAccess::Read, PolicyDecision::Deny);
+        store.restrict("app", "unsafe behavior", 4, 5);
+        store.record_access("app", Permission::Location, 10);
+        store.set("app", Permission::Location, GrantState::Granted);
+        store.set("other", Permission::Location, GrantState::Granted);
+        store.grant_scoped("app", Permission::Location, None, RoomScope::AllRooms, GrantDuration::Always, None).unwrap();
+        let network = store.allow_network("app", NetworkScope::Origin("https://example.com".into()), RoomScope::AllRooms, GrantDuration::RobrixSession, None).unwrap();
+        store.mark_network_request_once(network);
+        store.allow_host_once("app", "example.com");
+        store.reset_subject("app");
+        assert_eq!(store.state("app", Permission::Location), GrantState::Ask);
+        assert_eq!(store.state("other", Permission::Location), GrantState::Granted);
+        assert!(store.scoped_grants("app").is_empty());
+        assert!(store.network_grants("app").is_empty());
+        assert!(!store.request_once.contains(&network));
+        assert!(store.matrix_write());
+        assert_eq!(store.room_policy(Some("!protected"), RoomAccess::Read), PolicyDecision::Deny);
+        assert!(store.is_restricted("app"));
+        assert!(!store.explicit_review.contains_key("app"));
+        assert_eq!(store.use_count("app", Permission::Location), 1);
+        assert_eq!(store.last_access("app", Permission::Location), Some(10));
+    }
+
+    #[test]
+    fn ask_again_removes_every_group_allowance_and_does_not_restore_normal_auto_access() {
+        let mut store = PermissionStore::default();
+        let permission = Permission::MatrixRoomInfo;
+        let cap = crate::capabilities::by_id("matrix.room.info.read").unwrap();
+        store.set("app", permission, GrantState::Granted);
+        store.set_capability("app", cap.id, GrantState::Granted);
+        store.grant_once("app", permission);
+        store.grant_until("app", permission, u64::MAX);
+        let grant = store.grant_scoped("app", permission, None, RoomScope::AllRooms, GrantDuration::RobrixSession, None).unwrap();
+        store.mark_request_once(grant);
+        store.set("app", Permission::Location, GrantState::Granted);
+        store.ask_again("app", permission);
+        assert_eq!(store.state("app", permission), GrantState::Ask);
+        assert_eq!(store.capability_state("app", cap.id), GrantState::Ask);
+        assert!(!store.has_once("app", permission));
+        assert!(store.scoped_grants("app").is_empty());
+        assert!(!store.request_once.contains(&grant));
+        assert_eq!(store.effective_capability_for_in_context("app", |_| true, |_| true, cap, PermissionContext::default()), Effective::NeedsPrompt);
+        assert_eq!(store.state("app", Permission::Location), GrantState::Granted);
+    }
+
+    #[test]
+    fn ask_again_overrides_implicit_room_allowances_until_new_scoped_consent() {
+        let cap = crate::capabilities::by_id("matrix.room.messages.read").unwrap();
+        let permission = Permission::MatrixRoomRead;
+        let context = PermissionContext { origin_room: Some("!room"), target_room: Some("!room") };
+        let other = PermissionContext { origin_room: Some("!other"), target_room: Some("!other") };
+        for allowance in ["global", "room", "space"] {
+            let mut store = PermissionStore::default();
+            store.set_room_spaces("!room", vec!["!space".into()]);
+            match allowance {
+                "global" => store.set_global_policy(RoomAccess::Read, PolicyDecision::Allow),
+                "room" => store.set_room_policy("!room", RoomAccess::Read, PolicyDecision::Allow),
+                _ => store.set_space_policy("!space", RoomAccess::Read, PolicyDecision::Allow),
+            }
+            assert_eq!(store.effective_capability_for_in_context("app", |_| true, |_| true, cap, context), Effective::Granted);
+            store.ask_again("app", permission);
+            let bytes = serde_json::to_vec(&store).unwrap();
+            store = serde_json::from_slice(&bytes).unwrap();
+            store.set_room_spaces("!room", vec!["!space".into()]);
+            assert_eq!(store.effective_capability_for_in_context("app", |_| true, |_| true, cap, context), Effective::NeedsPrompt,
+                "Ask again must survive restart and override the {allowance} implicit allowance");
+            let grant = store.grant_scoped("app", permission, Some(cap.id), RoomScope::room("!room"), GrantDuration::RobrixSession, Some("!room")).unwrap();
+            assert_eq!(store.effective_capability_for_in_context("app", |_| true, |_| true, cap, context), Effective::Granted);
+            assert_eq!(store.effective_capability_for_in_context("app", |_| true, |_| true, cap, other), Effective::NeedsPrompt);
+            store.set_room_policy("!room", RoomAccess::Read, PolicyDecision::Deny);
+            assert_eq!(store.effective_capability_for_in_context("app", |_| true, |_| true, cap, context), Effective::Denied,
+                "an explicit review and approval cannot weaken a hard room block");
+            store.set_room_policy("!room", RoomAccess::Read, PolicyDecision::Ask);
+            store.remove_scoped_grant(grant);
+            assert_eq!(store.effective_capability_for_in_context("app", |_| true, |_| true, cap, context), Effective::NeedsPrompt);
+            store.set("app", permission, GrantState::Granted);
+            assert_eq!(store.effective_capability_for_in_context("app", |_| true, |_| true, cap, context), Effective::Granted);
+        }
+    }
+
+    #[test]
+    fn ask_again_overrides_collection_whitelists_without_changing_ordinary_narrowed_grants() {
+        let cap = crate::capabilities::by_id("matrix.rooms.messages.search").unwrap();
+        let mut store = PermissionStore::default();
+        store.set_global_policy(RoomAccess::Read, PolicyDecision::Allow);
+        let context = PermissionContext { origin_room: Some("!room"), target_room: Some("!room") };
+        let evaluate = |store: &PermissionStore| store.effective_collection_capability_for_in_context("app", |_| true, |_| true, cap, context);
+        assert_eq!(evaluate(&store), Effective::Granted);
+        let grant = store.grant_scoped("app", Permission::MatrixRoomsRead, Some(cap.id), RoomScope::room("!room"), GrantDuration::RobrixSession, Some("!room")).unwrap();
+        store.remove_scoped_grant(grant);
+        assert_eq!(evaluate(&store), Effective::Granted, "ordinary narrowed-grant expiry still follows the shared room rule");
+        store.ask_again("app", Permission::MatrixRoomsRead);
+        assert_eq!(evaluate(&store), Effective::NeedsPrompt);
+        store.grant_scoped("app", Permission::MatrixRoomsRead, Some(cap.id), RoomScope::room("!room"), GrantDuration::RobrixSession, Some("!room")).unwrap();
+        assert_eq!(evaluate(&store), Effective::Granted);
+        store.set_capability("app", cap.id, GrantState::Denied);
+        assert_eq!(evaluate(&store), Effective::Denied);
+        store.set_capability("app", cap.id, GrantState::Ask);
+        store.set_global_policy(RoomAccess::Read, PolicyDecision::Deny);
+        assert_eq!(evaluate(&store), Effective::Denied);
+        store.reset_subject("app");
+        assert!(!store.explicit_review.contains_key("app"));
+        store.set_global_policy(RoomAccess::Read, PolicyDecision::Allow);
+        assert_eq!(evaluate(&store), Effective::Granted, "Reset permissions restores the default policy interpretation");
     }
 }
 

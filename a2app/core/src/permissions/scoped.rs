@@ -556,6 +556,10 @@ impl PermissionStore {
         self.scoped.iter().chain(&self.session_scoped).filter(|g| g.subject == subject).collect()
     }
 
+    pub fn scoped_grant(&self, id: u64) -> Option<&ScopedGrant> {
+        self.scoped.iter().chain(&self.session_scoped).find(|grant| grant.id == id)
+    }
+
     pub fn remove_scoped_grant(&mut self, id: u64) -> bool {
         self.request_once.remove(&id);
         let before = self.scoped.len() + self.session_scoped.len();
@@ -680,7 +684,9 @@ impl PermissionStore {
             GrantState::Granted => result(Effective::Granted, CapabilityGrant),
             GrantState::Ask => {
                 if let Some((access, evaluation)) = policy {
-                    if evaluation.decision == PolicyDecision::Allow {
+                    if evaluation.decision == PolicyDecision::Allow
+                        && !(base == Effective::NeedsPrompt && self.needs_explicit_review(subject, group))
+                    {
                         return result(Effective::Granted, RoomPolicy { access, reason: evaluation.reason });
                     }
                 }
@@ -745,8 +751,8 @@ impl PermissionStore {
             GrantState::Denied => Effective::Denied,
             GrantState::Granted => Effective::Granted,
             GrantState::Ask => {
-                let whitelist = self.global_policy(RoomAccess::Read) == PolicyDecision::Allow
-                    || has_allowance;
+                let whitelist = (self.global_policy(RoomAccess::Read) == PolicyDecision::Allow || has_allowance)
+                    && !(base == Effective::NeedsPrompt && self.needs_explicit_review(subject, group));
                 if whitelist || self.has_scoped_collection_consent(subject, cap, context) { Effective::Granted } else { base }
             }
         }
@@ -771,6 +777,10 @@ impl PermissionStore {
 
     pub fn network_grants(&self, subject: &str) -> Vec<&NetworkGrant> {
         self.network.iter().chain(&self.session_network).filter(|g| g.subject == subject).collect()
+    }
+
+    pub fn network_grant(&self, id: u64) -> Option<&NetworkGrant> {
+        self.network.iter().chain(&self.session_network).find(|grant| grant.id == id)
     }
 
     pub fn remove_network_grant(&mut self, id: u64) -> bool {

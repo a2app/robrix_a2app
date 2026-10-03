@@ -237,15 +237,34 @@ pub fn retains_instance(key: &InstanceKey) -> bool {
 }
 
 pub fn disable_app(cx: &mut Cx, app_id: &str) {
-    let Ok(account) = current_account() else { return };
-    let ids = with(|state| state.store.as_ref().map(|store| store.jobs().iter().filter(|job|
-        job.binding.account == account && job.binding.app_id == app_id).map(|job| job.id).collect::<Vec<_>>()).unwrap_or_default());
-    for id in ids {
-        if let Ok(job) = owned_job(id) { stop_job_instance(cx, &job); }
-        let result = with(|state| state.store.as_mut().unwrap().disable(&account, id, now_ms()));
-        if let Err(error) = result { with(|state| state.error = Some(error)); }
+    let _ = disable_app_checked(cx, app_id);
+}
+
+/// Stop current runs before withdrawing this app's durable background
+/// consent. A failed save remains visible and stops scheduling rather than
+/// reporting that an approval was removed successfully.
+pub fn disable_app_checked(cx: &mut Cx, app_id: &str) -> Result<(), String> {
+    let account = current_account()?;
+    let (jobs, mut failure) = with(|state| (
+        state.store.as_ref().map(|store| store.jobs().iter().filter(|job|
+            job.binding.account == account && job.binding.app_id == app_id).cloned().collect::<Vec<_>>()).unwrap_or_default(),
+        state.error.clone().or_else(|| state.store.as_ref().and_then(JobStore::error).map(str::to_owned)),
+    ));
+    for job in &jobs { stop_job_instance(cx, job); }
+    for job in jobs {
+        let result = with(|state| state.store.as_mut().ok_or("Background tasks are unavailable.")?.disable(&account, job.id, now_ms()));
+        if let Err(error) = result {
+            if failure.is_none() { failure = Some(error.clone()); }
+            with(|state| { state.error = Some(error); });
+        } else {
+            with(|state| {
+                state.status.insert(job.id, "Paused. Review and enable this task to run it again.".into());
+            });
+        }
     }
+    stop_on_storage_error(cx);
     changed();
+    failure.map_or(Ok(()), Err)
 }
 
 /// A global permissions reset also withdraws all saved background consent,
@@ -835,6 +854,34 @@ View{width: Fill height: Fill}
         assert_eq!(snapshot().unwrap()[0].job.pause_reason, Some(PauseReason::AppChanged));
         assert!(run_now(&mut fixture.cx, id).is_err());
         assert!(instances::heap_of(&job_key(&fixture.binding).unwrap()).is_none());
+    }
+
+    #[test]
+    fn app_permission_reset_stops_workers_and_durably_pauses_tasks() {
+        let mut fixture = Fixture::new("// background: true\nfn on_background(json){}\nView{width: Fill height: Fill}");
+        let id = fixture.enable();
+        run_now(&mut fixture.cx, id).unwrap();
+        let key = job_key(&fixture.binding).unwrap();
+        assert!(instances::heap_of(&key).is_some());
+        disable_app_checked(&mut fixture.cx, &fixture.binding.app_id).unwrap();
+        assert!(instances::heap_of(&key).is_none());
+        assert!(!snapshot().unwrap()[0].job.enabled);
+        drop(with(|state| state.store.take()));
+        with(|state| state.store = Some(JobStore::open(&fixture.root, now_ms()).unwrap()));
+        assert!(!snapshot().unwrap()[0].job.enabled);
+        assert!(run_now(&mut fixture.cx, id).is_err());
+    }
+
+    #[test]
+    fn app_permission_reset_reports_background_storage_failures() {
+        let mut fixture = Fixture::new("// background: true\nfn on_background(json){}\nView{width: Fill height: Fill}");
+        let id = fixture.enable();
+        run_now(&mut fixture.cx, id).unwrap();
+        with(|state| state.error = Some("Injected storage failure".into()));
+        let result = disable_app_checked(&mut fixture.cx, &fixture.binding.app_id);
+        assert_eq!(result, Err("Injected storage failure".into()));
+        assert!(instances::heap_of(&job_key(&fixture.binding).unwrap()).is_none());
+        assert!(with(|state| state.stopped_on_error));
     }
 
 }

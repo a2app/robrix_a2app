@@ -16,6 +16,7 @@ use matrix_sdk::ruma::OwnedRoomId;
 use a2app_core::diff::{line_diff, DiffLine};
 use a2app_core::manifest::{A2AppScope, MiniAppId, MiniAppManifest, RunsIn};
 use a2app_core::permissions::{Effective, GrantState, Permission, RoomScope, RoomAccess, RoomPolicyMode, PolicyDecision, agent_subject, agent_room_of};
+use a2app_core::information_flow::{self as flow, AuthoritySession, ContextId, ReaderScope, Recipient, SharingDuration, Source};
 use crate::a2app::permission_choices::PermissionChoicesWidgetExt;
 use crate::a2app::permission_prompt::{PermissionScopeEditorWidgetExt, duration_label, network_scope_label};
 use crate::a2app::data_sharing::DataSharingWidgetExt;
@@ -940,7 +941,7 @@ script_mod! {
                     text_style: REGULAR_TEXT {font_size: 9.5},
                     color: (MESSAGE_TEXT_COLOR)
                 }
-                text: "This app is running. Permission changes apply immediately, and approved requests continue in the same app."
+                text: "Approving a request continues in the app. Removing approvals or resetting permissions stops affected work; reopen the app to continue."
             }
             no_perms_label := Label {
                 visible: false,
@@ -965,6 +966,19 @@ script_mod! {
                 permission_row := mod.widgets.MiniAppPermissionRow { }
                 capability_row := mod.widgets.MiniAppCapabilityRow { }
             }
+            info_approvals_section := View {
+                width: Fill, height: Fit, flow: Down, spacing: 8
+                SubsectionLabel { text: "Saved action and data approvals" }
+                mod.widgets.PermissionOptionLabel { text: "These approvals also let this app continue without asking. Removing one stops affected work. Other approvals may still apply; Block this permission turns the feature off. Room and space blocks still apply." }
+                info_approvals := FlatList {
+                    width: Fill, height: Fit, flow: Down, spacing: 2
+                    access_rule := mod.widgets.MiniAppAccessRuleRow {}
+                }
+            }
+            info_reset_permissions := RobrixNegativeIconButton {
+                padding: 10, text: "Reset this app's permissions…"
+            }
+            mod.widgets.PermissionOptionLabel { text: "Denied a request by mistake? Reopen the app to ask again. Resetting permissions also clears this app's saved approvals; your saved data is kept." }
 
             // Everything else, grouped so a narrow window wraps each group
             // on its own line instead of scattering twelve buttons.
@@ -1172,7 +1186,7 @@ script_mod! {
                     global_read := PermissionChoices {
                         labels: ["Use each app's permissions", "Allow in every room", "Only in rooms I allow", "Block all room reads"]
                     }
-                    mod.widgets.PermissionOptionLabel { text: "Changes apply immediately. A blocked room or space stays blocked. Blocking new reads does not remove data an app already received; manage that under Advanced permissions." }
+                    mod.widgets.PermissionOptionLabel { text: "Changes apply immediately. A blocked room or space stays blocked. To revoke approvals for data an app already received, open that app's Permissions and remove its saved action and data approvals." }
                 }
                 write_defaults := View {
                     visible: false, width: Fill, height: Fit, flow: Down, spacing: 12
@@ -1197,9 +1211,10 @@ script_mod! {
                             padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Block this permission"
                         }
                         access_ask := RobrixNeutralIconButton {
-                            padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Use default"
+                            padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Ask again"
                         }
                     }
+                    mod.widgets.PermissionOptionLabel { text: "Ask again clears this permission group's saved answers and approvals. Reopen the app or repeat your agent request to review permission again." }
                 }
                 access_form := View {
                     visible: false, width: Fill, height: Fit, flow: Down, spacing: 12
@@ -1243,6 +1258,15 @@ script_mod! {
                     access_empty := mod.widgets.PermissionOptionLabel { text: "No saved allowances. Add one when you want this app to remember your choice." }
                     access_rules := FlatList {
                         width: Fill, height: Fit, flow: Down, spacing: 8
+                        access_rule := mod.widgets.MiniAppAccessRuleRow {}
+                    }
+                }
+                access_approvals_section := View {
+                    visible: false, width: Fill, height: Fit, flow: Down, spacing: 8
+                    SubsectionLabel { text: "Saved action and data approvals" }
+                    mod.widgets.PermissionOptionLabel { text: "Review saved action and data approvals here. Removing one stops affected work. Other approvals may still apply; Block this permission turns the feature off. Room and space blocks still apply." }
+                    access_approvals := FlatList {
+                        width: Fill, height: Fit, flow: Down, spacing: 2
                         access_rule := mod.widgets.MiniAppAccessRuleRow {}
                     }
                 }
@@ -2290,6 +2314,29 @@ impl Widget for MiniAppsScreen {
                 |cx| cx.action(A2AppOp::ResetAllPermissions),
             );
         }
+        if self.pane == Pane::Info && self.view.button(cx, ids!(info_reset_permissions)).clicked(actions)
+            && let Some(app_id) = self.info_app.clone()
+            && let Ok(account) = super::information_flow::account()
+        {
+            let name = with_a2app(|state| state.registry.get(&app_id).map(|manifest| manifest.name.clone())).flatten().unwrap_or_else(|| app_id.clone());
+            let mut body = String::from("This clears this app's saved approvals and denials in every room and in public mode. The app stops and its background tasks pause. Reopen it to review new requests. Your saved data, room protection, and approvals shared with other apps are kept.");
+            if with_a2app(|state| state.permissions.is_restricted(&app_id)).unwrap_or(false) {
+                body.push_str(" This app remains stopped for unsafe behavior. Choose Let it run again separately if you want to reopen it.");
+            }
+            self.confirm_delete(
+                cx,
+                format!("Reset {name}'s permissions?"),
+                body,
+                "Reset permissions",
+                move |cx| {
+                    if super::information_flow::account().is_ok_and(|current| current == account) {
+                        cx.action(A2AppOp::ResetAppPermissions(app_id));
+                    } else {
+                        enqueue_popup_notification("The account changed. Review this app's permissions again.", PopupKind::Warning, Some(5.0));
+                    }
+                },
+            );
+        }
         if self.view.button(cx, ids!(inspect_protection_button)).clicked(actions) {
             self.view.protection_inspector(cx, ids!(protection_inspector)).configure(cx);
             self.set_pane(cx, Pane::Inspector);
@@ -2679,12 +2726,16 @@ impl Widget for MiniAppsScreen {
         // Resolved before the draw loop: once a list is mutably borrowed
         // below, a widget query for it would fail and return a zero uid.
         let perms_list_uid = self.view.widget(cx, ids!(perms_list)).widget_uid();
+        let approval_lists = [
+            self.view.widget(cx, ids!(info_approvals)).widget_uid(),
+            self.view.widget(cx, ids!(access_approvals)).widget_uid(),
+        ];
         let diff_list_uid = self.view.widget(cx, ids!(diff_list)).widget_uid();
 
         while let Some(subview) = self.view.draw_walk(cx, scope, walk).step() {
             let uid = subview.widget_uid();
             if let Some(mut list) = subview.as_flat_list().borrow_mut() {
-                self.draw_flat_list(cx, uid, perms_list_uid, &mut list);
+                self.draw_flat_list(cx, uid, perms_list_uid, approval_lists, &mut list);
                 continue;
             }
             if let Some(mut list) = subview.as_portal_list().borrow_mut() {
@@ -3069,6 +3120,8 @@ impl MiniAppsScreen {
                     state.registry.get(&app_id).is_some_and(|m| !m.permissions.is_empty())
                 }).unwrap_or(false);
                 self.view.widget(cx, ids!(no_perms_label)).set_visible(cx, !declares_any);
+                let has_approvals = !self.saved_approval_rows(cx).is_empty();
+                self.view.widget(cx, ids!(info_approvals_section)).set_visible(cx, has_approvals);
                 self.view.widget(cx, ids!(no_versions_label)).set_visible(cx, self.versions.is_empty());
                 self.view.widget(cx, ids!(info_reset_button)).set_visible(cx, self.reset_available);
             }
@@ -3105,18 +3158,20 @@ impl MiniAppsScreen {
                 let empty = self.access_rows(cx).is_empty();
                 self.view.widget(cx, ids!(access_empty)).set_visible(cx, empty);
                 if let Some(AccessEditor::App { app_id, perm, cap_id }) = &self.access_editor {
-                    let (state, group) = with_a2app(|runtime| (
+                    let (state, group, effective) = with_a2app(|runtime| (
                         cap_id.as_deref().map(|id| runtime.permissions.capability_state(app_id, id))
                             .unwrap_or_else(|| runtime.permissions.state(app_id, *perm)),
                         runtime.permissions.state(app_id, *perm),
-                    )).unwrap_or((GrantState::Ask, GrantState::Ask));
+                        runtime.permissions.effective_for_in_context(app_id, |_| true, *perm, Default::default()),
+                    )).unwrap_or((GrantState::Ask, GrantState::Ask, Effective::NeedsPrompt));
                     let group_blocked = cap_id.is_some() && *perm != Permission::Network && group == GrantState::Denied;
                     let baseline = if group_blocked {
-                        "Blocked by its permission group. Open that group and choose Use default before allowing this ability."
+                        "Blocked by its permission group. Open that group and choose Ask again before allowing this ability."
                     } else { match state {
                         GrantState::Granted => "Default for this permission: allowed everywhere.",
                         GrantState::Denied => "Blocked everywhere. Saving an allowance below removes this permission block.",
                         GrantState::Ask if cap_id.is_some() && group == GrantState::Granted => "Uses its permission group, which allows access everywhere.",
+                        GrantState::Ask if effective == Effective::NeedsPrompt => "Will ask before using this permission. Saved allowances below may apply in selected rooms or websites.",
                         GrantState::Ask => "Uses the default for this permission and the saved allowances below.",
                     }};
                     self.view.button(cx, ids!(access_add)).set_enabled(cx, !group_blocked);
@@ -3127,12 +3182,29 @@ impl MiniAppsScreen {
                     }
                     self.view.label(cx, ids!(access_baseline)).set_text(cx, baseline);
                 }
+                let approvals_visible = self.access_view == AccessView::Overview
+                    && matches!(self.access_editor, Some(AccessEditor::App { .. }))
+                    && !self.saved_approval_rows(cx).is_empty();
+                self.view.widget(cx, ids!(access_approvals_section)).set_visible(cx, approvals_visible);
             }
             Pane::Source | Pane::Diff | Pane::Edit | Pane::Sharing | Pane::Inspector | Pane::Background => {}
         }
     }
 
-    fn draw_flat_list(&mut self, cx: &mut Cx2d, uid: WidgetUid, perms_list_uid: WidgetUid, list: &mut FlatList) {
+    fn draw_flat_list(&mut self, cx: &mut Cx2d, uid: WidgetUid, perms_list_uid: WidgetUid, approval_lists: [WidgetUid; 2], list: &mut FlatList) {
+        if approval_lists.contains(&uid) {
+            for (index, (key, label)) in self.saved_approval_rows(cx).into_iter().enumerate() {
+                let Some(item) = list.item(cx, LiveId::from_str(&format!("approval-{index}")), id!(access_rule)) else { continue };
+                if let Some(mut row) = item.borrow_mut::<MiniAppAccessRuleRow>() {
+                    row.key = Some(key);
+                    row.view.label(cx, ids!(rule_label)).set_text(cx, &label);
+                    row.view.widget(cx, ids!(rule_edit)).set_visible(cx, false);
+                    row.view.button(cx, ids!(rule_remove)).set_text(cx, "Remove approval");
+                }
+                item.draw_all(cx, &mut Scope::empty());
+            }
+            return;
+        }
         // Which list this is depends on which pane is visible; hidden panes
         // don't draw, so only one of these runs per draw pass.
         match self.pane {
@@ -3156,7 +3228,7 @@ impl MiniAppsScreen {
                         state.registry.get(&app_id).map(|m| {
                             m.permissions.iter()
                                 .filter_map(|p| Permission::from_str(p))
-                                .map(|p| (p, state.permissions.effective(m, p)))
+                                .map(|p| (p, state.permissions.effective_for_in_context(&app_id, |permission| m.declares(permission), p, Default::default())))
                                 .collect()
                         }).unwrap_or_default()
                     }).unwrap_or_default();
@@ -3458,13 +3530,16 @@ mod picker_tests {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AccessRuleKey {
     Room(String),
     Space(String),
     Grant(u64),
     Network(u64),
     Legacy { subject: String, perm: Permission },
+    Effect { account: String, id: u64 },
+    Action { account: String, id: u64 },
+    Sharing { account: String, id: u64, shared: bool },
 }
 
 #[derive(Clone)]
@@ -3552,6 +3627,49 @@ fn scope_label(cx: &mut Cx, scope: &RoomScope) -> String {
     }
 }
 
+fn approval_context_label(cx: &mut Cx, context: &ContextId) -> String {
+    match context {
+        ContextId::App { room: Some(room), .. } | ContextId::Agent { room, .. } => format!("In {}", room_label(cx, room)),
+        ContextId::App { room: None, .. } => "Account-wide use".into(),
+        ContextId::PublicApp { .. } => "Public mode".into(),
+    }
+}
+
+fn approval_duration_label(cx: &mut Cx, duration: &SharingDuration) -> String {
+    match duration {
+        SharingDuration::Permanent => "Forever (until removed)".into(),
+        SharingDuration::RobrixSession => "Until you quit Robrix".into(),
+        SharingDuration::RoomSession { room, .. } => format!("Until you close {}", room_label(cx, room)),
+    }
+}
+
+fn approval_source_label(cx: &mut Cx, source: &Source) -> String {
+    match source {
+        Source::Account { .. } => "your account information".into(),
+        Source::Room { room, .. } => format!("data from {}", room_label(cx, room)),
+        Source::UnknownPrivate => "previously received private data".into(),
+    }
+}
+
+fn approval_recipient_label(cx: &mut Cx, recipient: &Recipient) -> String {
+    match recipient {
+        Recipient::NetworkOrigin(origin) => format!("Website: {origin}"),
+        Recipient::ModelProvider(_) => "AI service".into(),
+        Recipient::MatrixRoom { room, .. } => format!("Room: {}", room_label(cx, room)),
+        Recipient::External => "Other apps or an exported file".into(),
+        Recipient::Clipboard => "System clipboard".into(),
+    }
+}
+
+fn approval_action_label(action: &flow::SensitiveAction) -> String {
+    a2app_core::capabilities::by_id(&action.kind).map(|capability| capability.title.to_string())
+        .unwrap_or_else(|| {
+            if action.kind.starts_with("network.") { "Send a website request".into() }
+            else if action.kind == "mcp.tools.call" { format!("Use tool: {}", action.target) }
+            else { "Repeat an approved action".into() }
+        })
+}
+
 impl MiniAppsScreen {
     fn set_access_view(&mut self, cx: &mut Cx, view: AccessView) {
         self.access_view = view;
@@ -3564,6 +3682,8 @@ impl MiniAppsScreen {
         self.view.widget(cx, ids!(agent_picker)).set_visible(cx, view == AccessView::AgentRooms);
         self.view.widget(cx, ids!(agent_permissions)).set_visible(cx, view == AccessView::AgentPermissions);
         self.view.widget(cx, ids!(access_rules_section)).set_visible(cx, overview);
+        let approvals_visible = !protection && overview && !self.saved_approval_rows(cx).is_empty();
+        self.view.widget(cx, ids!(access_approvals_section)).set_visible(cx, approvals_visible);
         self.view.widget(cx, ids!(access_form)).set_visible(cx, matches!(view, AccessView::Targets | AccessView::Rule | AccessView::Allowance));
         self.view.widget(cx, ids!(scope_section)).set_visible(cx, matches!(view, AccessView::Targets | AccessView::Allowance));
         self.view.widget(cx, ids!(policy_choices)).set_visible(cx, view == AccessView::Rule);
@@ -3671,8 +3791,8 @@ impl MiniAppsScreen {
         }
         self.managing_agents = false;
         self.view.button(cx, ids!(access_ask)).set_text(cx, if matches!(&editor, AccessEditor::App { cap_id: Some(_), .. }) {
-            "Use group setting"
-        } else { "Use default" });
+            "Ask again for this permission group"
+        } else { "Ask again" });
         self.view.widget(cx, ids!(access_block)).set_visible(cx, !protection);
         self.view.button(cx, ids!(access_save)).set_text(cx, if protection { "Save rules for selection" } else { "Allow selected" });
         self.view.permission_choices(cx, ids!(policy_read)).set_selected_item(cx, 0);
@@ -3799,6 +3919,9 @@ impl MiniAppsScreen {
     }
 
     fn remove_access_rule(&mut self, cx: &mut Cx, key: &AccessRuleKey) {
+        if matches!(key, AccessRuleKey::Effect { .. } | AccessRuleKey::Action { .. } | AccessRuleKey::Sharing { .. })
+            && !self.saved_approval_rows(cx).iter().any(|(current, _)| current == key)
+        { return; }
         let write = with_a2app(|state| state.permissions.matrix_write()).unwrap_or(false).then_some(PolicyDecision::Ask);
         match key {
             AccessRuleKey::Room(id) => self.apply_policy_scope(cx, &RoomScope::room(id), PolicyDecision::Ask, write),
@@ -3806,6 +3929,21 @@ impl MiniAppsScreen {
             AccessRuleKey::Grant(id) => cx.action(A2AppOp::RevokeScopedGrant(*id)),
             AccessRuleKey::Network(id) => cx.action(A2AppOp::RevokeNetworkGrant(*id)),
             AccessRuleKey::Legacy { subject, perm } => cx.action(A2AppOp::ClearLegacyGrants { subject: subject.clone(), perm: *perm }),
+            AccessRuleKey::Effect { id, .. } => cx.action(A2AppOp::RevokeEffectAuthority(*id)),
+            AccessRuleKey::Action { id, .. } => cx.action(A2AppOp::RevokeFlowAuthority(*id)),
+            AccessRuleKey::Sharing { id, account, shared } => {
+                if *shared {
+                    let id = *id;
+                    let account = account.clone();
+                    self.confirm_delete(cx, "Remove this shared approval?".into(),
+                        "This data approval is shared by all mini-apps and agents. Removing it affects all of them and stops active private-data work. Your data is kept; apps can ask again when needed.".into(),
+                        "Remove approval", move |cx| {
+                            if super::information_flow::account().is_ok_and(|current| current == account) {
+                                cx.action(A2AppOp::RevokeFlowSharing(id));
+                            }
+                        });
+                } else { cx.action(A2AppOp::RevokeFlowSharing(*id)); }
+            }
         }
         self.view.redraw(cx);
     }
@@ -3870,6 +4008,59 @@ impl MiniAppsScreen {
             }
             None => Vec::new(),
         }
+    }
+
+    fn saved_approval_rows(&self, cx: &mut Cx) -> Vec<(AccessRuleKey, String)> {
+        let subject = match self.pane {
+            Pane::Info => self.info_app.as_deref(),
+            Pane::Access if self.access_view == AccessView::Overview => match &self.access_editor {
+                Some(AccessEditor::App { app_id, .. }) => Some(app_id.as_str()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(subject) = subject else { return Vec::new() };
+        let Ok(account) = super::information_flow::account() else { return Vec::new() };
+        use super::runtime::permission_lifecycle::{context_matches_subject, sharing_matches_subject};
+        let mut rows = Vec::new();
+        for grant in flow::effect_authorities().unwrap_or_default() {
+            if !context_matches_subject(&grant.context, &account, subject) { continue; }
+            let title = grant.operation.strip_prefix("operation:").or_else(|| grant.operation.strip_prefix("action:"))
+                .and_then(a2app_core::capabilities::by_id).map(|capability| capability.title.to_string())
+                .or_else(|| grant.action.as_ref().map(approval_action_label)).unwrap_or_else(|| "Repeat this approved request".into());
+            let scope = grant.room_scope.as_ref().map(|scope| scope_label(cx, scope))
+                .unwrap_or_else(|| approval_context_label(cx, &grant.context));
+            let mut summary = format!("{title}\n{scope} · {}", approval_duration_label(cx, &grant.duration));
+            if let Some(recipient) = &grant.recipient { summary.push_str(&format!("\n{}", approval_recipient_label(cx, recipient))); }
+            if !grant.sources.is_empty() {
+                let sources = grant.sources.iter().map(|source| approval_source_label(cx, source)).collect::<Vec<_>>().join(", ");
+                summary.push_str(&format!("\nMay use {sources}."));
+            }
+            rows.push((AccessRuleKey::Effect { account: account.clone(), id: grant.id }, summary));
+        }
+        for grant in flow::authorities().unwrap_or_default() {
+            if !context_matches_subject(&grant.context, &account, subject) { continue; }
+            let duration = match &grant.session {
+                AuthoritySession::Once { .. } => "One time".into(),
+                AuthoritySession::RobrixSession => "Until you quit Robrix".into(),
+                AuthoritySession::RoomSession { room, .. } => format!("Until you close {}", room_label(cx, room)),
+            };
+            let summary = format!("{}\n{} · {duration}", approval_action_label(&grant.action), approval_context_label(cx, &grant.context));
+            rows.push((AccessRuleKey::Action { account: account.clone(), id: grant.id }, summary));
+        }
+        for grant in flow::sharing_grants().unwrap_or_default() {
+            if !sharing_matches_subject(&grant, &account, subject, true) { continue; }
+            let shared = matches!(grant.reader, ReaderScope::AllReaders);
+            let scope = match &grant.reader {
+                ReaderScope::AllReaders => "Shared by all mini-apps and agents".into(),
+                ReaderScope::App { .. } => "Everywhere this app runs".into(),
+                ReaderScope::Context(context) => approval_context_label(cx, context),
+            };
+            let summary = format!("Share {}\n{}\n{scope} · {}", approval_source_label(cx, &grant.source),
+                approval_recipient_label(cx, &grant.recipient), approval_duration_label(cx, &grant.duration));
+            rows.push((AccessRuleKey::Sharing { account: account.clone(), id: grant.id, shared }, summary));
+        }
+        rows
     }
 }
 

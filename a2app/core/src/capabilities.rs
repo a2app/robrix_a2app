@@ -211,7 +211,7 @@ pub const CATALOG: &[Capability] = &[
     // ----- core -----
     cap!("host.env.read", "App environment", "Its app id, attached room, instance tag, surface, platform and view mode.", Read, Outgoing, Instance, None, Available, Low, ["env"]),
     cap!("permissions.query", "Check its grants", "State of every declared group (and, with detail, every capability).", Read, Outgoing, App, None, Available, Low, ["permissions.query"]),
-    cap!("permissions.request", "Ask for a permission", "Raise the prompt for one declared GROUP ahead of first use; never a single capability, so the prompt unit stays the group.", Act, Outgoing, App, None, Available, Low, ["permissions.request"]),
+    cap!("permissions.request", "Ask for permissions", "Ask ahead of first use for one declared permission group (perm) or several related groups together (perms). Outgoing effects and website requests still receive host IFC checks.", Act, Outgoing, App, None, Available, Low, ["permissions.request"]),
     cap!("storage.file.read", "Read private storage", "fs.read / fs.exists / fs.list inside the app's own jail, which is per APP and shared by all its instances.", Read, Outgoing, App, None, Available, Low, []),
     cap!("storage.file.write", "Write private storage", "fs.write / append / remove / mkdir in the app's jail, which is per app and shared by all its instances.", Write, Outgoing, App, None, Available, Low, []),
     cap!("storage.instance.write", "Per-instance storage", "A reserved /instance/ prefix private to this app@room pair, ending the cross-instance clobber.", ReadWrite, Outgoing, Instance, None, PlannedNewPlumbing, Low, []),

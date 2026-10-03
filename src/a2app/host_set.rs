@@ -86,6 +86,17 @@ impl Widget for MiniAppHostArea {
             // host receives them; drag/drop belongs to the host under the pointer.
             let focus = cx.key_focus();
             if !host_receives_input(&host, event, focus, self.area.rect(cx)) { return; }
+            let rect = self.area.rect(cx);
+            let user_gesture = match event {
+                Event::MouseUp(pointer) => rect.contains(pointer.abs),
+                Event::TouchUpdate(pointer) => pointer.touches.iter().any(|touch|
+                    touch.state == makepad_widgets::makepad_platform::event::finger::TouchState::Stop && rect.contains(touch.abs)),
+                Event::KeyDown(_) => active_host_contains_focus(&host, focus),
+                _ => false,
+            };
+            if user_gesture && let Some(context) = super::instances::context_of_host(&host) {
+                super::runtime::note_permission_gesture(&context);
+            }
             // Text, character keys and dropped contents carry private data.
             // Navigation keys and keyboard button activation add no source.
             if matches!(event, Event::TextInput(_) | Event::TextRangeReplace(_)
