@@ -163,7 +163,7 @@ script_mod! {
                         }
 
                         // Mini-app permission prompts. No scrim dismissal:
-                        // "Not Now" is the explicit escape, so a looping
+                        // "Deny" is the explicit escape, so a looping
                         // script can't nag its way to an accidental Allow.
                         a2app_permission_modal := Modal {
                             can_dismiss: false,

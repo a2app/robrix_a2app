@@ -5,7 +5,7 @@
 use makepad_widgets::*;
 use a2app_core::information_flow::{
     self as flow, ActionAuthority, ActionDecision, AuthoritySession, ContextId, ContextSnapshot,
-    FlowDecision, Influence, ReaderScope, Recipient, SharingDuration, SharingGrant, Source,
+    EffectAuthority, FlowDecision, Influence, ReaderScope, Recipient, SharingDuration, SharingGrant, Source,
 };
 use a2app_agent::model_transport::ModelRecipient;
 use crate::home::rooms_list::RoomsListRef;
@@ -198,6 +198,7 @@ script_mod! {
 enum SharingCardTarget {
     Rule(u64),
     Authority(u64),
+    EffectAuthority(u64),
     Decision(FlowDecision),
     Action(ActionDecision),
     Activity(u64),
@@ -261,6 +262,7 @@ pub struct DataSharing {
     #[rust] blocked_sources: Vec<Source>,
     #[rust] action_decisions: Vec<ActionDecision>,
     #[rust] authorities: Vec<ActionAuthority>,
+    #[rust] effect_authorities: Vec<EffectAuthority>,
     #[rust] activities: Vec<a2app_core::protection_audit::Activity>,
     #[rust] activity_key: Option<(u64, usize, Option<ContextId>, Option<Source>, Option<Recipient>)>,
 }
@@ -283,7 +285,7 @@ impl Widget for DataSharing {
             if let Some(action) = action.downcast_ref::<SharingCardAction>()
                 && action.owner == self.widget_uid() && action.account == self.account && !self.wizard_open
                 && match &action.target {
-                    SharingCardTarget::Rule(_) | SharingCardTarget::Authority(_) => page == 0 && matches!(self.saved_selection, SharingCardTarget::None),
+                    SharingCardTarget::Rule(_) | SharingCardTarget::Authority(_) | SharingCardTarget::EffectAuthority(_) => page == 0 && matches!(self.saved_selection, SharingCardTarget::None),
                     SharingCardTarget::Decision(_) | SharingCardTarget::Action(_) => page == 1 && self.decision_selection == 0 && self.action_selection == 0,
                     SharingCardTarget::Activity(_) => page == 2 && self.activity_selection.is_none(),
                     SharingCardTarget::None => false,
@@ -390,6 +392,7 @@ impl Widget for DataSharing {
             let result = match self.saved_selection {
                 SharingCardTarget::Rule(id) if self.grants.iter().any(|grant| grant.id == id) => Ok(A2AppOp::RevokeFlowSharing(id)),
                 SharingCardTarget::Authority(id) if self.authorities.iter().any(|grant| grant.id == id) => Ok(A2AppOp::RevokeFlowAuthority(id)),
+                SharingCardTarget::EffectAuthority(id) if self.effect_authorities.iter().any(|grant| grant.id == id) => Ok(A2AppOp::RevokeEffectAuthority(id)),
                 _ => Err("This permission is no longer available. Return to Rules to choose another.".into()),
             };
             self.submit(cx, result);
@@ -533,6 +536,7 @@ impl DataSharing {
         match target {
             SharingCardTarget::Rule(id) if self.grants.iter().any(|grant| grant.id == *id) => self.saved_selection = target.clone(),
             SharingCardTarget::Authority(id) if self.authorities.iter().any(|grant| grant.id == *id) => self.saved_selection = target.clone(),
+            SharingCardTarget::EffectAuthority(id) if self.effect_authorities.iter().any(|grant| grant.id == *id) => self.saved_selection = target.clone(),
             SharingCardTarget::Decision(decision) => {
                 let Some(index) = self.decisions.iter().position(|current| current == decision) else { return };
                 self.decision_selection = index + 1;
@@ -565,6 +569,28 @@ impl DataSharing {
                     session => self.authority_duration_label(session),
                 }, self.account),
                 format!("{}\n\nAction: {}\nTarget: {}\n\n{}", self.context_label(&grant.context), grant.action.kind, grant.action.target, self.authority_duration_label(&grant.session)))),
+            SharingCardTarget::EffectAuthority(id) => self.effect_authorities.iter().find(|grant| grant.id == id).map(|grant| {
+                let sources = grant.sources.iter().map(|source| self.source_choice_label(source)).collect::<Vec<_>>();
+                let destination = grant.recipient.as_ref().map(|recipient| self.recipient_choice_label(recipient)).unwrap_or_else(|| "Inside Robrix".into());
+                let scope = match grant.room_scope.as_ref() {
+                    Some(a2app_core::permissions::RoomScope::AllRooms) => "\nRooms: All rooms. Blocked rooms stay protected.".into(),
+                    Some(a2app_core::permissions::RoomScope::Selection { rooms, spaces }) => format!("\nRooms: {}", rooms.iter().map(|room| self.room_name(room).to_string())
+                        .chain(spaces.iter().map(|space| format!("{} and its rooms", self.room_name(space)))).collect::<Vec<_>>().join(", ")),
+                    None => String::new(),
+                };
+                let scope_note = if grant.room_scope.is_some() {
+                    "Only this operation in the approved rooms is allowed. Data from other rooms or new sources still needs approval."
+                } else { "Only this operation and destination are approved. New data sources require another approval." };
+                let summary = format!("{}\n{}\n\nDestination: {destination}\nFor how long: {}{scope}\n\n{}\n\n{scope_note}",
+                    self.context_choice_label(&grant.context), self.effect_operation_label(grant), self.effect_duration_label(&grant.duration),
+                    if sources.is_empty() { "No private data was included in this approval.".into() } else { format!("Approved data:\n{}", bullets(&sources)) });
+                let exact_sources = grant.sources.iter().map(|source| self.source_label(source)).collect::<Vec<_>>();
+                let exact_influences = grant.influences.iter().map(|influence| self.influence_label(influence)).collect::<Vec<_>>();
+                (summary, format!("{}\n\nOperation: {}\nDestination: {}\n\nData:\n{}\n\nInput sources:\n{}",
+                    self.context_label(&grant.context), grant.operation,
+                    grant.recipient.as_ref().map(|recipient| self.recipient_label(recipient)).unwrap_or_else(|| "Inside Robrix".into()),
+                    bullets(&exact_sources), bullets(&exact_influences)))
+            }),
             _ => None,
         };
         self.view.label(cx, ids!(saved_rule_details)).set_text(cx, details.as_ref().map(|(summary, _)| summary.as_str()).unwrap_or("This permission is no longer saved."));
@@ -597,6 +623,12 @@ impl DataSharing {
                 rows.extend(self.authorities.iter().map(|grant| (
                     self.action_choice_label(&grant.action), format!("{}\n{}", self.context_choice_label(&grant.context), self.authority_duration_label(&grant.session)),
                     SharingCardTarget::Authority(grant.id), "View approval")));
+                rows.extend(self.effect_authorities.iter().map(|grant| (
+                    self.effect_operation_label(grant),
+                    format!("{}\n{}\n{}", self.context_choice_label(&grant.context),
+                        grant.recipient.as_ref().map(|recipient| self.recipient_choice_label(recipient)).unwrap_or_else(|| "Inside Robrix".into()),
+                        self.effect_duration_label(&grant.duration)),
+                    SharingCardTarget::EffectAuthority(grant.id), "View approval")));
             }
             1 => {
                 rows.extend(self.decisions.iter().filter(|decision| !decision.allowed).take(self.attention_limit).map(|decision| (
@@ -784,7 +816,7 @@ impl DataSharing {
                     Source::UnknownPrivate => false,
                 }).collect();
                 self.view.widget(cx, ids!(sharing_error)).set_visible(cx, false);
-                self.view.label(cx, ids!(current_rules)).set_text(cx, if self.grants.is_empty() && self.authorities.is_empty() {
+                self.view.label(cx, ids!(current_rules)).set_text(cx, if self.grants.is_empty() && self.authorities.is_empty() && self.effect_authorities.is_empty() {
                     "No extra sharing rules or action approvals. Private data is protected by default."
                 } else { "Your saved sharing rules and action approvals:" });
             }
@@ -955,6 +987,13 @@ mod tests {
             action: flow::SensitiveAction { kind: "network.POST".into(), target: "https://example.org".into() },
             session: AuthoritySession::RobrixSession, influences: Default::default(),
         });
+        editor.effect_authorities.push(EffectAuthority {
+            id: 73, context: ContextId::App { account: "@sharing-old:example.org".into(), app: "search".into(), room: None },
+            recipient: Some(Recipient::NetworkOrigin("https://example.org".into())), action: None,
+            operation: "operation:matrix.room.messages.search".into(), sources: Default::default(), influences: Default::default(),
+            room_scope: None,
+            duration: SharingDuration::Permanent,
+        });
 
 
         let sharing = editor.view.button(&cx, ids!(remove_button)).widget_uid();
@@ -967,6 +1006,41 @@ mod tests {
         assert_eq!(editor.account, "@sharing-new:example.org");
         assert!(editor.grants.is_empty());
         assert!(editor.authorities.is_empty());
+        assert!(editor.effect_authorities.is_empty());
+    }
+
+    #[test]
+    fn saved_operation_approval_has_readable_scope_and_can_be_removed_directly() {
+        let account = "@saved-search:example.org";
+        let _account = TestAccount::set(account);
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+        editor.account = account.into();
+        editor.apps.push(("search".into(), "Search".into()));
+        editor.rooms.push(("!private:example.org".into(), "Friends".into()));
+        editor.effect_authorities.push(EffectAuthority {
+            id: 74, context: ContextId::App { account: account.into(), app: "search".into(), room: Some("!private:example.org".into()) },
+            recipient: Some(Recipient::NetworkOrigin("https://matrix.example.org".into())), action: None,
+            operation: "operation:matrix.room.messages.search".into(),
+            room_scope: None,
+            sources: [Source::Room { account: account.into(), room: "!private:example.org".into() }].into(),
+            influences: Default::default(), duration: SharingDuration::Permanent,
+        });
+        editor.open_card(&mut cx, &SharingCardTarget::EffectAuthority(74));
+        let summary = editor.view.label(&cx, ids!(saved_rule_details)).text();
+        assert!(summary.contains("Search · Friends"));
+        assert!(summary.contains("https://matrix.example.org"));
+        assert!(summary.contains("Forever"));
+        assert!(summary.contains("Room · Friends"));
+        assert!(!summary.contains("!private:example.org"));
+        assert!(!editor.view.widget(&cx, ids!(saved_identifiers)).visible());
+        let remove = editor.view.button(&cx, ids!(remove_button)).widget_uid();
+        let clicks = cx.capture_actions(|cx| cx.widget_action(remove, ButtonAction::Clicked(Default::default())));
+        let actions = cx.capture_actions(|cx| editor.handle_event(cx, &Event::Actions(clicks), &mut Scope::empty()));
+        assert!(actions.iter().any(|action| matches!(action.downcast_ref::<A2AppOp>(), Some(A2AppOp::RevokeEffectAuthority(74)))));
+        editor.effect_authorities.clear();
+        editor.update_saved_details(&mut cx);
+        assert!(!editor.view.button(&cx, ids!(remove_button)).borrow().unwrap().enabled());
     }
 
     fn context_fixture() -> ContextSnapshot {

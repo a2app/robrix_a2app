@@ -40,20 +40,6 @@ script_mod! {
     mod.widgets.MiniAppHost = View {
         width: Fill, height: Fill
         flow: Down
-        permission_help := RoundedView {
-            visible: false
-            width: Fill, height: Fit, flow: Down, padding: 10, spacing: 8
-            draw_bg +: { color: (COLOR_BG_PREVIEW), border_radius: 4.0 }
-            Label {
-                width: Fill, height: Fit, flow: Flow.Right{wrap: true}
-                text: "This app needs your permission to continue."
-                draw_text +: { text_style: SETTINGS_REGULAR_TEXT_STYLE {}, color: (MESSAGE_TEXT_COLOR) }
-            }
-            permission_review := RobrixNeutralIconButton {
-                text: "Review permission"
-                icon_walk: Walk{width: 0, height: 0, margin: 0}
-            }
-        }
         content_bg := RoundedView {
             width: Fill, height: Fill
             flow: Down
@@ -96,12 +82,6 @@ impl Widget for MiniAppHostArea {
         if let Some(host) = self.host.clone()
             && !matches!(event, Event::NetworkResponses(_))
         {
-            if let Event::Actions(actions) = event
-                && host.button(cx, ids!(permission_review)).clicked(actions)
-                && let Some(context) = super::instances::context_of_host(&host)
-            {
-                cx.action(super::runtime::A2AppOp::ReviewFlow(context));
-            }
             // Keyboard events are broadcast to all surfaces. Only the focused
             // host receives them; drag/drop belongs to the host under the pointer.
             let focus = cx.key_focus();
@@ -166,20 +146,6 @@ impl Widget for MiniAppHostArea {
         if let Some(host) = self.host.clone()
             && rect.size.x > 1.0 && rect.size.y > 1.0
         {
-            let needs_review = super::instances::context_of_host(&host).is_some_and(|context| {
-                let Ok(epoch) = a2app_core::information_flow::context_epoch(&context) else { return false };
-                let mut recipients = std::collections::BTreeSet::new();
-                let blocked_sharing = a2app_core::information_flow::recent_decisions().unwrap_or_default().iter().rev()
-                    .filter(|decision| decision.context == context && decision.epoch == epoch)
-                    .filter(|decision| recipients.insert(decision.recipient.clone()))
-                    .any(|decision| !decision.allowed);
-                let mut actions = HashSet::new();
-                blocked_sharing || a2app_core::information_flow::recent_action_decisions().unwrap_or_default().iter().rev()
-                    .filter(|decision| decision.context == context && decision.epoch == epoch)
-                    .filter(|decision| actions.insert((decision.action.kind.clone(), decision.action.target.clone())))
-                    .any(|decision| !decision.allowed)
-            });
-            host.widget(cx, ids!(permission_help)).set_visible(cx, needs_review);
             let host_walk = Walk {
                 abs_pos: Some(rect.pos),
                 width: Size::Fixed(rect.size.x),
@@ -341,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_host_template_starts_with_permission_help_hidden() {
+    fn shared_host_uses_the_runtime_modal_instead_of_a_permission_banner() {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let (host, errors) = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
@@ -353,15 +319,9 @@ mod tests {
             (host, vm.take_errors())
         });
         assert!(errors.is_empty(), "shared mini-app host template failed to initialize: {errors:?}");
-        let help = host.widget(&cx, ids!(permission_help));
-        let review = host.button(&cx, ids!(permission_review));
-        assert!(!help.is_empty(), "the shared host owns the recovery banner");
-        assert!(!help.visible(), "ordinary mini-app launches need no recovery banner");
-        assert_eq!(review.text(), "Review permission");
+        assert!(host.widget(&cx, ids!(permission_help)).is_empty(), "permission requests belong in the runtime modal");
+        assert!(host.widget(&cx, ids!(permission_review)).is_empty(), "a mini-app must not send users through the sharing-rule editor");
         assert!(!host.widget(&cx, ids!(splash)).is_empty());
-        help.set_visible(&mut cx, true);
-        assert!(help.visible());
-        assert_eq!(review.text(), "Review permission");
     }
 
     #[test]

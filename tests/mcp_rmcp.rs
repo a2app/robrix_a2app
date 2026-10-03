@@ -110,6 +110,10 @@ impl AiHost for RecordingHost {
     fn read_tool(&self, _kind: ReadToolKind) -> Result<String, String> {
         Err("read_tool not exercised by this test".to_string())
     }
+
+    fn fetch_url(&self, _url: &str) -> Result<String, String> {
+        Err("fetch_url not exercised by this test".to_string())
+    }
 }
 
 /// Binds an in-process session tool server and connects to it the way octos

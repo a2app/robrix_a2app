@@ -146,6 +146,10 @@ impl AiHost for RecordingHost {
         // as if the read were refused so a stray call is visible in `calls`.
         Err("read_tool not exercised by this test".to_string())
     }
+
+    fn fetch_url(&self, _url: &str) -> Result<String, String> {
+        Err("fetch_url not exercised by this test".to_string())
+    }
 }
 
 /// Owns the relay child; kills it if the test ends (pass or panic) without

@@ -188,7 +188,7 @@ script_mod! {
                 }
                 room_action_help := mod.widgets.PermissionOptionLabel {
                     visible: false
-                    text: "To review a blocked action, keep the mini-app open in its room, return here and choose Run now. Then review the action in Advanced permissions and retry. Background tasks cannot ask for permission while running."
+                    text: "Open the mini-app and use its Test button to approve the task before scheduling it. Choose Until you quit Robrix or Forever in the permission popup. Background tasks cannot show popups while running."
                 }
             }
             show_help := RobrixNeutralIconButton {

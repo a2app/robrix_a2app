@@ -47,8 +47,20 @@ impl Request {
             value.to_str().map(|value| (name.as_str().to_owned(), value.to_owned()))
                 .map_err(|_| "HTTP headers cannot be reviewed safely.".to_string())
         }).collect::<Result<BTreeMap<_, _>, _>>()?;
-        Ok(serde_json::json!({ "url": self.url.as_str(), "method": self.method.as_str(),
+        Ok(serde_json::json!({ "operation": "network.http", "url": self.url.as_str(), "method": self.method.as_str(),
             "headers": headers, "body": self.body }))
+    }
+
+    /// Capture the same normalized operation used by the network worker.
+    ///
+    /// This lets one popup approve its Internet capability and data flow
+    /// before starting DNS or handing the request to an asynchronous worker.
+    pub(super) fn permission_review(&self, context: &ContextId) -> Result<flow::EffectReview, String> {
+        let epoch = flow::context_epoch(context)?;
+        let recipient = Recipient::network_origin(self.url.as_str())?;
+        let Recipient::NetworkOrigin(origin) = &recipient else { unreachable!() };
+        flow::add_influences_for_activation(context, epoch, [Influence::InternetOrigin(origin.clone())])?;
+        flow::prepare_effect_for_activation(context, epoch, Some(&recipient), self.sensitive_action()?.as_ref(), &self.review_payload()?)
     }
 
     pub fn parse(value: &serde_json::Value) -> Result<Self, String> {

@@ -288,6 +288,8 @@ pub(super) async fn unread(room_id: OwnedRoomId) -> Result<String, String> {
         "unread": room.num_unread_messages(),
         "mentions": room.num_unread_mentions(),
         "marked_unread": room.is_marked_unread(),
+        "favorite": room.is_favourite(),
+        "low_priority": room.is_low_priority(),
     }).to_string())
 }
 
@@ -343,14 +345,21 @@ pub(super) async fn successor(room_id: OwnedRoomId) -> Result<String, String> {
             "upgraded": false, "room_id": null, "name": null, "reason": null,
         }).to_string());
     };
-    super::policy::ensure_room_access(successor.room_id.as_str(), a2app_core::permissions::RoomAccess::Read)?;
-    let name = match client.get_room(&successor.room_id) {
-        Some(next) => match next.cached_display_name() {
-            Some(name) => Some(name.to_string()),
-            None => next.display_name().await.ok().map(|n| n.to_string()),
-        },
-        None => None,
-    };
+    if !super::policy::global_room_access_allowed(successor.room_id.as_str(), a2app_core::permissions::RoomAccess::Read) {
+        return Err(super::policy::ROOM_ACCESS_DENIED.into());
+    }
+    // The target ID and upgrade reason belong to the authorized room's
+    // tombstone. Reading the target's own name needs separate room access.
+    let name = if super::policy::room_access_allowed(successor.room_id.as_str(), a2app_core::permissions::RoomAccess::Read) {
+        super::policy::record_read_rooms(std::slice::from_ref(&successor.room_id))?;
+        match client.get_room(&successor.room_id) {
+            Some(next) => match next.cached_display_name() {
+                Some(name) => Some(name.to_string()),
+                None => next.display_name().await.ok().map(|n| n.to_string()),
+            },
+            None => None,
+        }
+    } else { None };
     Ok(serde_json::json!({
         "upgraded": true,
         "room_id": successor.room_id,

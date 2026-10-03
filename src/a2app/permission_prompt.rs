@@ -1,6 +1,4 @@
-//! The runtime permission prompt for mini-apps, with a scoped session default.
-//!
-//! One-time approval, broader scopes and lasting grants remain available.
+//! One permission decision for a mini-app action and its approval duration.
 //!
 //! Shown one at a time; the queue lives in [`crate::a2app::runtime`].
 
@@ -8,7 +6,7 @@ use makepad_widgets::*;
 use std::collections::BTreeSet;
 use a2app_core::permissions::{GrantDuration, NetworkScope, NetworkScopeKind, Permission, RoomScope};
 use crate::home::rooms_list::RoomsListRef;
-use crate::shared::popup_list::{enqueue_popup_notification, PopupKind};
+use crate::shared::collapsible_header::CollapsibleHeaderWidgetExt;
 use super::permission_choices::*;
 
 script_mod! {
@@ -20,13 +18,23 @@ script_mod! {
         flow: Flow.Right{wrap: true}
         draw_text +: { text_style: SETTINGS_REGULAR_TEXT_STYLE {}, color: (MESSAGE_TEXT_COLOR) }
     }
+    // Use container padding once, rather than Label's padding, to line up
+    // every paragraph and heading with the dropdown's selected text.
+    mod.widgets.PermissionPromptTextBlock = View {
+        width: Fill, height: Fit, flow: Down
+        padding: Inset{left: (PERMISSION_TEXT_INSET), right: (PERMISSION_TEXT_INSET)}
+    }
+    mod.widgets.PermissionPromptHeading = SettingsItemLabel {
+        width: Fill, height: Fit, margin: 0, padding: 0
+        flow: Flow.Right{wrap: true}
+    }
     mod.widgets.PermissionDropDown = RobrixSettingsDropDown {
         width: Fill, margin: 0
         draw_text +: { max_lines: 1, text_overflow: TextOverflow.Ellipsis }
     }
     mod.widgets.PermissionScopeEditor = set_type_default() do #(PermissionScopeEditor::register_widget(vm)) {
         width: Fill, height: Fit, flow: Down, spacing: 8
-        SettingsItemLabel { text: "Rooms and spaces" }
+        scope_heading := SettingsItemLabel { text: "Rooms and spaces" }
         target_summary := mod.widgets.PermissionOptionLabel {}
         choose_targets := RobrixNeutralIconButton {
             text: "Change rooms…"
@@ -44,11 +52,25 @@ script_mod! {
             target_checklist := View {
                 width: Fill, height: Fit, flow: Down, spacing: 6
                 target_filter := RobrixTextInput { width: Fill, empty_text: "Find rooms or spaces…" }
-                targets := PortalList {
-                    width: Fill, height: 168, flow: Down
-                    target := RobrixSettingsCheckBox {}
+                editor_targets := View {
+                    width: Fill, height: Fit
+                    targets := PortalList {
+                        width: Fill, height: 168, flow: Down
+                        target := RobrixSettingsCheckBox {}
+                    }
                 }
-                target_empty := mod.widgets.PermissionOptionLabel { visible: false }
+                popup_targets_section := View {
+                    visible: false, width: Fill, height: Fit, flow: Down
+                    popup_targets := FlatList {
+                        width: Fill, height: Fit, flow: Down
+                        scroll_bars: ScrollBars { show_scroll_x: false, show_scroll_y: false }
+                        target := RobrixSettingsCheckBox {}
+                    }
+                }
+                target_empty_row := mod.widgets.PermissionPromptTextBlock {
+                    visible: false
+                    target_empty := mod.widgets.PermissionOptionLabel { visible: false }
+                }
             }
         }
         duration_section := View {
@@ -114,96 +136,83 @@ script_mod! {
 
     mod.widgets.MiniAppPermissionPrompt = set_type_default() do #(MiniAppPermissionPrompt::register_widget(vm)) {
         ..mod.widgets.SmallModal
-
-        width: Fill { max: 640 }
-        height: Fill { max: 760 }
-        padding: 20
+        width: Fill { max: 560 }, padding: 0
         scroll_bars: ScrollBars { show_scroll_x: false, show_scroll_y: false }
-
-        View {
-            width: Fill, height: Fit, new_batch: true
-            prompt_title := ModalTitle { margin: Inset{bottom: 14} }
-        }
-        prompt_content := ScrollYView {
-            width: Fill, height: Fill, flow: Down, spacing: 12
-            padding: Inset{right: 8}
-            prompt_context := mod.widgets.PermissionOptionLabel {}
-            prompt_blurb := ModalBody {}
-            prompt_reason := ModalBody {
-                draw_text +: { text_style: SETTINGS_REGULAR_TEXT_STYLE {}, color: (MESSAGE_TEXT_COLOR) }
+        // Keep the rounded frame fixed while every part of the dialog scrolls.
+        // The 40px viewport inset accounts for SmallModal's outer margins.
+        // Inner margins keep the controls clear of the frame even at the bottom.
+        dialog_scroll := ScrollYView {
+            width: Fill, height: Fit { max: "calc(100vh - 40px)" }
+            margin: 20, padding: 0, flow: Down
+            View {
+                width: Fill, height: Fit, new_batch: true
+                prompt_title := ModalTitle { margin: Inset{bottom: 14} }
             }
-
-            // App-authored tool text stays plain and inert, with no links or markup.
-            prompt_tool := RoundedView {
-                width: Fill, height: Fit, visible: false, flow: Down, padding: 12, spacing: 8
-                draw_bg +: { color: (COLOR_BG_PREVIEW), border_radius: 4.0 }
-                SettingsItemLabel {
-                    width: Fill, flow: Flow.Right{wrap: true}
-                    text: "Tool details provided by the mini-app"
-                }
-                tool_label := mod.widgets.PermissionOptionLabel {}
-            }
-            prompt_scope_summary := mod.widgets.PermissionOptionLabel {}
-            remember_button := RobrixNeutralIconButton {
-                text: "More options…"
-                icon_walk: Walk{width: 0, height: 0, margin: 0}
-            }
-            remember_settings := View {
-                visible: false
+            prompt_content := View {
                 width: Fill, height: Fit, flow: Down, spacing: 12
-                LineH { height: 1 }
-                prompt_ability := mod.widgets.PermissionOptionLabel { visible: false }
-                scope_editor := mod.widgets.PermissionScopeEditor {}
-                mod.widgets.PermissionOptionLabel {
-                    text: "Room and space protections always take priority. You can change this permission later in Mini Apps."
+                mod.widgets.PermissionPromptTextBlock {
+                    spacing: 12
+                    prompt_blurb := ModalBody { margin: 0, padding: 0 }
+                    prompt_context := mod.widgets.PermissionOptionLabel {}
+                    prompt_reason := mod.widgets.PermissionOptionLabel { visible: false }
                 }
-                allow_once_button := RobrixNeutralIconButton {
-                    padding: 12,
-                    icon_walk: Walk{width: 0, height: 0, margin: 0}
-                    text: "Allow this request once"
+                prompt_tool := RoundedView {
+                    width: Fill, height: Fit, visible: false, flow: Down, padding: 12, spacing: 8
+                    draw_bg +: { color: (COLOR_BG_PREVIEW), border_radius: 4.0 }
+                    mod.widgets.PermissionPromptHeading { text: "Tool provided by the mini-app" }
+                    tool_label := mod.widgets.PermissionOptionLabel {}
                 }
-                deny_button := RobrixNegativeIconButton {
-                    icon_walk: Walk{width: 0, height: 0, margin: 0}
-                    text: "Block this permission everywhere"
+                flow_section := View {
+                    visible: false, width: Fill, height: Fit, flow: Down, spacing: 10
+                    flow_destination_row := mod.widgets.PermissionPromptTextBlock {
+                        flow_destination := mod.widgets.PermissionOptionLabel {}
+                    }
+                    flow_payload_toggle := RobrixSettingsCollapsibleHeader {}
+                    flow_payload_body := View {
+                        visible: false, width: Fill, height: Fit, flow: Down, new_batch: true
+                        padding: Inset{left: 36, top: 4, bottom: 4}
+                        flow_payload := mod.widgets.PermissionOptionLabel { visible: false }
+                    }
                 }
-                mod.widgets.PermissionOptionLabel {
-                    text: "Blocking applies to this mini-app or agent in every room."
+                spatial_section := View {
+                    visible: false, width: Fill, height: Fit, flow: Down, spacing: 8
+                    spatial_choice_section := View {
+                        width: Fill, height: Fit, flow: Down, spacing: 8
+                        mod.widgets.PermissionPromptTextBlock {
+                            mod.widgets.PermissionPromptHeading { text: "Approve in:" }
+                        }
+                        spatial_scope := PermissionDurationDropDown {
+                            labels: ["Current room(s)", "All rooms", "Rooms in a space", "Selected rooms and spaces"]
+                        }
+                    }
+                    spatial_picker := mod.widgets.PermissionScopeEditor { visible: false }
+                    mod.widgets.PermissionPromptTextBlock {
+                        spatial_summary := mod.widgets.PermissionOptionLabel {}
+                    }
                 }
             }
-            flow_section := View {
-                visible: false, width: Fill, height: Fit, flow: Down, spacing: 10
-                flow_destination := mod.widgets.PermissionOptionLabel {}
-                flow_sources := mod.widgets.PermissionOptionLabel {}
-                flow_scope_summary := mod.widgets.PermissionOptionLabel {
-                    text: "This app may repeat this kind of action to this destination, with different contents, until Robrix closes."
+            View {
+                width: Fill, height: Fit, flow: Down, spacing: 8, margin: Inset{top: 12}
+                mod.widgets.PermissionPromptTextBlock {
+                    mod.widgets.PermissionPromptHeading { text: "Approve duration:" }
                 }
-                flow_payload_toggle := RobrixNeutralIconButton {
-                    text: "Show action details"
-                    icon_walk: Walk{width: 0, height: 0, margin: 0}
-                }
-                View {
-                    width: Fill, height: Fit, new_batch: true
-                    flow_payload := mod.widgets.PermissionOptionLabel { visible: false }
-                }
-                LineH { height: 1 }
-                flow_session_button := RobrixNeutralIconButton {
-                    text: "Allow this request once"
-                    icon_walk: Walk{width: 0, height: 0, margin: 0}
+                approval_duration := PermissionDurationDropDown { labels: ["Until you quit Robrix", "Forever"] }
+                mod.widgets.PermissionPromptTextBlock {
+                    duration_summary := mod.widgets.PermissionOptionLabel {}
                 }
             }
-        }
-
-        ModalButtonsRow {
-            spacing: 8, padding: Inset{top: 16, bottom: 0}
-            allow_button := RobrixPositiveIconButton {
-                padding: 12,
-                icon_walk: Walk{width: 0, height: 0, margin: 0}
-                text: "Allow for this session"
-            }
-            not_now_button := RobrixNeutralIconButton {
-                padding: 12,
-                icon_walk: Walk{width: 0, height: 0, margin: 0}
-                text: "Not now"
+            ModalButtonsRow {
+                spacing: 8, padding: Inset{top: 16, bottom: 20}
+                not_now_button := RobrixNegativeIconButton {
+                    padding: 12, align: Align{x: 0.5, y: 0.5}, text: "Deny"
+                    draw_icon.svg: (ICON_FORBIDDEN)
+                    icon_walk: Walk{width: 16, height: 16, margin: Inset{left: -2, right: -1}}
+                }
+                allow_button := RobrixPositiveIconButton {
+                    padding: 12, align: Align{x: 0.5, y: 0.5}, text: "Approve"
+                    draw_icon.svg: (ICON_CHECKMARK)
+                    icon_walk: Walk{width: 16, height: 16, margin: Inset{left: -2, right: -1}}
+                }
             }
         }
     }
@@ -238,6 +247,10 @@ pub struct PromptInfo {
     pub tool: Option<ToolPreview>,
     /// The actual target of this request, which can differ from its source room.
     pub room_id: Option<String>,
+    /// The captured rooms or collection, present only for spatial requests.
+    pub scope: Option<RoomScope>,
+    /// Required request targets paired with their trusted ancestor spaces.
+    pub scope_targets: Vec<(String, Vec<String>)>,
     /// Closing this room expires a RoomSession grant.
     pub origin_room_id: Option<String>,
     pub network_url: Option<String>,
@@ -260,6 +273,14 @@ pub struct FlowPromptInfo {
     pub sources: Vec<String>,
     pub payload: String,
     pub allow_once: bool,
+    /// The host can preserve an approval beyond the current request.
+    pub allow_lasting: bool,
+    /// Room-relevant requests offer this captured scope as their default.
+    pub scope: Option<RoomScope>,
+    /// Required request targets paired with their trusted ancestor spaces.
+    pub scope_targets: Vec<(String, Vec<String>)>,
+    /// The current room for a collection request that defaults to all rooms.
+    pub room_id: Option<String>,
 }
 
 /// The user's answer, carried with the request id in a `PermissionPromptResponse`.
@@ -270,6 +291,8 @@ pub enum PermissionPromptAction {
     AllowOnce,
     AllowFlowOnce,
     AllowFlowSession,
+    AllowFlow { duration: GrantDuration },
+    AllowFlowScoped { scope: RoomScope, duration: GrantDuration },
     Deny,
     /// Nothing persists; this (app, permission) stops asking for the session.
     NotNow,
@@ -284,61 +307,79 @@ pub struct PermissionPromptResponse {
     pub answer: PermissionPromptAction,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApprovalDuration { Once, Session, Forever }
+
 #[derive(Script, ScriptHook, Widget)]
 pub struct MiniAppPermissionPrompt {
     #[deref] view: View,
     #[rust] prompt_id: u64,
-    #[rust] remember_expanded: bool,
-    #[rust] can_allow_once: bool,
     #[rust] flow_mode: bool,
     #[rust] flow_payload_expanded: bool,
-    #[rust] collection: bool,
-    #[rust] enable_writes: bool,
+    #[rust] durations: Vec<ApprovalDuration>,
+    #[rust] duration: usize,
+    #[rust] scope: Option<RoomScope>,
+    #[rust] captured_scope: Option<RoomScope>,
+    #[rust] current_scope: Option<RoomScope>,
+    #[rust] scope_targets: Vec<(String, Vec<String>)>,
+    #[rust] spatial_modes: Vec<usize>,
+    #[rust] spatial_mode: usize,
+    #[rust] spatial_available: bool,
+    #[rust] scope_valid: bool,
+    #[rust] space_membership_ready: bool,
+    #[rust] network: Option<NetworkScope>,
+    #[rust] request_valid: bool,
 }
 
 impl Widget for MiniAppPermissionPrompt {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
-
-        if let Event::Actions(actions) = event {
-            if self.flow_mode {
-                if self.view.button(cx, ids!(flow_payload_toggle)).clicked(actions) {
-                    self.flow_payload_expanded = !self.flow_payload_expanded;
-                    self.view.widget(cx, ids!(flow_payload)).set_visible(cx, self.flow_payload_expanded);
-                    self.view.button(cx, ids!(flow_payload_toggle)).set_text(cx,
-                        if self.flow_payload_expanded { "Hide action details" } else { "Show action details" });
-                    self.set_remember_expanded(cx, false);
-                }
-                if self.view.button(cx, ids!(allow_button)).clicked(actions) {
-                    self.answer(cx, PermissionPromptAction::AllowFlowSession);
-                } else if self.can_allow_once && self.view.button(cx, ids!(flow_session_button)).clicked(actions) {
-                    self.answer(cx, PermissionPromptAction::AllowFlowOnce);
-                } else if self.view.button(cx, ids!(not_now_button)).clicked(actions) {
-                    self.answer(cx, PermissionPromptAction::NotNow);
-                }
-                return;
+        let Event::Actions(actions) = event else { return };
+        if let Some(index) = self.view.drop_down2(cx, ids!(approval_duration)).selected(actions) {
+            if index < self.durations.len() {
+                self.duration = index;
             }
-            if self.view.button(cx, ids!(remember_button)).clicked(actions) {
-                self.set_remember_expanded(cx, !self.remember_expanded);
-            }
-            let editor = self.view.permission_scope_editor(cx, ids!(scope_editor));
-            if matches!(actions.find_widget_action(editor.widget_uid()).cast(), PermissionScopeEditorAction::Changed) {
-                self.refresh_allow_button(cx);
-            }
-            if self.view.button(cx, ids!(allow_button)).clicked(actions) {
-                match self.view.permission_scope_editor(cx, ids!(scope_editor)).selection() {
-                    Ok(selection) => self.answer(cx, PermissionPromptAction::AllowScoped {
-                        scope: selection.scope, duration: selection.duration, network: selection.network,
-                    }),
-                    Err(error) => enqueue_popup_notification(error, PopupKind::Warning, Some(5.0)),
-                }
-            } else if self.remember_expanded && self.can_allow_once && self.view.button(cx, ids!(allow_once_button)).clicked(actions) {
-                self.answer(cx, PermissionPromptAction::AllowOnce);
-            } else if self.remember_expanded && self.view.button(cx, ids!(deny_button)).clicked(actions) {
-                self.answer(cx, PermissionPromptAction::Deny);
-            } else if self.view.button(cx, ids!(not_now_button)).clicked(actions) {
-                self.answer(cx, PermissionPromptAction::NotNow);
-            }
+            self.refresh_duration(cx);
+        }
+        if self.spatial_available && let Some(index) = self.view.drop_down2(cx, ids!(spatial_scope)).selected(actions) {
+            if let Some(mode) = self.spatial_modes.get(index).copied() { self.select_spatial_scope(cx, mode); }
+            self.refresh_duration(cx);
+        }
+        let picker = self.view.permission_scope_editor(cx, ids!(spatial_picker));
+        if self.spatial_available && self.spatial_mode >= 2
+            && !matches!(self.durations.get(self.duration), Some(ApprovalDuration::Once))
+            && matches!(actions.find_widget_action(picker.widget_uid()).cast(), PermissionScopeEditorAction::Changed)
+        {
+            self.scope = picker.selection().ok().map(|selection| selection.scope);
+            self.refresh_duration(cx);
+        }
+        let details = self.view.collapsible_header(cx, ids!(flow_payload_toggle));
+        if self.flow_mode && let Some(expanded) = details.expansion_changed(actions) {
+            self.flow_payload_expanded = expanded;
+            self.view.widget(cx, ids!(flow_payload_body)).set_visible(cx, expanded);
+            self.view.widget(cx, ids!(flow_payload)).set_visible(cx, self.flow_payload_expanded);
+            self.view.redraw(cx);
+        }
+        if self.view.button(cx, ids!(not_now_button)).clicked(actions) {
+            self.answer(cx, PermissionPromptAction::NotNow);
+        } else if self.request_valid && self.scope_valid && self.view.button(cx, ids!(allow_button)).clicked(actions) {
+            let Some(duration) = self.durations.get(self.duration).copied() else { return };
+            let answer = match (self.flow_mode, duration) {
+                (true, ApprovalDuration::Once) => PermissionPromptAction::AllowFlowOnce,
+                (true, duration) if self.spatial_available => PermissionPromptAction::AllowFlowScoped {
+                    scope: self.scope.clone().unwrap_or(RoomScope::AllRooms),
+                    duration: if duration == ApprovalDuration::Forever { GrantDuration::Always } else { GrantDuration::RobrixSession },
+                },
+                (true, ApprovalDuration::Session) => PermissionPromptAction::AllowFlow { duration: GrantDuration::RobrixSession },
+                (true, ApprovalDuration::Forever) => PermissionPromptAction::AllowFlow { duration: GrantDuration::Always },
+                (false, ApprovalDuration::Once) => PermissionPromptAction::AllowOnce,
+                (false, duration) => PermissionPromptAction::AllowScoped {
+                    scope: self.scope.clone().unwrap_or(RoomScope::AllRooms),
+                    duration: if duration == ApprovalDuration::Forever { GrantDuration::Always } else { GrantDuration::RobrixSession },
+                    network: self.network.clone(),
+                },
+            };
+            self.answer(cx, answer);
         }
     }
 
@@ -352,123 +393,169 @@ impl MiniAppPermissionPrompt {
         cx.action(PermissionPromptResponse { prompt_id: self.prompt_id, answer });
     }
 
-    fn set_remember_expanded(&mut self, cx: &mut Cx, expanded: bool) {
-        self.remember_expanded = expanded;
-        let max_height = if expanded || self.enable_writes || self.flow_mode { 760.0 } else { 620.0 };
-        self.view.walk.height = Size::Fill {
-            weight: 100.0, basis: FitBound::Abs(0.0), shrink: 0.0,
-            min: None, max: Some(max_height),
+    fn configure_duration(&mut self, cx: &mut Cx, once: bool, lasting: bool) {
+        self.durations.clear();
+        if once { self.durations.push(ApprovalDuration::Once); }
+        if lasting { self.durations.extend([ApprovalDuration::Session, ApprovalDuration::Forever]); }
+        self.duration = self.durations.iter().position(|duration| *duration == ApprovalDuration::Session).unwrap_or(0);
+        self.request_valid &= !self.durations.is_empty();
+        let dropdown = self.view.drop_down2(cx, ids!(approval_duration));
+        dropdown.set_labels(cx, self.durations.iter().map(|duration| match duration {
+            ApprovalDuration::Once => "One time".into(), ApprovalDuration::Session => "Until you quit Robrix".into(), ApprovalDuration::Forever => "Forever".into(),
+        }).collect());
+        dropdown.set_selected_item(cx, self.duration);
+        self.refresh_duration(cx);
+    }
+
+    fn configure_spatial_scope(&mut self, cx: &mut Cx, scope: Option<RoomScope>, targets: &[(String, Vec<String>)], room: Option<&str>) {
+        self.captured_scope = scope.clone();
+        self.current_scope = match scope.as_ref() {
+            Some(RoomScope::Selection { .. }) => scope.clone(),
+            Some(RoomScope::AllRooms) => room.map(|room| {
+                let is_space = cx.has_global::<RoomsListRef>() && cx.get_global::<RoomsListRef>().permission_targets()
+                    .iter().any(|(id, _, space)| id == room && *space);
+                if is_space { RoomScope::Selection { rooms: Vec::new(), spaces: vec![room.into()] } }
+                else { RoomScope::room(room) }
+            }),
+            None => None,
         };
-        self.view.widget(cx, ids!(remember_settings)).set_visible(cx, expanded);
-        self.view.button(cx, ids!(remember_button)).set_text(cx, if expanded {
-            "Hide options"
-        } else { "More options…" });
+        self.scope = scope;
+        self.scope_targets = targets.to_vec();
+        self.spatial_available = self.captured_scope.is_some();
+        self.spatial_mode = usize::from(matches!(self.captured_scope, Some(RoomScope::AllRooms)));
+        self.spatial_modes = if self.current_scope.is_some() { vec![0, 1, 2, 3] } else { vec![1, 2, 3] };
+        let labels = self.spatial_modes.iter().map(|mode| match mode {
+            0 => match self.current_scope.as_ref() {
+                Some(RoomScope::Selection { rooms, spaces }) if rooms.len() == 1 && spaces.is_empty() => "Current room",
+                Some(RoomScope::Selection { spaces, .. }) if !spaces.is_empty() => "Current rooms and spaces",
+                _ => "Current rooms",
+            },
+            1 => "All rooms", 2 => "Rooms in a space", _ => "Selected rooms and spaces",
+        }.to_string()).collect();
+        let dropdown = self.view.drop_down2(cx, ids!(spatial_scope));
+        dropdown.set_labels(cx, labels);
+        dropdown.set_selected_item(cx, self.spatial_modes.iter().position(|mode| *mode == self.spatial_mode).unwrap_or(0));
+        self.view.widget(cx, ids!(spatial_section)).set_visible(cx, self.spatial_available);
+        self.view.widget(cx, ids!(spatial_picker)).set_visible(cx, false);
+    }
+
+    fn select_spatial_scope(&mut self, cx: &mut Cx, index: usize) {
+        if index >= 4 || matches!(self.durations.get(self.duration), Some(ApprovalDuration::Once)) { return }
+        self.spatial_mode = index;
+        self.scope = match index {
+            0 => self.current_scope.clone(),
+            1 => Some(RoomScope::AllRooms),
+            _ => {
+                let scope = self.scope.clone().unwrap_or_else(|| self.captured_scope.clone().unwrap_or(RoomScope::AllRooms));
+                let picker = self.view.permission_scope_editor(cx, ids!(spatial_picker));
+                picker.configure_popup(cx, &scope, index == 2);
+                picker.selection().ok().map(|selection| selection.scope)
+            },
+        };
+        self.refresh_duration(cx);
         self.view.redraw(cx);
     }
 
-    fn refresh_allow_button(&self, cx: &mut Cx) {
-        let editor = self.view.permission_scope_editor(cx, ids!(scope_editor));
-        let selection = editor.selection();
-        let valid = selection.is_ok();
-        self.view.button(cx, ids!(allow_button)).set_enabled(cx, valid);
-        self.view.widget(cx, ids!(allow_button)).set_disabled(cx, !valid);
-        let label = if self.enable_writes { "Enable and allow" } else {
-            match selection.as_ref().map(|selection| selection.duration) {
-                Ok(GrantDuration::RobrixSession) => "Allow for this session",
-                Ok(GrantDuration::RoomSession) => "Allow for this room",
-                Ok(GrantDuration::Always) => "Allow and remember",
-                Err(_) => "Allow",
-            }
+    fn refresh_duration(&mut self, cx: &mut Cx) {
+        let once = matches!(self.durations.get(self.duration), Some(ApprovalDuration::Once));
+        self.view.drop_down2(cx, ids!(approval_duration)).set_selected_item(cx, self.duration);
+        self.view.drop_down2(cx, ids!(spatial_scope)).set_selected_item(cx,
+            self.spatial_modes.iter().position(|mode| *mode == self.spatial_mode).unwrap_or(0));
+        let selected_scope = if once { self.captured_scope.as_ref() } else { self.scope.as_ref() };
+        let waiting_for_space = self.spatial_available && !self.space_membership_ready
+            && matches!(selected_scope, Some(RoomScope::Selection { spaces, .. }) if !spaces.is_empty());
+        self.scope_valid = !waiting_for_space && (!self.spatial_available || once
+            || self.scope.as_ref().is_some_and(|scope| scope_covers_targets(scope, &self.scope_targets)));
+        self.view.widget(cx, ids!(spatial_choice_section)).set_visible(cx, !once);
+        self.view.widget(cx, ids!(spatial_picker)).set_visible(cx, self.spatial_available && !once && self.spatial_mode >= 2);
+        let spatial_summary = if waiting_for_space {
+            if once { "Loading rooms used by this request.".into() }
+            else { "Loading rooms in the selected space. You can also choose a different room scope.".into() }
+        } else if once {
+            "One time approves only the rooms used by the request shown.".into()
+        } else if !self.scope_valid {
+            let instruction = match (self.spatial_mode == 2, self.scope_targets.is_empty()) {
+                (true, true) => "Choose a space.",
+                (true, false) => "Choose a space that includes every room used by this request.",
+                (false, true) => "Select at least one room or space.",
+                (false, false) => "Select every room used by this request.",
+            };
+            if self.durations.contains(&ApprovalDuration::Once) { format!("{instruction} Or choose One time for only this request.") }
+            else { instruction.into() }
+        } else if let Some(scope) = self.scope.as_ref() {
+            popup_scope_summary(cx, scope)
+        } else { String::new() };
+        self.view.label(cx, ids!(spatial_summary)).set_text(cx, &spatial_summary);
+        let summary = match self.durations.get(self.duration) {
+            Some(ApprovalDuration::Once) if self.durations.len() == 1 => "Approval applies only to the request shown.",
+            Some(ApprovalDuration::Once) => "Only this request. Ask again next time.",
+            Some(ApprovalDuration::Session) => "Repeat this action without asking again until you quit Robrix.",
+            Some(ApprovalDuration::Forever) => "Remember this choice. You can change it in Mini Apps.",
+            None => "Choose how long to allow this action.",
         };
-        self.view.button(cx, ids!(allow_button)).set_text(cx, label);
-        let mut summary = editor.selection_summary();
-        if self.collection {
-            summary = summary.replace("In any room or space", "Your rooms and spaces");
-            summary.push_str("\nBlocked rooms and spaces stay protected.");
-        }
-        self.view.label(cx, ids!(prompt_scope_summary)).set_text(cx, &summary);
+        self.view.label(cx, ids!(duration_summary)).set_text(cx, summary);
+        self.view.button(cx, ids!(allow_button)).set_enabled(cx, self.request_valid && self.scope_valid);
+        self.view.widget(cx, ids!(allow_button)).set_disabled(cx, !self.request_valid || !self.scope_valid);
     }
 }
 
 impl MiniAppPermissionPromptRef {
-    /// Populates the prompt for the given request.
+    /// Shows one decision with its captured target and approval duration.
     pub fn show(&self, cx: &mut Cx, info: &PromptInfo) {
         let Some(mut inner) = self.borrow_mut() else { return };
         inner.prompt_id = info.prompt_id;
-        inner.view.view(cx, ids!(prompt_content)).set_scroll_pos(cx, Vec2d::default());
-        inner.view.permission_scope_editor(cx, ids!(scope_editor)).configure(
-            cx, if info.collection { None } else { info.room_id.as_deref() }, info.origin_room_id.as_deref(),
-            info.network_url.as_deref(), info.perm == Permission::Network, false,
-        );
-        inner.view.permission_scope_editor(cx, ids!(scope_editor)).use_prompt_defaults(cx);
         inner.flow_mode = false;
+        inner.space_membership_ready = true;
         inner.flow_payload_expanded = false;
-        inner.collection = info.collection;
-        inner.enable_writes = info.enable_writes;
+        inner.view.collapsible_header(cx, ids!(flow_payload_toggle)).set_expanded(cx, false, Animate::No);
+        inner.view.widget(cx, ids!(flow_payload_body)).set_visible(cx, false);
+        inner.scope = Some(info.scope.clone().unwrap_or_else(|| if info.collection { RoomScope::AllRooms } else {
+            info.room_id.as_deref().map(RoomScope::room).unwrap_or(RoomScope::AllRooms)
+        }));
+        let captured_scope = inner.scope.clone();
+        inner.configure_spatial_scope(cx, info.scope.clone(), &info.scope_targets, info.room_id.as_deref());
+        if !inner.spatial_available { inner.scope = captured_scope; }
+        inner.network = info.network_url.as_deref().and_then(|url| NetworkScope::from_url(url, NetworkScopeKind::Origin).ok());
+        inner.request_valid = info.perm != Permission::Network || inner.network.is_some();
+        inner.view.view(cx, ids!(dialog_scroll)).set_scroll_pos(cx, Vec2d::default());
         inner.view.widget(cx, ids!(flow_section)).set_visible(cx, false);
-        inner.view.widget(cx, ids!(remember_button)).set_visible(cx, true);
-        inner.view.widget(cx, ids!(prompt_scope_summary)).set_visible(cx, true);
-        inner.view.widget(cx, ids!(allow_button)).set_visible(cx, true);
-        inner.can_allow_once = info.can_allow_once && !info.enable_writes;
-        let valid = inner.view.permission_scope_editor(cx, ids!(scope_editor)).selection().is_ok();
-        inner.set_remember_expanded(cx, !valid);
-        let asked = if info.perm == Permission::Network { "Connect to this website" } else { info.perm.title() };
-        inner.view.label(cx, ids!(prompt_title)).set_text(cx, &format!(
-            "{} {}\n{}",
-            info.app_icon, info.app_name, asked,
-        ));
-        let editor = inner.view.permission_scope_editor(cx, ids!(scope_editor));
+        inner.view.label(cx, ids!(prompt_title)).set_text(cx, &review_text(&format!("{} {} needs permission", info.app_icon, info.app_name)));
+        let action = info.capability.as_deref().unwrap_or(info.perm.title());
+        let blurb = if info.enable_writes {
+            format!("{action}. Approving also turns on room changes for mini-apps. Each app still needs its own permission.")
+        } else { action.to_string() };
+        inner.view.label(cx, ids!(prompt_blurb)).set_text(cx, &review_text(&blurb));
+        let names = if cx.has_global::<RoomsListRef>() { cx.get_global::<RoomsListRef>().permission_targets() } else { Vec::new() };
+        let room_name = |id: &str| names.iter().find(|(room, _, _)| room == id).map(|(_, name, _)| name.clone())
+            .unwrap_or_else(|| if id.starts_with('!') { "Selected room".into() } else { id.into() });
         let mut context = Vec::new();
-        if let Some(room) = info.room_id.as_deref().filter(|_| !info.collection) {
-            let name = editor.borrow().and_then(|editor| editor.targets.iter()
-                .find(|(id, _, _)| id == room).map(|(_, name, _)| name.clone()))
-                .unwrap_or_else(|| room.to_string());
-            context.push(format!("In {name}"));
+        match if inner.spatial_available { inner.scope.as_ref() } else { None } {
+            Some(RoomScope::AllRooms) if info.collection => context.push("Your rooms and spaces. Blocked rooms stay protected.".to_string()),
+            Some(RoomScope::Selection { rooms, spaces }) => {
+                let targets = rooms.iter().map(|id| room_name(id))
+                    .chain(spaces.iter().map(|id| format!("{} and its rooms", room_name(id)))).collect::<Vec<_>>();
+                let label = if !spaces.is_empty() { "Rooms and spaces" } else if targets.len() == 1 { "Room" } else { "Rooms" };
+                context.push(format!("{label}: {}", targets.join(", ")));
+            }
+            _ => {},
         }
+        if let Some(NetworkScope::Origin(origin)) = &inner.network { context.push(format!("Website: {origin}")); }
+        if !inner.request_valid { context.push("The app did not provide a valid website address. Cancel and check the address in the app.".into()); }
         inner.view.label(cx, ids!(prompt_context)).set_text(cx, &context.join("\n"));
         inner.view.widget(cx, ids!(prompt_context)).set_visible(cx, !context.is_empty());
-        inner.view.widget(cx, ids!(allow_once_button)).set_visible(cx, info.can_allow_once && !info.enable_writes);
-        inner.view.label(cx, ids!(prompt_ability)).set_text(cx, &info.capability.as_ref()
-            .map(|capability| format!("Requested action: {capability}")).unwrap_or_default());
-        inner.view.widget(cx, ids!(prompt_ability)).set_visible(cx, info.capability.is_some());
-        // Keep the internet warning before the choices, including Allow once.
-        // The management editor also shows it next to its website controls.
-        inner.view.widget(cx, ids!(scope_editor.network_warning)).set_visible(cx, false);
-        let description = if info.perm == Permission::Network {
-            "Connect to the website shown below. Sending private room or account data off this device still needs your sharing permission."
-        } else { info.perm.blurb() };
-        let blurb = if info.enable_writes {
-            format!("Room changes are turned off. Allow turns them on and gives this app the permission shown below. Other apps still follow their own permissions and room protections.\n\n{description}")
-        } else { description.to_string() };
-        inner.view.label(cx, ids!(prompt_blurb)).set_text(cx, &blurb);
-        let reason_text = match (info.agent, info.reason.as_deref()) {
-            (true, Some(reason)) => reason.to_string(),
-            (true, None) => String::from("It needs this to answer your messages in this room."),
-            (false, Some(reason)) => format!("The app's stated reason: \"{reason}\""),
-            (false, None) => String::new(),
-        };
-        inner.view.label(cx, ids!(prompt_reason)).set_text(cx, &reason_text);
-        inner.view.widget(cx, ids!(prompt_reason)).set_visible(cx, !reason_text.is_empty());
-        // The app's own tool text, verbatim. The user reviews exactly what the
-        // model will read, so this is never reformatted.
+        let reason = info.reason.as_deref().unwrap_or("");
+        inner.view.label(cx, ids!(prompt_reason)).set_text(cx, &review_text(reason));
+        inner.view.widget(cx, ids!(prompt_reason)).set_visible(cx, !reason.is_empty());
         match &info.tool {
             Some(tool) => {
-                let mut text = format!("Tool name: {}\n\n{}", tool.name, tool.description);
-                if !tool.args.is_empty() {
-                    text.push_str("\n\nArguments:");
-                    for (name, ty, desc) in &tool.args {
-                        text.push_str(&format!("\n  • {name} ({ty})"));
-                        if !desc.trim().is_empty() {
-                            text.push_str(&format!(" — {desc}"));
-                        }
-                    }
-                }
-                inner.view.label(cx, ids!(tool_label)).set_text(cx, &text);
-                inner.view.view(cx, ids!(prompt_tool)).set_visible(cx, true);
+                let mut text = format!("{}\n\n{}", tool.name, tool.description);
+                for (name, ty, desc) in &tool.args { text.push_str(&format!("\n• {name} ({ty}): {desc}")); }
+                inner.view.label(cx, ids!(tool_label)).set_text(cx, &review_text(&text));
+                inner.view.widget(cx, ids!(prompt_tool)).set_visible(cx, true);
             }
-            None => inner.view.view(cx, ids!(prompt_tool)).set_visible(cx, false),
+            None => inner.view.widget(cx, ids!(prompt_tool)).set_visible(cx, false),
         }
-        inner.refresh_allow_button(cx);
+        inner.configure_duration(cx, info.can_allow_once && !info.enable_writes, true);
         inner.view.redraw(cx);
     }
 
@@ -476,31 +563,44 @@ impl MiniAppPermissionPromptRef {
         let Some(mut inner) = self.borrow_mut() else { return };
         inner.prompt_id = info.prompt_id;
         inner.flow_mode = true;
-        inner.can_allow_once = info.allow_once;
+        inner.space_membership_ready = true;
         inner.flow_payload_expanded = false;
-        inner.collection = false;
-        inner.enable_writes = false;
-        inner.set_remember_expanded(cx, false);
-        inner.view.view(cx, ids!(prompt_content)).set_scroll_pos(cx, Vec2d::default());
-        for id in [ids!(remember_button), ids!(prompt_scope_summary), ids!(prompt_context), ids!(prompt_reason), ids!(prompt_tool)] {
-            inner.view.widget(cx, id).set_visible(cx, false);
-        }
+        inner.view.collapsible_header(cx, ids!(flow_payload_toggle)).set_expanded(cx, false, Animate::No);
+        inner.view.widget(cx, ids!(flow_payload_body)).set_visible(cx, false);
+        inner.configure_spatial_scope(cx, info.scope.clone(), &info.scope_targets, info.room_id.as_deref());
+        inner.network = None;
+        inner.request_valid = true;
+        inner.view.view(cx, ids!(dialog_scroll)).set_scroll_pos(cx, Vec2d::default());
+        for id in [ids!(prompt_context), ids!(prompt_reason), ids!(prompt_tool)] { inner.view.widget(cx, id).set_visible(cx, false); }
         inner.view.widget(cx, ids!(flow_section)).set_visible(cx, true);
         inner.view.widget(cx, ids!(flow_payload)).set_visible(cx, false);
-        inner.view.button(cx, ids!(flow_payload_toggle)).set_text(cx, "Show action details");
-        inner.view.label(cx, ids!(prompt_title)).set_text(cx, &format!("{} {}\n{}", info.app_icon, info.app_name, info.action));
-        inner.view.label(cx, ids!(prompt_blurb)).set_text(cx,
-            "Check the destination and any private data below, then choose how long to allow this action.");
-        inner.view.label(cx, ids!(flow_destination)).set_text(cx, &format!("Destination: {}", info.destination));
-        let sources = if info.sources.is_empty() { "None".into() }
-            else { info.sources.iter().map(|source| format!("• {source}")).collect::<Vec<_>>().join("\n") };
-        inner.view.label(cx, ids!(flow_sources)).set_text(cx, &format!("Private data involved:\n{sources}"));
-        inner.view.label(cx, ids!(flow_payload)).set_text(cx, &review_text(&info.payload));
-        inner.view.widget(cx, ids!(allow_button)).set_visible(cx, true);
-        inner.view.widget(cx, ids!(allow_button)).set_disabled(cx, false);
-        inner.view.button(cx, ids!(allow_button)).set_enabled(cx, true);
-        inner.view.button(cx, ids!(allow_button)).set_text(cx, "Allow for this session");
-        inner.view.widget(cx, ids!(flow_session_button)).set_visible(cx, info.allow_once);
+        inner.view.label(cx, ids!(prompt_title)).set_text(cx, &review_text(&format!("{} {} needs permission", info.app_icon, info.app_name)));
+        inner.view.label(cx, ids!(prompt_blurb)).set_text(cx, &review_text(&info.action));
+        let target = info.destination.strip_prefix("Room: ").map(|room| format!("In {room}"))
+            .unwrap_or_else(|| info.destination.clone());
+        let matrix_server = info.destination.starts_with("Your Matrix server: ");
+        inner.view.label(cx, ids!(flow_destination)).set_text(cx, &review_text(&target));
+        let show_destination = !matrix_server && !target.is_empty() && target != "Robrix";
+        inner.view.widget(cx, ids!(flow_destination)).set_visible(cx, show_destination);
+        inner.view.widget(cx, ids!(flow_destination_row)).set_visible(cx, show_destination);
+        let details = if matrix_server { format!("{}\n\n{}", info.destination, info.payload) } else { info.payload.clone() };
+        inner.view.label(cx, ids!(flow_payload)).set_text(cx, &review_text(&details));
+        inner.configure_duration(cx, info.allow_once, info.allow_lasting);
+        inner.view.redraw(cx);
+    }
+
+    /// Refreshes trusted space ancestry without changing the user's choices.
+    pub fn update_scope_targets(&self, cx: &mut Cx, targets: &[(String, Vec<String>)]) {
+        let Some(mut inner) = self.borrow_mut() else { return };
+        inner.scope_targets = targets.to_vec();
+        inner.refresh_duration(cx);
+        inner.view.redraw(cx);
+    }
+
+    pub fn set_space_membership_ready(&self, cx: &mut Cx, ready: bool) {
+        let Some(mut inner) = self.borrow_mut() else { return };
+        inner.space_membership_ready = ready;
+        inner.refresh_duration(cx);
         inner.view.redraw(cx);
     }
 }
@@ -516,6 +616,32 @@ fn review_text(payload: &str) -> String {
         } else { displayed.push(character); }
     }
     displayed
+}
+
+fn scope_covers_targets(scope: &RoomScope, targets: &[(String, Vec<String>)]) -> bool {
+    let nonempty = match scope {
+        RoomScope::AllRooms => true,
+        RoomScope::Selection { rooms, spaces } => !rooms.is_empty() || !spaces.is_empty(),
+    };
+    nonempty && targets.iter().all(|(target, ancestors)| match scope {
+        RoomScope::AllRooms => true,
+        RoomScope::Selection { rooms, spaces } => rooms.contains(target) || spaces.contains(target)
+            || spaces.iter().any(|space| ancestors.contains(space)),
+    })
+}
+
+fn popup_scope_summary(cx: &mut Cx, scope: &RoomScope) -> String {
+    match scope {
+        RoomScope::AllRooms => "All rooms and spaces, including ones you join later. Blocked rooms stay protected.".into(),
+        RoomScope::Selection { rooms, spaces } => {
+            let targets = if cx.has_global::<RoomsListRef>() { cx.get_global::<RoomsListRef>().permission_targets() } else { Vec::new() };
+            let name = |id: &str| targets.iter().find(|(target, _, _)| target == id).map(|(_, name, _)| name.clone())
+                .unwrap_or_else(|| if id.starts_with('!') { "Selected room".into() } else { id.into() });
+            let names = rooms.iter().map(|room| name(room))
+                .chain(spaces.iter().map(|space| format!("{} and its rooms", name(space)))).collect::<Vec<_>>();
+            format!("Applies in {}. Blocked rooms stay protected.", names.join(", "))
+        },
+    }
 }
 
 /// Shared by the request prompt and the permission/policy editors.
@@ -544,6 +670,8 @@ pub struct PermissionScopeEditor {
     #[rust] scope_choice_valid: bool,
     #[rust] targets_expanded: bool,
     #[rust] room_policy: bool,
+    #[rust] popup_scope: bool,
+    #[rust] popup_spaces_only: bool,
     #[rust] origin_room: Option<String>,
     #[rust] choose_origin: bool,
     #[rust] session_rooms: Vec<String>,
@@ -561,49 +689,49 @@ impl Widget for PermissionScopeEditor {
         self.view.handle_event(cx, event, scope);
         let Event::Actions(actions) = event else { return };
         let mut changed = false;
-        if let Some(index) = self.view.permission_choices(cx, ids!(scope_choice)).changed(actions) {
+        if !self.popup_scope && let Some(index) = self.view.permission_choices(cx, ids!(scope_choice)).changed(actions) {
             changed = true;
             self.scope_choice_valid = index < 2;
             self.all_rooms = index == 1;
             self.update_target_visibility(cx);
         }
-        if self.view.button(cx, ids!(choose_targets)).clicked(actions) {
+        if !self.popup_scope && self.view.button(cx, ids!(choose_targets)).clicked(actions) {
             changed = true;
             self.targets_expanded = !self.targets_expanded;
             self.update_target_visibility(cx);
         }
-        if let Some(index) = self.view.permission_choices(cx, ids!(duration_choice)).changed(actions) {
+        if !self.popup_scope && let Some(index) = self.view.permission_choices(cx, ids!(duration_choice)).changed(actions) {
             changed = true;
             self.duration = index;
             self.view.widget(cx, ids!(session_origin_section)).set_visible(cx, self.choose_origin && index == 0);
         }
-        if let Some(index) = self.view.permission_choices(cx, ids!(session_origin)).changed(actions) {
+        if !self.popup_scope && let Some(index) = self.view.permission_choices(cx, ids!(session_origin)).changed(actions) {
             changed = true;
             self.session_origin_index = index;
         }
-        if let Some(index) = self.view.permission_choices(cx, ids!(network_choice)).changed(actions) {
+        if !self.popup_scope && let Some(index) = self.view.permission_choices(cx, ids!(network_choice)).changed(actions) {
             changed = true;
             self.network_kind = match index { 0 => 0, 1 => 1, 2 => 3, _ => usize::MAX };
             self.view.permission_choices(cx, ids!(network_advanced_choice)).set_selected_item(cx, usize::MAX);
             self.update_network_visibility(cx);
             self.update_network_summary(cx);
         }
-        if let Some(index) = self.view.permission_choices(cx, ids!(network_advanced_choice)).changed(actions) {
+        if !self.popup_scope && let Some(index) = self.view.permission_choices(cx, ids!(network_advanced_choice)).changed(actions) {
             changed = true;
             self.network_kind = match index { 0 => 2, 1 => 4, _ => usize::MAX };
             self.view.permission_choices(cx, ids!(network_choice)).set_selected_item(cx, usize::MAX);
             self.update_network_visibility(cx);
             self.update_network_summary(cx);
         }
-        if self.view.button(cx, ids!(change_network)).clicked(actions) {
+        if !self.popup_scope && self.view.button(cx, ids!(change_network)).clicked(actions) {
             self.network_expanded = !self.network_expanded;
             self.update_network_visibility(cx);
         }
-        if self.view.button(cx, ids!(more_network)).clicked(actions) {
+        if !self.popup_scope && self.view.button(cx, ids!(more_network)).clicked(actions) {
             self.advanced_network_expanded = !self.advanced_network_expanded;
             self.update_network_visibility(cx);
         }
-        if let Some(value) = self.view.text_input(cx, ids!(network_value)).changed(actions) {
+        if !self.popup_scope && let Some(value) = self.view.text_input(cx, ids!(network_value)).changed(actions) {
             changed = true;
             self.network_value = value;
             self.update_network_summary(cx);
@@ -612,16 +740,26 @@ impl Widget for PermissionScopeEditor {
             changed = true;
             let filter = filter.to_lowercase();
             self.filtered = self.targets.iter().enumerate()
-                .filter(|(_, (id, name, _))| name.to_lowercase().contains(&filter) || id.contains(&filter))
+                .filter(|(_, (id, name, space))| (!self.popup_spaces_only || *space) && (name.to_lowercase().contains(&filter) || id.contains(&filter)))
                 .map(|(index, _)| index).collect();
-            self.view.portal_list(cx, ids!(targets)).set_first_id_and_scroll(0, 0.0);
+            if !self.popup_scope { self.view.portal_list(cx, ids!(targets)).set_first_id_and_scroll(0, 0.0); }
         }
-        for (row_index, row) in self.view.portal_list(cx, ids!(targets)).items_with_actions(actions) {
-            if let Some(checked) = row.as_check_box().changed(actions)
-                && let Some(&target_index) = self.filtered.get(row_index)
-            {
+        let target_changes = if self.popup_scope {
+            self.view.flat_list(cx, ids!(popup_targets)).items_with_actions(actions).into_iter()
+                .filter_map(|(id, row)| {
+                    let target_index = usize::try_from(id.0.checked_sub(1)?).ok()?;
+                    self.filtered.contains(&target_index).then_some(target_index)
+                        .zip(row.as_check_box().changed(actions))
+                }).collect::<Vec<_>>()
+        } else {
+            self.view.portal_list(cx, ids!(targets)).items_with_actions(actions).into_iter()
+                .filter_map(|(row_index, row)| self.filtered.get(row_index).copied()
+                    .zip(row.as_check_box().changed(actions))).collect::<Vec<_>>()
+        };
+        for (target_index, checked) in target_changes {
+            if let Some((id, _, is_space)) = self.targets.get(target_index) {
                 changed = true;
-                let (id, _, is_space) = &self.targets[target_index];
+                if self.popup_spaces_only && checked { self.spaces.clear(); }
                 let selected = if *is_space { &mut self.spaces } else { &mut self.rooms };
                 if checked { selected.insert(id.clone()); } else { selected.remove(id); }
             }
@@ -647,6 +785,16 @@ impl Widget for PermissionScopeEditor {
                     checkbox.set_active(cx, selected.contains(id), Animate::No);
                     row.draw_all(cx, scope);
                 }
+            } else if let Some(mut list) = widget.as_flat_list().borrow_mut() {
+                for &target_index in &self.filtered {
+                    let Some((id, name, is_space)) = self.targets.get(target_index) else { continue };
+                    let Some(row) = list.item(cx, LiveId(target_index as u64 + 1), id!(target)) else { continue };
+                    row.set_text(cx, &format!("{} · {}", name, if *is_space { "Space and its rooms" } else { "Room" }));
+                    let selected = if *is_space { &self.spaces } else { &self.rooms };
+                    row.as_check_box().set_active(cx, selected.contains(id), Animate::No);
+                    row.draw_all(cx, scope);
+                }
+                list.items.retain_visible();
             }
         }
         DrawStep::done()
@@ -655,9 +803,11 @@ impl Widget for PermissionScopeEditor {
 
 impl PermissionScopeEditor {
     fn update_target_visibility(&self, cx: &mut Cx) {
-        self.view.widget(cx, ids!(choose_targets)).set_visible(cx, !self.room_policy);
-        self.view.widget(cx, ids!(selected_targets)).set_visible(cx, self.targets_expanded);
+        self.view.widget(cx, ids!(choose_targets)).set_visible(cx, !self.room_policy && !self.popup_scope);
+        self.view.widget(cx, ids!(selected_targets)).set_visible(cx, self.targets_expanded || self.popup_scope);
         self.view.widget(cx, ids!(target_checklist)).set_visible(cx, !self.all_rooms);
+        self.view.widget(cx, ids!(editor_targets)).set_visible(cx, !self.popup_scope);
+        self.view.widget(cx, ids!(popup_targets_section)).set_visible(cx, self.popup_scope);
         self.view.button(cx, ids!(choose_targets)).set_text(cx, if self.targets_expanded {
             "Done choosing rooms"
         } else { "Change rooms…" });
@@ -691,6 +841,7 @@ impl PermissionScopeEditor {
         };
         self.view.label(cx, ids!(target_summary)).set_text(cx, &text);
         self.view.widget(cx, ids!(target_empty)).set_visible(cx, self.filtered.is_empty());
+        self.view.widget(cx, ids!(target_empty_row)).set_visible(cx, self.filtered.is_empty());
         self.view.label(cx, ids!(target_empty)).set_text(cx, if self.targets.is_empty() {
             "No rooms or spaces are loaded yet. Open a room and try again."
         } else { "No rooms or spaces match your search." });
@@ -726,43 +877,6 @@ impl PermissionScopeEditor {
 }
 
 impl PermissionScopeEditorRef {
-    fn use_prompt_defaults(&self, cx: &mut Cx) {
-        let Some(mut inner) = self.borrow_mut() else { return };
-        inner.duration = usize::from(inner.origin_room.is_some());
-        let duration = inner.duration;
-        inner.view.permission_choices(cx, ids!(duration_choice)).set_selected_item(cx, duration);
-        if inner.network && !inner.network_value.is_empty() {
-            inner.network_kind = 1;
-            inner.view.permission_choices(cx, ids!(network_choice)).set_selected_item(cx, 1);
-            inner.update_network_summary(cx);
-        }
-    }
-
-    fn selection_summary(&self) -> String {
-        let selection = match self.selection() { Ok(selection) => selection, Err(error) => return error };
-        let Some(inner) = self.borrow() else { return String::new() };
-        let names = |ids: &[String]| ids.iter().map(|id| inner.targets.iter()
-            .find(|(target, _, _)| target == id).map(|(_, name, _)| name.as_str()).unwrap_or(id)).collect::<Vec<_>>().join(", ");
-        let rooms = match &selection.scope {
-            RoomScope::AllRooms => "In any room or space".into(),
-            RoomScope::Selection { rooms, spaces } => {
-                let mut targets = Vec::new();
-                if !rooms.is_empty() { targets.push(names(rooms)); }
-                if !spaces.is_empty() { targets.push(format!("{} and its rooms", names(spaces))); }
-                format!("Only in {}", targets.join(", "))
-            }
-        };
-        let duration = match selection.duration {
-            GrantDuration::RoomSession => format!("Until {} closes", selection.origin_room.as_deref()
-                .and_then(|id| inner.targets.iter().find(|(target, _, _)| target == id).map(|(_, name, _)| name.as_str()))
-                .or(selection.origin_room.as_deref()).unwrap_or("the starting room")),
-            GrantDuration::RobrixSession => "Until Robrix closes".into(),
-            GrantDuration::Always => "Until you change this permission".into(),
-        };
-        let network = selection.network.as_ref().map(|network| format!("\n{}", network_scope_label(network))).unwrap_or_default();
-        format!("For this mini-app or agent only\n{rooms}\n{duration}{network}")
-    }
-
     pub(crate) fn configure(
         &self, cx: &mut Cx, room_id: Option<&str>, origin_room: Option<&str>,
         network_url: Option<&str>, network: bool, policy: bool,
@@ -792,6 +906,10 @@ impl PermissionScopeEditorRef {
         inner.network_expanded = network && network_url.is_none();
         inner.advanced_network_expanded = false;
         inner.room_policy = policy;
+        inner.popup_scope = false;
+        inner.popup_spaces_only = false;
+        inner.view.widget(cx, ids!(scope_heading)).set_visible(cx, true);
+        inner.view.widget(cx, ids!(target_summary)).set_visible(cx, true);
         inner.all_rooms = room_id.is_none() && !policy;
         inner.scope_choice_valid = true;
         inner.view.permission_choices(cx, ids!(scope_choice)).set_selected_item(cx, usize::from(inner.all_rooms));
@@ -799,6 +917,7 @@ impl PermissionScopeEditorRef {
         inner.targets_expanded = !inner.all_rooms && (policy || room_id.is_none());
         inner.update_target_visibility(cx);
         inner.view.text_input(cx, ids!(target_filter)).set_text(cx, "");
+        inner.view.text_input(cx, ids!(target_filter)).set_empty_text(cx, "Find rooms or spaces…".into());
         inner.view.portal_list(cx, ids!(targets)).set_first_id_and_scroll(0, 0.0);
         let mut durations = Vec::new();
         if let Some(origin) = origin_room {
@@ -817,6 +936,32 @@ impl PermissionScopeEditorRef {
         inner.update_network_visibility(cx);
         inner.update_summary(cx);
         inner.update_network_summary(cx);
+        inner.view.redraw(cx);
+    }
+
+    /// Reuses the checklist inside the popup without another scope or duration editor.
+    fn configure_popup(&self, cx: &mut Cx, scope: &RoomScope, spaces_only: bool) {
+        self.configure(cx, None, None, None, false, false);
+        let selected = match scope {
+            RoomScope::Selection { rooms, spaces } => RoomScope::Selection {
+                rooms: if spaces_only { Vec::new() } else { rooms.clone() },
+                spaces: if spaces_only { spaces.iter().take(1).cloned().collect() } else { spaces.clone() },
+            },
+            RoomScope::AllRooms => RoomScope::Selection { rooms: Vec::new(), spaces: Vec::new() },
+        };
+        self.set_scope(cx, &selected);
+        let Some(mut inner) = self.borrow_mut() else { return };
+        inner.popup_scope = true;
+        inner.popup_spaces_only = spaces_only;
+        inner.filtered = inner.targets.iter().enumerate().filter(|(_, (_, _, space))| !spaces_only || *space)
+            .map(|(index, _)| index).collect();
+        for id in [ids!(scope_heading), ids!(target_summary), ids!(scope_choice_section), ids!(duration_section), ids!(network_section)] {
+            inner.view.widget(cx, id).set_visible(cx, false);
+        }
+        let hint = if spaces_only { "Find a space…" } else { "Find rooms or spaces…" };
+        inner.view.text_input(cx, ids!(target_filter)).set_empty_text(cx, hint.into());
+        inner.update_target_visibility(cx);
+        inner.update_summary(cx);
         inner.view.redraw(cx);
     }
 
@@ -874,7 +1019,8 @@ impl PermissionScopeEditorRef {
                     }
                 }
             }
-            inner.filtered = (0..inner.targets.len()).collect();
+            inner.filtered = inner.targets.iter().enumerate().filter(|(_, (_, _, space))| !inner.popup_spaces_only || *space)
+                .map(|(index, _)| index).collect();
         }
         inner.view.permission_choices(cx, ids!(scope_choice)).set_selected_item(cx, usize::from(inner.all_rooms));
         inner.targets_expanded = inner.room_policy || (!inner.all_rooms && inner.rooms.is_empty() && inner.spaces.is_empty());
@@ -942,6 +1088,35 @@ mod tests {
         assert_eq!(selection.duration, GrantDuration::RoomSession);
         editor.set_scope(&mut cx, &RoomScope::Selection { rooms: Vec::new(), spaces: Vec::new() });
         assert!(editor.selection().is_err(), "an empty checklist must never broaden to all rooms");
+    }
+
+    #[test]
+    fn popup_target_selection_keeps_room_identity_when_the_checklist_is_filtered() {
+        let (mut cx, editor) = editor();
+        let rooms = vec!["!alpha:example.org".to_string(), "!beta:example.org".to_string()];
+        editor.configure_popup(&mut cx, &RoomScope::Selection { rooms: rooms.clone(), spaces: Vec::new() }, false);
+        let inner = editor.borrow().unwrap();
+        let list = inner.view.flat_list(&cx, ids!(popup_targets));
+        let filter = inner.view.text_input(&cx, ids!(target_filter)).widget_uid();
+        let alpha = inner.targets.iter().position(|(id, _, _)| id == &rooms[0]).unwrap();
+        let beta = inner.targets.iter().position(|(id, _, _)| id == &rooms[1]).unwrap();
+        drop(inner);
+        let alpha_row = list.item(&mut cx, LiveId(alpha as u64 + 1), id!(target)).unwrap();
+        let beta_row = list.item(&mut cx, LiveId(beta as u64 + 1), id!(target)).unwrap();
+        let change = cx.capture_actions(|cx| cx.widget_action(filter, TextInputAction::Changed("!beta".into())));
+        editor.borrow_mut().unwrap().handle_event(&mut cx, &Event::Actions(change), &mut Scope::empty());
+        for row in [&beta_row, &alpha_row] {
+            let change = cx.capture_actions(|cx| cx.group_widget_actions(list.widget_uid(), row.widget_uid(), |cx| {
+                cx.widget_action(row.widget_uid(), CheckBoxAction::Change(false));
+            }));
+            editor.borrow_mut().unwrap().handle_event(&mut cx, &Event::Actions(change), &mut Scope::empty());
+        }
+        assert_eq!(editor.selection().unwrap().scope, RoomScope::room(&rooms[0]),
+            "a filtered row selects its own room, and a stale hidden row cannot alter another room's permission");
+        editor.configure(&mut cx, Some(&rooms[0]), None, None, false, false);
+        let inner = editor.borrow().unwrap();
+        assert!(inner.view.widget(&cx, ids!(editor_targets)).visible());
+        assert!(!inner.view.widget(&cx, ids!(popup_targets_section)).visible());
     }
 
     #[test]
@@ -1032,270 +1207,323 @@ mod tests {
         assert!(editor.selection().is_err(), "unknown duration must never become a permanent grant");
     }
 
-    #[test]
-    fn prompt_keeps_app_text_plain_and_resets_one_time_approval_visibility() {
-        let mut cx = Cx::new(Box::new(|_, _| {}));
-        let prompt = cx.with_vm(|vm| {
-            makepad_widgets::script_mod(vm);
-            crate::shared::script_mod(vm);
-            super::super::permission_choices::script_mod(vm);
-            super::script_mod(vm);
-            let value = script_eval!(vm, { mod.widgets.MiniAppPermissionPrompt {} });
-            WidgetRef::script_from_value(vm, value).as_mini_app_permission_prompt()
-        });
-        let mut info = PromptInfo {
-            prompt_id: 1,
-            app_name: "Test mini-app".into(), app_icon: "".into(), perm: Permission::Network,
-            reason: Some("<a href=\"https://example.org\">a claimed reason</a>".into()),
-            capability: None, agent: false,
-            tool: Some(ToolPreview {name: "example".into(), description: "<b>Plain tool text</b>".into(), args: Vec::new()}),
-            room_id: Some("!room:example.org".into()), origin_room_id: None,
-            network_url: Some("https://example.org/page".into()), can_allow_once: true,
-            collection: false,
-            enable_writes: false,
-        };
-        prompt.show(&mut cx, &info);
-        assert!(!prompt.borrow().unwrap().view.widget(&cx, ids!(remember_settings)).visible());
-        assert!(prompt.borrow().unwrap().view.label(&cx, ids!(prompt_reason)).text().contains("<a href="));
-        assert!(prompt.borrow().unwrap().view.label(&cx, ids!(tool_label)).text().contains("<b>Plain tool text</b>"));
-        assert!(prompt.borrow().unwrap().view.widget(&cx, ids!(allow_once_button)).visible());
-        assert!(prompt.borrow().unwrap().view.label(&cx, ids!(prompt_blurb)).text().contains("off this device"));
-        let editor = prompt.borrow().unwrap().view.permission_scope_editor(&cx, ids!(scope_editor));
-        assert!(!editor.borrow().unwrap().view.widget(&cx, ids!(network_warning)).visible(), "the prompt warning must appear only once");
-        info.can_allow_once = false;
-        info.tool = None;
-        prompt.show(&mut cx, &info);
-        assert!(!prompt.borrow().unwrap().view.widget(&cx, ids!(allow_once_button)).visible());
-        assert!(!prompt.borrow().unwrap().view.widget(&cx, ids!(prompt_tool)).visible());
-        assert!(!prompt.borrow().unwrap().view.widget(&cx, ids!(remember_settings)).visible(), "a valid session default also supports ongoing requests without advanced settings");
-        assert!(prompt.borrow().unwrap().view.widget(&cx, ids!(allow_button)).visible());
-        info.can_allow_once = true;
-        prompt.show(&mut cx, &info);
-        assert!(!prompt.borrow().unwrap().view.widget(&cx, ids!(remember_settings)).visible(), "a new one-time request starts with the simple decision");
-    }
-
-    #[test]
-    fn scoped_approval_tracks_form_validity_without_disabling_one_time_approval() {
-        let mut cx = Cx::new(Box::new(|_, _| {}));
-        let prompt = cx.with_vm(|vm| {
-            makepad_widgets::script_mod(vm);
-            crate::shared::script_mod(vm);
-            super::super::permission_choices::script_mod(vm);
-            super::script_mod(vm);
-            let value = script_eval!(vm, { mod.widgets.MiniAppPermissionPrompt {} });
-            WidgetRef::script_from_value(vm, value).as_mini_app_permission_prompt()
-        });
-        let info = PromptInfo {
-            prompt_id: 1,
-            app_name: "Test mini-app".into(), app_icon: String::new(), perm: Permission::Network,
-            reason: None, capability: None, agent: false, tool: None,
-            room_id: None, origin_room_id: None, network_url: None, can_allow_once: true,
-            collection: false,
-            enable_writes: false,
-        };
-        prompt.show(&mut cx, &info);
-        assert!(prompt.borrow().unwrap().view.widget(&cx, ids!(remember_settings)).visible(), "missing targets open the editor so users can finish the request");
-        let editor = prompt.borrow().unwrap().view.permission_scope_editor(&cx, ids!(scope_editor));
-        let network_input = editor.borrow().unwrap().view.text_input(&cx, ids!(network_value)).widget_uid();
-        let room_scope = editor.borrow().unwrap().view.permission_choices(&cx, ids!(scope_choice)).widget_uid();
-        let allow = prompt.borrow().unwrap().view.widget(&cx, ids!(allow_button));
-        let once = prompt.borrow().unwrap().view.widget(&cx, ids!(allow_once_button));
-        assert!(allow.disabled(&cx));
-        assert!(!once.disabled(&cx));
-
-        // Dispatch the same child actions a user edit produces, then the editor's notification.
-        for (text, disabled) in [("https://example.org/page", false), ("not a web address", true), ("https://example.org/page", false)] {
-            let change = cx.capture_actions(|cx| cx.widget_action(network_input, TextInputAction::Changed(text.into())));
-            let notify = cx.capture_actions(|cx| prompt.borrow_mut().unwrap().handle_event(cx, &Event::Actions(change), &mut Scope::empty()));
-            prompt.borrow_mut().unwrap().handle_event(&mut cx, &Event::Actions(notify), &mut Scope::empty());
-            assert_eq!(allow.disabled(&cx), disabled);
-            assert!(!once.disabled(&cx));
+    fn ordinary_info() -> PromptInfo {
+        PromptInfo {
+            prompt_id: 17, app_name: "Search".into(), app_icon: "🔎".into(), perm: Permission::MatrixRoomRead,
+            reason: Some("Search messages in this room.".into()), capability: Some("Search messages".into()),
+            agent: false, tool: None, room_id: Some("!target:example.org".into()), origin_room_id: Some("!origin:example.org".into()),
+            network_url: None, can_allow_once: true, collection: false, enable_writes: false, scope: Some(RoomScope::room("!target:example.org")),
+            scope_targets: vec![("!target:example.org".into(), vec!["!parent:example.org".into()])],
         }
-        for (index, disabled) in [(0, true), (1, false)] {
-            let change = cx.capture_actions(|cx| cx.widget_action(room_scope, PermissionChoicesAction::Changed(index)));
-            let notify = cx.capture_actions(|cx| prompt.borrow_mut().unwrap().handle_event(cx, &Event::Actions(change), &mut Scope::empty()));
-            prompt.borrow_mut().unwrap().handle_event(&mut cx, &Event::Actions(notify), &mut Scope::empty());
-            assert_eq!(allow.disabled(&cx), disabled, "an empty room selection cannot be approved");
+    }
+
+    fn answer(prompt: &MiniAppPermissionPromptRef, cx: &mut Cx, duration: usize, deny: bool) -> PermissionPromptResponse {
+        let inner = prompt.borrow().unwrap();
+        let dropdown = inner.view.drop_down2(cx, ids!(approval_duration)).widget_uid();
+        let button = inner.view.button(cx, if deny { ids!(not_now_button) } else { ids!(allow_button) }).widget_uid();
+        drop(inner);
+        let selected = cx.capture_actions(|cx| cx.widget_action(dropdown, DropDown2Action::Select(duration)));
+        prompt.borrow_mut().unwrap().handle_event(cx, &Event::Actions(selected), &mut Scope::empty());
+        let click = cx.capture_actions(|cx| cx.widget_action(button, ButtonAction::Clicked(Default::default())));
+        let actions = cx.capture_actions(|cx| prompt.borrow_mut().unwrap().handle_event(cx, &Event::Actions(click), &mut Scope::empty()));
+        actions.iter().find_map(|action| action.downcast_ref::<PermissionPromptResponse>().cloned()).expect("one decision response")
+    }
+
+    #[test]
+    fn one_simple_prompt_emits_selected_duration_with_captured_room_scope() {
+        let (mut cx, prompt) = prompt();
+        let info = ordinary_info();
+        for (index, duration) in [(0, None), (1, Some(GrantDuration::RobrixSession)), (2, Some(GrantDuration::Always))] {
+            prompt.show(&mut cx, &info);
+            let inner = prompt.borrow().unwrap();
+            assert_eq!(inner.duration, 1, "a new request defaults to the session");
+            assert_eq!(inner.view.button(&cx, ids!(allow_button)).text(), "Approve");
+            assert_eq!(inner.view.button(&cx, ids!(not_now_button)).text(), "Deny");
+            assert!(inner.view.widget(&cx, ids!(approval_duration)).visible());
+            assert!(inner.view.widget(&cx, ids!(scope_editor)).is_empty(), "the decision modal has no scope wizard");
+            assert!(inner.view.label(&cx, ids!(prompt_blurb)).text().contains("Search messages"));
+            assert!(!inner.view.label(&cx, ids!(prompt_context)).text().contains("!target"), "raw room ids are not request explanations");
+            drop(inner);
+            let response = answer(&prompt, &mut cx, index, false);
+            assert_eq!(response.prompt_id, info.prompt_id);
+            match (duration, response.answer) {
+                (None, PermissionPromptAction::AllowOnce) => {},
+                (Some(expected), PermissionPromptAction::AllowScoped { scope, duration, network }) => {
+                    assert_eq!(scope, RoomScope::room("!target:example.org"));
+                    assert_eq!(duration, expected);
+                    assert!(network.is_none());
+                }
+                (_, other) => panic!("wrong approval: {other:?}"),
+            }
         }
-        prompt.show(&mut cx, &info);
-        assert!(allow.disabled(&cx), "a new prompt must not keep the previous enabled state");
+        assert!(matches!(answer(&prompt, &mut cx, 2, true).answer, PermissionPromptAction::NotNow));
     }
 
     #[test]
-    fn primary_approval_uses_room_and_website_session_defaults() {
+    fn website_and_collection_scopes_are_captured_without_an_editor() {
         let (mut cx, prompt) = prompt();
-        let info = PromptInfo {
-            prompt_id: 1,
-            app_name: "Public Web".into(), app_icon: "🌐".into(), perm: Permission::Network,
-            reason: None, capability: Some("HTTP requests".into()), agent: false, tool: None,
-            room_id: Some("!target:example.org".into()), origin_room_id: Some("!source:example.org".into()),
-            network_url: Some("https://Example.org:443/changing/path?value=2".into()), can_allow_once: true,
-            collection: false,
-            enable_writes: false,
-        };
+        let mut info = ordinary_info();
+        info.perm = Permission::Network;
+        info.scope = None;
+        info.network_url = Some("https://Example.org:443/changing/path?value=2".into());
         prompt.show(&mut cx, &info);
-        let inner = prompt.borrow().unwrap();
-        assert!(!inner.remember_expanded);
-        assert_eq!(inner.view.button(&cx, ids!(allow_button)).text(), "Allow for this session");
-        let summary = inner.view.label(&cx, ids!(prompt_scope_summary)).text();
-        assert!(summary.contains("Until Robrix closes"));
-        assert!(summary.contains("!target:example.org"));
-        assert!(summary.contains("https://example.org"));
-        assert!(!summary.contains("changing/path"));
-        let allow = inner.view.button(&cx, ids!(allow_button)).widget_uid();
-        let once = inner.view.button(&cx, ids!(allow_once_button)).widget_uid();
-        drop(inner);
-        let click = cx.capture_actions(|cx| cx.widget_action(once, ButtonAction::Clicked(Default::default())));
-        let actions = cx.capture_actions(|cx| prompt.borrow_mut().unwrap().handle_event(cx, &Event::Actions(click), &mut Scope::empty()));
-        assert!(!actions.iter().any(|action| action.downcast_ref::<PermissionPromptResponse>().map(|response| &response.answer).is_some()), "hidden one-time controls cannot override the default");
-        let click = cx.capture_actions(|cx| cx.widget_action(allow, ButtonAction::Clicked(Default::default())));
-        let actions = cx.capture_actions(|cx| prompt.borrow_mut().unwrap().handle_event(cx, &Event::Actions(click), &mut Scope::empty()));
-        assert!(actions.iter().any(|action| matches!(action.downcast_ref::<PermissionPromptResponse>().map(|response| &response.answer),
-            Some(PermissionPromptAction::AllowScoped { scope, duration: GrantDuration::RobrixSession, network: Some(NetworkScope::Origin(origin)) })
-                if scope == &RoomScope::room("!target:example.org") && origin == "https://example.org")));
-    }
-
-    #[test]
-    fn collection_prompt_covers_rooms_and_resets_for_a_single_room_request() {
-        let (mut cx, prompt) = prompt();
-        let mut info = PromptInfo {
-            prompt_id: 1,
-            app_name: "Rooms Atlas".into(), app_icon: String::new(), perm: Permission::MatrixRoomsList,
-            reason: None, capability: Some("Room list".into()), agent: false, tool: None,
-            room_id: Some("!origin:example.org".into()), origin_room_id: Some("!origin:example.org".into()),
-            network_url: None, can_allow_once: true, collection: true, enable_writes: false,
-        };
+        assert!(!prompt.borrow().unwrap().view.widget(&cx, ids!(spatial_section)).visible());
+        assert!(prompt.borrow().unwrap().view.label(&cx, ids!(prompt_context)).text().contains("Website: https://example.org"));
+        assert!(matches!(answer(&prompt, &mut cx, 1, false).answer,
+            PermissionPromptAction::AllowScoped { scope, duration: GrantDuration::RobrixSession, network: Some(NetworkScope::Origin(origin)) }
+                if scope == RoomScope::room("!target:example.org") && origin == "https://example.org"));
+        info.collection = true;
+        info.scope = Some(RoomScope::AllRooms);
+        info.perm = Permission::MatrixRoomsList;
+        info.network_url = None;
         prompt.show(&mut cx, &info);
-        let inner = prompt.borrow().unwrap();
-        let editor = inner.view.permission_scope_editor(&cx, ids!(scope_editor));
-        let selection = editor.selection().unwrap();
-        assert_eq!(selection.scope, RoomScope::AllRooms);
-        assert_eq!(selection.duration, GrantDuration::RobrixSession);
-        let summary = inner.view.label(&cx, ids!(prompt_scope_summary)).text();
-        assert!(summary.contains("Your rooms and spaces"));
-        assert!(summary.contains("Blocked rooms and spaces stay protected"));
-        assert!(!inner.view.widget(&cx, ids!(prompt_context)).visible());
-        drop(inner);
+        assert!(prompt.borrow().unwrap().view.label(&cx, ids!(prompt_context)).text().contains("Your rooms and spaces"));
+        assert!(matches!(answer(&prompt, &mut cx, 1, false).answer,
+            PermissionPromptAction::AllowScoped { scope: RoomScope::AllRooms, .. }));
         info.collection = false;
-        info.perm = Permission::MatrixRoomSend;
+        info.scope = Some(RoomScope::room("!target:example.org"));
         prompt.show(&mut cx, &info);
-        assert_eq!(editor.selection().unwrap().scope, RoomScope::room("!origin:example.org"), "collection access cannot spill into a room-send prompt");
+        assert!(matches!(answer(&prompt, &mut cx, 1, false).answer,
+            PermissionPromptAction::AllowScoped { scope, .. } if scope == RoomScope::room("!target:example.org")));
     }
 
     #[test]
-    fn room_write_recovery_is_explicit_and_never_offers_one_time_enablement() {
+    fn selected_rooms_are_captured_without_broadening_to_a_collection() {
         let (mut cx, prompt) = prompt();
-        let info = PromptInfo {
-            prompt_id: 1,
-            app_name: "Roll Call".into(), app_icon: String::new(), perm: Permission::MatrixRoomSend,
-            reason: None, capability: Some("Send a message".into()), agent: false, tool: None,
-            room_id: Some("!target:example.org".into()), origin_room_id: Some("!origin:example.org".into()),
-            network_url: None, can_allow_once: true, collection: false, enable_writes: true,
-        };
+        let mut info = ordinary_info();
+        info.collection = true;
+        let scope = RoomScope::Selection { rooms: vec!["First room".into(), "Second room".into()], spaces: Vec::new() };
+        info.scope = Some(scope.clone());
+        info.scope_targets = vec![("First room".into(), Vec::new()), ("Second room".into(), Vec::new())];
+        prompt.show(&mut cx, &info);
+        let context = prompt.borrow().unwrap().view.label(&cx, ids!(prompt_context)).text();
+        assert!(context.contains("First room") && context.contains("Second room"));
+        assert!(!context.contains("Your rooms and spaces"));
+        assert!(matches!(answer(&prompt, &mut cx, 1, false).answer,
+            PermissionPromptAction::AllowScoped { scope: captured, .. } if captured == scope));
+    }
+
+    #[test]
+    fn subscriptions_and_write_enablement_offer_only_working_durations() {
+        let (mut cx, prompt) = prompt();
+        let mut info = ordinary_info();
+        for (ongoing, enable_writes) in [(true, false), (false, true)] {
+            info.can_allow_once = !ongoing;
+            info.enable_writes = enable_writes;
+            prompt.show(&mut cx, &info);
+            assert_eq!(prompt.borrow().unwrap().durations, [ApprovalDuration::Session, ApprovalDuration::Forever]);
+            assert!(matches!(answer(&prompt, &mut cx, 0, false).answer,
+                PermissionPromptAction::AllowScoped { duration: GrantDuration::RobrixSession, .. }));
+            if enable_writes { assert!(prompt.borrow().unwrap().view.label(&cx, ids!(prompt_blurb)).text().contains("turns on room changes")); }
+        }
+        info.can_allow_once = true;
+        info.enable_writes = false;
+        prompt.show(&mut cx, &info);
+        assert_eq!(prompt.borrow().unwrap().durations[0], ApprovalDuration::Once, "the next request restores its own choices");
+    }
+
+    #[test]
+    fn missing_network_target_is_not_another_configuration_wizard() {
+        let (mut cx, prompt) = prompt();
+        let mut info = ordinary_info();
+        info.perm = Permission::Network;
         prompt.show(&mut cx, &info);
         let inner = prompt.borrow().unwrap();
-        assert_eq!(inner.view.button(&cx, ids!(allow_button)).text(), "Enable and allow");
-        assert!(inner.view.label(&cx, ids!(prompt_blurb)).text().contains("Room changes are turned off"));
-        assert!(inner.view.label(&cx, ids!(prompt_blurb)).text().contains("Other apps still follow their own permissions"));
-        assert!(!inner.can_allow_once);
-        assert!(!inner.view.widget(&cx, ids!(allow_once_button)).visible());
+        assert!(!inner.request_valid);
+        assert!(inner.view.widget(&cx, ids!(allow_button)).disabled(&cx));
+        assert!(inner.view.label(&cx, ids!(prompt_context)).text().contains("check the address in the app"));
+        assert!(inner.view.widget(&cx, ids!(scope_editor)).is_empty());
     }
 
     #[test]
-    fn flow_approval_shows_full_details_and_never_reuses_ordinary_answers() {
+    fn flow_prompt_has_one_decision_for_all_sources_and_selected_duration() {
         let (mut cx, prompt) = prompt();
         let info = FlowPromptInfo {
-            prompt_id: 1,
-            app_name: "Roll Call".into(), app_icon: "🎲".into(), action: "Post dice result".into(),
-            destination: "Private test room".into(), sources: vec!["Account data".into()],
-            payload: "{\n  \"body\": \"Result \u{202e}4\"\n}".into(), allow_once: true,
+            prompt_id: 19, app_name: "Search".into(), app_icon: "🔎".into(), action: "Search room messages and send your search text to your Matrix server.".into(),
+            destination: "Your Matrix server".into(), sources: vec!["Account data".into(), "Unknown private data".into()],
+            payload: "{\n  \"query\": \"nexus \u{202e}4\"\n}".into(), allow_once: true, allow_lasting: true,
+            scope: None, scope_targets: Vec::new(), room_id: None,
         };
-        prompt.show_flow(&mut cx, &info);
-        let inner = prompt.borrow().unwrap();
-        assert!(inner.flow_mode);
-        assert_eq!(inner.view.button(&cx, ids!(allow_button)).text(), "Allow for this session");
-        assert_eq!(inner.view.button(&cx, ids!(flow_session_button)).text(), "Allow this request once");
-        let session_scope = inner.view.label(&cx, ids!(flow_scope_summary)).text();
-        assert!(session_scope.contains("this destination") && session_scope.contains("different contents") && session_scope.contains("until Robrix closes"));
-        assert!(!inner.view.widget(&cx, ids!(flow_payload)).visible());
-        let payload = inner.view.label(&cx, ids!(flow_payload)).text();
-        assert!(payload.contains("\\u202e"));
-        assert!(!payload.contains('\u{202e}'));
-        assert!(payload.contains('\n'), "pretty-printed structure stays readable");
-        let detail = inner.view.button(&cx, ids!(flow_payload_toggle)).widget_uid();
-        let allow = inner.view.button(&cx, ids!(allow_button)).widget_uid();
-        let session = inner.view.button(&cx, ids!(flow_session_button)).widget_uid();
-        drop(inner);
-        let click = cx.capture_actions(|cx| cx.widget_action(detail, ButtonAction::Clicked(Default::default())));
-        prompt.borrow_mut().unwrap().handle_event(&mut cx, &Event::Actions(click), &mut Scope::empty());
+        for (index, duration) in [(0, None), (1, Some(GrantDuration::RobrixSession)), (2, Some(GrantDuration::Always))] {
+            prompt.show_flow(&mut cx, &info);
+            let inner = prompt.borrow().unwrap();
+            assert!(inner.view.widget(&cx, ids!(approval_duration)).visible());
+            assert!(inner.view.widget(&cx, ids!(flow_sources)).is_empty(), "sources are not user choices");
+            assert!(!inner.view.widget(&cx, ids!(flow_payload)).visible());
+            assert!(inner.view.label(&cx, ids!(prompt_blurb)).text().contains("Search room messages"));
+            assert!(inner.view.label(&cx, ids!(flow_payload)).text().contains("\\u202e"));
+            drop(inner);
+            let response = answer(&prompt, &mut cx, index, false);
+            assert_eq!(response.prompt_id, info.prompt_id);
+            match (duration, response.answer) {
+                (None, PermissionPromptAction::AllowFlowOnce) => {},
+                (Some(expected), PermissionPromptAction::AllowFlow { duration }) => assert_eq!(duration, expected),
+                (_, other) => panic!("wrong flow approval: {other:?}"),
+            }
+        }
+        let details = prompt.borrow().unwrap().view.collapsible_header(&cx, ids!(flow_payload_toggle)).widget_uid();
+        let clicked = cx.capture_actions(|cx| cx.widget_action(details, crate::shared::collapsible_header::CollapsibleHeaderAction::ExpansionChanged(true)));
+        prompt.borrow_mut().unwrap().handle_event(&mut cx, &Event::Actions(clicked), &mut Scope::empty());
         assert!(prompt.borrow().unwrap().view.widget(&cx, ids!(flow_payload)).visible());
-        for (button, once) in [(allow, false), (session, true)] {
-            let click = cx.capture_actions(|cx| cx.widget_action(button, ButtonAction::Clicked(Default::default())));
-            let actions = cx.capture_actions(|cx| prompt.borrow_mut().unwrap().handle_event(cx, &Event::Actions(click), &mut Scope::empty()));
-            assert!(actions.iter().any(|action| action.downcast_ref::<PermissionPromptResponse>().is_some_and(|response| response.prompt_id == info.prompt_id)));
-            assert!(actions.iter().any(|action| match action.downcast_ref::<PermissionPromptResponse>().map(|response| &response.answer) {
-                Some(PermissionPromptAction::AllowFlowOnce) => once,
-                Some(PermissionPromptAction::AllowFlowSession) => !once,
-                _ => false,
-            }));
-        }
-        let ordinary = PromptInfo {
-            prompt_id: 2,
-            app_name: "Room Pulse".into(), app_icon: String::new(), perm: Permission::MatrixRoomRead,
-            reason: None, capability: Some("Recent messages".into()), agent: false, tool: None,
-            room_id: Some("!target:example.org".into()), origin_room_id: None, network_url: None, can_allow_once: true,
-            collection: false,
-            enable_writes: false,
-        };
-        prompt.show(&mut cx, &ordinary);
-        let inner = prompt.borrow().unwrap();
-        assert!(!inner.flow_mode);
-        assert!(!inner.view.widget(&cx, ids!(flow_section)).visible());
-        assert_eq!(inner.view.button(&cx, ids!(allow_button)).text(), "Allow for this session");
-        assert!(inner.view.label(&cx, ids!(prompt_title)).text().contains("Read room content"));
-        assert!(!inner.view.label(&cx, ids!(prompt_title)).text().contains("Recent messages"));
-        drop(inner);
-        let click = cx.capture_actions(|cx| cx.widget_action(session, ButtonAction::Clicked(Default::default())));
-        let actions = cx.capture_actions(|cx| prompt.borrow_mut().unwrap().handle_event(cx, &Event::Actions(click), &mut Scope::empty()));
-        assert!(!actions.iter().any(|action| action.downcast_ref::<PermissionPromptResponse>().map(|response| &response.answer).is_some()));
-        let click = cx.capture_actions(|cx| cx.widget_action(allow, ButtonAction::Clicked(Default::default())));
-        let actions = cx.capture_actions(|cx| prompt.borrow_mut().unwrap().handle_event(cx, &Event::Actions(click), &mut Scope::empty()));
-        assert!(actions.iter().any(|action| action.downcast_ref::<PermissionPromptResponse>().is_some_and(|response|
-            response.prompt_id == ordinary.prompt_id && matches!(response.answer, PermissionPromptAction::AllowScoped { .. }))),
-            "a reused modal must bind answers to the current request");
+        prompt.show(&mut cx, &ordinary_info());
+        assert!(!prompt.borrow().unwrap().view.widget(&cx, ids!(flow_section)).visible());
+        assert_eq!(answer(&prompt, &mut cx, 1, false).prompt_id, 17);
     }
 
     #[test]
-    fn ongoing_flow_review_keeps_complete_details_and_requires_session_approval() {
+    fn captured_legacy_request_is_one_plain_decision_without_a_source_editor() {
         let (mut cx, prompt) = prompt();
-        let payload = format!("{{\n  \"operation\": \"matrix.room.state.get\",\n  \"state_key\": \"{}\"\n}}", "specific-read-target-".repeat(80));
         let info = FlowPromptInfo {
-            prompt_id: 1,
-            app_name: "Shared checklist".into(), app_icon: String::new(),
-            action: "Watch the shared checklist".into(), destination: "Private test room".into(),
-            sources: vec!["Private test room".into(), "Your account profile".into()],
-            payload: payload.clone(), allow_once: false,
+            prompt_id: 27, app_name: "Search".into(), app_icon: "🔎".into(), action: "Search for nexus in this room".into(),
+            destination: "Your Matrix server: https://matrix.example.org".into(), sources: vec!["Account data".into(), "Unknown private data".into()],
+            payload: "{\"query\":\"nexus\"}".into(), allow_once: true, allow_lasting: true,
+            scope: None, scope_targets: Vec::new(), room_id: None,
         };
         prompt.show_flow(&mut cx, &info);
         let inner = prompt.borrow().unwrap();
-        assert!(inner.view.widget(&cx, ids!(allow_button)).visible());
-        assert_eq!(inner.view.button(&cx, ids!(allow_button)).text(), "Allow for this session");
-        assert!(!inner.view.widget(&cx, ids!(flow_session_button)).visible());
-        assert_eq!(inner.view.label(&cx, ids!(flow_payload)).text(), payload);
-        assert!(inner.view.label(&cx, ids!(flow_destination)).text().contains("Private test room"));
-        let sources = inner.view.label(&cx, ids!(flow_sources)).text();
-        assert!(sources.contains("Private test room") && sources.contains("Your account profile"));
-        let once = inner.view.button(&cx, ids!(flow_session_button)).widget_uid();
-        let session = inner.view.button(&cx, ids!(allow_button)).widget_uid();
+        assert_eq!(inner.durations, [ApprovalDuration::Once, ApprovalDuration::Session, ApprovalDuration::Forever]);
+        assert_eq!(inner.view.drop_down2(&cx, ids!(approval_duration)).selected_item(), 1);
+        assert!(inner.view.widget(&cx, ids!(approval_duration)).visible());
+        assert!(!inner.view.widget(&cx, ids!(flow_destination)).visible());
+        assert!(inner.view.label(&cx, ids!(flow_payload)).text().contains(&info.destination));
+        assert!(inner.view.label(&cx, ids!(flow_payload)).text().contains(&info.payload));
+        assert!(!inner.view.label(&cx, ids!(prompt_blurb)).text().contains("Unknown"));
         drop(inner);
-        for (button, expected) in [(once, false), (session, true)] {
-            let click = cx.capture_actions(|cx| cx.widget_action(button, ButtonAction::Clicked(Default::default())));
-            let actions = cx.capture_actions(|cx| prompt.borrow_mut().unwrap().handle_event(cx, &Event::Actions(click), &mut Scope::empty()));
-            assert_eq!(actions.iter().any(|action| matches!(action.downcast_ref::<PermissionPromptResponse>().map(|response| &response.answer),
-                Some(PermissionPromptAction::AllowFlowSession))), expected);
-            assert!(!actions.iter().any(|action| matches!(action.downcast_ref::<PermissionPromptResponse>().map(|response| &response.answer),
-                Some(PermissionPromptAction::AllowFlowOnce))), "an ongoing request cannot be approved through a hidden one-time button");
-        }
+        assert!(matches!(answer(&prompt, &mut cx, 0, false).answer, PermissionPromptAction::AllowFlowOnce));
+        assert!(matches!(answer(&prompt, &mut cx, 1, false).answer, PermissionPromptAction::AllowFlow { duration: GrantDuration::RobrixSession }));
+        assert!(matches!(answer(&prompt, &mut cx, 2, false).answer, PermissionPromptAction::AllowFlow { duration: GrantDuration::Always }));
     }
 
+    #[test]
+    fn restricted_source_request_cannot_select_lasting_approval() {
+        let (mut cx, prompt) = prompt();
+        let info = FlowPromptInfo {
+            prompt_id: 28, app_name: "Search".into(), app_icon: "🔎".into(), action: "Search for nexus in the selected room".into(),
+            destination: "Room: Selected room".into(), sources: vec!["Data from a different account".into()],
+            payload: "{\"query\":\"nexus\"}".into(), allow_once: true, allow_lasting: false,
+            scope: None, scope_targets: Vec::new(), room_id: None,
+        };
+        prompt.show_flow(&mut cx, &info);
+        let inner = prompt.borrow().unwrap();
+        assert_eq!(inner.durations, [ApprovalDuration::Once]);
+        assert_eq!(inner.view.drop_down2(&cx, ids!(approval_duration)).selected_item(), 0);
+        assert_eq!(inner.view.label(&cx, ids!(duration_summary)).text(), "Approval applies only to the request shown.");
+        assert_eq!(inner.view.label(&cx, ids!(flow_destination)).text(), "In Selected room");
+        assert!(inner.view.widget(&cx, ids!(flow_destination)).visible());
+        drop(inner);
+        assert!(matches!(answer(&prompt, &mut cx, 0, false).answer, PermissionPromptAction::AllowFlowOnce));
+        assert!(matches!(answer(&prompt, &mut cx, 2, false).answer, PermissionPromptAction::AllowFlowOnce), "a stale duration cannot turn one-time review into lasting permission");
+    }
+
+    #[test]
+    fn invalid_duration_events_preserve_choice_and_do_not_broaden_approval() {
+        let (mut cx, prompt) = prompt();
+        let mut info = ordinary_info();
+        info.can_allow_once = false;
+        prompt.show(&mut cx, &info);
+        assert!(matches!(answer(&prompt, &mut cx, 99, false).answer,
+            PermissionPromptAction::AllowScoped { duration: GrantDuration::RobrixSession, .. }));
+        assert_eq!(prompt.borrow().unwrap().duration, 0);
+    }
+
+    #[test]
+    fn spatial_scope_requires_each_request_target_or_its_trusted_space() {
+        let targets = vec![("First room".into(), vec!["Containing space".into()]),
+            ("Second room".into(), vec!["Containing space".into()])];
+        assert!(scope_covers_targets(&RoomScope::AllRooms, &targets));
+        assert!(!scope_covers_targets(&RoomScope::room("First room"), &targets));
+        assert!(scope_covers_targets(&RoomScope::Selection { rooms: Vec::new(), spaces: vec!["Containing space".into()] }, &targets));
+        assert!(!scope_covers_targets(&RoomScope::Selection { rooms: Vec::new(), spaces: vec!["Other space".into()] }, &targets));
+        assert!(!scope_covers_targets(&RoomScope::Selection { rooms: Vec::new(), spaces: Vec::new() }, &[]));
+    }
+
+    #[test]
+    fn in_popup_space_picker_approves_only_a_covering_space_and_once_remains_exact() {
+        let (mut cx, prompt) = prompt();
+        prompt.show(&mut cx, &ordinary_info());
+        prompt.borrow_mut().unwrap().select_spatial_scope(&mut cx, 2);
+        let inner = prompt.borrow().unwrap();
+        assert!(!inner.scope_valid);
+        assert!(inner.view.widget(&cx, ids!(allow_button)).disabled(&cx));
+        let picker = inner.view.permission_scope_editor(&cx, ids!(spatial_picker));
+        drop(inner);
+        for id in [ids!(scope_choice_section), ids!(duration_section), ids!(network_section), ids!(choose_targets)] {
+            assert!(!picker.borrow().unwrap().view.widget(&cx, id).visible(), "the popup has no second scope, duration or network step");
+        }
+        let space = RoomScope::Selection { rooms: Vec::new(), spaces: vec!["!parent:example.org".into()] };
+        picker.set_scope(&mut cx, &space);
+        let changed = cx.capture_actions(|cx| cx.widget_action(picker.widget_uid(), PermissionScopeEditorAction::Changed));
+        prompt.borrow_mut().unwrap().handle_event(&mut cx, &Event::Actions(changed), &mut Scope::empty());
+        assert!(matches!(answer(&prompt, &mut cx, 1, false).answer,
+            PermissionPromptAction::AllowScoped { scope, duration: GrantDuration::RobrixSession, .. } if scope == space));
+        prompt.update_scope_targets(&mut cx, &[("!target:example.org".into(), Vec::new())]);
+        assert!(!prompt.borrow().unwrap().scope_valid);
+        prompt.update_scope_targets(&mut cx, &ordinary_info().scope_targets);
+        assert!(prompt.borrow().unwrap().scope_valid);
+        prompt.set_space_membership_ready(&mut cx, false);
+        assert!(!prompt.borrow().unwrap().scope_valid, "wait for trusted space membership before replaying the request");
+        prompt.set_space_membership_ready(&mut cx, true);
+        assert!(prompt.borrow().unwrap().scope_valid);
+        assert_eq!(prompt.borrow().unwrap().scope, Some(space));
+        assert_eq!(prompt.borrow().unwrap().duration, 1);
+        picker.set_scope(&mut cx, &RoomScope::Selection { rooms: Vec::new(), spaces: Vec::new() });
+        let changed = cx.capture_actions(|cx| cx.widget_action(picker.widget_uid(), PermissionScopeEditorAction::Changed));
+        prompt.borrow_mut().unwrap().handle_event(&mut cx, &Event::Actions(changed), &mut Scope::empty());
+        assert!(!prompt.borrow().unwrap().scope_valid);
+        assert!(matches!(answer(&prompt, &mut cx, 0, false).answer, PermissionPromptAction::AllowOnce));
+        assert!(!prompt.borrow().unwrap().view.widget(&cx, ids!(spatial_choice_section)).visible());
+        assert!(!prompt.borrow().unwrap().view.widget(&cx, ids!(spatial_picker)).visible());
+    }
+
+    #[test]
+    fn collection_defaults_all_rooms_but_can_approve_the_current_room() {
+        let (mut cx, prompt) = prompt();
+        let mut info = ordinary_info();
+        info.collection = true;
+        info.scope = Some(RoomScope::AllRooms);
+        info.scope_targets.clear();
+        prompt.show(&mut cx, &info);
+        assert_eq!(prompt.borrow().unwrap().spatial_mode, 1);
+        prompt.borrow_mut().unwrap().select_spatial_scope(&mut cx, 0);
+        assert!(matches!(answer(&prompt, &mut cx, 1, false).answer,
+            PermissionPromptAction::AllowScoped { scope, .. } if scope == RoomScope::room("!target:example.org")));
+        info.room_id = None;
+        prompt.show(&mut cx, &info);
+        assert_eq!(prompt.borrow().unwrap().spatial_modes, [1, 2, 3]);
+        assert!(matches!(answer(&prompt, &mut cx, 1, false).answer,
+            PermissionPromptAction::AllowScoped { scope: RoomScope::AllRooms, .. }));
+    }
+
+    #[test]
+    fn spatial_flow_answers_include_scope_while_account_requests_hide_the_picker() {
+        let (mut cx, prompt) = prompt();
+        let mut info = FlowPromptInfo {
+            prompt_id: 31, app_name: "Search".into(), app_icon: "🔎".into(), action: "Search the current room".into(),
+            destination: "Your Matrix server: https://matrix.example.org".into(), sources: vec!["Account data".into()],
+            payload: "{\"query\":\"nexus\"}".into(), allow_once: true, allow_lasting: true,
+            scope: Some(RoomScope::room("!target:example.org")),
+            scope_targets: vec![("!target:example.org".into(), vec!["!parent:example.org".into()])],
+            room_id: Some("!target:example.org".into()),
+        };
+        prompt.show_flow(&mut cx, &info);
+        assert!(matches!(answer(&prompt, &mut cx, 1, false).answer,
+            PermissionPromptAction::AllowFlowScoped { scope, duration: GrantDuration::RobrixSession } if scope == RoomScope::room("!target:example.org")));
+        prompt.borrow_mut().unwrap().select_spatial_scope(&mut cx, 1);
+        assert!(matches!(answer(&prompt, &mut cx, 2, false).answer,
+            PermissionPromptAction::AllowFlowScoped { scope: RoomScope::AllRooms, duration: GrantDuration::Always }));
+        assert!(matches!(answer(&prompt, &mut cx, 0, false).answer, PermissionPromptAction::AllowFlowOnce));
+        info.scope = None;
+        info.scope_targets.clear();
+        info.room_id = None;
+        prompt.show_flow(&mut cx, &info);
+        assert!(!prompt.borrow().unwrap().view.widget(&cx, ids!(spatial_section)).visible());
+        assert!(matches!(answer(&prompt, &mut cx, 1, false).answer,
+            PermissionPromptAction::AllowFlow { duration: GrantDuration::RobrixSession }));
+        let mut account = ordinary_info();
+        account.perm = Permission::MatrixProfile;
+        account.scope = None;
+        account.scope_targets.clear();
+        prompt.show(&mut cx, &account);
+        assert!(!prompt.borrow().unwrap().view.widget(&cx, ids!(spatial_section)).visible(), "an origin room does not make account permission spatial");
+    }
 }

@@ -248,6 +248,32 @@ pub fn disable_app(cx: &mut Cx, app_id: &str) {
     changed();
 }
 
+/// A global permissions reset also withdraws all saved background consent,
+/// including tasks from other accounts or apps no longer in the registry.
+pub fn reset_permissions(cx: &mut Cx) -> Result<(), String> {
+    let (ids, jobs) = with(|state| (state.active.keys().copied().collect::<Vec<_>>(),
+        state.store.as_ref().map(|store| store.jobs().to_vec()).unwrap_or_default()));
+    for id in ids { retire(cx, id); }
+    for job in &jobs { stop_job_instance(cx, job); }
+    let result = with(|state| {
+        if let Some(timer) = state.timer.take() { cx.stop_timer(timer); }
+        state.timer_at = None;
+        state.watched_rooms.clear();
+        state.ready.clear();
+        state.failures.clear();
+        state.last_owners.clear();
+        let unavailable = state.error.clone().unwrap_or_else(|| "Background tasks are unavailable.".into());
+        let result = state.store.as_mut().ok_or(unavailable)?.disable_all(now_ms());
+        if let Err(error) = &result { state.error = Some(error.clone()); }
+        for job in jobs {
+            state.status.insert(job.id, "Paused after permissions were reset. Review and enable this task to run it again.".into());
+        }
+        result
+    });
+    changed();
+    result
+}
+
 /// In-flight work dies before persistent run state is released on logout.
 pub fn suspend(cx: &mut Cx, signed_out: bool) {
     let (account, ids) = with(|state| {
@@ -401,10 +427,14 @@ pub fn record_failure(heap: usize, error: &str) {
     let Ok(account) = current_account() else { return };
     let current = instances::context_of_heap(heap).and_then(|context| flow::context_epoch(&context).ok().map(|epoch| (context, epoch)));
     let mut error = error.chars().take(4096).collect::<String>();
-    if error == flow::EFFECT_REVIEW_REQUIRED || error.contains("Advanced permissions")
+    if error == "Choose where to send this data before allowing this request." {
+        error.push_str(" Open the task's app and choose a destination before testing this action while it is visible. Automated runs do not open permission dialogs.");
+    } else if error == flow::EFFECT_REVIEW_REQUIRED || error == flow::ACTION_REVIEW_REQUIRED
+        || error == "Your permission is needed before this data can be sent."
+        || error.contains("Advanced permissions")
         || error.contains("Data sharing") || error.contains("sensitive action") || error.contains("untrusted")
     {
-        error.push_str(" Open the task's app and test this action while it is visible. Choose Allow for this session before running the background task again. Automated runs do not open permission dialogs.");
+        error.push_str(" Open the task's app and test this action while it is visible. Select Until you quit Robrix or Forever, then choose Approve before running the background task again. Automated runs do not open permission dialogs.");
     }
     with(|state| {
         let ids = state.last_owners.iter().filter(|(_, (owner_heap, epoch, context))|
@@ -645,7 +675,7 @@ View{width: Fill height: Fill}
         record_failure(heap, a2app_core::information_flow::ACTION_REVIEW_REQUIRED);
         assert!(snapshot().unwrap()[0].status.contains("while it is visible"), "the host denial remains attributed after hidden-worker retirement");
         record_failure(heap, flow::EFFECT_REVIEW_REQUIRED);
-        assert!(snapshot().unwrap()[0].status.contains("Allow for this session"), "combined effect denials explain foreground session setup");
+        assert!(snapshot().unwrap()[0].status.contains("Until you quit Robrix or Forever"), "combined effect denials explain foreground setup with lasting approval");
         finish_failure_drain();
         record_failure(heap, "An unrelated later error");
         assert!(!snapshot().unwrap()[0].status.contains("unrelated"));

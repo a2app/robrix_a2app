@@ -139,7 +139,7 @@ impl A2AppMatrixResult {
 }
 
 impl A2AppMatrixRequest {
-    pub fn authorized(self, subject: String, capability: &str, origin_room: Option<String>, consent: Box<PermissionStore>, flow_context: a2app_core::information_flow::ContextId) -> Self {
+    pub fn authorized(self, subject: String, capability: &str, origin_room: Option<String>, consent: Box<PermissionStore>, flow_context: a2app_core::information_flow::ContextId, args: serde_json::Value) -> Self {
         let flow_epoch = a2app_core::information_flow::context_epoch(&flow_context).ok();
         let target_room = self.room_target().map(|(room, _, _)| room).or_else(|| match &self {
             Self::SpaceRooms { space_id, .. } => Some(space_id.to_string()),
@@ -147,7 +147,7 @@ impl A2AppMatrixRequest {
             _ => origin_room.clone(),
         });
         Self::Authorized {
-            authorization: MatrixAuthorization { subject, capability: capability.to_string(), origin_room, target_room, consent, flow_context: Some(flow_context), flow_epoch },
+            authorization: MatrixAuthorization { subject, capability: capability.to_string(), origin_room, target_room, consent, flow_context: Some(flow_context), flow_epoch, flow_payload: Some(args) },
             request: Box::new(self),
         }
     }
@@ -573,6 +573,7 @@ async fn run_matrix_request(request: A2AppMatrixRequest, authorization: Option<M
                         .collect(),
                 };
                 targets.retain(|room| policy::room_access_allowed(room.room_id().as_str(), RoomAccess::Read));
+                policy::record_read_rooms(&targets.iter().map(|room| room.room_id().to_owned()).collect::<Vec<_>>())?;
                 let needle = query.to_lowercase();
                 let mut seen: HashSet<OwnedEventId> = HashSet::new();
                 let mut hits: Vec<(u64, serde_json::Value)> = Vec::new();
@@ -621,11 +622,12 @@ async fn run_matrix_request(request: A2AppMatrixRequest, authorization: Option<M
                     }
                 }
                 let mut server_used = false;
-                let unencrypted: Vec<OwnedRoomId> = targets.iter()
+                let mut unencrypted: Vec<OwnedRoomId> = targets.iter()
                     .filter(|r| !r.encryption_state().is_encrypted())
                     .filter(|r| policy::room_access_allowed(r.room_id().as_str(), RoomAccess::Read))
                     .map(|r| r.room_id().to_owned())
                     .collect();
+                unencrypted.sort_by(|a, b| a.as_str().cmp(b.as_str()));
                 if server && !unencrypted.is_empty() {
                     use matrix_sdk::ruma::api::client::filter::RoomEventFilter;
                     use matrix_sdk::ruma::api::client::search::search_events::v3::{Categories, Criteria, OrderBy, Request, SearchKeys};
@@ -633,14 +635,15 @@ async fn run_matrix_request(request: A2AppMatrixRequest, authorization: Option<M
                     criteria.keys = Some(vec![SearchKeys::ContentBody]);
                     criteria.order_by = Some(OrderBy::Recent);
                     let mut filter = RoomEventFilter::default();
-                    filter.rooms = Some(unencrypted);
+                    filter.rooms = Some(unencrypted.clone());
                     criteria.filter = filter;
                     let mut categories = Categories::new();
                     categories.room_events = Some(criteria);
-                    // Search terms are plaintext to the homeserver even when
-                    // their source was an encrypted room. Room output consent
-                    // does not authorize this distinct network recipient.
-                    policy::ensure_server_output(client.homeserver().as_str()).await?;
+                    // Capture exactly the plaintext query and room filter
+                    // that the SDK is about to send before showing consent.
+                    let parameters = policy::search_server_parameters(&query, &unencrypted, limit);
+                    policy::ensure_server_output_with_payload(client.homeserver().as_str(), &parameters).await?;
+                    for room in &unencrypted { policy::ensure_room_access(room.as_str(), RoomAccess::Read)?; }
                     let response = policy::audit_server_operation(client.homeserver().as_str(), client.send(Request::new(categories))).await
                         .map_err(|e| format!("server search failed: {e}"))?;
                     server_used = true;

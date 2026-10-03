@@ -232,16 +232,22 @@ pub(crate) async fn rooms(space_id: OwnedRoomId) -> Result<String, String> {
     check_space()?;
     let client = get_client().ok_or("not logged in")?;
     let homeserver = client.homeserver();
+    let approval = super::policy::begin_server_query(homeserver.as_str()).await?;
     let list = SpaceRoomList::new(client, space_id.clone()).await;
     // Each page is one /hierarchy request; stop at the end or at the row cap.
+    let mut pages = 0;
     loop {
         check_space()?;
-        super::policy::ensure_server_output(homeserver.as_str()).await?;
+        approval.check()?;
         super::policy::audit_server_operation(homeserver.as_str(), list.paginate()).await
             .map_err(|e| format!("couldn't load the space's rooms: {e}"))?;
+        pages += 1;
         let done = matches!(list.pagination_state(), SpaceRoomListPaginationState::Idle { end_reached: true });
         if done || list.rooms().await.len() >= 200 {
             break;
+        }
+        if pages >= 100 {
+            return Err("The server did not finish loading this space. Try again.".into());
         }
     }
     let out: Vec<serde_json::Value> = list.rooms().await.into_iter()

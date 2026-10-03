@@ -63,6 +63,21 @@ script_mod! {
             margin: Inset{right: 5.5},
         }
     }
+
+    // The room-category header reused for disclosures in settings and dialogs.
+    mod.widgets.RobrixSettingsCollapsibleHeader = mod.widgets.CollapsibleHeader {
+        height: 40, margin: 0
+        title: "Details"
+        draw_bg +: { color: (COLOR_BG_PREVIEW) }
+        collapse_icon +: { draw_bg.color: (MESSAGE_TEXT_COLOR) }
+        label +: {
+            draw_text +: {
+                color: (MESSAGE_TEXT_COLOR)
+                text_style: SETTINGS_BOLD_TEXT_STYLE {}
+            }
+        }
+        unread_badge +: { visible: false }
+    }
 }
 
 /// The categories of collapsible headers in the rooms list.
@@ -103,6 +118,8 @@ pub enum CollapsibleHeaderAction {
     Toggled {
         category: HeaderCategory,
     },
+    /// A standalone disclosure header changed its expanded state.
+    ExpansionChanged(bool),
     #[default]
     None,
 }
@@ -110,6 +127,8 @@ pub enum CollapsibleHeaderAction {
 #[derive(Script, ScriptHook, Widget)]
 pub struct CollapsibleHeader {
     #[deref] view: View,
+    /// A standalone disclosure title; empty uses the room-category name.
+    #[live] title: String,
     #[rust(true)] is_expanded: bool,
     #[rust] category: HeaderCategory,
     #[rust] num_unread_mentions: u64,
@@ -138,7 +157,8 @@ impl Widget for CollapsibleHeader {
         if let Some(mut arrow) = self.view.child_by_path(ids!(collapse_icon)).borrow_mut::<ExpandArrow>() {
             arrow.set_is_open_no_animate(self.is_expanded);
         }
-        self.view.child_by_path(ids!(label)).set_text(cx, self.category.as_str());
+        let title = if self.title.is_empty() { self.category.as_str() } else { &self.title };
+        self.view.child_by_path(ids!(label)).set_text(cx, title);
         self.view.child_by_path(ids!(unread_badge))
             .as_unread_badge()
             .update_counts(false, self.num_unread_mentions, self.num_unread_messages);
@@ -153,16 +173,37 @@ impl CollapsibleHeader {
             arrow.set_is_open(cx, self.is_expanded, Animate::Yes);
         }
         self.redraw(cx);
-        cx.widget_action(
-            self.widget_uid(), 
+        let action = if self.title.is_empty() {
             CollapsibleHeaderAction::Toggled {
                 category: self.category,
-            },
-        );
+            }
+        } else {
+            CollapsibleHeaderAction::ExpansionChanged(self.is_expanded)
+        };
+        cx.widget_action(self.widget_uid(), action);
     }
 }
 
 impl CollapsibleHeaderRef {
+    /// Sets the disclosure's state without changing its title or category.
+    pub fn set_expanded(&self, cx: &mut Cx, is_expanded: bool, animate: Animate) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.is_expanded = is_expanded;
+            if let Some(mut arrow) = inner.view.child_by_path(ids!(collapse_icon)).borrow_mut::<ExpandArrow>() {
+                arrow.set_is_open(cx, is_expanded, animate);
+            }
+            inner.redraw(cx);
+        }
+    }
+
+    /// Returns the new state when a standalone disclosure was toggled.
+    pub fn expansion_changed(&self, actions: &Actions) -> Option<bool> {
+        match actions.find_widget_action(self.widget_uid()).cast() {
+            CollapsibleHeaderAction::ExpansionChanged(expanded) => Some(expanded),
+            _ => None,
+        }
+    }
+
     /// Sets the category and expanded state of the header.
     pub fn set_details(
         &self,

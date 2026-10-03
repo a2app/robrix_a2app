@@ -26,7 +26,7 @@ cargo run --features a2app
 - **Per-app isolation**: each app runs in its own Splash isolate with nothing
   by default: no filesystem beyond its private jail, no network, no host access.
   Capabilities are declared in the app's manifest, prompted at first use
-  (Allow for this session / Allow once / Block permission / Not now), revocable at any time, and a
+  with an Approve/Deny popup and a duration dropdown, revocable at any time, and a
   request-flooding app gets stopped and restricted.
 - **Matrix services**, each behind its own permission group: the attached
   room (info, messages, older history, one event, threads and replies,
@@ -107,16 +107,27 @@ saved allowances. **Add an allowance…** opens room, website and duration choic
 asks for the agent's room and then the permission to edit. Opening or cancelling
 an editor does not grant access.
 
-Request prompts show the app, task, rooms or website, and duration. **Allow for
-this session** grants the declared permission group for those rooms until Robrix
-closes; website access covers only the displayed HTTP(S) origin. Collection
-permissions cover your rooms and spaces while retaining room protection filters.
-**More options…** exposes **Allow once**, narrower website/room scopes, permanent
-choices, and blocking. Duplicate requests share one prompt and pending requests
-continue automatically after approval. If room changes are off, the first write
-can explicitly **Enable and allow**, provided no other rule blocks it.
+**Reset all permissions…** in the Mini Apps screen restores default access,
+clears saved approvals and blocks, stops active apps and agents, and pauses
+background tasks. App data and provenance are retained. Apps ask again when
+opened; background tasks must be enabled again.
 
-**Advanced permissions** has **Rules**, **Needs attention**, and **History** views. Adding
+Request popups show the app, task and captured rooms or website. Choose **One
+time**, **Until you quit Robrix**, or **Forever** under **Approve duration:**,
+then **Approve** or **Deny**. The default is until you quit Robrix; website access
+covers only the displayed HTTP(S) origin. For room operations, **Approve in:**
+defaults to the requested rooms. Choose **Current room(s)**, **All rooms**,
+**Rooms in a space**, or **Selected rooms and spaces** in the same popup.
+Spaces include their nested rooms and future membership changes. Fixed requests
+must fit the selection; room collections are filtered to it. **One time** approves
+only the captured request. Account and device tasks omit room choices.
+Robrix checks room protection internally. Ongoing subscriptions need a
+session or lasting duration. Duplicate requests share one prompt and pending
+requests continue automatically after approval. If room changes are off, the
+popup explains that Approve also enables them, provided no other rule blocks it.
+
+**Advanced permissions** is optional management, never a required step in a
+runtime permission request. It has **Rules**, **Needs attention**, and **History** views. Adding
 a rule walks through data and app, destination, then duration and a final review.
 Blocked actions retain an exact review before approval. **Background tasks**
 shows task cards with Pause/Resume, Edit, and Details; new tasks walk through
@@ -361,7 +372,10 @@ only the pending request, including its asynchronous completion. Subscriptions
 and requests to enable a permission use a selected duration instead.
 Explicit action and sharing session choices also survive restarting that same
 app context, so recurring background workers keep the permission the user chose.
-New private sources, destinations or untrusted influences still need review.
+Room-scoped action approvals apply to the same app and operation in the selected
+rooms, including room data from within that selection. Other private sources,
+destinations or untrusted influences still need review. Older saved operation
+approvals retain their original exact scope until replaced or removed.
 
 Global, room and ancestor-space blocks always override allowlists and app
 grants. Read and write are independent. The **Allow apps to send or change rooms** master switch
@@ -416,11 +430,17 @@ Retained private data is never declassified through a sharing rule.
 Opening a mini-app does not itself read room or account data. Robrix records
 actual service responses, hooks and input before delivering them. Keyboard
 input belongs only to the focused app; typing in the room composer does not
-mark other apps as private. A blocked app offers **Review permission** to open
-its request directly while keeping the instance running. Foreground requests
-normally show a direct prompt combining private sources, destination and exact
-action, then continue the pending operation after approval. Sharing rules remain
-reviewable after an app stops; exact action approval requires its live instance.
+mark other apps as private. Foreground requests show a modal describing the action,
+Approve/Deny and a duration dropdown, then continue the pending
+operation after approval. Source labels, taint tracking and rule selection stay
+behind the scenes; full request details are optional. Combined approvals bind
+the operation, destination, app context and reviewed sources/influences. A local
+room read is not an export to that room. One-time approval covers one immutable
+request. Until you quit Robrix and Forever approvals can also cover an older
+saved app, while its private provenance remains protected. These approvals stay
+limited to that app context, operation, recipient and reviewed inputs; they do
+not create general sharing rules for unidentified data. Saved approvals
+can be removed in Advanced permissions.
 
 The design follows the established floating-label approach described by
 [LIO's authors](https://www.scs.stanford.edu/~deian/pubs/stefan%3A2011%3Aflexible.pdf)
@@ -486,20 +506,19 @@ private sources, actual recipients, and all sources blocking a disclosure,
 with direct access to the relevant sharing rule.
 
 Action approval captures the reviewed influence set and live activation.
-**This exact action once** also captures the complete host-owned request
-contents. A foreground prompt can approve sharing and the sensitive action
-together. Its primary **Allow for this session** authorizes the displayed known
-sources and operation/target until Robrix closes. **Allow this request once**
-releases only that captured effect and creates no sharing rule. Both continue
-the waiting request automatically. The advanced history
-review still authorizes one unchanged manual retry. Approval is consumed
-immediately before the effect starts. Changed contents, a different target, cancellation,
-revocation or a new activation cannot reuse that approval. Explicit room-session
-and Robrix-session choices remain available for repeated operations of the same
-kind to the same target, including different contents. These approvals authorize
-actions; source-to-recipient sharing rules still independently protect private data.
-New influences, ending the selected room or Robrix session, or explicit revocation
-invalidate session authority. No app can endorse its own content or reset these labels.
+A foreground prompt can approve sharing and the sensitive action together.
+**One time** covers the complete host-owned request and is consumed immediately
+before the effect starts. Changed contents, a different target, cancellation,
+revocation or a new activation cannot reuse that one-time approval.
+**Until you quit Robrix** and **Forever** remember the app's operation and
+target for repeated requests, including different contents. All choices continue
+the waiting request automatically and preserve its private source labels.
+New sources or influences require another review. Session approvals end when
+Robrix quits; permanent approvals remain until revoked. The advanced history
+review still authorizes one unchanged manual retry, and explicit room-session
+choices remain available there. Operation approvals do not create general
+source-to-recipient sharing rules. No app can endorse its own content or reset
+these labels.
 This constrains actions influenced by prompt injection; it does not classify
 instructions as malicious or make remote content trustworthy. Diagnostic
 history is bounded, local and metadata-only; request/response bodies are not

@@ -267,25 +267,66 @@ fn next_permission_prompt_id() -> u64 {
 }
 
 enum FlowContinuation {
-    Bridge { request: SplashHostRequest, review: a2app_core::information_flow::EffectReview, allow_once: bool },
+    Bridge { request: SplashHostRequest, review: a2app_core::information_flow::EffectReview, allow_once: bool, permission: Option<Permission> },
     Worker(super::effect_review::WorkerReview),
+    Generated { review: a2app_core::information_flow::EffectReview },
 }
 
 impl FlowContinuation {
     fn review(&self) -> &a2app_core::information_flow::EffectReview {
-        match self { Self::Bridge { review, .. } => review, Self::Worker(worker) => &worker.review }
+        match self { Self::Bridge { review, .. } | Self::Generated { review } => review, Self::Worker(worker) => &worker.review }
     }
 
     fn allow_once(&self) -> bool {
-        match self { Self::Bridge { allow_once, .. } => *allow_once, Self::Worker(worker) => worker.allow_once }
+        match self { Self::Bridge { allow_once, .. } => *allow_once, Self::Worker(worker) => worker.allow_once, Self::Generated { .. } => true }
     }
 
     fn is_cancelled(&self) -> bool {
-        matches!(self, Self::Worker(worker) if worker.is_cancelled())
+        match self {
+            Self::Worker(worker) => worker.is_cancelled(),
+            Self::Generated { .. } => !self.can_prompt(),
+            Self::Bridge { .. } => false,
+        }
+    }
+
+    fn can_prompt(&self) -> bool {
+        with_a2app(|state| self.can_prompt_with_state(state)).unwrap_or(false)
+    }
+
+    fn can_prompt_with_state(&self, state: &A2AppState) -> bool {
+        let review = self.review();
+        if super::information_flow::current_context(&review.context).is_err()
+            || a2app_core::information_flow::ensure_context_epoch(&review.context, review.epoch).is_err()
+        { return false; }
+        match self {
+            Self::Generated { .. } => state.pending_generated.as_ref().is_some_and(|pending|
+                pending.matches_review(review)
+                    && state.generation_context.as_ref() == Some(&review.context) && state.generation_epoch == Some(review.epoch)
+                    && pending.can_retain()),
+            _ => instances::context_can_prompt(&review.context, review.epoch),
+        }
+    }
+
+    fn replace_review(&mut self, mut updated: a2app_core::information_flow::EffectReview) {
+        // An allowed capture has no ticket payload. Keep the complete request
+        // available when capability consent is still waiting in this modal.
+        if updated.payload.is_empty() { updated.payload = self.review().payload.clone(); }
+        match self {
+            Self::Generated { review } => {
+                with_a2app(|state| {
+                    if let Some(pending) = state.pending_generated.as_mut().filter(|pending|
+                        pending.matches_review(review))
+                    { pending.effect_review_id = Some(updated.id); }
+                });
+                *review = updated;
+            }
+            Self::Bridge { review, .. } => *review = updated,
+            Self::Worker(worker) => worker.review = updated,
+        }
     }
 
     fn approve(&self, approve: impl FnOnce(&a2app_core::information_flow::EffectReview) -> Result<(), String>) -> Result<(), String> {
-        match self { Self::Bridge { review, .. } => approve(review), Self::Worker(worker) => worker.approve(approve) }
+        match self { Self::Bridge { review, .. } | Self::Generated { review } => approve(review), Self::Worker(worker) => worker.approve(approve) }
     }
 }
 
@@ -426,7 +467,7 @@ impl AiRoomInfo {
     }
 }
 
-/// A completed build waiting for review; Retry installs these captured bytes.
+/// A completed build waiting for the user's decision on these captured bytes.
 struct PendingGeneratedApp {
     manifest: Box<MiniAppManifest>,
     refine_of: Option<MiniAppId>,
@@ -436,15 +477,29 @@ struct PendingGeneratedApp {
     attribution: Option<(Option<VersionActor>, AcquisitionSource)>,
     action_target: Option<String>,
     review_id: Option<u64>,
+    effect_review_id: Option<u64>,
 }
 
 impl PendingGeneratedApp {
+    fn matches_review(&self, review: &a2app_core::information_flow::EffectReview) -> bool {
+        self.effect_review_id == Some(review.id) && self.context == review.context && self.epoch == review.epoch
+            && matches!((serde_json::to_value(&self.manifest), serde_json::from_str::<serde_json::Value>(&review.payload)),
+                (Ok(payload), Ok(captured)) if payload == captured)
+    }
+
     fn action(&self) -> Option<a2app_core::information_flow::SensitiveAction> {
         self.action_target.as_ref().map(|target| a2app_core::information_flow::SensitiveAction {
             kind: "apps.generate".into(), target: target.clone(),
         })
     }
 
+    fn install_action(&self) -> a2app_core::information_flow::SensitiveAction {
+        self.action().unwrap_or_else(|| a2app_core::information_flow::SensitiveAction {
+            kind: "apps.generate".into(), target: self.manifest.id.clone(),
+        })
+    }
+
+    #[cfg(test)]
     fn commit_review(&self, commit: impl FnOnce(&a2app_core::information_flow::ContextId, u64,
         &a2app_core::information_flow::SensitiveAction, &serde_json::Value) -> Result<(), String>) -> Result<(), String>
     {
@@ -470,6 +525,7 @@ impl PendingGeneratedApp {
 impl Drop for PendingGeneratedApp {
     fn drop(&mut self) {
         if let Some(id) = self.review_id { let _ = a2app_core::information_flow::cancel_exact_action(id); }
+        if let Some(id) = self.effect_review_id { let _ = a2app_core::information_flow::cancel_effect(id); }
     }
 }
 
@@ -611,6 +667,9 @@ pub fn init() {
     a2app_core::set_data_root(crate::app_data_dir().join("a2app"));
     if let Err(error) = a2app_core::information_flow::init(a2app_core::data_root()) {
         error!("Mini-app information-flow protection: {error}");
+    }
+    if let Err(error) = a2app_core::information_flow::set_effect_room_scope_matcher(matrix::policy::effect_room_scope_matches) {
+        error!("Mini-app room permission matching: {error}");
     }
 
     let mut registry = AppRegistry::new(builtin::builtin_apps());
@@ -793,6 +852,8 @@ pub enum A2AppOp {
     /// Jumps to `room_id` and docks the app there.
     OpenInRoom { app_id: MiniAppId, room_id: OwnedRoomId },
     SetPermission { app_id: MiniAppId, perm: Permission, state: GrantState },
+    /// Resets all mini-app and agent permissions and room protection settings.
+    ResetAllPermissions,
     /// A single ability's own answer under its group (`Ask` = follow group).
     SetCapability { app_id: MiniAppId, cap_id: String, state: GrantState },
     GrantScoped { app_id: MiniAppId, perm: Permission, cap_id: Option<String>, scope: RoomScope, duration: GrantDuration, origin_room: Option<String> },
@@ -821,6 +882,7 @@ pub enum A2AppOp {
         expected_epoch: u64,
     },
     RevokeFlowAuthority(u64),
+    RevokeEffectAuthority(u64),
     GrantExactFlowAuthority {
         context: a2app_core::information_flow::ContextId,
         request_id: u64,
@@ -1052,6 +1114,7 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
             }
             if action.downcast_ref::<matrix::spaces::A2AppPolicySpacesInvalidated>().is_some() {
                 invalidate_policy_spaces(cx);
+                refresh_permission_scope_targets(cx, ui);
                 continue;
             }
             if let Some(update) = action.downcast_ref::<matrix::spaces::A2AppPolicySpaces>() {
@@ -1072,6 +1135,7 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
                 });
                 if let Some(error) = &update.error { warning!("Mini-app space permissions: {error}"); }
                 publish_grants(cx);
+                refresh_permission_scope_targets(cx, ui);
                 ui.redraw(cx);
                 continue;
             }
@@ -1165,6 +1229,7 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
 
     if with_a2app(|state| state.policy_spaces_revision != matrix::spaces::policy_spaces_revision()).unwrap_or(false) {
         invalidate_policy_spaces(cx);
+        refresh_permission_scope_targets(cx, ui);
     }
     request_policy_spaces();
     // Deliver finished matrix calls back into their isolates. The callback
@@ -1174,6 +1239,7 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     for result in matrix_results {
         let reply = result.reply;
         let requested_context = result.authorization.as_ref().and_then(|auth| auth.flow_context.clone());
+        let capability = result.authorization.as_ref().map(|auth| auth.capability.clone());
         let activation_check = result.authorization.as_ref().ok_or("Missing Matrix authorization.".to_string())
             .and_then(|authorization| authorization.check_context());
         let result = with_a2app(|state| result.checked_result(&state.permissions))
@@ -1185,7 +1251,7 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
                     return Err("The requesting Matrix context changed.".into());
                 }
                 let value = serde_json::from_str(&data).map_err(|_| "Invalid service response.")?;
-                super::information_flow::record_response(&context, &value)?;
+                super::information_flow::record_matrix_response(&context, capability.as_deref(), &value)?;
                 Ok(data)
             });
         match &result {
@@ -1438,11 +1504,13 @@ fn deliver_room_hooks(
                 })));
             }
             RoomWatchKind::Reaction { event_id, key, sender, added } => {
+                let is_own = crate::sliding_sync::current_user_id().as_ref() == Some(&sender);
                 each.push((Some(room_id.clone()), "on_room_reaction", serde_json::json!({
                     "room_id": room_id,
                     "event_id": event_id,
                     "key": key,
                     "sender_id": sender,
+                    "is_own": is_own,
                     "added": added,
                 })));
             }
@@ -1608,7 +1676,12 @@ fn permission_filtered_hook(app_id: &str, origin: Option<&RoomId>, hook: &str, p
         // Totals computed for the entire account cannot be safely attributed
         // to a subject with access to only selected rooms.
         if hook == "on_unread_totals_changed"
-            && (state.permissions.effective_capability(manifest, cap) != Effective::Granted
+            && ((state.permissions.effective_capability(manifest, cap) != Effective::Granted
+                && !(state.permissions.has_all_room_collection_consent(app_id, cap, PermissionContext {
+                    origin_room: origin.map(|room| room.as_str()), target_room: None,
+                }) && state.permissions.effective_collection_capability_in_context(manifest, cap, PermissionContext {
+                    origin_room: origin.map(|room| room.as_str()), target_room: None,
+                }) == Effective::Granted))
                 || state.permissions.policy_mode(RoomAccess::Read) == RoomPolicyMode::WhitelistOnly
                 || state.permissions.room_rules().values().any(|rule| rule.read == PolicyDecision::Deny)
                 || state.permissions.space_rules().values().any(|rule| rule.read == PolicyDecision::Deny))
@@ -1988,6 +2061,7 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             apply_permission_to_running(cx, ui, &app_id, perm);
             ui.redraw(cx);
         }
+        A2AppOp::ResetAllPermissions => reset_all_permissions(cx, ui),
         A2AppOp::SetCapability { app_id, cap_id, state: new_state } => {
             let Some(cap) = a2app_core::capabilities::by_id(&cap_id) else { return };
             with_a2app(|state| {
@@ -2162,6 +2236,17 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             if revoked && let Ok(account) = super::information_flow::account() { a2app_core::protection_audit::record_policy_change(&account); }
             stop_private_contexts(cx, ui);
             ui.redraw(cx);
+        }
+        A2AppOp::RevokeEffectAuthority(id) => {
+            match a2app_core::information_flow::revoke_effect_authority(id) {
+                Ok(revoked) => {
+                    if revoked && let Ok(account) = super::information_flow::account() { a2app_core::protection_audit::record_policy_change(&account); }
+                    if revoked { stop_private_contexts(cx, ui); }
+                    publish_grants(cx);
+                    ui.redraw(cx);
+                }
+                Err(error) => enqueue_popup_notification(error, PopupKind::Error, Some(5.0)),
+            }
         }
         A2AppOp::RoomClosed(room_id) => {
             super::background::room_closed(cx, room_id.as_str());
@@ -2603,7 +2688,7 @@ fn advance_generation(cx: &mut Cx, ui: &WidgetRef) {
                 let action_target = state.ai_generation_room.as_ref().map(ToString::to_string);
                 #[cfg(not(unix))]
                 let action_target = None;
-                Ok(PendingGeneratedApp { manifest, refine_of, context, epoch, request, attribution: state.generation_attribution.take(), action_target, review_id: None })
+                Ok(PendingGeneratedApp { manifest, refine_of, context, epoch, request, attribution: state.generation_attribution.take(), action_target, review_id: None, effect_review_id: None })
             }).unwrap_or_else(|| Err("Mini-app state is unavailable.".into()));
             match pending {
                 Ok(pending) => finish_generated_app(cx, ui, pending),
@@ -2628,67 +2713,77 @@ fn advance_generation(cx: &mut Cx, ui: &WidgetRef) {
     }
 }
 
-/// Final installation uses the original capture and activation, including on
-/// Retry. It never regenerates or silently substitutes a newly produced app.
+/// Install the captured build after its permission decision, without regeneration.
 fn finish_generated_app(cx: &mut Cx, ui: &WidgetRef, mut pending: PendingGeneratedApp) {
-    let mut awaiting_review = false;
-    let result = with_a2app(|state| -> Result<(), String> {
+    let payload = serde_json::to_value(&pending.manifest).map_err(|_| "Cannot review the generated mini-app.".to_owned());
+    let action = pending.install_action();
+    let review = payload.as_ref().map_err(|error| error.clone()).and_then(|payload| {
         super::information_flow::current_context(&pending.context)?;
         a2app_core::information_flow::ensure_context_epoch(&pending.context, pending.epoch)?;
-        if pending.refine_of.is_none() && (state.registry.get(&pending.manifest.id).is_some()
-            || persistence::has_app_files(&pending.manifest.id)) {
-            return Err("Another saved app now uses this generated app's ID. Start a new generation; this reviewed build cannot replace it.".into());
-        }
-        if let Some(action) = pending.action() {
-            let approval = pending.commit_review(a2app_core::information_flow::commit_exact_action_for_activation);
-            // Unsupported one-time captures still permit explicit session
-            // review, then Retry of the same bounded retained build.
-            awaiting_review = approval.is_err()
-                && a2app_core::information_flow::recent_action_decisions().is_ok_and(|decisions| decisions.iter().rev()
-                    .any(|decision| decision.context == pending.context && decision.epoch == pending.epoch && decision.action == action && !decision.allowed))
-                && pending.can_retain();
-            approval?;
-        }
-        // Provenance reaches code before any version or source is persisted.
-        a2app_core::information_flow::add_sources(&pending.context, [super::information_flow::account_source(&pending.context)])?;
-        let room = match &pending.manifest.scope { A2AppScope::Room { room_id } => Some(room_id.as_str()), A2AppScope::Account => None };
-        let to = super::information_flow::app_context(&pending.manifest.id, room)?;
-        let legacy = state.registry.get(&pending.manifest.id).is_some_and(super::information_flow::manifest_has_private_source);
-        a2app_core::information_flow::register_context_with_legacy_data(&to, legacy)?;
-        a2app_core::information_flow::transfer(&pending.context, &to)?;
-        a2app_core::information_flow::record_app_code_from(&pending.manifest.id, &pending.context)?;
-        let (actor, source) = pending.attribution.clone().map(|(actor, source)| (actor, Some(source)))
-            .unwrap_or((None, None));
-        commit_version(&mut pending.manifest, VersionOrigin::Ai, &pending.request, actor, source)?;
-        persistence::save_user_app(&pending.manifest).map_err(|_| "Could not save the reviewed mini-app.".to_string())?;
-        state.clear_adopted_builtin_update(&pending.manifest);
-        state.registry.insert((*pending.manifest).clone());
-        state.generation = None;
-        state.generation_context = None; state.generation_epoch = None;
-        state.failed_request = None;
-        state.console.status = if pending.refine_of.is_some() { format!("Updated \"{}\".", pending.manifest.name) }
-            else { format!("Created \"{}\".", pending.manifest.name) };
-        state.registry_dirty = true;
-        Ok(())
-    }).unwrap_or_else(|| Err("Mini-app state is unavailable.".into()));
-    if let Err(reason) = result {
-        if awaiting_review {
-            let payload = serde_json::to_value(&pending.manifest).ok();
-            pending.review_id = a2app_core::information_flow::recent_action_decisions().ok().and_then(|decisions| {
-                decisions.into_iter().rev().find(|d| d.context == pending.context && d.epoch == pending.epoch
-                    && d.action.kind == "apps.generate" && pending.action_target.as_deref() == Some(d.action.target.as_str())
-                    && d.request.as_ref().is_some_and(|request| serde_json::from_str::<serde_json::Value>(&request.payload).ok() == payload))
-                    .and_then(|d| d.request.map(|request| request.id))
+        let valid = with_a2app(|state| {
+            state.generation_context.as_ref() == Some(&pending.context) && state.generation_epoch == Some(pending.epoch)
+                && (pending.refine_of.is_some() || (state.registry.get(&pending.manifest.id).is_none()
+                    && !persistence::has_app_files(&pending.manifest.id)))
+        }).unwrap_or(false);
+        if !valid { return Err("This completed build was cancelled or another app now uses its ID. Start a new generation.".into()); }
+        a2app_core::information_flow::prepare_effect_for_activation(&pending.context, pending.epoch, None, Some(&action), payload)
+    });
+    if let Ok(review) = &review && !review.allowed {
+        if pending.can_retain() {
+            pending.effect_review_id = Some(review.id);
+            let review = review.clone();
+            with_a2app(|state| {
+                state.generation = None;
+                state.failed_request = None;
+                state.console.status = "The app is ready. Choose whether to install it in the permission popup.".into();
+                state.pending_generated = Some(pending);
             });
+            queue_flow_prompt(cx, ui, FlowContinuation::Generated { review });
+            ui.redraw(cx);
+            return;
         }
+        let _ = a2app_core::information_flow::cancel_effect(review.id);
+    }
+    let result = review.and_then(|review| {
+        if !review.allowed { return Err("The generated app is too large to retain for review. Ask for a smaller app.".into()); }
+        let payload = payload?;
+        with_a2app(|state| -> Result<(), String> {
+            super::information_flow::current_context(&pending.context)?;
+            a2app_core::information_flow::ensure_context_epoch(&pending.context, pending.epoch)?;
+            if pending.refine_of.is_none() && (state.registry.get(&pending.manifest.id).is_some()
+                || persistence::has_app_files(&pending.manifest.id)) {
+                return Err("Another saved app now uses this generated app's ID. Start a new generation.".into());
+            }
+            a2app_core::information_flow::commit_effect_for_activation(&pending.context, pending.epoch, None, Some(&action), &payload)?;
+            // Provenance reaches code before any version or source is persisted.
+            a2app_core::information_flow::add_sources(&pending.context, [super::information_flow::account_source(&pending.context)])?;
+            let room = match &pending.manifest.scope { A2AppScope::Room { room_id } => Some(room_id.as_str()), A2AppScope::Account => None };
+            let to = super::information_flow::app_context(&pending.manifest.id, room)?;
+            let legacy = state.registry.get(&pending.manifest.id).is_some_and(super::information_flow::manifest_has_private_source);
+            a2app_core::information_flow::register_context_with_legacy_data(&to, legacy)?;
+            a2app_core::information_flow::transfer(&pending.context, &to)?;
+            a2app_core::information_flow::record_app_code_from(&pending.manifest.id, &pending.context)?;
+            let (actor, source) = pending.attribution.clone().map(|(actor, source)| (actor, Some(source)))
+                .unwrap_or((None, None));
+            commit_version(&mut pending.manifest, VersionOrigin::Ai, &pending.request, actor, source)?;
+            persistence::save_user_app(&pending.manifest).map_err(|_| "Could not save the reviewed mini-app.".to_string())?;
+            state.clear_adopted_builtin_update(&pending.manifest);
+            state.registry.insert((*pending.manifest).clone());
+            state.generation = None;
+            state.generation_context = None; state.generation_epoch = None;
+            state.failed_request = None;
+            state.console.status = if pending.refine_of.is_some() { format!("Updated \"{}\".", pending.manifest.name) }
+                else { format!("Created \"{}\".", pending.manifest.name) };
+            state.registry_dirty = true;
+            Ok(())
+        }).unwrap_or_else(|| Err("Mini-app state is unavailable.".into()))
+    });
+    if let Err(reason) = result {
         with_a2app(|state| {
             state.generation = None;
             state.generation_context = None; state.generation_epoch = None;
-            if awaiting_review {
-                state.failed_request = Some(pending.request.clone());
-                state.console.status = "Build complete. Review its exact contents in Advanced permissions, then select Retry to install this saved build.".into();
-                state.pending_generated = Some(pending);
-            } else { state.console.status = format!("Failed: {reason}"); }
+            state.failed_request = None;
+            state.console.status = format!("The app was not installed: {reason}");
         });
         #[cfg(unix)]
         resolve_session_generation(cx, ui, None, Err(format!("The build could not be installed: {reason}")));
@@ -2753,6 +2848,7 @@ fn process_broker(cx: &mut Cx, ui: &WidgetRef) {
             pane_state: &instances::pane_state,
             storage_path: &compartment_storage_path,
             room_name: &room_name,
+            permission_target_room: Some(&permission_target_room),
             desktop_view,
             check_flow: &super::information_flow::check_request,
             check_response: &super::information_flow::check_response,
@@ -2775,7 +2871,7 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
         }
         BrokerAsk::FlowReview { request, review } => {
             let allow_once = !request.service.starts_with("matrix.") && request.service != "network.http";
-            queue_flow_prompt(cx, ui, FlowContinuation::Bridge { request, review, allow_once });
+            queue_flow_prompt(cx, ui, FlowContinuation::Bridge { request, review, allow_once, permission: None });
         }
         BrokerAsk::Prompt { app_id, perm, request, tool } => {
             let grant = tool.map(|t| PromptToolGrant {
@@ -2837,7 +2933,7 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
                 Err(error) => services::respond(cx, reply, Err(&error)),
             }
         }
-        BrokerAsk::Matrix { reply, app_id, room, call, capability, consent } => {
+        BrokerAsk::Matrix { reply, app_id, room, call, capability, consent, args } => {
             let flow_context = match super::information_flow::context_for_heap(reply.heap_key) {
                 Ok(context) => context,
                 Err(error) => return services::respond(cx, reply, Err(&error)),
@@ -2845,7 +2941,7 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
             let origin = room.clone();
             let room = room.and_then(|r| OwnedRoomId::try_from(r.as_str()).ok());
             match matrix::request_for(call, room, reply) {
-                Ok(request) => submit_async_request(MatrixRequest::A2App(request.authorized(app_id, capability, origin, consent, flow_context))),
+                Ok(request) => submit_async_request(MatrixRequest::A2App(request.authorized(app_id, capability, origin, consent, flow_context, args))),
                 Err(e) => {
                     with_a2app(|state| state.broker.note(reply, &app_id));
                     services::respond(cx, reply, Err(e));
@@ -2861,6 +2957,9 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
             let Ok(room_id) = room.as_deref().map(OwnedRoomId::try_from).transpose() else {
                 return services::respond(cx, reply, Err("not a valid room id"));
             };
+            if let Err(error) = super::information_flow::record_subscription(heap_key, hook) {
+                return services::respond(cx, reply, Err(&error));
+            }
             with_a2app(|state| {
                 let sub = state.hook_subs.entry(heap_key).or_insert_with(|| HookSubscription {
                     app_id,
@@ -3294,6 +3393,129 @@ fn install_version(cx: &mut Cx, ui: &WidgetRef, updated: MiniAppManifest, done: 
     ui.redraw(cx);
 }
 
+pub(super) fn matrix_link_action(room: Option<String>, url: &str) -> Result<HostAction, String> {
+    let matrix_id = MatrixToUri::parse(url).map(|uri| uri.id().clone())
+        .or_else(|_| MatrixUri::parse(url).map(|uri| uri.id().clone()))
+        .map_err(|_| String::from("not a matrix.to or matrix: link"))?;
+    match matrix_id {
+        MatrixId::User(user_id) => Ok(HostAction::ShowUser { room, user_id: user_id.to_string() }),
+        MatrixId::Room(room_id) => Ok(HostAction::OpenRoom { room: room_id.to_string() }),
+        MatrixId::Event(room_or_alias, event_id) => {
+            let room_id = OwnedRoomId::try_from(room_or_alias)
+                .map_err(|_| String::from("room aliases can't be resolved yet"))?;
+            Ok(HostAction::JumpToEvent { room: Some(room_id.to_string()), event_id: event_id.to_string() })
+        }
+        _ => Err(String::from("room aliases can't be resolved yet")),
+    }
+}
+
+pub(super) fn host_action_target_room(action: &HostAction) -> Option<&str> {
+    match action {
+        HostAction::OpenRoom { room } => Some(room),
+        HostAction::OpenSpace { space } => Some(space),
+        HostAction::JumpToEvent { room, .. } | HostAction::OpenThread { room, .. }
+        | HostAction::ShowUser { room, .. } | HostAction::OpenApp { room, .. }
+        | HostAction::ComposerInsert { room, .. } | HostAction::ComposerReplyTo { room, .. }
+            => room.as_deref(),
+        _ => None,
+    }
+}
+
+pub(super) fn permission_target_room(service: &str, args: &serde_json::Value, origin: Option<&str>) -> Option<String> {
+    if service == "nav.link" {
+        let room = args["room_id"].as_str().map(str::trim).filter(|room| !room.is_empty()).or(origin);
+        let action = matrix_link_action(room.map(str::to_owned), args["url"].as_str()?).ok()?;
+        return host_action_target_room(&action).map(str::to_owned);
+    }
+    services::permission_context(service, args, origin).target_room.map(str::to_owned)
+}
+
+#[cfg(test)]
+mod matrix_link_scope_tests {
+    use super::*;
+
+    #[test]
+    fn matrix_links_use_the_parsed_room_instead_of_the_callers_origin() {
+        for url in ["https://matrix.to/#/!target:test", "matrix:roomid/target:test",
+            "https://matrix.to/#/!target:test/$event:test"]
+        {
+            let args = serde_json::json!({ "url": url, "room_id": "!spoofed:test" });
+            assert_eq!(permission_target_room("nav.link", &args, Some("!origin:test")), Some("!target:test".into()));
+            let action = matrix_link_action(Some("!origin:test".into()), url).unwrap();
+            assert_eq!(host_action_target_room(&action), Some("!target:test"));
+        }
+        let user = serde_json::json!({ "url": "https://matrix.to/#/@person:test" });
+        assert_eq!(permission_target_room("nav.link", &user, Some("!origin:test")), Some("!origin:test".into()));
+        assert!(matrix_link_action(Some("!origin:test".into()), "https://matrix.to/#/#alias:test").is_err());
+    }
+
+    #[test]
+    fn a_scoped_link_grant_covers_the_destination_and_keeps_the_session_origin() {
+        let mut manifest = builtin::stock("room-peek").unwrap();
+        manifest.declare(Permission::RobrixNavigation);
+        manifest.capabilities.push("host.nav.link".into());
+        let cap = a2app_core::capabilities::by_id("host.nav.link").unwrap();
+        let args = serde_json::json!({ "url": "https://matrix.to/#/!target:test" });
+        let target = permission_target_room("nav.link", &args, Some("!origin:test")).unwrap();
+        let mut store = PermissionStore::default();
+        store.grant_scoped(&manifest.id, Permission::RobrixNavigation, Some(cap.id), RoomScope::room("!target:test"),
+            GrantDuration::RoomSession, Some("!origin:test")).unwrap();
+        let context = PermissionContext { origin_room: Some("!origin:test"), target_room: Some(&target) };
+        assert_eq!(store.effective_capability_in_context(&manifest, cap, context), Effective::Granted);
+        assert_eq!(store.effective_capability_in_context(&manifest, cap,
+            PermissionContext { origin_room: Some("!origin:test"), target_room: Some("!other:test") }), Effective::NeedsPrompt);
+        assert_eq!(store.effective_capability_in_context(&manifest, cap,
+            PermissionContext { origin_room: Some("!replacement:test"), target_room: Some(&target) }), Effective::NeedsPrompt);
+    }
+
+    #[test]
+    fn observing_selected_rooms_can_subscribe_from_a_different_origin_and_filters_events() {
+        let previous = A2APP.with(|state| state.replace(None));
+        let mut manifest = builtin::stock("room-peek").unwrap();
+        manifest.permissions = vec![Permission::RobrixObserve.as_str().into()];
+        manifest.capabilities = vec!["on_active_room_changed".into()];
+        initialize_background_test(manifest.clone());
+        let origin = OwnedRoomId::try_from("!origin:test").unwrap();
+        with_a2app(|state| {
+            state.permissions.grant_scoped(&manifest.id, Permission::RobrixObserve, None, RoomScope::room("!target:test"),
+                GrantDuration::RoomSession, Some(origin.as_str())).unwrap();
+            let cap = a2app_core::capabilities::by_id("on_active_room_changed").unwrap();
+            assert!(services::is_room_collection(cap));
+            assert_eq!(state.permissions.effective_collection_capability_in_context(&manifest, cap,
+                PermissionContext { origin_room: Some(origin.as_str()), target_room: Some(origin.as_str()) }), Effective::Granted);
+        });
+        let selected = serde_json::json!({ "room_id": "!target:test", "name": "Selected" });
+        let other = serde_json::json!({ "room_id": "!other:test", "name": "Other" });
+        assert!(permission_filtered_hook(&manifest.id, Some(&origin), "on_active_room_changed", &selected).is_some());
+        assert!(permission_filtered_hook(&manifest.id, Some(&origin), "on_active_room_changed", &other).is_none());
+        A2APP.with(|state| { state.replace(previous); });
+    }
+
+    #[test]
+    fn unread_totals_accept_all_rooms_consent_but_keep_subset_and_room_denials_protected() {
+        let previous = A2APP.with(|state| state.replace(None));
+        let mut manifest = builtin::stock("room-peek").unwrap();
+        manifest.permissions = vec![Permission::MatrixRoomsList.as_str().into()];
+        manifest.capabilities = vec!["on_unread_totals_changed".into()];
+        initialize_background_test(manifest.clone());
+        let origin = OwnedRoomId::try_from("!origin:test").unwrap();
+        let payload = serde_json::json!({ "unread": 4, "mentions": 1 });
+        with_a2app(|state| {
+            state.permissions.grant_scoped(&manifest.id, Permission::MatrixRoomsList, None, RoomScope::room("!target:test"),
+                GrantDuration::RobrixSession, None).unwrap();
+        });
+        assert!(permission_filtered_hook(&manifest.id, Some(&origin), "on_unread_totals_changed", &payload).is_none());
+        with_a2app(|state| {
+            state.permissions.grant_scoped(&manifest.id, Permission::MatrixRoomsList, None, RoomScope::AllRooms,
+                GrantDuration::RobrixSession, None).unwrap();
+        });
+        assert!(permission_filtered_hook(&manifest.id, Some(&origin), "on_unread_totals_changed", &payload).is_some());
+        with_a2app(|state| state.permissions.set_room_policy("!target:test", RoomAccess::Read, PolicyDecision::Deny));
+        assert!(permission_filtered_hook(&manifest.id, Some(&origin), "on_unread_totals_changed", &payload).is_none());
+        A2APP.with(|state| { state.replace(previous); });
+    }
+}
+
 fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, heap: usize, action: HostAction) -> Result<(), String> {
     let room_of = |room: Option<String>| -> Result<OwnedRoomId, String> {
         let room = room.ok_or("this mini-app is not attached to a room; pass {room_id}")?;
@@ -3335,19 +3557,16 @@ fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, heap: usize, action: HostAct
             cx.action(action);
         }
         HostAction::OpenLink { room, url } => {
-            let matrix_id = MatrixToUri::parse(&url).map(|u| u.id().clone())
-                .or_else(|_| MatrixUri::parse(&url).map(|u| u.id().clone()))
-                .map_err(|_| String::from("not a matrix.to or matrix: link"))?;
-            let action = match matrix_id {
-                MatrixId::User(user_id) => HostAction::ShowUser { room, user_id: user_id.to_string() },
-                MatrixId::Room(room_id) => HostAction::OpenRoom { room: room_id.to_string() },
-                MatrixId::Event(room_or_alias, event_id) => {
-                    let room_id = OwnedRoomId::try_from(room_or_alias)
-                        .map_err(|_| String::from("room aliases can't be resolved yet"))?;
-                    HostAction::JumpToEvent { room: Some(room_id.to_string()), event_id: event_id.to_string() }
-                }
-                _ => return Err(String::from("room aliases can't be resolved yet")),
-            };
+            let action = matrix_link_action(room, &url)?;
+            let context = super::information_flow::context_for_heap(heap)?;
+            let capability = a2app_core::capabilities::by_id("host.nav.link").ok_or("Unknown navigation action.")?;
+            let allowed = with_a2app(|state| {
+                let Some(manifest) = context.app().and_then(|app| state.registry.get(app)) else { return false };
+                state.permissions.effective_capability_in_context(manifest, capability, PermissionContext {
+                    origin_room: context.room(), target_room: host_action_target_room(&action),
+                }) == Effective::Granted
+            }).unwrap_or(false);
+            if !allowed { return Err("Opening this link is not allowed for its destination room.".into()); }
             return perform_host_action(cx, ui, heap, action);
         }
         HostAction::OpenApp { room, app_id } => {
@@ -3491,6 +3710,20 @@ fn queue_permission_prompt(
         refuse_parked_request(cx, perm, parked);
         return;
     }
+    if tool.is_none() && let ParkedRequest::Bridge(Some(request)) = &parked
+        && let Ok(Some(review)) = combined_bridge_review(request)
+    {
+        let enable_writes = with_a2app(|state| parked_can_enable_writes(state, &subject, perm, &parked)).unwrap_or(false);
+        if !enable_writes || review.allow_session() {
+            let ParkedRequest::Bridge(Some(request)) = parked else { unreachable!() };
+            queue_flow_prompt(cx, ui, FlowContinuation::Bridge { request, review, allow_once: !enable_writes, permission: Some(perm) });
+            return;
+        }
+        // Enable the master switch through its ordinary popup first when the
+        // actual effect can only receive exact one-time approval. Otherwise
+        // neither duration would be available in the combined popup.
+        let _ = a2app_core::information_flow::cancel_effect(review.id);
+    }
     with_a2app(|state| {
         let rooms = parked_rooms(&parked);
         let activation = match &parked {
@@ -3529,17 +3762,158 @@ fn queue_permission_prompt(
     show_next_permission_prompt(cx, ui);
 }
 
+/// Combine ordinary access and an immediate outgoing effect into one question.
+///
+/// Deferred Matrix effects still resolve their actual SDK operation at the
+/// worker boundary. Local reads have no outgoing data-sharing requirement.
+fn combined_bridge_review(request: &SplashHostRequest) -> Result<Option<a2app_core::information_flow::EffectReview>, String> {
+    let context = super::information_flow::context_for_heap(request.heap_key)?;
+    let args: serde_json::Value = serde_json::from_str(&request.args_json).map_err(|error| error.to_string())?;
+    if request.service == "network.http" {
+        let review = super::network::Request::parse(&args)?.permission_review(&context)?;
+        return Ok((!review.allowed).then_some(review));
+    }
+    if request.service.starts_with("matrix.") { return matrix_permission_review(request, &context, &args); }
+    if matches!(request.service.as_str(),
+        "host.composer.insert" | "host.composer.reply_to" | "host.nav.app") { return Ok(None); }
+    let Some(capability) = a2app_core::capabilities::for_service(&request.service) else { return Ok(None) };
+    let contract = capability.flow_contract().ok_or("Missing data-flow contract.")?;
+    let target_room = permission_target_room(&request.service, &args, context.room());
+    let target = target_room.as_deref();
+    let homeserver = crate::sliding_sync::get_client().map(|client| client.homeserver().to_string());
+    let recipient = contract.recipient(context.account(), target, &args, homeserver.as_deref())?;
+    let action = contract.sensitive_action(capability.id, &args, target);
+    if recipient.is_none() && action.is_none() { return Ok(None); }
+    let epoch = a2app_core::information_flow::context_epoch(&context)?;
+    let review = a2app_core::information_flow::prepare_effect_for_activation(&context, epoch, recipient.as_ref(), action.as_ref(), &args)?;
+    Ok((!review.allowed).then_some(review))
+}
+
+/// Capture local SDK metadata before asking about a remote Matrix operation.
+///
+/// Preflight changes only a private policy clone and provenance labels. It
+/// performs no network work, grants no access, and reads no message contents.
+fn matrix_permission_review(request: &SplashHostRequest, context: &a2app_core::information_flow::ContextId, args: &serde_json::Value) -> Result<Option<a2app_core::information_flow::EffectReview>, String> {
+    use a2app_core::{capabilities::{FlowOutput, FlowSource}, information_flow::{self as flow, Influence, Recipient, SensitiveAction}};
+    let capability = a2app_core::capabilities::for_service(&request.service).ok_or("Unknown Matrix action.")?;
+    let contract = capability.flow_contract().ok_or("Missing data-flow contract.")?;
+    let call = services::matrix::parse(&request.service, args, context.room().is_some())?;
+    let permission_context = services::permission_context(&request.service, args, context.room());
+    let Some(client) = crate::sliding_sync::get_client() else { return Ok(None) };
+    let epoch = flow::context_epoch(context)?;
+    let mut searched_sources = flow::Label::new();
+    let sensitive = |target: &str, payload: serde_json::Value| -> Result<(Recipient, Option<SensitiveAction>, serde_json::Value), String> {
+        let recipient = contract.recipient(context.account(), Some(target), &payload, Some(client.homeserver().as_str()))?
+            .ok_or("Missing Matrix action destination.")?;
+        Ok((recipient, Some(SensitiveAction { kind: capability.id.into(), target: target.into() }), payload))
+    };
+    let (recipient, action, payload) = match call {
+        services::MatrixServiceCall::SendMessage { body }
+        | services::MatrixServiceCall::RoomsSend { body, .. } => {
+            let room = permission_context.target_room.ok_or("Missing message destination.")?;
+            let content = matrix_sdk::ruma::events::room::message::RoomMessageEventContent::text_plain(body);
+            sensitive(room, serde_json::to_value(content).map_err(|_| "Cannot review message content.")?)?
+        }
+        services::MatrixServiceCall::Pin { event_id, pinned } => {
+            let room = permission_context.target_room.ok_or("Missing pin destination.")?;
+            let event_id = matrix_sdk::ruma::OwnedEventId::try_from(event_id).map_err(|_| "invalid event_id")?;
+            sensitive(room, serde_json::json!({ "event_id": event_id, "pinned": pinned }))?
+        }
+        services::MatrixServiceCall::RoomFlag { flag, on } => {
+            let room = permission_context.target_room.ok_or("Missing room flag destination.")?;
+            let flag_name = match flag {
+                services::matrix::RoomFlag::Favorite => "favorite",
+                services::matrix::RoomFlag::LowPriority => "low_priority",
+                services::matrix::RoomFlag::Unread => "unread",
+            };
+            sensitive(room, serde_json::json!({ "flag": flag_name, "on": on }))?
+        }
+        services::MatrixServiceCall::InviteRespond { room_id, accept } => {
+            let room = matrix_sdk::ruma::OwnedRoomId::try_from(room_id).map_err(|_| "invalid room_id")?;
+            sensitive(room.as_str(), serde_json::json!({ "accept": accept }))?
+        }
+        services::MatrixServiceCall::Invite { user_id } => {
+            let room = permission_context.target_room.ok_or("Missing invite destination.")?;
+            let user_id = matrix_sdk::ruma::OwnedUserId::try_from(user_id).map_err(|_| "invalid user_id")?;
+            sensitive(room, serde_json::json!({ "user_id": user_id }))?
+        }
+        services::MatrixServiceCall::Typing { typing } => {
+            if typing && !crate::settings::app_preferences::send_typing_notices() { return Ok(None); }
+            let room = permission_context.target_room.ok_or("Missing typing destination.")?;
+            sensitive(room, serde_json::json!({ "typing": typing }))?
+        }
+        services::MatrixServiceCall::Join { room, via } => {
+            // Aliases must first be resolved by the guarded worker lookup.
+            if !room.starts_with('!') { return Ok(None); }
+            let room = matrix_sdk::ruma::OwnedRoomId::try_from(room).map_err(|_| "invalid room_id")?;
+            let via = via.into_iter().map(matrix_sdk::ruma::OwnedServerName::try_from)
+                .collect::<Result<Vec<_>, _>>().map_err(|_| "invalid via server name")?;
+            sensitive(room.as_str(), serde_json::json!({ "operation": "join", "room_id": room, "via": via }))?
+        }
+        services::MatrixServiceCall::Search { query, scope, limit, server: true } => {
+            let mut store = with_a2app(|state| state.permissions.clone()).ok_or("Mini Apps are unavailable.")?;
+            let subject = context.app().ok_or("Missing mini-app identity.")?;
+            store.grant_scoped(subject, capability.group.ok_or("Missing permission group.")?, Some(capability.id),
+                bridge_scope(request, capability, &args, permission_context.target_room), GrantDuration::RobrixSession, context.room())?;
+            let auth = matrix::policy::MatrixAuthorization::new(subject, capability.id, context.room(), &store).with_flow(context.clone());
+            let targets = match scope {
+                services::SearchScope::Attached => context.room().and_then(|id| matrix_sdk::ruma::RoomId::parse(id).ok())
+                    .and_then(|id| client.get_room(&id)).into_iter().collect::<Vec<_>>(),
+                services::SearchScope::AllJoined => client.joined_rooms().into_iter().filter(|room| !room.is_space()).collect(),
+                services::SearchScope::Rooms(ids) => ids.iter().filter_map(|id| matrix_sdk::ruma::RoomId::parse(id).ok())
+                    .filter_map(|id| client.get_room(&id)).filter(|room| room.state() == matrix_sdk::RoomState::Joined && !room.is_space()).collect(),
+            };
+            let readable = targets.iter().filter(|room|
+                store.room_policy(Some(room.room_id().as_str()), RoomAccess::Read) != PolicyDecision::Deny
+                    && auth.permits(&store, Some(room.room_id().as_str()))).collect::<Vec<_>>();
+            let unencrypted = readable.iter().filter(|room| !room.encryption_state().is_encrypted())
+                .map(|room| room.room_id().to_owned()).collect::<Vec<_>>();
+            if unencrypted.is_empty() { return Ok(None); }
+            searched_sources.extend(readable.iter().map(|room| flow::Source::Room {
+                account: context.account().into(), room: room.room_id().to_string(),
+            }));
+            let parameters = matrix::policy::search_server_parameters(&query, &unencrypted, limit);
+            (Recipient::network_origin(client.homeserver().as_str())?, None,
+                serde_json::json!({ "destination": client.homeserver().as_str(), "operation": capability.id, "parameters": parameters }))
+        }
+        _ if !contract.privileged_effect && matches!(contract.output, FlowOutput::MatrixServer | FlowOutput::MatrixPagination) => {
+            let Some(recipient) = contract.recipient(context.account(), permission_context.target_room, args, Some(client.homeserver().as_str()))? else { return Ok(None) };
+            (recipient, None, serde_json::json!({ "destination": client.homeserver().as_str(), "operation": capability.id, "parameters": args }))
+        }
+        _ => return Ok(None),
+    };
+    // Record the declared incoming source now so final dispatch cannot add
+    // an already-disclosed source and force a second permission popup.
+    if !matches!(contract.source, FlowSource::InstalledAppCode | FlowSource::IpcAppCode | FlowSource::Peer) {
+        let sources = contract.source_labels(context.account(), context.room(), permission_context.target_room)?;
+        flow::add_sources_for_activation(context, epoch, sources.clone())?;
+        if contract.untrusted_content {
+            flow::add_influences_for_activation(context, epoch, sources.into_iter().map(|source| match source {
+                flow::Source::Room { account, room } => Influence::RoomContent { account, room },
+                _ => Influence::Unknown,
+            }))?;
+        }
+    }
+    flow::add_sources_for_activation(context, epoch, searched_sources.clone())?;
+    flow::add_influences_for_activation(context, epoch, searched_sources.into_iter().filter_map(|source| match source {
+        flow::Source::Room { account, room } => Some(Influence::RoomContent { account, room }),
+        _ => None,
+    }))?;
+    let review = flow::prepare_effect_for_activation(context, epoch, Some(&recipient), action.as_ref(), &payload)?;
+    Ok((!review.allowed).then_some(review))
+}
+
 fn queue_flow_prompt(cx: &mut Cx, ui: &WidgetRef, flow: FlowContinuation) {
     let review = flow.review();
-    if super::information_flow::current_context(&review.context).is_err()
-        || !instances::context_can_prompt(&review.context, review.epoch)
-    {
+    if !flow.can_prompt() {
         refuse_flow(cx, flow, "Open this mini-app to review the permission it needs.");
         return;
     }
-    let subject = review.context.app().unwrap_or_default().to_owned();
-    let perm = review.action.as_ref().and_then(|action| a2app_core::capabilities::by_id(&action.kind))
-        .and_then(|capability| capability.group).unwrap_or(Permission::Network);
+    let subject = review.context.app().map(str::to_owned)
+        .unwrap_or_else(|| review.context.room().map(agent_subject).unwrap_or_default());
+    let perm = match &flow { FlowContinuation::Bridge { permission: Some(permission), .. } => Some(*permission), _ => None }
+        .or_else(|| review.action.as_ref().and_then(|action| a2app_core::capabilities::by_id(&action.kind))
+            .and_then(|capability| capability.group)).unwrap_or(Permission::Network);
     with_a2app(|state| state.prompts.push_back(PermissionPrompt {
         id: next_permission_prompt_id(), subject, perm, parked: Vec::new(), tool: None, flow: Some(flow), enable_writes: false, activations: Vec::new(),
     }));
@@ -3549,6 +3923,23 @@ fn queue_flow_prompt(cx: &mut Cx, ui: &WidgetRef, flow: FlowContinuation) {
 fn refuse_flow(cx: &mut Cx, flow: FlowContinuation, reason: &str) {
     match flow {
         FlowContinuation::Worker(worker) => worker.finish(Err(reason.into())),
+        FlowContinuation::Generated { review } => {
+            let _ = a2app_core::information_flow::cancel_effect(review.id);
+            let cancelled = with_a2app(|state| {
+                if !state.pending_generated.as_ref().is_some_and(|pending| pending.matches_review(&review))
+                { return false; }
+                state.pending_generated = None;
+                state.generation = None;
+                state.generation_context = None; state.generation_epoch = None;
+                state.failed_request = None;
+                state.console.status = "The app was not installed. You can start a new request.".into();
+                true
+            }).unwrap_or(false);
+            #[cfg(unix)]
+            if cancelled { resolve_session_generation(cx, &WidgetRef::empty(), None, Err(format!("The app was not installed: {reason}"))); }
+            #[cfg(not(unix))]
+            let _ = cancelled;
+        }
         FlowContinuation::Bridge { request, review, .. } => {
             let _ = a2app_core::information_flow::cancel_effect(review.id);
             if a2app_core::information_flow::ensure_context_epoch(&review.context, review.epoch).is_ok()
@@ -3573,6 +3964,7 @@ fn replay_bridge_request(cx: &mut Cx, ui: &WidgetRef, request: SplashHostRequest
             is_docked: &is_docked, is_running: &instances::is_running,
             pane_state: &instances::pane_state, storage_path: &compartment_storage_path,
             room_name: &room_name, desktop_view,
+            permission_target_room: Some(&permission_target_room),
             check_flow: &super::information_flow::check_request,
             check_response: &super::information_flow::check_response,
         }, request)
@@ -3604,10 +3996,7 @@ fn sweep_permission_prompts(cx: &mut Cx, ui: &WidgetRef) {
     let stale = with_a2app(|state| {
         let prompt = state.active_prompt.as_ref()?;
         let stale = if let Some(flow) = &prompt.flow {
-            let review = flow.review();
-            a2app_core::information_flow::ensure_context_epoch(&review.context, review.epoch).is_err()
-                || !instances::context_can_prompt(&review.context, review.epoch)
-                || flow.is_cancelled()
+            !flow.can_prompt_with_state(state) || matches!(flow, FlowContinuation::Worker(worker) if worker.is_cancelled())
         } else {
             !prompt.parked.iter().any(|parked| match parked {
                 ParkedRequest::Bridge(Some(request)) => bridge_activation_can_prompt(request, &prompt.activations),
@@ -3825,7 +4214,7 @@ fn show_next_permission_prompt(cx: &mut Cx, ui: &WidgetRef) {
         retain_live_bridge_requests(&mut prompt);
         if prompt.flow.is_none() && prompt.parked.is_empty() { continue; }
         if let Some(flow) = prompt.flow.as_mut() {
-            if flow.is_cancelled() {
+            if flow.is_cancelled() || !flow.can_prompt() {
                 refuse_flow(cx, prompt.flow.take().unwrap(), "This permission request was cancelled.");
                 continue;
             }
@@ -3835,15 +4224,15 @@ fn show_next_permission_prompt(cx: &mut Cx, ui: &WidgetRef) {
                 .and_then(|payload| a2app_core::information_flow::prepare_effect_for_activation(
                     &review.context, review.epoch, review.recipient.as_ref(), review.action.as_ref(), &payload));
             let updated = match updated {
-                Ok(updated) if instances::context_can_prompt(&updated.context, updated.epoch) => updated,
-                Ok(_) => { refuse_flow(cx, prompt.flow.take().unwrap(), "Reopen this mini-app to continue."); continue; }
+                Ok(updated) => updated,
                 Err(error) => { refuse_flow(cx, prompt.flow.take().unwrap(), &error); continue; }
             };
-            match flow {
-                FlowContinuation::Bridge { review, .. } => *review = updated,
-                FlowContinuation::Worker(worker) => worker.review = updated,
+            flow.replace_review(updated);
+            if !flow.can_prompt() {
+                refuse_flow(cx, prompt.flow.take().unwrap(), "This permission request was cancelled.");
+                continue;
             }
-            if flow.review().allowed {
+            if flow.review().allowed && flow_bridge_permission_granted(flow) {
                 resume_flow(cx, ui, prompt.flow.take().unwrap());
                 continue;
             }
@@ -3866,9 +4255,30 @@ fn show_next_permission_prompt(cx: &mut Cx, ui: &WidgetRef) {
             with_a2app(|state| state.active_prompt = Some(prompt));
             ui.mini_app_permission_prompt(cx, ids!(a2app_permission_modal.content)).show(cx, &info);
         }
+        let spaces_ready = with_a2app(|state| state.policy_spaces_ready
+            && state.policy_spaces_revision == matrix::spaces::policy_spaces_revision()).unwrap_or(false);
+        ui.mini_app_permission_prompt(cx, ids!(a2app_permission_modal.content)).set_space_membership_ready(cx, spaces_ready);
         ui.modal(cx, ids!(a2app_permission_modal)).open(cx);
         return;
     }
+}
+
+/// A grant from the preceding popup can also cover an already queued request.
+fn flow_bridge_permission_granted(flow: &FlowContinuation) -> bool {
+    let FlowContinuation::Bridge { request, review, permission: Some(_), .. } = flow else { return true };
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(&request.args_json) else { return false };
+    let Some(capability) = a2app_core::capabilities::for_service(&request.service) else { return false };
+    let Some(subject) = review.context.app() else { return false };
+    let target = permission_target_room(&request.service, &args, review.context.room());
+    let context = PermissionContext { origin_room: review.context.room(), target_room: target.as_deref() };
+    with_a2app(|state| {
+        let Some(manifest) = state.registry.get(subject) else { return false };
+        let effective = if services::is_room_collection(capability) {
+            state.permissions.effective_collection_capability_in_context(manifest, capability, context)
+        } else { state.permissions.effective_capability_in_context(manifest, capability, context) };
+        effective == Effective::Granted && (request.service != "network.http" || args["url"].as_str()
+            .is_some_and(|url| state.permissions.is_url_allowed(subject, url, context)))
+    }).unwrap_or(false)
 }
 
 fn prompt_already_granted(state: &A2AppState, prompt: &PermissionPrompt) -> bool {
@@ -3905,14 +4315,56 @@ fn flow_prompt_info(state: &A2AppState, rooms: Option<&RoomsListRef>, flow: &Flo
         Some(Recipient::External) => "External destination".into(),
         None => "Robrix".into(),
     };
-    let action = review.action.as_ref().and_then(|action| a2app_core::capabilities::by_id(&action.kind))
+    let capability = review.action.as_ref().and_then(|action| a2app_core::capabilities::by_id(&action.kind))
         .or_else(|| serde_json::from_str::<serde_json::Value>(&review.payload).ok()
-            .and_then(|payload| payload["operation"].as_str().and_then(a2app_core::capabilities::by_id)))
-        .map(|capability| capability.title.to_string()).unwrap_or_else(|| "Share data to continue".into());
+            .and_then(|payload| payload["operation"].as_str().and_then(a2app_core::capabilities::by_id)));
+    let payload = serde_json::from_str::<serde_json::Value>(&review.payload).unwrap_or_default();
+    let (scope, scope_targets) = flow_prompt_scope(state, flow, capability, &payload);
+    let mut action = capability.map(|capability| permission_action(capability,
+        payload.get("parameters").unwrap_or(&payload))).unwrap_or_else(|| "Send this request".into());
+    if capability.is_some_and(|capability| matches!(capability.id,
+        "matrix.room.event.read" | "matrix.room.thread.read" | "matrix.room.messages.paginate"
+            | "host.nav.event" | "host.nav.thread"))
+    {
+        let parameters = payload.get("parameters").unwrap_or(&payload);
+        if let Some(room) = parameters["room_id"].as_str().or_else(|| parameters["room"].as_str())
+            .or_else(|| review.context.room())
+        { action.push_str(&format!("\nIn {}", room_name(room))); }
+    }
+    if capability.is_some_and(|capability| matches!(capability.id, "matrix.room.messages.search" | "matrix.rooms.messages.search")) {
+        if let Some(ids) = payload["parameters"]["room_ids"].as_array() {
+            let names = ids.iter().filter_map(serde_json::Value::as_str).map(room_name).collect::<Vec<_>>();
+            let shown = names.iter().take(6).cloned().collect::<Vec<_>>().join(", ");
+            if !shown.is_empty() {
+                action.push_str(&format!("\nRooms: {shown}"));
+                if names.len() > 6 { action.push_str(&format!(" and {} more", names.len() - 6)); }
+            }
+        }
+        action.push_str("\nThe search text is sent to your Matrix server. Encrypted rooms are searched on this device.");
+    }
+    if capability.is_some_and(|capability| capability.id == "matrix.space.rooms.list")
+        && let Some(space) = payload["parameters"]["space_id"].as_str()
+    { action.push_str(&format!("\nSpace: {}", room_name(space))); }
+    if let FlowContinuation::Bridge { request, permission: Some(permission), .. } = flow {
+        let manifest = review.context.app().and_then(|app| state.registry.get(app));
+        let args = serde_json::from_str::<serde_json::Value>(&request.args_json).unwrap_or_default();
+        if manifest.is_some_and(|manifest| services::can_enable_permission_writes(&state.permissions, manifest, *permission,
+            services::permission_context(&request.service, &args, review.context.room())))
+        { action.push_str(". Approving also turns on room changes for mini-apps. Each app still needs its own permission."); }
+    }
+    let (app_name, app_icon) = if let FlowContinuation::Generated { .. } = flow {
+        if let Some(pending) = state.pending_generated.as_ref().filter(|pending| pending.matches_review(review)) {
+            action = format!("Install {} “{}”", if pending.refine_of.is_some() { "the update to" } else { "the new app" }, pending.manifest.name);
+        }
+        ("Mini Apps".into(), "✨".into())
+    } else {
+        (manifest.map(|manifest| manifest.name.clone()).unwrap_or_else(|| "Mini-app".into()),
+            manifest.map(|manifest| manifest.icon.clone()).unwrap_or_default())
+    };
     FlowPromptInfo {
         prompt_id: 0,
-        app_name: manifest.map(|manifest| manifest.name.clone()).unwrap_or_else(|| "Mini-app".into()),
-        app_icon: manifest.map(|manifest| manifest.icon.clone()).unwrap_or_default(),
+        app_name,
+        app_icon,
         action, destination,
         sources: review.sources.iter().map(|source| match source {
             Source::Account { .. } => "Your account data or text entered in this app".into(),
@@ -3921,14 +4373,56 @@ fn flow_prompt_info(state: &A2AppState, rooms: Option<&RoomsListRef>, flow: &Flo
         }).collect(),
         payload: serde_json::from_str::<serde_json::Value>(&review.payload)
             .and_then(|value| serde_json::to_string_pretty(&value)).unwrap_or_else(|_| review.payload.to_string()),
+        scope, scope_targets,
+        room_id: review.context.room().map(str::to_owned),
         allow_once: flow.allow_once(),
+        allow_lasting: review.allow_session(),
     }
+}
+
+fn flow_prompt_scope(state: &A2AppState, flow: &FlowContinuation,
+    capability: Option<&a2app_core::capabilities::Capability>, payload: &serde_json::Value,
+) -> (Option<RoomScope>, Vec<(String, Vec<String>)>) {
+    use a2app_core::information_flow::Recipient;
+    let Some(capability) = capability.filter(|capability| capability_has_room_scope(capability)) else { return (None, Vec::new()) };
+    let review = flow.review();
+    let parameters = payload.get("parameters").unwrap_or(payload);
+    let target = match review.recipient.as_ref() {
+        Some(Recipient::MatrixRoom { room, .. }) => Some(room.as_str()),
+        _ => parameters["room_id"].as_str().or_else(|| parameters["space_id"].as_str())
+            .or_else(|| parameters["room"].as_str())
+            .or_else(|| review.action.as_ref().map(|action| action.target.as_str()).filter(|target| RoomId::parse(target).is_ok()))
+            .or_else(|| (!services::is_room_collection(capability)).then(|| review.context.room()).flatten()),
+    };
+    let captured_query = payload.get("parameters").is_some();
+    let scope = if let FlowContinuation::Bridge { request, .. } = flow && !captured_query {
+        let args = serde_json::from_str::<serde_json::Value>(&request.args_json).unwrap_or_default();
+        let target = permission_target_room(&request.service, &args, review.context.room());
+        bridge_scope(request, capability, &args, target.as_deref())
+    } else { capability_scope(capability, parameters, target) };
+    let mut targets = Vec::new();
+    if let FlowContinuation::Bridge { .. } = flow && !captured_query {
+        if !services::is_room_collection(capability) { targets.extend(target.map(str::to_owned)); }
+    } else {
+        // A worker has already captured the outgoing query. Unlike the initial
+        // collection consent, approval cannot change the rooms in that query.
+        if capability.id == "matrix.rooms.messages.search" && let Some(ids) = parameters["room_ids"].as_array() {
+            targets.extend(ids.iter().filter_map(|id| id.as_str().map(str::to_owned)));
+        }
+        targets.extend(target.map(str::to_owned));
+    }
+    (Some(scope), scope_targets(state, targets))
 }
 
 fn resume_flow(cx: &mut Cx, ui: &WidgetRef, flow: FlowContinuation) {
     match flow {
         FlowContinuation::Worker(worker) => worker.finish(Ok(())),
         FlowContinuation::Bridge { request, .. } => replay_bridge_request(cx, ui, request),
+        FlowContinuation::Generated { review } => {
+            let pending = with_a2app(|state| state.pending_generated.take_if(|pending| pending.matches_review(&review))).flatten();
+            if let Some(pending) = pending { finish_generated_app(cx, ui, pending); }
+            else { let _ = a2app_core::information_flow::cancel_effect(review.id); }
+        }
     }
 }
 
@@ -4089,7 +4583,7 @@ fn parked_rooms(parked: &ParkedRequest) -> (Option<String>, Option<String>) {
             let (_, room) = a2app_core::manifest::split_instance_tag(&request.app_tag);
             let origin = room.map(str::to_string);
             let args: serde_json::Value = serde_json::from_str(&request.args_json).unwrap_or_default();
-            let target = services::permission_context(&request.service, &args, origin.as_deref()).target_room.map(str::to_string);
+            let target = permission_target_room(&request.service, &args, origin.as_deref());
             (origin, target)
         }
         ParkedRequest::Bridge(None) => (None, None),
@@ -4173,6 +4667,185 @@ fn parked_can_allow_once(parked: &ParkedRequest) -> bool {
     }
 }
 
+/// Describe the user's task rather than the internal permission category.
+fn permission_action(capability: &a2app_core::capabilities::Capability, args: &serde_json::Value) -> String {
+    match capability.id {
+        "matrix.room.messages.search" | "matrix.rooms.messages.search" =>
+            args["query"].as_str().map(|query| format!("Search messages for {query:?}"))
+                .unwrap_or_else(|| "Search messages".into()),
+        "network.http" => if matches!(args["method"].as_str().unwrap_or("GET"), "GET" | "HEAD") {
+            "Fetch a web page".into()
+        } else { "Send a web request".into() },
+        "device.clipboard.write" => "Copy text to the clipboard".into(),
+        "device.clipboard.read" => "Read text from the clipboard".into(),
+        "device.url.open" => "Open a link in your browser".into(),
+        "host.nav.event" => "Open this message".into(),
+        "host.nav.thread" => "Open this conversation thread".into(),
+        "host.nav.user" => "View this person's profile".into(),
+        "host.nav.room" | "host.nav.space" => "Open this room or space".into(),
+        "matrix.room.message.send" | "matrix.rooms.message.send" => {
+            if let Some(body) = args["body"].as_str() {
+                let mut shown = body.chars().take(240).collect::<String>();
+                if body.chars().count() > 240 { shown.push('…'); }
+                format!("Post this message:\n{shown}")
+            } else { "Post a message".into() }
+        }
+        "matrix.room.message.reply" | "matrix.room.thread.reply" => "Reply to a message".into(),
+        "matrix.room.pin.set" => (if args["pinned"].as_bool() == Some(false) { "Unpin this message" } else { "Pin this message" }).into(),
+        "matrix.room.favorite.set" => (if args["on"].as_bool() == Some(false) { "Remove this room from your favorites" } else { "Add this room to your favorites" }).into(),
+        "matrix.room.low_priority.set" => (if args["on"].as_bool() == Some(false) { "Restore this room's normal priority" } else { "Mark this room as low priority" }).into(),
+        "matrix.room.unread.set" => (if args["on"].as_bool() == Some(false) { "Clear this room's unread flag" } else { "Mark this room as unread" }).into(),
+        "matrix.invites.respond" => (if args["accept"].as_bool() == Some(false) { "Decline this room invite" } else { "Accept this room invite" }).into(),
+        "matrix.rooms.join" => (if args["operation"].as_str() == Some("knock") { "Ask to join this room" } else { "Join this room" }).into(),
+        "matrix.room.typing.send" => (if args["typing"].as_bool() == Some(false) { "Stop showing you as typing" } else { "Show you as typing in this room" }).into(),
+        "matrix.room.invite.send" => args["user_id"].as_str().map(|user| format!("Invite {user} to this room"))
+            .unwrap_or_else(|| "Invite someone to this room".into()),
+        "matrix.room.messages.read" | "matrix.rooms.messages.read" => "Read recent messages".into(),
+        "matrix.room.info.read" => "Read this room's name and settings".into(),
+        "matrix.room.pins.read" => "Read this room's pinned messages".into(),
+        "matrix.room.threads.read" => "List conversations in this room".into(),
+        "matrix.room.thread.read" => "Load replies to this conversation".into(),
+        "matrix.room.event.read" => "Load this message".into(),
+        "matrix.room.messages.paginate" => "Load older messages in this room".into(),
+        "matrix.room.receipts.read" => "Read who has read this room's messages".into(),
+        "matrix.room.unread.read" => "Read this room's unread count and flags".into(),
+        "matrix.room.power_levels.read" => "Read your permissions in this room".into(),
+        "matrix.room.successor.read" => "Check this room's upgrade notice".into(),
+        "matrix.room.link.create" => "Create a link to this room or message".into(),
+        "matrix.rooms.list" => "List your rooms".into(),
+        "matrix.rooms.invites.list" => "List your room invites".into(),
+        "matrix.spaces.list" => "List your spaces".into(),
+        "matrix.space.info.read" => "Read this space's details".into(),
+        "matrix.space.rooms.list" => "Load the rooms in this space".into(),
+        "matrix.user.profile.read" => args["user_id"].as_str().map(|user| format!("Look up the profile of {user}"))
+            .unwrap_or_else(|| "Look up this person's profile".into()),
+        "on_room_message" => "Watch new messages in this room".into(),
+        "on_room_members_changed" => "Watch who joins or leaves this room".into(),
+        "on_room_pins_changed" => "Watch changes to this room's pinned messages".into(),
+        "on_room_typing" => "Watch who is typing in this room".into(),
+        "on_room_receipt" => "Watch who reads this room's messages".into(),
+        "on_room_reaction" => "Watch reactions to messages in this room".into(),
+        "on_room_message_changed" => "Watch edits and removals of messages in this room".into(),
+        "matrix.room.members.read" => "Read the room's member list".into(),
+        "matrix.profile.read" => "Read your account profile".into(),
+        _ => capability.title.into(),
+    }
+}
+
+/// Default to the rooms requested; the popup can widen or narrow this scope.
+fn parked_scope(parked: &ParkedRequest) -> RoomScope {
+    if let ParkedRequest::Bridge(Some(request)) = parked {
+        if let Some(capability) = parked_capability(parked)
+            && let Ok(args) = serde_json::from_str::<serde_json::Value>(&request.args_json)
+        { return bridge_scope(request, capability, &args, parked_rooms(parked).1.as_deref()); }
+    }
+    let (_, target) = parked_rooms(parked);
+    if parked_capability(parked).is_some_and(|cap| cap.scope == a2app_core::capabilities::Scope::Space)
+        && let Some(space) = target.as_ref()
+    { return RoomScope::Selection { rooms: Vec::new(), spaces: vec![space.clone()] }; }
+    target.as_deref().map(RoomScope::room).unwrap_or(RoomScope::AllRooms)
+}
+
+fn bridge_scope(_request: &SplashHostRequest, capability: &a2app_core::capabilities::Capability, args: &serde_json::Value, target: Option<&str>) -> RoomScope {
+    capability_scope(capability, args, target)
+}
+
+fn capability_scope(capability: &a2app_core::capabilities::Capability, args: &serde_json::Value, target: Option<&str>) -> RoomScope {
+    if capability.id == "matrix.rooms.messages.search" && let Some(rooms) = args["room_ids"].as_array() && !rooms.is_empty() {
+        return RoomScope::Selection { rooms: rooms.iter().filter_map(|room| room.as_str().map(str::to_owned)).collect(), spaces: Vec::new() };
+    }
+    if matches!(capability.id, "matrix.space.info.read" | "matrix.space.rooms.list" | "host.nav.space")
+        && let Some(space) = args["space_id"].as_str().filter(|space| !space.is_empty())
+    {
+        return RoomScope::Selection { rooms: Vec::new(), spaces: vec![space.into()] };
+    }
+    if capability.scope == a2app_core::capabilities::Scope::Space && let Some(space) = target {
+        return RoomScope::Selection { rooms: Vec::new(), spaces: vec![space.into()] };
+    }
+    if services::is_room_collection(capability) { return RoomScope::AllRooms; }
+    target.map(RoomScope::room).unwrap_or(RoomScope::AllRooms)
+}
+
+fn capability_has_room_scope(capability: &a2app_core::capabilities::Capability) -> bool {
+    matches!(capability.scope, a2app_core::capabilities::Scope::Room
+        | a2app_core::capabilities::Scope::MultiRoom | a2app_core::capabilities::Scope::Space)
+}
+
+fn scope_targets(state: &A2AppState, ids: impl IntoIterator<Item = String>) -> Vec<(String, Vec<String>)> {
+    let ancestry_is_current = state.policy_spaces_revision == matrix::spaces::policy_spaces_revision();
+    ids.into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().map(|room| {
+        let ancestors = if ancestry_is_current {
+            state.permissions.room_space_memberships().get(&room).into_iter().flatten().cloned().collect()
+        } else { Vec::new() };
+        (room, ancestors)
+    }).collect()
+}
+
+fn parked_scope_targets(state: &A2AppState, parked: &[ParkedRequest]) -> Vec<(String, Vec<String>)> {
+    // Collections are filtered to the selected scope by their workers. Fixed
+    // requests must be covered before approval, so they cannot prompt in a loop.
+    scope_targets(state, parked.iter().filter(|request| parked_requires_fixed_scope(request))
+        .filter_map(|request| parked_rooms(request).1))
+}
+
+fn parked_requires_fixed_scope(request: &ParkedRequest) -> bool {
+    if let Some(capability) = parked_capability(request) {
+        return (capability_has_room_scope(capability) && !services::is_room_collection(capability))
+            || capability.id == "mcp.tools.register";
+    }
+    match request {
+        ParkedRequest::Bridge(Some(request)) => request.service == "permissions.request",
+        #[cfg(unix)]
+        ParkedRequest::AiTool { .. } => true,
+        _ => false,
+    }
+}
+
+fn prompt_room_scope(perm: Permission, parked: &[ParkedRequest]) -> Option<RoomScope> {
+    let request = parked.first()?;
+    let spatial = parked_capability(request).map(|capability| capability_has_room_scope(capability)
+        || capability.id == "mcp.tools.register").unwrap_or_else(|| matches!(perm,
+        Permission::MatrixRoomRead | Permission::MatrixRoomSend | Permission::MatrixRoomInfo
+            | Permission::MatrixRoomWatch | Permission::MatrixRoomInteract | Permission::MatrixRoomAppData
+            | Permission::MatrixRoomManage | Permission::MatrixRoomInvite | Permission::MatrixMedia
+            | Permission::MatrixRoomsList | Permission::MatrixRoomsRead | Permission::MatrixRoomsSend
+            | Permission::MatrixMembership | Permission::MatrixSpaces | Permission::RobrixComposer
+            | Permission::McpTools | Permission::AppLaunch | Permission::AppGeneration));
+    spatial.then(|| parked_scope(request))
+}
+
+fn chosen_scope_covers(state: &A2AppState, scope: &RoomScope, targets: &[(String, Vec<String>)]) -> bool {
+    match scope {
+        RoomScope::AllRooms => true,
+        RoomScope::Selection { rooms, spaces } => (!rooms.is_empty() || !spaces.is_empty())
+            && targets.iter().all(|(room, _)| {
+                rooms.contains(room) || spaces.contains(room)
+                    || (state.policy_spaces_revision == matrix::spaces::policy_spaces_revision()
+                        && state.permissions.room_scope_matches(scope, room))
+            }),
+    }
+}
+
+fn refresh_permission_scope_targets(cx: &mut Cx, ui: &WidgetRef) {
+    let targets = with_a2app(|state| {
+        let prompt = state.active_prompt.as_ref()?;
+        if let Some(flow) = prompt.flow.as_ref() {
+            let review = flow.review();
+            let payload = serde_json::from_str::<serde_json::Value>(&review.payload).unwrap_or_default();
+            let capability = review.action.as_ref().and_then(|action| a2app_core::capabilities::by_id(&action.kind))
+                .or_else(|| payload["operation"].as_str().and_then(a2app_core::capabilities::by_id));
+            Some(flow_prompt_scope(state, flow, capability, &payload).1)
+        } else { Some(parked_scope_targets(state, &prompt.parked)) }
+    }).flatten();
+    if let Some(targets) = targets {
+        let prompt = ui.mini_app_permission_prompt(cx, ids!(a2app_permission_modal.content));
+        let ready = with_a2app(|state| state.policy_spaces_ready
+            && state.policy_spaces_revision == matrix::spaces::policy_spaces_revision()).unwrap_or(false);
+        prompt.set_space_membership_ready(cx, ready);
+        prompt.update_scope_targets(cx, &targets);
+    }
+}
+
 /// Builds what the prompt modal shows for one (subject, group, parked) tuple.
 /// An AI room's agent subject is presented as the room's AI with the concrete
 /// read it asked for; a mini-app keeps its registry identity and the app's own
@@ -4208,10 +4881,12 @@ fn prompt_info_for(
             capability: Some(ai_prompt_action(rooms, perm, parked)),
             agent: true,
             tool: tool_preview,
+            scope: prompt_room_scope(perm, parked),
+            scope_targets: parked_scope_targets(state, parked),
             room_id, origin_room_id, network_url, can_allow_once, collection: parked.iter().filter_map(parked_capability).any(services::is_room_collection), enable_writes: false,
         };
     }
-    let (app_name, app_icon, reason) = state.registry.get(subject)
+    let (app_name, app_icon, mut reason) = state.registry.get(subject)
         .map(|m| (m.name.clone(), m.icon.clone(), m.reason_for(perm).map(str::to_string)))
         .unwrap_or_else(|| (subject.to_string(), String::new(), None));
     // Name the exact ability that asked, not just its group; a parked
@@ -4240,9 +4915,19 @@ fn prompt_info_for(
             #[cfg(unix)]
             ParkedRequest::NetworkAccess { .. } => None,
         })
-        .map(|c| c.title.to_string())
+        .map(|c| {
+            let args = parked.iter().find_map(|parked| if let ParkedRequest::Bridge(Some(request)) = parked {
+                serde_json::from_str::<serde_json::Value>(&request.args_json).ok()
+            } else { None }).unwrap_or_default();
+            if matches!(c.id, "matrix.room.messages.search" | "matrix.rooms.messages.search") {
+                reason = Some(if args["server"].as_bool() == Some(true) {
+                    "Your search text is sent to your Matrix server for unencrypted rooms. Encrypted rooms are searched on this device.".into()
+                } else { "Searches messages already on this device. Your search text stays in Robrix.".into() });
+            }
+            permission_action(c, &args)
+        })
     };
-    PromptInfo { prompt_id: 0, app_name, app_icon, perm, reason, capability, agent: false, tool: tool_preview, room_id, origin_room_id, network_url, can_allow_once,
+    PromptInfo { prompt_id: 0, app_name, app_icon, perm, reason, capability, agent: false, tool: tool_preview, scope: prompt_room_scope(perm, parked), scope_targets: parked_scope_targets(state, parked), room_id, origin_room_id, network_url, can_allow_once,
         collection: parked.iter().filter_map(parked_capability).any(services::is_room_collection), enable_writes: false }
 }
 
@@ -4280,6 +4965,62 @@ fn ai_tool_refused_text(perm: Permission) -> String {
     )
 }
 
+/// Prepare capability consent for the same request as the outgoing review.
+///
+/// The caller installs this snapshot only after IFC approval succeeds. Once
+/// receipts reach async workers but disappear from the live permission store.
+fn combined_permission_store(request: &SplashHostRequest, permission: Permission, answer: &PermissionPromptAction) -> Result<(PermissionStore, Option<(u64, bool)>), String> {
+    let (once, duration) = match answer {
+        PermissionPromptAction::AllowFlowOnce => (true, GrantDuration::RobrixSession),
+        PermissionPromptAction::AllowFlowSession => (false, GrantDuration::RobrixSession),
+        PermissionPromptAction::AllowFlow { duration } => (false, duration.clone()),
+        PermissionPromptAction::AllowFlowScoped { duration, .. } => (false, *duration),
+        _ => return Err("This request was not approved.".into()),
+    };
+    let context = super::information_flow::context_for_heap(request.heap_key)?;
+    let args: serde_json::Value = serde_json::from_str(&request.args_json).map_err(|error| error.to_string())?;
+    let capability = a2app_core::capabilities::for_service(&request.service).ok_or("Unknown app action.")?;
+    let target = permission_target_room(&request.service, &args, context.room());
+    let permission_context = PermissionContext { origin_room: context.room(), target_room: target.as_deref() };
+    with_a2app(|state| {
+        let subject = context.app().ok_or("Missing mini-app identity.")?;
+        let manifest = state.registry.get(subject).ok_or("This mini-app was removed.")?;
+        let enable_writes = services::can_enable_writes(&state.permissions, manifest, capability, permission_context);
+        let effective = if services::is_room_collection(capability) {
+            state.permissions.effective_collection_capability_in_context(manifest, capability, permission_context)
+        } else { state.permissions.effective_capability_in_context(manifest, capability, permission_context) };
+        if matches!(effective, Effective::Denied | Effective::Undeclared) && !enable_writes {
+            return Err("This action is blocked by your app or room settings.".into());
+        }
+        if enable_writes && once { return Err("Enabling room changes needs a session or lasting approval.".into()); }
+        let mut store = state.permissions.clone();
+        if enable_writes { store.set_matrix_write(true); }
+        let scope = match answer {
+            PermissionPromptAction::AllowFlowScoped { scope, .. } => scope.clone(),
+            _ => bridge_scope(request, capability, &args, permission_context.target_room),
+        };
+        if !services::is_room_collection(capability) && capability_has_room_scope(capability) {
+            let targets = scope_targets(state, permission_context.target_room.map(str::to_owned));
+            if !chosen_scope_covers(state, &scope, &targets) {
+                return Err("Choose a room or space that includes the room used by this request.".into());
+            }
+        }
+        let network = request.service == "network.http";
+        let id = if network {
+            let url = args["url"].as_str().ok_or("Missing website address.")?;
+            let scope_network = if once { NetworkScope::ExactUrl(url.into()) }
+                else { NetworkScope::from_url(url, a2app_core::permissions::NetworkScopeKind::Origin)? };
+            store.allow_network(subject, scope_network, scope, duration, context.room())?
+        } else {
+            store.grant_scoped(subject, permission, Some(capability.id), scope, duration, context.room())?
+        };
+        if once {
+            if network { store.mark_network_request_once(id); } else { store.mark_request_once(id); }
+        }
+        Ok((store, once.then_some((id, network))))
+    }).unwrap_or_else(|| Err("Mini Apps are unavailable.".into()))
+}
+
 fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, response: PermissionPromptResponse) {
     if !with_a2app(|state| state.active_prompt.as_ref().is_some_and(|prompt| prompt.id == response.prompt_id)).unwrap_or(false) { return; }
     let answer = response.answer;
@@ -4291,24 +5032,54 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, response: PermissionPro
         return;
     }
     if let Some(mut flow) = prompt.flow.take() {
+        let subject = prompt.subject.clone();
+        let permission = prompt.perm;
+        let mut combined_once = None;
+        let mut combined_permission = false;
         let result = flow.approve(|review| super::information_flow::current_context(&review.context)
-            .and_then(|_| if !instances::context_can_prompt(&review.context, review.epoch) {
+            .and_then(|_| if !flow.can_prompt() {
                 Err("This mini-app is no longer open. Reopen it to continue.".into())
             } else {
-                match answer {
+                if !matches!(answer, PermissionPromptAction::AllowFlowOnce | PermissionPromptAction::AllowFlowSession | PermissionPromptAction::AllowFlow { .. } | PermissionPromptAction::AllowFlowScoped { .. }) {
+                    return Err("This request was not approved.".into());
+                }
+                let permission = match &flow {
+                    FlowContinuation::Bridge { request, permission: Some(permission), .. } =>
+                        Some(combined_permission_store(request, *permission, &answer)?),
+                    _ => None,
+                };
+                let approved = if review.allowed { Ok(()) } else { match answer {
                     PermissionPromptAction::AllowFlowOnce if flow.allow_once() => a2app_core::information_flow::approve_effect_once(review),
                     PermissionPromptAction::AllowFlowSession => a2app_core::information_flow::approve_effect_session(review, a2app_core::information_flow::SharingDuration::RobrixSession),
+                    PermissionPromptAction::AllowFlow { duration: GrantDuration::RobrixSession } => a2app_core::information_flow::approve_effect_session(review, a2app_core::information_flow::SharingDuration::RobrixSession),
+                    PermissionPromptAction::AllowFlow { duration: GrantDuration::Always } => a2app_core::information_flow::approve_effect_always(review),
+                    PermissionPromptAction::AllowFlowScoped { ref scope, duration } => {
+                        let duration = match duration {
+                            GrantDuration::RobrixSession => a2app_core::information_flow::SharingDuration::RobrixSession,
+                            GrantDuration::Always => a2app_core::information_flow::SharingDuration::Permanent,
+                            GrantDuration::RoomSession => return Err("Choose Until you quit Robrix or Forever for this approval.".into()),
+                        };
+                        a2app_core::information_flow::approve_effect_scoped(review, scope.clone(), duration)
+                    }
                     _ => Err("This request was not approved.".into()),
+                }};
+                approved?;
+                if let Some((store, once)) = permission {
+                    with_a2app(|state| { state.permissions = store; state.perms_dirty = true; });
+                    combined_once = once;
+                    combined_permission = true;
+                    publish_grants(cx);
                 }
+                Ok(())
             }));
         match result {
             Ok(()) => resume_flow(cx, ui, flow),
             Err(error) => {
                 // Data can arrive while the review is open. Keep the exact
                 // operation waiting and require a fresh answer for new sources.
-                let updated = matches!(answer, PermissionPromptAction::AllowFlowOnce | PermissionPromptAction::AllowFlowSession)
+                let updated = matches!(answer, PermissionPromptAction::AllowFlowOnce | PermissionPromptAction::AllowFlowSession | PermissionPromptAction::AllowFlow { .. } | PermissionPromptAction::AllowFlowScoped { .. })
                     && !flow.is_cancelled() && refresh_flow_capture(&mut flow).unwrap_or(false);
-                if updated && flow.review().allowed { resume_flow(cx, ui, flow); }
+                if updated && flow.review().allowed && flow_bridge_permission_granted(&flow) { resume_flow(cx, ui, flow); }
                 else if updated {
                     prompt.id = next_permission_prompt_id();
                     prompt.flow = Some(flow);
@@ -4316,6 +5087,12 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, response: PermissionPro
                 } else { refuse_flow(cx, flow, &error); }
             }
         }
+        if let Some((id, network)) = combined_once {
+            with_a2app(|state| { if network { state.permissions.remove_network_grant(id); } else { state.permissions.remove_scoped_grant(id); } });
+            publish_grants(cx);
+        }
+        if combined_permission { apply_permission_to_running(cx, ui, &subject, permission); }
+        publish_grants(cx);
         show_next_permission_prompt(cx, ui);
         ui.redraw(cx);
         return;
@@ -4333,7 +5110,7 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, response: PermissionPro
         ui.redraw(cx);
         return;
     }
-    let (origin, target) = prompt.parked.first().map(parked_rooms).unwrap_or_default();
+    let (origin, _) = prompt.parked.first().map(parked_rooms).unwrap_or_default();
     let network_url = prompt.parked.iter().find_map(parked_network_url);
     let capability = prompt.parked.iter().find_map(parked_capability).map(|cap| cap.id);
     let once = matches!(answer, PermissionPromptAction::AllowOnce);
@@ -4342,6 +5119,10 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, response: PermissionPro
     let granted = match answer {
         PermissionPromptAction::AllowScoped { scope, duration, network } => {
             let result = with_a2app(|state| {
+                let targets = parked_scope_targets(state, &prompt.parked);
+                if !chosen_scope_covers(state, &scope, &targets) {
+                    return Err("Choose rooms or spaces that include every room used by this request.".into());
+                }
                 if prompt.enable_writes && !state.permissions.matrix_write() {
                     let can_enable = prompt.parked.iter().all(|parked|
                         parked_can_enable_writes(state, &prompt.subject, prompt.perm, parked));
@@ -4370,9 +5151,7 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, response: PermissionPro
         PermissionPromptAction::AllowOnce => {
             // Temporarily authorize exactly this replay. No durable or
             // session grant survives it, and queued requests have separate prompts.
-            let scope = target.as_ref().map(|room| RoomScope::Selection {
-                rooms: vec![room.clone()], spaces: Vec::new(),
-            }).unwrap_or(RoomScope::AllRooms);
+            let scope = prompt.parked.first().map(parked_scope).unwrap_or(RoomScope::AllRooms);
             prompt.parked.first().is_some_and(parked_can_allow_once) && with_a2app(|state| {
                 if let Some(url) = &network_url {
                     temporary_network = state.permissions.allow_network(&prompt.subject,
@@ -4413,7 +5192,7 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, response: PermissionPro
             });
             false
         }
-        PermissionPromptAction::AllowFlowOnce | PermissionPromptAction::AllowFlowSession => false,
+        PermissionPromptAction::AllowFlowOnce | PermissionPromptAction::AllowFlowSession | PermissionPromptAction::AllowFlow { .. } | PermissionPromptAction::AllowFlowScoped { .. } => false,
         PermissionPromptAction::None => unreachable!(),
     };
     if let Some(id) = temporary_grant {
@@ -4459,6 +5238,7 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, response: PermissionPro
                                 pane_state: &instances::pane_state,
                                 storage_path: &compartment_storage_path,
                                 room_name: &room_name,
+                                permission_target_room: Some(&permission_target_room),
                                 desktop_view,
                                 check_flow: &super::information_flow::check_request,
                                 check_response: &super::information_flow::check_response,
@@ -4516,16 +5296,13 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, response: PermissionPro
 fn refresh_flow_capture(flow: &mut FlowContinuation) -> Result<bool, String> {
     let review = flow.review();
     super::information_flow::current_context(&review.context)?;
-    if !instances::context_can_prompt(&review.context, review.epoch) { return Ok(false); }
+    if !flow.can_prompt() { return Ok(false); }
     let payload = serde_json::from_str(&review.payload).map_err(|_| "This permission request is invalid.".to_owned())?;
     let updated = a2app_core::information_flow::prepare_effect_for_activation(
         &review.context, review.epoch, review.recipient.as_ref(), review.action.as_ref(), &payload)?;
     if updated == *review { return Ok(false); }
     if review.id != updated.id { let _ = a2app_core::information_flow::cancel_effect(review.id); }
-    match flow {
-        FlowContinuation::Bridge { review, .. } => *review = updated,
-        FlowContinuation::Worker(worker) => worker.review = updated,
-    }
+    flow.replace_review(updated);
     Ok(true)
 }
 
@@ -4749,6 +5526,66 @@ fn stop_private_contexts(cx: &mut Cx, ui: &WidgetRef) {
     for app in apps { stop_app_everywhere(cx, ui, &app); }
 }
 
+fn reset_all_permissions(cx: &mut Cx, ui: &WidgetRef) {
+    let Some((prompts, cancel_generation)) = with_a2app(|state| {
+        let mut prompts = state.prompts.drain(..).collect::<Vec<_>>();
+        prompts.extend(state.active_prompt.take());
+        state.permissions.reset_to_defaults();
+        state.perms_dirty = true;
+        state.dismissed_prompts.clear();
+        state.dismissed_net_hosts.clear();
+        state.room_action = None;
+        #[cfg(unix)]
+        state.once_rooms.clear();
+        (prompts, state.generation.is_some() || state.pending_generated.is_some())
+    }) else { return };
+    // Publish revocation before waking blocked callers or retiring their VMs.
+    publish_grants(cx);
+    ui.modal(cx, ids!(a2app_permission_modal)).close(cx);
+    for prompt in prompts {
+        for parked in prompt.parked { refuse_parked_request(cx, prompt.perm, parked); }
+        if let Some(flow) = prompt.flow { refuse_flow(cx, flow, "Permissions were reset."); }
+    }
+    if cancel_generation {
+        // Use ordinary cancellation to answer the agent's waiting build tool
+        // and update its console before private contexts are torn down.
+        apply_op(cx, ui, A2AppOp::CancelGeneration);
+        with_a2app(|state| {
+            state.generation_attribution = None;
+            state.console.status = "Cancelled because permissions were reset.".into();
+        });
+    }
+    // Background-task enablement is consent too. Keep the tasks and their
+    // configuration, but require the user to enable them again after reset.
+    let background_result = super::background::reset_permissions(cx);
+    stop_private_contexts(cx, ui);
+    super::room_watch::stop_all();
+    with_a2app(|state| {
+        state.hook_subs.clear();
+        state.watched_rooms.clear();
+        state.account_watched = false;
+        state.foreground_app = None;
+    });
+    ui.modal(cx, ids!(mini_app_host_modal)).close(cx);
+    let flow_result = a2app_core::information_flow::reset_permissions();
+    publish_grants(cx);
+    // Save immediately: closing Robrix just after reset must not restore the
+    // old approvals. Leave a failed save dirty so normal persistence retries.
+    let save_result = with_a2app(|state| {
+        let result = persistence::save_permissions(&state.permissions);
+        state.perms_dirty = result.is_err();
+        result.map_err(|error| error.to_string())
+    }).unwrap_or_else(|| Err("Mini Apps is unavailable.".into()));
+    if let Ok(account) = super::information_flow::account() {
+        a2app_core::protection_audit::record_policy_change(&account);
+    }
+    match flow_result.and(background_result).and(save_result) {
+        Ok(()) => enqueue_popup_notification("All permissions reset. Apps and agents will ask again; background tasks are paused.", PopupKind::Success, Some(5.0)),
+        Err(error) => enqueue_popup_notification(format!("Couldn't save the permissions reset: {error}"), PopupKind::Error, Some(8.0)),
+    }
+    ui.redraw(cx);
+}
+
 fn refresh_permission_policy(cx: &mut Cx, ui: &WidgetRef) {
     if let Ok(account) = super::information_flow::account() {
         a2app_core::protection_audit::record_policy_change(&account);
@@ -4778,11 +5615,27 @@ fn refresh_permission_policy(cx: &mut Cx, ui: &WidgetRef) {
 /// Republishes the grant snapshot that isolate-creation sites read.
 fn publish_grants(_cx: &mut Cx) {
     super::background::changed();
+    let account = super::information_flow::account().ok();
+    let effect_spaces: std::collections::BTreeSet<String> = a2app_core::information_flow::effect_authorities().unwrap_or_default()
+        .into_iter().filter(|grant| Some(grant.context.account()) == account.as_deref())
+        .filter_map(|grant| grant.room_scope)
+        .flat_map(|scope| match scope { RoomScope::Selection { spaces, .. } => spaces, RoomScope::AllRooms => Vec::new() }).collect();
+    matrix::policy::publish_effect_space_roots(effect_spaces.clone());
     with_a2app(|state| {
-        let roots = state.permissions.configured_space_ids();
+        let mut roots = state.permissions.configured_space_ids();
+        roots.extend(effect_spaces);
         if roots != state.policy_space_roots {
+            // A complete joined-space graph already covers these roots. Keep
+            // it usable for the request resuming immediately after approval.
+            let client = crate::sliding_sync::get_client();
+            let covered = state.policy_spaces_ready
+                && state.policy_spaces_revision == matrix::spaces::policy_spaces_revision()
+                && roots.difference(&state.policy_space_roots).all(|space|
+                    state.permissions.room_space_memberships().contains_key(space)
+                        && RoomId::parse(space).ok().and_then(|id| client.as_ref()?.get_room(&id))
+                            .is_some_and(|room| room.is_space() && room.state() == RoomState::Joined));
             state.policy_space_roots = roots;
-            matrix::spaces::invalidate_policy_spaces();
+            if !covered { matrix::spaces::invalidate_policy_spaces(); }
         }
         let revision = matrix::spaces::policy_spaces_revision();
         if state.policy_spaces_revision != revision {
@@ -4820,10 +5673,10 @@ pub fn persist_now() {
 
 fn save_dirty(state: &mut A2AppState) {
     if state.perms_dirty {
-        if let Err(e) = persistence::save_permissions(&state.permissions) {
-            error!("Failed to save mini-app permissions: {e}");
+        match persistence::save_permissions(&state.permissions) {
+            Ok(()) => state.perms_dirty = false,
+            Err(e) => error!("Failed to save mini-app permissions: {e}"),
         }
-        state.perms_dirty = false;
     }
     if state.registry_dirty {
         if let Err(e) = persistence::save_registry_state(&state.persisted) {
@@ -7903,6 +8756,21 @@ mod permission_tests {
     use super::*;
 
     #[test]
+    fn popup_scopes_follow_consumed_room_and_space_targets() {
+        let room_read = a2app_core::capabilities::by_id("matrix.room.messages.read").unwrap();
+        let extras = serde_json::json!({ "rooms": [TARGET], "space_id": SPACE, "room_id": TARGET });
+        assert_eq!(capability_scope(room_read, &extras, Some(SOURCE)), RoomScope::room(SOURCE),
+            "unused arguments must not replace the actual attached-room target");
+        let space_rooms = a2app_core::capabilities::by_id("matrix.space.rooms.list").unwrap();
+        assert_eq!(capability_scope(space_rooms, &serde_json::json!({ "space_id": SPACE }), Some(SPACE)),
+            RoomScope::Selection { rooms: Vec::new(), spaces: vec![SPACE.into()] });
+        let search = a2app_core::capabilities::by_id("matrix.rooms.messages.search").unwrap();
+        assert_eq!(capability_scope(search, &serde_json::json!({ "room_ids": [SOURCE, TARGET] }), Some(SOURCE)),
+            RoomScope::Selection { rooms: vec![SOURCE.into(), TARGET.into()], spaces: Vec::new() });
+        assert_eq!(capability_scope(search, &serde_json::json!({ "query": "hello" }), Some(SOURCE)), RoomScope::AllRooms);
+    }
+
+    #[test]
     fn network_permission_changes_keep_the_public_activation_and_pending_callback() {
         use a2app_core::information_flow as flow;
         use makepad_widgets::widget_async::CxSplashVmExt;
@@ -8353,7 +9221,7 @@ View{note := Label{text:"waiting"}}
         let mut pending = PendingGeneratedApp {
             manifest: Box::new(a2app_core::builtin::stock("room-peek").unwrap()), refine_of: None,
             context: context.clone(), epoch: registry.context_epoch(&context).unwrap(), request: "build fixture".into(), attribution: None,
-            action_target: Some(SOURCE.into()), review_id: None,
+            action_target: Some(SOURCE.into()), review_id: None, effect_review_id: None,
         };
         assert!(pending.can_retain());
         let source = pending.manifest.source.clone();

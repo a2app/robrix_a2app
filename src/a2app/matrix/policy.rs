@@ -2,13 +2,17 @@
 
 use std::sync::{LazyLock, RwLock};
 
-use a2app_core::permissions::{Effective, PermissionContext, PermissionStore, PolicyDecision, RoomAccess};
+use a2app_core::permissions::{Effective, PermissionContext, PermissionStore, PolicyDecision, RoomAccess, RoomScope};
 use a2app_core::information_flow::{self as flow, ContextId, Recipient, SensitiveAction};
 
 pub const ROOM_ACCESS_DENIED: &str = "room access is blocked by the safety rules in Mini Apps";
 
 static POLICY: LazyLock<RwLock<PermissionStore>> = LazyLock::new(Default::default);
 static POLICY_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Effect checks hold the IFC registry lock. Keep their ancestry lookup separate
+// from POLICY, whose worker checks can enter the IFC registry themselves.
+static EFFECT_SPACE_MEMBERSHIPS: LazyLock<RwLock<(u64, std::collections::BTreeMap<String, std::collections::BTreeSet<String>>)>> = LazyLock::new(Default::default);
+static EFFECT_SPACE_ROOTS: LazyLock<RwLock<std::collections::BTreeSet<String>>> = LazyLock::new(Default::default);
 
 /// The UI publishes after changing permissions or room ancestry. Workers read
 /// a current snapshot at each boundary, rather than retaining old approvals.
@@ -21,15 +25,37 @@ pub fn publish_permission_policy_at_revision(store: &PermissionStore, revision: 
     let current = super::spaces::policy_spaces_revision();
     *policy = store.clone();
     if revision != current { policy.clear_room_spaces(); }
+    *EFFECT_SPACE_MEMBERSHIPS.write().unwrap() = (current, policy.room_space_memberships().clone());
     POLICY_REVISION.store(current, std::sync::atomic::Ordering::SeqCst);
 }
 
 pub fn invalidate_room_spaces() {
     POLICY.write().unwrap().clear_room_spaces();
+    EFFECT_SPACE_MEMBERSHIPS.write().unwrap().1.clear();
 }
 
 pub fn configured_space_ids() -> std::collections::BTreeSet<String> {
-    POLICY.read().unwrap().configured_space_ids()
+    let mut spaces = POLICY.read().unwrap().configured_space_ids();
+    spaces.extend(EFFECT_SPACE_ROOTS.read().unwrap().iter().cloned());
+    spaces
+}
+
+pub fn publish_effect_space_roots(spaces: std::collections::BTreeSet<String>) {
+    *EFFECT_SPACE_ROOTS.write().unwrap() = spaces;
+}
+
+/// Match a selected space against current host ancestry, never app metadata.
+pub fn effect_room_scope_matches(account: &str, scope: &RoomScope, room: &str) -> bool {
+    if crate::a2app::information_flow::account().as_deref() != Ok(account) { return false; }
+    match scope {
+        RoomScope::AllRooms => true,
+        RoomScope::Selection { rooms, spaces } => {
+            if rooms.iter().any(|id| id == room) || spaces.iter().any(|space| space == room) { return true; }
+            let ancestry = EFFECT_SPACE_MEMBERSHIPS.read().unwrap();
+            ancestry.0 == super::spaces::policy_spaces_revision()
+                && ancestry.1.get(room).is_some_and(|parents| spaces.iter().any(|space| parents.contains(space)))
+        }
+    }
 }
 
 fn with_current_policy<T>(f: impl FnOnce(&PermissionStore) -> T) -> T {
@@ -54,6 +80,7 @@ pub struct MatrixAuthorization {
     pub consent: Box<PermissionStore>,
     pub flow_context: Option<ContextId>,
     pub flow_epoch: Option<u64>,
+    pub flow_payload: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for MatrixAuthorization {
@@ -71,12 +98,18 @@ impl MatrixAuthorization {
             target_room: origin_room.map(str::to_string),
             flow_context: None,
             flow_epoch: None,
+            flow_payload: None,
         }
     }
 
     pub fn with_flow(mut self, context: ContextId) -> Self {
         self.flow_epoch = a2app_core::information_flow::context_epoch(&context).ok();
         self.flow_context = Some(context);
+        self
+    }
+
+    pub fn with_payload(mut self, payload: serde_json::Value) -> Self {
+        self.flow_payload = Some(payload);
         self
     }
 
@@ -109,17 +142,27 @@ impl MatrixAuthorization {
         decision(&self.consent) == Effective::Granted
             && match decision(store) {
                 Effective::Granted => true,
-                Effective::NeedsPrompt => self.consent.has_request_once(&self.subject, cap.id, context),
+                Effective::NeedsPrompt => self.has_collection_once(context),
                 Effective::Denied | Effective::Undeclared => false,
             }
+    }
+
+    fn has_collection_once(&self, context: PermissionContext<'_>) -> bool {
+        self.consent.scoped_grants(&self.subject).iter().any(|grant| match &grant.scope {
+            a2app_core::permissions::RoomScope::AllRooms => self.consent.has_request_once(&self.subject, &self.capability, context),
+            a2app_core::permissions::RoomScope::Selection { rooms, spaces } => rooms.iter().chain(spaces).any(|room|
+                self.consent.has_request_once(&self.subject, &self.capability,
+                    PermissionContext { origin_room: context.origin_room, target_room: Some(room) })),
+        })
     }
 
     pub fn check_flow(&self, room: Option<&str>, access: RoomAccess) -> Result<(), String> {
         let context = self.flow_context.as_ref().ok_or("Missing host information-flow context.")?;
         self.check_context()?;
         let epoch = self.flow_epoch.ok_or("Missing information-flow activation.")?;
-        // A read's room/event/search parameters can carry private data too.
-        // Recheck their destination after queuing, just like a write body.
+        // Reading Robrix's cache does not send data to a room. Remote query
+        // parameters are checked against the homeserver at their SDK boundary.
+        if access == RoomAccess::Read { return Ok(()); }
         let final_write = access == RoomAccess::Write && a2app_core::capabilities::by_id(&self.capability)
             .and_then(|capability| capability.flow_contract()).is_some_and(|contract| contract.privileged_effect);
         if let Some(room) = room.filter(|_| !final_write) {
@@ -234,6 +277,67 @@ pub fn commit_flow_action(context: &ContextId, action: &SensitiveAction, payload
 /// Matrix query parameters are plaintext output to the homeserver even when
 /// their target room is encrypted. Require sharing with that exact origin.
 pub async fn ensure_server_output(url: &str) -> Result<(), String> {
+    let payload = AUTHORIZATION.try_with(|authorization| authorization.flow_payload.clone()).ok().flatten()
+        .unwrap_or(serde_json::Value::Null);
+    ensure_server_output_with_payload(url, &payload).await
+}
+
+/// The reviewed search uses the same deterministic room filter as the SDK.
+pub fn search_server_parameters(query: &str, room_ids: &[matrix_sdk::ruma::OwnedRoomId], limit: u32) -> serde_json::Value {
+    let mut room_ids = room_ids.to_vec();
+    room_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    serde_json::json!({ "query": query, "room_ids": room_ids,
+        "result_limit": limit, "keys": ["content.body"], "order_by": "recent" })
+}
+
+/// Record each authorized room before its cached messages reach this worker.
+pub fn record_read_rooms(rooms: &[matrix_sdk::ruma::OwnedRoomId]) -> Result<(), String> {
+    ensure_live_activation()?;
+    let authorization = AUTHORIZATION.try_with(Clone::clone)
+        .map_err(|_| "Missing host information-flow authorization.".to_string())?;
+    authorization.check_current_permission()?;
+    let context = authorization.flow_context.as_ref().ok_or("Missing host information-flow context.")?;
+    let epoch = authorization.flow_epoch.ok_or("Missing information-flow activation.")?;
+    for room in rooms { ensure_room_access(room.as_str(), RoomAccess::Read)?; }
+    flow::add_sources_for_activation(context, epoch, rooms.iter().map(|room|
+        flow::Source::Room { account: context.account().into(), room: room.to_string() }))?;
+    flow::add_influences_for_activation(context, epoch, rooms.iter().map(|room|
+        flow::Influence::RoomContent { account: context.account().into(), room: room.to_string() }))
+}
+
+/// Review and consume one immutable query before it reaches the homeserver.
+pub async fn ensure_server_output_with_payload(url: &str, parameters: &serde_json::Value) -> Result<(), String> {
+    approve_server_query(url, parameters).await.map(|_| ())
+}
+
+/// Approval for the pages of one bounded, immutable host query.
+///
+/// A one-time choice covers this service call, including its SDK pagination.
+/// Each page still checks current capability consent, activation and inputs.
+pub(super) struct ServerQueryApproval {
+    authorization: MatrixAuthorization,
+    sources: flow::Label,
+    influences: flow::Influences,
+}
+
+impl ServerQueryApproval {
+    pub(super) fn check(&self) -> Result<(), String> {
+        self.authorization.check_current_permission()?;
+        let context = self.authorization.flow_context.as_ref().ok_or("Missing host information-flow context.")?;
+        if flow::labels(context)? != self.sources || flow::influences(context)? != self.influences {
+            return Err("This app received new data while loading. Load this view again to review its permission.".into());
+        }
+        Ok(())
+    }
+}
+
+pub(super) async fn begin_server_query(url: &str) -> Result<ServerQueryApproval, String> {
+    let parameters = AUTHORIZATION.try_with(|authorization| authorization.flow_payload.clone()).ok().flatten()
+        .ok_or("Missing captured Matrix query.")?;
+    approve_server_query(url, &parameters).await
+}
+
+async fn approve_server_query(url: &str, parameters: &serde_json::Value) -> Result<ServerQueryApproval, String> {
     ensure_live_activation()?;
     let authorization = AUTHORIZATION.try_with(Clone::clone)
         .map_err(|_| "Missing host information-flow authorization.".to_string())?;
@@ -241,13 +345,13 @@ pub async fn ensure_server_output(url: &str) -> Result<(), String> {
     authorization.check_current_permission()?;
     let epoch = authorization.flow_epoch.ok_or("Missing information-flow activation.")?;
     let recipient = Recipient::network_origin(url)?;
-    if flow::ensure_allowed_for_activation(context, epoch, &recipient).is_err() {
-        let payload = serde_json::json!({ "destination": url, "operation": authorization.capability });
-        let review = flow::prepare_effect_for_activation(context, epoch, Some(&recipient), None, &payload)?;
-        crate::a2app::effect_review::request(review, false).await?;
-    }
+    let payload = serde_json::json!({ "destination": url, "operation": authorization.capability, "parameters": parameters });
+    let review = flow::prepare_effect_for_activation(context, epoch, Some(&recipient), None, &payload)?;
+    crate::a2app::effect_review::request(review, true).await?;
     authorization.check_current_permission()?;
-    flow::ensure_allowed_for_activation(context, epoch, &recipient)
+    let capture = flow::prepare_effect_for_activation(context, epoch, Some(&recipient), None, &payload)?;
+    flow::commit_effect_for_activation(context, epoch, Some(&recipient), None, &payload)?;
+    Ok(ServerQueryApproval { authorization, sources: capture.sources, influences: capture.influences })
 }
 
 pub fn room_access_allowed(room: &str, access: RoomAccess) -> bool {
@@ -309,21 +413,11 @@ pub async fn commit_sensitive_target(target: &str, payload: &serde_json::Value) 
     flow::commit_effect_for_activation(context, epoch, recipient.as_ref(), Some(&action), payload)
 }
 
-/// Resolve sharing consent before a read whose parameters target another room.
+/// Recheck room permissions before reading cached data or changing a room.
+///
+/// Reads release no data to room members. Any remote query is reviewed for its
+/// actual server destination immediately before the SDK sends it.
 pub async fn review_room_access(room: &str, access: RoomAccess) -> Result<(), String> {
-    let auth = AUTHORIZATION.try_with(Clone::clone).ok();
-    let Some(auth) = auth.filter(|_| access == RoomAccess::Read) else { return ensure_room_access(room, access) };
-    auth.check_context()?;
-    let permitted = with_current_policy(|store| store.room_policy(Some(room), access) != PolicyDecision::Deny && auth.permits(store, Some(room)));
-    if !permitted { return Err(ROOM_ACCESS_DENIED.into()); }
-    let context = auth.flow_context.as_ref().ok_or("Missing host information-flow context.")?;
-    let recipient = Recipient::MatrixRoom { account: context.account().into(), room: room.into() };
-    let epoch = auth.flow_epoch.ok_or("Missing information-flow activation.")?;
-    if flow::ensure_allowed_for_activation(context, epoch, &recipient).is_err() {
-        let payload = serde_json::json!({ "room": room, "operation": auth.capability });
-        let review = flow::prepare_effect_for_activation(context, epoch, Some(&recipient), None, &payload)?;
-        crate::a2app::effect_review::request(review, false).await?;
-    }
     ensure_room_access(room, access)
 }
 
@@ -348,17 +442,35 @@ pub fn filter_read_result(
         row.get("room_id").or_else(|| row.get("space_id"))
             .and_then(serde_json::Value::as_str).is_none_or(&allowed)
     };
-    if !row_allowed(&value) {
+    // An upgrade pointer is data from the already-authorized source room.
+    // It grants no read access to the successor; blocked rooms stay hidden.
+    let successor_reference = authorization.is_some_and(|auth|
+        auth.capability == "matrix.room.successor.read" && auth.permits(store, auth.target_room.as_deref()))
+        && value["upgraded"].as_bool() == Some(true)
+        && value["room_id"].as_str().is_some_and(|room| store.room_policy(Some(room), RoomAccess::Read) != PolicyDecision::Deny);
+    if !row_allowed(&value) && !successor_reference {
         return Err(ROOM_ACCESS_DENIED.to_string());
+    }
+    if successor_reference && value["room_id"].as_str().is_some_and(|room| !allowed(room)) {
+        value["name"] = serde_json::Value::Null;
     }
     for key in ["rooms", "spaces", "invites", "results"] {
         if let Some(rows) = value.get_mut(key).and_then(serde_json::Value::as_array_mut) {
             rows.retain(&row_allowed);
         }
     }
-    // A stale aggregate can reveal activity in a room removed by the filter.
+    // Keep the legacy Search response field, but count only rooms represented
+    // in the authorized results. The raw aggregate can reveal filtered rooms;
+    // removing the field breaks saved apps that still display it.
+    let result_room_count = value.get("results").and_then(serde_json::Value::as_array)
+        .map(|rows| rows.iter().filter_map(|row| row.get("room_id")
+            .and_then(serde_json::Value::as_str)).collect::<std::collections::BTreeSet<_>>().len());
     if let Some(object) = value.as_object_mut() {
-        object.remove("searched_rooms");
+        if let Some(count) = result_room_count {
+            object.insert("searched_rooms".into(), count.into());
+        } else {
+            object.remove("searched_rooms");
+        }
     }
     Ok(value.to_string())
 }
@@ -404,9 +516,33 @@ mod tests {
             let output: serde_json::Value = serde_json::from_str(&filtered).unwrap();
             assert_eq!(output[key].as_array().unwrap().len(), 1, "{key}");
             assert_eq!(output[key][0][id], "!public:s");
-            assert!(output.get("searched_rooms").is_none());
+            if key == "results" {
+                assert_eq!(output["searched_rooms"], 1);
+            } else {
+                assert!(output.get("searched_rooms").is_none());
+            }
         }
         assert!(filter_read_result(r#"{"room_id":"!private:s","name":"Private"}"#, &store, None).is_err());
+    }
+
+    #[test]
+    fn search_count_uses_unique_visible_rooms_even_without_the_raw_aggregate() {
+        let mut store = PermissionStore::default();
+        store.set_room_policy("!private:s", RoomAccess::Read, PolicyDecision::Deny);
+        store.set_room_spaces("!public:s", vec![]);
+        store.set_room_spaces("!private:s", vec![]);
+        for raw_count in [None, Some(99)] {
+            let mut input = serde_json::json!({ "results": [
+                { "room_id": "!public:s", "event_id": "$first:s" },
+                { "room_id": "!public:s", "event_id": "$second:s" },
+                { "room_id": "!private:s", "event_id": "$hidden:s" },
+            ] });
+            if let Some(count) = raw_count { input["searched_rooms"] = count.into(); }
+            let filtered = filter_read_result(&input.to_string(), &store, None).unwrap();
+            let output: serde_json::Value = serde_json::from_str(&filtered).unwrap();
+            assert_eq!(output["results"].as_array().unwrap().len(), 2);
+            assert_eq!(output["searched_rooms"], 1);
+        }
     }
 
     #[test]
@@ -455,6 +591,17 @@ mod tests {
             let mut revoked = store.clone();
             revoked.remove_scoped_grant(grant);
             assert!(!auth.permits_request(&revoked));
+            let once = revoked.grant_scoped("app", cap.group.unwrap(), Some(capability),
+                RoomScope::room("!child:s"), GrantDuration::RobrixSession, None).unwrap();
+            revoked.mark_request_once(once);
+            let mut once_auth = MatrixAuthorization::new("app", capability, Some("!origin:s"), &revoked);
+            once_auth.target_room = Some(root.into());
+            revoked.remove_scoped_grant(once);
+            assert!(once_auth.permits_request(&revoked), "collection once proof belongs to its selected child, not its root");
+            assert!(once_auth.permits(&revoked, Some("!child:s")));
+            assert!(!once_auth.permits(&revoked, Some("!sibling:s")));
+            revoked.set_capability("app", capability, GrantState::Denied);
+            assert!(!once_auth.permits_request(&revoked));
             let mut denied = store.clone();
             denied.set_capability("app", capability, GrantState::Denied);
             assert!(!auth.permits_request(&denied));
@@ -528,6 +675,200 @@ mod tests {
         assert!(ensure_server_output("https://matrix.example").await.is_err());
         let authorization = MatrixAuthorization::new("app", "matrix.room.event.read", Some("!room:s"), &PermissionStore::default());
         assert!(authorization.check_flow(Some("!room:s"), RoomAccess::Read).is_err());
+    }
+
+    #[tokio::test]
+    async fn saved_edited_search_reads_locally_after_one_ordinary_approval() {
+        use makepad_widgets::*;
+        use a2app_core::{manifest::AppRegistry, services::{self, Broker, BrokerAsk, BrokerCtx}};
+        use crate::a2app::{instances, information_flow, runtime};
+        let _review_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
+
+        // A saved September Search copy, including its historical manual edit,
+        // reproduces the installed app path rather than a fresh stock fixture.
+        let mut manifest = a2app_core::builtin::stock("search").unwrap();
+        manifest.id = "search-saved-upgrade-test".into();
+        manifest.source = include_str!("testdata/search_legacy.splash").into();
+        a2app_core::persistence::ensure_current_version(&mut manifest,
+            a2app_core::versions::VersionOrigin::Manual, "Edited by hand", 1, 0).unwrap();
+        a2app_core::persistence::save_user_app(&manifest).unwrap();
+        let saved = a2app_core::persistence::load_user_apps().into_iter().find(|saved| saved.id == manifest.id).unwrap();
+        let mut current_stock = a2app_core::builtin::stock("search").unwrap();
+        current_stock.id = saved.id.clone();
+        let upgrade = a2app_core::builtin::reconcile_builtin(&saved, &current_stock, None, None, 2, 0).unwrap();
+        assert_eq!(upgrade.manifest.source, saved.source, "upgrading must retain the user's manual edit");
+        assert!(upgrade.available_update.is_some());
+        let manifest = upgrade.manifest;
+        assert!(information_flow::manifest_has_private_source(&manifest));
+        let previous_account = information_flow::TEST_ACCOUNT.with(|account| account.replace(Some("@saved-search:test".into())));
+        runtime::initialize_background_test(manifest.clone());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let template = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::host_set::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppHost {} });
+            vm.bx.heap.new_object_ref(value.as_object().unwrap())
+        });
+        instances::set_host_template(template);
+        let room = matrix_sdk::ruma::OwnedRoomId::try_from("!saved-search:test").unwrap();
+        let key = (manifest.id.clone(), Some(room.clone()));
+        let host = instances::ensure(&mut cx, &key, &manifest, &[]).unwrap();
+        makepad_widgets::widget_tree::set_ui_root(&mut cx, &host);
+        for line in manifest.source.lines() {
+            if let Some((prefix, _)) = line.split_once(":=")
+                && let Some(name) = prefix.split_whitespace().last()
+            { host.widget(&cx, &[LiveId::from_str(name)]); }
+        }
+        let context = instances::context_of_key(&key).unwrap();
+        flow::add_sources(&context, [flow::Source::Account { account: context.account().into() }]).unwrap();
+        assert!(flow::labels(&context).unwrap().contains(&flow::Source::UnknownPrivate));
+        let splash = host.widget(&cx, ids!(splash));
+        assert!(splash.borrow_mut::<Splash>().unwrap().call_script_fn_with_strings(&mut cx, id!(run_search), &["nexus"]));
+        cx.with_vm_and_async(|_| {});
+        let registry = AppRegistry::new(vec![manifest.clone()]);
+        let mut store = PermissionStore::default();
+        store.set_strict(true);
+        let storage = |heap| flow::context_storage_path(&information_flow::context_for_heap(heap)?);
+        fn broker_context<'a>(registry: &'a AppRegistry, permissions: &'a PermissionStore, app: &'a str,
+            storage: &'a dyn Fn(usize) -> Result<std::path::PathBuf, String>) -> BrokerCtx<'a>
+        {
+            BrokerCtx { registry, permissions, foreground_app: Some(app),
+                is_docked: &|_| true, is_running: &|_| true, pane_state: &|_| None,
+                storage_path: storage, room_name: &|_| Some("Saved Search room".into()), desktop_view: true,
+                permission_target_room: Some(&runtime::permission_target_room),
+                check_flow: &information_flow::check_request, check_response: &information_flow::check_response }
+        }
+        let mut broker = Broker::new();
+        let asks = broker.process(&mut cx, broker_context(&registry, &store, &manifest.id, &storage));
+        let mut prompts = asks.into_iter().filter_map(|ask| match ask {
+            BrokerAsk::Prompt { request: Some(request), perm, .. } => Some((request, perm)),
+            BrokerAsk::FlowReview { .. } => panic!("local search must not review private exports"),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(prompts.len(), 1);
+        let (request, permission) = prompts.pop().unwrap();
+        store.grant_scoped(&manifest.id, permission, None, RoomScope::room(room.as_str()), GrantDuration::RobrixSession, None).unwrap();
+        let asks = broker.dispatch_after_grant(&mut cx, broker_context(&registry, &store, &manifest.id, &storage), request);
+        let mut calls = asks.into_iter().filter_map(|ask| match ask {
+            BrokerAsk::Matrix { reply, capability, consent, call, args, .. } => Some((reply, capability, consent, call, args)),
+            BrokerAsk::Prompt { .. } | BrokerAsk::FlowReview { .. } => panic!("one approval must resume the saved search"),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        let (reply, capability, consent, call, args) = calls.pop().unwrap();
+        assert_eq!(args["query"], "nexus");
+        assert_eq!(args["server"], false);
+        let authorization = MatrixAuthorization::new(&manifest.id, capability, Some(room.as_str()), &consent)
+            .with_flow(context.clone()).with_payload(args);
+        publish_permission_policy(&store);
+        with_authorization(authorization.clone(), async {
+            review_room_access(room.as_str(), RoomAccess::Read).await.unwrap();
+            assert!(room_access_allowed(room.as_str(), RoomAccess::Read));
+            assert!(crate::a2app::effect_review::take_pending().is_empty());
+        }).await;
+        assert!(matches!(call, services::MatrixServiceCall::Search { server: false, .. }));
+        let result = super::super::A2AppMatrixResult { reply,
+            result: Ok(serde_json::json!({ "results": [{ "room_id": room, "room_name": "Saved Search room",
+                "event_id": "$hit:test", "sender": "Alice", "body": "nexus", "ts": 1 }], "searched_rooms": 1, "server_used": false }).to_string()),
+            authorization: Some(authorization.clone()), target: Some((room.to_string(), RoomAccess::Read)), reads_rooms: true };
+        let response = result.checked_result(&store).unwrap();
+        information_flow::check_response(reply, &response).unwrap();
+        services::respond(&mut cx, reply, Ok(&response));
+        cx.with_vm_and_async(|_| {});
+        assert!(host.widget(&cx, ids!(status)).text().starts_with("1 result"));
+
+        // All durations work for the saved app without changing its provenance.
+        // Lasting choices cover only this operation and exact server origin.
+        for duration in 0..3 {
+            use std::{future::Future, task::{Context, Poll, Waker}};
+            let parameters = serde_json::json!({ "query": "nexus", "room_ids": [room], "limit": 40 });
+            let mut worker = Box::pin(with_authorization(authorization.clone(),
+                ensure_server_output_with_payload("https://matrix.example", &parameters)));
+            assert!(worker.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+            let mut pending = crate::a2app::effect_review::take_pending();
+            assert_eq!(pending.len(), 1);
+            assert!(pending[0].allow_once);
+            assert!(pending[0].review.allow_session());
+            pending[0].approve(|review| match duration {
+                0 => flow::approve_effect_once(review),
+                1 => flow::approve_effect_session(review, flow::SharingDuration::RobrixSession),
+                _ => flow::approve_effect_always(review),
+            }).unwrap();
+            pending.pop().unwrap().finish(Ok(()));
+            assert!(matches!(worker.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(Ok(()))));
+            if duration > 0 {
+                let changed = serde_json::json!({ "query": "another query", "room_ids": [room], "limit": 40 });
+                with_authorization(authorization.clone(), ensure_server_output_with_payload("https://matrix.example", &changed)).await.unwrap();
+                assert!(crate::a2app::effect_review::take_pending().is_empty());
+                for grant in flow::effect_authorities().unwrap().into_iter().filter(|grant| grant.context == context) {
+                    assert_eq!(grant.duration == flow::SharingDuration::Permanent, duration == 2);
+                    flow::revoke_effect_authority(grant.id).unwrap();
+                }
+            }
+            assert!(flow::effect_authorities().unwrap().into_iter().all(|grant| grant.context != context));
+        }
+        assert!(flow::labels(&context).unwrap().contains(&flow::Source::UnknownPrivate));
+        instances::quit_app(&mut cx, &manifest.id);
+        instances::clear_host_template();
+        information_flow::TEST_ACCOUNT.with(|account| { account.replace(previous_account); });
+        std::fs::remove_dir_all(a2app_core::data_root().join("apps").join(&manifest.id)).unwrap();
+        makepad_widgets::splash_host::take_splash_host_requests();
+    }
+
+    #[tokio::test]
+    async fn server_query_review_resumes_original_and_obeys_selected_duration() {
+        use std::{future::Future, task::{Context, Poll, Waker}};
+        let _review_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
+        let context = ContextId::App { account: "@search-once:test".into(), app: "search-once-test".into(), room: Some("!room:test".into()) };
+        let previous_account = crate::a2app::information_flow::TEST_ACCOUNT.with(|account| account.replace(Some(context.account().into())));
+        flow::register_context(&context).unwrap();
+        flow::add_sources(&context, [flow::Source::Account { account: context.account().into() }]).unwrap();
+        let mut store = PermissionStore::default();
+        store.set("search-once-test", Permission::MatrixRoomRead, GrantState::Granted);
+        publish_permission_policy(&store);
+        let auth = MatrixAuthorization::new("search-once-test", "matrix.room.messages.search", context.room(), &store).with_flow(context.clone());
+        let parameters = serde_json::json!({ "query": "nexus", "room_ids": ["!room:test"], "limit": 40 });
+        let mut worker = Box::pin(with_authorization(auth.clone(), ensure_server_output_with_payload("https://matrix.example", &parameters)));
+        assert!(worker.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+        let mut pending = crate::a2app::effect_review::take_pending();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].allow_once);
+        let capture: serde_json::Value = serde_json::from_str(&pending[0].review.payload).unwrap();
+        assert_eq!(capture["operation"], "matrix.room.messages.search");
+        assert_eq!(capture["parameters"], parameters);
+        pending[0].approve(flow::approve_effect_once).unwrap();
+        pending.pop().unwrap().finish(Ok(()));
+        assert!(matches!(worker.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(Ok(()))));
+        let changed = serde_json::json!({ "query": "different secret", "room_ids": ["!room:test"], "limit": 40 });
+        let mut worker = Box::pin(with_authorization(auth.clone(), ensure_server_output_with_payload("https://matrix.example", &changed)));
+        assert!(worker.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+        let mut pending = crate::a2app::effect_review::take_pending();
+        assert_eq!(pending.len(), 1, "once must not authorize a different query");
+        assert!(pending[0].review.payload.contains("different secret"));
+        pending.pop().unwrap().finish(Err("Denied".into()));
+        assert!(matches!(worker.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(Err(_))));
+        for permanent in [false, true] {
+            let mut worker = Box::pin(with_authorization(auth.clone(), ensure_server_output_with_payload("https://matrix.example", &parameters)));
+            assert!(worker.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+            let mut pending = crate::a2app::effect_review::take_pending();
+            assert_eq!(pending.len(), 1);
+            pending[0].approve(|review| if permanent { flow::approve_effect_always(review) }
+                else { flow::approve_effect_session(review, flow::SharingDuration::RobrixSession) }).unwrap();
+            pending.pop().unwrap().finish(Ok(()));
+            assert!(matches!(worker.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(Ok(()))));
+            with_authorization(auth.clone(), ensure_server_output_with_payload("https://matrix.example", &changed)).await.unwrap();
+            assert!(crate::a2app::effect_review::take_pending().is_empty(), "session and forever reuse this operation's review");
+            let recipient = Recipient::network_origin("https://matrix.example").unwrap();
+            assert!(flow::ensure_allowed(&context, &recipient).is_err(), "approval must not grant arbitrary exports");
+            for grant in flow::effect_authorities().unwrap().into_iter().filter(|grant| grant.context == context) {
+                assert_eq!(grant.duration == flow::SharingDuration::Permanent, permanent);
+                flow::revoke_effect_authority(grant.id).unwrap();
+            }
+        }
+        flow::remove_context(&context).unwrap();
+        crate::a2app::information_flow::TEST_ACCOUNT.with(|account| { account.replace(previous_account); });
     }
 
     #[tokio::test]

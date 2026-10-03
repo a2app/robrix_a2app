@@ -611,6 +611,10 @@ script_mod! {
                         padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
                         text: "Check access…"
                     }
+                    reset_all_permissions_button := RobrixNegativeIconButton {
+                        padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                        text: "Reset all permissions…"
+                    }
                 }
             }
 
@@ -2272,6 +2276,19 @@ impl Widget for MiniAppsScreen {
         }
         if self.view.button(cx, ids!(agent_permissions_button)).clicked(actions) {
             self.show_agent_permissions(cx);
+        }
+        if self.view.button(cx, ids!(reset_all_permissions_button)).clicked(actions) {
+            let mut body = String::from("This clears saved permissions for all mini-apps and agents and restores room and space access to the defaults. Active apps and agents will stop, and background tasks will pause. They will ask for permission again when needed. Your apps and saved data are kept.");
+            if with_a2app(|state| !state.permissions.restricted_apps().is_empty()).unwrap_or(false) {
+                body.push_str(" Apps or agents stopped for unsafe behavior remain restricted.");
+            }
+            self.confirm_delete(
+                cx,
+                String::from("Reset all permissions?"),
+                body,
+                "Reset all permissions",
+                |cx| cx.action(A2AppOp::ResetAllPermissions),
+            );
         }
         if self.view.button(cx, ids!(inspect_protection_button)).clicked(actions) {
             self.view.protection_inspector(cx, ids!(protection_inspector)).configure(cx);

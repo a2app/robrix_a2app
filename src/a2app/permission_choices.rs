@@ -6,6 +6,8 @@ script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
 
+    mod.widgets.PERMISSION_TEXT_INSET = 12.0
+
     mod.widgets.PermissionChoiceRow = RobrixSettingsRadioButton {
         width: Fill, height: Fit{min: FitBound.Abs(40.0)}
         flow: Flow.Right{wrap: true}
@@ -35,6 +37,36 @@ script_mod! {
             border_color: (COLOR_SECONDARY_DARKER), border_color_hover: (COLOR_ACTIVE_PRIMARY)
             border_color_active: (COLOR_ACTIVE_PRIMARY_DARKER), border_color_focus: (COLOR_ACTIVE_PRIMARY_DARKER)
             border_color_down: (COLOR_ACTIVE_PRIMARY_DARKER), border_color_disabled: (COLOR_SECONDARY_DARKER)
+        }
+    }
+    mod.widgets.PermissionDurationDropDown = DropDown2 {
+        width: Fill, height: 44, margin: 0
+        align: Align{x: 0.0, y: 0.5}
+        padding: Inset{top: 8, bottom: 8, left: (mod.widgets.PERMISSION_TEXT_INSET), right: 30}
+        item_height: 44.0, popup_margin: 8.0
+        draw_text +: {
+            ink_centered: true
+            text_style: SETTINGS_REGULAR_TEXT_STYLE {}
+            color: (MESSAGE_TEXT_COLOR), color_hover: (MESSAGE_TEXT_COLOR)
+            color_focus: (MESSAGE_TEXT_COLOR), color_down: (MESSAGE_TEXT_COLOR)
+        }
+        draw_bg +: {
+            color: (COLOR_PRIMARY), color_hover: (COLOR_BG_PREVIEW)
+            color_focus: (COLOR_PRIMARY), color_down: (COLOR_BG_PREVIEW)
+            border_color: (COLOR_SECONDARY_DARKER), border_color_hover: (COLOR_ACTIVE_PRIMARY)
+            border_color_focus: (COLOR_ACTIVE_PRIMARY_DARKER), border_color_down: (COLOR_ACTIVE_PRIMARY_DARKER)
+            border_size: 1.0, border_radius: 4.0
+            arrow_color: (MESSAGE_TEXT_COLOR), arrow_color_hover: (COLOR_ACTIVE_PRIMARY_DARKER)
+        }
+        draw_popup_bg +: {
+            color: (COLOR_PRIMARY), border_color: (COLOR_SECONDARY_DARKER)
+            border_size: 1.0, border_radius: 4.0
+        }
+        draw_item +: { color_hover: (COLOR_BG_PREVIEW), color_active: (COLOR_BG_PREVIEW) }
+        draw_item_text +: {
+            ink_centered: true
+            text_style: SETTINGS_REGULAR_TEXT_STYLE {}
+            color: (MESSAGE_TEXT_COLOR), color_hover: (MESSAGE_TEXT_COLOR), color_active: (MESSAGE_TEXT_COLOR)
         }
     }
     mod.widgets.PermissionChoices = set_type_default() do #(PermissionChoices::register_widget(vm)) {

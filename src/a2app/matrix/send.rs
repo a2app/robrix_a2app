@@ -109,7 +109,6 @@ pub(super) async fn typing(room_id: OwnedRoomId, typing: bool) -> Result<String,
     super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
-    super::policy::ensure_server_output(client.homeserver().as_str()).await?;
     super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::json!({ "typing": typing })).await?;
     super::policy::audit_server_operation(client.homeserver().as_str(), room.typing_notice(typing)).await
         .map_err(|e| format!("couldn't send the typing notice: {e}"))?;
@@ -165,7 +164,6 @@ pub(super) async fn pin(room_id: OwnedRoomId, event_id: OwnedEventId, pinned: bo
     super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
-    super::policy::ensure_server_output(client.homeserver().as_str()).await?;
     super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::json!({ "event_id": event_id, "pinned": pinned })).await?;
     let result = if pinned {
         super::policy::audit_server_operation(client.homeserver().as_str(), room.pin_event(&event_id)).await
@@ -180,7 +178,6 @@ pub(super) async fn room_flag(room_id: OwnedRoomId, flag: RoomFlag, on: bool) ->
     super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
     let client = get_client().ok_or("not logged in")?;
     let room = client.get_room(&room_id).ok_or("room not found")?;
-    super::policy::ensure_server_output(client.homeserver().as_str()).await?;
     let flag_name = match flag { RoomFlag::Favorite => "favorite", RoomFlag::LowPriority => "low_priority", RoomFlag::Unread => "unread" };
     super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::json!({ "flag": flag_name, "on": on })).await?;
     let result = match flag {

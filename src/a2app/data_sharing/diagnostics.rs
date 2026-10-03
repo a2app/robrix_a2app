@@ -200,6 +200,8 @@ impl DataSharing {
         }
         self.authorities = flow::authorities().unwrap_or_default().into_iter()
             .filter(|grant| grant.context.account() == self.account).collect();
+        self.effect_authorities = flow::effect_authorities().unwrap_or_default().into_iter()
+            .filter(|grant| grant.context.account() == self.account).collect();
         let count = self.decisions.iter().filter(|decision| !decision.allowed).count() + self.action_decisions.len();
         self.view.label(cx, ids!(attention_summary)).set_text(cx, if count == 0 {
             "Nothing needs your attention. Blocked sharing requests and actions will appear here."
@@ -437,7 +439,7 @@ impl DataSharing {
         }
     }
 
-    fn influence_label(&self, influence: &Influence) -> String {
+    pub(super) fn influence_label(&self, influence: &Influence) -> String {
         match influence {
             Influence::RoomContent { account, room } => format!("Room content · {} · {account}", self.room_label(room)),
             Influence::InternetOrigin(origin) => format!("Website content · {origin}"),
@@ -476,6 +478,21 @@ impl DataSharing {
             SharingDuration::Permanent => "Until you remove this rule".into(),
             SharingDuration::RobrixSession => "Until Robrix closes".into(),
             SharingDuration::RoomSession { account, room } => format!("Until {} closes · {account}", self.room_label(room)),
+        }
+    }
+
+    pub(super) fn effect_operation_label(&self, grant: &EffectAuthority) -> String {
+        let operation = grant.operation.strip_prefix("operation:").or_else(|| grant.operation.strip_prefix("action:"));
+        if let Some(capability) = operation.and_then(a2app_core::capabilities::by_id) { return capability.title.into(); }
+        if let Some(action) = &grant.action { return self.action_choice_label(action); }
+        "This exact request".into()
+    }
+
+    pub(super) fn effect_duration_label(&self, duration: &SharingDuration) -> String {
+        match duration {
+            SharingDuration::Permanent => "Forever (until you remove this permission)".into(),
+            SharingDuration::RoomSession { room, .. } => format!("Until {} closes", self.room_name(room)),
+            SharingDuration::RobrixSession => "Until Robrix closes".into(),
         }
     }
 }

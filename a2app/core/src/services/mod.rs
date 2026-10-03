@@ -355,6 +355,8 @@ pub enum BrokerAsk {
         capability: &'static str,
         consent: Box<PermissionStore>,
         call: MatrixServiceCall,
+        /// Immutable caller arguments, captured for the host's action review.
+        args: serde_json::Value,
     },
     /// Steer the host UI (navigate, or touch the composer), then answer
     /// `reply`. Ids are validated by the host, which knows the id types.
@@ -472,6 +474,9 @@ pub struct BrokerCtx<'a> {
     pub storage_path: &'a dyn Fn(usize) -> Result<std::path::PathBuf, String>,
     /// A room's display name, for `env`.
     pub room_name: &'a dyn Fn(&str) -> Option<String>,
+    /// Resolve host-parsed destinations before checking scoped permissions.
+    /// None uses the service's ordinary attached/argument room target.
+    pub permission_target_room: Option<&'a dyn Fn(&str, &serde_json::Value, Option<&str>) -> Option<String>>,
     pub desktop_view: bool,
     /// Host-trusted provenance and output checks, before service side effects.
     pub check_flow: &'a dyn Fn(&SplashHostRequest, &crate::capabilities::Capability, &serde_json::Value, &AppRegistry) -> Result<Option<crate::information_flow::EffectReview>, String>,
@@ -509,7 +514,7 @@ pub fn is_room_collection(capability: &crate::capabilities::Capability) -> bool 
     matches!(capability.id,
         "matrix.rooms.list" | "matrix.rooms.search" | "matrix.rooms.invites.list"
         | "matrix.rooms.messages.search" | "matrix.spaces.list" | "matrix.space.rooms.list"
-        | "on_rooms_changed" | "on_invite_received" | "on_unread_totals_changed"
+        | "on_rooms_changed" | "on_invite_received" | "on_unread_totals_changed" | "on_active_room_changed"
     )
 }
 
@@ -854,7 +859,11 @@ impl Broker {
         {
             return respond(cx, reply, Err("Enter a complete website address starting with http:// or https://, without a username or password."));
         }
-        let context = permission_context(&req.service, &args, instance_room.as_deref());
+        let resolved_target = ctx.permission_target_room
+            .and_then(|resolve| resolve(&req.service, &args, instance_room.as_deref()));
+        let ordinary_context = permission_context(&req.service, &args, instance_room.as_deref());
+        let context = PermissionContext { origin_room: ordinary_context.origin_room,
+            target_room: resolved_target.as_deref().or(ordinary_context.target_room) };
         let collection = is_room_collection(capability);
         let denied = if collection && req.service != "matrix.space_rooms" {
             ctx.permissions.global_policy(RoomAccess::Read) == PolicyDecision::Deny
@@ -1295,6 +1304,7 @@ impl Broker {
                         capability: capability.id,
                         consent: Box::new(ctx.permissions.clone()),
                         call,
+                        args,
                     }),
                     Err(e) => respond(cx, reply, Err(&e)),
                 }

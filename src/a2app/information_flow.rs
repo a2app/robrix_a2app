@@ -118,6 +118,17 @@ pub fn record_response(context: &ContextId, value: &serde_json::Value) -> Result
     flow::add_influences(context, influences)
 }
 
+/// An upgrade pointer belongs to the original room's tombstone.
+///
+/// The successor worker records a target source only if it reads that room.
+pub fn record_matrix_response(context: &ContextId, capability: Option<&str>, value: &serde_json::Value) -> Result<(), String> {
+    if capability == Some("matrix.room.successor.read") {
+        let mut value = value.clone();
+        if let Some(object) = value.as_object_mut() { object.remove("room_id"); }
+        record_response(context, &value)
+    } else { record_response(context, value) }
+}
+
 pub fn check_response(reply: services::Reply, data: &str) -> Result<(), String> {
     let context = context_for_heap(reply.heap_key)?;
     if let Ok(value) = serde_json::from_str(data) { record_response(&context, &value)?; }
@@ -176,12 +187,15 @@ pub fn check_request(request: &SplashHostRequest, capability: &Capability, args:
         return Err("The service does not match its information-flow contract.".into());
     }
     let contract = capability.flow_contract().ok_or("This service has no information-flow contract.")?;
-    let target = services::permission_context(&request.service, args, room).target_room;
+    let target_room = super::runtime::permission_target_room(&request.service, args, room);
+    let target = target_room.as_deref();
     // Deferred Matrix/network/UI effects capture their resolved contents at
     // the final sink. Immediate platform effects commit this immutable call.
     let deferred = request.service.starts_with("matrix.") || request.service == "network.http"
         || matches!(capability.id, "host.composer.insert" | "host.composer.reply_to" | "host.nav.app");
-    let final_effect = deferred && (contract.privileged_effect || request.service == "network.http");
+    let final_effect = deferred && (contract.privileged_effect || request.service == "network.http"
+        || matches!(contract.output, a2app_core::capabilities::FlowOutput::MatrixSearch
+            | a2app_core::capabilities::FlowOutput::MatrixServer | a2app_core::capabilities::FlowOutput::MatrixPagination));
     if !final_effect {
         let homeserver = crate::sliding_sync::get_client().map(|client| client.homeserver().to_string());
         let recipient = contract.recipient(context_account(&context), target, args, homeserver.as_deref())?;
@@ -223,6 +237,18 @@ fn record_contract_source(
         }
     }
     Ok(())
+}
+
+/// Include an approved subscription's possible inputs before its first event.
+///
+/// No room contents are read here. Visible setup can approve later actions
+/// using the same source and influence floor as the subscribed event.
+pub fn record_subscription(heap: usize, name: &str) -> Result<(), String> {
+    let context = context_for_heap(heap)?;
+    let capability = a2app_core::capabilities::for_hook(name).ok_or("Unknown subscribed event.")?;
+    let contract = capability.flow_contract().ok_or("Missing subscribed event data-flow contract.")?;
+    let room = context.room();
+    record_contract_source(&context, contract, room, room, &a2app_core::manifest::AppRegistry::default())
 }
 
 pub fn record_hook(heap: usize, hook: makepad_widgets::LiveId, args: &[&str]) -> Result<(), String> {

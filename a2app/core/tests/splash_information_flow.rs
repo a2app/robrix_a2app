@@ -168,6 +168,13 @@ impl Harness {
             let mut registry = flow.borrow_mut();
             if request.service == "network.http" {
                 bodies.borrow_mut().push(args["body"].as_str().unwrap_or_default().into());
+                let origin = match Recipient::network_origin(args["url"].as_str().ok_or("Missing network URL")?)? {
+                    Recipient::NetworkOrigin(origin) => origin,
+                    _ => unreachable!(),
+                };
+                // The real HTTP worker records the origin before reviewing
+                // any outgoing request, including the first public response.
+                registry.add_influences(context, [Influence::InternetOrigin(origin)])?;
             }
             let recipient = contract.recipient(ACCOUNT, target, args, Some("https://homeserver.test"))?;
             let action = contract.sensitive_action(cap.id, args, target);
@@ -211,6 +218,7 @@ impl Harness {
             registry: &self.apps, permissions: &self.permissions, foreground_app: self.foreground_app.as_deref(),
             is_docked: &|_| true, is_running: &|_| true, pane_state: &|heap| self.panes.get(&heap).cloned(), storage_path: &storage_path,
             room_name: &|_| Some("Private room".into()), desktop_view: true,
+            permission_target_room: None,
             check_flow: &check_flow, check_response: &check_response,
         };
         let asks = if let Some(request) = pending { self.broker.dispatch_after_grant(&mut self.cx, ctx, request) }
@@ -590,12 +598,12 @@ fn matrix_fixture(call: &services::MatrixServiceCall) -> serde_json::Value {
         OlderMessages { .. } => serde_json::json!({"messages":[],"has_more":false}),
         Event { .. } => serde_json::json!({"body":"release fixture","reactions":[],"edited":false}),
         ReadReceipts { .. } => serde_json::json!({"receipts":[{"name":"Alice","user_id":"@alice:test","event_id":"$message:test","ts":1720000000000_u64}]}),
-        Unread => serde_json::json!({"unread":2,"mentions":1,"marked_unread":false}),
+        Unread => serde_json::json!({"unread":2,"mentions":1,"marked_unread":false,"favorite":false,"low_priority":false}),
         PowerLevels => serde_json::json!({"mine":100,"can":{"invite":true,"kick":true,"ban":true,"redact_others":true,"pin":true,"send_message":true,"notify_room":true,"change_settings":true}}),
         Permalink { .. } => serde_json::json!({"url":"https://matrix.to/#/!private:test/$message:test"}),
         Successor => serde_json::json!({"upgraded":false,"room_id":null}),
         RoomsList | RoomsSearch { .. } => serde_json::json!({"rooms":[room]}),
-        Search { server, .. } => serde_json::json!({"results":[message],"searched_rooms":1,"server_used":server}),
+        Search { server, .. } => serde_json::json!({"results":[message],"server_used":server}),
         Invites => serde_json::json!({"invites":[{"room_id":"!invite:test","name":"Invited room","inviter_name":"Alice","inviter":"@alice:test","is_space":false,"is_direct":false}]}),
         RoomPreview { .. } => serde_json::json!({"name":"Preview room","topic":"Fixture topic","member_count":2,"join_rule":"public"}),
         Spaces => serde_json::json!({"spaces":[{"space_id":"!space:test","name":"Test Space","topic":"Fixture topic","member_count":2}]}),
