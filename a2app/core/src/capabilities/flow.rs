@@ -95,9 +95,9 @@ pub fn contract(id: &str) -> Option<FlowContract> {
         | "matrix.room.power_levels.read" | "matrix.room.link.create"
         | "matrix.room.successor.read" | "matrix.room.receipts.read"
         | "matrix.rooms.info.read" | "matrix.rooms.messages.read"
-        | "matrix.space.info.read" | "matrix.space.rooms.list"
+        | "matrix.space.info.read"
             => (S::TargetRoom, O::Local, true, false),
-        "matrix.room.thread.read" | "matrix.room.event.read"
+        "matrix.room.thread.read" | "matrix.room.event.read" | "matrix.space.rooms.list"
             => (S::TargetRoom, O::MatrixServer, true, false),
         "matrix.room.messages.paginate" => (S::TargetRoom, O::MatrixPagination, true, false),
         "matrix.room.messages.search" => (S::TargetRoom, O::MatrixSearch, true, false),

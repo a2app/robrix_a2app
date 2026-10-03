@@ -60,6 +60,107 @@ fn session_rules_never_persist_and_expire_only_at_their_boundary() {
 }
 
 #[test]
+fn permissions_reset_retires_every_approval_but_retains_app_and_agent_provenance() {
+    let root = TestRoot::new();
+    let mut registry = root.registry();
+    let app = app("alice", "private");
+    let agent = ContextId::Agent { account: "alice".into(), room: "private".into() };
+    let account = Source::Account { account: "alice".into() };
+    let label: Label = [source(), account.clone()].into();
+    for context in [&app, &agent] {
+        registry.register_context(context).unwrap();
+        registry.add_sources(context, label.clone()).unwrap();
+        registry.add_influences(context, [internet()]).unwrap();
+        registry.set_clearance(context, Some(label.clone())).unwrap();
+        let path = registry.context_storage_path(context).unwrap();
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("retained"), "private app or agent state").unwrap();
+    }
+    registry.add_code_sources("tool", [source()]).unwrap();
+    registry.add_code_influences("tool", [Influence::Model("archived-generator".into())]).unwrap();
+    registry.reconcile_builtin_code("tool").unwrap();
+    registry.add_code_influences("tool", [Influence::Model("current-generator".into())]).unwrap();
+    let post = SensitiveAction { kind: "network.POST".into(), target: "https://example.com".into() };
+    let copy = SensitiveAction { kind: "device.clipboard.write".into(), target: "clipboard".into() };
+    let exact = SensitiveAction { target: "other/user".into(), ..action() };
+    let payload = serde_json::json!({"body":"reviewed private contents"});
+    let mut captures = Vec::new();
+    for context in [&app, &agent] {
+        let epoch = registry.context_epoch(context).unwrap();
+        let labels = registry.labels(context).unwrap();
+        let influences = registry.influences(context).unwrap();
+        for source in &labels {
+            registry.grant_sharing(source.clone(), Recipient::ModelProvider("durable-model".into()),
+                ReaderScope::Context(context.clone()), SharingDuration::Permanent).unwrap();
+            registry.grant_sharing(source.clone(), Recipient::ModelProvider("session-model".into()),
+                ReaderScope::Context(context.clone()), SharingDuration::RobrixSession).unwrap();
+            registry.grant_sharing(source.clone(), Recipient::ModelProvider("room-model".into()),
+                ReaderScope::Context(context.clone()), SharingDuration::RoomSession { account: "alice".into(), room: "private".into() }).unwrap();
+        }
+        registry.grant_authority(context, action(), AuthoritySession::RobrixSession).unwrap();
+        registry.grant_authority(context, SensitiveAction { target: "room-session/user".into(), ..action() },
+            AuthoritySession::RoomSession { account: "alice".into(), room: "private".into() }).unwrap();
+        let forever = registry.prepare_effect_for_activation(context, epoch, Some(&site()), Some(&post), &payload).unwrap();
+        registry.approve_effect_always(&forever).unwrap();
+        let session = registry.prepare_effect_for_activation(context, epoch, Some(&Recipient::Clipboard), Some(&copy), &payload).unwrap();
+        registry.approve_effect_session(&session, SharingDuration::RobrixSession).unwrap();
+        assert!(registry.check_exact_action_for_activation(context, epoch, &exact, &payload).is_err());
+        let request = registry.recent_action_decisions().unwrap().last().unwrap().request.clone().unwrap();
+        registry.grant_exact_action_for_activation(context, request.id, &influences, epoch).unwrap();
+        let once = registry.prepare_effect_for_activation(context, epoch, Some(&Recipient::Clipboard), Some(&exact), &payload).unwrap();
+        registry.approve_effect_once(&once).unwrap();
+        captures.push((context.clone(), epoch, labels, influences, once, request.id));
+    }
+    assert!(!registry.sharing_grants().unwrap().is_empty());
+    assert_eq!(registry.effect_authorities().unwrap().len(), 4);
+    assert_eq!(registry.authorities().unwrap().len(), 6);
+    let metadata = registry.metadata.clone();
+    let code_label = registry.code_labels("tool").unwrap();
+    let code_influences = registry.code_influences("tool").unwrap();
+
+    registry.reset_permissions().unwrap();
+    assert!(registry.sharing_grants().unwrap().is_empty());
+    assert!(registry.effect_authorities().unwrap().is_empty());
+    assert!(registry.authorities().unwrap().is_empty());
+    assert!(registry.pending_actions.is_empty()); assert!(registry.pending_effects.is_empty());
+    assert_eq!(registry.metadata.contexts, metadata.contexts);
+    assert_eq!(registry.metadata.code, metadata.code);
+    assert_eq!(registry.metadata.historical_code, metadata.historical_code);
+    assert_eq!(registry.metadata.next_id, metadata.next_id);
+    for (context, epoch, _, influences, once, request) in &captures {
+        assert!(registry.ensure_context_epoch(context, *epoch).is_err());
+        assert!(registry.approve_effect_once(once).is_err());
+        assert!(registry.grant_exact_action_for_activation(context, *request, influences, *epoch).is_err());
+    }
+    let mut reopened = root.registry();
+    for registry in [&mut registry, &mut reopened] {
+        assert!(registry.sharing_grants().unwrap().is_empty());
+        assert!(registry.effect_authorities().unwrap().is_empty());
+        assert!(registry.authorities().unwrap().is_empty());
+        assert_eq!(registry.code_labels("tool").unwrap(), code_label);
+        assert_eq!(registry.code_influences("tool").unwrap(), code_influences);
+        for (context, old_epoch, labels, influences, once, request) in &captures {
+            registry.register_context(context).unwrap();
+            let epoch = registry.context_epoch(context).unwrap();
+            assert_ne!(epoch, *old_epoch);
+            assert_eq!(registry.labels(context).unwrap(), *labels);
+            assert_eq!(registry.influences(context).unwrap(), *influences);
+            assert_eq!(registry.clearance(context).unwrap(), Some(label.clone()));
+            assert_eq!(fs::read_to_string(registry.context_storage_path(context).unwrap().join("retained")).unwrap(), "private app or agent state");
+            assert!(registry.ensure_allowed(context, &Recipient::ModelProvider("durable-model".into())).is_err());
+            assert!(registry.ensure_action_allowed(context, &action()).is_err());
+            assert!(registry.commit_effect_for_activation(context, *old_epoch, Some(&site()), Some(&post), &payload).is_err());
+            assert!(registry.commit_effect_for_activation(context, epoch, Some(&site()), Some(&post), &payload).is_err());
+            assert!(registry.commit_effect_for_activation(context, epoch, Some(&Recipient::Clipboard), Some(&copy), &payload).is_err());
+            assert!(registry.commit_effect_for_activation(context, epoch, Some(&Recipient::Clipboard), Some(&exact), &payload).is_err());
+            assert!(registry.approve_effect_once(once).is_err());
+            assert!(registry.grant_exact_action_for_activation(context, *request, influences, epoch).is_err());
+            assert!(registry.commit_exact_action_for_activation(context, epoch, &exact, &payload).is_err());
+        }
+    }
+}
+
+#[test]
 fn legacy_policy_edit_does_not_erase_a_scoped_allowance() {
     let root = TestRoot::new();
     let mut registry = root.registry();

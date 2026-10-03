@@ -34,12 +34,14 @@ pub(super) struct Metadata {
     pub historical_code: BTreeMap<String, StoredProvenance>,
     pub contexts: Vec<StoredContext>,
     pub grants: Vec<SharingGrant>,
+    #[serde(default)]
+    pub effect_authorities: Vec<EffectAuthority>,
     pub next_id: u64,
 }
 
 impl Default for Metadata {
     fn default() -> Self {
-        Self { version: SCHEMA_VERSION, code: BTreeMap::new(), historical_code: BTreeMap::new(), contexts: Vec::new(), grants: Vec::new(), next_id: 1 }
+        Self { version: SCHEMA_VERSION, code: BTreeMap::new(), historical_code: BTreeMap::new(), contexts: Vec::new(), grants: Vec::new(), effect_authorities: Vec::new(), next_id: 1 }
     }
 }
 
@@ -153,6 +155,12 @@ pub(super) fn validate_metadata(metadata: &Metadata) -> Result<(), String> {
         sharing::validate_grant(grant)?;
         if grant.duration != SharingDuration::Permanent || grant.id == 0 || grant.id >= metadata.next_id || !ids.insert(grant.id) {
             return Err("Invalid persistent sharing grant.".into());
+        }
+    }
+    for grant in &metadata.effect_authorities {
+        effects::validate_authority(grant)?;
+        if grant.duration != SharingDuration::Permanent || grant.id == 0 || grant.id >= metadata.next_id || !ids.insert(grant.id) {
+            return Err("Invalid persistent operation approval.".into());
         }
     }
     Ok(())

@@ -220,6 +220,25 @@ impl JobStore {
         self.set_paused(account, id, None, RunOutcome::Cancelled, now_ms)
     }
 
+    /// Withdraw background consent across every account in one durable write.
+    /// Keep task configuration and completed-run history for later review.
+    pub fn disable_all(&mut self, now_ms: u64) -> Result<(), String> {
+        self.healthy()?;
+        let mut next = self.document.clone();
+        let mut changed = false;
+        for job in &mut next.jobs {
+            if job.enabled || job.in_flight.is_some() {
+                job.finish(RunOutcome::Cancelled, now_ms);
+                job.enabled = false;
+                job.next_due_ms = None;
+                job.pause_reason = None;
+                changed = true;
+            }
+        }
+        if changed { self.persist(next)?; }
+        Ok(())
+    }
+
     pub fn pause(&mut self, account: &str, id: u64, reason: PauseReason, now_ms: u64) -> Result<(), String> {
         self.set_paused(account, id, Some(reason), RunOutcome::Interrupted, now_ms)
     }
@@ -714,6 +733,48 @@ mod tests {
         assert_eq!(bob_runs.len(), 1);
         assert_eq!(bob_runs[0].job_id, bob);
         assert!(store.job(alice).unwrap().in_flight.is_some());
+    }
+
+    #[test]
+    fn global_permissions_reset_pauses_every_account_and_retains_configuration_on_disk() {
+        let root = TestRoot::new();
+        let mut store = root.open(0);
+        let alice = store.enable(binding("alice-task"), interval(), hash(), 0).unwrap();
+        let mut bob_binding = binding("orphan-task");
+        bob_binding.account = BOB.into();
+        let bob = store.enable(bob_binding, interval(), hash(), 0).unwrap();
+        let completed = store.enable(binding("completed-alarm"), Trigger::Alarm { unix_ms: 100 }, hash(), 0).unwrap();
+        let finished = store.claim_now(ALICE, completed, 100, installed).unwrap().unwrap();
+        store.complete(ALICE, completed, finished.run_id, RunOutcome::Succeeded, 101).unwrap();
+        let original_completed = store.job(completed).unwrap().clone();
+        let alice_run = store.claim_now(ALICE, alice, 200, installed).unwrap().unwrap();
+        let bob_run = store.claim_now(BOB, bob, 200, installed).unwrap().unwrap();
+        let configurations = store.jobs().iter().map(|job|
+            (job.id, job.binding.clone(), job.trigger.clone(), job.fingerprint.clone())).collect::<Vec<_>>();
+
+        store.disable_all(300).unwrap();
+        assert_eq!(store.job(completed).unwrap(), &original_completed, "completed history is not a permission answer");
+        for (id, run) in [(alice, alice_run.run_id), (bob, bob_run.run_id)] {
+            let job = store.job(id).unwrap();
+            assert!(!job.enabled); assert!(job.in_flight.is_none()); assert!(job.next_due_ms.is_none());
+            assert_eq!(job.last_run.as_ref().unwrap().run_id, run);
+            assert_eq!(job.last_run.as_ref().unwrap().outcome, RunOutcome::Cancelled);
+        }
+        assert!(!store.complete(ALICE, alice, alice_run.run_id, RunOutcome::Succeeded, 301).unwrap());
+        assert!(!store.complete(BOB, bob, bob_run.run_id, RunOutcome::Succeeded, 301).unwrap());
+        drop(store);
+        let mut store = root.open(400);
+        assert_eq!(store.jobs().iter().map(|job|
+            (job.id, job.binding.clone(), job.trigger.clone(), job.fingerprint.clone())).collect::<Vec<_>>(), configurations);
+        for account in [ALICE, BOB] {
+            assert!(store.claim_due(account, 1_000_000, 4, installed).unwrap().is_empty());
+            assert_eq!(store.next_wakeup(account), None);
+        }
+        assert!(store.claim_now(ALICE, alice, 1_000_000, installed).is_err());
+        assert!(store.claim_now(BOB, bob, 1_000_000, installed).is_err());
+        let before = root.bytes();
+        store.disable_all(1_000_001).unwrap();
+        assert_eq!(root.bytes(), before, "repeating reset does not rewrite task history");
     }
 
     #[test]

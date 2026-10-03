@@ -382,6 +382,18 @@ impl PermissionStore {
 
     pub fn clear_room_spaces(&mut self) { self.room_spaces.clear(); }
 
+    /// Trusted, resolved space ancestry, shared by popup and effect approvals.
+    pub fn room_space_memberships(&self) -> &BTreeMap<String, BTreeSet<String>> { &self.room_spaces }
+
+    pub fn room_scope_matches(&self, scope: &RoomScope, room: &str) -> bool {
+        match scope {
+            RoomScope::AllRooms => true,
+            RoomScope::Selection { rooms, spaces } => rooms.iter().any(|id| id == room)
+                || spaces.iter().any(|space| space == room
+                    || self.room_spaces.get(room).is_some_and(|ancestors| ancestors.contains(space))),
+        }
+    }
+
     /// Keep resolving configured spaces even after the user leaves them:
     /// leaving a space must not silently remove protection from its rooms.
     pub fn configured_space_ids(&self) -> BTreeSet<String> {
@@ -496,12 +508,8 @@ impl PermissionStore {
     fn scope_matches(&self, scope: &RoomScope, context: PermissionContext<'_>) -> bool {
         match scope {
             RoomScope::AllRooms => true,
-            RoomScope::Selection { rooms, spaces } => {
-                let Some(room) = context.target_room.or(context.origin_room) else { return false };
-                rooms.iter().any(|id| id == room) || spaces.iter().any(|space| {
-                    space == room || self.room_spaces.get(room).is_some_and(|ancestors| ancestors.contains(space))
-                })
-            }
+            RoomScope::Selection { .. } => context.target_room.or(context.origin_room)
+                .is_some_and(|room| self.room_scope_matches(scope, room)),
         }
     }
 
@@ -704,6 +712,18 @@ impl PermissionStore {
         }) || (group == Permission::MatrixRoomsRead && self.read_rooms.get(subject).is_some_and(|rooms| !rooms.is_empty()))
     }
 
+    /// Aggregate account totals require an explicit all-rooms grant.
+    /// A selected room or space can authorize rows, never unfiltered totals.
+    pub fn has_all_room_collection_consent(&self, subject: &str, cap: &Capability, context: PermissionContext<'_>) -> bool {
+        let Some(group) = cap.group else { return false };
+        self.scoped.iter().chain(&self.session_scoped).any(|grant| {
+            grant.subject == subject && grant.permission == group.as_str()
+                && (grant.capability.is_none() || grant.capability.as_deref() == Some(cap.id))
+                && Self::lifetime_matches(grant.duration, grant.origin_room.as_deref(), context)
+                && grant.scope == RoomScope::AllRooms
+        })
+    }
+
     /// Admits only read-only collection orchestration. A grant for any subset
     /// can start the query, but EVERY returned/accessed room must subsequently
     /// pass `effective_capability_for_in_context` with its actual target ID.
@@ -804,6 +824,27 @@ impl PermissionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_totals_require_all_rooms_and_honor_the_origin_lifetime() {
+        let cap = crate::capabilities::by_id("on_unread_totals_changed").unwrap();
+        let mut store = PermissionStore::default();
+        let owner = PermissionContext { origin_room: Some("!owner:s"), target_room: None };
+        let other = PermissionContext { origin_room: Some("!other:s"), target_room: None };
+        store.grant_scoped("app", Permission::MatrixRoomsList, None, RoomScope::room("!selected:s"),
+            GrantDuration::RobrixSession, None).unwrap();
+        assert!(store.has_scoped_collection_consent("app", cap, owner));
+        assert!(!store.has_all_room_collection_consent("app", cap, owner));
+        let id = store.grant_scoped("app", Permission::MatrixRoomsList, Some(cap.id), RoomScope::AllRooms,
+            GrantDuration::RoomSession, Some("!owner:s")).unwrap();
+        assert!(store.has_all_room_collection_consent("app", cap, owner));
+        assert!(!store.has_all_room_collection_consent("app", cap, other));
+        assert!(!store.has_all_room_collection_consent("another-app", cap, owner));
+        let list = crate::capabilities::by_id("matrix.rooms.list").unwrap();
+        assert!(!store.has_all_room_collection_consent("app", list, owner));
+        store.remove_scoped_grant(id);
+        assert!(!store.has_all_room_collection_consent("app", cap, owner));
+    }
 
     fn context<'a>(origin: &'a str, target: &'a str) -> PermissionContext<'a> {
         PermissionContext { origin_room: Some(origin), target_room: Some(target) }

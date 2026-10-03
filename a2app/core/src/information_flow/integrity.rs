@@ -66,7 +66,7 @@ impl Registry {
 
     pub fn ensure_action_allowed(&self, context: &ContextId, action: &SensitiveAction) -> Result<(), String> {
         if self.action_decision(context, action)?.allowed { Ok(()) }
-        else { Err("Your approval is needed for this action. Open Mini Apps > Advanced permissions > Needs attention to review it.".into()) }
+        else { Err(ACTION_REVIEW_REQUIRED.into()) }
     }
 
     pub fn recent_action_decisions(&self) -> Result<Vec<ActionDecision>, String> {
@@ -154,13 +154,13 @@ pub(super) struct PendingAction {
 const MAX_EXACT_PAYLOAD: usize = 64 * 1024;
 const MAX_PENDING_ACTIONS: usize = 64;
 
-pub const ACTION_REVIEW_REQUIRED: &str = "Your approval is needed for this action. Open Mini Apps > Advanced permissions > Needs attention, review it and choose Allow this exact action once. Then try the same action again.";
+pub const ACTION_REVIEW_REQUIRED: &str = "Your permission is needed before this action can continue.";
 
 /// Bound allocation and nesting before sorting/serializing untrusted JSON.
 /// Object order has no meaning; arrays, numbers and strings retain their value.
 pub(super) fn canonical_payload(value: &serde_json::Value) -> Result<String, String> {
     fn measure(value: &serde_json::Value, depth: usize, remaining: &mut usize) -> Result<(), String> {
-        if depth > 32 { return Err("The action is too deeply nested to review safely.".into()); }
+        if depth > 32 { return Err("This request is too complex. Simplify it and try again.".into()); }
         let size = match value {
             serde_json::Value::String(s) => s.len().checked_add(2),
             serde_json::Value::Array(a) => {
@@ -169,15 +169,15 @@ pub(super) fn canonical_payload(value: &serde_json::Value) -> Result<String, Str
             }
             serde_json::Value::Object(o) => {
                 for (key, value) in o {
-                    *remaining = remaining.checked_sub(key.len().checked_add(2).ok_or("The action is too large to review safely.")?)
-                        .ok_or("The action is too large to review safely.")?;
+                    *remaining = remaining.checked_sub(key.len().checked_add(2).ok_or("This request is too large. Use less text and try again.")?)
+                        .ok_or("This request is too large. Use less text and try again.")?;
                     measure(value, depth + 1, remaining)?;
                 }
                 o.len().checked_mul(2).and_then(|s| s.checked_add(2))
             }
             _ => Some(32),
-        }.ok_or("The action is too large to review safely.")?;
-        *remaining = remaining.checked_sub(size).ok_or("The action is too large to review safely; reduce its contents and try again.")?;
+        }.ok_or("This request is too large. Use less text and try again.")?;
+        *remaining = remaining.checked_sub(size).ok_or("This request is too large. Use less text and try again.")?;
         Ok(())
     }
     fn sorted(value: &serde_json::Value) -> serde_json::Value {
@@ -204,7 +204,7 @@ pub(super) fn canonical_payload(value: &serde_json::Value) -> Result<String, Str
         fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
     }
     let mut output = Bounded(Vec::new());
-    serde_json::to_writer(&mut output, &sorted(value)).map_err(|_| "The action is too large to review safely; reduce its contents and try again.")?;
+    serde_json::to_writer(&mut output, &sorted(value)).map_err(|_| "This request is too large. Use less text and try again.")?;
     String::from_utf8(output.0).map_err(|_| "The action cannot be reviewed safely.".into())
 }
 
@@ -243,7 +243,7 @@ impl Registry {
                 // Keep an operation-only denial so the UI can still offer an
                 // explicitly broader session choice. It cannot approve once.
                 self.action_decision(context, action)?;
-                return Err(format!("{error} No one-time permission was created. Reduce the contents, or explicitly allow this operation and target for a session in Mini Apps > Advanced permissions and action review."));
+                return Err(error);
             }
         };
         let existing = self.pending_actions.iter().find(|pending| {

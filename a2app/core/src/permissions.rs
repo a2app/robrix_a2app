@@ -973,6 +973,16 @@ impl PermissionStore {
         self.request_once.clear();
     }
 
+    /// Restore every permission answer and room protection setting to its
+    /// first-run default. Keep audit history, host-owned space membership,
+    /// grant identity counters, and separate bridge-abuse restrictions.
+    pub fn reset_to_defaults(&mut self) {
+        self.reset_all();
+        self.strict = false;
+        self.matrix_write = false;
+        self.room_policies = None;
+    }
+
     /// Bars an app from running after it abused the host bridge. This is the
     /// end of the escalation ladder, not a permission decision: no capability
     /// is involved, the app simply does not get to run until the user says so.
@@ -1768,6 +1778,110 @@ mod tests {
         store.reset_all();
         assert!(store.is_restricted("t"), "a stop is not a grant");
         assert_eq!(store.state("t", Permission::Location), GrantState::Ask);
+    }
+
+    #[test]
+    fn reset_to_defaults_forgets_app_and_agent_answers_but_keeps_restrictions_and_audit() {
+        let mut store = PermissionStore::default();
+        store.migrate();
+        let agent = agent_subject("!agent:example.org");
+        let context = PermissionContext { origin_room: Some("!room:example.org"), target_room: Some("!room:example.org") };
+        for subject in ["t", agent.as_str()] {
+            store.set(subject, Permission::Network, GrantState::Granted);
+            store.set(subject, Permission::Location, GrantState::Denied);
+            store.set_capability(subject, "device.url.open", GrantState::Denied);
+            store.grant_until(subject, Permission::MatrixRoomRead, 10_000);
+            store.grant_once(subject, Permission::ClipboardRead);
+            store.allow_room_send(subject, "!room:example.org");
+            store.allow_room_read(subject, "!room:example.org");
+            store.allow_host(subject, "example.org");
+            store.allow_host_once(subject, "once.example.org");
+            store.allow_tool(subject, "app.durable", "hash");
+            store.allow_tool_once(subject, "app.once", "hash");
+            store.deny_tool(subject, "app.denied");
+            store.grant_scoped(subject, Permission::MatrixRoomRead, None, RoomScope::AllRooms, GrantDuration::Always, None).unwrap();
+            store.grant_scoped(subject, Permission::OpenUrl, Some("device.url.open"), RoomScope::room("!room:example.org"), GrantDuration::Always, None).unwrap();
+            let once = store.grant_scoped(subject, Permission::MatrixRoomSend, Some("matrix.room.message.send"),
+                RoomScope::room("!room:example.org"), GrantDuration::RoomSession, context.origin_room).unwrap();
+            store.mark_request_once(once);
+            store.allow_network(subject, NetworkScope::Origin("https://example.org".into()), RoomScope::AllRooms, GrantDuration::Always, None).unwrap();
+            let once = store.allow_network(subject, NetworkScope::ExactUrl("https://once.example.org/path".into()),
+                RoomScope::AllRooms, GrantDuration::RobrixSession, None).unwrap();
+            store.mark_network_request_once(once);
+            store.record_access(subject, Permission::Network, 100);
+            assert!(store.has_request_once(subject, "matrix.room.message.send", context));
+            assert!(store.has_network_request_once(subject, "https://once.example.org/path", context));
+        }
+        store.restrict("blocked-app", "bridge abuse", 200, 42);
+        let blocked_agent = agent_subject("!blocked:example.org");
+        store.restrict(&blocked_agent, "bridge abuse", 201, 43);
+        let serial = store.grant_serial;
+
+        store.reset_to_defaults();
+        assert_eq!(store.grant_serial, serial, "new approvals must not reuse old worker receipt identities");
+        assert!(store.request_once.is_empty());
+        let reloaded: PermissionStore = serde_json::from_str(&serde_json::to_string(&store).unwrap()).unwrap();
+        for store in [&store, &reloaded] {
+            for subject in ["t", agent.as_str()] {
+                for permission in [Permission::Network, Permission::Location, Permission::MatrixRoomRead] {
+                    assert_eq!(store.state(subject, permission), GrantState::Ask);
+                }
+                assert_eq!(store.capability_state(subject, "device.url.open"), GrantState::Ask);
+                assert_eq!(store.effective_capability_for_in_context(subject, |_| true, |_| true,
+                    crate::capabilities::by_id("device.url.open").unwrap(), context), Effective::Granted,
+                    "a removed scoped answer must also restore the normal first-run default");
+                assert!(store.timed_until(subject, Permission::MatrixRoomRead, 100).is_none());
+                assert!(!store.has_session_answers(subject));
+                assert!(store.room_send_grants(subject).is_empty()); assert!(store.room_read_grants(subject).is_empty());
+                assert!(!store.is_host_allowed(subject, "example.org")); assert!(!store.is_host_allowed(subject, "once.example.org"));
+                assert!(store.tool_grants(subject).is_empty()); assert!(!store.is_tool_denied(subject, "app.denied"));
+                assert!(store.scoped_grants(subject).is_empty()); assert!(store.network_grants(subject).is_empty());
+                assert!(!store.has_request_once(subject, "matrix.room.message.send", context));
+                assert!(!store.has_network_request_once(subject, "https://once.example.org/path", context));
+                assert_eq!(store.use_count(subject, Permission::Network), 1);
+                assert_eq!(store.last_access(subject, Permission::Network), Some(100));
+            }
+            assert_eq!(store.restriction("blocked-app").unwrap().refusals, 42);
+            assert_eq!(store.restriction(&blocked_agent).unwrap().refusals, 43);
+            assert_eq!(store.effective(&manifest(&["network"]), Permission::Network), Effective::NeedsPrompt);
+        }
+    }
+
+    #[test]
+    fn reset_to_defaults_restores_room_and_space_defaults_without_old_write_allowances() {
+        let mut store = PermissionStore::default();
+        store.migrate();
+        store.set_strict(true);
+        store.set_global_policy(RoomAccess::Read, PolicyDecision::Allow);
+        store.set_global_policy(RoomAccess::Write, PolicyDecision::Allow);
+        store.set_policy_mode(RoomAccess::Read, RoomPolicyMode::WhitelistOnly);
+        store.set_policy_mode(RoomAccess::Write, RoomPolicyMode::WhitelistOnly);
+        store.set_room_policy("!room:example.org", RoomAccess::Read, PolicyDecision::Deny);
+        store.set_room_policy("!room:example.org", RoomAccess::Write, PolicyDecision::Allow);
+        store.set_space_policy("!space:example.org", RoomAccess::Read, PolicyDecision::Allow);
+        store.set_space_policy("!space:example.org", RoomAccess::Write, PolicyDecision::Deny);
+        store.set_room_spaces("!room:example.org", vec!["!space:example.org".into()]);
+        store.set_matrix_write(false);
+
+        store.reset_to_defaults();
+        assert!(!store.strict()); assert!(!store.matrix_write());
+        assert_eq!(store.global_policy(RoomAccess::Read), PolicyDecision::Ask);
+        assert_eq!(store.global_policy(RoomAccess::Write), PolicyDecision::Deny);
+        assert!(store.room_rules().is_empty()); assert!(store.space_rules().is_empty());
+        assert!(store.room_space_memberships()["!room:example.org"].contains("!space:example.org"));
+        let mut reloaded: PermissionStore = serde_json::from_str(&serde_json::to_string(&store).unwrap()).unwrap();
+        reloaded.migrate();
+        for store in [&mut store, &mut reloaded] {
+            for access in [RoomAccess::Read, RoomAccess::Write] {
+                assert_eq!(store.policy_mode(access), RoomPolicyMode::Standard);
+                assert_eq!(store.room_policy(Some("!room:example.org"), access),
+                    if access == RoomAccess::Read { PolicyDecision::Ask } else { PolicyDecision::Deny });
+            }
+            assert_eq!(store.write_policy_when_enabled(), PolicyDecision::Ask);
+            store.set_matrix_write(true);
+            assert_eq!(store.global_policy(RoomAccess::Write), PolicyDecision::Ask);
+            assert!(store.room_rules().is_empty()); assert!(store.space_rules().is_empty());
+        }
     }
 
     /// The write switch sits above every grant: off means Denied even for

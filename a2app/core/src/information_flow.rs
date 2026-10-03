@@ -30,7 +30,7 @@ mod storage;
 mod effects;
 pub use sharing::{ReaderScope, SharingDuration, SharingGrant, FlowDecision};
 pub use integrity::{Influence, Influences, SensitiveAction, AuthoritySession, ActionAuthority, ActionDecision, ActionRequest, ACTION_REVIEW_REQUIRED};
-pub use effects::{EffectReview, EFFECT_REVIEW_REQUIRED};
+pub use effects::{EffectAuthority, EffectReview, EffectRoomScopeMatcher, EFFECT_REVIEW_REQUIRED};
 use storage::{Metadata, StoredContext, StoredProvenance};
 
 /// A private source identified by the host, never by an app-supplied argument.
@@ -134,6 +134,8 @@ pub struct Registry {
     contexts: BTreeSet<ContextId>,
     context_epochs: BTreeMap<ContextId, u64>,
     session_grants: Vec<SharingGrant>,
+    session_effect_authorities: Vec<EffectAuthority>,
+    effect_room_scope_matcher: Option<EffectRoomScopeMatcher>,
     authorities: Vec<ActionAuthority>,
     pending_actions: VecDeque<integrity::PendingAction>,
     pending_effects: VecDeque<effects::PendingEffect>,
@@ -153,7 +155,7 @@ impl Registry {
         };
         storage::validate_metadata(&metadata)?;
         Ok(Self {
-            root, metadata, contexts: BTreeSet::new(), context_epochs: BTreeMap::new(), session_grants: Vec::new(), authorities: Vec::new(), pending_actions: VecDeque::new(), pending_effects: VecDeque::new(),
+            root, metadata, contexts: BTreeSet::new(), context_epochs: BTreeMap::new(), session_grants: Vec::new(), session_effect_authorities: Vec::new(), effect_room_scope_matcher: None, authorities: Vec::new(), pending_actions: VecDeque::new(), pending_effects: VecDeque::new(),
             next_ephemeral_id: 1 << 63, decisions: RefCell::new(VecDeque::new()),
             action_decisions: RefCell::new(VecDeque::new()), persistence_error: None,
         })
@@ -468,6 +470,8 @@ impl Registry {
         self.pending_effects.retain(|pending| pending.review.context.account() != account || pending.review.context.room() != Some(room));
         self.session_grants.retain(|grant| !matches!(&grant.duration,
             SharingDuration::RoomSession { account: a, room: r } if a == account && r == room));
+        self.session_effect_authorities.retain(|grant| !matches!(&grant.duration,
+            SharingDuration::RoomSession { account: a, room: r } if a == account && r == room));
         self.authorities.retain(|grant| !matches!(&grant.session,
             AuthoritySession::RoomSession { account: a, room: r } if a == account && r == room));
         Ok(())
@@ -476,12 +480,26 @@ impl Registry {
     pub fn end_session(&mut self) -> Result<(), String> {
         self.check_healthy()?;
         self.session_grants.clear();
+        self.session_effect_authorities.clear();
         self.authorities.clear();
         self.pending_actions.clear();
         self.pending_effects.clear();
         self.action_decisions.borrow_mut().clear();
         self.contexts.clear();
         self.context_epochs.clear();
+        Ok(())
+    }
+
+    /// Revoke all durable and session approvals without erasing the sources
+    /// or influences protecting retained app data, code, and agent history.
+    /// Retire activations too, so an already queued worker cannot reuse consent.
+    pub fn reset_permissions(&mut self) -> Result<(), String> {
+        self.check_healthy()?;
+        let mut next = self.metadata.clone();
+        next.grants.clear();
+        next.effect_authorities.clear();
+        self.end_session()?;
+        if next != self.metadata { self.persist(next)?; }
         Ok(())
     }
 
@@ -690,6 +708,26 @@ pub fn approve_effect_session(review: &EffectReview, duration: SharingDuration) 
     with_registry(|registry| registry.approve_effect_session(review, duration))
 }
 
+pub fn approve_effect_always(review: &EffectReview) -> Result<(), String> {
+    with_registry(|registry| registry.approve_effect_always(review))
+}
+
+pub fn set_effect_room_scope_matcher(matcher: EffectRoomScopeMatcher) -> Result<(), String> {
+    with_registry(|registry| registry.set_effect_room_scope_matcher(matcher))
+}
+
+pub fn approve_effect_scoped(review: &EffectReview, scope: crate::permissions::RoomScope, duration: SharingDuration) -> Result<(), String> {
+    with_registry(|registry| registry.approve_effect_scoped(review, scope, duration))
+}
+
+pub fn effect_authorities() -> Result<Vec<EffectAuthority>, String> {
+    with_registry(|registry| registry.effect_authorities())
+}
+
+pub fn revoke_effect_authority(id: u64) -> Result<bool, String> {
+    with_registry(|registry| registry.revoke_effect_authority(id))
+}
+
 pub fn commit_effect_for_activation(context: &ContextId, epoch: u64, recipient: Option<&Recipient>, action: Option<&SensitiveAction>, payload: &serde_json::Value) -> Result<(), String> {
     with_registry(|registry| registry.commit_effect_for_activation(context, epoch, recipient, action, payload))
 }
@@ -792,6 +830,10 @@ pub fn close_room_session(account: &str, room: &str) -> Result<(), String> {
 
 pub fn end_session() -> Result<(), String> {
     with_registry(Registry::end_session)
+}
+
+pub fn reset_permissions() -> Result<(), String> {
+    with_registry(Registry::reset_permissions)
 }
 
 pub fn decision(context: &ContextId, recipient: &Recipient) -> Result<FlowDecision, String> {
