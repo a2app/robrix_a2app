@@ -2,7 +2,7 @@
 // icon: 📌
 // tint: #C0533E
 // description: The messages pinned in this room.
-// permissions: matrix-room-read, robrix-navigation, matrix-room-info
+// permissions: matrix-room-read, robrix-navigation, matrix-room-info, matrix.room.pins.read, host.nav.event, on_room_pins_changed
 // why-matrix-room-read: Shows this room's pinned messages.
 // why-robrix-navigation: Jumps to a pinned message you tap.
 // why-matrix-room-info: Refreshes when the pins change.
@@ -13,6 +13,7 @@ let watch_ready = false
 let pins_loading = false
 let pins_loaded = false
 let live_refresh_pending = false
+let setup_pending = false
 
 let items = []
 let status = "Loading…"
@@ -47,9 +48,10 @@ fn on_room_pins_changed(json){
 }
 
 fn schedule_live_refresh(){
-    if live_refresh_pending { return nil }
+    if live_refresh_pending || !host.has("matrix.room.pins.read") { return nil }
     live_refresh_pending = start_timeout(1.0, || {
         live_refresh_pending = false
+        if !host.has("matrix.room.pins.read") { return nil }
         if pins_loading { schedule_live_refresh() } else { load() }
     }) != nil
 }
@@ -66,7 +68,9 @@ fn watch(){
 }
 
 fn on_permissions_changed(caps){
-    if !pins_loaded { load() }
+    if setup_pending { return nil }
+    if !host.has("matrix.room.pins.read") { pins_loaded = false }
+    elif !pins_loaded { load() }
     if host.has("on_room_pins_changed") { watch() } else { watch_ready = false }
 }
 
@@ -77,10 +81,25 @@ fn jump_to_pin(i){
     })
 }
 
-let _boot = start_timeout(0.05, || {
-    load()
-    watch()
-})
+fn setup(retry){
+    if setup_pending { return nil }
+    setup_pending = true
+    host.request("permissions.request", {perms: ["matrix-room-read", "matrix-room-info"], retry: retry}, fn(r){
+        setup_pending = false
+        if !r.is_ok { status = r.error empty_msg = r.error show_header() ui.item_list.render() return nil }
+        if r.data.permissions["matrix-room-read"] == true && host.has("matrix.room.pins.read") { load() }
+        else {
+            items = []
+            status = "Permission denied. Click Refresh to ask again."
+            empty_msg = status
+            show_header()
+            ui.item_list.render()
+        }
+        if r.data.permissions["matrix-room-info"] == true && host.has("on_room_pins_changed") { watch() }
+    })
+}
+
+let _boot = start_timeout(0.05, || setup(false))
 
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
@@ -124,7 +143,7 @@ View{
         View{
             width: Fill height: Fit flow: Right align: Align{x: 0.5}
             Button{
-                text: "Refresh" on_click: || { status = "Loading…" show_header() load() }
+                text: "Refresh" on_click: || setup(true)
                 draw_text +: { color: #x1C274C }
             }
         }

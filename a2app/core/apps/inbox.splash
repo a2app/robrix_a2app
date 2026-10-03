@@ -2,7 +2,7 @@
 // icon: 📥
 // tint: #E0862B
 // description: Your invites and the rooms with unread messages, live.
-// permissions: matrix-rooms-list, robrix-navigation, matrix-membership
+// permissions: matrix-rooms-list, robrix-navigation, matrix-membership, matrix.rooms.invites.list, matrix.rooms.list, on_invite_received, on_rooms_changed, on_unread_totals_changed, host.nav.room, matrix.invites.respond
 // why-matrix-rooms-list: Lists your invites and the rooms with unread messages.
 // why-robrix-navigation: Opens a room you tap.
 // why-matrix-membership: Accepts or declines an invite when you tap a button.
@@ -166,8 +166,8 @@ fn open_room(i){
     })
 }
 
-fn on_invite_received(json){ load_invites() }
-fn on_rooms_changed(json){ load_unread() }
+fn on_invite_received(json){ if host.has("matrix.rooms.invites.list") { load_invites() } }
+fn on_rooms_changed(json){ if host.has("matrix.rooms.list") { load_unread() } }
 fn on_unread_totals_changed(json){
     let t = json.parse_json()
     ui.totals.set_text(totals_text(t.unread, t.mentions))
@@ -199,8 +199,10 @@ fn watch(){
 }
 
 fn on_permissions_changed(caps){
-    if !invites_loaded && host.has("matrix.rooms.invites.list") { load_invites() }
-    if !unread_loaded && host.has("matrix.rooms.list") { load_unread() }
+    if !host.has("matrix.rooms.invites.list") { invites_loaded = false }
+    elif !invites_loaded { load_invites() }
+    if !host.has("matrix.rooms.list") { unread_loaded = false }
+    elif !unread_loaded { load_unread() }
     watch_granted()
 }
 
@@ -216,7 +218,7 @@ View{
         View{
             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
             totals := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
-            Button{ text: "Refresh" on_click: || load_all() draw_text +: { color: #x1C274C } }
+            Button{ text: "Refresh" on_click: || { load_all() watch() } draw_text +: { color: #x1C274C } }
         }
         status := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
         invite_head := Label{ text: "INVITES" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }

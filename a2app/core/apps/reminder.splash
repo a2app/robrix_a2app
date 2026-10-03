@@ -3,7 +3,7 @@
 // tint: #8A5FB0
 // description: A recurring reminder or one-time alarm, attached to an account, room or space.
 // background: true
-// permissions: notifications
+// permissions: notifications, notifications.post
 // why-notifications: Shows the reminder text you save when your task is due.
 
 let message = "Time for a break."

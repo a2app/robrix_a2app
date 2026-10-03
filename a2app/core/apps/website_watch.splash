@@ -3,7 +3,7 @@
 // tint: #2A7F92
 // description: Check a website for a keyword on a saved schedule, then notify you or post to this room.
 // background: true
-// permissions: network, notifications, matrix-room-send
+// permissions: network, notifications, matrix-room-send, network.http, notifications.post, matrix.room.message.send
 // why-network: Fetches the URL you save when your background task runs.
 // why-notifications: Shows a popup when the keyword first appears.
 // why-matrix-room-send: Optionally reports a match to this task's attached room.

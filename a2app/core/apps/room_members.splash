@@ -2,7 +2,7 @@
 // icon: 👥
 // tint: #6C8E3A
 // description: Who is in this room, with their power levels.
-// permissions: matrix-room-read, robrix-navigation, matrix-room-watch
+// permissions: matrix-room-read, robrix-navigation, matrix-room-watch, matrix.room.members.read, host.nav.user, on_room_members_changed
 // why-matrix-room-read: Lists who is in this room.
 // why-robrix-navigation: Opens the profile of a member you tap.
 // why-matrix-room-watch: Refreshes the list as people join or leave.
@@ -13,6 +13,7 @@ let watch_ready = false
 let members_loading = false
 let members_loaded = false
 let live_refresh_pending = false
+let setup_pending = false
 
 let items = []
 let status = "Loading…"
@@ -49,9 +50,10 @@ fn on_room_members_changed(json){
 }
 
 fn schedule_live_refresh(){
-    if live_refresh_pending { return nil }
+    if live_refresh_pending || !host.has("matrix.room.members.read") { return nil }
     live_refresh_pending = start_timeout(1.0, || {
         live_refresh_pending = false
+        if !host.has("matrix.room.members.read") { return nil }
         if members_loading { schedule_live_refresh() } else { load() }
     }) != nil
 }
@@ -68,7 +70,9 @@ fn watch(){
 }
 
 fn on_permissions_changed(caps){
-    if !members_loaded { load() }
+    if setup_pending { return nil }
+    if !host.has("matrix.room.members.read") { members_loaded = false }
+    elif !members_loaded { load() }
     if host.has("on_room_members_changed") { watch() } else { watch_ready = false }
 }
 
@@ -85,10 +89,25 @@ fn member_line(m){
     return line
 }
 
-let _boot = start_timeout(0.05, || {
-    load()
-    watch()
-})
+fn setup(retry){
+    if setup_pending { return nil }
+    setup_pending = true
+    host.request("permissions.request", {perms: ["matrix-room-read", "matrix-room-watch"], retry: retry}, fn(r){
+        setup_pending = false
+        if !r.is_ok { status = r.error empty_msg = r.error show_header() ui.item_list.render() return nil }
+        if r.data.permissions["matrix-room-read"] == true && host.has("matrix.room.members.read") { load() }
+        else {
+            items = []
+            status = "Permission denied. Click Refresh to ask again."
+            empty_msg = status
+            show_header()
+            ui.item_list.render()
+        }
+        if r.data.permissions["matrix-room-watch"] == true && host.has("on_room_members_changed") { watch() }
+    })
+}
+
+let _boot = start_timeout(0.05, || setup(false))
 
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
@@ -132,7 +151,7 @@ View{
         View{
             width: Fill height: Fit flow: Right align: Align{x: 0.5}
             Button{
-                text: "Refresh" on_click: || { status = "Loading…" show_header() load() }
+                text: "Refresh" on_click: || setup(true)
                 draw_text +: { color: #x1C274C }
             }
         }

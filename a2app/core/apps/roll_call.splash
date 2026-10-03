@@ -2,7 +2,7 @@
 // icon: 🎲
 // tint: #7C6CF0
 // description: Rolls dice and can post the result to the room.
-// permissions: matrix-room-send
+// permissions: matrix-room-send, matrix.room.message.send
 // why-matrix-room-send: Posts your roll into this room.
 
 let die_a = 1

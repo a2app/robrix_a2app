@@ -257,7 +257,8 @@ macro_rules! app_source {
 }
 
 fn app(id: &str, name: &str, icon: &str, tint: u32, source: String) -> MiniAppManifest {
-    let description = crate::header::parse_app_header(&source).description.unwrap_or_default();
+    let header = crate::header::parse_app_header(&source);
+    let description = header.description.unwrap_or_default();
     let mut manifest = MiniAppManifest {
         id: id.to_string(),
         name: name.to_string(),
@@ -268,7 +269,7 @@ fn app(id: &str, name: &str, icon: &str, tint: u32, source: String) -> MiniAppMa
         allow_net: false,
         permissions: permissions_for(id),
         permission_reasons: reasons_for(id),
-        capabilities: Vec::new(),
+        capabilities: header.capabilities,
         builtin: true,
         widget: None,
         shortcuts: Vec::new(),
@@ -524,6 +525,32 @@ mod tests {
     }
 
     #[test]
+    fn untouched_older_defaults_adopt_narrowed_declarations_that_limit_existing_group_grants() {
+        let mut initial = release_app("release-narrow-capabilities");
+        initial.capabilities.clear();
+        let seeded = reconcile_builtin(&initial, &initial, None, None, UPDATE_TIME, 0).unwrap();
+        let mut newer = initial.clone();
+        newer.source = "// permissions: matrix-room-info, matrix.room.info.read\nView{ original_default }".into();
+        newer.capabilities = vec!["matrix.room.info.read".into()];
+        let updated = reconcile_builtin(&seeded.manifest, &newer, Some(&seeded.baseline), None, UPDATE_TIME + 1, 0).unwrap();
+        assert!(updated.adopted_default);
+        assert!(updated.available_update.is_none());
+        assert_eq!(updated.manifest.source, newer.source);
+        assert_eq!(updated.manifest.capabilities, newer.capabilities);
+        let details = crate::capabilities::by_id("matrix.room.info.read").unwrap();
+        let other = crate::capabilities::by_id("matrix.room.power_levels.read").unwrap();
+        assert!(updated.manifest.declares_capability(details));
+        assert!(!updated.manifest.declares_capability(other));
+        // A saved group grant remains subject to the current declarations.
+        let mut permissions = crate::permissions::PermissionStore::default();
+        permissions.set(&initial.id, crate::permissions::Permission::MatrixRoomInfo, crate::permissions::GrantState::Granted);
+        assert_eq!(permissions.effective_capability(&updated.manifest, other), crate::permissions::Effective::Undeclared);
+        let archived = crate::persistence::load_version(&initial.id, &updated.baseline.stamp).unwrap().0;
+        assert_eq!(archived.capabilities, newer.capabilities);
+        crate::persistence::remove_user_app(&initial.id);
+    }
+
+    #[test]
     fn customized_apps_keep_their_branch_and_offer_each_latest_default() {
         let initial = release_app("release-customized");
         let seeded = reconcile_builtin(&initial, &initial, None, None, UPDATE_TIME, 0).unwrap();
@@ -685,6 +712,14 @@ mod tests {
             assert!(!m.description.is_empty(), "{} has no description", m.id);
             assert_eq!(h.permissions, m.permissions, "{}", m.id);
             assert_eq!(h.permission_reasons, m.permission_reasons, "{}", m.id);
+            assert_eq!(h.capabilities, m.capabilities, "{}", m.id);
+            assert!(!m.capabilities.is_empty(), "{} must narrow its groups to the abilities it uses", m.id);
+            for permission in &m.permissions {
+                let permission = crate::permissions::Permission::from_str(permission).unwrap();
+                assert!(m.capabilities.iter().any(|id|
+                    crate::capabilities::by_id(id).unwrap().group == Some(permission)),
+                    "{} leaves {permission:?} unrestricted", m.id);
+            }
         }
     }
 

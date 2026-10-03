@@ -2,7 +2,7 @@
 // icon: 🔍
 // tint: #0F88FE
 // description: Finds messages in this room or across all of them.
-// permissions: matrix-room-read, matrix-rooms-list, matrix-rooms-read, robrix-navigation
+// permissions: matrix-room-read, matrix-rooms-list, matrix-rooms-read, robrix-navigation, matrix.room.messages.search, matrix.rooms.list, matrix.rooms.messages.search, host.nav.event
 // why-matrix-room-read: Searches the messages in this room.
 // why-matrix-rooms-list: Lists your rooms so you can pick which to search.
 // why-matrix-rooms-read: Searches messages across the rooms you pick.
@@ -161,7 +161,8 @@ fn open_result(i){
 }
 
 fn on_permissions_changed(caps){
-    if mode == "pick" && !rooms_loaded && host.has("matrix.rooms.list") { load_rooms() }
+    if !host.has("matrix.rooms.list") { rooms_loaded = false }
+    elif mode == "pick" && !rooms_loaded { load_rooms() }
 }
 
 let _boot = start_timeout(0.05, || {

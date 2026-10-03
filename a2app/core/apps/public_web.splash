@@ -2,7 +2,7 @@
 // icon: 🌐
 // tint: #2A7F92
 // description: Fetch a fixed public example page without reading room or account data.
-// permissions: network
+// permissions: network, network.http
 // why-network: Fetches https://example.com/ when you press the button.
 
 let busy = false

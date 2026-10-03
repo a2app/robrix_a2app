@@ -3,7 +3,7 @@
 // tint: #D9822B
 // description: Notify when a new room message contains a saved keyword, including while its pane is closed.
 // background: true
-// permissions: matrix-room-watch, notifications
+// permissions: matrix-room-watch, notifications, on_room_message, notifications.post
 // why-matrix-room-watch: Tests new messages in this task's attached room for your keyword.
 // why-notifications: Shows one popup for each matching batch of messages.
 
@@ -56,18 +56,27 @@ fn on_background(json){
     })
 }
 
+fn show_test(test_keyword){
+    host.request("notify.post", {title: "Keyword Alert", body: "Test alert for '" + test_keyword + "'."}, fn(out){
+        test_pending = false
+        if out.is_ok { show_status("Test alert shown for '" + test_keyword + "'.") }
+        else { show_status(out.error) }
+    })
+}
+
 fn test_alert(){
     if test_pending { return nil }
     test_pending = true
     let test_keyword = keyword
-    host.request("permissions.request", {perm: "matrix-room-watch"}, fn(r){
+    if host.has("on_room_message") { show_test(test_keyword) return nil }
+    host.request("permissions.request", {perms: ["matrix-room-watch"], retry: true}, fn(r){
         if !r.is_ok { test_pending = false show_status(r.error) return nil }
-        if !r.data.granted { test_pending = false show_status("Room watching was not allowed. Test again when you want to allow alerts.") return nil }
-        host.request("notify.post", {title: "Keyword Alert", body: "Test alert for '" + test_keyword + "'."}, fn(out){
+        if r.data.permissions["matrix-room-watch"] != true || !host.has("on_room_message") {
             test_pending = false
-            if out.is_ok { show_status("Test alert shown for '" + test_keyword + "'.") }
-            else { show_status(out.error) }
-        })
+            show_status("Room message watching was not allowed. Test again when you want to enable alerts.")
+            return nil
+        }
+        show_test(test_keyword)
     })
 }
 

@@ -8,7 +8,7 @@ use a2app_core::{
     capabilities::Capability,
     information_flow::{ContextId, FlowPolicy, Influence, Recipient, Registry, Source, SharingDuration},
     manifest::{AppRegistry, instance_tag},
-    permissions::{GrantDuration, GrantState, NetworkScope, Permission, PermissionStore, RoomScope},
+    permissions::{Effective, GrantDuration, GrantState, NetworkScope, Permission, PermissionStore, RoomScope},
     services::{self, Broker, BrokerAsk, BrokerCtx, HostAction, PaneState, Reply},
 };
 use makepad_widgets::{*, splash::Splash, splash_host::SplashHostRequest, widget_async::CxSplashVmExt};
@@ -153,7 +153,132 @@ impl Harness {
     }
 
     fn process(&mut self) -> Vec<BrokerAsk> {
-        self.dispatch(None)
+        let mut pending = Vec::new();
+        for _ in 0..100 {
+            let mut answered = false;
+            for ask in self.dispatch(None) {
+                match ask {
+                    BrokerAsk::PermissionBatch { app_id, request, perms }
+                        if perms.iter().all(|permission| self.batch_status(&app_id, &request, *permission) == Effective::Granted) =>
+                    {
+                        let answers: serde_json::Map<String, serde_json::Value> = perms.into_iter()
+                            .map(|permission| (permission.as_str().into(), true.into())).collect();
+                        self.reply(Reply { heap_key: request.heap_key, req_id: request.req_id },
+                            &serde_json::json!({"granted":true,"permissions":answers}).to_string());
+                        answered = true;
+                    }
+                    other => pending.push(other),
+                }
+            }
+            if !answered { return pending; }
+        }
+        panic!("already approved stock setup did not finish");
+    }
+
+    fn batch_status(&self, app_id: &str, request: &SplashHostRequest, permission: Permission) -> Effective {
+        let args: serde_json::Value = serde_json::from_str(&request.args_json).unwrap();
+        let context = self.contexts.get(&request.heap_key).unwrap();
+        services::permission_setup_status(&self.permissions, self.apps.get(app_id).unwrap(), permission,
+            services::permission_context(&request.service, &args, context.room()))
+    }
+
+    fn take_stock_batch(&mut self, app_id: &str) -> (SplashHostRequest, Vec<Permission>) {
+        for _ in 0..20 {
+            let mut batch = None;
+            for ask in self.process() {
+                match ask {
+                    BrokerAsk::PermissionBatch { app_id: subject, request, perms } => {
+                        assert_eq!(subject, app_id);
+                        assert!(batch.replace((request, perms)).is_none(), "one setup produces one batch");
+                    }
+                    BrokerAsk::Used { .. } => {},
+                    _ => panic!("{app_id} performs no protected work before its setup answer"),
+                }
+            }
+            if let Some(batch) = batch { return batch; }
+        }
+        panic!("{app_id} did not request its startup group batch");
+    }
+
+    fn answer_stock_batch(&mut self, app: &WidgetRef, app_id: &str, request: SplashHostRequest,
+        perms: &[Permission], selected: &[Permission], audit: &mut StockAudit)
+    {
+        assert!(selected.iter().all(|permission| perms.contains(permission)), "a batch cannot grant an unrequested group");
+        let needs_prompt = perms.iter().any(|permission| self.batch_status(app_id, &request, *permission) != Effective::Granted);
+        if needs_prompt { audit.batch_prompts += 1; }
+        for permission in perms {
+            if selected.contains(permission) {
+                if self.batch_status(app_id, &request, *permission) != Effective::Granted {
+                    assert!(!audit.prompts.contains(permission), "{app_id} repeatedly prompts for {permission:?}");
+                    audit.prompts.push(*permission);
+                }
+                if services::can_enable_permission_writes(&self.permissions, self.apps.get(app_id).unwrap(), *permission,
+                    services::permission_context(&request.service, &serde_json::from_str(&request.args_json).unwrap(),
+                        self.contexts.get(&request.heap_key).unwrap().room()))
+                {
+                    audit.write_setups += 1;
+                    self.permissions.set_matrix_write(true);
+                }
+                self.permissions.set(app_id, *permission, GrantState::Granted);
+            } else {
+                self.permissions.set(app_id, *permission, GrantState::Denied);
+            }
+        }
+        self.publish_grants(app, app_id);
+        let answers: serde_json::Map<String, serde_json::Value> = perms.iter().map(|permission|
+            (permission.as_str().into(), selected.contains(permission).into())).collect();
+        // A batch resolves its setup callback once. It does not replay that
+        // request once per group or approve any future outgoing effect.
+        self.reply(Reply { heap_key: request.heap_key, req_id: request.req_id },
+            &serde_json::json!({"granted":selected.len() == perms.len(),"permissions":answers}).to_string());
+    }
+
+    fn grant_stock_request(&mut self, app_id: &str, permission: Permission, request: &SplashHostRequest) {
+        if request.service == "permissions.request" {
+            self.permissions.set(app_id, permission, GrantState::Granted);
+            return;
+        }
+        let capability = if request.service == "events.subscribe" {
+            let args: serde_json::Value = serde_json::from_str(&request.args_json).unwrap();
+            a2app_core::capabilities::for_hook(args["event"].as_str().unwrap()).unwrap()
+        } else { a2app_core::capabilities::for_service(&request.service).unwrap() };
+        assert_eq!(capability.group, Some(permission));
+        assert!(self.apps.get(app_id).unwrap().declares_capability(capability));
+        // Concrete prompts authorize the captured ability, not every other
+        // ability in its group. Spatial/lifetime enforcement has separate tests.
+        self.permissions.set_capability(app_id, capability.id, GrantState::Granted);
+    }
+
+    fn deny_stock_pending(&mut self, app: &WidgetRef, app_id: &str) -> usize {
+        let mut denied = 0;
+        let mut idle_passes = 0;
+        for _ in 0..20 {
+            let asks = self.process();
+            if asks.is_empty() {
+                idle_passes += 1;
+                if denied > 0 && idle_passes >= 2 && !self.stock_callbacks_paused() { return denied; }
+            } else { idle_passes = 0; }
+            for ask in asks {
+                match ask {
+                    BrokerAsk::PermissionBatch { app_id: subject, request, perms } => {
+                        assert_eq!(subject, app_id);
+                        self.answer_stock_batch(app, app_id, request, &perms, &[], &mut StockAudit::default());
+                        denied += 1;
+                    }
+                    BrokerAsk::Prompt { app_id: subject, request: Some(request), .. }
+                    | BrokerAsk::EnableWrites { app_id: subject, request, .. } => {
+                        assert_eq!(subject, app_id);
+                        services::respond(&mut self.cx, Reply { heap_key: request.heap_key, req_id: request.req_id }, Err("Permission denied."));
+                        self.cx.with_vm_and_async(|_| {});
+                        self.assert_callback_errors(app_id);
+                        denied += 1;
+                    }
+                    BrokerAsk::Used { .. } => {},
+                    _ => panic!("{app_id} must not perform protected work after refusing its request"),
+                }
+            }
+        }
+        panic!("{app_id} did not finish a refused request");
     }
 
     fn dispatch(&mut self, pending: Option<SplashHostRequest>) -> Vec<BrokerAsk> {
@@ -261,6 +386,14 @@ impl Harness {
         self.call(app, name, &args)
     }
 
+    fn call_object(&mut self, app: &WidgetRef, name: &str, json: &str) -> bool {
+        let source = app.borrow::<Splash>().unwrap().view.source.clone();
+        let vm_id = self.cx.script_ref_vm_id(&source).unwrap();
+        let argument = self.cx.with_script_vm_id(vm_id, |vm|
+            makepad_widgets::makepad_script::json::JsonParserThread::default().read_json(json, &mut vm.bx.heap));
+        self.call(app, name, &[argument])
+    }
+
     fn widget_click(&mut self, app: &WidgetRef, text: &str, args: &[ScriptValue]) {
         fn find(root: &WidgetRef, text: &str) -> Option<WidgetRef> {
             if root.text() == text { return Some(root.clone()); }
@@ -325,18 +458,18 @@ impl Harness {
         for _ in 0..100 {
             while let Some(ask) = pending.pop_front() {
                 match ask {
+                    BrokerAsk::PermissionBatch { app_id: subject, request, perms } => {
+                        assert_eq!(subject, app_id);
+                        self.answer_stock_batch(app, app_id, request, &perms, &perms, audit);
+                    }
                     BrokerAsk::Prompt { app_id: subject, perm, request, .. } => {
                         assert_eq!(subject, app_id);
-                        assert!(!audit.prompts.contains(&perm), "{app_id} repeatedly prompts for {perm:?}");
-                        audit.prompts.push(perm);
-                        self.permissions.set(app_id, perm, GrantState::Granted);
+                        if !audit.prompts.contains(&perm) { audit.prompts.push(perm); }
+                        audit.concrete_prompts += 1;
                         if perm == Permission::Network {
                             self.permissions.allow_network(app_id, NetworkScope::ExactUrl("https://example.com/".into()),
                                 RoomScope::AllRooms, GrantDuration::RobrixSession, None).unwrap();
                         }
-                        // Runtime publishes the new snapshot before replaying
-                        // the original call. Its guest hook must be idempotent.
-                        self.publish_grants(app, app_id);
                         let mut requests = request.into_iter().collect::<Vec<_>>();
                         let mut rest = VecDeque::new();
                         while let Some(queued) = pending.pop_front() {
@@ -347,13 +480,17 @@ impl Harness {
                             }
                         }
                         pending = rest;
+                        for request in &requests { self.grant_stock_request(app_id, perm, request); }
+                        // Publish all captured abilities before resuming any
+                        // callback, matching the host's coalesced prompt.
+                        self.publish_grants(app, app_id);
                         for request in requests { pending.extend(self.dispatch(Some(request))); }
                     }
                     BrokerAsk::EnableWrites { request, app_id: subject, perm } => {
                         assert_eq!(subject, app_id);
                         audit.write_setups += 1;
                         self.permissions.set_matrix_write(true);
-                        self.permissions.set(app_id, perm, GrantState::Granted);
+                        self.grant_stock_request(app_id, perm, &request);
                         self.publish_grants(app, app_id);
                         pending.extend(self.dispatch(Some(request)));
                     }
@@ -383,8 +520,14 @@ impl Harness {
                     }
                     BrokerAsk::HostQuery { reply, query } => {
                         let data = match query {
-                            services::HostQuery::Prefs => serde_json::json!({"view_mode":"desktop","view_mode_override":"auto","ui_zoom":1,"thumbnail_max_height":400,"send_on_enter":true,"show_read_receipts":true}),
-                            services::HostQuery::DeviceInfo => serde_json::json!({"platform":"test","os_version":"fixture","model":"Test device","locale":"en-US","time_zone":"UTC","utc_offset_minutes":0,"cpu_cores":4}),
+                            services::HostQuery::Prefs => {
+                                audit.services.push("host.prefs".into());
+                                serde_json::json!({"view_mode":"desktop","view_mode_override":"auto","ui_zoom":1,"thumbnail_max_height":400,"send_on_enter":true,"show_read_receipts":true})
+                            }
+                            services::HostQuery::DeviceInfo => {
+                                audit.services.push("device.info".into());
+                                serde_json::json!({"platform":"test","os_version":"fixture","model":"Test device","locale":"en-US","time_zone":"UTC","utc_offset_minutes":0,"cpu_cores":4})
+                            }
                         };
                         self.reply(reply, &data.to_string());
                     }
@@ -561,6 +704,8 @@ fn stock_matrix_requests(host: &mut Harness, count: usize) -> Vec<(Reply, servic
 #[derive(Default)]
 struct StockAudit {
     prompts: Vec<Permission>,
+    batch_prompts: usize,
+    concrete_prompts: usize,
     reviews: usize,
     services: Vec<String>,
     subscriptions: Vec<String>,
@@ -717,9 +862,9 @@ fn run_every_stock_app(strict: bool) {
         if !strict { assert_eq!((initial_prompts, audit.prompts.len() - initial_prompts), expected,
             "{} initial and primary-action permission groups: {:?}", manifest.id, audit.prompts);
         let expected_reviews = match manifest.id.as_str() {
-            "room-peek" | "presence" | "room-stats" => (1, 1),
+            "room-peek" | "presence" | "room-stats" | "spaces" => (1, 1),
             "room-threads" => (0, 2),
-            "room-members" | "room-pins" | "room-tools" | "spaces" | "inbox" | "account" => (0, 1),
+            "room-members" | "room-pins" | "room-tools" | "inbox" | "account" => (0, 1),
             _ => (0, 0),
         };
         assert_eq!((initial_reviews, audit.reviews - initial_reviews), expected_reviews,
@@ -756,6 +901,133 @@ fn stock_spaces_loads_attached_space_after_its_environment_callback() {
     host.settle_stock(&app, "spaces", &mut audit);
     assert_eq!(audit.services, ["matrix.space.info.read", "matrix.space.rooms.list"]);
     assert_eq!(app.widget(&host.cx, ids!(status)).text(), "1 room");
+}
+
+fn grouped_stock_startups() -> Vec<(&'static str, Vec<Permission>, Permission)> {
+    use Permission::*;
+    vec![
+        ("account", vec![MatrixProfile, MatrixAccountRead], MatrixProfile),
+        ("inspector", vec![RobrixPreferences, RobrixObserve, DeviceInfo], RobrixPreferences),
+        ("presence", vec![MatrixRoomRead, MatrixRoomWatch], MatrixRoomRead),
+        ("room-members", vec![MatrixRoomRead, MatrixRoomWatch], MatrixRoomRead),
+        ("room-pins", vec![MatrixRoomRead, MatrixRoomInfo], MatrixRoomRead),
+        ("room-threads", vec![MatrixRoomRead, MatrixRoomWatch], MatrixRoomRead),
+        ("room-peek", vec![MatrixRoomInfo, MatrixRoomRead, MatrixRoomWatch], MatrixRoomRead),
+        ("room-stats", vec![MatrixRoomRead, MatrixRoomInfo], MatrixRoomRead),
+        ("room-tools", vec![MatrixRoomRead, MatrixRoomInfo], MatrixRoomRead),
+    ]
+}
+
+#[test]
+fn grouped_stock_startups_finish_a_denial_and_refresh_after_a_new_approval() {
+    for (app_id, expected, _) in grouped_stock_startups() {
+        let mut host = Harness::new();
+        let (app, _) = host.launch_stock_permissions(app_id, false, false);
+        // Include ordinary abilities in the denied snapshot so the guest
+        // callback cannot accidentally run them after a negative batch answer.
+        for permission in &expected { host.permissions.set(app_id, *permission, GrantState::Denied); }
+        host.publish_grants(&app, app_id);
+        host.boot();
+        let (request, perms) = host.take_stock_batch(app_id);
+        assert_eq!(perms, expected, "{app_id} requests only its startup dependencies");
+        let mut audit = StockAudit::default();
+        host.answer_stock_batch(&app, app_id, request, &perms, &[], &mut audit);
+        host.settle_stock(&app, app_id, &mut audit);
+        assert!(!host.stock_callbacks_paused(), "{app_id} must finish a denied setup callback");
+        assert!(audit.services.is_empty(), "{app_id} must not read rejected data");
+        assert!(audit.subscriptions.is_empty(), "{app_id} must not subscribe to rejected hooks");
+        assert_eq!(audit.batch_prompts, 1);
+        host.publish_grants(&app, app_id);
+        host.settle_stock(&app, app_id, &mut audit);
+        assert_eq!(audit.batch_prompts, 1, "{app_id} cannot ask again from a permission-change callback");
+        assert!(audit.services.is_empty());
+        // The runtime separately tests trusted-input refusal clearing. This
+        // VM fixture restores Ask to model that explicit retry's new snapshot.
+        for permission in &perms { host.permissions.set(app_id, *permission, GrantState::Ask); }
+        host.widget_click(&app, "Refresh", &[]);
+        host.settle_stock(&app, app_id, &mut audit);
+        assert!(!audit.services.is_empty(), "{app_id} must actually load its approved data");
+        assert!(!host.stock_callbacks_paused());
+        assert!(audit.batch_prompts <= 2, "{app_id} retry is at most one additional setup popup");
+        let reads = audit.services.len();
+        let hooks = audit.subscriptions.len();
+        for permission in &perms { host.permissions.set(app_id, *permission, GrantState::Denied); }
+        host.publish_grants(&app, app_id);
+        host.settle_stock(&app, app_id, &mut audit);
+        assert_eq!(audit.services.len(), reads, "{app_id} does not reread revoked data");
+        assert_eq!(audit.subscriptions.len(), hooks, "{app_id} does not resubscribe while revoked");
+        for permission in &perms { host.permissions.set(app_id, *permission, GrantState::Granted); }
+        host.publish_grants(&app, app_id);
+        host.settle_stock(&app, app_id, &mut audit);
+        assert!(audit.services.len() > reads, "{app_id} refreshes after reapproval");
+    }
+}
+
+#[test]
+fn grouped_stock_startups_use_selected_reads_without_requesting_unselected_groups() {
+    for (app_id, expected, read) in grouped_stock_startups() {
+        let mut host = Harness::new();
+        let (app, _) = host.launch_stock_permissions(app_id, false, false);
+        for permission in &expected { host.permissions.set(app_id, *permission, GrantState::Denied); }
+        host.publish_grants(&app, app_id);
+        host.boot();
+        let (request, perms) = host.take_stock_batch(app_id);
+        assert_eq!(perms, expected);
+        let mut audit = StockAudit::default();
+        host.answer_stock_batch(&app, app_id, request, &perms, &[read], &mut audit);
+        host.settle_stock(&app, app_id, &mut audit);
+        assert_eq!(audit.batch_prompts, 1);
+        assert_eq!(audit.prompts, [read], "{app_id} cannot silently grant an unselected group");
+        assert!(!audit.services.is_empty(), "{app_id} must use its selected read");
+        assert!(audit.subscriptions.iter().all(|hook|
+            a2app_core::capabilities::for_hook(hook).unwrap().group == Some(read)),
+            "{app_id} unselected live-update groups remain off");
+        assert!(!host.stock_callbacks_paused());
+        for permission in perms.into_iter().filter(|permission| *permission != read) {
+            assert_eq!(host.permissions.state(app_id, permission), GrantState::Denied);
+        }
+        let reads = audit.services.len();
+        host.publish_grants(&app, app_id);
+        host.settle_stock(&app, app_id, &mut audit);
+        assert_eq!(audit.services.len(), reads, "{app_id} does not reload a completed partial setup");
+        assert_eq!(audit.batch_prompts, 1, "{app_id} cannot nag about unselected startup features");
+    }
+}
+
+#[test]
+fn other_stock_apps_finish_refusals_and_retry_from_visible_controls() {
+    for app_id in ["public-web", "website-watch", "reminder", "keyword-alert", "roll-call", "room-info", "search", "watcher", "spaces", "inbox"] {
+        let mut host = Harness::new();
+        host.permissions.set_strict(true);
+        let (app, _) = host.launch_stock_permissions(app_id, false, false);
+        host.call(&app, "on_app_resize", &[460_f64.into(), 700_f64.into()]);
+        host.boot();
+        let control = match app_id {
+            "public-web" => "Fetch example.com",
+            "website-watch" => "Test saved website and report",
+            "reminder" => "Test saved reminder",
+            "keyword-alert" => "Set up and test saved keyword",
+            "roll-call" => { assert!(host.call(&app, "roll", &[])); "Post to room" }
+            "search" => { app.text_input(&host.cx, ids!(q)).set_text(&mut host.cx, "release"); "Search" }
+            _ => "Refresh",
+        };
+        if !matches!(app_id, "room-info" | "watcher" | "spaces" | "inbox") { host.widget_click(&app, control, &[]); }
+        assert!(host.deny_stock_pending(&app, app_id) > 0, "{app_id} exposes its first needed permission");
+        assert!(!host.stock_callbacks_paused(), "{app_id} refusal finishes the original callback");
+        let failures = host.broker.failures();
+        assert!(failures.iter().all(|failure| failure.error == "Permission denied."),
+            "{app_id} reports only the deliberate fixture refusals");
+        host.publish_grants(&app, app_id);
+        for ask in host.process() { assert!(matches!(ask, BrokerAsk::Used { .. }), "{app_id} cannot automatically retry a denied request"); }
+        let declared = host.apps.get(app_id).unwrap().permissions.clone();
+        for permission in declared { host.permissions.set(app_id, Permission::from_str(&permission).unwrap(), GrantState::Ask); }
+        host.widget_click(&app, control, &[]);
+        let mut audit = StockAudit::default();
+        host.settle_stock(&app, app_id, &mut audit);
+        assert!(!host.stock_callbacks_paused());
+        assert!(!audit.services.is_empty() || !audit.subscriptions.is_empty() || !audit.notifications.is_empty(),
+            "{app_id} visible retry must complete real approved work");
+    }
 }
 
 #[test]
@@ -954,7 +1226,7 @@ fn stock_roll_call_first_post_finishes_after_enabling_matrix_writes() {
 }
 
 #[test]
-fn stock_watcher_requests_reply_permission_when_a_rule_is_saved_and_runs_it() {
+fn stock_watcher_saves_without_write_permission_and_tests_only_the_selected_rule_actions() {
     let mut host = Harness::new();
     let (app, context) = host.launch_stock_permissions("watcher", false, false);
     host.permissions.set_matrix_write(false);
@@ -966,18 +1238,32 @@ fn stock_watcher_requests_reply_permission_when_a_rule_is_saved_and_runs_it() {
     host.flow.borrow_mut().add_sources(&context, [Source::Account { account: ACCOUNT.into() }]).unwrap();
     assert!(host.call(&app, "add_rule", &[]));
     host.settle_stock(&app, "watcher", &mut audit);
-    assert_eq!(audit.write_setups, 1, "reply configuration explicitly enables writes and grants its declared room-send ability");
+    assert_eq!(audit.write_setups, 0, "saving a rule cannot enable Matrix writes");
+    assert!(audit.notifications.is_empty());
+    assert!(audit.services.is_empty());
+    assert!(host.call_object(&app, "test_rule", r#"{"keyword":"release","notify":true,"reply":"Thanks for the release update"}"#));
+    host.settle_stock(&app, "watcher", &mut audit);
+    assert_eq!(audit.batch_prompts, 0, "an already approved watcher needs no new blanket setup");
+    assert_eq!(audit.write_setups, 1, "testing a reply explicitly enables writes and grants its declared room-send ability");
+    assert_eq!(audit.notifications, ["Watcher test: Test alert for 'release'."]);
+    assert_eq!(audit.services, ["matrix.room.message.send"]);
     host.flow.borrow_mut().add_sources(&context, [Source::Room { account: ACCOUNT.into(), room: ROOM.into() }]).unwrap();
     host.flow.borrow_mut().add_influences(&context, [Influence::RoomContent { account: ACCOUNT.into(), room: ROOM.into() }]).unwrap();
     assert!(host.call_strings(&app, "on_room_message", &[r#"[{"event_id":"$message:test","sender_name":"Alice","body":"release today","is_own":false}]"#]));
     host.settle_stock(&app, "watcher", &mut audit);
-    assert_eq!(audit.notifications, ["Watcher: release: Alice: release today"]);
-    assert_eq!(audit.services, ["matrix.room.message.send"]);
-    assert_eq!(audit.reviews, 1, "the first influenced reply uses one combined review");
+    host.boot(); // The notification callback paces the queued reply with a timer.
+    host.settle_stock(&app, "watcher", &mut audit);
+    assert_eq!(audit.notifications, ["Watcher test: Test alert for 'release'.", "Watcher: release: Alice: release today"]);
+    assert_eq!(audit.services, ["matrix.room.message.send", "matrix.room.message.send"]);
+    let reviews = audit.reviews;
+    assert!((1..=2).contains(&reviews), "the test and first influenced reply each have at most one combined review");
+    host.boot(); // Finish the action pacing timer before delivering another batch.
     assert!(host.call_strings(&app, "on_room_message", &[r#"[{"event_id":"$message:test","sender_name":"Alice","body":"release tomorrow","is_own":false}]"#]));
     host.settle_stock(&app, "watcher", &mut audit);
-    assert_eq!(audit.reviews, 1, "session permission prevents repeated auto-reply reviews");
-    assert_eq!(audit.services.len(), 2);
+    host.boot();
+    host.settle_stock(&app, "watcher", &mut audit);
+    assert_eq!(audit.reviews, reviews, "session permission prevents repeated auto-reply reviews");
+    assert_eq!(audit.services.len(), 3);
     assert_eq!(audit.write_setups, 1, "automatic replies reuse the approved write setup");
 }
 
@@ -1037,7 +1323,7 @@ fn stock_website_room_reports_and_keyword_empty_batches_finish_without_prompt_lo
     assert_eq!(audit.services, ["network.http", "matrix.room.message.send"]);
     assert!(audit.completions.is_empty());
     assert_eq!(audit.write_setups, 1);
-    assert_eq!(app.widget(&host.cx, ids!(status)).text(), "Test report posted. This website and room are ready for scheduled checks.");
+    assert_eq!(app.widget(&host.cx, ids!(status)).text(), "Test report posted to this room.");
     let grants = (audit.prompts.len(), audit.reviews, audit.write_setups);
     app.borrow_mut::<Splash>().unwrap().set_host_prompts(&mut host.cx, false);
     // A real scheduled check occurs after the setup rate budget refills.
@@ -1407,7 +1693,7 @@ fn stock_website_test_explains_malformed_saved_urls_before_requesting_permission
         assert_eq!(audit.services, ["network.http"]);
         assert_eq!(audit.notifications.len(), 1);
         assert!(audit.completions.is_empty());
-        assert_eq!(app.widget(&host.cx, ids!(status)).text(), "Test report shown. This website is ready for scheduled checks.");
+        assert_eq!(app.widget(&host.cx, ids!(status)).text(), "Test report shown in a Robrix popup.");
     }
 }
 

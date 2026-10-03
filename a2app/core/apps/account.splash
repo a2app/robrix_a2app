@@ -2,7 +2,7 @@
 // icon: 🪪
 // tint: #386FA4
 // description: You, this device, your homeserver, and a user lookup.
-// permissions: matrix-profile, matrix-account-read, matrix-users, open-url, robrix-navigation
+// permissions: matrix-profile, matrix-account-read, matrix-users, open-url, robrix-navigation, matrix.profile.read, matrix.account.device.read, matrix.account.info.read, matrix.account.ignored.read, matrix.user.profile.read, matrix.user.dm.find, device.url.open, host.nav.room
 // why-matrix-profile: Shows your display name and user id.
 // why-matrix-account-read: Shows this device, your homeserver, and who you ignore.
 // why-matrix-users: Looks up the profile and DM of a user id you enter.
@@ -23,6 +23,7 @@ let ignored_note = "Loading…"
 let manage_url = nil
 let dm_room = nil
 let lookup_request = 0
+let setup_pending = false
 
 fn or_blank(name, fallback){
     if name == nil || name == "" { return fallback }
@@ -168,13 +169,36 @@ fn lookup_ignored(i){
 }
 
 fn on_permissions_changed(caps){
-    if !profile_loaded && host.has("matrix.profile.read") { load_profile() }
-    if !device_loaded && host.has("matrix.account.device.read") { load_device() }
-    if !account_loaded && host.has("matrix.account.info.read") { load_account() }
-    if !ignored_loaded && host.has("matrix.account.ignored.read") { load_ignored() }
+    if setup_pending { return nil }
+    if !host.has("matrix.profile.read") { profile_loaded = false }
+    elif !profile_loaded { load_profile() }
+    if !host.has("matrix.account.device.read") { device_loaded = false }
+    elif !device_loaded { load_device() }
+    if !host.has("matrix.account.info.read") { account_loaded = false }
+    elif !account_loaded { load_account() }
+    if !host.has("matrix.account.ignored.read") { ignored_loaded = false }
+    elif !ignored_loaded { load_ignored() }
 }
 
-let _boot = start_timeout(0.05, || load())
+fn setup(retry){
+    if setup_pending { return nil }
+    setup_pending = true
+    host.request("permissions.request", {perms: ["matrix-profile", "matrix-account-read"], retry: retry}, fn(r){
+        setup_pending = false
+        if !r.is_ok { ui.server_line.set_text(r.error) return nil }
+        let denied = "Permission denied. Click Refresh to ask again."
+        if r.data.permissions["matrix-profile"] == true && host.has("matrix.profile.read") { load_profile() }
+        else { ui.me_name.set_text("Signed in") ui.me_id.set_text(denied) }
+        if r.data.permissions["matrix-account-read"] == true && host.has("matrix.account.device.read") { load_device() }
+        else { ui.device_line.set_text(denied) }
+        if r.data.permissions["matrix-account-read"] == true && host.has("matrix.account.info.read") { load_account() }
+        else { manage_url = nil ui.manage_wrap.set_visible(false) ui.server_line.set_text(denied) }
+        if r.data.permissions["matrix-account-read"] == true && host.has("matrix.account.ignored.read") { load_ignored() }
+        else { ignored = [] ignored_note = denied ui.ignored_list.render() }
+    })
+}
+
+let _boot = start_timeout(0.05, || setup(false))
 
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
@@ -186,7 +210,7 @@ View{
                 text: "YOU" width: Fill padding: 0 margin: 0
                 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
             }
-            Button{ text: "Refresh" on_click: || load() draw_text +: { color: #x1C274C } }
+            Button{ text: "Refresh" on_click: || setup(true) draw_text +: { color: #x1C274C } }
         }
         RoundedView{
             width: Fill height: Fit flow: Down spacing: 4 padding: 12

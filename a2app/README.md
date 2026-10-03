@@ -107,6 +107,12 @@ saved allowances. **Add an allowance…** opens room, website and duration choic
 asks for the agent's room and then the permission to edit. Opening or cancelling
 an editor does not grant access.
 
+The regular **Permissions** panel also lists saved action and sharing approvals.
+Choose **Remove approval** to take one back, or **Ask again** to clear a group's
+saved answers and reopen the app for a new prompt. **Reset permissions…** resets
+just that app, stops its active work and pauses its background tasks. Its saved
+data stays intact, and other apps' permissions and room protection stay intact.
+
 **Reset all permissions…** in the Mini Apps screen restores default access,
 clears saved approvals and blocks, stops active apps and agents, and pauses
 background tasks. App data and provenance are retained. Apps ask again when
@@ -122,8 +128,12 @@ Spaces include their nested rooms and future membership changes. Fixed requests
 must fit the selection; room collections are filtered to it. **One time** approves
 only the captured request. Account and device tasks omit room choices.
 Robrix checks room protection internally. Ongoing subscriptions need a
-session or lasting duration. Duplicate requests share one prompt and pending
-requests continue automatically after approval. If room changes are off, the
+session or lasting duration. Related setup requests appear together, with
+**Choose permissions individually** to approve only selected features. Pending
+requests continue automatically after approval; unchecked features stay off.
+**Deny** declines this request without blocking the app forever. Try its button
+or **Refresh** again, or close and reopen the app, to ask again. Timers and
+unrelated permission changes do not repeat a dismissed request. If room changes are off, the
 popup explains that Approve also enables them, provided no other rule blocks it.
 
 **Advanced permissions** is optional management, never a required step in a
@@ -440,7 +450,8 @@ request. Until you quit Robrix and Forever approvals can also cover an older
 saved app, while its private provenance remains protected. These approvals stay
 limited to that app context, operation, recipient and reviewed inputs; they do
 not create general sharing rules for unidentified data. Saved approvals
-can be removed in Advanced permissions.
+can be removed in the app's regular Permissions panel; Advanced permissions
+remains an optional view of the underlying rules and history.
 
 The design follows the established floating-label approach described by
 [LIO's authors](https://www.scs.stanford.edu/~deian/pubs/stefan%3A2011%3Aflexible.pdf)

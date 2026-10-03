@@ -630,8 +630,15 @@ const PERMISSION_POLICY: &str = "The app is SANDBOXED. Anything beyond its own U
      denied — real fallback content, never a blank screen or a dead button — must \
      handle `r.is_ok == false` in every `host.request` callback, must re-check \
      `host.has(\"x\")` at use time rather than caching it at boot, and should define \
-     `fn on_permissions_changed(caps)` to re-sync anything gated. Ask for the least \
-     it needs. The host also limits HOW OFTEN an app may ask: requests are charged \
+     `fn on_permissions_changed(caps)` to re-sync anything gated, reloading only \
+     allowed abilities that have not already completed and never retrying a denial \
+     from that hook. For startup needing several read/watch groups, use one \
+     `permissions.request` with `{perms:[\"group\",...]}` for only those declared \
+     groups; honor partial `r.data.permissions` selections and exact `host.has` \
+     checks. Use `{retry:true}` only from a visible Refresh/Test click after denial. \
+     Single Fetch/Post/Open actions call their concrete service directly to keep \
+     one-time approval; never batch unspecified network access or unused writes. \
+     Ask for the least it needs. The host also limits HOW OFTEN an app may ask: requests are charged \
      against a per-app budget, so ask on user action or when data goes stale — never \
      poll in a loop, never request from a fast timer, never retry a failure \
      immediately. Over-budget requests come back as `r.is_ok == false` (handle them \

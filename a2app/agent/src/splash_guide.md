@@ -348,6 +348,40 @@ Ungated plumbing every app has: `host.env.read` (`"env"`),
 and the hooks `on_permissions_changed(caps)`, `on_app_resize(w, h)`,
 `on_focus_changed(json)`, `on_surface_changed(json)`; see "Your own pane".
 
+When opening a pane requires several read or live-update groups, ask for them
+together with one `permissions.request` call:
+
+```splash
+let setup_pending = false
+fn setup(retry){
+    if setup_pending { return nil }
+    setup_pending = true
+    host.request("permissions.request", {perms: ["matrix-room-read", "matrix-room-watch"], retry: retry}, fn(r){
+        setup_pending = false
+        if !r.is_ok { ui.status.set_text(r.error) return nil }
+        if r.data.permissions["matrix-room-read"] == true && host.has("matrix.room.messages.read") { load() }
+        else { ui.status.set_text("Permission denied. Click Refresh to ask again.") }
+        if r.data.permissions["matrix-room-watch"] == true && host.has("on_room_message") { watch() }
+        return nil
+    })
+}
+let _boot = start_timeout(0.05, || setup(false))
+// The Refresh button's on_click calls setup(true).
+```
+
+The answer is `{granted, permissions: {"group-name": bool, ...}}`. A partial
+approval is a successful reply with `granted: false`; continue only the selected
+parts and check each exact `host.has` ability too. Request only groups needed
+for this step, and guard duplicate setup/read/subscription requests while their
+callbacks are pending. Ongoing setup offers session or lasting approval.
+For a single Fetch, Post, Open or similar action, call its concrete service
+directly so the user can approve just that request once. Network access always
+needs a concrete URL; `network` cannot appear in a setup batch. Batches still
+leave outgoing data and action review to the host when the actual effect runs.
+`retry: true` is for an explicit user click or key activation after denial; it
+cannot make a timer or automatic callback reopen a refused prompt. A durable
+block is changed in Mini Apps settings, not overridden by an app's retry.
+
 ## Letting the AI call your app (MCP tools)
 
 An app attached to a room whose AI is on can register tools the AI calls.
@@ -408,7 +442,10 @@ fn register_tools(){
 // at startup — only after a grant changes — so the boot timeout is what
 // registers on open, and the hook re-registers after any grant/revoke.
 let _boot = start_timeout(0.05, || register_tools())
-fn on_permissions_changed(caps){ register_tools() }
+fn on_permissions_changed(caps){
+    if host.has("mcp.tools.register") { register_tools() }
+    return nil
+}
 ```
 
 Register every tool from those two places only: never from a button or a
@@ -450,7 +487,8 @@ Rules:
   `ok` is a keyword, so an unquoted `ok:` parses as an ok-test followed by a
   stray `:` and fails validation ("Expected expression … found Operator(:)").
 - Register on boot with a `start_timeout(0.05, ...)` (as above) and again
-  from `on_permissions_changed`; a refusal is `r.is_ok == false` with the
+  from `on_permissions_changed` only when `host.has("mcp.tools.register")` is
+  true, and guard registrations already completed or pending; a refusal is `r.is_ok == false` with the
   reason. If the user denies, tell them in the app and keep working — never
   assume the AI can call.
 - At most 16 tools; names may use letters, digits, `_` and `-`; descriptions
@@ -464,7 +502,10 @@ Instead of a Refresh button, subscribe once after your first load and
 define the hook as a top-level `fn`. The hook's own group is what the
 user is asked for (`matrix-room-watch` prompts on first use,
 `matrix-room-info` starts allowed), and a subscription dies with the app
-instance, so subscribe again from `on_permissions_changed`.
+instance. In `on_permissions_changed`, retain only still-allowed subscriptions
+and subscribe to each allowed hook only if it is not already pending or active.
+Never subscribe to a refused hook from that callback; use a visible Refresh or
+Test button for the user to ask again.
 
 ```splash
 fn on_room_message(json){
@@ -611,7 +652,10 @@ A grant can also be taken away WHILE the app runs. Three rules:
 - Define `fn on_permissions_changed(caps)` (top level) to re-sync anything
   that depends on a capability: `caps` is a JSON array string, so
   `caps.parse_json()` gives you the current list. Hide the affordance, or
-  show why it failed. Every host HTTP request checks current permissions.
+  show why it failed. Reload only if the exact ability is currently allowed
+  and the prior load has not completed; keep pending/completed flags so an
+  unrelated grant does not repeat reads or subscriptions. Never retry a denied
+  request from this callback. Every host HTTP request checks current permissions.
 - Never leave stale UI claiming something you can no longer do — a label
   saying "live" over data you can't refresh is worse than the fallback.
 
@@ -626,8 +670,9 @@ tight loop), and an app that keeps hammering is STOPPED by the launcher and
 shown to the user as misbehaving. Two further rules follow from this:
 - File pickers, save dialogs and `auth.check` only work while your app is on
   screen, and only one at a time.
-- One `host.request` per user action. If a retry is genuinely needed, wait
-  at least a second and give up after a couple of tries.
+- Keep requests proportional to the user's action; collect necessary startup
+  permissions in one explicit setup batch. After a refusal, stop and offer a
+  visible Retry, Refresh or Test control instead of automatically asking again.
 
 **There are also limits on how much you may USE — but only when the machine
 is busy.** Apps SHARE the processor, memory, timers and downloads: on its own

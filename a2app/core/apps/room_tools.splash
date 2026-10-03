@@ -2,7 +2,7 @@
 // icon: 🧰
 // tint: #8D6E63
 // description: Favorite, low priority, unread, pins and links for this room.
-// permissions: matrix-room-read, matrix-room-info, matrix-room-manage, clipboard-write, robrix-navigation
+// permissions: matrix-room-read, matrix-room-info, matrix-room-manage, clipboard-write, robrix-navigation, matrix.room.pins.read, matrix.room.messages.read, matrix.room.unread.read, matrix.room.link.create, matrix.room.successor.read, matrix.room.favorite.set, matrix.room.low_priority.set, matrix.room.unread.set, matrix.room.pin.set, device.clipboard.write, host.nav.room
 // why-matrix-room-read: Lists recent messages and which of them are pinned.
 // why-matrix-room-info: Reads the unread flag, room links and where an upgraded room went.
 // why-matrix-room-manage: Changes favorite, low priority, unread and pins when you tap.
@@ -30,6 +30,7 @@ let pending_pins = []
 let pins_revision = 0
 let successor = ""
 let empty_note = "Loading…"
+let setup_pending = false
 
 fn flag_text(f){
     if f.on.is_nil() { return f.off_text + "…" }
@@ -219,13 +220,34 @@ fn load_all(){
 }
 
 fn on_permissions_changed(caps){
-    if !unread_loaded && host.has("matrix.room.unread.read") { load_unread() }
-    if !pins_loaded && host.has("matrix.room.pins.read") { load_pins() }
-    if !messages_loaded && host.has("matrix.room.messages.read") { load_messages() }
-    if !successor_loaded && host.has("matrix.room.successor.read") { load_successor() }
+    if setup_pending { return nil }
+    if !host.has("matrix.room.unread.read") { unread_loaded = false }
+    elif !unread_loaded { load_unread() }
+    if !host.has("matrix.room.pins.read") { pins_loaded = false }
+    elif !pins_loaded { load_pins() }
+    if !host.has("matrix.room.messages.read") { messages_loaded = false }
+    elif !messages_loaded { load_messages() }
+    if !host.has("matrix.room.successor.read") { successor_loaded = false }
+    elif !successor_loaded { load_successor() }
 }
 
-let _boot = start_timeout(0.05, || load_all())
+fn setup(retry){
+    if setup_pending { return nil }
+    setup_pending = true
+    host.request("permissions.request", {perms: ["matrix-room-read", "matrix-room-info"], retry: retry}, fn(r){
+        setup_pending = false
+        if !r.is_ok { ui.status.set_text(r.error) return nil }
+        let denied = false
+        if r.data.permissions["matrix-room-info"] == true && host.has("matrix.room.unread.read") { load_unread() } else { denied = true }
+        if r.data.permissions["matrix-room-read"] == true && host.has("matrix.room.pins.read") { load_pins() } else { denied = true }
+        if r.data.permissions["matrix-room-read"] == true && host.has("matrix.room.messages.read") { load_messages() }
+        else { denied = true messages = [] empty_note = "Permission denied. Click Refresh to ask again." ui.msg_list.render() }
+        if r.data.permissions["matrix-room-info"] == true && host.has("matrix.room.successor.read") { load_successor() } else { denied = true }
+        if denied { ui.status.set_text("Some room details were not allowed. Click Refresh to ask again.") }
+    })
+}
+
+let _boot = start_timeout(0.05, || setup(false))
 
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
@@ -235,6 +257,7 @@ View{
             text: "Each button changes this room only when you tap it." width: Fill padding: 0 margin: 0
             draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
         }
+        Button{ text: "Refresh" on_click: || setup(true) draw_text +: { color: #x1C274C } }
         upgraded_wrap := View{
             width: Fill height: Fit flow: Down spacing: 4 visible: false
             Label{

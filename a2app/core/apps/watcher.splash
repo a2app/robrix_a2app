@@ -2,7 +2,7 @@
 // icon: 👁
 // tint: #D9822B
 // description: Keyword rules that notify you, and can auto-reply.
-// permissions: matrix-room-watch, notifications, matrix-room-send
+// permissions: matrix-room-watch, notifications, matrix-room-send, on_room_message, notifications.post, matrix.room.message.send
 // why-matrix-room-watch: Sees new messages so it can match your rules.
 // why-notifications: Tells you when a message matches a rule.
 // why-matrix-room-send: Posts your reply when a rule says to.
@@ -145,21 +145,37 @@ fn complete_test(text){
     run_next_action()
 }
 
-fn test_reply(test){
-    if test.reply == "" { complete_test("Test notification shown.") return nil }
-    host.request("matrix.send_message", {body: test.reply}, fn(r){
-        if r.is_ok { complete_test("Test reply posted to this room.") }
-        else { finish_test("Test reply failed: " + r.error) }
-    })
-}
-
 fn run_rule_test(test){
+    let remaining = 0
+    if test.notify { remaining += 1 }
+    if test.reply != "" { remaining += 1 }
+    let failure = ""
+    let done = fn(r, label){
+        if !r.is_ok && failure == "" { failure = label + " failed: " + r.error }
+        remaining -= 1
+        if remaining > 0 { return nil }
+        if failure != "" { finish_test(failure) }
+        elif test.reply != "" { complete_test("Test reply posted to this room.") }
+        else { complete_test("Test notification shown.") }
+        return nil
+    }
+    // Queue the selected concrete effects together. The host can review
+    // their contents in one prompt; neither grants an unused rule action.
     if test.notify {
         host.request("notify.post", {title: "Watcher test", body: "Test alert for '" + test.keyword + "'."}, fn(r){
-            if !r.is_ok { finish_test("Test notification failed: " + r.error) return nil }
-            test_reply(test)
+            done(r, "Test notification")
         })
-    } else { test_reply(test) }
+    }
+    if test.reply != "" {
+        host.request("matrix.send_message", {body: test.reply}, fn(r){ done(r, "Test reply") })
+    }
+}
+
+fn start_rule_test(test){
+    if !watch_ready {
+        pending_test = test
+        subscribe()
+    } else { run_rule_test(test) }
 }
 
 fn test_rule(rule){
@@ -171,10 +187,15 @@ fn test_rule(rule){
     let test = {keyword: rule.keyword, notify: rule.notify, reply: rule.reply}
     test_pending = true
     ui.status.set_text("Testing '" + test.keyword + "'…")
-    if !watch_ready {
-        pending_test = test
-        subscribe()
-    } else { run_rule_test(test) }
+    if host.has("on_room_message") { start_rule_test(test) return nil }
+    host.request("permissions.request", {perms: ["matrix-room-watch"], retry: true}, fn(r){
+        if !r.is_ok { finish_test("Test stopped: " + r.error) return nil }
+        if r.data.permissions["matrix-room-watch"] != true || !host.has("on_room_message") {
+            finish_test("Room watching was not allowed. Test again when you want to enable the rule.")
+            return nil
+        }
+        start_rule_test(test)
+    })
 }
 
 fn remove_rule(i){
@@ -261,6 +282,7 @@ View{
             text: "Starting…" width: Fill padding: 0 margin: 0
             draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
         }
+        Button{ text: "Refresh" on_click: || subscribe() draw_text +: { color: #x1C274C } }
         RoundedView{
             width: Fill height: Fit flow: Down spacing: 8 padding: 10
             show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }

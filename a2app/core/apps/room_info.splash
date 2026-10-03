@@ -2,7 +2,7 @@
 // icon: 🏷
 // tint: #2E86AB
 // description: Name, topic, member count and settings of this room.
-// permissions: matrix-room-info
+// permissions: matrix-room-info, matrix.room.info.read
 // why-matrix-room-info: Shows this room's name, topic, and settings.
 
 let info_loading = false
@@ -40,7 +40,8 @@ fn load(){
 }
 
 fn on_permissions_changed(caps){
-    if !info_loaded { load() }
+    if !host.has("matrix.room.info.read") { info_loaded = false }
+    elif !info_loaded { load() }
 }
 
 let _boot = start_timeout(0.05, || load())

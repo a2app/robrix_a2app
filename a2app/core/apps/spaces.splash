@@ -2,7 +2,7 @@
 // icon: 🪐
 // tint: #5B3FD9
 // description: Explore your spaces and join the rooms inside them.
-// permissions: matrix-spaces, matrix-rooms-list, robrix-navigation, matrix-membership
+// permissions: matrix-spaces, matrix-rooms-list, robrix-navigation, matrix-membership, matrix.spaces.list, matrix.space.info.read, matrix.space.rooms.list, matrix.rooms.preview.read, host.nav.room, matrix.rooms.join
 // why-matrix-spaces: Lists your spaces and the rooms inside them.
 // why-matrix-rooms-list: Previews a room you have not joined yet.
 // why-robrix-navigation: Opens a room you tap.
@@ -96,7 +96,7 @@ fn load_spaces(){
             empty_note = "You haven't joined any spaces yet."
             ui.status.set_text("" + items.len() + " " + plural(items.len(), "space") + " · tap one to explore it")
         } else {
-            empty_note = "Nothing to show."
+            empty_note = r.error
             ui.status.set_text(r.error)
         }
         ui.item_list.render()
@@ -123,7 +123,7 @@ fn load_rooms(){
             empty_note = "This space has no rooms yet."
             ui.status.set_text("" + items.len() + " " + plural(items.len(), "room"))
         } else {
-            empty_note = "Nothing to show."
+            empty_note = r.error
             ui.status.set_text(r.error)
         }
         ui.item_list.render()
@@ -240,6 +240,9 @@ fn join_room(){
 }
 
 fn on_permissions_changed(caps){
+    if !host.has("matrix.spaces.list") { spaces_loaded = false }
+    if !host.has("matrix.space.info.read") { info_loaded = false }
+    if !host.has("matrix.space.rooms.list") { rooms_loaded = false }
     if trail.len() == 0 {
         if !spaces_loaded && host.has("matrix.spaces.list") { load_spaces() }
     } else {
@@ -264,6 +267,7 @@ View{
         View{
             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
             crumb := Label{ text: "Spaces" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
+            Button{ text: "Refresh" on_click: || reload() draw_text +: { color: #x1C274C } }
             back_wrap := View{
                 width: Fit height: Fit visible: false
                 Button{ text: "Back" on_click: || go_back() draw_text +: { color: #x1C274C } }

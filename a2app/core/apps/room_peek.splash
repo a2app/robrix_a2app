@@ -2,7 +2,7 @@
 // icon: 👀
 // tint: #4A90D9
 // description: Room details, the latest messages and a quick way to send one.
-// permissions: matrix-room-info, matrix-room-read, matrix-room-send, robrix-navigation, matrix-room-watch
+// permissions: matrix-room-info, matrix-room-read, matrix-room-send, robrix-navigation, matrix-room-watch, matrix.room.info.read, matrix.room.messages.read, matrix.room.event.read, matrix.room.message.send, host.nav.event, on_room_message, on_room_members_changed, on_room_typing, on_room_reaction, on_room_message_changed
 // why-matrix-room-info: Shows this room's name and member count.
 // why-matrix-room-read: Lists the latest messages in this room and their reactions.
 // why-matrix-room-send: Sends the message you type into this room.
@@ -19,6 +19,7 @@ let messages_loading = false
 let messages_loaded = false
 let messages_reload_pending = false
 let sending = false
+let setup_pending = false
 
 let room_name = ""
 let room_line = "Loading…"
@@ -246,9 +247,10 @@ fn on_room_members_changed(json){
 }
 
 fn schedule_room_refresh(){
-    if room_refresh_pending { return nil }
+    if room_refresh_pending || !host.has("matrix.room.info.read") { return nil }
     room_refresh_pending = start_timeout(1.0, || {
         room_refresh_pending = false
+        if !host.has("matrix.room.info.read") { return nil }
         if room_loading { schedule_room_refresh() } else { load_room() }
     }) != nil
 }
@@ -296,16 +298,33 @@ fn on_app_resize(w, h){
 }
 
 fn on_permissions_changed(caps){
-    if !room_loaded { load_room() }
-    if !messages_loaded { load_messages() }
+    if setup_pending { return nil }
+    if !host.has("matrix.room.info.read") { room_loaded = false }
+    elif !room_loaded { load_room() }
+    if !host.has("matrix.room.messages.read") { messages_loaded = false }
+    elif !messages_loaded { load_messages() }
     watch_granted()
 }
 
-let _boot = start_timeout(0.05, || {
-    load_room()
-    load_messages()
-    watch()
-})
+fn setup(retry){
+    if setup_pending { return nil }
+    setup_pending = true
+    host.request("permissions.request", {perms: ["matrix-room-info", "matrix-room-read", "matrix-room-watch"], retry: retry}, fn(r){
+        setup_pending = false
+        if !r.is_ok { room_line = r.error show_room() return nil }
+        if r.data.permissions["matrix-room-info"] == true && host.has("matrix.room.info.read") { load_room() }
+        else { room_line = "Permission denied. Click Refresh to ask again." show_room() }
+        if r.data.permissions["matrix-room-read"] == true && host.has("matrix.room.messages.read") { load_messages() }
+        else {
+            messages = []
+            empty_line = "Permission denied. Click Refresh to ask again."
+            ui.msg_list.render()
+        }
+        if r.data.permissions["matrix-room-watch"] == true { watch_granted() }
+    })
+}
+
+let _boot = start_timeout(0.05, || setup(false))
 
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
@@ -322,6 +341,7 @@ View{
             text: "Loading…" width: Fill padding: 0 margin: 0
             draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
         }
+        Button{ text: "Refresh" on_click: || setup(true) draw_text +: { color: #x1C274C } }
         msg_list := ScrollYView{
             width: Fill height: Fill{min: 80} flow: Down spacing: 6
             on_item_tap: |i| jump_to_message(i)

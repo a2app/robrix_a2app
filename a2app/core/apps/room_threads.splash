@@ -2,7 +2,7 @@
 // icon: 🧵
 // tint: #8A5CA8
 // description: The threads in this room, readable in place.
-// permissions: matrix-room-read, robrix-navigation, matrix-room-watch
+// permissions: matrix-room-read, robrix-navigation, matrix-room-watch, matrix.room.threads.read, matrix.room.thread.read, host.nav.thread, on_room_message
 // why-matrix-room-read: Lists the discussion threads in this room and shows the one you open.
 // why-robrix-navigation: Opens the thread you're reading in Robrix.
 // why-matrix-room-watch: Refreshes as new messages arrive.
@@ -16,6 +16,7 @@ let thread_loading = ""
 let thread_request = 0
 let thread_loaded = false
 let live_refresh_pending = false
+let setup_pending = false
 
 let items = []
 let open_id = ""
@@ -125,8 +126,12 @@ fn on_room_message(json){
 
 fn schedule_live_refresh(){
     if live_refresh_pending { return nil }
+    if open_id == "" && !host.has("matrix.room.threads.read") { return nil }
+    if open_id != "" && !host.has("matrix.room.thread.read") { return nil }
     live_refresh_pending = start_timeout(1.0, || {
         live_refresh_pending = false
+        if open_id == "" && !host.has("matrix.room.threads.read") { return nil }
+        if open_id != "" && !host.has("matrix.room.thread.read") { return nil }
         if threads_loading || thread_loading != "" {
             schedule_live_refresh()
         } elif open_id != "" {
@@ -147,18 +152,39 @@ fn watch(){
 }
 
 fn on_permissions_changed(caps){
-    if open_id != "" {
+    if setup_pending { return nil }
+    if !host.has("matrix.room.threads.read") { threads_loaded = false }
+    if !host.has("matrix.room.thread.read") { thread_loaded = false }
+    if open_id != "" && host.has("matrix.room.thread.read") {
         if !thread_loaded { load_thread() }
-    } else {
+    } elif open_id == "" && host.has("matrix.room.threads.read") {
         if !threads_loaded { load() }
     }
     if host.has("on_room_message") { watch() } else { watch_ready = false }
 }
 
-let _boot = start_timeout(0.05, || {
-    load()
-    watch()
-})
+fn setup(retry){
+    if setup_pending { return nil }
+    setup_pending = true
+    host.request("permissions.request", {perms: ["matrix-room-read", "matrix-room-watch"], retry: retry}, fn(r){
+        setup_pending = false
+        if !r.is_ok { status = r.error empty_msg = r.error show_header() ui.item_list.render() return nil }
+        if open_id != "" {
+            if r.data.permissions["matrix-room-read"] == true && host.has("matrix.room.thread.read") { load_thread() }
+            else { ui.thread_header.set_text("Permission denied. Click Refresh to ask again.") }
+        } elif r.data.permissions["matrix-room-read"] == true && host.has("matrix.room.threads.read") { load() }
+        else {
+            items = []
+            status = "Permission denied. Click Refresh to ask again."
+            empty_msg = status
+            show_header()
+            ui.item_list.render()
+        }
+        if r.data.permissions["matrix-room-watch"] == true && host.has("on_room_message") { watch() }
+    })
+}
+
+let _boot = start_timeout(0.05, || setup(false))
 
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
@@ -204,7 +230,7 @@ View{
             View{
                 width: Fill height: Fit flow: Right align: Align{x: 0.5}
                 Button{
-                    text: "Refresh" on_click: || { status = "Loading…" show_header() load() }
+                    text: "Refresh" on_click: || setup(true)
                     draw_text +: { color: #x1C274C }
                 }
             }
@@ -221,6 +247,7 @@ View{
                     text: "Open in Robrix" on_click: || open_in_robrix()
                     draw_text +: { color: #x1C274C }
                 }
+                Button{ text: "Refresh" on_click: || setup(true) draw_text +: { color: #x1C274C } }
             }
             thread_header := Label{
                 text: "Loading…" padding: 0 margin: 0

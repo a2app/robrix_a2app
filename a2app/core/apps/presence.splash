@@ -2,7 +2,7 @@
 // icon: 👀
 // tint: #3A86FF
 // description: Who is typing and how far each person has read.
-// permissions: matrix-room-read, matrix-room-watch, robrix-navigation
+// permissions: matrix-room-read, matrix-room-watch, robrix-navigation, matrix.room.receipts.read, matrix.room.event.read, on_room_typing, on_room_receipt, host.nav.user, host.nav.event
 // why-matrix-room-read: Shows how far each person has read.
 // why-matrix-room-watch: Updates who is typing and reading as it happens.
 // why-robrix-navigation: Opens a person you tap, or jumps to the message they read.
@@ -20,6 +20,7 @@ let pending = ""
 let fetch_scheduled = false
 let typing_line = "Nobody is typing"
 let live_note = ""
+let setup_pending = false
 
 fn show_typing(){
     let line = typing_line
@@ -168,20 +169,49 @@ fn watch(){
     subscribe("on_room_receipt")
 }
 
-fn on_permissions_changed(caps){
-    if !receipts_loaded { load() }
-    if host.has("matrix.room.event.read") {
-        bodies.retain(|body| body.loaded)
-        fetch_next()
-    }
+fn watch_granted(){
     subscribed_events.retain(|event| host.has(event))
     if host.has("on_room_typing") { subscribe("on_room_typing") }
     if host.has("on_room_receipt") { subscribe("on_room_receipt") }
 }
 
+fn on_permissions_changed(caps){
+    if setup_pending { return nil }
+    if !host.has("matrix.room.receipts.read") { receipts_loaded = false }
+    elif !receipts_loaded { load() }
+    if host.has("matrix.room.event.read") {
+        bodies.retain(|body| body.loaded)
+        fetch_next()
+    }
+    watch_granted()
+}
+
 fn reload(){
     bodies.retain(|body| body.loaded)
-    load()
+    if host.has("matrix.room.receipts.read") { load() }
+    else {
+        rows = []
+        ui.header.set_text("Permission denied. Click Refresh to ask again.")
+        refresh()
+    }
+    watch_granted()
+}
+
+fn setup(retry){
+    if setup_pending { return nil }
+    setup_pending = true
+    host.request("permissions.request", {perms: ["matrix-room-read", "matrix-room-watch"], retry: retry}, fn(r){
+        setup_pending = false
+        if !r.is_ok { ui.header.set_text(r.error) return nil }
+        bodies.retain(|body| body.loaded)
+        if r.data.permissions["matrix-room-read"] == true && host.has("matrix.room.receipts.read") { load() }
+        else {
+            rows = []
+            ui.header.set_text("Permission denied. Click Refresh to ask again.")
+            refresh()
+        }
+        if r.data.permissions["matrix-room-watch"] == true { watch_granted() }
+    })
 }
 
 fn tap_cell(i){
@@ -196,10 +226,7 @@ fn tap_cell(i){
 
 fn on_nav(r){ if !r.is_ok { ui.header.set_text(r.error) } }
 
-let _boot = start_timeout(0.05, || {
-    load()
-    watch()
-})
+let _boot = start_timeout(0.05, || setup(false))
 
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
@@ -247,7 +274,7 @@ View{
         }
         View{
             width: Fill height: Fit flow: Right align: Align{x: 0.5}
-            Button{ text: "Refresh" on_click: || reload() draw_text +: { color: #x1C274C } }
+            Button{ text: "Refresh" on_click: || setup(true) draw_text +: { color: #x1C274C } }
         }
     }
 }

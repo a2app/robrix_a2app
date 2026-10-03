@@ -2,7 +2,7 @@
 // icon: 🛠
 // tint: #546E7A
 // description: What Robrix tells a mini-app about its pane, settings and device.
-// permissions: robrix-ui, robrix-preferences, robrix-observe, device-info
+// permissions: robrix-ui, robrix-preferences, robrix-observe, device-info, ui.pane.set_side, ui.pane.break_out, ui.pane.minimize, ui.pane.restore, host.prefs.read, on_prefs_changed, on_active_room_changed, on_navigation_changed, device.info.read
 // why-robrix-ui: Moves, pops out, minimizes, restores or closes its own pane when you tap.
 // why-robrix-preferences: Shows Robrix's display settings and follows changes to them.
 // why-robrix-observe: Logs which room and screen you switch to, so you can see what an app would see.
@@ -20,6 +20,7 @@ let prefs_loaded = false
 let device_loading = false
 let device_loaded = false
 let resize_pending = false
+let setup_pending = false
 
 let events = []
 let pane = nil
@@ -220,17 +221,39 @@ fn load(){
 }
 
 fn on_permissions_changed(caps){
-    if !pane_loaded { read_pane() }
+    if setup_pending { return nil }
+    if !host.has("ui.pane.read") { pane_loaded = false }
+    elif !pane_loaded { read_pane() }
     if !env_loaded { read_env() }
-    if !prefs_loaded { read_prefs() }
-    if !device_loaded { read_device() }
+    if !host.has("host.prefs.read") { prefs_loaded = false }
+    elif !prefs_loaded { read_prefs() }
+    if !host.has("device.info.read") { device_loaded = false }
+    elif !device_loaded { read_device() }
     watch_granted()
 }
 
-let _boot = start_timeout(0.05, || {
-    load()
-    watch()
-})
+fn setup(retry){
+    if setup_pending { return nil }
+    setup_pending = true
+    host.request("permissions.request", {perms: ["robrix-preferences", "robrix-observe", "device-info"], retry: retry}, fn(r){
+        setup_pending = false
+        if !r.is_ok { ui.pane_state.set_text(r.error) return nil }
+        read_env()
+        read_pane()
+        if r.data.permissions["robrix-preferences"] == true && host.has("host.prefs.read") { read_prefs() }
+        else { ui.prefs_line.set_text("Permission denied. Click Refresh to ask again.") }
+        if r.data.permissions["device-info"] == true && host.has("device.info.read") { read_device() }
+        else { ui.device_line.set_text("Permission denied. Click Refresh to ask again.") }
+        subscribed_events.retain(|event| host.has(event))
+        if r.data.permissions["robrix-preferences"] == true && host.has("on_prefs_changed") { subscribe("on_prefs_changed") }
+        if r.data.permissions["robrix-observe"] == true {
+            if host.has("on_active_room_changed") { subscribe("on_active_room_changed") }
+            if host.has("on_navigation_changed") { subscribe("on_navigation_changed") }
+        }
+    })
+}
+
+let _boot = start_timeout(0.05, || setup(false))
 
 View{
     width: Fill height: Fill flow: Down align: Align{x: 0.5}
@@ -273,6 +296,7 @@ View{
             Label{ text: "DEVICE" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
             device_line := Label{ text: "…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
         }
+        Button{ text: "Refresh" on_click: || setup(true) draw_text +: { color: #x1C274C } }
         Label{
             text: "EVENTS · newest first" width: Fill padding: 0 margin: 0
             draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
