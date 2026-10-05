@@ -7565,10 +7565,12 @@ fn attach_ai_session(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, _name: 
 fn start_ai_session(state: &mut A2AppState, room_id: &OwnedRoomId, prefs: AgentPrefs) -> Result<AiSession, String> {
     let context = super::information_flow::begin_agent_session(room_id.as_str())?;
     let epoch = a2app_core::information_flow::context_epoch(&context)?;
-    // A fresh room must not have to prompt for the directory, its own
-    // transcript, or the installed mini-app list. Applied here (not only on
-    // the marker-check attach path) so a lazily started session — the first
-    // message in a newly created room — gets them too.
+    // A fresh room must not have to prompt for the room/space directory. The
+    // other directory-adjacent capabilities (its own transcript, the installed
+    // mini-app list) still go through `request_task_permissions`. Applied here
+    // (not only on the marker-check attach path) so a lazily started session —
+    // the first message in a newly created room — gets the directory defaults
+    // too.
     apply_ai_room_capability_defaults(state, room_id);
     let result = (|| {
         // A freshly created AI room has no sharing rules yet, so its first
