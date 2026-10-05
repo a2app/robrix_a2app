@@ -388,7 +388,7 @@ impl Backend {
     /// only 1 is allowed for this model" — a message about a parameter nobody
     /// set, naming neither the model nor the provider.
     ///
-    /// Rule (2) is DeepSeek: octos's registry default is `deepseek-chat`,
+    /// For DeepSeek, rule (2) replaces octos's `deepseek-chat` default,
     /// which today routes to a model whose DEFAULT has extended thinking on —
     /// so an app that asked for no reasoning still gets streams of thinking,
     /// because nothing octos sends can turn a default-on model off. Robrix's
@@ -398,6 +398,10 @@ impl Backend {
     /// asks for no reasoning (generation always does) or when the config
     /// names no model at all — an explicitly configured DeepSeek model is
     /// respected, except by a no-reasoning run, which overrides it.
+    ///
+    /// For Gemini, rule (2) replaces the pinned 2.5 Flash default, which
+    /// Google restricts to existing users. A config without a model uses
+    /// Robrix's current Flash default; an explicit model stays selected.
     ///
     /// Shared by the child process (which sends `--model`) and the embedded
     /// agent (which sets `AcpCommand.model`). They had separate copies of this
@@ -417,6 +421,11 @@ impl Backend {
         let no_reasoning = prefs.thinking.as_deref() == Some("off");
         if provider == "deepseek" && (no_reasoning || !super::providers::model_in_config()) {
             return super::providers::default_model_for("deepseek").map(str::to_string);
+        }
+        // The pinned Gemini default is unavailable to new Google projects.
+        // Keep an explicit model, and give both agent backends the same default.
+        if matches!(provider.as_str(), "gemini" | "google") && !super::providers::model_in_config() {
+            return super::providers::default_model_for(provider).map(str::to_string);
         }
         None
     }

@@ -33,7 +33,7 @@ pub const CATALOG: &[ProviderSpec] = &[
     ProviderSpec { id: "openai", label: "OpenAI", hint: "sk-…" },
     ProviderSpec { id: "moonshot-coding", label: "Kimi (Coding Plan)", hint: "sk-kimi-…" },
     ProviderSpec { id: "moonshot", label: "Kimi / Moonshot", hint: "sk-…" },
-    ProviderSpec { id: "gemini", label: "Google Gemini", hint: "AIza…" },
+    ProviderSpec { id: "gemini", label: "Google Gemini", hint: "AQ.… or AIza…" },
     ProviderSpec { id: "groq", label: "Groq", hint: "gsk_…" },
     ProviderSpec { id: "openrouter", label: "OpenRouter", hint: "sk-or-…" },
     ProviderSpec { id: "deepseek", label: "DeepSeek", hint: "sk-…" },
@@ -342,14 +342,23 @@ pub fn effective_provider() -> Option<String> {
 /// a config Robrix writes never sets one.
 const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-v4-flash";
 
+// Google limits Gemini 2.5 access to users who previously used those models.
+// https://ai.google.dev/gemini-api/docs/deprecations
+const GEMINI_DEFAULT_MODEL: &str = "gemini-3.8-flash";
+
 /// The model Robrix itself defaults a provider to, when its stock octos
-/// registry default would run the wrong reasoning mode. Only DeepSeek today:
+/// registry default is unsuitable for a fresh setup. For DeepSeek,
 /// octos's `deepseek-chat` default routes to a model whose default has
 /// extended thinking on, and nothing octos sends can turn a default-on model
-/// off — the no-thinking variant has to be NAMED. See [`Backend::model_override`]
-/// for when this is applied.
+/// off — the no-thinking variant has to be NAMED. Gemini's 2.5 default is
+/// restricted to prior users. See [`Backend::model_override`]
+/// for when these defaults are applied.
 pub(crate) fn default_model_for(provider: &str) -> Option<&'static str> {
-    (provider == "deepseek").then_some(DEEPSEEK_DEFAULT_MODEL)
+    match provider {
+        "deepseek" => Some(DEEPSEEK_DEFAULT_MODEL),
+        "gemini" | "google" => Some(GEMINI_DEFAULT_MODEL),
+        _ => None,
+    }
 }
 
 /// Whether the octos config a run would read names a model at all. When it
@@ -372,6 +381,8 @@ pub(crate) fn model_in_config() -> bool {
 ///   re-pick — re-entering a key is not a statement about the model.
 /// * A DeepSeek config with no model yet gets [`DEEPSEEK_DEFAULT_MODEL`], so a
 ///   fresh setup is flash-with-no-thinking without anyone naming a model.
+/// * A Gemini config with no model yet gets [`GEMINI_DEFAULT_MODEL`], which
+///   is available to new Google projects.
 fn reconcile_model(
     config: &mut serde_json::Map<String, serde_json::Value>,
     id: &str,
@@ -380,8 +391,10 @@ fn reconcile_model(
     if prior_provider != Some(id) {
         config.remove("model");
     }
-    if id == "deepseek" && !config.contains_key("model") {
-        config.insert("model".to_string(), serde_json::json!(DEEPSEEK_DEFAULT_MODEL));
+    if !config.contains_key("model") {
+        if let Some(model) = default_model_for(id) {
+            config.insert("model".to_string(), serde_json::json!(model));
+        }
     }
 }
 
@@ -416,7 +429,7 @@ pub fn save_key(id: &str, key: &str) -> Result<(), String> {
         return Err("Paste a key first".to_string());
     }
     // Some prefixes name their provider unambiguously (`sk-ant-`, `gsk_`,
-    // `AIza`, `sk-or-`, `sk-kimi-`). If one of those lands on the wrong row
+    // `AQ.`, `AIza`, `sk-or-`, `sk-kimi-`). If one of those lands on the wrong row
     // it's a slip, and saving it would fail later as an auth error with no
     // hint about the real cause. A plain `sk-…` is genuinely shared by
     // OpenAI/Moonshot/DeepSeek, so it is never second-guessed.
@@ -744,6 +757,41 @@ mod tests {
     }
 
     #[test]
+    fn gemini_keys_are_saved_without_changing_their_format() {
+        with_temp_config(|| {
+            save_key("anthropic", "sk-ant-fixture").unwrap();
+            for key in ["AQ.synthetic-key_123-xyz", "AIzaSyntheticLegacyKey"] {
+                save_key("gemini", &format!("  {key}\n")).unwrap();
+                let config = config_json();
+                assert_eq!(config["provider"], "gemini");
+                assert_eq!(config["model"], "gemini-3.8-flash");
+                assert_eq!(config["env_vars"]["GEMINI_API_KEY"], key);
+                assert_eq!(key_for("gemini").as_deref(), Some(key));
+                assert_eq!(key_for("anthropic").as_deref(), Some("sk-ant-fixture"));
+            }
+            write_config(|config| { config.insert("model".into(), serde_json::json!("gemini-2.5-flash")); }).unwrap();
+            save_key("gemini", "AQ.synthetic-replacement-key").unwrap();
+            assert_eq!(config_json()["model"], "gemini-2.5-flash", "changing a key preserves an explicit model");
+        });
+    }
+
+    #[test]
+    fn gemini_model_defaults_match_child_and_embedded_selection() {
+        with_temp_config(|| {
+            for id in ["gemini", "google"] {
+                let backend = super::super::prefs::Backend::Octos { provider: id.into() };
+                let prefs = super::super::prefs::AgentPrefs::default();
+                assert_eq!(backend.model_override(&prefs).as_deref(), Some("gemini-3.8-flash"));
+                assert_eq!(backend.args(&prefs), vec!["--model", "gemini-3.8-flash"]);
+            }
+            save_key("gemini", "AQ.synthetic-key").unwrap();
+            write_config(|config| { config.insert("model".into(), serde_json::json!("gemini-2.5-flash")); }).unwrap();
+            let backend = super::super::prefs::Backend::Octos { provider: "gemini".into() };
+            assert_eq!(backend.model_override(&super::super::prefs::AgentPrefs::default()), None);
+        });
+    }
+
+    #[test]
     fn keys_accumulate_and_switching_is_one_field() {
         with_temp_config(|| {
             save_key("anthropic", "sk-ant-one").unwrap();
@@ -863,6 +911,11 @@ mod tests {
             assert!(err.contains("Anthropic"), "{err}");
             // Nothing was written.
             assert!(config_json().get("env_vars").is_none());
+            for key in ["AQ.synthetic-key_123-xyz", "AIzaSyntheticLegacyKey"] {
+                let err = save_key("openai", key).unwrap_err();
+                assert!(err.contains("Google Gemini"), "{err}");
+                assert!(config_json().get("env_vars").is_none());
+            }
             // A shared `sk-` prefix is not second-guessed.
             assert!(save_key("moonshot", "sk-plain-platform-key").is_ok());
         });

@@ -22,6 +22,7 @@ const KEY_PREFIXES: &[(&str, &str)] = &[
     // one has to be configured directly.
     ("sk-kimi-", "moonshot-coding"),
     ("gsk_", "groq"),
+    ("AQ.", "gemini"),
     ("AIza", "gemini"),
     ("sk-", "openai"),
 ];
@@ -94,7 +95,9 @@ mod tests {
         assert_eq!(provider_for_key("sk-ant-api03-xyz"), Some("anthropic"));
         assert_eq!(provider_for_key("  sk-or-v1-xyz "), Some("openrouter"));
         assert_eq!(provider_for_key("gsk_xyz"), Some("groq"));
+        assert_eq!(provider_for_key("  AQ.synthetic-key_123-xyz \n"), Some("gemini"));
         assert_eq!(provider_for_key("AIzaSyXyz"), Some("gemini"));
+        assert_eq!(provider_for_key("AQwithout-dot"), None);
         assert_eq!(provider_for_key("sk-proj-xyz"), Some("openai"));
         assert_eq!(provider_for_key("whatever"), None);
         assert_eq!(provider_for_key(""), None);

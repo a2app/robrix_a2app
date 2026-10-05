@@ -12,6 +12,10 @@ use super::{AgentPrefs, ModelRecipient, stored_api_key};
 #[derive(Clone, Copy, PartialEq)]
 enum Protocol { OpenAi, Anthropic }
 
+// The registry's Gemini URL speaks Google's native protocol. The guarded
+// transport uses Google's documented OpenAI-compatible API instead.
+const GEMINI_OPENAI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
+
 /// The model configuration fields consumed by the host transport.
 ///
 /// Keep credential resolution compatible with Octos without linking its CLI,
@@ -206,7 +210,7 @@ pub(super) fn resolve(prefs: &AgentPrefs) -> Result<Resolved, String> {
     let entry = octos_llm::registry::lookup(&selected);
     let name = entry.map(|entry| entry.name).or_else(|| selected.eq_ignore_ascii_case("custom").then_some("custom"))
         .ok_or("This model backend cannot enforce private-data sharing. Select an OpenAI-compatible or Anthropic provider.")?;
-    if !matches!(name, "openai" | "anthropic" | "deepseek" | "moonshot" | "moonshot-coding" | "groq" | "openrouter" | "ollama" | "custom") {
+    if !matches!(name, "openai" | "anthropic" | "gemini" | "deepseek" | "moonshot" | "moonshot-coding" | "groq" | "openrouter" | "ollama" | "custom") {
         return Err("This model backend is not supported by the guarded transport. Select an OpenAI-compatible or Anthropic provider.".into());
     }
     let protocol = match config.api_type.as_deref() {
@@ -216,8 +220,18 @@ pub(super) fn resolve(prefs: &AgentPrefs) -> Result<Resolved, String> {
         None if name == "anthropic" => Protocol::Anthropic,
         None => Protocol::OpenAi,
     };
-    let base = config.base_url.as_deref().or_else(|| entry.and_then(|entry| entry.default_base_url))
+    if name == "gemini" && protocol == Protocol::Anthropic && config.base_url.is_none() {
+        return Err("Configure an explicit Anthropic-compatible API base URL for this model protocol.".into());
+    }
+    let registry_base = entry.and_then(|entry| entry.default_base_url);
+    let base = config.base_url.as_deref().or(registry_base)
         .ok_or("Configure a model API base URL.")?;
+    // A saved copy of Google's native default needs the same translation as
+    // an omitted URL. Custom endpoints and explicit protocols remain intact.
+    let base = if name == "gemini" && protocol == Protocol::OpenAi
+        && registry_base.is_some_and(|default| base.trim_end_matches('/') == default.trim_end_matches('/')) {
+        GEMINI_OPENAI_BASE_URL
+    } else { base };
     // Only the built-in Ollama default is rewritten. Arbitrary HTTP DNS names
     // do not become trusted local services because of a user-supplied label.
     let base = if name == "ollama" && config.base_url.is_none() { "http://127.0.0.1:11434/v1" } else { base };
@@ -365,7 +379,7 @@ impl LlmProvider for GuardedProvider {
         if let Some(record) = &self.on_response { record().map_err(eyre::Report::msg)?; }
         let value = result?;
         match self.config.protocol {
-            Protocol::OpenAi => parse_openai(value),
+            Protocol::OpenAi => parse_openai(value, &self.config.provider),
             Protocol::Anthropic => parse_anthropic(value),
         }
     }
@@ -379,7 +393,17 @@ fn openai_body(resolved: &Resolved, messages: &[Message], tools: &[ToolSpec], co
         if let Some(id) = &message.tool_call_id { value["tool_call_id"] = json!(id); }
         if let Some(reasoning) = &message.reasoning_content { value["reasoning_content"] = json!(reasoning); }
         if let Some(calls) = &message.tool_calls {
-            value["tool_calls"] = json!(calls.iter().map(|call| json!({"id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments.to_string()}})).collect::<Vec<_>>());
+            value["tool_calls"] = json!(calls.iter().map(|call| {
+                let mut value = json!({"id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments.to_string()}});
+                // Gemini requires the original signature on subsequent tool
+                // turns. Only replay that known field, never arbitrary metadata.
+                if resolved.provider == "gemini" {
+                    if let Some(signature) = call.metadata.as_ref().and_then(|metadata| metadata["thought_signature"].as_str()).filter(|signature| !signature.is_empty()) {
+                        value["extra_content"] = json!({"google":{"thought_signature":signature}});
+                    }
+                }
+                value
+            }).collect::<Vec<_>>());
         }
         value
     }).collect();
@@ -435,13 +459,17 @@ fn number(value: &Value) -> u32 { value.as_u64().unwrap_or(0).min(u32::MAX as u6
 fn required(value: &Value) -> eyre::Result<String> {
     value.as_str().map(str::to_string).ok_or_else(|| eyre::eyre!("Malformed model response."))
 }
-fn parse_openai(value: Value) -> eyre::Result<ChatResponse> {
+fn parse_openai(value: Value, provider: &str) -> eyre::Result<ChatResponse> {
     let choice = value["choices"].as_array().and_then(|choices| choices.first()).ok_or_else(|| eyre::eyre!("Missing model response."))?;
     let message = &choice["message"];
     let mut calls = Vec::new();
     for call in message["tool_calls"].as_array().into_iter().flatten() {
+        let metadata = if provider == "gemini" {
+            call["extra_content"]["google"]["thought_signature"].as_str().filter(|signature| !signature.is_empty())
+                .map(|signature| json!({"thought_signature":signature}))
+        } else { None };
         calls.push(ToolCall { id: required(&call["id"])?, name: required(&call["function"]["name"])?,
-            arguments: serde_json::from_str(&required(&call["function"]["arguments"])?).map_err(|_| eyre::eyre!("Malformed model tool arguments."))?, metadata: None });
+            arguments: serde_json::from_str(&required(&call["function"]["arguments"])?).map_err(|_| eyre::eyre!("Malformed model tool arguments."))?, metadata });
     }
     let usage = &value["usage"];
     let cached = number(&usage["prompt_tokens_details"]["cached_tokens"]);
@@ -678,7 +706,7 @@ mod tests {
         assert_eq!(third.recipient.endpoint, "https://second.example/v1/chat/completions");
         config["model"] = json!("other-model"); write(&config);
         assert_ne!(third.recipient.id, resolve(&prefs).unwrap().recipient.id);
-        for unsupported in ["gemini", "scenario", "arbitrary-provider"] {
+        for unsupported in ["scenario", "arbitrary-provider"] {
             config["provider"] = json!(unsupported); write(&config);
             assert!(resolve(&prefs).is_err());
         }
@@ -691,6 +719,136 @@ mod tests {
         assert!(custom.key.is_empty(), "custom endpoints do not inherit an arbitrary provider credential");
         unsafe { std::env::set_var("ROBRIX_AGENT_CMD", "opaque-test-agent"); }
         assert_eq!(resolve(&prefs).unwrap().recipient, custom.recipient, "backend selection does not change the host-owned model recipient");
+    }
+
+    #[test]
+    fn gemini_resolution_uses_compatible_default_and_preserves_explicit_endpoints() {
+        let _guard = crate::CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        struct Restore { config: Option<std::ffi::OsString>, provider: Option<String> }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe { match &self.config {
+                    Some(value) => std::env::set_var("OCTOS_CONFIG_DIR", value),
+                    None => std::env::remove_var("OCTOS_CONFIG_DIR"),
+                } }
+                match &self.provider { Some(value) => crate::providers::set_session(value), None => crate::providers::clear_session() }
+            }
+        }
+        let _restore = Restore { config: std::env::var_os("OCTOS_CONFIG_DIR"), provider: crate::providers::session_provider() };
+        let directory = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("OCTOS_CONFIG_DIR", directory.path()); }
+        crate::providers::clear_session();
+        let mut config = json!({"provider":"gemini","env_vars":{"GEMINI_API_KEY":"AQ.synthetic-auth-key"}});
+        let write = |value: &Value| std::fs::write(directory.path().join("config.json"), value.to_string()).unwrap();
+        write(&config);
+        let prefs = AgentPrefs::default();
+        let auth_key = resolve(&prefs).unwrap();
+        assert_eq!(auth_key.provider, "gemini");
+        assert_eq!(auth_key.key, "AQ.synthetic-auth-key");
+        assert!(auth_key.protocol == Protocol::OpenAi);
+        assert_eq!(auth_key.recipient.endpoint, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions");
+        assert!(!auth_key.recipient.local);
+        assert_eq!(auth_key.model, "gemini-3.8-flash", "fresh Gemini setup uses a model available to new projects");
+        assert!(!auth_key.recipient.id.contains(&auth_key.key));
+
+        config["env_vars"]["GEMINI_API_KEY"] = json!("AIzaSyntheticLegacyKey"); write(&config);
+        let legacy_key = resolve(&prefs).unwrap();
+        assert_eq!(legacy_key.key, "AIzaSyntheticLegacyKey");
+        assert_eq!(legacy_key.recipient.endpoint, auth_key.recipient.endpoint);
+        assert_ne!(legacy_key.recipient.id, auth_key.recipient.id);
+        config["provider"] = json!("google"); config["api_type"] = json!("openai"); write(&config);
+        assert_eq!(resolve(&prefs).unwrap().recipient, legacy_key.recipient, "registry aliases resolve to the same Gemini recipient");
+        for base in ["https://generativelanguage.googleapis.com/v1beta", "https://generativelanguage.googleapis.com/v1beta/"] {
+            config["base_url"] = json!(base); write(&config);
+            assert_eq!(resolve(&prefs).unwrap().recipient, legacy_key.recipient, "saved native default uses the compatible endpoint");
+        }
+        config.as_object_mut().unwrap().remove("base_url");
+        config["model"] = json!("gemini-2.5-flash"); write(&config);
+        let selected_model = resolve(&prefs).unwrap();
+        assert_eq!(selected_model.model, "gemini-2.5-flash", "an explicit legacy model stays selected");
+        assert_ne!(selected_model.recipient.id, legacy_key.recipient.id);
+
+        config["base_url"] = json!("https://proxy.example/google/v1/"); write(&config);
+        let custom = resolve(&prefs).unwrap();
+        assert_eq!(custom.recipient.endpoint, "https://proxy.example/google/v1/chat/completions");
+        assert_ne!(custom.recipient.id, selected_model.recipient.id);
+        config["api_type"] = json!("anthropic"); write(&config);
+        let anthropic = resolve(&prefs).unwrap();
+        assert!(anthropic.protocol == Protocol::Anthropic);
+        assert_eq!(anthropic.recipient.endpoint, "https://proxy.example/google/v1/messages");
+        assert_ne!(anthropic.recipient.id, custom.recipient.id);
+        config.as_object_mut().unwrap().remove("base_url"); write(&config);
+        assert!(resolve(&prefs).err().unwrap().contains("explicit Anthropic-compatible API base URL"));
+        config["api_type"] = json!("native-gemini"); write(&config);
+        assert!(resolve(&prefs).err().unwrap().contains("Unsupported model API protocol"));
+    }
+
+    #[tokio::test]
+    async fn gemini_keys_and_signed_tool_feedback_use_guarded_bearer_transport() {
+        for key in ["AQ.synthetic-auth-key", "AIzaSyntheticLegacyKey"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let allowed = Arc::new(AtomicBool::new(true));
+            let mut config = fixture(&format!("http://{address}/v1beta/openai"), Protocol::OpenAi);
+            config.provider = "gemini".into(); config.key = key.into();
+            let provider = GuardedProvider::new(config, approval(allowed.clone())).unwrap();
+            let body = json!({"choices":[{"message":{"content":null,"tool_calls":[{
+                "id":"call-1","type":"function","function":{"name":"room_read","arguments":"{\"room\":\"private\"}"},
+                "extra_content":{"google":{"thought_signature":"opaque+/signature=","unexpected":"discard"},"other":"discard"}
+            }]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}).to_string();
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+            let server = request(listener.try_clone().unwrap(), response, None);
+            let result = provider.chat(&[message(MessageRole::User, "approved input")], &[], &ChatConfig::default()).await.unwrap();
+            assert_eq!(result.stop_reason, StopReason::ToolUse);
+            assert_eq!(result.tool_calls[0].metadata, Some(json!({"thought_signature":"opaque+/signature="})));
+            let received = server.join().unwrap();
+            assert!(received.starts_with("POST /v1beta/openai/chat/completions HTTP/1.1\r\n"));
+            let headers = received.split("\r\n\r\n").next().unwrap();
+            let authorization = headers.lines().filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("authorization")).unwrap().1.trim();
+            assert_eq!(authorization, format!("Bearer {key}"));
+            assert!(!headers.lines().filter_map(|line| line.split_once(':')).any(|(name, _)| name.eq_ignore_ascii_case("x-goog-api-key")));
+
+            let mut assistant = message(MessageRole::Assistant, "");
+            assistant.tool_calls = Some(result.tool_calls);
+            let mut feedback = message(MessageRole::Tool, "approved private result");
+            feedback.tool_call_id = Some("call-1".into());
+            let history = [message(MessageRole::User, "approved input"), assistant, feedback];
+            let server = request(listener.try_clone().unwrap(), ok_response(), None);
+            provider.chat(&history, &[], &ChatConfig::default()).await.unwrap();
+            let received = server.join().unwrap();
+            let body: Value = serde_json::from_str(received.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(body["messages"][1]["tool_calls"][0]["extra_content"], json!({"google":{"thought_signature":"opaque+/signature="}}));
+            assert_eq!(body["messages"][2]["tool_call_id"], "call-1");
+            assert_eq!(body["messages"][2]["content"], "approved private result");
+            allowed.store(false, Ordering::SeqCst);
+            listener.set_nonblocking(true).unwrap();
+            let error = provider.chat(&history, &[], &ChatConfig::default()).await.unwrap_err().to_string();
+            assert!(error.contains("policy denied"));
+            assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        }
+    }
+
+    #[test]
+    fn gemini_tool_metadata_is_limited_to_string_signatures_and_not_sent_to_other_providers() {
+        let response = |signature: Value| json!({"choices":[{"message":{"tool_calls":[{
+            "id":"call-1","function":{"name":"room_read","arguments":"{}"},
+            "extra_content":{"google":{"thought_signature":signature,"unexpected":"discard"},"other":"discard"}
+        }]},"finish_reason":"tool_calls"}],"usage":{}});
+        let mut assistant = message(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(parse_openai(response(json!("original-signature")), "gemini").unwrap().tool_calls);
+        assistant.tool_calls.as_mut().unwrap()[0].metadata.as_mut().unwrap()["unexpected"] = json!("discard");
+        let mut config = fixture("https://proxy.example/v1", Protocol::OpenAi);
+        config.provider = "gemini".into();
+        let body = openai_body(&config, &[assistant.clone()], &[], &ChatConfig::default());
+        assert_eq!(body["messages"][0]["tool_calls"][0]["extra_content"], json!({"google":{"thought_signature":"original-signature"}}));
+        config.provider = "openai".into();
+        let body = openai_body(&config, &[assistant], &[], &ChatConfig::default());
+        assert!(body["messages"][0]["tool_calls"][0].get("extra_content").is_none());
+        assert!(parse_openai(response(json!("original-signature")), "openai").unwrap().tool_calls[0].metadata.is_none());
+        for signature in [Value::Null, json!(""), json!(123), json!({"unexpected":"discard"})] {
+            assert!(parse_openai(response(signature), "gemini").unwrap().tool_calls[0].metadata.is_none());
+        }
     }
 
     #[tokio::test]
