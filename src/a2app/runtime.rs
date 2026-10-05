@@ -7502,6 +7502,12 @@ fn apply_ai_room_capability_defaults(state: &mut A2AppState, room_id: &OwnedRoom
 /// Applies the one-time directory defaults to a permission store. Returns
 /// whether anything changed. Split out from [`apply_ai_room_capability_defaults`]
 /// so the once-per-room behavior is unit-testable.
+///
+/// The directory capabilities share permission groups with other capabilities
+/// (room search, previews, invites, the room-list hooks; the space-changed
+/// hook), so the group itself is left `Ask`: each directory capability is
+/// granted by id with a durable all-rooms scoped grant. Setting the group to
+/// `Granted` would silently hand the agent everything else in it.
 #[cfg(unix)]
 fn apply_directory_capability_defaults(permissions: &mut PermissionStore, room_id: &OwnedRoomId) -> bool {
     let subject = agent_subject(room_id.as_str());
@@ -7509,9 +7515,27 @@ fn apply_directory_capability_defaults(permissions: &mut PermissionStore, room_i
     for cap_id in a2app_core::task_grants::DIRECTORY_CAP_IDS {
         let Some(cap) = a2app_core::capabilities::by_id(cap_id) else { continue };
         let Some(group) = cap.group else { continue };
-        if permissions.state(&subject, group) == GrantState::Ask {
-            permissions.set(&subject, group, GrantState::Granted);
-            changed = true;
+        // A stored Deny is a hard block and must never be overridden by the
+        // once-per-room default.
+        if permissions.state(&subject, group) == GrantState::Denied {
+            continue;
+        }
+        let already = permissions.scoped_grants(&subject).iter().any(|grant| {
+            grant.capability.as_deref() == Some(*cap_id) && grant.scope == RoomScope::AllRooms
+        });
+        if already {
+            continue;
+        }
+        match permissions.grant_scoped(
+            &subject,
+            group,
+            Some(cap_id),
+            RoomScope::AllRooms,
+            GrantDuration::Always,
+            None,
+        ) {
+            Ok(_) => changed = true,
+            Err(error) => log!("AI Rooms: couldn't default the {cap_id} capability: {error}"),
         }
     }
     changed
@@ -11122,9 +11146,18 @@ View{note := Label{text:"waiting"}}
         apply_directory_capability_defaults(&mut permissions, &room);
         assert_eq!(permissions.state(&subject, denied_group), GrantState::Denied);
         for cap_id in a2app_core::task_grants::DIRECTORY_CAP_IDS {
-            let group = a2app_core::capabilities::by_id(cap_id).unwrap().group.unwrap();
-            if group != denied_group {
-                assert_eq!(permissions.state(&subject, group), GrantState::Granted, "{cap_id}");
+            let cap = a2app_core::capabilities::by_id(cap_id).unwrap();
+            let group = cap.group.unwrap();
+            let effective = permissions.effective_capability_for_in_context(
+                &subject, ai_room_declares_perm, ai_room_declares_cap, cap,
+                PermissionContext { origin_room: Some(SOURCE), target_room: Some(SOURCE) },
+            );
+            if group == denied_group {
+                assert_ne!(effective, Effective::Granted, "{cap_id} must stay denied");
+            } else {
+                assert_eq!(effective, Effective::Granted, "{cap_id}");
+                assert_eq!(permissions.state(&subject, group), GrantState::Ask,
+                    "the group itself is not flipped to Granted");
             }
         }
         // The room's own reads and the app list are not defaulted.
@@ -11344,6 +11377,50 @@ View{note := Label{text:"waiting"}}
             with_a2app(|state| state.task_request_counts.contains_key(TARGET)).unwrap(),
             "another room keeps its own request budget"
         );
+    }
+
+    /// The directory defaults must grant the exact directory capabilities, not
+    /// their whole permission groups: room search, previews, invites and the
+    /// incoming room-list hooks share `MatrixRoomsList`, and `MatrixSpaces` is
+    /// shared with the space-changed hook. The store's group state stays Ask;
+    /// only a scoped grant for each directory capability is recorded.
+    #[cfg(unix)]
+    #[test]
+    fn directory_defaults_grant_a_shared_group_only_by_capability() {
+        use a2app_core::capabilities::CATALOG;
+        use a2app_core::task_grants::DIRECTORY_CAP_IDS;
+        let room: OwnedRoomId = SOURCE.try_into().unwrap();
+        let mut permissions = PermissionStore::default();
+        assert!(apply_directory_capability_defaults(&mut permissions, &room));
+        let subject = agent_subject(SOURCE);
+        let directory_groups: BTreeSet<Permission> = DIRECTORY_CAP_IDS.iter()
+            .filter_map(|id| a2app_core::capabilities::by_id(id).and_then(|cap| cap.group))
+            .collect();
+        // A caller that declares the whole group: with a group-level default
+        // every sibling would be granted, which is exactly the bug.
+        let declares_perm = |_permission: Permission| true;
+        let declares_cap = |_cap: &a2app_core::capabilities::Capability| true;
+        let mut saw_shared_sibling = false;
+        for cap in CATALOG.iter() {
+            let Some(group) = cap.group else { continue };
+            if !directory_groups.contains(&group) {
+                continue;
+            }
+            let effective = permissions.effective_capability_for_in_context(
+                &subject, declares_perm, declares_cap, cap,
+                PermissionContext { origin_room: Some(SOURCE), target_room: Some(SOURCE) },
+            );
+            if DIRECTORY_CAP_IDS.contains(&cap.id) {
+                assert_eq!(effective, Effective::Granted, "{} must be granted", cap.id);
+            } else {
+                saw_shared_sibling = true;
+                assert_ne!(effective, Effective::Granted,
+                    "{} shares a directory permission group but must not be granted by the defaults", cap.id);
+            }
+        }
+        assert!(saw_shared_sibling, "the catalog must have a non-directory capability sharing a directory group");
+        // Re-running is idempotent.
+        assert!(!apply_directory_capability_defaults(&mut permissions, &room));
     }
 
     /// The carried-over path follows the same apply/ledger/rollback machinery
