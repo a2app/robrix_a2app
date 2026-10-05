@@ -10266,6 +10266,11 @@ fn flush_pending_ai_turns(cx: &mut Cx) {
     let mut needs_timer = false;
     with_a2app(|state| {
         for (room_id, info) in state.ai_rooms.iter_mut() {
+            // Keep the timer armed while a closed turn still has final writes
+            // outstanding, so its failsafe deadline can fire on an idle app.
+            if info.final_writes_pending_revoke {
+                needs_timer = true;
+            }
             if info.ai_turn_in_flight {
                 needs_timer = true;
                 continue;
