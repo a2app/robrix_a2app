@@ -355,8 +355,8 @@ sharing check), and the runtime revokes the exact applied batch from its
 per-task ledger once the last of those writes lands. The grants are in-memory session grants
 (`GrantDuration::RobrixSession` / `SharingDuration::RoomSession`); they are
 never written to disk, and the runtime also revokes the exact applied batch
-from its per-task ledger when the turn closes, the session stops, or the room
-closes. "Not now" is remembered for the turn by
+from its per-task ledger once the turn's final writes have landed, the session
+stops, or the room closes. "Not now" is remembered for the turn by
 what the plan needs, independent of the agent's own need labels: a later
 request with the same needs, or a subset, is declined without a modal, while a
 request that adds a new need is shown. A turn may make at most three requests,
