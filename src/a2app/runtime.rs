@@ -11744,8 +11744,7 @@ View{note := Label{text:"waiting"}}
 
     /// Withdrawing a held carried-over prompt must not advance the room's
     /// cursor: the message was never delivered, so the next timeline update
-    /// re-forwards it (and re-raises the prompt).
-    #[cfg(unix)]
+    /// re-forwards it (and re-raises the prompt).    #[cfg(unix)]
     #[test]
     fn withdrawing_a_held_carried_prompt_leaves_the_cursor_for_refetch() {
         let previous_state = A2APP.with(|state| state.replace(None));
@@ -11775,7 +11774,36 @@ View{note := Label{text:"waiting"}}
         A2APP.with(|state| { state.replace(previous_state); });
     }
 
-    // (the item-3 test above continues below with the newer-turn case)
+    /// A dead session's teardown must wait for its final Stopped row and Done
+    /// snapshot: its flow context has to outlive them, so `retire_ai_session`
+    /// defers and `settle_closed_turn` retires once the last write lands.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_session_waits_for_its_final_writes_before_teardown() {
+        let previous_state = A2APP.with(|state| state.replace(None));
+        initialize_state(AppRegistry::new(Vec::new()), PermissionStore::default(), A2AppPersistedState::default(), Default::default());
+        let room_id: OwnedRoomId = SOURCE.try_into().unwrap();
+        let context = a2app_core::information_flow::ContextId::Agent { account: "alice".into(), room: SOURCE.into() };
+        with_a2app(|state| {
+            state.ai_rooms.insert(room_id.clone(), AiRoomInfo::new(None));
+            let info = state.ai_rooms.get_mut(&room_id).unwrap();
+            info.final_writes_pending_revoke = true;
+            info.pending_final_writes = BTreeSet::from([7u64]);
+            state.task_ledger.insert(a2app_core::task_grants::AppliedTask {
+                task_id: 13, subject: "agent".into(), context, epoch: 1,
+                title: "t".into(), plan_hash: [0; 32], grants: Vec::new(), item_states: BTreeMap::new(),
+            });
+        });
+        retire_ai_session(&room_id);
+        assert!(with_a2app(|state| state.ai_rooms.get(&room_id).is_some_and(|info| info.retire_after_final_writes)).unwrap(),
+            "the teardown waits for the final write");
+        final_write_landed(&room_id, 7);
+        assert!(with_a2app(|state| state.task_ledger.is_empty()).unwrap(),
+            "the landed write releases the grants");
+        assert!(with_a2app(|state| state.ai_rooms.get(&room_id).is_some_and(|info| !info.retire_after_final_writes)).unwrap(),
+            "the deferred teardown ran once the write landed");
+        A2APP.with(|state| { state.replace(previous_state); });
+    }
 
     /// A natural reply that lands after a newer turn has started does not
     /// revoke the room's ledger; the newer turn's close removes every entry.
