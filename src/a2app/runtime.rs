@@ -6182,10 +6182,17 @@ fn revoke_task_grants(room_id: &OwnedRoomId) {
         return;
     }
     let mut guard = PermissionStoreGuard::take();
+    let mut revoked_cleanly = true;
     for task in &tasks {
-        task_grants::rollback(task, guard.store(), &task_grants::GlobalFlowApply);
+        revoked_cleanly &= task_grants::rollback(task, guard.store(), &task_grants::GlobalFlowApply);
     }
     guard.restore(|_| {});
+    if !revoked_cleanly {
+        enqueue_popup_notification(
+            "Some of this turn's sharing rules could not be revoked. Review Data Sharing to be sure no access was left behind.",
+            PopupKind::Warning, Some(8.0),
+        );
+    }
 }
 
 /// Takes every task prompt pending for a room (without a UI handle), so a

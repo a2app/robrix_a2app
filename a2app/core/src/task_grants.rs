@@ -966,9 +966,21 @@ pub fn apply(
     let rollback = |applied: &AppliedTask, store: &mut PermissionStore, flow: &dyn FlowApply| {
         for grant in applied.grants.iter().rev() {
             match *grant {
-                GrantRef::Scoped(id) | GrantRef::Tool(id) => { store.remove_scoped_grant(id); }
-                GrantRef::Network(id) => { store.remove_network_grant(id); }
-                GrantRef::Flow(id) => { let _ = flow.revoke(id); }
+                GrantRef::Scoped(id) | GrantRef::Tool(id) => {
+                    if !store.remove_scoped_grant(id) {
+                        makepad_widgets::log!("Mini-app task rollback: scoped grant {id} was already gone.");
+                    }
+                }
+                GrantRef::Network(id) => {
+                    if !store.remove_network_grant(id) {
+                        makepad_widgets::log!("Mini-app task rollback: network grant {id} was already gone.");
+                    }
+                }
+                GrantRef::Flow(id) => {
+                    if let Err(error) = flow.revoke(id) {
+                        makepad_widgets::log!("Mini-app task rollback: couldn't revoke flow rule {id}: {error}");
+                    }
+                }
             }
         }
     };
@@ -1022,15 +1034,35 @@ pub fn apply(
 }
 
 /// Removes every grant an applied task created. Safe to call more than once;
-/// a grant already revoked by the user is simply not found.
-pub fn rollback(applied: &AppliedTask, store: &mut PermissionStore, flow: &dyn FlowApply) {
+/// a grant already revoked by the user is simply not found. A failure to
+/// revoke a flow rule (or a grant that is already gone) is logged, not
+/// swallowed, so a leaking rule is diagnosable. Returns false when any grant
+/// could not be removed cleanly, so the caller can tell the user.
+pub fn rollback(applied: &AppliedTask, store: &mut PermissionStore, flow: &dyn FlowApply) -> bool {
+    let mut clean = true;
     for grant in applied.grants.iter().rev() {
         match *grant {
-            GrantRef::Scoped(id) | GrantRef::Tool(id) => { store.remove_scoped_grant(id); }
-            GrantRef::Network(id) => { store.remove_network_grant(id); }
-            GrantRef::Flow(id) => { let _ = flow.revoke(id); }
+            GrantRef::Scoped(id) | GrantRef::Tool(id) => {
+                if !store.remove_scoped_grant(id) {
+                    makepad_widgets::log!("Mini-app task rollback: scoped grant {id} was already gone.");
+                    clean = false;
+                }
+            }
+            GrantRef::Network(id) => {
+                if !store.remove_network_grant(id) {
+                    makepad_widgets::log!("Mini-app task rollback: network grant {id} was already gone.");
+                    clean = false;
+                }
+            }
+            GrantRef::Flow(id) => {
+                if let Err(error) = flow.revoke(id) {
+                    makepad_widgets::log!("Mini-app task rollback: couldn't revoke flow rule {id}: {error}");
+                    clean = false;
+                }
+            }
         }
     }
+    clean
 }
 
 /// Narrows an approved set so an unchecked read drops the implied flow rules
