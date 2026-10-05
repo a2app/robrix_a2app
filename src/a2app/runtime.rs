@@ -113,6 +113,19 @@ const AI_START_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 /// result can find the exact tool call it answers.
 #[cfg(unix)]
 static NEXT_AI_TOOL_ID: AtomicU64 = AtomicU64::new(1);
+/// The next id for an `ai_turn`/activity state-event write. The id is echoed
+/// back on its result so a closed turn's final write can be matched to the
+/// token it registered.
+#[cfg(unix)]
+static NEXT_AI_WRITE_ID: AtomicU64 = AtomicU64::new(1);
+/// The final-write token for a closed turn's natural reply. Only one can be
+/// outstanding per turn, and the reply result carries no write id.
+#[cfg(unix)]
+const FINAL_REPLY_WRITE_ID: u64 = u64::MAX;
+/// How long a closed turn's grants may outlive a final write that never
+/// reports back before the runtime gives up and revokes them anyway.
+#[cfg(unix)]
+const FINAL_WRITE_FAILSAFE: Duration = Duration::from_secs(30);
 
 /// One granted read in flight: its room, the tool kind (so the receipt chip
 /// can name it when the result lands) and the channel answering the tool call.
@@ -565,22 +578,24 @@ pub struct AiRoomInfo {
     start_failed_at: Option<Instant>,
     /// A closed turn's final writes (the `Done` `ai_turn` snapshot, an
     /// error/stopped activity row, the natural reply) still queued or in
-    /// flight. The turn's task-scoped grants stay live until this reaches
-    /// zero, so each of those writes still passes the whole-label sharing
-    /// check. See [`close_active_turn`].
-    pending_final_writes: u32,
+    /// flight, each by its host-assigned write token. The turn's task-scoped
+    /// grants stay live until every token is released, so each of those writes
+    /// still passes the whole-label sharing check. See [`close_active_turn`].
+    pending_final_writes: BTreeSet<u64>,
     /// Whether the turn is closed and only its final writes keep its grants
     /// alive. Set by [`close_active_turn`], cleared when the revoke runs.
     final_writes_pending_revoke: bool,
     /// The state key of the final `ai_turn` (Done) snapshot waiting to be
-    /// written; moved to `final_turn_in_flight` when the write is submitted.
+    /// written. While this is set, the Done has not been submitted yet, so
+    /// [`settle_closed_turn`] must not revoke.
     final_turn_key: Option<String>,
-    /// Whether the final `ai_turn` snapshot write is in flight.
-    final_turn_in_flight: bool,
-    /// Whether a final error/stopped activity row write is in flight.
-    final_activity_in_flight: bool,
-    /// Whether the turn's final natural reply write is in flight.
-    final_reply_in_flight: bool,
+    /// When the closed turn's grants were parked. If a final write never
+    /// reports back, [`flush_pending_ai_turns`] revokes at this point so a
+    /// stuck write cannot keep grants alive forever.
+    final_writes_deadline: Option<Instant>,
+    /// Whether a dead session's teardown is waiting for its final writes to
+    /// land before it removes the flow context (`Gone`).
+    retire_after_final_writes: bool,
 }
 
 #[cfg(unix)]
@@ -603,12 +618,11 @@ impl AiRoomInfo {
             first_posted_turn: None,
             anchor_in_flight: None,
             start_failed_at: None,
-            pending_final_writes: 0,
+            pending_final_writes: BTreeSet::new(),
             final_writes_pending_revoke: false,
             final_turn_key: None,
-            final_turn_in_flight: false,
-            final_activity_in_flight: false,
-            final_reply_in_flight: false,
+            final_writes_deadline: None,
+            retire_after_final_writes: false,
         }
     }
 
@@ -622,6 +636,11 @@ impl AiRoomInfo {
         self.anchor_in_flight = None;
         self.status_busy = false;
         self.status_queued = 0;
+        self.pending_final_writes.clear();
+        self.final_writes_pending_revoke = false;
+        self.final_turn_key = None;
+        self.final_writes_deadline = None;
+        self.retire_after_final_writes = false;
     }
 }
 
@@ -5706,18 +5725,20 @@ fn run_request_task_permissions(    cx: &mut Cx,
 }
 
 /// The tool-call receipt for a plan that needed no prompt: success only when
-/// every item is already allowed, a failed receipt when every item is blocked
-/// or not offered, and a failed "some blocked" note for a mix.
+/// every item is already allowed, a failed "Blocked by room policy" when every
+/// item is blocked by policy, a failed "Not offered" when every item is
+/// unofferable, and a failed mixed note otherwise.
 #[cfg(unix)]
 fn settled_task_receipt(plan: &TaskPlan) -> (bool, &'static str) {
-    if plan.items.iter().all(|item| matches!(item.state, ItemState::AlreadyAllowed)) {
+    let all = |pred: fn(&ItemState) -> bool| !plan.items.is_empty() && plan.items.iter().all(|item| pred(&item.state));
+    if all(|state| matches!(state, ItemState::AlreadyAllowed)) {
         (true, "Nothing new to allow")
-    } else if !plan.items.is_empty()
-        && plan.items.iter().all(|item| matches!(item.state, ItemState::Blocked(_) | ItemState::NotOffered(_)))
-    {
+    } else if all(|state| matches!(state, ItemState::Blocked(_))) {
         (false, "Blocked by room policy")
+    } else if all(|state| matches!(state, ItemState::NotOffered(_))) {
+        (false, "Not offered")
     } else {
-        (false, "Some needs are blocked by room policy")
+        (false, "Some needs were refused")
     }
 }
 
@@ -6177,14 +6198,12 @@ fn revoke_task_grants(room_id: &OwnedRoomId) {
         state.dismissed_task_plans.retain(|(room, _), _| room != room_id.as_str());
         state.task_request_counts.remove(room_id.as_str());
         // Grants are gone, so no final write still needs them; forget any
-        // outstanding write bookkeeping so a later turn's counter is clean.
+        // outstanding write bookkeeping so a later turn's tokens are clean.
         if let Some(info) = state.ai_rooms.get_mut(room_id) {
-            info.pending_final_writes = 0;
+            info.pending_final_writes.clear();
             info.final_writes_pending_revoke = false;
             info.final_turn_key = None;
-            info.final_turn_in_flight = false;
-            info.final_activity_in_flight = false;
-            info.final_reply_in_flight = false;
+            info.final_writes_deadline = None;
         }
         let ids: Vec<u64> = state
             .task_ledger
@@ -6214,6 +6233,11 @@ fn revoke_task_grants(room_id: &OwnedRoomId) {
 
 /// Takes every task prompt pending for a room (without a UI handle), so a
 /// teardown path can answer its caller even when it cannot close the modal.
+///
+/// A host-raised carried-over prompt ([`TaskResume::UserPrompt`]) holds the
+/// user messages it was raised for; dropping it here loses those copies, but
+/// the room's cursor was never advanced for a held message, so the next
+/// timeline update re-forwards them and re-raises the prompt.
 #[cfg(unix)]
 fn take_room_tasks(room_id: &OwnedRoomId) -> Vec<TaskPrompt> {
     with_a2app(|state| {
@@ -6885,17 +6909,7 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
             // turn has started leaves the room's ledger to that newer turn's
             // close, which removes every entry the room applied.
             if answer_id.is_none() {
-                let landed = with_a2app(|state| {
-                    let info = state.ai_rooms.get_mut(&room_id)?;
-                    info.final_reply_in_flight.then(|| {
-                        info.final_reply_in_flight = false;
-                    })
-                })
-                .flatten()
-                .is_some();
-                if landed {
-                    final_write_landed(&room_id);
-                }
+                final_write_landed(&room_id, FINAL_REPLY_WRITE_ID);
             }
             let Some((_, turn, answer, receipts)) = parked else { return };
             // The write outlives a turn the user cancelled (its tool call is
@@ -7023,7 +7037,7 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
                 let _ = answer.send(result);
             }
         }
-        AiRoomAction::StateEventPosted { room_id, event_type, success } => {
+        AiRoomAction::StateEventPosted { room_id, event_type, write_id, success } => {
             // Release the coalescing guard for this room's turn card so the
             // next pending snapshot can be written (see
             // `flush_pending_ai_turns`), and adapt the write spacing: a rate
@@ -7048,34 +7062,34 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
                         }
                     }
                 });
-                // A closed turn's final Done snapshot is the one write whose
-                // result releases the turn's task grants.
-                let landed = with_a2app(|state| {
-                    let info = state.ai_rooms.get_mut(&room_id)?;
-                    info.final_turn_in_flight.then(|| {
-                        info.final_turn_in_flight = false;
-                    })
-                })
-                .flatten()
-                .is_some();
-                if landed {
-                    final_write_landed(&room_id);
-                }
             }
-            if event_type.as_str() == AI_ACTIVITY_EVENT_TYPE {
-                let landed = with_a2app(|state| {
-                    let info = state.ai_rooms.get_mut(&room_id)?;
-                    info.final_activity_in_flight.then(|| {
-                        info.final_activity_in_flight = false;
-                    })
-                })
-                .flatten()
-                .is_some();
-                if landed {
-                    final_write_landed(&room_id);
-                }
-            }
+            // A closed turn's final write releases its token when it lands.
+            final_write_landed(&room_id, write_id);
         }
+    }
+}
+
+/// Tears down a session that just died. A `Gone` session's final Stopped row
+/// and `Done` snapshot still need its flow context, so if a closed turn has
+/// final writes outstanding the teardown is deferred ([`settle_closed_turn`]
+/// runs it once they land). Every other path stops at once.
+#[cfg(unix)]
+fn retire_ai_session(room_id: &OwnedRoomId) {
+    let deferred = with_a2app(|state| {
+        let info = state.ai_rooms.get_mut(room_id)?;
+        if info.final_writes_pending_revoke
+            && (info.final_turn_key.is_some() || !info.pending_final_writes.is_empty())
+        {
+            info.retire_after_final_writes = true;
+            Some(true)
+        } else {
+            Some(false)
+        }
+    })
+    .flatten()
+    .unwrap_or(false);
+    if !deferred {
+        stop_ai_session(room_id);
     }
 }
 
@@ -8045,6 +8059,10 @@ fn raise_carried_permission_prompt(room_id: &OwnedRoomId, texts: &[(OwnedEventId
             resume: TaskResume::UserPrompt { texts: texts.to_vec() },
         });
     });
+    // `forward_ai_room_texts` is called from the room screen while the runtime
+    // pass that shows queued prompts may already have run; wake it so the
+    // carried-over modal appears without waiting for another event.
+    makepad_widgets::SignalToUI::set_ui_signal();
     true
 }
 
@@ -8262,11 +8280,12 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
                             // The only final write left is the `Done` snapshot;
                             // its result releases the turn's grants.
                             close_active_turn(&room_id, false);
+                            settle_closed_turn(&room_id);
                         } else {
                             to_post.push((room_id.clone(), text));
                             // The reply and the Done snapshot are still being
                             // written; keep this turn's grants until both land
-                            // (see `PostReplyResult` and `flush_pending_ai_turns`).
+                            // (the reply is queued below, then settled).
                             close_active_turn(&room_id, false);
                         }
                     }
@@ -8282,6 +8301,7 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
                             }
                         });
                         close_active_turn(&room_id, false);
+                        settle_closed_turn(&room_id);
                         ui.redraw(cx);
                     }
                     SessionUpdate::Error(msg) => {
@@ -8299,15 +8319,17 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
                         close_active_turn(&room_id, false);
                         log!("AI Rooms: room {room_id}'s agent session reported an error: {msg}");
                         post_ai_activity(&room_id, AiActivityKind::Error, Some(&msg));
+                        settle_closed_turn(&room_id);
                         errors.push(msg)
                     }
                     SessionUpdate::Gone(msg) => {
                         log!("AI Rooms: room {room_id}'s agent session is GONE: {msg}");
                         // The session is dead, but its final Stopped row and
                         // Done snapshot still need the turn's grants: keep them
-                        // until those writes land, then revoke.
+                        // until those writes land, then revoke and retire.
                         close_active_turn(&room_id, false);
                         post_ai_activity(&room_id, AiActivityKind::Stopped, Some(&msg));
+                        settle_closed_turn(&room_id);
                         deaths.push((room_id.clone(), msg))
                     }
                 }
@@ -8316,6 +8338,9 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
     }
     for (room_id, text) in to_post {
         post_ai_reply(&room_id, text, None);
+        // The natural reply registered its final-write token; settle now that
+        // it is queued (a newer turn leaves the ledger to that turn's close).
+        settle_closed_turn(&room_id);
     }
     for msg in errors {
         log!("AI Rooms: showing session error popup: {msg}");
@@ -8336,9 +8361,11 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
         });
         // A dead session is a (re)start boundary: its one-time grants,
         // in-flight reads/posts, parked prompts and turn state all go, exactly
-        // as the panel's power-off does it.
+        // as the panel's power-off does it. Its final Stopped row and Done
+        // snapshot, though, still need the session's flow context, so the
+        // teardown waits for them when they are outstanding.
         refuse_room_prompts(cx, ui, &room_id);
-        stop_ai_session(&room_id);
+        retire_ai_session(&room_id);
         ui.redraw(cx);
     }
 
@@ -9923,16 +9950,10 @@ fn post_ai_activity(room_id: &OwnedRoomId, kind: AiActivityKind, label: Option<&
     };
     // Error/stopped rows are a closed turn's final output: register the write
     // so the turn's grants stay live until it lands.
-    if post_ai_state_event(room_id, AI_ACTIVITY_EVENT_TYPE, &next_ai_state_key("activity"), &content) {
-        register_final_write(room_id);
-        with_a2app(|state| {
-            if let Some(info) = state.ai_rooms.get_mut(room_id) {
-                info.final_activity_in_flight = true;
-            }
-        });
-    } else {
-        // The row could not even be queued; the write is not outstanding.
-        maybe_revoke_closed_turn(room_id);
+    match post_ai_state_event(room_id, AI_ACTIVITY_EVENT_TYPE, &next_ai_state_key("activity"), &content) {
+        Some(token) => register_final_write(room_id, token),
+        // The row could not even be queued; it is not outstanding.
+        None => settle_closed_turn(room_id),
     }
 }
 
@@ -10037,47 +10058,67 @@ fn with_turn(
     .flatten()
 }
 
-/// Records one final write a closed turn must land before its task grants can
-/// be revoked.
+/// Registers one final write a closed turn must land before its task grants
+/// can be revoked.
 #[cfg(unix)]
-fn register_final_write(room_id: &OwnedRoomId) {
+fn register_final_write(room_id: &OwnedRoomId, token: u64) {
     with_a2app(|state| {
         if let Some(info) = state.ai_rooms.get_mut(room_id) {
-            info.pending_final_writes = info.pending_final_writes.saturating_add(1);
+            info.pending_final_writes.insert(token);
         }
     });
 }
 
-/// Revokes a closed turn's grants once every registered final write has landed
-/// and no newer turn has taken over the room's ledger. A newer turn's own close
-/// revokes whatever both turns applied, so this leaves the ledger alone when an
-/// active turn exists.
+/// Releases one final-write token and revokes the closed turn's grants once
+/// every token is gone.
 #[cfg(unix)]
-fn maybe_revoke_closed_turn(room_id: &OwnedRoomId) {
-    let revoke = with_a2app(|state| {
+fn final_write_landed(room_id: &OwnedRoomId, token: u64) {
+    with_a2app(|state| {
+        if let Some(info) = state.ai_rooms.get_mut(room_id) {
+            info.pending_final_writes.remove(&token);
+        }
+    });
+    settle_closed_turn(room_id);
+}
+
+/// Revokes a closed turn's grants once its `Done` snapshot is no longer queued,
+/// every outstanding final-write token has landed, and no newer turn has taken
+/// over the room's ledger. A newer turn's own close revokes whatever both turns
+/// applied, so this leaves the ledger alone when an active turn exists.
+///
+/// A dead session's teardown waits here too: its flow context must outlive the
+/// writes it still has queued (`Gone`).
+#[cfg(unix)]
+fn settle_closed_turn(room_id: &OwnedRoomId) {
+    let (revoke, retire) = with_a2app(|state| {
         let info = state.ai_rooms.get_mut(room_id)?;
-        if !info.final_writes_pending_revoke || info.pending_final_writes > 0 {
-            return Some(false);
+        if !info.final_writes_pending_revoke
+            || info.final_turn_key.is_some()
+            || !info.pending_final_writes.is_empty()
+        {
+            return Some((false, false));
         }
         info.final_writes_pending_revoke = false;
-        Some(info.active_turn.is_none())
+        info.final_writes_deadline = None;
+        // A newer turn owns the ledger now; its own close revokes it.
+        if info.active_turn.is_some() {
+            return Some((false, false));
+        }
+        Some((true, info.retire_after_final_writes))
     })
     .flatten()
-    .unwrap_or(false);
+    .unwrap_or((false, false));
     if revoke {
         revoke_task_grants(room_id);
     }
-}
-
-/// One final write landed. See [`maybe_revoke_closed_turn`].
-#[cfg(unix)]
-fn final_write_landed(room_id: &OwnedRoomId) {
-    with_a2app(|state| {
-        if let Some(info) = state.ai_rooms.get_mut(room_id) {
-            info.pending_final_writes = info.pending_final_writes.saturating_sub(1);
-        }
-    });
-    maybe_revoke_closed_turn(room_id);
+    if retire {
+        with_a2app(|state| {
+            if let Some(info) = state.ai_rooms.get_mut(room_id) {
+                info.retire_after_final_writes = false;
+            }
+        });
+        stop_ai_session(room_id);
+    }
 }
 
 /// Settles and clears this room's open turn: rewrites its `ai_turn` row
@@ -10085,14 +10126,13 @@ fn final_write_landed(room_id: &OwnedRoomId) {
 /// it, so the next turn gets a fresh card. A no-op when no turn is open.
 ///
 /// When `revoke_grants` is false, the turn's task grants are kept until its
-/// final writes land: this queues the `Done` snapshot and registers it on the
-/// room's [pending-final-writes counter](AiRoomInfo::pending_final_writes),
-/// and [`final_write_landed`] revokes once the counter reaches zero. The real
-/// reply and any error/stopped activity row register themselves the same way,
-/// so every write the turn produces still passes the whole-label sharing check
-/// while those grants are live. `revoke_grants` true revokes at once, for the
-/// rare close with no write to wait for (session teardown uses
-/// `revoke_task_grants` directly).
+/// final writes land: this queues the `Done` snapshot (tracked by
+/// [`AiRoomInfo::final_turn_key`] until the flush submits it), and the caller
+/// finishes with [`settle_closed_turn`] after it has queued the turn's reply or
+/// error/stopped row. Those later writes register their own tokens, so the last
+/// one to land revokes. `revoke_grants` true revokes at once, for the rare
+/// close with no write to wait for (session teardown uses `revoke_task_grants`
+/// directly).
 #[cfg(unix)]
 fn close_active_turn(room_id: &OwnedRoomId, revoke_grants: bool) {
     let closed = with_a2app(|state| {
@@ -10103,11 +10143,9 @@ fn close_active_turn(room_id: &OwnedRoomId, revoke_grants: bool) {
         // earlier rewrite.
         turn.seq = turn.seq.saturating_add(1);
         if !revoke_grants {
-            // Register the Done snapshot now; the flush marks it in flight and
-            // its result (or a dropped write) releases it.
             info.final_writes_pending_revoke = true;
             info.final_turn_key = Some(turn.key.clone());
-            info.pending_final_writes = info.pending_final_writes.saturating_add(1);
+            info.final_writes_deadline = Some(Instant::now() + FINAL_WRITE_FAILSAFE);
         }
         Some((
             turn.key.clone(),
@@ -10133,15 +10171,15 @@ fn close_active_turn(room_id: &OwnedRoomId, revoke_grants: bool) {
         }
         None if revoke_grants => revoke_task_grants(room_id),
         None => {
-            // No turn card was open, so there is no Done snapshot. An error
-            // or stopped row (queued by the caller) is the only final write;
-            // if there is none, this revokes now.
+            // No turn card was open, so there is no Done snapshot. The caller
+            // still has to queue the error/stopped row or the reply, then
+            // settle; do not revoke here, or that write would be refused.
             with_a2app(|state| {
                 if let Some(info) = state.ai_rooms.get_mut(room_id) {
                     info.final_writes_pending_revoke = true;
+                    info.final_writes_deadline = Some(Instant::now() + FINAL_WRITE_FAILSAFE);
                 }
             });
-            maybe_revoke_closed_turn(room_id);
         }
     }
 }
@@ -10202,6 +10240,28 @@ fn post_ai_turn(room_id: &OwnedRoomId, key: &str, content: &AiTurnContent) {
 #[cfg(unix)]
 fn flush_pending_ai_turns(cx: &mut Cx) {
     let now = Instant::now();
+    // Failsafe: a closed turn whose final write never reports back must not
+    // keep its grants alive forever. The flush timer calls this every pass.
+    let expired: Vec<OwnedRoomId> = with_a2app(|state| {
+        state
+            .ai_rooms
+            .iter_mut()
+            .filter(|(_, info)| {
+                info.final_writes_pending_revoke
+                    && info.final_writes_deadline.is_some_and(|deadline| now >= deadline)
+            })
+            .map(|(room_id, info)| {
+                info.pending_final_writes.clear();
+                info.final_turn_key = None;
+                room_id.clone()
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+    for room_id in expired {
+        log!("AI Rooms: room {room_id}'s final writes did not report back in time; releasing its turn grants.");
+        settle_closed_turn(&room_id);
+    }
     let mut to_post: Vec<(OwnedRoomId, String, AiTurnContent, bool)> = Vec::new();
     let mut needs_timer = false;
     with_a2app(|state| {
@@ -10261,17 +10321,12 @@ fn flush_pending_ai_turns(cx: &mut Cx) {
         }
     });
     for (room_id, key, content, final_turn) in to_post {
-        let submitted = post_ai_state_event(&room_id, AI_TURN_EVENT_TYPE, &key, &content);
+        let token = post_ai_state_event(&room_id, AI_TURN_EVENT_TYPE, &key, &content);
         if final_turn {
-            if submitted {
-                with_a2app(|state| {
-                    if let Some(info) = state.ai_rooms.get_mut(&room_id) {
-                        info.final_turn_in_flight = true;
-                    }
-                });
-            } else {
-                // The final snapshot could not be queued; release it now.
-                final_write_landed(&room_id);
+            match token {
+                Some(token) => register_final_write(&room_id, token),
+                // The final snapshot could not be queued; it is not outstanding.
+                None => settle_closed_turn(&room_id),
             }
         }
     }
@@ -10280,15 +10335,15 @@ fn flush_pending_ai_turns(cx: &mut Cx) {
 /// Serializes one AI-session activity/tool-call row and hands it to the
 /// async worker as a [`AiRoomRequest::PostAiStateEvent`]. Best-effort: the
 /// worker logs failures and the turn continues (the reply's receipts are the
-/// durable record). Returns whether the write was actually queued; a dropped
-/// write gets no result, so callers relying on one must settle it here.
+/// durable record). Returns the host write id when the write was queued; a
+/// dropped write gets no result, so callers relying on one must settle it.
 #[cfg(unix)]
 fn post_ai_state_event(
     room_id: &OwnedRoomId,
     event_type: &str,
     state_key: &str,
     content: &impl serde::Serialize,
-) -> bool {
+) -> Option<u64> {
     if !room_policy_allows(room_id.as_str(), RoomAccess::Write) {
         with_a2app(|state| {
             if let Some(info) = state.ai_rooms.get_mut(room_id) {
@@ -10296,7 +10351,7 @@ fn post_ai_state_event(
                 info.pending_ai_turns.clear();
             }
         });
-        return false;
+        return None;
     }
     let flow_context = match super::information_flow::agent_context(room_id.as_str()).and_then(|context| {
         super::information_flow::ensure_room_output(&context, room_id.as_str())?;
@@ -10310,26 +10365,27 @@ fn post_ai_state_event(
                     info.pending_ai_turns.clear();
                 }
             });
-            return false;
+            return None;
         }
     };
-    match serde_json::to_value(content) {
-        Ok(json) => {
-            submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::PostAiStateEvent {
-                room_id: room_id.clone(),
-                event_type: event_type.to_string(),
-                state_key: state_key.to_string(),
-                content: json,
-                flow_epoch: a2app_core::information_flow::context_epoch(&flow_context).unwrap_or(0),
-                flow_context,
-            }));
-            true
-        }
+    let json = match serde_json::to_value(content) {
+        Ok(json) => json,
         Err(e) => {
             log!("AI Rooms: couldn't serialize an {event_type} state row: {e}");
-            false
+            return None;
         }
-    }
+    };
+    let write_id = NEXT_AI_WRITE_ID.fetch_add(1, Ordering::Relaxed);
+    submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::PostAiStateEvent {
+        room_id: room_id.clone(),
+        event_type: event_type.to_string(),
+        state_key: state_key.to_string(),
+        content: json,
+        write_id,
+        flow_epoch: a2app_core::information_flow::context_epoch(&flow_context).unwrap_or(0),
+        flow_context,
+    }));
+    Some(write_id)
 }
 
 /// Writes `text` as an `ai_reply` state event — the agent's only output
@@ -10410,12 +10466,7 @@ fn post_ai_reply(room_id: &OwnedRoomId, text: String, answer_id: Option<u64>) {
     // the write result lands (see [`AiRoomAction::PostReplyResult`]). A parked
     // `send_message` reply belongs to a still-live turn and is not counted.
     if answer_id.is_none() {
-        register_final_write(room_id);
-        with_a2app(|state| {
-            if let Some(info) = state.ai_rooms.get_mut(room_id) {
-                info.final_reply_in_flight = true;
-            }
-        });
+        register_final_write(room_id, FINAL_REPLY_WRITE_ID);
     }
 }
 
@@ -11431,11 +11482,14 @@ View{note := Label{text:"waiting"}}
         assert_eq!(settled_task_receipt(&plan(vec![ItemState::AlreadyAllowed])), (true, "Nothing new to allow"));
         assert_eq!(settled_task_receipt(&plan(vec![ItemState::Blocked(TaskReason::BlockedByRoomPolicy)])),
             (false, "Blocked by room policy"));
+        assert_eq!(settled_task_receipt(&plan(vec![ItemState::NotOffered(TaskReason::NotOffered)])),
+            (false, "Not offered"));
         assert_eq!(settled_task_receipt(&plan(vec![ItemState::AlreadyAllowed, ItemState::NotOffered(TaskReason::NotOffered)])),
-            (false, "Some needs are blocked by room policy"));
+            (false, "Some needs were refused"));
     }
 
-    /// The directory defaults must grant the exact directory capabilities, not    /// their whole permission groups: room search, previews, invites and the
+    /// The directory defaults must grant the exact directory capabilities, not
+    /// their whole permission groups: room search, previews, invites and the
     /// incoming room-list hooks share `MatrixRoomsList`, and `MatrixSpaces` is
     /// shared with the space-changed hook. The store's group state stays Ask;
     /// only a scoped grant for each directory capability is recorded.
@@ -11526,7 +11580,9 @@ View{note := Label{text:"waiting"}}
         let account = format!("final-writes-{}", std::process::id());
         let previous_account = super::super::information_flow::TEST_ACCOUNT.with(|a| a.replace(Some(account.clone())));
         let previous_state = A2APP.with(|state| state.replace(None));
-        initialize_state(AppRegistry::new(Vec::new()), PermissionStore::default(), A2AppPersistedState::default(), Default::default());
+        let mut runtime_permissions = PermissionStore::default();
+        runtime_permissions.set_matrix_write(true);
+        initialize_state(AppRegistry::new(Vec::new()), runtime_permissions, A2AppPersistedState::default(), Default::default());
         let room_id: OwnedRoomId = SOURCE.try_into().unwrap();
         let context = super::super::information_flow::prepare_agent(SOURCE).unwrap();
         let provider = Recipient::ModelProvider("final-provider".into());
@@ -11552,21 +11608,35 @@ View{note := Label{text:"waiting"}}
             });
             state.task_ledger.insert(applied);
         });
-        // The turn closes with a Done snapshot plus an error activity row;
-        // both register before either lands.
+        // The turn closes with a Done snapshot on its card. Closing must not
+        // revoke: the caller has not queued the reply/activity yet, and the
+        // Done is not even submitted until the flush runs.
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let ui = WidgetRef::empty();
         close_active_turn(&room_id, false);
-        register_final_write(&room_id);
-        // While the final writes are outstanding, the whole-label output check
+        settle_closed_turn(&room_id);
+        assert!(with_a2app(|state| state.task_ledger.get(7).is_some()).unwrap(),
+            "closing a turn must not revoke before its Done snapshot is submitted");
+        // The flush submits the Done and registers its final-write token.
+        flush_pending_ai_turns(&mut cx);
+        let token = with_a2app(|state| {
+            let info = state.ai_rooms.get(&room_id)?;
+            assert!(info.final_turn_key.is_none(), "the flush consumed the queued Done");
+            info.pending_final_writes.iter().next().copied()
+        })
+        .flatten()
+        .expect("the flush registers the final snapshot's token");
+        // While the write is outstanding, the whole-label output check
         // `ensure_ai_state_output` makes (the room and the homeserver origin)
-        // still passes, so the writes are not refused.
+        // still passes, so the write is not refused.
         assert!(flow::ensure_allowed(&context, &own_room).is_ok());
         assert!(flow::ensure_allowed(&context, &homeserver).is_ok());
-        // The Done snapshot lands first; one write still keeps the grants.
-        final_write_landed(&room_id);
         assert!(with_a2app(|state| state.task_ledger.get(7).is_some()).unwrap(),
-            "a still-outstanding final write keeps the turn's grants");
-        // The last write lands: the ledger is empty and the grants are gone.
-        final_write_landed(&room_id);
+            "an outstanding final write keeps the turn's grants");
+        // The Done snapshot lands: the ledger is empty and the grants are gone.
+        apply_ai_room_action(&mut cx, &ui, AiRoomAction::StateEventPosted {
+            room_id: room_id.clone(), event_type: AI_TURN_EVENT_TYPE.into(), write_id: token, success: true,
+        });
         assert!(with_a2app(|state| state.task_ledger.is_empty()).unwrap(),
             "the last final write empties the room's ledger");
         assert!(flow::ensure_allowed(&context, &homeserver).is_err());
@@ -11575,6 +11645,104 @@ View{note := Label{text:"waiting"}}
         A2APP.with(|state| { state.replace(previous_state); });
         super::super::information_flow::TEST_ACCOUNT.with(|a| { a.replace(previous_account); });
     }
+
+    /// A turn with no tool calls (no card) has no Done snapshot. Closing it
+    /// must still leave the revoke to the caller after it queues the reply, or
+    /// the reply would be refused because the grants were already gone.
+    #[cfg(unix)]
+    #[test]
+    fn closing_a_cardless_turn_keeps_grants_for_the_reply() {
+        let account = format!("cardless-{}", std::process::id());
+        let previous_account = super::super::information_flow::TEST_ACCOUNT.with(|a| a.replace(Some(account.clone())));
+        let previous_state = A2APP.with(|state| state.replace(None));
+        initialize_state(AppRegistry::new(Vec::new()), PermissionStore::default(), A2AppPersistedState::default(), Default::default());
+        let room_id: OwnedRoomId = SOURCE.try_into().unwrap();
+        let context = a2app_core::information_flow::ContextId::Agent { account: account.clone(), room: SOURCE.into() };
+        with_a2app(|state| {
+            state.ai_rooms.insert(room_id.clone(), AiRoomInfo::new(None));
+            state.task_ledger.insert(a2app_core::task_grants::AppliedTask {
+                task_id: 9, subject: "agent".into(), context: context.clone(), epoch: 1,
+                title: "t".into(), plan_hash: [0; 32], grants: Vec::new(), item_states: BTreeMap::new(),
+            });
+        });
+        // No active turn: closing it must not revoke on its own. The caller
+        // queues the reply, then settles.
+        close_active_turn(&room_id, false);
+        assert!(with_a2app(|state| state.task_ledger.get(9).is_some()).unwrap(),
+            "a cardless turn must keep its grants until the reply is queued");
+        // The reply final write is the only outstanding token; it keeps the
+        // grants until it lands.
+        register_final_write(&room_id, FINAL_REPLY_WRITE_ID);
+        settle_closed_turn(&room_id);
+        assert!(with_a2app(|state| state.task_ledger.get(9).is_some()).unwrap(),
+            "the queued reply keeps the grants until it lands");
+        final_write_landed(&room_id, FINAL_REPLY_WRITE_ID);
+        assert!(with_a2app(|state| state.task_ledger.is_empty()).unwrap(),
+            "the landed reply empties the room's ledger");
+        A2APP.with(|state| { state.replace(previous_state); });
+        super::super::information_flow::TEST_ACCOUNT.with(|a| { a.replace(previous_account); });
+    }
+
+    /// Two final writes outstanding at once (an error row and a stopped row in
+    /// one pass) each hold a token: the grants stay live until both land, so a
+    /// single boolean can never strand the second one.
+    #[cfg(unix)]
+    #[test]
+    fn two_final_writes_each_hold_the_grants_until_they_land() {
+        let previous_state = A2APP.with(|state| state.replace(None));
+        initialize_state(AppRegistry::new(Vec::new()), PermissionStore::default(), A2AppPersistedState::default(), Default::default());
+        let room_id: OwnedRoomId = SOURCE.try_into().unwrap();
+        let context = a2app_core::information_flow::ContextId::Agent { account: "alice".into(), room: SOURCE.into() };
+        with_a2app(|state| {
+            state.ai_rooms.insert(room_id.clone(), AiRoomInfo::new(None));
+            state.task_ledger.insert(a2app_core::task_grants::AppliedTask {
+                task_id: 11, subject: "agent".into(), context, epoch: 1,
+                title: "t".into(), plan_hash: [0; 32], grants: Vec::new(), item_states: BTreeMap::new(),
+            });
+        });
+        close_active_turn(&room_id, false);
+        register_final_write(&room_id, 1);
+        register_final_write(&room_id, 2);
+        settle_closed_turn(&room_id);
+        assert!(with_a2app(|state| state.task_ledger.get(11).is_some()).unwrap(),
+            "two outstanding writes keep the grants");
+        final_write_landed(&room_id, 1);
+        assert!(with_a2app(|state| state.task_ledger.get(11).is_some()).unwrap(),
+            "the second write still holds the grants");
+        final_write_landed(&room_id, 2);
+        assert!(with_a2app(|state| state.task_ledger.is_empty()).unwrap(),
+            "the last write empties the ledger");
+        A2APP.with(|state| { state.replace(previous_state); });
+    }
+
+    /// The failsafe: a final write that never reports back must not keep the
+    /// grants alive past the deadline.
+    #[cfg(unix)]
+    #[test]
+    fn a_stuck_final_write_is_released_by_the_failsafe_deadline() {
+        let previous_state = A2APP.with(|state| state.replace(None));
+        initialize_state(AppRegistry::new(Vec::new()), PermissionStore::default(), A2AppPersistedState::default(), Default::default());
+        let room_id: OwnedRoomId = SOURCE.try_into().unwrap();
+        let context = a2app_core::information_flow::ContextId::Agent { account: "alice".into(), room: SOURCE.into() };
+        with_a2app(|state| {
+            state.ai_rooms.insert(room_id.clone(), AiRoomInfo::new(None));
+            let info = state.ai_rooms.get_mut(&room_id).unwrap();
+            info.final_writes_pending_revoke = true;
+            info.pending_final_writes = BTreeSet::from([42u64]);
+            info.final_writes_deadline = Some(Instant::now() - Duration::from_secs(1));
+            state.task_ledger.insert(a2app_core::task_grants::AppliedTask {
+                task_id: 12, subject: "agent".into(), context, epoch: 1,
+                title: "t".into(), plan_hash: [0; 32], grants: Vec::new(), item_states: BTreeMap::new(),
+            });
+        });
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        flush_pending_ai_turns(&mut cx);
+        assert!(with_a2app(|state| state.task_ledger.is_empty()).unwrap(),
+            "the deadline releases a write that never reported back");
+        A2APP.with(|state| { state.replace(previous_state); });
+    }
+
+    // (the item-3 test above continues below with the newer-turn case)
 
     /// A natural reply that lands after a newer turn has started does not
     /// revoke the room's ledger; the newer turn's close removes every entry.
@@ -11594,7 +11762,7 @@ View{note := Label{text:"waiting"}}
                 key: "turn-2".into(), tool_calls: Vec::new(), thinking: false, seq: 0, created_at: 0,
             });
             info.final_writes_pending_revoke = true;
-            info.pending_final_writes = 0;
+            info.pending_final_writes = BTreeSet::from([5u64]);
             for task_id in [1u64, 2u64] {
                 state.task_ledger.insert(a2app_core::task_grants::AppliedTask {
                     task_id,
@@ -11608,7 +11776,9 @@ View{note := Label{text:"waiting"}}
                 });
             }
         });
-        maybe_revoke_closed_turn(&room_id);
+        // The older turn's last final write lands while a newer turn is live:
+        // the newer turn owns the ledger, so nothing is revoked yet.
+        final_write_landed(&room_id, 5);
         assert!(with_a2app(|state| !state.task_ledger.is_empty()).unwrap(),
             "the newer turn owns the room's ledger");
         // The newer turn closes: its close removes every ledger entry of the
@@ -11617,10 +11787,10 @@ View{note := Label{text:"waiting"}}
             if let Some(info) = state.ai_rooms.get_mut(&room_id) {
                 info.active_turn = None;
                 info.final_writes_pending_revoke = true;
-                info.pending_final_writes = 0;
+                info.pending_final_writes.clear();
             }
         });
-        maybe_revoke_closed_turn(&room_id);
+        settle_closed_turn(&room_id);
         assert!(with_a2app(|state| state.task_ledger.is_empty()).unwrap(),
             "the newer turn's close removes every ledger entry of the room");
         A2APP.with(|state| { state.replace(previous_state); });

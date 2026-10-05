@@ -106,6 +106,9 @@ pub enum AiRoomRequest {
         event_type: String,
         state_key: String,
         content: serde_json::Value,
+        /// Host-assigned identity echoed back on the result, so the runtime
+        /// can match a final write's completion to the token it registered.
+        write_id: u64,
         flow_epoch: u64, flow_context: ContextId,
     },
     /// A capability-gated attached-room read the session's agent asked for
@@ -145,7 +148,7 @@ pub enum AiRoomAction {
     /// this to release the room's `ai_turn` in-flight flag — and to widen or
     /// narrow its write spacing — so the next coalesced turn snapshot can go
     /// out without piling onto the server's state-event rate limit.
-    StateEventPosted { room_id: OwnedRoomId, event_type: String, success: bool },
+    StateEventPosted { room_id: OwnedRoomId, event_type: String, write_id: u64, success: bool },
 }
 
 /// Raw Matrix state remains plaintext even in encrypted rooms.
@@ -292,12 +295,12 @@ async fn handle_ai_room_request_inner(request: AiRoomRequest) {
                 }
             }
         }
-        AiRoomRequest::PostAiStateEvent { room_id, event_type, state_key, content, flow_context, .. } => {
+        AiRoomRequest::PostAiStateEvent { room_id, event_type, state_key, content, write_id, flow_context, .. } => {
             let Some(room) = get_client().and_then(|c| c.get_room(&room_id)) else {
                 log!("AI Rooms worker: can't post {event_type} to {room_id}: room not found in client.");
                 // Still release the runtime's in-flight flag; the row is lost
                 // but the turn must not wedge behind it.
-                Cx::post_action(AiRoomAction::StateEventPosted { room_id, event_type, success: false });
+                Cx::post_action(AiRoomAction::StateEventPosted { room_id, event_type, write_id, success: false });
                 return;
             };
             let success = match send_ai_state_event(&room, &event_type, &state_key, content, &flow_context).await {
@@ -309,7 +312,7 @@ async fn handle_ai_room_request_inner(request: AiRoomRequest) {
                     false
                 }
             };
-            Cx::post_action(AiRoomAction::StateEventPosted { room_id, event_type, success });
+            Cx::post_action(AiRoomAction::StateEventPosted { room_id, event_type, write_id, success });
         }
         AiRoomRequest::ToolRead { id, room_id, tool, authorization, flow_context, .. } => {
             let read = async {
