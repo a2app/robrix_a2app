@@ -11742,6 +11742,39 @@ View{note := Label{text:"waiting"}}
         A2APP.with(|state| { state.replace(previous_state); });
     }
 
+    /// Withdrawing a held carried-over prompt must not advance the room's
+    /// cursor: the message was never delivered, so the next timeline update
+    /// re-forwards it (and re-raises the prompt).
+    #[cfg(unix)]
+    #[test]
+    fn withdrawing_a_held_carried_prompt_leaves_the_cursor_for_refetch() {
+        let previous_state = A2APP.with(|state| state.replace(None));
+        initialize_state(AppRegistry::new(Vec::new()), PermissionStore::default(), A2AppPersistedState::default(), Default::default());
+        let room_id: OwnedRoomId = SOURCE.try_into().unwrap();
+        let prior: OwnedEventId = "$prior:example.org".try_into().unwrap();
+        let held: OwnedEventId = "$held:example.org".try_into().unwrap();
+        let context = a2app_core::information_flow::ContextId::Agent { account: "alice".into(), room: SOURCE.into() };
+        let plan = TaskPlan {
+            task_id: 1, subject: "s".into(), context, epoch: 1, title: "t".into(), explanation: "e".into(),
+            items: Vec::new(), plan_hash: [0; 32], needs_fingerprint: [0; 32],
+        };
+        with_a2app(|state| {
+            state.ai_rooms.insert(room_id.clone(), AiRoomInfo::new(Some(prior.clone())));
+            state.task_prompts.push_back(TaskPrompt {
+                room_id: room_id.clone(),
+                plan,
+                resume: TaskResume::UserPrompt { texts: vec![(held, "held message".into())] },
+            });
+        });
+        assert_eq!(take_room_tasks(&room_id).len(), 1);
+        assert_eq!(
+            with_a2app(|state| state.ai_rooms.get(&room_id).and_then(|info| info.cursor.clone())).flatten(),
+            Some(prior),
+            "the held message's event must be re-forwarded on the next pass"
+        );
+        A2APP.with(|state| { state.replace(previous_state); });
+    }
+
     // (the item-3 test above continues below with the newer-turn case)
 
     /// A natural reply that lands after a newer turn has started does not
