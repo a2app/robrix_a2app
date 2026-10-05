@@ -270,6 +270,28 @@ impl Registry {
         Ok(label)
     }
 
+    /// The sources a still-live agent context carries into a new turn: every
+    /// source beyond the baseline (the context's own room and the room
+    /// directory) that has no sharing rule to `provider`. The label persists
+    /// across turns, but a turn-scoped provider rule does not, so the next
+    /// model call would otherwise be refused. The host uses this at the start
+    /// of a turn to raise one prompt for the carried-over sources.
+    pub fn carried_over_sources(&self, context: &ContextId, provider: &Recipient) -> Result<Label, String> {
+        self.check_context(context)?;
+        self.check_healthy()?;
+        provider.validate()?;
+        let own_room = context.room();
+        let label = self.labels(context)?;
+        Ok(label
+            .into_iter()
+            .filter(|source| {
+                let baseline = matches!(source, Source::RoomDirectory { .. })
+                    || matches!(source, Source::Room { room, .. } if Some(room.as_str()) == own_room);
+                !baseline && !self.source_allowed(source, provider, Some(context))
+            })
+            .collect())
+    }
+
     pub fn influences(&self, context: &ContextId) -> Result<Influences, String> {
         let entry = self.stored_context(context)?;
         self.labels(context)?;
@@ -907,6 +929,12 @@ pub fn sharing_allows_for_reader(source: &Source, recipient: &Recipient, reader:
     })
 }
 
+/// The sources a still-live agent context carries into a new turn without a
+/// provider rule; see [`Registry::carried_over_sources`].
+pub fn carried_over_sources(context: &ContextId, provider: &Recipient) -> Result<Label, String> {
+    with_registry(|registry| registry.carried_over_sources(context, provider))
+}
+
 pub fn close_room_session(account: &str, room: &str) -> Result<(), String> {
     with_registry(|registry| registry.close_room_session(account, room))
 }
@@ -1414,6 +1442,50 @@ mod tests {
         registry.begin_agent_session(&context).unwrap();
         assert_eq!(registry.labels(&context).unwrap(), [room_source("alice", "room-a")].into_iter().collect());
         assert_eq!(registry.influences(&context).unwrap(), [Influence::RoomContent { account: "alice".into(), room: "room-a".into() }].into_iter().collect());
+    }
+
+    #[test]
+    fn a_turn_scoped_provider_rule_leaves_a_carried_room_blocked_next_turn() {
+        let root = TestRoot::new();
+        let mut registry = root.registry();
+        let context = agent("alice", "!ai:example.org");
+        let provider = Recipient::ModelProvider("provider".into());
+        registry.register_context(&context).unwrap();
+        registry.begin_agent_session(&context).unwrap();
+        // The baseline own-room source reaches the provider, as the defaults do.
+        registry
+            .grant_sharing(
+                room_source("alice", "!ai:example.org"),
+                provider.clone(),
+                ReaderScope::Context(context.clone()),
+                SharingDuration::Permanent,
+            )
+            .unwrap();
+        // Turn 1 reads room B; the task plan grants the turn-scoped provider rule.
+        let room_b = room_source("alice", "!room-b:example.org");
+        registry.add_sources(&context, [room_b.clone()]).unwrap();
+        let grant = registry
+            .grant_sharing(
+                room_b.clone(),
+                provider.clone(),
+                ReaderScope::Context(context.clone()),
+                SharingDuration::RoomSession { account: "alice".into(), room: "!ai:example.org".into() },
+            )
+            .unwrap();
+        assert!(registry.ensure_allowed(&context, &provider).is_ok());
+        assert!(registry.carried_over_sources(&context, &provider).unwrap().is_empty());
+        // Turn 1 closes: the task rollback revokes the turn-scoped grant.
+        registry.revoke_sharing(grant).unwrap();
+        // Turn 2 starts: the label still holds room B (the conversation memory
+        // persists), but the provider rule is gone, so the first model call is
+        // refused until the user re-allows the carried source.
+        assert!(registry.labels(&context).unwrap().contains(&room_b));
+        assert_eq!(registry.carried_over_sources(&context, &provider).unwrap(), [room_b].into_iter().collect());
+        assert!(registry.ensure_allowed(&context, &provider).is_err(),
+            "the carried-over room is refused until the user re-allows it");
+        // The own room and the directory are the baseline, never carried over.
+        registry.add_sources(&context, [Source::RoomDirectory { account: "alice".into() }]).unwrap();
+        assert_eq!(registry.carried_over_sources(&context, &provider).unwrap().len(), 1);
     }
 
     #[test]

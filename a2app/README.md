@@ -417,6 +417,22 @@ context reads more while the modal is open, the stale approval no longer
 matches and a fresh review is shown. A cross-room post or fetch after reading
 untrusted content therefore pauses for a per-action review; that is intended.
 
+**Carried-over sources between turns.** The agent's conversation memory
+persists for a session, so its information-flow label does too, but the
+permission and sharing rules a turn applied are turn-scoped and revoked when
+the turn closes. At the start of each turn, if the label still holds a source
+from an earlier turn (another room, account data) that the current model
+provider may no longer see, Robrix raises one prompt on the agent's behalf
+before the first model call. It lists `Let <source> reach <provider>` rows
+plus the homeserver-origin and own-room rows (so the turn's reply and activity
+rows can be written), and explains: "Earlier in this conversation the
+assistant read <room names>. Allow it to keep using that information for this
+turn." Approval applies the rows through the same task-apply path and the
+same ledger, so the turn's close revokes them again and the next turn prompts
+again. Declining still delivers the message: the turn runs, the model call is
+refused the standard way ("Information flow blocked"), and the room shows the
+error row.
+
 **Re-asking.** A gated read, fetch or post refused because the label grew
 returns an error telling the agent to ask again with the new need. The agent
 may make at most three requests per turn, and each after the first must contain

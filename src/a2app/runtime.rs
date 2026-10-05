@@ -348,9 +348,21 @@ impl FlowContinuation {
 pub struct TaskPrompt {
     pub room_id: OwnedRoomId,
     pub plan: TaskPlan,
-    /// The `request_task_permissions` tool call to release once the user
-    /// answers (or the turn closes).
-    pub answer: Sender<Result<String, String>>,
+    /// What to do once the user answers. An agent's own request releases the
+    /// parked `request_task_permissions` tool call; a carried-over prompt the
+    /// host raised on the agent's behalf releases the user messages it held
+    /// back so the turn can start.
+    pub resume: TaskResume,
+}
+
+/// What a task prompt does once the user answers it.
+#[cfg(unix)]
+pub enum TaskResume {
+    /// Release the `request_task_permissions` tool call that raised it.
+    AgentTool(Sender<Result<String, String>>),
+    /// Deliver the held user messages; the turn then runs with whatever the
+    /// user approved (on a decline, the model call is refused as usual).
+    UserPrompt { texts: Vec<(OwnedEventId, String)> },
 }
 
 /// A parked agent effect waiting on the exact-action review. The same modal
@@ -5663,7 +5675,7 @@ fn run_request_task_permissions(    cx: &mut Cx,
         return;
     }
     with_a2app(|state| {
-        state.task_prompts.push_back(TaskPrompt { room_id: room_id.clone(), plan, answer });
+        state.task_prompts.push_back(TaskPrompt { room_id: room_id.clone(), plan, resume: TaskResume::AgentTool(answer) });
     });
     show_next_task_prompt(cx, ui);
 }
@@ -5972,12 +5984,15 @@ fn answer_task_prompt(cx: &mut Cx, ui: &WidgetRef, action: TaskPermissionAction)
         with_a2app(|state| state.active_task = Some(prompt));
         return;
     }
-    let TaskPrompt { room_id, plan, answer } = prompt;
+    let TaskPrompt { room_id, plan, resume } = prompt;
     let approved = with_a2app(|state| {
         task_answer_approval(&room_id, &plan, &action, &mut state.dismissed_task_plans)
     })
     .unwrap_or_default();
-    if matches!(action, TaskPermissionAction::NotNow) {
+    // A host-raised carried-over prompt is not the agent's tool call, so it
+    // leaves no `ai_tool_call` row of its own.
+    let agent_tool = matches!(&resume, TaskResume::AgentTool(_));
+    if agent_tool && matches!(action, TaskPermissionAction::NotNow) {
         note_ai_tool_call(&room_id, "request_task_permissions", false, "Declined");
     }
     // Apply outside the state borrow: information-flow rules live in their own
@@ -5988,12 +6003,16 @@ fn answer_task_prompt(cx: &mut Cx, ui: &WidgetRef, action: TaskPermissionAction)
     let outcome = match result {
         Ok(task) => {
             applied = Some(task);
-            note_ai_tool_call(&room_id, "request_task_permissions", true, &format!("Approved: {}", plan.title));
+            if agent_tool {
+                note_ai_tool_call(&room_id, "request_task_permissions", true, &format!("Approved: {}", plan.title));
+            }
             Ok(task_grants::outcome(&plan, &approved).to_string())
         }
         Err(error) => {
             let message = error.message();
-            note_ai_tool_call(&room_id, "request_task_permissions", false, &message);
+            if agent_tool {
+                note_ai_tool_call(&room_id, "request_task_permissions", false, &message);
+            }
             Err(message)
         }
     };
@@ -6003,7 +6022,21 @@ fn answer_task_prompt(cx: &mut Cx, ui: &WidgetRef, action: TaskPermissionAction)
         }
     });
     publish_grants(cx);
-    let _ = answer.send(outcome);
+    match resume {
+        TaskResume::AgentTool(answer) => {
+            let _ = answer.send(outcome);
+        }
+        TaskResume::UserPrompt { texts } => {
+            if let Err(error) = outcome {
+                // The carried-over rules could not be applied; the turn still
+                // runs, so say why before the model call is refused.
+                log!("AI Rooms: couldn't apply the carried-over permissions for {room_id}: {error}");
+            }
+            // Deliver with the carried check disabled: this batch has been
+            // answered, so it must not raise the same prompt again.
+            forward_ai_room_texts_inner(&room_id, texts, false);
+        }
+    }
     show_next_permission_prompt(cx, ui);
     ui.redraw(cx);
 }
@@ -6178,8 +6211,10 @@ fn refuse_room_tasks(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
     })
     .unwrap_or_default();
     for prompt in pending {
-        let message = task_grants::outcome(&prompt.plan, &std::collections::BTreeSet::new()).to_string();
-        let _ = prompt.answer.send(Ok(message));
+        if let TaskResume::AgentTool(answer) = prompt.resume {
+            let message = task_grants::outcome(&prompt.plan, &std::collections::BTreeSet::new()).to_string();
+            let _ = answer.send(Ok(message));
+        }
     }
     let (reviews, review_was_active) = with_a2app(|state| {
         let (mine, rest): (Vec<_>, Vec<_>) = state.exact_reviews.drain(..).partition(|review| &review.room_id == room_id);
@@ -6977,8 +7012,10 @@ fn stop_ai_session(room_id: &OwnedRoomId) {
         // pending task prompt is answered declined so its caller never hangs.
         revoke_task_grants(room_id);
         for prompt in take_room_tasks(room_id) {
-            let message = task_grants::outcome(&prompt.plan, &std::collections::BTreeSet::new()).to_string();
-            let _ = prompt.answer.send(Ok(message));
+            if let TaskResume::AgentTool(answer) = prompt.resume {
+                let message = task_grants::outcome(&prompt.plan, &std::collections::BTreeSet::new()).to_string();
+                let _ = answer.send(Ok(message));
+            }
         }
     }
     cancel_ai_fetches(room_id);
@@ -7635,12 +7672,29 @@ fn abort_ai_room_work(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
 /// here beyond the member messages themselves: a session starts fresh and
 /// silent, and its first (and only) inputs are real user messages.
 ///
+/// Before starting a turn, if the agent's still-live label carries a source
+/// the current model provider may no longer see (a room read in an earlier
+/// turn whose turn-scoped rule was revoked), the host raises one carried-over
+/// task prompt and holds these messages until the user answers. On approval
+/// the host applies the same turn-scoped rules and delivers the messages; on
+/// a decline the messages are still delivered, so the model call is refused
+/// the standard way.
+///
 /// Each successfully-forwarded event becomes the room's new cursor,
 /// persisted as room account data for restart continuity.
 #[cfg(unix)]
 pub fn forward_ai_room_texts(
     room_id: &OwnedRoomId,
     new_texts: Vec<(OwnedEventId, String)>,
+) {
+    forward_ai_room_texts_inner(room_id, new_texts, true);
+}
+
+#[cfg(unix)]
+fn forward_ai_room_texts_inner(
+    room_id: &OwnedRoomId,
+    new_texts: Vec<(OwnedEventId, String)>,
+    check_carried: bool,
 ) {
     if new_texts.is_empty() {
         return;
@@ -7664,6 +7718,22 @@ pub fn forward_ai_room_texts(
     if cooling {
         log!("AI Rooms: room {room_id}'s agent failed to start recently; not retrying yet.");
         return;
+    }
+    if check_carried {
+        // Start the session first: `begin_agent_session` resets the label for
+        // a fresh session, so a restart is not treated as a carried-over turn.
+        if let Err(error) = ensure_ai_session(room_id) {
+            log!("AI Rooms: FAILED to start/use room {room_id}'s agent session: {error}");
+            enqueue_popup_notification(
+                format!("Couldn't start this AI room's agent: {error}"),
+                PopupKind::Error, Some(6.0),
+            );
+            return;
+        }
+        if raise_carried_permission_prompt(room_id, &new_texts) {
+            log!("AI Rooms: holding {} message(s) for room {room_id} behind a carried-over permission prompt.", new_texts.len());
+            return;
+        }
     }
     let prefs = with_a2app(|state| state.agent_prefs.clone())
         .unwrap_or_else(a2app_agent::prefs::load_agent_prefs);
@@ -7717,6 +7787,150 @@ pub fn forward_ai_room_texts(
             cursor,
         }));
     }
+}
+
+/// Attaches a room's AI session if it has none, so a carried-over check can
+/// see the (possibly reset) label before a turn starts.
+#[cfg(unix)]
+fn ensure_ai_session(room_id: &OwnedRoomId) -> Result<(), String> {
+    if with_a2app(|state| state.ai_sessions.contains_key(room_id)).unwrap_or(false) {
+        return Ok(());
+    }
+    let prefs = with_a2app(|state| state.agent_prefs.clone())
+        .unwrap_or_else(a2app_agent::prefs::load_agent_prefs);
+    with_a2app(|state| {
+        let started = start_ai_session(state, room_id, prefs);
+        if let Some(info) = state.ai_rooms.get_mut(room_id) {
+            info.start_failed_at = started.is_err().then(Instant::now);
+        }
+        state.ai_sessions.insert(room_id.clone(), started?);
+        Ok(())
+    })
+    .unwrap_or_else(|| Err("AI state is unavailable.".into()))
+}
+
+/// The rows a host-raised carried-over prompt shows: every source beyond the
+/// baseline that has no rule to the model provider, to the homeserver origin
+/// or back into the room. The explanation names what was read.
+#[cfg(unix)]
+fn build_carried_task_plan(
+    room_id: &OwnedRoomId,
+    context: &a2app_core::information_flow::ContextId,
+    sources: &BTreeSet<Source>,
+    provider: &Recipient,
+    homeserver: Option<&Recipient>,
+    task_id: u64,
+) -> TaskPlan {
+    use a2app_core::capabilities::Risk;
+    use a2app_core::task_grants::{ItemOrigin, PlanAction, PlanItem};
+    let account = context.account().to_string();
+    let own_room = Recipient::MatrixRoom { account, room: room_id.to_string() };
+    let mut recipients = vec![provider.clone()];
+    if let Some(homeserver) = homeserver {
+        recipients.push(homeserver.clone());
+    }
+    recipients.push(own_room);
+    let mut items = Vec::new();
+    let mut labels = Vec::new();
+    for source in sources {
+        let label = match source {
+            Source::Room { room, .. } => resolve_room_label(None, room),
+            Source::Account { .. } => "account data".to_string(),
+            Source::RoomDirectory { .. } => "the room directory".to_string(),
+            Source::UnknownPrivate => "stored data".to_string(),
+        };
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+        for recipient in &recipients {
+            let already = a2app_core::information_flow::sharing_allows_for_reader(source, recipient, context)
+                .unwrap_or(false);
+            items.push(PlanItem {
+                id: format!("flow:{}:{}", serde_json::to_string(source).unwrap_or_default(),
+                    serde_json::to_string(recipient).unwrap_or_default()),
+                origin: ItemOrigin::Requested,
+                action: PlanAction::Flow { source: source.clone(), recipient: recipient.clone() },
+                state: if already { ItemState::AlreadyAllowed } else { ItemState::NeedsGrant },
+                why: None,
+                risk: Risk::High,
+            });
+        }
+    }
+    let explanation = format!(
+        "Earlier in this conversation the assistant read {}. Allow it to keep using that information for this turn.",
+        labels.join(", ")
+    );
+    let mut plan = TaskPlan {
+        task_id,
+        subject: agent_subject(room_id.as_str()),
+        context: context.clone(),
+        epoch: a2app_core::information_flow::context_epoch(context).unwrap_or(0),
+        title: "Keep using earlier context".to_string(),
+        explanation,
+        items,
+        plan_hash: [0; 32],
+        needs_fingerprint: [0; 32],
+    };
+    plan.seal();
+    plan
+}
+
+/// Holds `texts` behind one carried-over prompt when the agent's live label
+/// has sources the model provider may no longer see. Returns true when the
+/// texts were queued (a prompt already pending or freshly raised); false lets
+/// the caller deliver them.
+#[cfg(unix)]
+fn raise_carried_permission_prompt(room_id: &OwnedRoomId, texts: &[(OwnedEventId, String)]) -> bool {
+    let Ok(context) = super::information_flow::agent_context(room_id.as_str()) else { return false };
+    let (provider, homeserver, task_id) = with_a2app(|state| {
+        let provider = a2app_agent::model_transport::current_recipient(&state.agent_prefs)
+            .ok()
+            .map(|recipient| Recipient::ModelProvider(recipient.id));
+        let homeserver = crate::sliding_sync::get_client()
+            .and_then(|client| Recipient::network_origin(client.homeserver().as_str()).ok());
+        (provider, homeserver, state.next_task_id.saturating_add(1))
+    })
+    .unwrap_or((None, None, 0));
+    let Some(provider) = provider else { return false };
+    let carried = match a2app_core::information_flow::carried_over_sources(&context, &provider) {
+        Ok(carried) if !carried.is_empty() => carried,
+        _ => return false,
+    };
+    // A prompt already waiting (or showing) for this room absorbs the text
+    // instead of raising a second one.
+    let appended = with_a2app(|state| {
+        let existing = state
+            .active_task
+            .as_mut()
+            .filter(|prompt| &prompt.room_id == room_id && matches!(&prompt.resume, TaskResume::UserPrompt { .. }))
+            .or_else(|| {
+                state.task_prompts.iter_mut().find(|prompt| {
+                    &prompt.room_id == room_id && matches!(&prompt.resume, TaskResume::UserPrompt { .. })
+                })
+            });
+        let Some(prompt) = existing else { return false };
+        let TaskResume::UserPrompt { texts: held } = &mut prompt.resume else { return false };
+        for (event_id, text) in texts {
+            if !held.iter().any(|(held_id, _)| held_id == event_id) {
+                held.push((event_id.clone(), text.clone()));
+            }
+        }
+        true
+    })
+    .unwrap_or(false);
+    if appended {
+        return true;
+    }
+    let plan = build_carried_task_plan(room_id, &context, &carried, &provider, homeserver.as_ref(), task_id);
+    with_a2app(|state| {
+        state.next_task_id = task_id;
+        state.task_prompts.push_back(TaskPrompt {
+            room_id: room_id.clone(),
+            plan,
+            resume: TaskResume::UserPrompt { texts: texts.to_vec() },
+        });
+    });
+    true
 }
 
 /// Whether a parked permission prompt is holding a tool call for `room_id`.
@@ -10963,5 +11177,42 @@ View{note := Label{text:"waiting"}}
             with_a2app(|state| state.task_request_counts.contains_key(TARGET)).unwrap(),
             "another room keeps its own request budget"
         );
+    }
+
+    /// The carried-over path follows the same apply/ledger/rollback machinery
+    /// as an agent's own task: applying the host-raised plan clears the
+    /// provider rows, and the turn-close rollback restores them so the next
+    /// turn prompts again.
+    #[cfg(unix)]
+    #[test]
+    fn a_carried_over_room_is_cleared_by_the_task_apply_and_restored_by_rollback() {
+        let account = format!("carried-{}", std::process::id());
+        let previous_account = super::super::information_flow::TEST_ACCOUNT.with(|a| a.replace(Some(account.clone())));
+        let previous_state = A2APP.with(|state| state.replace(None));
+        let context = super::super::information_flow::prepare_agent(SOURCE).unwrap();
+        // The agent read TARGET in an earlier turn; its turn-scoped provider
+        // rule is gone, but the label persists into this turn.
+        let provider = Recipient::ModelProvider("carried-provider".into());
+        let carried_room = Source::Room { account: account.clone(), room: TARGET.into() };
+        a2app_core::information_flow::add_sources(&context, [carried_room.clone()]).unwrap();
+        let carried = a2app_core::information_flow::carried_over_sources(&context, &provider).unwrap();
+        assert!(carried.contains(&carried_room));
+        let room_id: OwnedRoomId = SOURCE.try_into().unwrap();
+        let plan = build_carried_task_plan(&room_id, &context, &carried, &provider, None, 1);
+        assert!(plan.explanation.contains("Earlier in this conversation"), "the host writes the explanation");
+        assert!(plan.items.iter().any(|item| item.state.is_grantable()), "the carried source needs a row");
+        let approved: BTreeSet<String> = plan.items.iter().filter(|item| item.state.is_grantable())
+            .map(|item| item.id.clone()).collect();
+        let mut store = PermissionStore::default();
+        let applied = task_grants::apply(&plan, &approved, &mut store, &task_grants::GlobalFlowApply).unwrap();
+        assert!(!applied.grants.is_empty(), "the carried plan must store rules");
+        assert!(a2app_core::information_flow::carried_over_sources(&context, &provider).unwrap().is_empty(),
+            "applying the carried plan clears the provider rows");
+        task_grants::rollback(&applied, &mut store, &task_grants::GlobalFlowApply);
+        assert!(a2app_core::information_flow::carried_over_sources(&context, &provider).unwrap().contains(&carried_room),
+            "the turn-close rollback restores the carried source for the next turn");
+        let _ = a2app_core::information_flow::remove_context(&context);
+        A2APP.with(|state| { state.replace(previous_state); });
+        super::super::information_flow::TEST_ACCOUNT.with(|a| { a.replace(previous_account); });
     }
 }
