@@ -6853,7 +6853,9 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
             // A natural reply is the closed turn's final output. Its result
             // releases the turn's task grants once every other final write has
             // landed; a `send_message` reply belongs to a still-live turn and
-            // never releases them.
+            // never releases them. A natural reply that lands after a newer
+            // turn has started leaves the room's ledger to that newer turn's
+            // close, which removes every entry the room applied.
             if answer_id.is_none() {
                 let landed = with_a2app(|state| {
                     let info = state.ai_rooms.get_mut(&room_id)?;
@@ -11426,5 +11428,54 @@ View{note := Label{text:"waiting"}}
         let _ = flow::remove_context(&context);
         A2APP.with(|state| { state.replace(previous_state); });
         super::super::information_flow::TEST_ACCOUNT.with(|a| { a.replace(previous_account); });
+    }
+
+    /// A natural reply that lands after a newer turn has started does not
+    /// revoke the room's ledger; the newer turn's close removes every entry.
+    #[cfg(unix)]
+    #[test]
+    fn a_natural_reply_after_a_newer_turn_leaves_the_ledger_to_that_turns_close() {
+        let previous_state = A2APP.with(|state| state.replace(None));
+        initialize_state(AppRegistry::new(Vec::new()), PermissionStore::default(), A2AppPersistedState::default(), Default::default());
+        let room_id: OwnedRoomId = SOURCE.try_into().unwrap();
+        let context = a2app_core::information_flow::ContextId::Agent { account: "alice".into(), room: SOURCE.into() };
+        with_a2app(|state| {
+            state.ai_rooms.insert(room_id.clone(), AiRoomInfo::new(None));
+            let info = state.ai_rooms.get_mut(&room_id).unwrap();
+            // A newer turn is live, so the older turn's last final write must
+            // not revoke the ledger both turns share.
+            info.active_turn = Some(ActiveTurn {
+                key: "turn-2".into(), tool_calls: Vec::new(), thinking: false, seq: 0, created_at: 0,
+            });
+            info.final_writes_pending_revoke = true;
+            info.pending_final_writes = 0;
+            for task_id in [1u64, 2u64] {
+                state.task_ledger.insert(a2app_core::task_grants::AppliedTask {
+                    task_id,
+                    subject: "agent".into(),
+                    context: context.clone(),
+                    epoch: 1,
+                    title: "t".into(),
+                    plan_hash: [0; 32],
+                    grants: Vec::new(),
+                });
+            }
+        });
+        maybe_revoke_closed_turn(&room_id);
+        assert!(with_a2app(|state| !state.task_ledger.is_empty()).unwrap(),
+            "the newer turn owns the room's ledger");
+        // The newer turn closes: its close removes every ledger entry of the
+        // room, including the older turn's.
+        with_a2app(|state| {
+            if let Some(info) = state.ai_rooms.get_mut(&room_id) {
+                info.active_turn = None;
+                info.final_writes_pending_revoke = true;
+                info.pending_final_writes = 0;
+            }
+        });
+        maybe_revoke_closed_turn(&room_id);
+        assert!(with_a2app(|state| state.task_ledger.is_empty()).unwrap(),
+            "the newer turn's close removes every ledger entry of the room");
+        A2APP.with(|state| { state.replace(previous_state); });
     }
 }
