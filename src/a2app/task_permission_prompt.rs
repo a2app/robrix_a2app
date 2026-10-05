@@ -44,12 +44,6 @@ script_mod! {
             text: "Details (0 items)"
             icon_walk: Walk{width: 0, height: 0, margin: 0}
         }
-        sharing_toggle := RobrixNeutralIconButton {
-            visible: false
-            margin: Inset{top: 6}
-            text: "Information sharing this requires"
-            icon_walk: Walk{width: 0, height: 0, margin: 0}
-        }
         details := ScrollYView {
             visible: false
             width: Fill, height: 340, flow: Down
@@ -100,10 +94,6 @@ pub struct TaskItemView {
     /// items start unchecked and disabled, so Allow never re-grants them.
     pub grantable: bool,
     pub checked: bool,
-    /// A rule Robrix derived from a requested read, rather than something the
-    /// agent asked for. These are grouped under their own collapsed section so
-    /// a large label's implied rules cannot bury the agent's own needs.
-    pub implied: bool,
 }
 
 /// What the modal shows for one resolved task plan.
@@ -131,9 +121,6 @@ pub enum TaskPermissionAction {
 pub struct TaskPermissionPrompt {
     #[deref] view: View,
     #[rust] expanded: bool,
-    /// Whether the implied "Information sharing this requires" rows are shown
-    /// inside the Details list. Starts collapsed.
-    #[rust] implied_expanded: bool,
     #[rust] items: Vec<TaskItemView>,
 }
 
@@ -146,26 +133,9 @@ impl Widget for TaskPermissionPrompt {
                 self.expanded = !self.expanded;
                 self.apply_expanded(cx);
             }
-            if self.view.button(cx, ids!(sharing_toggle)).clicked(actions) {
-                self.implied_expanded = !self.implied_expanded;
-                // The implied rows live inside the Details list, so revealing
-                // them also opens it; hiding them leaves Details as it was.
-                if self.implied_expanded {
-                    self.expanded = true;
-                }
-                self.apply_expanded(cx);
-            }
             let mut changed = false;
-            // The PortalList index is a position in the visible subset, which
-            // excludes implied rows until their section is opened, so map it
-            // back to the source item before mutating a checkbox.
-            let visible: Vec<usize> = self.items.iter().enumerate()
-                .filter(|(_, item)| !item.implied || self.implied_expanded)
-                .map(|(index, _)| index)
-                .collect();
             for (index, row) in self.view.portal_list(cx, ids!(items)).items_with_actions(actions) {
-                let Some(&source) = visible.get(index) else { continue };
-                let Some(item) = self.items.get_mut(source) else { continue };
+                let Some(item) = self.items.get_mut(index) else { continue };
                 if !item.grantable { continue; }
                 if let Some(checked) = row.check_box(cx, ids!(check)).changed(actions) {
                     item.checked = checked;
@@ -189,16 +159,9 @@ impl Widget for TaskPermissionPrompt {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         while let Some(widget) = self.view.draw_walk(cx, scope, walk).step() {
             if let Some(mut list) = widget.as_portal_list().borrow_mut() {
-                // Requested rows are always shown; the implied flow rules are
-                // hidden until the user opens their section.
-                let visible: Vec<usize> = self.items.iter().enumerate()
-                    .filter(|(_, item)| !item.implied || self.implied_expanded)
-                    .map(|(index, _)| index)
-                    .collect();
-                list.set_item_range(cx, 0, visible.len());
+                list.set_item_range(cx, 0, self.items.len());
                 while let Some(index) = list.next_visible_item(cx) {
-                    let Some(&source) = visible.get(index) else { continue };
-                    let Some(item) = self.items.get(source).cloned() else { continue };
+                    let Some(item) = self.items.get(index).cloned() else { continue };
                     let row = list.item(cx, index, id!(item));
                     let check = row.check_box(cx, ids!(check));
                     check.set_text(&format!("{} — {}", item.title, item.chip));
@@ -217,33 +180,15 @@ impl Widget for TaskPermissionPrompt {
 impl TaskPermissionPrompt {
     fn apply_expanded(&mut self, cx: &mut Cx) {
         self.view.widget(cx, ids!(details)).set_visible(cx, self.expanded);
-        // The two counts partition the grantable rows: the agent's requested
-        // needs under Details, Robrix's derived rules under their own heading.
-        let grantable = self.items.iter().filter(|item| item.grantable && !item.implied).count();
+        let grantable = self.items.iter().filter(|item| item.grantable).count();
         let text = if self.expanded {
             "Hide details".to_string()
         } else {
             format!("Details ({grantable} items)")
         };
         self.view.button(cx, ids!(details_toggle)).set_text(cx, &text);
-        self.refresh_sharing_toggle(cx);
         self.refresh_allow(cx);
         self.view.redraw(cx);
-    }
-
-    fn refresh_sharing_toggle(&self, cx: &mut Cx) {
-        let implied = self.items.iter().filter(|item| item.implied).count();
-        if implied == 0 {
-            self.view.widget(cx, ids!(sharing_toggle)).set_visible(cx, false);
-            return;
-        }
-        self.view.widget(cx, ids!(sharing_toggle)).set_visible(cx, true);
-        let text = if self.implied_expanded {
-            format!("Hide information sharing ({implied})")
-        } else {
-            format!("Information sharing this requires ({implied})")
-        };
-        self.view.button(cx, ids!(sharing_toggle)).set_text(cx, &text);
     }
 
     fn refresh_allow(&self, cx: &mut Cx) {
@@ -261,7 +206,6 @@ impl TaskPermissionPromptRef {
         let Some(mut inner) = self.borrow_mut() else { return };
         inner.items = info.items.clone();
         inner.expanded = false;
-        inner.implied_expanded = false;
         inner.view.label(cx, ids!(agent_paragraph)).set_text(cx, &info.explanation);
         match &info.risk {
             Some(risk) => {

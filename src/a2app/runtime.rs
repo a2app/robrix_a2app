@@ -60,7 +60,7 @@ use crate::utils::RoomNameId;
 #[cfg(unix)]
 use a2app_core::information_flow::{Recipient, Source};
 #[cfg(unix)]
-use a2app_core::task_grants::{self, ItemOrigin, ItemState, ResolveInputs, TaskLedger, TaskPlan, TaskReason};
+use a2app_core::task_grants::{self, ItemState, ResolveInputs, TaskLedger, TaskPlan, TaskReason};
 #[cfg(unix)]
 use crate::a2app::ai::session::{AiSession, PromptOutcome, SessionJob, SessionUpdate};
 #[cfg(unix)]
@@ -5772,7 +5772,6 @@ fn task_prompt_info(
             chip: task_item_chip(&item.state),
             grantable: item.state.is_grantable(),
             checked: item.state.is_grantable(),
-            implied: matches!(item.origin, ItemOrigin::Implied { .. }),
         })
         .collect();
     let risk = plan
@@ -8822,7 +8821,6 @@ fn exact_review_info(
             chip: String::from("Needs review"),
             grantable: true,
             checked: true,
-            implied: false,
         }],
         risk: Some(String::from(
             "Approving allows exactly this one action. If the assistant reads more first, it asks again.",
