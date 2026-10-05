@@ -312,9 +312,9 @@ agent did not list:
   sources that feed the task;
 - a target-room read adds a rule to that room's server, because the query
   leaves Robrix;
-- the rows are pre-checked, shown under an "Information sharing this requires"
-  heading, and each is tagged with the reads that cause it; unchecking a read
-  drops the rules that depend on it (`dependent_approval`);
+- the rows are pre-checked, grouped under a collapsed "Information sharing this
+  requires" section, and each is tagged with the reads that cause it; unchecking
+  a read drops the rules that depend on it (`dependent_approval`);
 - they last until the turn ends.
 
 **What is on by default.** Grants: the four directory tools listed above and

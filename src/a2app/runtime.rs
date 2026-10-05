@@ -4197,6 +4197,7 @@ fn task_prompt_info(
             chip: task_item_chip(&item.state),
             grantable: item.state.is_grantable(),
             checked: item.state.is_grantable(),
+            implied: matches!(item.origin, ItemOrigin::Implied { .. }),
         })
         .collect();
     let risk = plan
@@ -4204,16 +4205,12 @@ fn task_prompt_info(
         .iter()
         .any(|item| item.state.is_grantable() && item.risk >= a2app_core::capabilities::Risk::High)
         .then(|| "This plan includes broad or high-risk access. Review the details before allowing.".to_string());
-    let has_implied = plan.items.iter().any(|item| matches!(item.origin, ItemOrigin::Implied { .. }));
     TaskPromptInfo {
         // Only the assistant's own paragraph. Robrix's framing is the modal
         // title and the detail rows below, never a label on the agent's words.
         explanation: plan.explanation.clone(),
         items,
         risk,
-        // The derived flow rules are shown as their own group, so the user can
-        // tell what Robrix added apart from what the agent asked for.
-        sharing_heading: has_implied.then(|| "Information sharing this requires".to_string()),
     }
 }
 
@@ -4400,17 +4397,13 @@ fn answer_task_prompt(cx: &mut Cx, ui: &WidgetRef, action: TaskPermissionAction)
         return;
     }
     let TaskPrompt { room_id, plan, answer } = prompt;
-    let approved = match action {
-        TaskPermissionAction::NotNow => {
-            with_a2app(|state| {
-                state.dismissed_task_plans.insert((room_id.to_string(), plan.needs_fingerprint), plan.need_keys());
-            });
-            note_ai_tool_call(&room_id, "request_task_permissions", false, "Declined");
-            std::collections::BTreeSet::new()
-        }
-        TaskPermissionAction::Allow(ids) => task_grants::dependent_approval(&plan, ids),
-        TaskPermissionAction::None => unreachable!(),
-    };
+    let approved = with_a2app(|state| {
+        task_answer_approval(&room_id, &plan, &action, &mut state.dismissed_task_plans)
+    })
+    .unwrap_or_default();
+    if matches!(action, TaskPermissionAction::NotNow) {
+        note_ai_tool_call(&room_id, "request_task_permissions", false, "Declined");
+    }
     // Apply outside the state borrow: information-flow rules live in their own
     // registry, and a partial apply is rolled back by `task_grants::apply`.
     let mut guard = PermissionStoreGuard::take();
@@ -4481,6 +4474,42 @@ fn answer_exact_review(cx: &mut Cx, ui: &WidgetRef, review: ExactReviewPrompt, a
         }
     }
 }
+
+/// Whether an `ai_reply`/`send_message` write result should drop the turn's
+/// task grants now (see [`AiRoomAction::PostReplyResult`]). A natural reply
+/// (`parked_turn == None`) revokes only when no newer turn has taken over. A
+/// parked `send_message` revokes only while its own turn is still the live
+/// one, so a result from a turn the user cancelled can never touch the turn
+/// that replaced it.
+#[cfg(unix)]
+fn should_revoke_task_grants(parked_turn: Option<&str>, live_turn: Option<&str>) -> bool {
+    match parked_turn {
+        Some(turn) => live_turn == Some(turn),
+        None => live_turn.is_none(),
+    }
+}
+
+/// The items one task answer actually approves. `Not now` approves nothing and
+/// is remembered as a dismissal so the same needs are refused for the turn;
+/// `Allow` narrows the checked ids so an unchecked read drops the flow rules
+/// that depend on it. `None` never reaches a real answer.
+#[cfg(unix)]
+fn task_answer_approval(
+    room_id: &OwnedRoomId,
+    plan: &TaskPlan,
+    action: &TaskPermissionAction,
+    dismissed: &mut HashMap<(String, [u8; 32]), BTreeSet<String>>,
+) -> BTreeSet<String> {
+    match action {
+        TaskPermissionAction::NotNow => {
+            dismissed.insert((room_id.to_string(), plan.needs_fingerprint), plan.need_keys());
+            BTreeSet::new()
+        }
+        TaskPermissionAction::Allow(ids) => task_grants::dependent_approval(plan, ids.clone()),
+        TaskPermissionAction::None => BTreeSet::new(),
+    }
+}
+
 /// Revokes every task grant a room applied and forgets its "Not now" memory.
 /// Also refuses any exact-action review parked for the room, so a serve
 /// thread waiting on one never hangs across a turn or teardown.
@@ -5119,21 +5148,12 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
             // rode on can go now. A natural reply (no parked tool call) only
             // revokes if no newer turn has taken over; a `send_message` reply
             // revokes only while its own turn is still the live one.
-            let revoke = match parked.as_ref().and_then(|(_, turn, _, _)| turn.as_deref()) {
-                Some(turn) => with_a2app(|state| {
-                    state
-                        .ai_rooms
-                        .get(&room_id)
-                        .and_then(|info| info.active_turn.as_ref().map(|t| t.key.as_str() == turn))
-                })
-                .flatten()
-                .unwrap_or(false),
-                None => with_a2app(|state| {
-                    state.ai_rooms.get(&room_id).is_none_or(|info| info.active_turn.is_none())
-                })
-                .unwrap_or(false),
-            };
-            if revoke {
+            let parked_turn = parked.as_ref().and_then(|(_, turn, _, _)| turn.as_deref()).map(str::to_string);
+            let live_turn = with_a2app(|state| {
+                state.ai_rooms.get(&room_id).and_then(|info| info.active_turn.as_ref().map(|turn| turn.key.clone()))
+            })
+            .flatten();
+            if should_revoke_task_grants(parked_turn.as_deref(), live_turn.as_deref()) {
                 revoke_task_grants(&room_id);
             }
             let Some((_, turn, answer, receipts)) = parked else { return };
@@ -7157,11 +7177,11 @@ fn exact_review_info(
             chip: String::from("Needs review"),
             grantable: true,
             checked: true,
+            implied: false,
         }],
         risk: Some(String::from(
             "Approving allows exactly this one action. If the assistant reads more first, it asks again.",
         )),
-        sharing_heading: None,
     }
 }
 
@@ -8075,6 +8095,23 @@ fn close_active_turn(room_id: &OwnedRoomId, revoke_grants: bool) {
 /// turn can otherwise produce dozens of snapshots.
 #[cfg(unix)]
 const AI_TURN_POST_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Whether a room's next `ai_turn` snapshot may be written now. A turn's first
+/// snapshot is the card's anchor and skips the ADAPTIVE backoff so the card
+/// appears at once, but it still waits out the hard minimum spacing: a run of
+/// very short turns must not fire back-to-back state events into the server's
+/// rate limit. Every later snapshot respects the adaptive backoff.
+#[cfg(unix)]
+fn turn_post_is_cooled_down(
+    anchor_pending: bool,
+    since_last: Option<Duration>,
+    backoff: Duration,
+) -> bool {
+    let anchor_cooled = anchor_pending
+        && since_last.is_none_or(|elapsed| elapsed >= AI_TURN_POST_MIN_INTERVAL);
+    let spaced = since_last.is_none_or(|elapsed| elapsed >= backoff);
+    anchor_cooled || spaced
+}
 /// The upper bound the adaptive `ai_turn` write spacing backs off to when the
 /// homeserver keeps rejecting writes as rate-limited.
 #[cfg(unix)]
@@ -8129,11 +8166,8 @@ fn flush_pending_ai_turns(cx: &mut Cx) {
                 .pending_ai_turns
                 .front()
                 .is_some_and(|(key, _)| info.first_posted_turn.as_deref() != Some(key.as_str()));
-            let cooled_down = anchor_pending
-                || info
-                    .last_ai_turn_post
-                    .is_none_or(|last| now.duration_since(last) >= info.ai_turn_backoff);
-            if !cooled_down {
+            let since_last = info.last_ai_turn_post.map(|last| now.duration_since(last));
+            if !turn_post_is_cooled_down(anchor_pending, since_last, info.ai_turn_backoff) {
                 needs_timer = true;
                 continue;
             }
@@ -8693,5 +8727,97 @@ mod permission_tests {
         let with_new: BTreeSet<String> = ["needs:a", "needs:b", "needs:c"].into_iter().map(String::from).collect();
         assert!(!task_plan_is_dismissed(&dismissed, SOURCE, &with_new));
         assert!(!task_plan_is_dismissed(&dismissed, TARGET, &["needs:a".to_string()].into_iter().collect()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_results_revoke_task_grants_only_for_the_live_turn() {
+        // A natural reply (no parked turn) revokes when no newer turn is live.
+        assert!(should_revoke_task_grants(None, None));
+        assert!(!should_revoke_task_grants(None, Some("newer")));
+        // A parked send_message revokes only while its own turn is still live;
+        // a result from a cancelled turn must not touch its replacement.
+        assert!(should_revoke_task_grants(Some("turn-1"), Some("turn-1")));
+        assert!(!should_revoke_task_grants(Some("turn-1"), Some("turn-2")));
+        assert!(!should_revoke_task_grants(Some("turn-1"), None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_turn_anchor_skips_the_adaptive_backoff_but_keeps_the_hard_floor() {
+        let backoff = Duration::from_secs(20);
+        // No prior post: anything may go now.
+        assert!(turn_post_is_cooled_down(true, None, backoff));
+        // A post 10s ago is inside the adaptive backoff, but the anchor skips it.
+        assert!(turn_post_is_cooled_down(true, Some(Duration::from_secs(10)), backoff));
+        // Inside the hard floor: even the anchor waits, so a burst of short
+        // turns cannot fire back-to-back state events.
+        assert!(!turn_post_is_cooled_down(true, Some(Duration::from_secs(1)), backoff));
+        // A non-anchor snapshot respects the adaptive backoff.
+        assert!(!turn_post_is_cooled_down(false, Some(Duration::from_secs(10)), backoff));
+        assert!(turn_post_is_cooled_down(false, Some(Duration::from_secs(25)), backoff));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_not_now_answer_dismisses_the_plans_needs_and_approves_nothing() {
+        let room: OwnedRoomId = SOURCE.try_into().unwrap();
+        let plan = a2app_core::task_grants::TaskPlan {
+            task_id: 1,
+            subject: "agent".into(),
+            context: a2app_core::information_flow::ContextId::Agent { account: "alice".into(), room: SOURCE.into() },
+            epoch: 1,
+            title: "t".into(),
+            explanation: "e".into(),
+            items: Vec::new(),
+            plan_hash: [0; 32],
+            needs_fingerprint: [9; 32],
+        };
+        let mut dismissed = HashMap::new();
+        let approved = task_answer_approval(&room, &plan, &TaskPermissionAction::NotNow, &mut dismissed);
+        assert!(approved.is_empty(), "Not now approves nothing");
+        assert!(dismissed.contains_key(&(SOURCE.to_string(), [9; 32])), "Not now must be remembered for the turn");
+        // An Allow keeps the checked ids and does not dismiss the plan.
+        let dismissed_len = dismissed.len();
+        let approved = task_answer_approval(
+            &room, &plan, &TaskPermissionAction::Allow(vec!["n1".into()]), &mut dismissed);
+        assert!(approved.contains("n1"));
+        assert_eq!(dismissed.len(), dismissed_len);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn revoking_a_turn_drops_its_grants_dismissals_and_request_budget() {
+        initialize_state(
+            AppRegistry::new(Vec::new()),
+            PermissionStore::default(),
+            A2AppPersistedState::default(),
+            Default::default(),
+        );
+        let room: OwnedRoomId = SOURCE.try_into().unwrap();
+        let context = a2app_core::information_flow::ContextId::Agent { account: "alice".into(), room: SOURCE.into() };
+        with_a2app(|state| {
+            state.task_ledger.insert(a2app_core::task_grants::AppliedTask {
+                task_id: 42,
+                subject: "agent".into(),
+                context,
+                epoch: 1,
+                title: "t".into(),
+                plan_hash: [0; 32],
+                grants: Vec::new(),
+            });
+            state.dismissed_task_plans.insert((SOURCE.to_string(), [3; 32]), BTreeSet::new());
+            state.task_request_counts.insert(SOURCE.to_string(), 2);
+            state.task_request_counts.insert(TARGET.to_string(), 1);
+        })
+        .unwrap();
+        revoke_task_grants(&room);
+        assert!(with_a2app(|state| state.task_ledger.get(42).is_none()).unwrap(), "the turn's grants are gone");
+        assert!(with_a2app(|state| state.dismissed_task_plans.keys().all(|(dismissed_room, _)| dismissed_room != SOURCE)).unwrap());
+        assert!(with_a2app(|state| !state.task_request_counts.contains_key(SOURCE)).unwrap());
+        assert!(
+            with_a2app(|state| state.task_request_counts.contains_key(TARGET)).unwrap(),
+            "another room keeps its own request budget"
+        );
     }
 }
