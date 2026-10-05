@@ -683,7 +683,7 @@ fn cleaned_why(why: Option<&str>) -> Option<String> {
 pub fn clean_text(text: &str, max: usize) -> String {
     let mut out = String::with_capacity(text.len().min(max));
     for ch in text.chars() {
-        if ch == '\n' || ch == '\t' || !ch.is_control() {
+        if (ch == '\n' || ch == '\t' || !ch.is_control()) && !is_direction_control(ch) {
             out.push(ch);
         }
         if out.chars().count() >= max {
@@ -693,7 +693,21 @@ pub fn clean_text(text: &str, max: usize) -> String {
     out.trim().to_string()
 }
 
+/// Direction-changing format characters (`Cf`), which `char::is_control` does
+/// not catch. The agent's prose is shown verbatim in the approval dialog, so a
+/// bidi override could visually reorder it and spoof what the user reads.
+/// Strip them from every agent-supplied string rather than render them.
+fn is_direction_control(ch: char) -> bool {
+    matches!(ch,
+        '\u{061c}'                  // Arabic letter mark
+        | '\u{200e}' | '\u{200f}'   // left-to-right / right-to-left mark
+        | '\u{202a}'..='\u{202e}'   // LRE / RLE / PDF / LRO / RLO
+        | '\u{2066}'..='\u{2069}'   // LRI / RLI / FSI / PDI
+    )
+}
+
 fn clip(text: &str, max: usize) -> String {
+    let text: String = text.chars().filter(|ch| !is_direction_control(*ch)).collect();
     let text = text.trim();
     if text.chars().count() <= max {
         return text.to_string();
@@ -1376,6 +1390,16 @@ mod tests {
         let cleaned = clean_text("hi\u{7}there", 4);
         assert_eq!(cleaned, "hith");
         assert!(!clean_text("a\nb", 10).contains('\u{7}'));
+    }
+
+    #[test]
+    fn cleaning_strips_direction_controls_from_agent_text() {
+        // An RLO could visually reverse the rest of the paragraph.
+        assert_eq!(clean_text("safe\u{202e}evil", 100), "safeevil");
+        // Bidi isolates and directional marks are removed too.
+        assert_eq!(clean_text("\u{2066}a\u{2069}\u{200f}b", 100), "ab");
+        // The title, which reaches the tool-call note, is sanitized as well.
+        assert_eq!(clip("\u{202e}Important", 100), "Important");
     }
 
     #[test]

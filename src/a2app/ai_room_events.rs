@@ -719,9 +719,17 @@ fn readable_tool_summary(summary: &str) -> String {
         return String::new();
     }
     let mut spaced = String::with_capacity(summary.len() + 16);
-    for ch in summary.chars() {
+    let mut chars = summary.chars().peekable();
+    while let Some(ch) = chars.next() {
         spaced.push(ch);
-        if matches!(ch, '{' | '}' | '[' | ']' | ',' | ':') {
+        // Pad the punctuation that separates tokens so the text can wrap, but
+        // never split a URL scheme: `https://host` must stay in one token.
+        let separates = match ch {
+            '{' | '}' | '[' | ']' | ',' => true,
+            ':' => chars.peek() != Some(&'/'),
+            _ => false,
+        };
+        if separates {
             spaced.push(' ');
         }
     }
@@ -1228,6 +1236,16 @@ mod tests {
         assert_eq!(format_tool_result("Listed your rooms", truncated), "• test seven\n• Random");
         let messages = r#"{"messages": [{"sender": "zcorpan", "sender_id": "@z:m.org", "body": "https:"#;
         assert_eq!(format_tool_result("Read messages", messages), "• zcorpan: https:");
+    }
+
+    /// The last-resort spacing pass for an unrecognized JSON blob must not
+    /// split a URL scheme into `https: //host`.
+    #[test]
+    fn unparseable_json_keeps_url_schemes_intact() {
+        let truncated = r#"{"url":"https://example.org/a/b","other":[1,2]"#;
+        let rendered = format_tool_result("mystery", truncated);
+        assert!(!rendered.contains("https: //"), "{rendered}");
+        assert!(rendered.contains("https://example.org/a/b"), "{rendered}");
     }
 
     /// A turn card's title and per-call lines reflect the running/done state,
