@@ -593,9 +593,6 @@ pub struct RoomPaneDock {
     #[rust] room_members: TimelineMembers,
     #[rust] panes: Vec<DockedPane>,
     #[rust] sides_assigned: bool,
-    /// A pane was removed while this dock was hidden, so the timeline beneath it
-    /// wasn't laid out again; the next time this room is focused, we redraw everything.
-    #[rust] needs_full_redraw: bool,
     /// Whether we're in the middle of drawing (across multiple draw steps).
     #[rust] is_drawing: bool,
     #[rust] tooltip: RoomActionTooltip,
@@ -675,14 +672,6 @@ impl Widget for RoomPaneDock {
                 && request_room_id == room_id
             {
                 self.handle_request(cx, &room_name_id, kind, *op);
-                continue;
-            }
-            if self.needs_full_redraw
-                && let Some(AppStateAction::RoomFocused(room)) = action.downcast_ref()
-                && room.room_id() == room_id
-            {
-                self.needs_full_redraw = false;
-                cx.redraw_all();
                 continue;
             }
             if let Some(AppStateAction::RoomNameUpdated(new_name)) = action.downcast_ref()
@@ -1216,7 +1205,6 @@ impl RoomPaneDock {
             // The edge keeps drawing the pane until it has slid out.
             self.edge(cx, side).remove_pane(cx, kind, animate);
         }
-        self.needs_full_redraw = true;
         self.view.redraw(cx);
     }
 

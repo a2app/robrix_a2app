@@ -1080,7 +1080,8 @@ fn stock_space_selection_ignores_replies_from_earlier_visits() {
         let mut info = None;
         let mut rooms = None;
         for _ in 0..4 {
-            for ask in host.process() { match ask {
+            let mut pending: VecDeque<_> = host.process().into();
+            while let Some(ask) = pending.pop_front() { match ask {
                 BrokerAsk::Matrix { reply, call: services::MatrixServiceCall::SpaceInfo { space_id }, .. } => {
                     assert_eq!(space_id, expected);
                     assert!(info.replace(reply).is_none());
@@ -1088,6 +1089,17 @@ fn stock_space_selection_ignores_replies_from_earlier_visits() {
                 BrokerAsk::Matrix { reply, call: services::MatrixServiceCall::SpaceRooms { space_id }, .. } => {
                     assert_eq!(space_id, expected);
                     assert!(rooms.replace(reply).is_none());
+                }
+                BrokerAsk::FlowReview { request, review } => {
+                    assert_eq!(request.service, "matrix.space_rooms");
+                    let args: serde_json::Value = serde_json::from_str(&request.args_json).unwrap();
+                    assert_eq!(args["space_id"], expected);
+                    assert_eq!(review.context, host.contexts[&request.heap_key]);
+                    assert_eq!(review.recipient, Some(Recipient::NetworkOrigin("https://homeserver.test".into())));
+                    assert!(review.action.is_none());
+                    assert!(!review.allowed);
+                    host.flow.borrow_mut().approve_effect_session(&review, SharingDuration::RobrixSession).unwrap();
+                    pending.extend(host.dispatch(Some(request)));
                 }
                 BrokerAsk::Used { .. } => {},
                 _ => panic!("unexpected space navigation request"),
@@ -2100,6 +2112,9 @@ fn hidden_instance_cannot_navigate_through_another_foreground_instance_of_the_sa
     }, source);
     assert_ne!(hidden, visible);
     assert_ne!(hidden_context, visible_context);
+    // This navigation fixture adds a service beyond room-peek's narrowed
+    // navigation capabilities; granting its group alone cannot declare it.
+    host.apps.get_mut(app).unwrap().capabilities.push("host.nav.room".into());
     // Both app-wide signals claim this app is visible: the modal foreground
     // ID below and Harness::process's is_docked=true. The calling heap wins.
     host.foreground_app = Some(app.into());

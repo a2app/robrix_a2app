@@ -41,9 +41,9 @@ clap = { version = "4.0.16", features = ["derive"] }
 crossbeam-channel = "0.5.10"
 crossbeam-queue = "0.3.8"
 eyeball = { version = "0.8.8", features = ["tracing"] } # same as matrix-sdk-ui
-eyeball-im = { version = "0.9.0", features = [ "tracing" ] } # same as matrix-sdk-ui
+eyeball-im = { version = "0.9.1", features = [ "tracing" ] } # same as matrix-sdk-ui
 futures = "0.3"
-imbl = { version = "7.0.1", features = ["serde"] } # same as matrix-sdk-ui
+imbl = { version = "7.0.2", features = ["serde"] } # same as matrix-sdk-ui
 futures-util = "0.3"
 hashbrown = { version = "0.16", features = ["raw-entry"] }
 htmlize = { version = "1.1", features = ["unescape"] }
@@ -72,7 +72,7 @@ matrix-sdk-ui = { git = "https://github.com/matrix-org/matrix-rust-sdk", default
 ## * Note: we need a feature like "compat-unset-display-name" to unset display names, but that doesn't exist yet.
 ##
 ## Note: we actually patch this below to use our `tsp` branch instead.
-ruma = { git = "https://github.com/ruma/ruma", rev = "0908aaa9847093ecb32bc6edf0af525f726717fd", features = [
+ruma = { git = "https://github.com/ruma/ruma", rev = "f5e5e1c885f598036fd4326c566e9d1928027d5d", features = [
     "compat-optional",
     "compat-unset-avatar",
     "unstable-compat-lax-syncv5-deser",
@@ -174,8 +174,8 @@ members = ["a2app/core", "a2app/agent"]
 ## One source of truth for the makepad pin: the a2app crates inherit it, so
 ## a repin here can't leave them on a different fork or branch.
 [workspace.dependencies]
-makepad-widgets = { git = "https://github.com/kevinaboos/makepad", branch = "portal_list_skip_to_robrix", features = ["serde"] }
-makepad-code-editor = { git = "https://github.com/kevinaboos/makepad", branch = "portal_list_skip_to_robrix" }
+makepad-widgets = { git = "https://github.com/kevinaboos/makepad", branch = "stack_navigation_animation_robrix", features = ["serde"] }
+makepad-code-editor = { git = "https://github.com/kevinaboos/makepad", branch = "stack_navigation_animation_robrix" }
 
 
 [patch.crates-io]
@@ -216,6 +216,13 @@ ruma = { git = "https://github.com/project-robius/ruma.git", branch = "tsp" }
 
 ## Octos dependencies share upstream main after #2443 and #2455 merged;
 ## see `a2app/agent/Cargo.toml` for the exact confined-worker protocol revision.
+
+## Our PR <https://github.com/matrix-org/matrix-rust-sdk/pull/7198> plus more thread fixes and pagination completion fixes.
+## Remove this once they're all merged upstream.
+[patch."https://github.com/matrix-org/matrix-rust-sdk"]
+matrix-sdk = { git = "https://github.com/project-robius/matrix-rust-sdk", branch = "robrix_pagination_completion" }
+matrix-sdk-base = { git = "https://github.com/project-robius/matrix-rust-sdk", branch = "robrix_pagination_completion" }
+matrix-sdk-ui = { git = "https://github.com/project-robius/matrix-rust-sdk", branch = "robrix_pagination_completion" }
 
 [build-dependencies]
 toml = "1"

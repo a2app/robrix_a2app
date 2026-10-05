@@ -145,7 +145,7 @@ script_mod! {
         }
 
         room_mini_apps_button       := mod.widgets.RoomActionButton {draw_icon.svg: ICON_SPARKLE, visible: false}
-        room_info_button            := mod.widgets.RoomActionButton {draw_icon.svg: ICON_INFO}
+        // room_info_button            := mod.widgets.RoomActionButton {draw_icon.svg: ICON_INFO}
         room_threads_button         := mod.widgets.RoomActionButton {draw_icon.svg: ICON_REPLY_IN_THREAD}
         room_pinned_messages_button := mod.widgets.RoomActionButton {draw_icon.svg: ICON_PIN}
         room_members_button         := mod.widgets.RoomActionButton {draw_icon.svg: ICON_MEMBERS}
@@ -171,7 +171,7 @@ script_mod! {
                 wrap_spacing: 8
                 padding: 8
                 room_mini_apps_button := RoomActionTextButton {draw_icon.svg: ICON_SPARKLE, visible: false}
-                room_info_button := RoomActionTextButton {draw_icon.svg: ICON_INFO}
+                // room_info_button := RoomActionTextButton {draw_icon.svg: ICON_INFO}
                 // room_settings_button := RoomActionTextButton {draw_icon.svg: ICON_SETTINGS}
                 room_threads_button := RoomActionTextButton {draw_icon.svg: ICON_REPLY_IN_THREAD}
                 room_members_button := RoomActionTextButton {draw_icon.svg: ICON_MEMBERS}
@@ -259,7 +259,7 @@ script_mod! {
 const ACTIONS: &[(LiveId, &str, RoomActionBarAction)] = &[
     #[cfg(feature = "a2app")]
     (id!(room_mini_apps_button), "Mini Apps", RoomActionBarAction::None),
-    (id!(room_info_button), "Room info", RoomActionBarAction::None),
+    // (id!(room_info_button), "Room info", RoomActionBarAction::None),
     // (id!(room_settings_button), "Room settings", RoomActionBarAction::None),
     (id!(room_threads_button), "Threads", RoomActionBarAction::TogglePane(RoomPaneKind::Threads)),
     (id!(room_members_button), "Members", RoomActionBarAction::TogglePane(RoomPaneKind::Members)),

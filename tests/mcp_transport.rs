@@ -352,7 +352,7 @@ fn a_full_mcp_session_over_the_relay_child() {
     client.expect_silence(Duration::from_millis(500));
 
     // tools/list: the session's full tool set — the capability-gated reads,
-    // the generator, and the two ungated native tools — no cursor.
+    // the generator, and the native tools — no cursor.
     let result = client.request("tools/list", json!({}));
     assert!(result.get("nextCursor").is_none(), "never paginate");
     let tools = result["tools"].as_array().expect("tools is a list");
@@ -375,6 +375,7 @@ fn a_full_mcp_session_over_the_relay_child() {
             "call_mini_app_tool",
             "read_room_memory",
             "send_message",
+            "web_fetch",
             "post_room_message",
         ]
     );
