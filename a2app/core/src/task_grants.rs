@@ -963,27 +963,6 @@ pub fn apply(
         item_states: BTreeMap::new(),
     };
     let origin_room = Some(plan.context.room().unwrap_or_default());
-    let rollback = |applied: &AppliedTask, store: &mut PermissionStore, flow: &dyn FlowApply| {
-        for grant in applied.grants.iter().rev() {
-            match *grant {
-                GrantRef::Scoped(id) | GrantRef::Tool(id) => {
-                    if !store.remove_scoped_grant(id) {
-                        makepad_widgets::log!("Mini-app task rollback: scoped grant {id} was already gone.");
-                    }
-                }
-                GrantRef::Network(id) => {
-                    if !store.remove_network_grant(id) {
-                        makepad_widgets::log!("Mini-app task rollback: network grant {id} was already gone.");
-                    }
-                }
-                GrantRef::Flow(id) => {
-                    if let Err(error) = flow.revoke(id) {
-                        makepad_widgets::log!("Mini-app task rollback: couldn't revoke flow rule {id}: {error}");
-                    }
-                }
-            }
-        }
-    };
     for item in plan.items.iter().filter(|item| approved.contains(&item.id) && item.state.is_grantable()) {
         // The store may have changed since the plan was resolved. A now-allowed
         // item needs no new grant; a now-denied one is reported blocked and
