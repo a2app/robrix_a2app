@@ -287,7 +287,13 @@ impl Registry {
             .filter(|source| {
                 let baseline = matches!(source, Source::RoomDirectory { .. })
                     || matches!(source, Source::Room { room, .. } if Some(room.as_str()) == own_room);
-                !baseline && !self.source_allowed(source, provider, Some(context))
+                // `UnknownPrivate` can never be released by a sharing rule, so
+                // it must never raise an unactionable carried-over prompt (a
+                // legacy agent memory that reset on session start would
+                // otherwise prompt on every restart).
+                !baseline
+                    && !matches!(source, Source::UnknownPrivate)
+                    && !self.source_allowed(source, provider, Some(context))
             })
             .collect())
     }
@@ -1486,6 +1492,17 @@ mod tests {
         // The own room and the directory are the baseline, never carried over.
         registry.add_sources(&context, [Source::RoomDirectory { account: "alice".into() }]).unwrap();
         assert_eq!(registry.carried_over_sources(&context, &provider).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unknown_private_never_raises_a_carried_over_prompt() {
+        let root = TestRoot::new();
+        let mut registry = root.registry();
+        let context = agent("alice", "!ai:example.org");
+        let provider = Recipient::ModelProvider("provider".into());
+        registry.register_context_with_legacy_data(&context, true).unwrap();
+        assert!(registry.carried_over_sources(&context, &provider).unwrap().is_empty(),
+            "legacy stored data cannot be released, so it must not prompt on restart");
     }
 
     #[test]
