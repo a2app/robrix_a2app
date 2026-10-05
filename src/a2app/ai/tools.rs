@@ -1047,25 +1047,32 @@ impl RequestTaskPermissionsTool {
     }
 }
 
+/// The model-facing description of [`RequestTaskPermissionsTool`]. Kept as a
+/// constant so the guide, the README and the tool description can be checked
+/// against each other.
+pub const REQUEST_TASK_PERMISSIONS_DESCRIPTION: &str =
+    "Ask the user once, up front, for everything a task needs. Call it \
+     BEFORE any task that reads another room, posts to a room, fetches a \
+     website or calls a mini-app tool. List every need in one call: do not \
+     split a task across several requests and do not call a gated tool \
+     first. Write `explanation` as ONE coherent paragraph for the person \
+     who must approve it: what you want to do, and what data you need in \
+     order to do it (which rooms, which websites, which mini-app tools). \
+     Use room names, not ids. Give each need a short `why`. Use room ids \
+     from list_rooms (which needs no request). The result lists `granted` \
+     and `not_granted` with a reason; grants last only until this turn \
+     ends. If the work later needs something you did not list, call this tool \
+     again with that new need: you get at most three requests in one turn, and \
+     each request must contain at least one need you have not already declined. \
+     A need the user declined is not asked again this turn.";
+
 impl Tool for RequestTaskPermissionsTool {
     fn name(&self) -> &str {
         "request_task_permissions"
     }
 
     fn description(&self) -> &str {
-        "Ask the user once, up front, for everything a task needs. Call it \
-         BEFORE any task that reads another room, posts to a room, fetches a \
-         website or calls a mini-app tool. List every need in one call: do not \
-         split a task across several requests and do not call a gated tool \
-         first. Write `explanation` as ONE coherent paragraph for the person \
-         who must approve it: what you want to do, and what data you need in \
-         order to do it (which rooms, which websites, which mini-app tools). \
-         Use room names, not ids. Give each need a short `why`. Use room ids \
-         from list_rooms (which needs no request). The result lists `granted` \
-         and `not_granted` with a reason; grants last only until this turn \
-         ends. If the user declines, do not ask again this turn. If the work \
-         later needs something you did not list, do not call this tool again: \
-         do what you can and say in your reply what you could not do."
+        REQUEST_TASK_PERMISSIONS_DESCRIPTION
     }
 
     fn input_schema(&self) -> Value {
@@ -1350,6 +1357,20 @@ mod tests {
             ),
             Effective::NeedsPrompt,
             "reading another room must still prompt"
+        );
+    }
+
+    /// The tool description must match the guide's re-ask behavior: a later
+    /// need is requested with another call, a declined need stays declined,
+    /// and a turn allows at most three requests. The old "do not call this
+    /// tool again" instruction contradicts the guide and must be gone.
+    #[test]
+    fn request_task_permissions_description_matches_the_reask_guide() {
+        let description = REQUEST_TASK_PERMISSIONS_DESCRIPTION;
+        assert!(description.contains("three"), "the request cap is missing: {description}");
+        assert!(
+            !description.contains("do not call this tool again"),
+            "the description still forbids re-asking: {description}"
         );
     }
 
