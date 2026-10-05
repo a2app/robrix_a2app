@@ -5685,7 +5685,8 @@ fn run_request_task_permissions(    cx: &mut Cx,
     if !plan.needs_prompt() {
         // Every item is already allowed or blocked by policy: no modal, so
         // the agent is answered at once and blocked items surface on the turn.
-        note_ai_tool_call(room_id, "request_task_permissions", true, "Nothing new to allow");
+        let (ok, note) = settled_task_receipt(&plan);
+        note_ai_tool_call(room_id, "request_task_permissions", ok, note);
         let _ = answer.send(Ok(declined(&plan)));
         return;
     }
@@ -5702,6 +5703,22 @@ fn run_request_task_permissions(    cx: &mut Cx,
         state.task_prompts.push_back(TaskPrompt { room_id: room_id.clone(), plan, resume: TaskResume::AgentTool(answer) });
     });
     show_next_task_prompt(cx, ui);
+}
+
+/// The tool-call receipt for a plan that needed no prompt: success only when
+/// every item is already allowed, a failed receipt when every item is blocked
+/// or not offered, and a failed "some blocked" note for a mix.
+#[cfg(unix)]
+fn settled_task_receipt(plan: &TaskPlan) -> (bool, &'static str) {
+    if plan.items.iter().all(|item| matches!(item.state, ItemState::AlreadyAllowed)) {
+        (true, "Nothing new to allow")
+    } else if !plan.items.is_empty()
+        && plan.items.iter().all(|item| matches!(item.state, ItemState::Blocked(_) | ItemState::NotOffered(_)))
+    {
+        (false, "Blocked by room policy")
+    } else {
+        (false, "Some needs are blocked by room policy")
+    }
 }
 
 /// Records one task request for `room` and returns whether it is within the
@@ -11379,8 +11396,37 @@ View{note := Label{text:"waiting"}}
         );
     }
 
-    /// The directory defaults must grant the exact directory capabilities, not
-    /// their whole permission groups: room search, previews, invites and the
+    /// A plan that needs no prompt still gets an honest tool receipt: success
+    /// only when everything is already allowed, a failed "Blocked by room
+    /// policy" when everything is blocked, and a failed mixed note otherwise.
+    #[cfg(unix)]
+    #[test]
+    fn a_settled_plan_receipt_distinguishes_allowed_from_blocked() {
+        use a2app_core::task_grants::{ItemOrigin, PlanAction, PlanItem};
+        let plan = |states: Vec<ItemState>| {
+            let items = states.into_iter().enumerate().map(|(index, state)| PlanItem {
+                id: format!("n{index}"),
+                origin: ItemOrigin::Requested,
+                action: PlanAction::Network { url: "https://example.com/".into(), scope: RoomScope::room(SOURCE) },
+                state,
+                why: None,
+                risk: a2app_core::capabilities::Risk::Low,
+            }).collect();
+            TaskPlan {
+                task_id: 1, subject: "s".into(),
+                context: a2app_core::information_flow::ContextId::Agent { account: "a".into(), room: SOURCE.into() },
+                epoch: 1, title: "t".into(), explanation: "e".into(),
+                plan_hash: [0; 32], needs_fingerprint: [0; 32], items,
+            }
+        };
+        assert_eq!(settled_task_receipt(&plan(vec![ItemState::AlreadyAllowed])), (true, "Nothing new to allow"));
+        assert_eq!(settled_task_receipt(&plan(vec![ItemState::Blocked(TaskReason::BlockedByRoomPolicy)])),
+            (false, "Blocked by room policy"));
+        assert_eq!(settled_task_receipt(&plan(vec![ItemState::AlreadyAllowed, ItemState::NotOffered(TaskReason::NotOffered)])),
+            (false, "Some needs are blocked by room policy"));
+    }
+
+    /// The directory defaults must grant the exact directory capabilities, not    /// their whole permission groups: room search, previews, invites and the
     /// incoming room-list hooks share `MatrixRoomsList`, and `MatrixSpaces` is
     /// shared with the space-changed hook. The store's group state stays Ask;
     /// only a scoped grant for each directory capability is recorded.
