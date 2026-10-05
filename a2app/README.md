@@ -363,7 +363,11 @@ request that adds a new need is shown. A turn may make at most three requests,
 so a looping agent cannot re-ask forever. The per-call prompts remain the
 fallback for anything the agent did not list. The plan model, resolver and
 atomic apply live in `a2app/core/src/task_grants.rs`; the prompt is
-`src/a2app/task_permission_prompt.rs`.
+`src/a2app/task_permission_prompt.rs`. The modal can wait behind other
+prompts, so every grantable item is re-checked against the live permission
+store when it is applied: an item that became allowed is skipped (no duplicate
+grant), and an item the user blocked in the meantime is reported
+`blocked_by_room_policy` and not granted while the rest of the batch applies.
 
 **The room and space directory is on by default.** `list_rooms`,
 `list_spaces`, `space_info` and `list_space_rooms` are granted once, on an AI

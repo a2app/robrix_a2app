@@ -829,6 +829,12 @@ pub struct AppliedTask {
     pub title: String,
     pub plan_hash: [u8; 32],
     pub grants: Vec<GrantRef>,
+    /// The re-evaluated state of items that no longer needed a grant (or could
+    /// not be granted) when the batch was applied. The store can change while
+    /// the modal waits, so an item `NeedsGrant` at resolve may be
+    /// `AlreadyAllowed` or `Blocked` by apply time; its state is recorded here
+    /// and the grant is skipped. Items absent kept their resolved state.
+    pub item_states: BTreeMap<String, ItemState>,
 }
 
 /// One stored grant created by a task, addressed by its kind so revoke can
@@ -883,10 +889,56 @@ impl ApplyError {
     }
 }
 
+/// Re-checks one approved item against the live store. The plan was resolved
+/// some time before it was applied (the modal can wait behind others), and the
+/// user can change policy meanwhile. Returns a replacement state when the
+/// resolved verdict no longer holds, so the grant is skipped: `AlreadyAllowed`
+/// when the capability or URL is now allowed, `Blocked(BlockedByRoomPolicy)`
+/// when a room policy now denies it. `None` lets the grant proceed.
+fn recheck_grantable(item: &PlanItem, plan: &TaskPlan, store: &PermissionStore) -> Option<ItemState> {
+    match &item.action {
+        PlanAction::Scoped { permission, capability, scope } => {
+            let cap = capabilities::by_id(capability)?;
+            Permission::from_str(permission)?;
+            let mut declared = BTreeSet::new();
+            for other in &plan.items {
+                if let PlanAction::Scoped { capability, .. } = &other.action {
+                    declared.insert(capability.as_str());
+                }
+            }
+            let declares_perm = |p: Permission| declared.iter().any(|id| capabilities::by_id(id).and_then(|c| c.group) == Some(p));
+            let declares_cap = |c: &Capability| declared.contains(c.id);
+            let targets: Vec<Option<&str>> = match scope {
+                RoomScope::AllRooms => vec![plan.context.room()],
+                RoomScope::Selection { rooms, spaces } => rooms.iter().chain(spaces).map(|target| Some(target.as_str())).collect(),
+            };
+            let mut already = !targets.is_empty();
+            for target in targets {
+                let context = PermissionContext { origin_room: plan.context.room(), target_room: target };
+                if let Some((_, evaluation)) = store.capability_room_evaluation(cap, context)
+                    && evaluation.decision == crate::permissions::PolicyDecision::Deny
+                {
+                    return Some(ItemState::Blocked(TaskReason::BlockedByRoomPolicy));
+                }
+                if store.effective_capability_for_in_context(&plan.subject, &declares_perm, &declares_cap, cap, context) != Effective::Granted {
+                    already = false;
+                }
+            }
+            already.then_some(ItemState::AlreadyAllowed)
+        }
+        PlanAction::Network { url, .. } => {
+            let context = PermissionContext { origin_room: plan.context.room(), target_room: plan.context.room() };
+            store.is_url_allowed(&plan.subject, url, context).then_some(ItemState::AlreadyAllowed)
+        }
+        PlanAction::Tool { .. } | PlanAction::Flow { .. } => None,
+    }
+}
+
 /// Applies every approved item as one atomic batch: permission, network and
 /// tool grants first, information-flow rules last. Any failure rolls back
 /// everything already applied and returns the failing item, so a task never
-/// leaves a half-granted state.
+/// leaves a half-granted state. Each grantable item is re-checked against the
+/// live store first (see [`recheck_grantable`]).
 pub fn apply(
     plan: &TaskPlan,
     approved: &BTreeSet<String>,
@@ -904,6 +956,7 @@ pub fn apply(
         title: plan.title.clone(),
         plan_hash: plan.plan_hash,
         grants: Vec::new(),
+        item_states: BTreeMap::new(),
     };
     let origin_room = Some(plan.context.room().unwrap_or_default());
     let rollback = |applied: &AppliedTask, store: &mut PermissionStore, flow: &dyn FlowApply| {
@@ -916,6 +969,13 @@ pub fn apply(
         }
     };
     for item in plan.items.iter().filter(|item| approved.contains(&item.id) && item.state.is_grantable()) {
+        // The store may have changed since the plan was resolved. A now-allowed
+        // item needs no new grant; a now-denied one is reported blocked and
+        // skipped. Either way the rest of the batch continues.
+        if let Some(state) = recheck_grantable(item, plan, store) {
+            applied.item_states.insert(item.id.clone(), state);
+            continue;
+        }
         let result = match &item.action {
             PlanAction::Scoped { permission, capability, scope } => {
                 match Permission::from_str(permission) {
@@ -1032,12 +1092,22 @@ impl TaskLedger {
 /// The result the tool hands back to the model. Reasons are the closed set in
 /// [`TaskReason`].
 pub fn outcome(plan: &TaskPlan, approved: &BTreeSet<String>) -> serde_json::Value {
+    outcome_with(plan, approved, &BTreeMap::new())
+}
+
+/// Like [`outcome`], but reports the item states re-evaluated when the plan
+/// was applied (see [`AppliedTask::item_states`]).
+pub fn outcome_of(plan: &TaskPlan, approved: &BTreeSet<String>, applied: &AppliedTask) -> serde_json::Value {
+    outcome_with(plan, approved, &applied.item_states)
+}
+
+fn outcome_with(plan: &TaskPlan, approved: &BTreeSet<String>, overrides: &BTreeMap<String, ItemState>) -> serde_json::Value {
     let mut granted = Vec::new();
     let mut not_granted = Vec::new();
     let mut satisfied = 0usize;
     let mut blocked = 0usize;
     for item in &plan.items {
-        match &item.state {
+        match overrides.get(&item.id).unwrap_or(&item.state) {
             // An already-allowed item counts as satisfied: the agent can use it
             // without a new grant, so it is not a declination.
             ItemState::AlreadyAllowed => {
@@ -1296,6 +1366,54 @@ mod tests {
         assert_eq!(plan.items.iter().find(|i| i.id == "n1").unwrap().state, ItemState::AlreadyAllowed);
     }
 
+    /// The store can change while the modal waits. A room the user denies in
+    /// the meantime is reported blocked at apply time and nothing is granted
+    /// for it; the rest of the batch still applies.
+    #[test]
+    fn apply_rechecks_room_policy_and_reports_a_new_denial() {
+        let mut store = PermissionStore::default();
+        store.set_matrix_write(true);
+        let joined = |room: &str| matches!(room, "!ai:example.org" | "!leads:example.org");
+        let lookup = FakeLookup { allowed: Default::default() };
+        let plan = resolve(&request(vec![TaskNeed::Capability { id: "n1".into(),
+            capability: "matrix.rooms.message.send".into(), targets: vec!["!leads:example.org".into()], why: None }]),
+            &inputs(&store, &joined, &lookup)).unwrap();
+        let approved: BTreeSet<String> = plan.items.iter().map(|i| i.id.clone()).collect();
+        // The user denies the target room while the prompt waits.
+        store.set_room_policy("!leads:example.org", RoomAccess::Write, PolicyDecision::Deny);
+        let flow = FakeFlow::new();
+        let applied = apply(&plan, &approved, &mut store, &flow).unwrap();
+        assert_eq!(applied.item_states.get("n1"), Some(&ItemState::Blocked(TaskReason::BlockedByRoomPolicy)));
+        assert!(store.scoped_grants(&plan.subject).is_empty(), "a denied item is not granted");
+        let outcome = outcome_of(&plan, &approved, &applied);
+        assert_eq!(outcome["not_granted"][0]["reason"], "blocked_by_room_policy");
+        // The batch is not a hard failure: the implied flow rules still apply.
+        assert!(!applied.grants.is_empty());
+    }
+
+    /// Granting the capability between resolve and apply must not produce a
+    /// second, duplicate grant.
+    #[test]
+    fn apply_does_not_duplicate_a_capability_granted_while_the_modal_waited() {
+        let mut store = PermissionStore::default();
+        store.set_matrix_write(true);
+        let joined = |room: &str| matches!(room, "!ai:example.org" | "!leads:example.org");
+        let lookup = FakeLookup { allowed: Default::default() };
+        let plan = resolve(&request(vec![TaskNeed::Capability { id: "n1".into(),
+            capability: "matrix.rooms.message.send".into(), targets: vec!["!leads:example.org".into()], why: None }]),
+            &inputs(&store, &joined, &lookup)).unwrap();
+        let approved: BTreeSet<String> = plan.items.iter().map(|i| i.id.clone()).collect();
+        // Something else grants it while the prompt waits.
+        store.grant_scoped(&plan.subject, Permission::MatrixRoomsSend, Some("matrix.rooms.message.send"),
+            RoomScope::room("!leads:example.org"), GrantDuration::RobrixSession, Some("!ai:example.org")).unwrap();
+        let before = store.scoped_grants(&plan.subject).len();
+        let flow = FakeFlow::new();
+        let applied = apply(&plan, &approved, &mut store, &flow).unwrap();
+        assert_eq!(applied.item_states.get("n1"), Some(&ItemState::AlreadyAllowed));
+        assert_eq!(store.scoped_grants(&plan.subject).len(), before, "no duplicate grant is added");
+        assert_eq!(outcome_of(&plan, &approved, &applied)["granted"][0], "n1");
+    }
+
     #[test]
     fn unjoined_targets_are_invalid_and_unknown_capabilities_are_not_offered() {
         let store = PermissionStore::default();
@@ -1517,12 +1635,12 @@ mod tests {
     fn ledger_tracks_and_drains_tasks() {
         let mut ledger = TaskLedger::default();
         ledger.insert(AppliedTask { task_id: 3, subject: "s".into(), context: ContextId::Agent { account: "a".into(), room: "r".into() },
-            epoch: 1, title: "t".into(), plan_hash: [0; 32], grants: vec![GrantRef::Scoped(2)] });
+            epoch: 1, title: "t".into(), plan_hash: [0; 32], grants: vec![GrantRef::Scoped(2)], item_states: BTreeMap::new() });
         assert_eq!(ledger.tasks().count(), 1);
         assert!(ledger.remove(3).is_some());
         assert!(ledger.is_empty());
         ledger.insert(AppliedTask { task_id: 4, subject: "s".into(), context: ContextId::Agent { account: "a".into(), room: "r".into() },
-            epoch: 1, title: "t".into(), plan_hash: [0; 32], grants: vec![] });
+            epoch: 1, title: "t".into(), plan_hash: [0; 32], grants: vec![], item_states: BTreeMap::new() });
         assert_eq!(ledger.drain().len(), 1);
     }
 }

@@ -6026,11 +6026,14 @@ fn answer_task_prompt(cx: &mut Cx, ui: &WidgetRef, action: TaskPermissionAction)
     let mut applied = None;
     let outcome = match result {
         Ok(task) => {
+            // Report the states re-checked at apply time, then keep the task in
+            // the ledger for the turn's close to revoke.
+            let outcome = task_grants::outcome_of(&plan, &approved, &task).to_string();
             applied = Some(task);
             if agent_tool {
                 note_ai_tool_call(&room_id, "request_task_permissions", true, &format!("Approved: {}", plan.title));
             }
-            Ok(task_grants::outcome(&plan, &approved).to_string())
+            Ok(outcome)
         }
         Err(error) => {
             let message = error.message();
@@ -11316,6 +11319,7 @@ View{note := Label{text:"waiting"}}
                 title: "t".into(),
                 plan_hash: [0; 32],
                 grants: Vec::new(),
+                item_states: BTreeMap::new(),
             });
             state.dismissed_task_plans.insert((SOURCE.to_string(), [3; 32]), BTreeSet::new());
             state.task_request_counts.insert(SOURCE.to_string(), 2);
@@ -11458,6 +11462,7 @@ View{note := Label{text:"waiting"}}
                     title: "t".into(),
                     plan_hash: [0; 32],
                     grants: Vec::new(),
+                    item_states: BTreeMap::new(),
                 });
             }
         });
