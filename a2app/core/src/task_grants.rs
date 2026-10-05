@@ -445,6 +445,27 @@ pub struct ResolveInputs<'a> {
     pub flow: &'a dyn FlowLookup,
 }
 
+/// Whether `cap` is already effectively allowed at every target in `targets`,
+/// built from a set of declared capability ids. Shared by the resolver's
+/// `AlreadyAllowed` verdict and `apply`'s live re-check so the two can never
+/// diverge.
+fn capability_allowed_at_all(
+    store: &PermissionStore,
+    subject: &str,
+    declared: &BTreeSet<&str>,
+    cap: &Capability,
+    targets: &[String],
+    origin_room: Option<&str>,
+) -> bool {
+    let declares_perm = |p: Permission| declared.iter().any(|id| capabilities::by_id(id).and_then(|c| c.group) == Some(p));
+    let declares_cap = |c: &Capability| declared.contains(c.id);
+    !targets.is_empty()
+        && targets.iter().all(|target| {
+            let context = PermissionContext { origin_room, target_room: Some(target.as_str()) };
+            store.effective_capability_for_in_context(subject, &declares_perm, &declares_cap, cap, context) == Effective::Granted
+        })
+}
+
 /// Turns the agent's request into the exact plan the user will see. Never
 /// errors on a need: a bad item becomes `NotOffered` or `Blocked`, so the rest
 /// of the plan still reaches the user and the model learns what failed.
@@ -457,6 +478,7 @@ pub fn resolve(request: &TaskRequest, inputs: &ResolveInputs<'_>) -> Result<Task
     let mut outputs: Vec<(String, Recipient)> = Vec::new();
     // The AI room itself is already a source (its messages reach the agent).
     let room_source = Source::Room { account: inputs.account.into(), room: inputs.room.into() };
+    let declared: BTreeSet<&str> = inputs.declared_capabilities.iter().copied().collect();
 
     for need in &request.needs {
         match need {
@@ -505,12 +527,7 @@ pub fn resolve(request: &TaskRequest, inputs: &ResolveInputs<'_>) -> Result<Task
                     continue;
                 }
                 // Already granted at every target means the user sees nothing.
-                let declares_perm = |p: Permission| inputs.declared_capabilities.iter().any(|id| capabilities::by_id(id).and_then(|c| c.group) == Some(p));
-                let declares_cap = |c: &Capability| inputs.declared_capabilities.contains(&c.id);
-                let already = !all_targets.is_empty() && all_targets.iter().all(|target| {
-                    let context = PermissionContext { origin_room: Some(inputs.room), target_room: Some(target) };
-                    inputs.store.effective_capability_for_in_context(inputs.subject, &declares_perm, &declares_cap, cap, context) == Effective::Granted
-                });
+                let already = capability_allowed_at_all(inputs.store, inputs.subject, &declared, cap, all_targets, Some(inputs.room));
                 let state = if already { ItemState::AlreadyAllowed } else { ItemState::NeedsGrant };
                 items.push(PlanItem { id: id.clone(), origin: ItemOrigin::Requested, action, state, why, risk: cap.risk });
                 collect_contract_flow(cap, inputs, all_targets, id, &mut read_sources, &mut outputs);
@@ -910,25 +927,20 @@ fn recheck_grantable(item: &PlanItem, plan: &TaskPlan, store: &PermissionStore) 
                     declared.insert(capability.as_str());
                 }
             }
-            let declares_perm = |p: Permission| declared.iter().any(|id| capabilities::by_id(id).and_then(|c| c.group) == Some(p));
-            let declares_cap = |c: &Capability| declared.contains(c.id);
-            let targets: Vec<Option<&str>> = match scope {
-                RoomScope::AllRooms => vec![plan.context.room()],
-                RoomScope::Selection { rooms, spaces } => rooms.iter().chain(spaces).map(|target| Some(target.as_str())).collect(),
+            let targets: Vec<String> = match scope {
+                RoomScope::AllRooms => plan.context.room().map(str::to_string).into_iter().collect(),
+                RoomScope::Selection { rooms, spaces } => rooms.iter().chain(spaces).cloned().collect(),
             };
-            let mut already = !targets.is_empty();
-            for target in targets {
-                let context = PermissionContext { origin_room: plan.context.room(), target_room: target };
+            for target in &targets {
+                let context = PermissionContext { origin_room: plan.context.room(), target_room: Some(target.as_str()) };
                 if let Some((_, evaluation)) = store.capability_room_evaluation(cap, context)
                     && evaluation.decision == crate::permissions::PolicyDecision::Deny
                 {
                     return Some(ItemState::Blocked(TaskReason::BlockedByRoomPolicy));
                 }
-                if store.effective_capability_for_in_context(&plan.subject, &declares_perm, &declares_cap, cap, context) != Effective::Granted {
-                    already = false;
-                }
             }
-            already.then_some(ItemState::AlreadyAllowed)
+            capability_allowed_at_all(store, &plan.subject, &declared, cap, &targets, plan.context.room())
+                .then_some(ItemState::AlreadyAllowed)
         }
         PlanAction::Network { url, .. } => {
             let context = PermissionContext { origin_room: plan.context.room(), target_room: plan.context.room() };
@@ -963,11 +975,42 @@ pub fn apply(
         item_states: BTreeMap::new(),
     };
     let origin_room = Some(plan.context.room().unwrap_or_default());
+    // A requested need whose implied sharing rule the user left unchecked is
+    // not usable: the capability grant would be recorded but the data could
+    // never reach the agent, so it is dropped here.
+    let mut declined_dependency: BTreeSet<String> = BTreeSet::new();
+    for item in &plan.items {
+        if let ItemOrigin::Implied { because } = &item.origin
+            && matches!(item.state, ItemState::NeedsGrant)
+            && !approved.contains(&item.id)
+        {
+            for cause in because {
+                declined_dependency.insert(cause.clone());
+            }
+        }
+    }
+    let mut blocked_requested: BTreeSet<String> = BTreeSet::new();
     for item in plan.items.iter().filter(|item| approved.contains(&item.id) && item.state.is_grantable()) {
+        // An implied row whose every cause was blocked at apply time is dead:
+        // it is reported blocked and skipped, never granted.
+        if let ItemOrigin::Implied { because } = &item.origin
+            && !because.is_empty()
+            && because.iter().all(|cause| blocked_requested.contains(cause))
+        {
+            applied.item_states.insert(item.id.clone(), ItemState::Blocked(TaskReason::BlockedByRoomPolicy));
+            continue;
+        }
+        // A read whose own sharing rule was left unchecked is not granted.
+        if matches!(item.origin, ItemOrigin::Requested) && declined_dependency.contains(&item.id) {
+            continue;
+        }
         // The store may have changed since the plan was resolved. A now-allowed
         // item needs no new grant; a now-denied one is reported blocked and
         // skipped. Either way the rest of the batch continues.
         if let Some(state) = recheck_grantable(item, plan, store) {
+            if matches!(state, ItemState::Blocked(_)) {
+                blocked_requested.insert(item.id.clone());
+            }
             applied.item_states.insert(item.id.clone(), state);
             continue;
         }
@@ -1440,15 +1483,53 @@ mod tests {
         assert!(store.scoped_grants(&plan.subject).is_empty(), "a denied item is not granted");
         let outcome = outcome_of(&plan, &approved, &applied);
         assert_eq!(outcome["not_granted"][0]["reason"], "blocked_by_room_policy");
-        // The batch is not a hard failure: the implied flow rules still apply.
-        assert!(!applied.grants.is_empty());
+        // A blocked read must not leave its own implied flow rules granted.
+        let leads = Source::Room { account: "alice".into(), room: "!leads:example.org".into() };
+        assert!(
+            !flow.allowed.borrow().iter().any(|(source, _)| *source == item_key(&leads)),
+            "a blocked read's flow rules must be skipped with it"
+        );
+        for item in plan.items.iter() {
+            if let ItemOrigin::Implied { because } = &item.origin
+                && because.contains(&"n1".to_string())
+            {
+                assert_eq!(applied.item_states.get(&item.id), Some(&ItemState::Blocked(TaskReason::BlockedByRoomPolicy)),
+                    "{} must be reported blocked", item.id);
+            }
+        }
+    }
+
+    /// A read whose implied sharing rule the user left unchecked is not
+    /// granted: the capability would sit in the ledger while its data could
+    /// never reach the agent. The outcome reports it `declined_dependency`.
+    #[test]
+    fn apply_drops_a_read_whose_flow_dependency_was_unchecked() {
+        let mut store = PermissionStore::default();
+        let joined = |room: &str| matches!(room, "!ai:example.org" | "!ops:example.org");
+        let lookup = FakeLookup { allowed: Default::default() };
+        let plan = resolve(&request(vec![TaskNeed::Capability { id: "n1".into(),
+            capability: "matrix.rooms.messages.read".into(), targets: vec!["!ops:example.org".into()], why: None }]),
+            &inputs(&store, &joined, &lookup)).unwrap();
+        // The user approves the read but unchecks the provider sharing rule.
+        let flow_item = plan.items.iter().find(|item| {
+            matches!(&item.action, PlanAction::Flow { recipient: Recipient::ModelProvider(_), .. })
+                && matches!(&item.origin, ItemOrigin::Implied { because } if because.contains(&"n1".to_string()))
+        }).expect("the read derives a provider flow row").id.clone();
+        let approved: BTreeSet<String> = plan.items.iter().map(|item| item.id.clone())
+            .filter(|id| id != &flow_item).collect();
+        let flow = FakeFlow::new();
+        let applied = apply(&plan, &approved, &mut store, &flow).unwrap();
+        assert!(store.scoped_grants(&plan.subject).is_empty(),
+            "a read without its sharing rule must not record its capability grant");
+        let outcome = outcome_of(&plan, &approved, &applied);
+        assert!(outcome["not_granted"].as_array().unwrap().iter().any(|entry| entry["reason"] == "declined_dependency"));
+        assert_eq!(outcome["status"], "partial");
     }
 
     /// Granting the capability between resolve and apply must not produce a
     /// second, duplicate grant.
     #[test]
-    fn apply_does_not_duplicate_a_capability_granted_while_the_modal_waited() {
-        let mut store = PermissionStore::default();
+    fn apply_does_not_duplicate_a_capability_granted_while_the_modal_waited() {        let mut store = PermissionStore::default();
         store.set_matrix_write(true);
         let joined = |room: &str| matches!(room, "!ai:example.org" | "!leads:example.org");
         let lookup = FakeLookup { allowed: Default::default() };
