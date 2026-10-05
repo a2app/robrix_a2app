@@ -348,8 +348,11 @@ policy and the information-flow rules, diffs it against what is already
 granted, and shows **one** modal: the agent's own plain-language paragraph plus
 a collapsible Details list of the exact items. The permission grants and the
 sharing rules they imply are applied together, for the agent's own subject,
-for **this turn only** — no durable or `Always` grant comes from this tool, and
-the turn's end revokes everything. The grants are in-memory session grants
+for **this turn only** — no durable or `Always` grant comes from this tool. The
+turn's output is written under those grants (the reply, any error/stopped
+activity row, and the final `Done` turn card each still pass the whole-label
+sharing check), and the runtime revokes the exact applied batch from its
+per-task ledger once the last of those writes lands. The grants are in-memory session grants
 (`GrantDuration::RobrixSession` / `SharingDuration::RoomSession`); they are
 never written to disk, and the runtime also revokes the exact applied batch
 from its per-task ledger when the turn closes, the session stops, or the room
