@@ -521,14 +521,8 @@ impl AiReplyTimelineCardRef {
             .filter(|c| !c.tool_calls.is_empty())
             .map(|c| {
                 let parts: Vec<String> = c.tool_calls.iter().map(|t| {
-                    let mut label = format!("{}{}", ai_tool_display_name(&t.name), detail_suffix(t.detail.as_deref()));
-                    if !t.ok {
-                        label.push_str(" ✗");
-                        if !t.summary.is_empty() {
-                            label.push_str(&format!(" ({})", t.summary));
-                        }
-                    }
-                    label
+                    let label = format!("{}{}", ai_tool_display_name(&t.name), detail_suffix(t.detail.as_deref()));
+                    if t.ok { label } else { format!("{label} ✗") }
                 }).collect();
                 format!("Used: {}", parts.join(", "))
             })
@@ -682,28 +676,19 @@ fn ai_turn_title(content: &AiTurnContent) -> String {
 /// The one-line text one tool call inside a turn card renders as. Mirrors
 /// [`ai_tool_call_label`] but without the per-call status glyph, since a
 /// leading `✓`/`✗` reads better in a list than the `⚙`/`✓` pair.
+///
+/// Only the action and its target argument are shown (for example
+/// `Read messages in “General”`); the tool's result is not listed here.
 pub fn ai_turn_tool_label(call: &AiTurnToolCall) -> String {
     let action = match call.status {
         AiTurnToolStatus::Started => ai_tool_display_name_running(&call.name),
         AiTurnToolStatus::Done => ai_tool_display_name(&call.name),
     };
     let detail = detail_suffix(call.detail.as_deref());
-    let summary = format_tool_result(&call.name, &call.summary);
     match call.status {
         AiTurnToolStatus::Started => format!("· {action}{detail}…"),
-        AiTurnToolStatus::Done => {
-            if call.ok {
-                if summary.is_empty() {
-                    format!("✓ {action}{detail}")
-                } else {
-                    format!("✓ {action}{detail}: {summary}")
-                }
-            } else if summary.is_empty() {
-                format!("✗ {action}{detail} refused")
-            } else {
-                format!("✗ {action}{detail}: {summary}")
-            }
-        }
+        AiTurnToolStatus::Done if call.ok => format!("✓ {action}{detail}"),
+        AiTurnToolStatus::Done => format!("✗ {action}{detail} refused"),
     }
 }
 
@@ -1122,29 +1107,18 @@ fn detail_suffix(detail: Option<&str>) -> String {
 
 /// The one-line text an [`AiToolCallContent`] row renders as: the humanized
 /// action plus whatever target detail the call carried (`Read messages in
-/// “General”`, `Built and ran a mini-app “a pomodoro timer”`).
+/// “General”`, `Built and ran a mini-app “a pomodoro timer”`). The result is
+/// not shown; only the action and its argument are.
 pub fn ai_tool_call_label(content: &AiToolCallContent) -> String {
     let action = match content.status {
         AiToolCallStatus::Started => ai_tool_display_name_running(&content.name),
         AiToolCallStatus::Done => ai_tool_display_name(&content.name),
     };
     let detail = detail_suffix(content.detail.as_deref());
-    let summary = format_tool_result(&content.name, &content.summary);
     match content.status {
         AiToolCallStatus::Started => format!("⚙ {action}{detail}…"),
-        AiToolCallStatus::Done => {
-            if content.ok {
-                if summary.is_empty() {
-                    format!("✓ {action}{detail}")
-                } else {
-                    format!("✓ {action}{detail}: {summary}")
-                }
-            } else if summary.is_empty() {
-                format!("✗ {action}{detail} refused")
-            } else {
-                format!("✗ {action}{detail}: {summary}")
-            }
-        }
+        AiToolCallStatus::Done if content.ok => format!("✓ {action}{detail}"),
+        AiToolCallStatus::Done => format!("✗ {action}{detail} refused"),
     }
 }
 
@@ -1340,5 +1314,32 @@ mod tests {
         // A thinking-only turn that settled keeps its thinking marker.
         let settled = AiTurnContent { status: AiTurnStatus::Done, ..thinking };
         assert_eq!(ai_turn_title(&settled), "Thought");
+    }
+
+    /// A tool call shows only what it did and, when it has one, its argument;
+    /// the result list (which can be long) is never rendered.
+    #[test]
+    fn tool_call_labels_omit_the_result_and_keep_the_argument() {
+        let listed = AiTurnToolCall {
+            name: "list_rooms".to_string(),
+            detail: None,
+            status: AiTurnToolStatus::Done,
+            ok: true,
+            summary: "• test 11\n• Random\n• Project".to_string(),
+        };
+        assert_eq!(ai_turn_tool_label(&listed), "✓ Listed your rooms");
+
+        let cross_room = AiTurnToolCall {
+            name: "read_other_room_messages".to_string(),
+            detail: Some("in “General”".to_string()),
+            status: AiTurnToolStatus::Done,
+            ok: true,
+            summary: "• zcorpan: hello".to_string(),
+        };
+        assert_eq!(ai_turn_tool_label(&cross_room), "✓ Read messages in “General”");
+
+        // A refused call says so, without spilling its error result.
+        let refused = AiTurnToolCall { ok: false, ..cross_room };
+        assert_eq!(ai_turn_tool_label(&refused), "✗ Read messages in “General” refused");
     }
 }

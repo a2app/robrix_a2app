@@ -4359,10 +4359,11 @@ fn session_job_detail(rooms: Option<&RoomsListRef>, job: &SessionJob) -> Option<
         // A launch names the app it runs; the read-only list has no target.
         SessionJob::LaunchApp { app_id, .. } => Some(format!("“{}”", resolve_app_label(app_id))),
         SessionJob::ListApps { .. } => None,
-        // No target of its own: the ACP `tool_call` event names the web tool,
-        // and the turn card is reposted with that name; this job carries only
-        // the host the user is being asked about.
-        SessionJob::NetworkAccess { .. } | SessionJob::FetchUrl { .. } => None,
+        // The web tool's own name is the action; the URL is the argument the
+        // reader needs to tell one fetch from another.
+        SessionJob::NetworkAccess { url, .. } | SessionJob::FetchUrl { url, .. } => {
+            (!url.trim().is_empty()).then(|| url.clone())
+        }
         // The tool name already names it; no extra target to add.
         SessionJob::InvokeMiniAppTool { .. } => None,
         // A bridged call still targets one app tool; name it for the card.
