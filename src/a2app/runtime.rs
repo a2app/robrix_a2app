@@ -6052,15 +6052,16 @@ fn answer_exact_review(cx: &mut Cx, ui: &WidgetRef, review: ExactReviewPrompt, a
 }
 
 /// Whether an `ai_reply`/`send_message` write result should drop the turn's
-/// task grants now (see [`AiRoomAction::PostReplyResult`]). A natural reply
-/// (`parked_turn == None`) revokes only when no newer turn has taken over. A
-/// parked `send_message` revokes only while its own turn is still the live
-/// one, so a result from a turn the user cancelled can never touch the turn
-/// that replaced it.
+/// task grants now (see [`AiRoomAction::PostReplyResult`]). A parked
+/// `send_message` write is an effect WITHIN its turn: the agent keeps
+/// reasoning and calling the model after the tool returns, and those calls
+/// still need the turn's grants, so the write result never revokes them; the
+/// turn's own close does. A natural reply has no more turn to protect, so it
+/// revokes once its write lands, unless a newer turn has already taken over.
 #[cfg(unix)]
 fn should_revoke_task_grants(parked_turn: Option<&str>, live_turn: Option<&str>) -> bool {
     match parked_turn {
-        Some(turn) => live_turn == Some(turn),
+        Some(_) => false,
         None => live_turn.is_none(),
     }
 }
@@ -7929,16 +7930,19 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
                         }).unwrap_or(false);
                         if posted_by_tool {
                             log!("AI Rooms: room {room_id}'s turn already posted via the send_message tool; dropping its {} trailing text.", text.chars().count());
+                            // Nothing more is written for this turn, so it is
+                            // fully over and its grants can go now. The
+                            // send_message write result cannot do this, because
+                            // the agent may still call the model between the
+                            // tool and this end-of-turn event.
+                            close_active_turn(&room_id, true);
                         } else {
-                            to_post.push((room_id.clone(), text))
+                            to_post.push((room_id.clone(), text));
+                            // The reply is still being written; keep this
+                            // turn's grants until it lands (see
+                            // `PostReplyResult`).
+                            close_active_turn(&room_id, false);
                         }
-                        // Turn over: the turn card is settled (Done), and
-                        // any tool call that never resolved stays as a
-                        // `Started` line inside it — the reply's receipt chips
-                        // still tell the outcome. This turn's grants stay until
-                        // the reply it queued lands (or, if `send_message`
-                        // already replied, until that write's result landed).
-                        close_active_turn(&room_id, false);
                     }
                     SessionUpdate::TurnEnded => {
                         // The turn ended without a reply (cancelled via Escape,
@@ -10871,13 +10875,13 @@ View{note := Label{text:"waiting"}}
 
     #[cfg(unix)]
     #[test]
-    fn write_results_revoke_task_grants_only_for_the_live_turn() {
+    fn write_results_revoke_task_grants_only_for_a_finished_turn() {
         // A natural reply (no parked turn) revokes when no newer turn is live.
         assert!(should_revoke_task_grants(None, None));
         assert!(!should_revoke_task_grants(None, Some("newer")));
-        // A parked send_message revokes only while its own turn is still live;
-        // a result from a cancelled turn must not touch its replacement.
-        assert!(should_revoke_task_grants(Some("turn-1"), Some("turn-1")));
+        // A parked send_message never revokes on its write: the agent keeps
+        // reasoning after the tool, so the turn's close drops the grants.
+        assert!(!should_revoke_task_grants(Some("turn-1"), Some("turn-1")));
         assert!(!should_revoke_task_grants(Some("turn-1"), Some("turn-2")));
         assert!(!should_revoke_task_grants(Some("turn-1"), None));
     }
