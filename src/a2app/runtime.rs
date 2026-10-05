@@ -8028,6 +8028,15 @@ fn raise_carried_permission_prompt(room_id: &OwnedRoomId, texts: &[(OwnedEventId
         return true;
     }
     let plan = build_carried_task_plan(room_id, &context, &carried, &provider, homeserver.as_ref(), task_id);
+    // A decline is remembered for the turn by the plan's needs, exactly as an
+    // agent-requested plan is: do not raise the same carried prompt twice.
+    let dismissed = with_a2app(|state| {
+        task_plan_is_dismissed(&state.dismissed_task_plans, room_id.as_str(), &plan.need_keys())
+    })
+    .unwrap_or(false);
+    if dismissed {
+        return false;
+    }
     with_a2app(|state| {
         state.next_task_id = task_id;
         state.task_prompts.push_back(TaskPrompt {
