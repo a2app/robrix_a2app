@@ -1389,9 +1389,10 @@ mod tests {
         let mut registry = root.registry();
         let receiver = agent("alice", "room-a");
         registry.register_context(&receiver).unwrap();
-        // Registering the app records its code provenance as UnknownPrivate.
+        // Registering the app as legacy records its code provenance as
+        // UnknownPrivate (existing app_data alone no longer taints code).
         let app_context = app("legacy", "alice", "room-a");
-        registry.register_context_with_legacy_data(&app_context, false).unwrap();
+        registry.register_context_with_legacy_data(&app_context, true).unwrap();
         assert!(registry.code_labels("legacy").unwrap().contains(&Source::UnknownPrivate));
         // A metadata listing only adds its own account source; the receiver
         // stays clean and can still reach the model provider.
