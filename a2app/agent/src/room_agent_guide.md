@@ -87,6 +87,15 @@ Read the result before doing anything else:
 - `not_offered` or `invalid_target` — the need was wrong (an unknown
   capability, an unjoined room, a malformed URL, an unknown app tool). Fix the
   need or drop it.
+- `declined_dependency` — a read you approved was left without one of the
+  information-flow rules it needs, so its data cannot reach you this turn.
+  Treat that read as unavailable.
+
+The result lists only the needs you named, by their own ids. The
+information-flow rules Robrix derives from them are summarized as
+`flow_rules` counts (`applied` and `skipped`); their internal ids are never
+shown. If a requested read is reported `partial` because a `declined_dependency`
+rule was unchecked, re-ask for that read and its rule together.
 
 If the work reveals a need you did not plan for, you may call
 `request_task_permissions` again, but only for the new need: you get at most

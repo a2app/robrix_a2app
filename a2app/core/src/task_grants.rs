@@ -155,6 +155,9 @@ pub enum ItemOrigin {
 #[serde(rename_all = "snake_case")]
 pub enum TaskReason {
     Declined,
+    /// The read was approved, but one of the information-flow rules it needs
+    /// was left unchecked, so the data cannot actually reach the agent.
+    DeclinedDependency,
     BlockedByRoomPolicy,
     NotOffered,
     InvalidTarget,
@@ -165,6 +168,7 @@ impl TaskReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Declined => "declined",
+            Self::DeclinedDependency => "declined_dependency",
             Self::BlockedByRoomPolicy => "blocked_by_room_policy",
             Self::NotOffered => "not_offered",
             Self::InvalidTarget => "invalid_target",
@@ -1102,11 +1106,43 @@ pub fn outcome_of(plan: &TaskPlan, approved: &BTreeSet<String>, applied: &Applie
 }
 
 fn outcome_with(plan: &TaskPlan, approved: &BTreeSet<String>, overrides: &BTreeMap<String, ItemState>) -> serde_json::Value {
+    // Which requested needs lost an implied flow row they depend on. A read
+    // the user approved but whose provider/room row was left unchecked cannot
+    // actually reach the agent, so it is reported as a partial need rather
+    // than a clean grant. The flow ids themselves stay internal.
+    let mut declined_dependency: BTreeSet<&str> = BTreeSet::new();
+    let mut flow_applied = 0usize;
+    let mut flow_skipped = 0usize;
+    for item in &plan.items {
+        let ItemOrigin::Implied { because } = &item.origin else { continue };
+        let state = overrides.get(&item.id).unwrap_or(&item.state);
+        let applied = match state {
+            ItemState::AlreadyAllowed => true,
+            ItemState::NeedsGrant => approved.contains(&item.id),
+            ItemState::Blocked(_) | ItemState::NotOffered(_) => false,
+        };
+        if applied {
+            flow_applied += 1;
+        } else {
+            flow_skipped += 1;
+            for cause in because {
+                declined_dependency.insert(cause.as_str());
+            }
+        }
+    }
+    // Only the agent's own requested needs are listed; the implied flow rows
+    // are summarized as counts so their internal ids never reach the model.
     let mut granted = Vec::new();
     let mut not_granted = Vec::new();
+    let mut requested = 0usize;
     let mut satisfied = 0usize;
     let mut blocked = 0usize;
+    let mut partial_needs = 0usize;
     for item in &plan.items {
+        if !matches!(item.origin, ItemOrigin::Requested) {
+            continue;
+        }
+        requested += 1;
         match overrides.get(&item.id).unwrap_or(&item.state) {
             // An already-allowed item counts as satisfied: the agent can use it
             // without a new grant, so it is not a declination.
@@ -1115,8 +1151,13 @@ fn outcome_with(plan: &TaskPlan, approved: &BTreeSet<String>, overrides: &BTreeM
                 granted.push(serde_json::Value::String(item.id.clone()));
             }
             ItemState::NeedsGrant if approved.contains(&item.id) => {
-                satisfied += 1;
-                granted.push(serde_json::Value::String(item.id.clone()));
+                if declined_dependency.contains(item.id.as_str()) {
+                    partial_needs += 1;
+                    not_granted.push(serde_json::json!({ "id": item.id, "reason": TaskReason::DeclinedDependency.as_str() }));
+                } else {
+                    satisfied += 1;
+                    granted.push(serde_json::Value::String(item.id.clone()));
+                }
             }
             ItemState::NeedsGrant => {
                 not_granted.push(serde_json::json!({ "id": item.id, "reason": TaskReason::Declined.as_str() }));
@@ -1127,19 +1168,20 @@ fn outcome_with(plan: &TaskPlan, approved: &BTreeSet<String>, overrides: &BTreeM
             }
         }
     }
-    // `granted`: every item is satisfied (granted or already allowed).
-    // `blocked`: every item is blocked by policy or not offered.
-    // `declined`: the user said no to every requested item and nothing was
-    // blocked by policy. `partial`: any other mix.
-    let status = if satisfied == plan.items.len() { "granted" }
-        else if blocked == plan.items.len() { "blocked" }
-        else if satisfied == 0 && blocked == 0 { "declined" }
+    // `granted`: every requested item is satisfied (granted or already
+    // allowed). `blocked`: every requested item is blocked by policy or not
+    // offered. `declined`: the user said no to every requested item and none
+    // was blocked. `partial`: any other mix.
+    let status = if satisfied == requested { "granted" }
+        else if blocked == requested { "blocked" }
+        else if satisfied == 0 && blocked == 0 && partial_needs == 0 { "declined" }
         else { "partial" };
     serde_json::json!({
         "task_id": plan.task_id,
         "status": status,
         "granted": granted,
         "not_granted": not_granted,
+        "flow_rules": { "applied": flow_applied, "skipped": flow_skipped },
         "lasts": "until this turn ends",
     })
 }
@@ -1563,6 +1605,41 @@ mod tests {
         // A mix is partial.
         let value = outcome(&make(vec![ItemState::AlreadyAllowed, ItemState::Blocked(TaskReason::NotOffered)]), &empty);
         assert_eq!(value["status"], "partial");
+    }
+
+    #[test]
+    fn outcome_keeps_implied_flow_ids_internal_and_reports_a_declined_dependency() {
+        let mut plan = TaskPlan {
+            task_id: 1, subject: "s".into(), context: ContextId::Agent { account: "a".into(), room: "r".into() },
+            epoch: 1, title: "t".into(), explanation: "e".into(), plan_hash: [0; 32], needs_fingerprint: [0; 32],
+            items: vec![
+                PlanItem { id: "n1".into(), origin: ItemOrigin::Requested, risk: Risk::High, why: None,
+                    action: PlanAction::Network { url: "https://example.com/".into(), scope: RoomScope::room("r") }, state: ItemState::NeedsGrant },
+                PlanItem { id: "flow:1".into(), origin: ItemOrigin::Implied { because: vec!["n1".into()] }, risk: Risk::High, why: None,
+                    action: PlanAction::Flow { source: Source::Room { account: "a".into(), room: "r".into() },
+                        recipient: Recipient::network_origin("https://example.com/").unwrap() }, state: ItemState::NeedsGrant },
+            ],
+        };
+        plan.seal();
+        // The read is approved but its implied flow row is left unchecked.
+        let approved: BTreeSet<String> = ["n1".to_string()].into_iter().collect();
+        let value = outcome(&plan, &approved);
+        assert_eq!(value["flow_rules"]["applied"], 0);
+        assert_eq!(value["flow_rules"]["skipped"], 1);
+        let granted: Vec<&str> = value["granted"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        assert!(!granted.contains(&"n1"), "a read without its dependency is not a clean grant");
+        assert!(!granted.iter().any(|id| id.starts_with("flow:")), "flow ids stay internal");
+        let reasons: Vec<&str> = value["not_granted"].as_array().unwrap().iter().filter_map(|e| e["reason"].as_str()).collect();
+        assert!(reasons.contains(&"declined_dependency"));
+        assert_eq!(value["status"], "partial");
+        // With the dependency approved, the read is a clean grant and the flow
+        // row is counted, never listed.
+        let approved: BTreeSet<String> = ["n1".to_string(), "flow:1".to_string()].into_iter().collect();
+        let value = outcome(&plan, &approved);
+        assert_eq!(value["flow_rules"]["applied"], 1);
+        assert_eq!(value["flow_rules"]["skipped"], 0);
+        assert_eq!(value["status"], "granted");
+        assert_eq!(value["granted"], serde_json::json!(["n1"]), "only the requested need is listed");
     }
 
     #[test]

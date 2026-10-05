@@ -5937,6 +5937,7 @@ fn task_item_chip(state: &ItemState) -> String {
 fn task_reason_label(reason: TaskReason) -> &'static str {
     match reason {
         TaskReason::Declined => "the user declined",
+        TaskReason::DeclinedDependency => "a sharing rule it needed was left unchecked",
         TaskReason::BlockedByRoomPolicy => "a room's protection blocks it",
         TaskReason::NotOffered => "not offered here",
         TaskReason::InvalidTarget => "not a room or space you have joined",
