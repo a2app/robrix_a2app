@@ -931,6 +931,12 @@ script_mod! {
                     icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
                     text: "Force Stop"
                 }
+                info_uninstall_button := RobrixNegativeIconButton {
+                    padding: 8,
+                    draw_icon +: { svg: (ICON_TRASH) }
+                    icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                    text: "Uninstall"
+                }
             }
 
             info_public_hint := mod.widgets.PermissionOptionLabel {
@@ -1091,12 +1097,6 @@ script_mod! {
                             draw_icon +: { svg: (ICON_ROTATE_CW) }
                             icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
                             text: "Reset to stock"
-                        }
-                        info_uninstall_button := RobrixNegativeIconButton {
-                            padding: 8,
-                            draw_icon +: { svg: (ICON_TRASH) }
-                            icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
-                            text: "Uninstall"
                         }
                     }
                 }
