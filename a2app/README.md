@@ -21,6 +21,10 @@ cargo run --features a2app
   bound to a room or space stay in that context. Room apps run in the room's pane;
   space apps open in a modal attached to that space. A footer links to the
   main Mini Apps screen to see all apps or generate new ones.
+- A resizable mini-app preview: drag its lower-right grip to check how the UI
+  fits a narrow or short pane; **Reset size** restores the default size. The
+  viewport dimensions are shown beside the grip. Room-bound apps run in their
+  room rather than a public instance.
 - A **create bar**: describe an app ("a pomodoro timer") and the
   agent writes it in the Splash dialect, validated with the real parser and
   auto-repaired for up to two turns. Generation uses the guarded model
