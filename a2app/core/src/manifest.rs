@@ -126,17 +126,14 @@ impl MiniAppManifest {
 
     /// Whether this app belongs in the picker for this room or space.
     /// A bound app stays in its own context, including utilities that need
-    /// no Matrix services. Unbound account apps stay on the Mini Apps screen.
+    /// no Matrix services. Account utilities can also run in a room or space.
     pub fn can_run_in_context(&self, room_id: &str, is_space: bool) -> bool {
-        let bound_here = match &self.scope {
-            A2AppScope::Room { room_id: bound } if bound != room_id => return false,
-            A2AppScope::Room { .. } => true,
-            A2AppScope::Account => false,
-        };
+        if let A2AppScope::Room { room_id: bound } = &self.scope
+            && bound != room_id { return false; }
         match self.runs_in() {
             RunsIn::Room | RunsIn::Rooms => !is_space,
             RunsIn::Spaces => is_space,
-            RunsIn::Account => bound_here,
+            RunsIn::Account => true,
         }
     }
 
@@ -404,20 +401,32 @@ mod tests {
     }
 
     #[test]
-    fn context_picker_separates_room_space_and_account_apps() {
+    fn context_picker_includes_account_apps_and_keeps_context_specific_apps_separate() {
         let apps = crate::builtin::builtin_apps();
         for (id, in_room, in_space) in [
             ("room-peek", true, false),
             ("search", true, false),
             ("inbox", true, false),
             ("spaces", false, true),
-            ("account", false, false),
-            ("inspector", false, false),
+            ("account", true, true),
+            ("inspector", true, true),
         ] {
             let app = apps.iter().find(|app| app.id == id).unwrap();
             assert_eq!(app.can_run_in_context("!room:example.org", false), in_room, "{id}");
             assert_eq!(app.can_run_in_context("!space:example.org", true), in_space, "{id}");
         }
+    }
+
+    #[test]
+    fn a_generated_account_utility_can_run_in_any_room_without_rebinding() {
+        let mut app = base();
+        app.scope = A2AppScope::Account;
+        app.permissions.clear();
+        app.allow_net = false;
+        assert_eq!(app.runs_in(), RunsIn::Account);
+        assert!(app.can_run_in_context("!first:example.org", false));
+        assert!(app.can_run_in_context("!second:example.org", false));
+        assert_eq!(app.scope, A2AppScope::Account);
     }
 
     #[test]

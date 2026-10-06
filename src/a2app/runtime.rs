@@ -17,7 +17,7 @@ use matrix_sdk::ruma::{matrix_uri::MatrixId, MatrixToUri, MatrixUri, OwnedEventI
 
 use a2app_core::builtin;
 use a2app_core::bundle;
-use a2app_core::manifest::{A2AppScope, AppRegistry, MiniAppId, MiniAppManifest};
+use a2app_core::manifest::{A2AppScope, AppRegistry, MiniAppId, MiniAppManifest, RunsIn};
 use a2app_core::permissions::{
     Effective, GrantState, Permission, PermissionStore, agent_subject, is_agent_subject,
     GrantDuration, NetworkScope, PermissionContext, PolicyDecision, RoomAccess, RoomPolicyMode, RoomScope,
@@ -1500,6 +1500,41 @@ fn open_in_room_pane(cx: &mut Cx, app_id: MiniAppId, room_id: OwnedRoomId) {
     room_pane::dock_when_shown(cx, crate::sliding_sync::TimelineKind::MainRoom { room_id }, kind, None);
 }
 
+/// The same context contract applies to picker launches, navigation, and
+/// restored room panes. A roomless aggregate app may still open on its own.
+fn validate_app_launch_context(manifest: &MiniAppManifest, room_id: Option<&str>, is_space: bool) -> Result<(), String> {
+    if let A2AppScope::Room { room_id: bound } = &manifest.scope
+        && room_id != Some(bound.as_str())
+    {
+        return Err(format!("\"{}\" belongs to a specific room or space. Open it in its original context.", manifest.name));
+    }
+    if let Some(room_id) = room_id {
+        if !manifest.can_run_in_context(room_id, is_space) {
+            let context = if manifest.runs_in() == RunsIn::Spaces { "a space" } else { "a room" };
+            return Err(format!("Run \"{}\" in {context}.", manifest.name));
+        }
+    } else if manifest.runs_in() == RunsIn::Room {
+        return Err(format!("Choose a room to run \"{}\".", manifest.name));
+    }
+    Ok(())
+}
+
+/// Resolves the actual Matrix context type instead of treating every room ID
+/// as a timeline room; spaces use the same ID type and need a modal surface.
+fn app_launch_context(manifest: &MiniAppManifest, room_id: Option<&RoomId>) -> Result<bool, String> {
+    let is_space = match room_id {
+        Some(room_id) => {
+            let room = crate::sliding_sync::get_client().and_then(|client| client.get_room(room_id))
+                .filter(|room| room.state() == RoomState::Joined)
+                .ok_or("The mini-app's room or space is no longer joined.")?;
+            room.is_space()
+        }
+        None => false,
+    };
+    validate_app_launch_context(manifest, room_id.map(RoomId::as_str), is_space)?;
+    Ok(is_space)
+}
+
 /// Invalidate queued watch events when the OS suspends the app.
 pub(super) fn stop_background_watches() {
     super::room_watch::stop_all();
@@ -1827,6 +1862,13 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 enqueue_popup_notification("That mini-app no longer exists.", PopupKind::Error, Some(4.0));
                 return;
             };
+            let is_space = match app_launch_context(&manifest, room.as_deref()) {
+                Ok(is_space) => is_space,
+                Err(error) => {
+                    enqueue_popup_notification(error, PopupKind::Error, Some(5.0));
+                    return;
+                }
+            };
             if restricted {
                 enqueue_popup_notification(
                     format!("\"{}\" was stopped for hammering the host with requests. You can let it run again from its app info.", manifest.name),
@@ -1840,7 +1882,7 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 host_pane(cx, ui).drop_app(cx, &app_id);
                 instances::quit(cx, &key);
             }
-            match (in_room_pane, room) {
+            match (in_room_pane && !is_space, room) {
                 // One isolate per (app, room): the target room's dock opens
                 // (or restores) ITS OWN instance, independent of any other.
                 (true, Some(pane_room)) => open_in_room_pane(cx, app_id, pane_room),
@@ -1859,6 +1901,10 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             let Some((manifest, restricted)) = with_a2app(|state| state.registry.get(&app_id)
                 .map(|manifest| (manifest.clone(), state.permissions.is_restricted(&app_id)))).flatten()
             else { return };
+            if let Err(error) = validate_app_launch_context(&manifest, None, false) {
+                enqueue_popup_notification(format!("Couldn't open a public instance: {error}"), PopupKind::Error, Some(5.0));
+                return;
+            }
             if restricted {
                 enqueue_popup_notification("Allow this stopped app to run before opening a public instance.", PopupKind::Error, Some(5.0));
                 return;
@@ -1870,7 +1916,6 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             let grants = grants_in_room(&app_id, None);
             if instances::ensure_public(cx, &manifest, &grants).is_none() { return; }
             let mut display = manifest;
-            display.scope = A2AppScope::Account;
             display.name = format!("{} · Public instance", display.name);
             if host_pane(cx, ui).open_app(cx, &display, grants, None) {
                 with_a2app(|state| state.foreground_app = Some(app_id));
@@ -2142,6 +2187,21 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             }
         }
         A2AppOp::OpenInRoom { app_id, room_id } => {
+            let Some(manifest) = with_a2app(|state| state.registry.get(&app_id).cloned()).flatten() else {
+                enqueue_popup_notification("That mini-app no longer exists.", PopupKind::Error, Some(4.0));
+                return;
+            };
+            match app_launch_context(&manifest, Some(&room_id)) {
+                Ok(true) => {
+                    apply_op(cx, ui, A2AppOp::OpenApp { app_id, room_id: Some(room_id), in_room_pane: false });
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    enqueue_popup_notification(error, PopupKind::Error, Some(5.0));
+                    return;
+                }
+            }
             if let Err(e) = queue_room_action(cx, room_id, RoomAction::OpenApp(app_id)) {
                 enqueue_popup_notification(format!("Couldn't open it there: {e}"), PopupKind::Error, Some(5.0));
             }
@@ -3729,6 +3789,9 @@ fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, heap: usize, action: HostAct
             let target = room.as_deref().or_else(|| match &manifest.scope {
                 A2AppScope::Room { room_id } => Some(room_id.as_str()), A2AppScope::Account => None,
             });
+            let room_id = target.map(|target| OwnedRoomId::try_from(target)
+                .map_err(|_| String::from("The mini-app's room or space ID is invalid."))).transpose()?;
+            let is_space = app_launch_context(&manifest, room_id.as_deref())?;
             let to = super::information_flow::app_context(&manifest.id, target)?;
             a2app_core::information_flow::register_context_with_legacy_data(&to, super::information_flow::manifest_has_private_source(&manifest))?;
             a2app_core::information_flow::transfer(&from, &to)?;
@@ -3745,8 +3808,7 @@ fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, heap: usize, action: HostAct
                 a2app_core::information_flow::context_epoch(&from)?, &a2app_core::information_flow::SensitiveAction {
                     kind: "host.nav.app".into(), target: app_id.clone(),
                 }, &serde_json::json!({ "app_id": app_id, "room_id": target }))?;
-            let room_id = room.and_then(|r| OwnedRoomId::try_from(r.as_str()).ok());
-            let in_room_pane = room_id.is_some();
+            let in_room_pane = room_id.is_some() && !is_space;
             apply_op(cx, ui, A2AppOp::OpenApp { app_id, room_id, in_room_pane });
         }
         HostAction::JumpToEvent { room, event_id } => {
@@ -7481,7 +7543,7 @@ fn post_ai_room_message(
 }
 
 /// Executes the `list_apps` tool: the installed apps this room's agent may
-/// launch — account-scoped apps plus apps scoped to this room — as JSON the
+/// launch — apps compatible with this room — as JSON the
 /// model reads and picks a `launch_app` id from. Gated like a read against
 /// the room's subject (`apps.list`), so a first use parks the call behind the
 /// permission prompt.
@@ -7502,10 +7564,7 @@ fn run_ai_list_apps(
                 state
                     .registry
                     .iter()
-                    .filter(|m| match &m.scope {
-                        A2AppScope::Account => true,
-                        A2AppScope::Room { room_id: owner } => owner == room_id.as_str(),
-                    })
+                    .filter(|m| m.can_run_in_context(room_id.as_str(), false))
                     .map(|m| {
                         let mut entry = serde_json::json!({
                             "id": m.id,
@@ -7572,7 +7631,7 @@ fn run_ai_list_apps(
 /// app in the session's room. This is the run path ONLY — no generation. Like
 /// a read, it is gated against the room's subject (`apps.launch`), so a first
 /// use parks the call behind the permission prompt. An id that is unknown,
-/// scoped to another room, or restricted is an error the model reads and can
+/// requiring another room or a space, or restricted is an error the model reads and can
 /// recover from (it can call `list_apps` for valid ids).
 #[cfg(unix)]
 fn run_ai_launch_app(
@@ -7627,17 +7686,15 @@ fn run_ai_launch_app_granted(
 ) {
     enum Refusal {
         Unknown,
-        OtherRoom(MiniAppId),
+        OtherContext(MiniAppId),
         Restricted(MiniAppId),
     }
     let outcome: Result<MiniAppManifest, Refusal> = with_a2app(|state| {
         let Some(manifest) = state.registry.get(&app_id).cloned() else {
             return Err(Refusal::Unknown);
         };
-        match &manifest.scope {
-            A2AppScope::Account => {}
-            A2AppScope::Room { room_id: owner } if owner == room_id.as_str() => {}
-            A2AppScope::Room { .. } => return Err(Refusal::OtherRoom(manifest.id)),
+        if !manifest.can_run_in_context(room_id.as_str(), false) {
+            return Err(Refusal::OtherContext(manifest.id));
         }
         if state.permissions.is_restricted(&manifest.id) {
             return Err(Refusal::Restricted(manifest.id));
@@ -7678,8 +7735,8 @@ fn run_ai_launch_app_granted(
                 Refusal::Unknown => format!(
                     "There is no installed mini-app with id \"{app_id}\". Use list_apps to see the ids that exist."
                 ),
-                Refusal::OtherRoom(id) => format!(
-                    "\"{id}\" belongs to another room, so it can't run here. Use list_apps for the apps available in this room."
+                Refusal::OtherContext(id) => format!(
+                    "\"{id}\" requires a different room or space, so it can't run here. Use list_apps for the apps available in this room."
                 ),
                 Refusal::Restricted(id) => format!(
                     "\"{id}\" was stopped for hammering the host with requests; the user has to let it run again from its app info."
@@ -8827,6 +8884,55 @@ fn post_ai_reply(room_id: &OwnedRoomId, text: String, answer_id: Option<u64>) {
 #[cfg(test)]
 mod permission_tests {
     use super::*;
+
+    #[test]
+    fn foreground_launches_allow_account_utilities_and_preserve_context_constraints() {
+        let mut utility = builtin::stock("account").unwrap();
+        utility.permissions.clear();
+        utility.capabilities.clear();
+        assert!(validate_app_launch_context(&utility, None, false).is_ok());
+        assert!(validate_app_launch_context(&utility, Some("!first:test"), false).is_ok());
+        assert!(validate_app_launch_context(&utility, Some("!second:test"), false).is_ok());
+        assert!(validate_app_launch_context(&utility, Some("!space:test"), true).is_ok());
+
+        utility.scope = A2AppScope::Room { room_id: "!bound:test".into() };
+        assert!(validate_app_launch_context(&utility, None, false).is_err());
+        assert!(validate_app_launch_context(&utility, Some("!other:test"), false).is_err());
+        assert!(validate_app_launch_context(&utility, Some("!bound:test"), false).is_ok());
+
+        let room_app = builtin::stock("room-peek").unwrap();
+        assert!(validate_app_launch_context(&room_app, None, false).is_err());
+        assert!(validate_app_launch_context(&room_app, Some("!room:test"), false).is_ok());
+        assert!(validate_app_launch_context(&room_app, Some("!space:test"), true).is_err());
+        let mut space_app = builtin::stock("spaces").unwrap();
+        assert!(validate_app_launch_context(&space_app, Some("!room:test"), false).is_err());
+        assert!(validate_app_launch_context(&space_app, Some("!space:test"), true).is_ok());
+        space_app.scope = A2AppScope::Room { room_id: "!space:test".into() };
+        assert!(validate_app_launch_context(&space_app, None, true).is_err());
+        assert!(validate_app_launch_context(&space_app, Some("!other:test"), true).is_err());
+        assert!(validate_app_launch_context(&space_app, Some("!space:test"), true).is_ok());
+    }
+
+    #[test]
+    fn public_launch_rejects_bound_and_attached_room_apps_before_changing_instance_state() {
+        let previous = A2APP.with(|state| state.replace(None));
+        let mut bound_utility = builtin::stock("account").unwrap();
+        bound_utility.scope = A2AppScope::Room { room_id: "!bound:test".into() };
+        let mut bound_space = builtin::stock("spaces").unwrap();
+        bound_space.scope = A2AppScope::Room { room_id: "!space:test".into() };
+        let room_app = builtin::stock("room-peek").unwrap();
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        for manifest in [bound_utility, bound_space, room_app] {
+            initialize_background_test(manifest.clone());
+            let dismissal = (manifest.id.clone(), Permission::Network);
+            with_a2app(|state| { state.dismissed_prompts.insert(dismissal.clone()); });
+            apply_op(&mut cx, &WidgetRef::empty(), A2AppOp::OpenPublicApp(manifest.id.clone()));
+            assert!(with_a2app(|state| state.dismissed_prompts.contains(&dismissal)).unwrap(),
+                "a rejected public launch must not reset permission choices or replace an existing instance");
+            assert_eq!(with_a2app(|state| state.registry.get(&manifest.id).unwrap().scope.clone()), Some(manifest.scope));
+        }
+        A2APP.with(|state| { state.replace(previous); });
+    }
 
     #[test]
     fn popup_scopes_follow_consumed_room_and_space_targets() {

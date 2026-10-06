@@ -267,3 +267,72 @@ impl RoomAppPickerRef {
         inner.clear(cx);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use a2app_core::manifest::A2AppScope;
+    use matrix_sdk::ruma::OwnedRoomId;
+
+    #[test]
+    fn account_utility_is_visible_launches_in_room_and_rechecks_its_binding() {
+        let mut utility = a2app_core::builtin::stock("account").unwrap();
+        utility.id = "time-zones".into();
+        utility.name = "Time Zones".into();
+        utility.description = "Current time across the world.".into();
+        utility.permissions.clear();
+        utility.capabilities.clear();
+        super::super::runtime::initialize_background_test(utility.clone());
+        with_a2app(|state| {
+            let mut bound = utility.clone();
+            bound.id = "bound-here".into();
+            bound.scope = A2AppScope::Room { room_id: "!picker:example.org".into() };
+            state.registry.insert(bound.clone());
+            bound.id = "bound-elsewhere".into();
+            bound.scope = A2AppScope::Room { room_id: "!other:example.org".into() };
+            state.registry.insert(bound);
+            state.registry.insert(a2app_core::builtin::stock("spaces").unwrap());
+        });
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let picker = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.RoomAppPicker {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let room_id = OwnedRoomId::try_from("!picker:example.org").unwrap();
+        let context = RoomNameId::empty(room_id.clone());
+        picker.as_room_app_picker().show(&mut cx, context.clone(), false);
+        let row = {
+            let inner = picker.borrow::<RoomAppPicker>().unwrap();
+            let ids = inner.rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>();
+            assert!(ids.contains(&"time-zones"));
+            assert!(ids.contains(&"bound-here"));
+            assert!(!ids.contains(&"bound-elsewhere"));
+            assert!(!ids.contains(&"spaces"));
+            let index = inner.rows.iter().position(|row| row.id == utility.id).unwrap();
+            let row = inner.view.portal_list(&cx, ids!(apps_list)).item(&mut cx, index, id!(app_row));
+            row.borrow_mut::<MiniAppRow>().unwrap().populate(&mut cx, &inner.rows[index]);
+            row
+        };
+        let clicked = cx.capture_actions(|cx| {
+            cx.widget_action(row.button(cx, ids!(row_open_button)).widget_uid(), ButtonAction::Clicked(Default::default()));
+        });
+        let row_actions = cx.capture_actions(|cx| picker.handle_event(cx, &Event::Actions(clicked), &mut Scope::empty()));
+        let launched = cx.capture_actions(|cx| picker.handle_event(cx, &Event::Actions(row_actions), &mut Scope::empty()));
+        assert!(launched.iter().any(|action| matches!(action.downcast_ref(),
+            Some(A2AppOp::OpenInRoom { app_id, room_id: target }) if app_id == &utility.id && target == &room_id)));
+        assert_eq!(with_a2app(|state| state.registry.get(&utility.id).unwrap().scope.clone()), Some(A2AppScope::Account));
+
+        picker.as_room_app_picker().show(&mut cx, context, false);
+        with_a2app(|state| state.registry.get_mut(&utility.id).unwrap().scope =
+            A2AppScope::Room { room_id: "!other:example.org".into() });
+        let stale = cx.capture_actions(|cx| cx.widget_action(row.widget_uid(), MiniAppRowAction::OpenApp(utility.id)));
+        let launched = cx.capture_actions(|cx| picker.handle_event(cx, &Event::Actions(stale), &mut Scope::empty()));
+        assert!(!launched.iter().any(|action| action.downcast_ref::<A2AppOp>().is_some()),
+            "a stale picker row cannot launch an app rebound to another context");
+        assert!(picker.borrow::<RoomAppPicker>().unwrap().context.is_some());
+    }
+}

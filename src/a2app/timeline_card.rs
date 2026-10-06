@@ -329,10 +329,13 @@ mod tests {
         let app = |id: &str| apps.iter().find(|app| app.id == id).unwrap();
         assert_eq!(launch_options(app("room-peek"), Some(&room_id)), (true, false));
         assert_eq!(launch_options(app("spaces"), Some(&room_id)), (false, false));
-        assert_eq!(launch_options(app("account"), Some(&room_id)), (false, true));
+        assert_eq!(launch_options(app("account"), Some(&room_id)), (true, false));
+        assert_eq!(launch_options(app("account"), None), (false, true));
         let mut bound = app("account").clone();
         bound.scope = a2app_core::manifest::A2AppScope::Room { room_id: "!other:example.org".into() };
         assert_eq!(launch_options(&bound, Some(&room_id)), (false, false));
+        bound.scope = a2app_core::manifest::A2AppScope::Room { room_id: room_id.to_string() };
+        assert_eq!(launch_options(&bound, Some(&room_id)), (true, false));
     }
 
     #[test]

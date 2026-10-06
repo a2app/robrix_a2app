@@ -47,6 +47,9 @@ pub fn attach(
             (!state.permissions.is_restricted(app_id)).then(|| state.registry.get(app_id).cloned()).flatten()
         }).flatten();
         let Some(manifest) = manifest else { return false };
+        if !manifest.can_run_in_context(room_id.as_str(), false) {
+            return false;
+        }
         let grants = a2app_core::permissions::snapshot_grants_for(app_id);
         if instances::ensure(cx, &key, &manifest, &grants).is_none() {
             return false;

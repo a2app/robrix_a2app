@@ -932,7 +932,7 @@ script_mod! {
                 }
             }
 
-            mod.widgets.PermissionOptionLabel {
+            info_public_hint := mod.widgets.PermissionOptionLabel {
                 text: "A public instance has separate storage and cannot read room/account data, pasted text or private messages from other apps. Internet permissions still apply. Apps whose code contains private data cannot run publicly."
             }
             info_legacy_storage := mod.widgets.PermissionOptionLabel {
@@ -2148,6 +2148,7 @@ impl MiniAppProviderRow {
 /// everything else just opens.
 fn run_label(scope: &A2AppScope, runs_in: RunsIn) -> &'static str {
     match (scope, runs_in) {
+        (A2AppScope::Room { .. }, RunsIn::Spaces) => "Run in space",
         (A2AppScope::Room { .. }, _) => "Run in room",
         (_, RunsIn::Room) => "Run in room…",
         _ => "Open",
@@ -3100,6 +3101,7 @@ impl MiniAppsScreen {
                 self.view.label(cx, ids!(info_name)).set_text(cx, &name);
                 let origin = if builtin { "Built-in mini-app" } else { "Your mini-app" };
                 let place = match (&scope, runs_in) {
+                    (A2AppScope::Room { room_id }, RunsIn::Spaces) => format!("runs in space {}", room_label(cx, room_id)),
                     (A2AppScope::Room { room_id }, _) => format!("runs in {}", room_label(cx, room_id)),
                     (_, RunsIn::Room) => String::from("runs in a room"),
                     (_, RunsIn::Rooms) => String::from("works across your rooms"),
@@ -3110,7 +3112,10 @@ impl MiniAppsScreen {
                 self.view.label(cx, ids!(info_kind)).set_text(cx, &kind);
                 let open_label = run_label(&scope, runs_in);
                 self.view.button(cx, ids!(info_open_button)).set_text(cx, open_label);
-                self.view.widget(cx, ids!(info_open_room_button)).set_visible(cx, open_label == "Open");
+                self.view.widget(cx, ids!(info_open_room_button)).set_visible(cx, open_label == "Open" && runs_in != RunsIn::Spaces);
+                let can_open_public = matches!(scope, A2AppScope::Account) && runs_in != RunsIn::Room;
+                self.view.widget(cx, ids!(info_public_button)).set_visible(cx, can_open_public);
+                self.view.widget(cx, ids!(info_public_hint)).set_visible(cx, can_open_public);
                 self.view.widget(cx, ids!(restricted_banner)).set_visible(cx, restricted);
                 let running = crate::a2app::runtime::with_a2app(|state| {
                     state.is_running(&app_id)
