@@ -126,7 +126,7 @@ script_mod! {
                     visible: false
                     width: Fill, height: Fit, flow: Down, spacing: 8
                     ability_details := ModalBody {}
-                    ModalBody { text: "Individual ability settings and scoped approvals are available in Mini Apps → Agent permissions." }
+                    ModalBody { text: "Individual ability settings and scoped approvals are available in Mini Apps → AI room permissions." }
                 }
             }
             extras_row := View {

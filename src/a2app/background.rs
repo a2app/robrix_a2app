@@ -450,7 +450,7 @@ pub fn record_failure(heap: usize, error: &str) {
         error.push_str(" Open the task's app and choose a destination before testing this action while it is visible. Automated runs do not open permission dialogs.");
     } else if error == flow::EFFECT_REVIEW_REQUIRED || error == flow::ACTION_REVIEW_REQUIRED
         || error == "Your permission is needed before this data can be sent."
-        || error.contains("Advanced permissions")
+        || error.contains("Agent permissions")
         || error.contains("Data sharing") || error.contains("sensitive action") || error.contains("untrusted")
     {
         error.push_str(" Open the task's app and test this action while it is visible. Select Until you quit Robrix or Forever, then choose Approve before running the background task again. Automated runs do not open permission dialogs.");

@@ -602,11 +602,11 @@ script_mod! {
                     }
                     agent_permissions_button := RobrixNeutralIconButton {
                         padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                        text: "Agent permissions…"
+                        text: "AI room permissions…"
                     }
                     sharing_button := RobrixNeutralIconButton {
                         padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                        text: "Advanced permissions…"
+                        text: "Agent permissions…"
                     }
                     inspect_protection_button := RobrixNeutralIconButton {
                         padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
@@ -727,33 +727,41 @@ script_mod! {
 
                     View {
                         width: Fill, height: Fit
-                        flow: Right
+                        flow: Down
                         spacing: 8
-                        align: Align{y: 0.5}
                         console_status := Label {
                             width: Fill, height: Fit
+                            flow: Flow.Right{wrap: true}
                             padding: 0, margin: 0
                             draw_text +: {
                                 text_style: theme.font_bold {font_size: 10.5},
                                 color: (COLOR_TEXT)
                             }
                         }
-                        stop_button := RobrixNegativeIconButton {
-                            padding: 8,
-                            icon_walk: Walk{width: 0, height: 0, margin: 0}
-                            text: "Stop"
-                        }
-                        retry_button := RobrixIconButton {
-                            visible: false,
-                            padding: 8,
-                            icon_walk: Walk{width: 0, height: 0, margin: 0}
-                            text: "Retry"
-                        }
-                        new_prompt_button := RobrixNeutralIconButton {
-                            visible: false,
-                            padding: 8,
-                            icon_walk: Walk{width: 0, height: 0, margin: 0}
-                            text: "New prompt"
+                        View {
+                            width: Fill, height: Fit, flow: Flow.Right{wrap: true}, spacing: 8
+                            stop_button := RobrixNegativeIconButton {
+                                padding: 8,
+                                icon_walk: Walk{width: 0, height: 0, margin: 0}
+                                text: "Stop"
+                            }
+                            retry_button := RobrixIconButton {
+                                visible: false,
+                                padding: 8,
+                                icon_walk: Walk{width: 0, height: 0, margin: 0}
+                                text: "Retry"
+                            }
+                            review_permissions_button := RobrixNeutralIconButton {
+                                visible: false,
+                                padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
+                                text: "Review permissions"
+                            }
+                            new_prompt_button := RobrixNeutralIconButton {
+                                visible: false,
+                                padding: 8,
+                                icon_walk: Walk{width: 0, height: 0, margin: 0}
+                                text: "New prompt"
+                            }
                         }
                     }
 
@@ -1311,7 +1319,7 @@ script_mod! {
                     padding: 8, draw_icon +: { svg: (ICON_JUMP) }
                     icon_walk: Walk{width: 14, height: 14, margin: 0}, text: "Back"
                 }
-                TitleLabel { width: Fill, margin: 0, flow: Flow.Right{wrap: true}, text: "Advanced permissions" }
+                TitleLabel { width: Fill, margin: 0, flow: Flow.Right{wrap: true}, text: "Agent permissions" }
             }
             sharing_editor := mod.widgets.DataSharing {}
         }
@@ -2551,6 +2559,11 @@ impl Widget for MiniAppsScreen {
         if self.view.button(cx, ids!(retry_button)).clicked(actions) {
             cx.action(A2AppOp::RetryGeneration);
         }
+        if self.pane == Pane::List && self.view.button(cx, ids!(review_permissions_button)).clicked(actions)
+            && let Some(context) = with_a2app(|state| state.console.review_context.clone()).flatten()
+        {
+            cx.action(A2AppOp::ReviewFlow(context));
+        }
         if self.view.button(cx, ids!(new_prompt_button)).clicked(actions) {
             self.view.speech_text_input(cx, ids!(prompt_input)).set_text(cx, "");
             self.reclassify(cx, "");
@@ -3056,16 +3069,17 @@ impl MiniAppsScreen {
                     (
                         state.registry.iter().next().is_some(),
                         (state.console.active, state.console.status.clone(),
-                         state.generation.is_some(), state.failed_request.is_some()),
+                         state.generation.is_some(), state.failed_request.is_some(), state.console.review_context.is_some()),
                     )
-                }).unwrap_or((false, (false, String::new(), false, false)));
+                }).unwrap_or((false, (false, String::new(), false, false, false)));
                 self.view.widget(cx, ids!(no_apps_label)).set_visible(cx, !any_apps);
-                let (active, status, running, can_retry) = console;
+                let (active, status, running, can_retry, can_review) = console;
                 self.view.widget(cx, ids!(console_section)).set_visible(cx, active);
                 if active {
                     self.view.label(cx, ids!(console_status)).set_text(cx, &status);
                     self.view.widget(cx, ids!(stop_button)).set_visible(cx, running);
                     self.view.widget(cx, ids!(retry_button)).set_visible(cx, !running && can_retry);
+                    self.view.widget(cx, ids!(review_permissions_button)).set_visible(cx, !running && can_review);
                     self.view.widget(cx, ids!(new_prompt_button)).set_visible(cx, !running);
                 }
             }
@@ -3378,6 +3392,33 @@ mod picker_tests {
     use crate::a2app::room_app_picker::{RoomAppPickerAction, RoomAppPickerWidgetRefExt};
     use crate::home::navigation_tab_bar::NavigationBarAction;
     use crate::utils::RoomNameId;
+
+    #[test]
+    fn generation_review_button_routes_to_its_blocked_context_without_retrying() {
+        super::super::runtime::initialize_background_test(a2app_core::builtin::stock("account").unwrap());
+        let context = ContextId::App { account: "@generation-review:example.org".into(),
+            app: "__generation".into(), room: Some("!testing:example.org".into()) };
+        with_a2app(|state| state.console.review_context = Some(context.clone()));
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
+        let review = screen.view.button(&cx, ids!(review_permissions_button)).widget_uid();
+        let clicks = cx.capture_actions(|cx| cx.widget_action(review, ButtonAction::Clicked(Default::default())));
+        let response = cx.capture_actions(|cx| screen.handle_event(cx, &Event::Actions(clicks), &mut Scope::empty()));
+        assert_eq!(response.iter().filter(|action| action.downcast_ref::<A2AppOp>().is_some()).count(), 1);
+        assert!(response.iter().any(|action| matches!(action.downcast_ref(), Some(A2AppOp::ReviewFlow(target)) if target == &context)));
+        screen.set_pane(&mut cx, Pane::Info);
+        let clicks = cx.capture_actions(|cx| cx.widget_action(review, ButtonAction::Clicked(Default::default())));
+        let response = cx.capture_actions(|cx| screen.handle_event(cx, &Event::Actions(clicks), &mut Scope::empty()));
+        assert!(!response.iter().any(|action| action.downcast_ref::<A2AppOp>().is_some()));
+    }
 
     #[test]
     fn app_permission_review_opens_attention_and_discards_stale_subpane_actions() {
@@ -3695,7 +3736,7 @@ impl MiniAppsScreen {
             "No custom rules yet. Rooms use the access settings above."
         } else { "No saved allowances. Add one to remember your choice for selected rooms or websites." });
         let title = match view {
-            AccessView::AgentRooms => Some("Agent permissions"),
+            AccessView::AgentRooms => Some("AI room permissions"),
             AccessView::AgentPermissions => Some("Choose a permission"),
             AccessView::Targets => Some("Choose rooms and spaces"),
             AccessView::Rule => Some("Set room access"),

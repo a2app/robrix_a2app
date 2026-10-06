@@ -183,7 +183,7 @@ script_mod! {
                         padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Permissions"
                     }
                     task_sharing := RobrixNeutralIconButton {
-                        padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Advanced permissions"
+                        padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Agent permissions"
                     }
                 }
                 room_action_help := mod.widgets.PermissionOptionLabel {

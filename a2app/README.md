@@ -103,7 +103,7 @@ decides an operation and opens that setting directly.
 
 Open a mini-app's settings and choose a permission to see its current state and
 saved allowances. **Add an allowance…** opens room, website and duration choices;
-**Show individual abilities** exposes narrower controls. **Agent permissions**
+**Show individual abilities** exposes narrower controls. **AI room permissions**
 asks for the agent's room and then the permission to edit. Opening or cancelling
 an editor does not grant access.
 
@@ -136,12 +136,18 @@ or **Refresh** again, or close and reopen the app, to ask again. Timers and
 unrelated permission changes do not repeat a dismissed request. If room changes are off, the
 popup explains that Approve also enables them, provided no other rule blocks it.
 
-**Advanced permissions** is optional management, never a required step in a
+**Agent permissions** manages AI generation and data-sharing permissions. It is
+optional management, never a required step in a
 runtime permission request. It has **Rules**, **Needs attention**, and **History** views. Adding
 a rule walks through data and app, destination, then duration and a final review.
 Blocked actions retain an exact review before approval. **Background tasks**
 shows task cards with Pause/Resume, Edit, and Details; new tasks walk through
 mini-app, location, schedule, and review before enabling.
+
+When generation fails waiting for permission, choose **Review permissions** to
+open the blocked request under **Agent permissions → Needs attention**. After
+reviewing and approving it, return to generation and choose **Retry**. Retrying
+keeps the original room context.
 
 ## Crates
 
@@ -216,7 +222,7 @@ Linux `keychain:` references use Octos's existing `~/.octos/secrets` store,
 including credentials scoped to a profile. Credentials remain in Robrix's
 host process and are never supplied to the confined worker.
 
-Run with `cargo run --features a2app` (or `a2app-embedded-agent`), then use **Advanced permissions** to allow the configured model recipient for the sources the
+Run with `cargo run --features a2app` (or `a2app-embedded-agent`), then use **Agent permissions** to allow the configured model recipient for the sources the
 agent or generator needs. A local endpoint also needs explicit source consent;
 Robrix cannot guarantee that the service itself will not forward data.
 
@@ -424,7 +430,7 @@ actual homeserver origin before a request is sent, even in encrypted rooms.
 Cached event reads stay local; ordinary messages use the destination room's
 normal encryption and sharing checks.
 
-Mini Apps → **Advanced permissions** manages source-to-recipient allowances
+Mini Apps → **Agent permissions** manages source-to-recipient allowances
 for a configured model service, an exact HTTP(S) origin, a Matrix room, or the clipboard.
 Choose one app in the current account, one exact app/room or agent context,
 or explicitly all readers. Rules can last for a room session, until Robrix
@@ -450,7 +456,7 @@ request. Until you quit Robrix and Forever approvals can also cover an older
 saved app, while its private provenance remains protected. These approvals stay
 limited to that app context, operation, recipient and reviewed inputs; they do
 not create general sharing rules for unidentified data. Saved approvals
-can be removed in the app's regular Permissions panel; Advanced permissions
+can be removed in the app's regular Permissions panel; Agent permissions
 remains an optional view of the underlying rules and history.
 
 The design follows the established floating-label approach described by

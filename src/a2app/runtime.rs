@@ -339,9 +339,76 @@ impl FlowContinuation {
 pub struct GenConsole {
     pub status: String,
     pub lines: Vec<String>,
+    /// The blocked generation's compartment, opened by Review permissions.
+    pub review_context: Option<a2app_core::information_flow::ContextId>,
     /// True from submit until the user starts a new prompt.
     pub active: bool,
     pub last_render: Option<Instant>,
+}
+
+impl GenConsole {
+    fn failed(&mut self, reason: &str, context: Option<a2app_core::information_flow::ContextId>) {
+        use a2app_core::information_flow as flow;
+        let needs_review = [
+            "Your permission is needed before this data can be sent.",
+            "Choose where to send this data before allowing this request.",
+            flow::ACTION_REVIEW_REQUIRED,
+            flow::EFFECT_REVIEW_REQUIRED,
+        ].iter().any(|message| reason.contains(message));
+        self.review_context = context.filter(|_| needs_review);
+        self.status = format!("Failed: {reason}");
+        if needs_review {
+            self.status.push_str(if self.review_context.is_some() {
+                " Select Review permissions to open Agent permissions → Needs attention. Review and approve the blocked request, then return here and select Retry."
+            } else {
+                " Open Agent permissions → Needs attention to review the blocked request, then return here and select Retry."
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod generation_recovery_tests {
+    use super::*;
+    use a2app_core::information_flow::{self as flow, ContextId};
+
+    #[test]
+    fn blocked_generation_explains_the_review_route_and_keeps_its_room() {
+        let context = ContextId::Agent { account: "@tester:example.org".into(), room: "!testing:example.org".into() };
+        for reason in [
+            "agent turn failed: Your permission is needed before this data can be sent.",
+            "Choose where to send this data before allowing this request.",
+            flow::ACTION_REVIEW_REQUIRED,
+            flow::EFFECT_REVIEW_REQUIRED,
+        ] {
+            let mut console = GenConsole::default();
+            console.failed(reason, Some(context.clone()));
+            assert_eq!(console.review_context.as_ref(), Some(&context));
+            assert!(console.status.contains("Select Review permissions"));
+            assert!(console.status.contains("Agent permissions → Needs attention"));
+            assert!(console.status.contains("select Retry"));
+        }
+    }
+
+    #[test]
+    fn non_permission_failure_clears_the_old_review_route() {
+        let mut console = GenConsole {
+            review_context: Some(ContextId::App { account: "tester".into(), app: "__generation".into(), room: None }),
+            ..Default::default()
+        };
+        console.failed("The agent connection closed.", console.review_context.clone());
+        assert!(console.review_context.is_none());
+        assert_eq!(console.status, "Failed: The agent connection closed.");
+    }
+
+    #[test]
+    fn stopped_generation_explains_the_management_route_without_a_direct_review_button() {
+        let mut console = GenConsole::default();
+        console.failed(flow::EFFECT_REVIEW_REQUIRED, None);
+        assert!(console.review_context.is_none());
+        assert!(console.status.contains("Open Agent permissions → Needs attention"));
+        assert!(!console.status.contains("Select Review permissions"));
+    }
 }
 
 /// The turn currently open for one AI room: the tool calls it has made so
@@ -2358,6 +2425,7 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 state.pending_generated = None;
                 state.generation_context = None; state.generation_epoch = None;
                 state.failed_request = None;
+                state.console.review_context = None;
                 state.console.status = String::from("Cancelled.");
             });
             // A session's launch_splash_app tool call may be waiting on this
@@ -2372,9 +2440,9 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 finish_generated_app(cx, ui, pending);
                 return;
             }
-            let retry = with_a2app(|state| state.failed_request.take()).flatten();
-            if let Some(request) = retry {
-                start_generation(cx, ui, request, None, None);
+            let retry = with_a2app(|state| state.failed_request.take().map(|request| (request, state.create_room.clone()))).flatten();
+            if let Some((request, room)) = retry {
+                start_generation(cx, ui, request, room, None);
             }
         }
         A2AppOp::NewPrompt => {
@@ -2624,6 +2692,8 @@ fn start_generation(
             return;
         }
         state.pending_generated = None;
+        state.console.review_context = None;
+        state.failed_request = Some(request.clone());
         let apps: Vec<(MiniAppId, String)> = state.registry.iter()
             .map(|a| (a.id.clone(), a.name.clone()))
             .collect();
@@ -2697,13 +2767,14 @@ fn start_generation(
                 state.console = GenConsole {
                     status,
                     lines: Vec::new(),
+                    review_context: None,
                     active: true,
                     last_render: None,
                 };
                 state.failed_request = Some(request);
             }
             Err(e) => {
-                state.console.status = e.clone();
+                state.console.failed(&e, Some(context));
                 state.console.active = true;
                 failed = Some(e.clone());
                 enqueue_popup_notification(e, PopupKind::Error, Some(6.0));
@@ -2746,7 +2817,11 @@ fn advance_generation(cx: &mut Cx, ui: &WidgetRef) {
             }
             GenOutcome::Failed(reason) => {
                 refresh_console(state, true);
-                state.console.status = format!("Failed: {reason}");
+                let context = state.generation_context.clone().filter(|context|
+                    state.generation_epoch.is_some_and(|epoch|
+                        a2app_core::information_flow::ensure_context_epoch(context, epoch).is_ok())
+                        && super::information_flow::current_context(context).is_ok());
+                state.console.failed(&reason, context);
                 Some(Done::Failed(reason))
             }
         }
@@ -5515,7 +5590,7 @@ fn retire_flow_context(cx: &mut Cx, ui: &WidgetRef, context: &a2app_core::inform
 }
 
 fn stop_private_contexts(cx: &mut Cx, ui: &WidgetRef) {
-    with_a2app(|state| { state.generation = None; state.generation_context = None; state.generation_epoch = None; state.pending_generated = None; });
+    with_a2app(|state| { state.generation = None; state.generation_context = None; state.generation_epoch = None; state.pending_generated = None; state.console.review_context = None; });
     #[cfg(unix)]
     {
         let rooms = with_a2app(|state| state.ai_sessions.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
