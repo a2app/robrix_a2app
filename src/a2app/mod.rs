@@ -28,6 +28,7 @@ pub mod instances;
 pub mod information_flow;
 mod effect_review;
 pub mod data_sharing;
+mod approval_details;
 pub mod protection_inspector;
 pub mod background_tasks;
 pub mod network;
@@ -58,6 +59,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
     permission_choices::script_mod(vm);
     permission_prompt::script_mod(vm);
     data_sharing::script_mod(vm);
+    approval_details::script_mod(vm);
     protection_inspector::script_mod(vm);
     background_tasks::script_mod(vm);
     ai_room_events::script_mod(vm);

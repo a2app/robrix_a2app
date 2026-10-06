@@ -114,6 +114,9 @@ asks for the agent's room and then the permission to edit. Opening or cancelling
 an editor does not grant access.
 
 The regular **Permissions** panel also lists saved action and sharing approvals.
+Each approval summarizes its destination, duration and data sources. **Details…**
+opens a searchable list of account data, rooms and direct conversations, with
+their full names and IDs; the Rooms and Conversations filters narrow that list.
 Choose **Remove approval** to take one back, or **Ask again** to clear a group's
 saved answers and reopen the app for a new prompt. **Reset permissions…** resets
 just that app, stops its active work and pauses its background tasks. Its saved

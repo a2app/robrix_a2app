@@ -2153,6 +2153,11 @@ impl RoomsListRef {
         self.borrow()?.get_room_state(room_id)
     }
 
+    /// Cached direct-conversation status, including rooms hidden from pickers.
+    pub fn get_room_is_direct(&self, room_id: &OwnedRoomId) -> Option<bool> {
+        self.borrow()?.all_joined_rooms.get(room_id).map(|room| room.is_direct)
+    }
+
     /// Returns the avatar for the given room, if it is known and fetched.
     pub fn get_room_avatar(&self, room_id: &OwnedRoomId) -> Option<FetchedRoomAvatar> {
         let inner = self.borrow()?;

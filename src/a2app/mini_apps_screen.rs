@@ -16,10 +16,11 @@ use matrix_sdk::ruma::OwnedRoomId;
 use a2app_core::diff::{line_diff, DiffLine};
 use a2app_core::manifest::{A2AppScope, MiniAppId, MiniAppManifest, RunsIn};
 use a2app_core::permissions::{Effective, GrantState, Permission, RoomScope, RoomAccess, RoomPolicyMode, PolicyDecision, agent_subject, agent_room_of};
-use a2app_core::information_flow::{self as flow, AuthoritySession, ContextId, ReaderScope, Recipient, SharingDuration, Source};
+use a2app_core::information_flow::{self as flow, AuthoritySession, ContextId, ReaderScope, Recipient, SharingDuration};
 use crate::a2app::permission_choices::PermissionChoicesWidgetExt;
 use crate::a2app::permission_prompt::{PermissionScopeEditorWidgetExt, duration_label, network_scope_label};
 use crate::a2app::data_sharing::DataSharingWidgetExt;
+use crate::a2app::approval_details::{ApprovalDetailsWidgetExt, ApprovalSource, approval_sources, source_summary};
 use crate::a2app::protection_inspector::{ProtectionInspectorAction, ProtectionInspectorWidgetExt};
 use crate::a2app::background_tasks::{BackgroundTasksAction, BackgroundTasksWidgetExt};
 use a2app_core::persistence;
@@ -1598,6 +1599,10 @@ script_mod! {
             }
         }
 
+        approval_details_modal := Modal {
+            content := mod.widgets.ApprovalDetails {}
+        }
+
         edit_pane := View {
             visible: false,
             width: Fill, height: Fill
@@ -2228,6 +2233,7 @@ pub struct MiniAppsScreen {
     #[rust] agent_details: bool,
     #[rust] agent_rooms: Vec<String>,
     #[rust] agent_abilities: Vec<(Permission, Option<String>, String)>,
+    #[rust] approval_details_key: Option<AccessRuleKey>,
 }
 
 impl Widget for MiniAppsScreen {
@@ -2243,6 +2249,17 @@ impl Widget for MiniAppsScreen {
                 self.view.data_sharing(cx, ids!(sharing_editor)).review_context(cx, context);
                 self.set_pane(cx, Pane::Sharing);
             }
+            return;
+        }
+        // A detail popup owns its controls; cached rows behind it cannot act.
+        if self.view.modal(cx, ids!(approval_details_modal)).is_open() {
+            self.view.widget(cx, ids!(approval_details_modal)).handle_event(cx, event, scope);
+            if let Event::Actions(actions) = event
+                && self.view.button(cx, ids!(approval_details_modal.content.close_button)).clicked(actions)
+            {
+                self.view.modal(cx, ids!(approval_details_modal)).close(cx);
+            }
+            if !self.view.modal(cx, ids!(approval_details_modal)).is_open() { self.approval_details_key = None; }
             return;
         }
         if self.pane == Pane::Providers {
@@ -2476,7 +2493,9 @@ impl Widget for MiniAppsScreen {
                     continue;
                 }
                 Some(MiniAppsScreenAction::EditAccessRule(key)) => {
-                    self.edit_access_rule(cx, key);
+                    if matches!(key, AccessRuleKey::Effect { .. } | AccessRuleKey::Action { .. } | AccessRuleKey::Sharing { .. }) {
+                        self.show_approval_details(cx, key);
+                    } else { self.edit_access_rule(cx, key); }
                     continue;
                 }
                 Some(MiniAppsScreenAction::RemoveAccessRule(key)) => {
@@ -2826,6 +2845,8 @@ impl MiniAppsScreen {
     }
 
     fn display_pane(&mut self, cx: &mut Cx, pane: Pane) {
+        self.view.modal(cx, ids!(approval_details_modal)).close(cx);
+        self.approval_details_key = None;
         if pane == Pane::List {
             self.cancel_scope = None;
         } else if self.cancel_scope.is_none() {
@@ -3041,6 +3062,12 @@ impl MiniAppsScreen {
 
     /// Refreshes all code-set labels/visibility from the a2app state.
     fn populate_before_draw(&mut self, cx: &mut Cx2d) {
+        if let Some(key) = &self.approval_details_key
+            && !self.saved_approval_rows(cx).iter().any(|row| &row.key == key)
+        {
+            self.view.modal(cx, ids!(approval_details_modal)).close(cx);
+            self.approval_details_key = None;
+        }
         if matches!(self.pane, Pane::List | Pane::Access) {
             let (read, read_mode, write, write_mode, write_enabled, rooms, spaces) = with_a2app(|state| (
                 state.permissions.global_policy(RoomAccess::Read), state.permissions.policy_mode(RoomAccess::Read),
@@ -3212,12 +3239,13 @@ impl MiniAppsScreen {
 
     fn draw_flat_list(&mut self, cx: &mut Cx2d, uid: WidgetUid, perms_list_uid: WidgetUid, approval_lists: [WidgetUid; 2], list: &mut FlatList) {
         if approval_lists.contains(&uid) {
-            for (index, (key, label)) in self.saved_approval_rows(cx).into_iter().enumerate() {
+            for (index, approval) in self.saved_approval_rows(cx).into_iter().enumerate() {
                 let Some(item) = list.item(cx, LiveId::from_str(&format!("approval-{index}")), id!(access_rule)) else { continue };
                 if let Some(mut row) = item.borrow_mut::<MiniAppAccessRuleRow>() {
-                    row.key = Some(key);
-                    row.view.label(cx, ids!(rule_label)).set_text(cx, &label);
-                    row.view.widget(cx, ids!(rule_edit)).set_visible(cx, false);
+                    row.key = Some(approval.key);
+                    row.view.label(cx, ids!(rule_label)).set_text(cx, &approval.summary);
+                    row.view.widget(cx, ids!(rule_edit)).set_visible(cx, true);
+                    row.view.button(cx, ids!(rule_edit)).set_text(cx, "Details…");
                     row.view.button(cx, ids!(rule_remove)).set_text(cx, "Remove approval");
                 }
                 item.draw_all(cx, &mut Scope::empty());
@@ -3689,12 +3717,33 @@ fn approval_duration_label(cx: &mut Cx, duration: &SharingDuration) -> String {
     }
 }
 
-fn approval_source_label(cx: &mut Cx, source: &Source) -> String {
-    match source {
-        Source::Account { .. } => "your account information".into(),
-        Source::Room { room, .. } => format!("data from {}", room_label(cx, room)),
-        Source::UnknownPrivate => "previously received private data".into(),
+struct SavedApprovalRow {
+    key: AccessRuleKey,
+    summary: String,
+    details: String,
+    sources: Vec<ApprovalSource>,
+}
+
+fn approval_scope_summary(cx: &mut Cx, scope: &RoomScope) -> String {
+    match scope {
+        RoomScope::Selection { rooms, spaces } if rooms.len() == 1 && spaces.is_empty() => format!("In {}", room_label(cx, &rooms[0])),
+        RoomScope::Selection { rooms, spaces } if rooms.is_empty() && spaces.len() == 1 => format!("In space {}", room_label(cx, &spaces[0])),
+        RoomScope::Selection { rooms, spaces } => {
+            let mut parts = Vec::new();
+            if !rooms.is_empty() { parts.push(format!("{} selected {}", rooms.len(), if rooms.len() == 1 { "room" } else { "rooms" })); }
+            if !spaces.is_empty() { parts.push(format!("{} selected {}", spaces.len(), if spaces.len() == 1 { "space" } else { "spaces" })); }
+            parts.join(" · ")
+        }
+        RoomScope::AllRooms => "All rooms".into(),
     }
+}
+
+fn resolve_approval_sources(cx: &mut Cx, sources: &flow::Label) -> Vec<ApprovalSource> {
+    approval_sources(sources, |id| {
+        let direct = cx.has_global::<RoomsListRef>() && OwnedRoomId::try_from(id).ok()
+            .and_then(|room| cx.get_global::<RoomsListRef>().get_room_is_direct(&room)) == Some(true);
+        (room_label(cx, id), direct)
+    })
 }
 
 fn approval_recipient_label(cx: &mut Cx, recipient: &Recipient) -> String {
@@ -3966,7 +4015,7 @@ impl MiniAppsScreen {
 
     fn remove_access_rule(&mut self, cx: &mut Cx, key: &AccessRuleKey) {
         if matches!(key, AccessRuleKey::Effect { .. } | AccessRuleKey::Action { .. } | AccessRuleKey::Sharing { .. })
-            && !self.saved_approval_rows(cx).iter().any(|(current, _)| current == key)
+            && !self.saved_approval_rows(cx).iter().any(|row| &row.key == key)
         { return; }
         let write = with_a2app(|state| state.permissions.matrix_write()).unwrap_or(false).then_some(PolicyDecision::Ask);
         match key {
@@ -4056,7 +4105,14 @@ impl MiniAppsScreen {
         }
     }
 
-    fn saved_approval_rows(&self, cx: &mut Cx) -> Vec<(AccessRuleKey, String)> {
+    fn show_approval_details(&mut self, cx: &mut Cx, key: &AccessRuleKey) {
+        let Some(row) = self.saved_approval_rows(cx).into_iter().find(|row| &row.key == key) else { return };
+        self.view.approval_details(cx, ids!(approval_details_modal.content)).configure(cx, &row.details, row.sources);
+        self.approval_details_key = Some(row.key);
+        self.view.modal(cx, ids!(approval_details_modal)).open(cx);
+    }
+
+    fn saved_approval_rows(&self, cx: &mut Cx) -> Vec<SavedApprovalRow> {
         let subject = match self.pane {
             Pane::Info => self.info_app.as_deref(),
             Pane::Access if self.access_view == AccessView::Overview => match &self.access_editor {
@@ -4074,15 +4130,16 @@ impl MiniAppsScreen {
             let title = grant.operation.strip_prefix("operation:").or_else(|| grant.operation.strip_prefix("action:"))
                 .and_then(a2app_core::capabilities::by_id).map(|capability| capability.title.to_string())
                 .or_else(|| grant.action.as_ref().map(approval_action_label)).unwrap_or_else(|| "Repeat this approved request".into());
-            let scope = grant.room_scope.as_ref().map(|scope| scope_label(cx, scope))
+            let sources = resolve_approval_sources(cx, &grant.sources);
+            let scope = grant.room_scope.as_ref().map(|scope| approval_scope_summary(cx, scope))
                 .unwrap_or_else(|| approval_context_label(cx, &grant.context));
             let mut summary = format!("{title}\n{scope} · {}", approval_duration_label(cx, &grant.duration));
             if let Some(recipient) = &grant.recipient { summary.push_str(&format!("\n{}", approval_recipient_label(cx, recipient))); }
-            if !grant.sources.is_empty() {
-                let sources = grant.sources.iter().map(|source| approval_source_label(cx, source)).collect::<Vec<_>>().join(", ");
-                summary.push_str(&format!("\nMay use {sources}."));
-            }
-            rows.push((AccessRuleKey::Effect { account: account.clone(), id: grant.id }, summary));
+            summary.push_str(&format!("\n{}", source_summary(&sources)));
+            let mut details = summary.clone();
+            if let Some(scope) = &grant.room_scope { details.push_str(&format!("\nApplies in: {}", scope_label(cx, scope))); }
+            if let Some(action) = &grant.action { details.push_str(&format!("\nAction: {}\nTarget: {}", action.kind, action.target)); }
+            rows.push(SavedApprovalRow { key: AccessRuleKey::Effect { account: account.clone(), id: grant.id }, summary, details, sources });
         }
         for grant in flow::authorities().unwrap_or_default() {
             if !context_matches_subject(&grant.context, &account, subject) { continue; }
@@ -4092,7 +4149,8 @@ impl MiniAppsScreen {
                 AuthoritySession::RoomSession { room, .. } => format!("Until you close {}", room_label(cx, room)),
             };
             let summary = format!("{}\n{} · {duration}", approval_action_label(&grant.action), approval_context_label(cx, &grant.context));
-            rows.push((AccessRuleKey::Action { account: account.clone(), id: grant.id }, summary));
+            let details = format!("{summary}\nAction: {}\nTarget: {}", grant.action.kind, grant.action.target);
+            rows.push(SavedApprovalRow { key: AccessRuleKey::Action { account: account.clone(), id: grant.id }, summary, details, sources: Vec::new() });
         }
         for grant in flow::sharing_grants().unwrap_or_default() {
             if !sharing_matches_subject(&grant, &account, subject, true) { continue; }
@@ -4102,9 +4160,10 @@ impl MiniAppsScreen {
                 ReaderScope::App { .. } => "Everywhere this app runs".into(),
                 ReaderScope::Context(context) => approval_context_label(cx, context),
             };
-            let summary = format!("Share {}\n{}\n{scope} · {}", approval_source_label(cx, &grant.source),
+            let sources = resolve_approval_sources(cx, &flow::Label::from([grant.source.clone()]));
+            let summary = format!("{}\n{}\n{scope} · {}", source_summary(&sources),
                 approval_recipient_label(cx, &grant.recipient), approval_duration_label(cx, &grant.duration));
-            rows.push((AccessRuleKey::Sharing { account: account.clone(), id: grant.id, shared }, summary));
+            rows.push(SavedApprovalRow { key: AccessRuleKey::Sharing { account: account.clone(), id: grant.id, shared }, details: summary.clone(), summary, sources });
         }
         rows
     }
