@@ -10,7 +10,7 @@ license = "MIT"
 readme = "README.md"
 categories = ["gui"]
 repository = "https://github.com/project-robius/robrix"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 metadata.makepad-auto-version = "zqpv-Yj-K7WNVK2I8h5Okhho46Q="
 
 [dependencies]
@@ -174,8 +174,8 @@ members = ["a2app/core", "a2app/agent"]
 ## One source of truth for the makepad pin: the a2app crates inherit it, so
 ## a repin here can't leave them on a different fork or branch.
 [workspace.dependencies]
-makepad-widgets = { git = "https://github.com/kevinaboos/makepad", branch = "stack_navigation_animation_robrix", features = ["serde"] }
-makepad-code-editor = { git = "https://github.com/kevinaboos/makepad", branch = "stack_navigation_animation_robrix" }
+makepad-widgets = { git = "https://github.com/kevinaboos/makepad", branch = "text_input_keep_focus_robrix", features = ["serde"] }
+makepad-code-editor = { git = "https://github.com/kevinaboos/makepad", branch = "text_input_keep_focus_robrix" }
 
 
 [patch.crates-io]
