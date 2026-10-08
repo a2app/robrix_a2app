@@ -1,9 +1,23 @@
+//! Integrity (untrusted-influence) tracking and exact-action review.
+//!
+//! Every context, including an AI-room agent session, needs an exact-action
+//! review once untrusted influence is present. The one exemption is an
+//! agent's own-room reply and activity rows (`ai.reply.write` /
+//! `ai.activity.write` targeting its own room): those are the assistant's
+//! visible output in the room the user is already talking to, and
+//! confidentiality (the room and homeserver sharing rules) still applies to
+//! them. See [`agent_own_room_output_exempt`].
+
 use super::*;
 
 /// Host-attributed untrusted influence. This is independent of confidentiality.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub enum Influence {
     RoomContent { account: String, room: String },
+    /// Other people wrote the room and space names, topics and counts the
+    /// directory tools return, so they are untrusted input even though the
+    /// results carry no message content.
+    RoomDirectory { account: String },
     InternetOrigin(String),
     MiniApp { account: String, app: String },
     Model(String),
@@ -52,7 +66,10 @@ impl Registry {
     pub fn action_decision(&self, context: &ContextId, action: &SensitiveAction) -> Result<ActionDecision, String> {
         validate_action(action)?;
         let influences = self.influences(context)?;
-        let allowed = influences.is_empty() || self.authorities.iter().any(|grant|
+        // Every context, including an agent session, needs a review once it
+        // holds untrusted influence. The sole exemption is the agent's own
+        // visible output in its own room; see `agent_own_room_output_exempt`.
+        let allowed = influences.is_empty() || agent_own_room_output_exempt(context, action) || self.authorities.iter().any(|grant|
             &grant.context == context && &grant.action == action && influences.is_subset(&grant.influences)
                 && !matches!(grant.session, AuthoritySession::Once { .. }));
         let decision = ActionDecision { context: context.clone(), epoch: self.context_epoch(context)?, action: action.clone(), influences, allowed, request: None };
@@ -122,9 +139,20 @@ pub(super) fn validate_action(action: &SensitiveAction) -> Result<(), String> {
     Ok(())
 }
 
+/// An agent's reply and activity rows are the visible output of the room the
+/// user is already talking to. They are written back into the agent's own
+/// room, so they skip exact-action review; the confidentiality check (the room
+/// and homeserver origin sharing rules) still governs them. Every other kind
+/// and target, including those same kinds targeting another room, is reviewed.
+fn agent_own_room_output_exempt(context: &ContextId, action: &SensitiveAction) -> bool {
+    let ContextId::Agent { room, .. } = context else { return false };
+    matches!(action.kind.as_str(), "ai.reply.write" | "ai.activity.write") && action.target == *room
+}
+
 pub(super) fn validate_influence(influence: &Influence) -> Result<(), String> {
     match influence {
         Influence::RoomContent { account, room } => validate_source(&Source::Room { account: account.clone(), room: room.clone() }),
+        Influence::RoomDirectory { account } => validate_source(&Source::RoomDirectory { account: account.clone() }),
         Influence::MiniApp { account, app } => validate_context(&ContextId::PublicApp { account: account.clone(), app: app.clone() }),
         Influence::InternetOrigin(origin) => Recipient::NetworkOrigin(origin.clone()).validate(),
         Influence::Model(model) if model.is_empty() => Err("A model influence identity is required.".into()),
@@ -223,6 +251,17 @@ impl Registry {
     fn exact_action(&mut self, context: &ContextId, epoch: u64, action: &SensitiveAction, payload: &serde_json::Value, commit: bool) -> Result<(), String> {
         self.ensure_context_epoch(context, epoch)?;
         validate_action(action)?;
+        // The agent's own-room reply and activity rows are its visible output,
+        // not a privileged cross-room or network effect; confidentiality still
+        // applies at the sink. No other kind or target is exempt.
+        if agent_own_room_output_exempt(context, action) {
+            if commit {
+                self.pending_actions.retain(|pending| &pending.decision.context != context || &pending.decision.action != action);
+                self.authorities.retain(|grant| &grant.context != context || &grant.action != action
+                    || !matches!(grant.session, AuthoritySession::Once { .. }));
+            }
+            return Ok(());
+        }
         let influences = self.influences(context)?;
         let session_allowed = influences.is_empty() || self.authorities.iter().any(|grant|
             &grant.context == context && &grant.action == action && influences.is_subset(&grant.influences)

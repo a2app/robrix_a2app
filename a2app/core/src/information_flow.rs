@@ -38,6 +38,14 @@ use storage::{Metadata, StoredContext, StoredProvenance};
 pub enum Source {
     Account { account: String },
     Room { account: String, room: String },
+    /// The account's room and space directory (names, ids, counts) as
+    /// returned by the AI agent's default `list_rooms` / `list_spaces` /
+    /// `space_info` / `list_space_rooms` tools. Directory results carry no
+    /// message content, but they are account data written by other people,
+    /// so they remain untrusted and need a source of their own: one provider
+    /// rule covers the whole directory and other recipients do not inherit
+    /// every listed room.
+    RoomDirectory { account: String },
     /// Existing private storage whose sources cannot be recovered safely.
     UnknownPrivate,
 }
@@ -262,6 +270,34 @@ impl Registry {
         Ok(label)
     }
 
+    /// The sources a still-live agent context carries into a new turn: every
+    /// source beyond the baseline (the context's own room and the room
+    /// directory) that has no sharing rule to `provider`. The label persists
+    /// across turns, but a turn-scoped provider rule does not, so the next
+    /// model call would otherwise be refused. The host uses this at the start
+    /// of a turn to raise one prompt for the carried-over sources.
+    pub fn carried_over_sources(&self, context: &ContextId, provider: &Recipient) -> Result<Label, String> {
+        self.check_context(context)?;
+        self.check_healthy()?;
+        provider.validate()?;
+        let own_room = context.room();
+        let label = self.labels(context)?;
+        Ok(label
+            .into_iter()
+            .filter(|source| {
+                let baseline = matches!(source, Source::RoomDirectory { .. })
+                    || matches!(source, Source::Room { room, .. } if Some(room.as_str()) == own_room);
+                // `UnknownPrivate` can never be released by a sharing rule, so
+                // it must never raise an unactionable carried-over prompt (a
+                // legacy agent memory that reset on session start would
+                // otherwise prompt on every restart).
+                !baseline
+                    && !matches!(source, Source::UnknownPrivate)
+                    && !self.source_allowed(source, provider, Some(context))
+            })
+            .collect())
+    }
+
     pub fn influences(&self, context: &ContextId) -> Result<Influences, String> {
         let entry = self.stored_context(context)?;
         self.labels(context)?;
@@ -446,6 +482,27 @@ impl Registry {
         self.join_code(app, StoredProvenance { label, influences })
     }
 
+    /// Joins an app's shared code provenance into `receiver`, fail-closed: an
+    /// app whose code has `UnknownPrivate`/`Unknown` provenance taints the
+    /// receiver rather than having those sources silently dropped. Metadata
+    /// listings do not call this; only paths that expose app code do.
+    pub fn join_code_labels(&mut self, app: &str, receiver: &ContextId) -> Result<(), String> {
+        let labels = self.code_labels(app)?;
+        self.add_sources(receiver, labels)?;
+        let influences = self.code_influences(app)?;
+        self.add_influences(receiver, influences)
+    }
+
+    /// Drops a stale session's accumulated provenance, then restores the
+    /// baseline own-room source and influence. Only a fresh session start
+    /// calls this; ordinary tool calls must never reset the label.
+    pub fn begin_agent_session(&mut self, context: &ContextId) -> Result<(), String> {
+        self.reset_agent_session_provenance(context)?;
+        let room = context.room().ok_or("An agent session context needs a room.")?;
+        self.add_sources(context, [Source::Room { account: context.account().into(), room: room.into() }])?;
+        self.add_influences(context, [Influence::RoomContent { account: context.account().into(), room: room.into() }])
+    }
+
     pub fn remove_context(&mut self, context: &ContextId) {
         self.forget_exact_actions(context);
         self.pending_effects.retain(|pending| &pending.review.context != context);
@@ -462,6 +519,28 @@ impl Registry {
         self.ensure_context_epoch(context, expected_epoch)?;
         self.remove_context(context);
         Ok(())
+    }
+
+    /// Reset a fresh agent session's accumulated provenance to the empty label.
+    ///
+    /// Agent memory is per-session and does not survive a restart (the
+    /// embedded backend uses an in-memory store and the confined child uses a
+    /// disposable per-session workspace), so a previous session's label is not
+    /// a record of live data. Carrying it forward only lets one bad join — a
+    /// legacy app's `Source::UnknownPrivate` code provenance picked up by
+    /// `list_apps` — permanently wedge every later model call and room write.
+    /// The caller re-adds the baseline room source immediately after.
+    pub fn reset_agent_session_provenance(&mut self, context: &ContextId) -> Result<(), String> {
+        self.check_healthy()?;
+        if !matches!(context, ContextId::Agent { .. }) {
+            return Err("Only an agent session context may have its provenance reset.".into());
+        }
+        let mut next = self.metadata.clone();
+        let Some(entry) = next.contexts.iter_mut().find(|entry| &entry.context == context) else {
+            return Ok(());
+        };
+        entry.provenance = StoredProvenance::default();
+        self.persist(next)
     }
 
     pub fn close_room_session(&mut self, account: &str, room: &str) -> Result<(), String> {
@@ -537,6 +616,7 @@ fn validate_source(source: &Source) -> Result<(), String> {
     match source {
         Source::Account { account } if account.is_empty() => Err("A source account identity is required.".into()),
         Source::Room { account, room } if account.is_empty() || room.is_empty() => Err("A source account and room identity are required.".into()),
+        Source::RoomDirectory { account } if account.is_empty() => Err("A source account identity is required.".into()),
         _ => Ok(()),
     }
 }
@@ -568,6 +648,7 @@ fn provenance_for_sources(sources: impl IntoIterator<Item = Source>) -> StoredPr
     let label: Label = sources.into_iter().collect();
     let influences = label.iter().filter_map(|source| match source {
         Source::Room { account, room } => Some(Influence::RoomContent { account: account.clone(), room: room.clone() }),
+        Source::RoomDirectory { account } => Some(Influence::RoomDirectory { account: account.clone() }),
         Source::UnknownPrivate => Some(Influence::Unknown),
         Source::Account { .. } => None,
     }).collect();
@@ -642,6 +723,18 @@ pub fn register_context_with_legacy_data(context: &ContextId, legacy_private_dat
 
 pub fn add_sources(context: &ContextId, sources: impl IntoIterator<Item = Source>) -> Result<(), String> {
     with_registry(|registry| registry.add_sources(context, sources))
+}
+
+/// Drop a fresh agent session's accumulated provenance; see
+/// [`Registry::reset_agent_session_provenance`].
+pub fn reset_agent_session_provenance(context: &ContextId) -> Result<(), String> {
+    with_registry(|registry| registry.reset_agent_session_provenance(context))
+}
+
+/// Drop a fresh agent session's accumulated provenance and restore its own
+/// room baseline; see [`Registry::begin_agent_session`].
+pub fn begin_agent_session(context: &ContextId) -> Result<(), String> {
+    with_registry(|registry| registry.begin_agent_session(context))
 }
 
 pub fn join_labels(context: &ContextId, label: &Label) -> Result<(), String> {
@@ -812,6 +905,10 @@ pub fn record_app_code_from(app: &str, context: &ContextId) -> Result<(), String
     with_registry(|registry| registry.record_app_code_from(app, context))
 }
 
+pub fn join_code_labels(app: &str, receiver: &ContextId) -> Result<(), String> {
+    with_registry(|registry| registry.join_code_labels(app, receiver))
+}
+
 pub fn grant_sharing(source: Source, recipient: Recipient, reader: ReaderScope, duration: SharingDuration) -> Result<u64, String> {
     with_registry(|registry| registry.grant_sharing(source, recipient, reader, duration))
 }
@@ -822,6 +919,26 @@ pub fn revoke_sharing(id: u64) -> Result<bool, String> {
 
 pub fn sharing_grants() -> Result<Vec<SharingGrant>, String> {
     with_registry(|registry| registry.sharing_grants())
+}
+
+/// Whether `source` may already reach `recipient` for this exact agent/reader
+/// context, without joining any new source into the context's label. Used by
+/// the upfront task-plan resolver to turn a needed information-flow rule into
+/// `AlreadyAllowed` instead of `NeedsGrant`; enforcement still happens where it
+/// always did (the guarded model transport and the room/network workers).
+pub fn sharing_allows_for_reader(source: &Source, recipient: &Recipient, reader: &ContextId) -> Result<bool, String> {
+    with_registry(|registry| {
+        registry.check_healthy()?;
+        recipient.validate()?;
+        validate_source(source)?;
+        Ok(registry.source_allowed(source, recipient, Some(reader)))
+    })
+}
+
+/// The sources a still-live agent context carries into a new turn without a
+/// provider rule; see [`Registry::carried_over_sources`].
+pub fn carried_over_sources(context: &ContextId, provider: &Recipient) -> Result<Label, String> {
+    with_registry(|registry| registry.carried_over_sources(context, provider))
 }
 
 pub fn close_room_session(account: &str, room: &str) -> Result<(), String> {
@@ -1295,6 +1412,97 @@ mod tests {
         metadata.historical_code.insert("test".into(), StoredProvenance::legacy(true));
         fs::write(root.0.join(METADATA_FILE), serde_json::to_vec(&metadata).unwrap()).unwrap();
         assert!(Registry::open(&root.0).is_err());
+    }
+
+    #[test]
+    fn joining_unknown_code_provenance_fails_closed_while_a_listing_does_not() {
+        let root = TestRoot::new();
+        let storage = root.0.join("app_data/legacy");
+        fs::create_dir_all(&storage).unwrap();
+        fs::write(storage.join("old-memory"), "private").unwrap();
+        let mut registry = root.registry();
+        let receiver = agent("alice", "room-a");
+        registry.register_context(&receiver).unwrap();
+        // Registering the app as legacy records its code provenance as
+        // UnknownPrivate (existing app_data alone no longer taints code).
+        let app_context = app("legacy", "alice", "room-a");
+        registry.register_context_with_legacy_data(&app_context, true).unwrap();
+        assert!(registry.code_labels("legacy").unwrap().contains(&Source::UnknownPrivate));
+        // A metadata listing only adds its own account source; the receiver
+        // stays clean and can still reach the model provider.
+        assert!(registry.labels(&receiver).unwrap().is_empty());
+        assert!(registry.ensure_allowed(&receiver, &site()).is_ok());
+        // A path that reads the app's code joins the unknown source fail-closed.
+        registry.join_code_labels("legacy", &receiver).unwrap();
+        assert!(registry.labels(&receiver).unwrap().contains(&Source::UnknownPrivate));
+        assert!(registry.ensure_allowed(&receiver, &site()).is_err());
+    }
+
+    #[test]
+    fn begin_agent_session_leaves_only_the_own_room_in_the_label() {
+        let root = TestRoot::new();
+        let mut registry = root.registry();
+        let context = agent("alice", "room-a");
+        registry.register_context(&context).unwrap();
+        registry.add_sources(&context, [room_source("alice", "room-b"), Source::Account { account: "alice".into() }]).unwrap();
+        registry.begin_agent_session(&context).unwrap();
+        assert_eq!(registry.labels(&context).unwrap(), [room_source("alice", "room-a")].into_iter().collect());
+        assert_eq!(registry.influences(&context).unwrap(), [Influence::RoomContent { account: "alice".into(), room: "room-a".into() }].into_iter().collect());
+    }
+
+    #[test]
+    fn a_turn_scoped_provider_rule_leaves_a_carried_room_blocked_next_turn() {
+        let root = TestRoot::new();
+        let mut registry = root.registry();
+        let context = agent("alice", "!ai:example.org");
+        let provider = Recipient::ModelProvider("provider".into());
+        registry.register_context(&context).unwrap();
+        registry.begin_agent_session(&context).unwrap();
+        // The baseline own-room source reaches the provider, as the defaults do.
+        registry
+            .grant_sharing(
+                room_source("alice", "!ai:example.org"),
+                provider.clone(),
+                ReaderScope::Context(context.clone()),
+                SharingDuration::Permanent,
+            )
+            .unwrap();
+        // Turn 1 reads room B; the task plan grants the turn-scoped provider rule.
+        let room_b = room_source("alice", "!room-b:example.org");
+        registry.add_sources(&context, [room_b.clone()]).unwrap();
+        let grant = registry
+            .grant_sharing(
+                room_b.clone(),
+                provider.clone(),
+                ReaderScope::Context(context.clone()),
+                SharingDuration::RoomSession { account: "alice".into(), room: "!ai:example.org".into() },
+            )
+            .unwrap();
+        assert!(registry.ensure_allowed(&context, &provider).is_ok());
+        assert!(registry.carried_over_sources(&context, &provider).unwrap().is_empty());
+        // Turn 1 closes: the task rollback revokes the turn-scoped grant.
+        registry.revoke_sharing(grant).unwrap();
+        // Turn 2 starts: the label still holds room B (the conversation memory
+        // persists), but the provider rule is gone, so the first model call is
+        // refused until the user re-allows the carried source.
+        assert!(registry.labels(&context).unwrap().contains(&room_b));
+        assert_eq!(registry.carried_over_sources(&context, &provider).unwrap(), [room_b].into_iter().collect());
+        assert!(registry.ensure_allowed(&context, &provider).is_err(),
+            "the carried-over room is refused until the user re-allows it");
+        // The own room and the directory are the baseline, never carried over.
+        registry.add_sources(&context, [Source::RoomDirectory { account: "alice".into() }]).unwrap();
+        assert_eq!(registry.carried_over_sources(&context, &provider).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unknown_private_never_raises_a_carried_over_prompt() {
+        let root = TestRoot::new();
+        let mut registry = root.registry();
+        let context = agent("alice", "!ai:example.org");
+        let provider = Recipient::ModelProvider("provider".into());
+        registry.register_context_with_legacy_data(&context, true).unwrap();
+        assert!(registry.carried_over_sources(&context, &provider).unwrap().is_empty(),
+            "legacy stored data cannot be released, so it must not prompt on restart");
     }
 
     #[test]

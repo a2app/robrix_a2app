@@ -12,6 +12,17 @@ fn setup() -> (TestRoot, Registry, ContextId, u64, SensitiveAction) {
     (root, registry, context, epoch, action)
 }
 
+fn setup_app() -> (TestRoot, Registry, ContextId, u64, SensitiveAction) {
+    let root = TestRoot::new();
+    let mut registry = root.registry();
+    let context = ContextId::App { account: "alice".into(), app: "tool".into(), room: Some("!private:example".into()) };
+    registry.register_context(&context).unwrap();
+    registry.add_influences(&context, [Influence::Model("provider".into())]).unwrap();
+    let epoch = registry.context_epoch(&context).unwrap();
+    let action = SensitiveAction { kind: "network.POST".into(), target: "https://example.org".into() };
+    (root, registry, context, epoch, action)
+}
+
 fn pending(registry: &mut Registry, context: &ContextId, epoch: u64, action: &SensitiveAction, payload: &serde_json::Value) -> ActionDecision {
     assert!(registry.check_exact_action_for_activation(context, epoch, action, payload).is_err());
     registry.recent_action_decisions().unwrap().pop().unwrap()
@@ -130,4 +141,50 @@ fn closing_the_owning_room_cancels_pending_review_and_approval() {
     registry.close_room_session(context.account(), context.room().unwrap()).unwrap();
     assert!(registry.commit_exact_action_for_activation(&context, epoch, &action, &payload).is_err());
     assert!(registry.grant_exact_action_for_activation(&context, decision.request.unwrap().id, &decision.influences, epoch).is_err());
+}
+
+#[test]
+fn influence_growth_raises_a_fresh_review_instead_of_failing_forever() {
+    let (_root, mut registry, context, epoch, action) = setup();
+    let payload = serde_json::json!({ "text": "message" });
+    let first = pending(&mut registry, &context, epoch, &action, &payload);
+    // Content read after the review: the old approval no longer matches.
+    registry.add_influences(&context, [Influence::InternetOrigin("https://new.example".into())]).unwrap();
+    assert!(registry.grant_exact_action_for_activation(&context, first.request.as_ref().unwrap().id, &first.influences, epoch).is_err(),
+        "an approval captured before new influence must not authorize the action");
+    // A fresh check captures the grown influence set and is reviewable.
+    assert!(registry.check_exact_action_for_activation(&context, epoch, &action, &payload).is_err());
+    let fresh = registry.recent_action_decisions().unwrap().pop().unwrap();
+    assert_ne!(fresh.influences, first.influences);
+    approve(&mut registry, &fresh);
+    registry.commit_exact_action_for_activation(&context, epoch, &action, &payload).unwrap();
+}
+
+#[test]
+fn app_contexts_keep_the_same_exact_review() {
+    let (_root, mut registry, context, epoch, action) = setup_app();
+    let payload = serde_json::json!({ "text": "reviewed" });
+    let decision = pending(&mut registry, &context, epoch, &action, &payload);
+    approve(&mut registry, &decision);
+    registry.commit_exact_action_for_activation(&context, epoch, &action, &payload).unwrap();
+    assert!(registry.commit_exact_action_for_activation(&context, epoch, &action, &payload).is_err(),
+        "a mini-app context's one-time approval is consumed on first commit");
+}
+
+#[test]
+fn agent_own_room_output_is_exempt_but_cross_room_is_not() {
+    let root = TestRoot::new();
+    let mut registry = root.registry();
+    let context = ContextId::Agent { account: "alice".into(), room: "!ai:example.org".into() };
+    registry.register_context(&context).unwrap();
+    registry.add_influences(&context, [Influence::RoomContent { account: "alice".into(), room: "!ai:example.org".into() }]).unwrap();
+    let epoch = registry.context_epoch(&context).unwrap();
+    for kind in ["ai.reply.write", "ai.activity.write"] {
+        let own = SensitiveAction { kind: kind.into(), target: "!ai:example.org".into() };
+        assert!(registry.ensure_action_allowed(&context, &own).is_ok(), "{kind} in the agent's own room is its visible output");
+        registry.check_exact_action_for_activation(&context, epoch, &own, &serde_json::json!({ "text": "x" })).unwrap();
+        let other = SensitiveAction { kind: kind.into(), target: "!other:example.org".into() };
+        assert!(registry.ensure_action_allowed(&context, &other).is_err(), "{kind} targeting another room needs review");
+        assert!(registry.check_exact_action_for_activation(&context, epoch, &other, &serde_json::json!({ "text": "x" })).is_err());
+    }
 }

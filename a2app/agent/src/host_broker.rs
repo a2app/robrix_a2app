@@ -58,7 +58,7 @@ impl HostBroker {
         let check: Check = Arc::new(move || flow::ensure_context_epoch(&context, epoch));
         #[allow(unused_mut)]
         let mut system_prompt = if room_agent {
-            "You are the room's assistant. Use only the host's advertised tools. Private data may be shared only where the host allows it.".to_string()
+            crate::ROOM_AGENT_GUIDE.to_string()
         } else {
             "You create Robrix mini-apps. Return the complete app in a fenced splash code block as requested. You have no filesystem or research tools.".to_string()
         };

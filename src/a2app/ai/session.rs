@@ -78,6 +78,12 @@ pub enum SessionJob {
     },
     /// `send_message`: post plain text into the session's room.
     SendRoomMessage { text: String, answer: Sender<Result<String, String>> },
+    /// `request_task_permissions`: the agent's upfront plan for a whole task.
+    /// The runtime resolves it against the capability catalog, room policy and
+    /// information-flow rules, shows one prompt, and applies the approved
+    /// subset as a single turn-scoped batch. `request` is the raw tool
+    /// arguments (untrusted); the runtime rebuilds every grant itself.
+    RequestTaskPermissions { request: Value, answer: Sender<Result<String, String>> },
     /// `post_room_message`: post text into ANOTHER joined room as an
     /// `m.notice` message. The runtime decides against the room's per-room
     /// send allowlist whether this may run — prompting the user the first
@@ -227,6 +233,12 @@ impl AiHost for SessionHost {
         let (answer_tx, answer_rx) = channel();
         self.submit(SessionJob::FetchUrl { url: url.to_string(), answer: answer_tx })?;
         answer_rx.recv().map_err(|_| "this session ended before the URL fetch completed".to_string())?
+    }
+
+    fn request_task_permissions(&self, request: Value) -> Result<String, String> {
+        let (answer_tx, answer_rx) = channel();
+        self.submit(SessionJob::RequestTaskPermissions { request, answer: answer_tx })?;
+        answer_rx.recv().map_err(|_| "this session ended before the permission request was answered".to_string())?
     }
 
     fn read_tool(&self, kind: ReadToolKind) -> Result<String, String> {
@@ -863,14 +875,27 @@ mod tests {
 
     #[test]
     fn retired_session_queue_and_activation_cannot_reach_its_replacement() {
-        use a2app_core::information_flow::{Registry, ContextId, Source, SensitiveAction, AuthoritySession};
+        use a2app_core::information_flow::ContextId;
+        // Agent (AI-room) sessions and mini-app (App) contexts both use the
+        // exact-action review for a cross-room post; the agent's own-room
+        // reply/activity output is the only exemption.
+        retired_session_queue_and_activation_cannot_reach_its_replacement_for(
+            ContextId::Agent { account: "alice".into(), room: "!same:example.org".into() },
+            ContextId::Agent { account: "bob".into(), room: "!same:example.org".into() },
+        );
+        retired_session_queue_and_activation_cannot_reach_its_replacement_for(
+            ContextId::App { account: "alice".into(), app: "tool".into(), room: Some("!same:example.org".into()) },
+            ContextId::App { account: "bob".into(), app: "tool".into(), room: Some("!same:example.org".into()) },
+        );
+    }
+
+    fn retired_session_queue_and_activation_cannot_reach_its_replacement_for(context: a2app_core::information_flow::ContextId, other_account: a2app_core::information_flow::ContextId) {
+        use a2app_core::information_flow::{Registry, Source, SensitiveAction, AuthoritySession};
         let root = std::env::temp_dir().join(format!("robrix-session-stop-{}-{}", std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         let mut registry = Registry::open(&root).unwrap();
-        let context = ContextId::Agent { account: "alice".into(), room: "!same:example.org".into() };
-        let other_account = ContextId::Agent { account: "bob".into(), room: "!same:example.org".into() };
         let source = Source::Room { account: "alice".into(), room: "!private:example.org".into() };
-        let action = SensitiveAction { kind: "ai.reply.write".into(), target: "!same:example.org".into() };
+        let action = SensitiveAction { kind: "matrix.rooms.message.send".into(), target: "!other:example.org".into() };
         registry.register_context(&context).unwrap();
         registry.register_context(&other_account).unwrap();
         registry.add_sources(&context, [source.clone()]).unwrap();

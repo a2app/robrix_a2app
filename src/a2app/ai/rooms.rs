@@ -106,6 +106,9 @@ pub enum AiRoomRequest {
         event_type: String,
         state_key: String,
         content: serde_json::Value,
+        /// Host-assigned identity echoed back on the result, so the runtime
+        /// can match a final write's completion to the token it registered.
+        write_id: u64,
         flow_epoch: u64, flow_context: ContextId,
     },
     /// A capability-gated attached-room read the session's agent asked for
@@ -145,7 +148,7 @@ pub enum AiRoomAction {
     /// this to release the room's `ai_turn` in-flight flag — and to widen or
     /// narrow its write spacing — so the next coalesced turn snapshot can go
     /// out without piling onto the server's state-event rate limit.
-    StateEventPosted { room_id: OwnedRoomId, event_type: String, success: bool },
+    StateEventPosted { room_id: OwnedRoomId, event_type: String, write_id: u64, success: bool },
 }
 
 /// Raw Matrix state remains plaintext even in encrypted rooms.
@@ -176,18 +179,21 @@ async fn send_ai_state_event(
     policy::ensure_room_access(room.room_id().as_str(), RoomAccess::Write)?;
     use matrix_sdk::ruma::api::client::state::send_state_event;
     use matrix_sdk::utils::IntoRawStateEventContent;
-    let payload = serde_json::json!({ "event_type": event_type, "state_key": state_key, "content": content });
+    let config = room.client().request_config().disable_retry();
+    ensure_ai_state_output(room, flow_context)?;
+    // Activity rows are the agent's own-room visible output, so they take the
+    // `ai.activity.write` exemption from exact-action review (see
+    // `agent_own_room_output_exempt`); the confidentiality check above still
+    // governs what may be written. A row targeting any other room would not be
+    // exempt.
+    let action = flow::SensitiveAction { kind: "ai.activity.write".into(), target: room.room_id().to_string() };
+    policy::commit_flow_action(flow_context, &action, &content)?;
     let request = send_state_event::v3::Request::new_raw(
         room.room_id().to_owned(),
         event_type.into(),
         state_key.to_owned(),
         content.into_raw_state_event_content(),
     );
-    let config = room.client().request_config().disable_retry();
-    ensure_ai_state_output(room, flow_context)?;
-    policy::commit_flow_action(flow_context, &flow::SensitiveAction {
-        kind: "ai.activity.write".into(), target: room.room_id().to_string(),
-    }, &payload)?;
     let recipient = flow::Recipient::network_origin(room.client().homeserver().as_str()).ok();
     policy::audit_flow_operation(flow_context, recipient, room.client()
         .send(request)
@@ -289,12 +295,12 @@ async fn handle_ai_room_request_inner(request: AiRoomRequest) {
                 }
             }
         }
-        AiRoomRequest::PostAiStateEvent { room_id, event_type, state_key, content, flow_context, .. } => {
+        AiRoomRequest::PostAiStateEvent { room_id, event_type, state_key, content, write_id, flow_context, .. } => {
             let Some(room) = get_client().and_then(|c| c.get_room(&room_id)) else {
                 log!("AI Rooms worker: can't post {event_type} to {room_id}: room not found in client.");
                 // Still release the runtime's in-flight flag; the row is lost
                 // but the turn must not wedge behind it.
-                Cx::post_action(AiRoomAction::StateEventPosted { room_id, event_type, success: false });
+                Cx::post_action(AiRoomAction::StateEventPosted { room_id, event_type, write_id, success: false });
                 return;
             };
             let success = match send_ai_state_event(&room, &event_type, &state_key, content, &flow_context).await {
@@ -306,7 +312,7 @@ async fn handle_ai_room_request_inner(request: AiRoomRequest) {
                     false
                 }
             };
-            Cx::post_action(AiRoomAction::StateEventPosted { room_id, event_type, success });
+            Cx::post_action(AiRoomAction::StateEventPosted { room_id, event_type, write_id, success });
         }
         AiRoomRequest::ToolRead { id, room_id, tool, authorization, flow_context, .. } => {
             let read = async {
@@ -788,7 +794,6 @@ async fn post_reply(room: &Room, content: &AiReplyContent, flow_context: &Contex
     policy::ensure_room_access(room.room_id().as_str(), RoomAccess::Write)?;
     let json = serde_json::to_value(content).map_err(|e| e.to_string())?;
     let key = next_reply_state_key();
-    let payload = reply_review_payload(content)?;
     use matrix_sdk::ruma::api::client::state::send_state_event;
     use matrix_sdk::utils::IntoRawStateEventContent;
     if room.state() != matrix_sdk::RoomState::Joined {
@@ -799,9 +804,12 @@ async fn post_reply(room: &Room, content: &AiReplyContent, flow_context: &Contex
     );
     let config = room.client().request_config().disable_retry();
     ensure_ai_state_output(room, flow_context)?;
-    policy::commit_flow_action(flow_context, &flow::SensitiveAction {
-        kind: "ai.reply.write".into(), target: room.room_id().to_string(),
-    }, &payload)?;
+    // The reply is the agent's own-room visible output, so it takes the
+    // `ai.reply.write` exemption from exact-action review (see
+    // `agent_own_room_output_exempt`); the room and homeserver sharing rules
+    // above still govern the write.
+    let action = flow::SensitiveAction { kind: "ai.reply.write".into(), target: room.room_id().to_string() };
+    policy::commit_flow_action(flow_context, &action, &reply_review_payload(content)?)?;
     let recipient = flow::Recipient::network_origin(room.client().homeserver().as_str()).ok();
     match policy::audit_flow_operation(flow_context, recipient, room.client().send(request).with_request_config(config)).await {
         Ok(response) => {
@@ -852,9 +860,16 @@ async fn post_notice(room: &Room, content: &AiReplyContent, flow_context: &Conte
         None => RoomMessageEventContent::notice_plain(format!("{NOTICE_PROVENANCE_PREFIX}{}", content.text)),
     };
     policy::ensure_room_flow_output(flow_context, room.room_id().as_str())?;
-    policy::commit_flow_action(flow_context, &flow::SensitiveAction {
-        kind: "matrix.rooms.message.send".into(), target: room.room_id().to_string(),
-    }, &serde_json::to_value(&message).map_err(|_| "Cannot review AI message content.")?)?;
+    // A cross-room post is a privileged effect, not the agent's own-room
+    // output: after untrusted influence it needs an exact-action review of
+    // this destination and body. The own-room reply/activity exemption does
+    // not apply here (see `agent_own_room_output_exempt`).
+    let action = flow::SensitiveAction { kind: "matrix.rooms.message.send".into(), target: room.room_id().to_string() };
+    let payload = serde_json::json!({
+        "room_id": room.room_id().to_string(),
+        "text": content.text,
+    });
+    policy::commit_flow_action(flow_context, &action, &payload)?;
     let recipient = flow::Recipient::MatrixRoom { account: flow_context.account().into(), room: room.room_id().to_string() };
     match policy::audit_flow_operation(flow_context, Some(recipient), room.send(message)).await {
         Ok(response) => {

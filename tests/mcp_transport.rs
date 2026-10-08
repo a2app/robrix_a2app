@@ -87,6 +87,16 @@ impl AiHost for RecordingHost {
         .to_string())
     }
 
+    fn fetch_url(&self, url: &str) -> Result<String, String> {
+        self.calls.lock().unwrap().push(format!("fetch_url({url:?})"));
+        Ok(json!({ "url": url, "body": "fixture" }).to_string())
+    }
+
+    fn request_task_permissions(&self, request: serde_json::Value) -> Result<String, String> {
+        self.calls.lock().unwrap().push(format!("request_task_permissions({request:?})"));
+        Ok(json!({ "task_id": 1, "status": "granted", "granted": [], "not_granted": [] }).to_string())
+    }
+
     fn launch_app(&self, app_id: &str) -> Result<String, String> {
         self.calls
             .lock()
@@ -145,10 +155,6 @@ impl AiHost for RecordingHost {
         // The transport tests never drive a read; record nothing, answer
         // as if the read were refused so a stray call is visible in `calls`.
         Err("read_tool not exercised by this test".to_string())
-    }
-
-    fn fetch_url(&self, _url: &str) -> Result<String, String> {
-        Err("fetch_url not exercised by this test".to_string())
     }
 }
 

@@ -299,8 +299,9 @@ broker; the embedded backend uses the session-scoped MCP server
    immediately from the create response). A marked room gets its session.
 3. **Forward**: member text messages after the saved forwarding cursor (room
    account data `rs.robius.robrix.ai_session_data`) are sent to the session as
-   prompts; the first prompt after a (re)start carries a short plaintext
-   transcript preamble for context.
+   prompts. The prompt carries the new messages only; the agent reads the
+   room's own history through the `read_room_messages` / `read_older_messages`
+   tools, which are permission-gated like any other read.
 4. **Answer**: the agent calls Robrix's own MCP tools — `send_message` (posts
    an `ai_reply`), `launch_splash_app` (runs the mini-app generation pipeline),
    or `list_apps`/`launch_app` (find and run an app that already exists) — or
@@ -323,17 +324,128 @@ bodies; only the mini-app services clip.
 | `read_room_messages` | Reads this room's recent messages | `matrix.room.messages.read` |
 | `read_older_messages` | Pages further back in this room | `matrix.room.messages.paginate` |
 | `room_info` | Reads this room's name, topic, members, join rule, encryption | `matrix.room.info.read` |
-| `list_rooms` | Lists the user's joined rooms and DMs | `matrix.rooms.list` |
+| `list_rooms` | Lists the user's joined rooms and DMs | `matrix.rooms.list` (default on) |
 | `read_other_room_messages` | Reads another joined room the model names | `matrix.rooms.messages.read` |
 | `post_room_message` | Posts a notice into another joined room | `matrix.rooms.message.send` (per room) |
-| `list_spaces` | Lists the spaces the user has joined | `matrix.spaces.list` |
-| `space_info` | Reads one space's details | `matrix.space.info.read` |
-| `list_space_rooms` | Lists the rooms/subspaces inside one space | `matrix.space.rooms.list` |
+| `list_spaces` | Lists the spaces the user has joined | `matrix.spaces.list` (default on) |
+| `space_info` | Reads one space's details | `matrix.space.info.read` (default on) |
+| `list_space_rooms` | Lists the rooms/subspaces inside one space | `matrix.space.rooms.list` (default on) |
 | `list_apps` | Lists the mini-apps installed and available in this room (id, name, description, scope, running) | `app-launch` |
 | `launch_app` | Runs an already-installed mini-app in this room, by id from `list_apps` | `app-launch` (run only) |
 | `list_mini_app_tools` | Lists the tools the room's mini-apps registered (id, name, description, args) | `mcp-tools` (kill switch) |
 | `call_mini_app_tool` | Calls one registered mini-app tool by id, forwarding `arguments` | `mcp-tools` (per tool) |
 | `launch_splash_app` | Builds and runs a NEW mini-app from a description | `apps.generate` |
+| `request_task_permissions` | Asks once, up front, for everything a task needs (rooms to read, places to write, URLs, app tools), and applies the approved subset as one turn-scoped batch | none (it raises the prompt the other gates would) |
+
+#### Upfront task permissions
+
+The agent plans first and asks once. Rather than raising a read prompt, then a
+per-room prompt, then a website prompt as it works, it calls
+`request_task_permissions` before a task with all of its needs in Robrix's own
+vocabulary (catalog ids, room ids from `list_rooms`, complete URLs, tool ids).
+Robrix validates each need against the capability catalog, room and space
+policy and the information-flow rules, diffs it against what is already
+granted, and shows **one** modal: the agent's own plain-language paragraph plus
+a collapsible Details list of the exact items. The permission grants and the
+sharing rules they imply are applied together, for the agent's own subject,
+for **this turn only** — no durable or `Always` grant comes from this tool. The
+turn's output is written under those grants (the reply, any error/stopped
+activity row, and the final `Done` turn card each still pass the whole-label
+sharing check), and the runtime revokes the exact applied batch from its
+per-task ledger once the last of those writes lands. The grants are in-memory session grants
+(`GrantDuration::RobrixSession` / `SharingDuration::RoomSession`); they are
+never written to disk, and the runtime also revokes the exact applied batch
+from its per-task ledger once the turn's final writes have landed, the session
+stops, or the room closes. "Not now" is remembered for the turn by
+what the plan needs, independent of the agent's own need labels: a later
+request with the same needs, or a subset, is declined without a modal, while a
+request that adds a new need is shown. A turn may make at most three requests,
+so a looping agent cannot re-ask forever. The per-call prompts remain the
+fallback for anything the agent did not list. The plan model, resolver and
+atomic apply live in `a2app/core/src/task_grants.rs`; the prompt is
+`src/a2app/task_permission_prompt.rs`. The modal can wait behind other
+prompts, so every grantable item is re-checked against the live permission
+store when it is applied: an item that became allowed is skipped (no duplicate
+grant), and an item the user blocked in the meantime is reported
+`blocked_by_room_policy` and not granted while the rest of the batch applies.
+
+**The room and space directory is on by default.** `list_rooms`,
+`list_spaces`, `space_info` and `list_space_rooms` are granted once, on an AI
+room's first session start (unless the user has denied that group), so the
+agent can name real rooms without asking first. A persisted per-room marker
+means the defaults are never re-applied: once the user sets one of those
+groups back to Ask or Deny, that choice sticks across sessions. The room's own
+messages, its info, and the installed-app list are **not** defaulted; they go
+through `request_task_permissions` like any other need. Directory results carry
+no message content but are still other people's words, so they are labelled
+with a single `Source::RoomDirectory` source and the `RoomDirectory` influence:
+one provider rule covers the whole directory, and other recipients do not
+inherit every listed room. Rooms with a Deny read policy are filtered out of
+directory results, so a protected room's name never reaches the model.
+
+**Implied information-flow rules.** For every plan, Robrix adds flow rules the
+agent did not list:
+
+- every source the agent already holds, plus every source it will read, may
+  reach the model provider (the model sees what it reads);
+- those sources may also reach the homeserver origin and the agent's own room,
+  because replies and activity rows are unencrypted Matrix state written back
+  to the room and the whole-label output check would otherwise refuse them;
+- each named output (a post target, a fetched origin) is allowed to receive the
+  sources that feed the task;
+- a target-room read adds a rule to that room's server, because the query
+  leaves Robrix;
+- the rows are pre-checked and shown in the same Details list as the requested
+  needs, and each is tagged with the reads that cause it; unchecking a read
+  drops the rules that depend on it (`dependent_approval`);
+- they last until the turn ends.
+
+**What is on by default.** Grants: the four directory tools listed above and
+nothing else. Sharing: the `RoomDirectory` source and the room's own source to
+the current model provider, plus the room's own source and the `RoomDirectory`
+to the homeserver origin and to the room itself (reply/activity plumbing). The
+provider is the configured endpoint, and it therefore sees the names, unread
+counts, tags and topics of every room and DM the user can list, plus the room's
+own content. Nothing account-level, such as the installed-app list, is shared
+by default. Every rule is `Permanent` and visible in the Data Sharing editor;
+the once-per-room and once-per-recipient markers mean a rule the user revokes
+there stays revoked, and a newly selected model provider gets only its own
+rules.
+
+**Exact-action review.** Only an agent's own-room `ai.reply.write` and
+`ai.activity.write` rows skip the exact-action review: they are the assistant's
+visible output in the room the user is already talking to, and confidentiality
+(the room and homeserver sharing rules) still applies. Every other effect — a
+cross-room post, a non-GET network request, an app-tool call, app generation —
+raises the exact-content review once untrusted influence is present. The host
+shows the exact target and the captured payload in the same modal as a task
+plan, parks the tool call, and resumes it when the user approves; if the
+context reads more while the modal is open, the stale approval no longer
+matches and a fresh review is shown. A cross-room post or fetch after reading
+untrusted content therefore pauses for a per-action review; that is intended.
+
+**Carried-over sources between turns.** The agent's conversation memory
+persists for a session, so its information-flow label does too, but the
+permission and sharing rules a turn applied are turn-scoped and revoked when
+the turn closes. At the start of each turn, if the label still holds a source
+from an earlier turn (another room, account data) that the current model
+provider may no longer see, Robrix raises one prompt on the agent's behalf
+before the first model call. It lists `Let <source> reach <provider>` rows
+plus the homeserver-origin and own-room rows (so the turn's reply and activity
+rows can be written), and explains: "Earlier in this conversation the
+assistant read <room names>. Allow it to keep using that information for this
+turn." Approval applies the rows through the same task-apply path and the
+same ledger, so the turn's close revokes them again and the next turn prompts
+again. Declining still delivers the message: the turn runs, the model call is
+refused the standard way ("Information flow blocked"), and the room shows the
+error row.
+
+**Re-asking.** A gated read, fetch or post refused because the label grew
+returns an error telling the agent to ask again with the new need. The agent
+may make at most three requests per turn, and each after the first must contain
+a need not already declined. "Not now" is remembered by the plan's needs, so a
+re-labeled request with the same needs, or a subset, is refused without a modal
+and only a strict superset re-prompts.
 
 `launch_splash_app` is create-only: it never rewrites an installed app. Running
 an app that already exists is `launch_app`'s job — list the ids with

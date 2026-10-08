@@ -378,7 +378,7 @@ async fn build_protected_agent(
         format_after_edit: false, ..Default::default()
     };
     let prompt = if room_agent {
-        "You are the room's assistant. Use only the host's advertised tools. Private data may be shared only where the host allows it."
+        crate::ROOM_AGENT_GUIDE
     } else {
         "You create Robrix mini-apps. Return the complete app in a fenced splash code block as requested. You have no filesystem or research tools."
     };
