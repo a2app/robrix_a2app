@@ -142,7 +142,8 @@ debug:
   `glass.OptionLabel{text}`.
 - Emoji work in any text. Symbol characters mostly DON'T: the app fonts have
   no ✕ ✗ ➜ ↻ or arrow glyphs (they render as empty boxes). For icons use
-  emoji (🗑 ➕ ▶️), plain words, or these known-good characters: × ○ ● − ﹀ ︿
+  emoji (🗑 ➕ ▶️), plain words, or these known-good characters: × ○ ● − ▼ ▲
+  (use ▼ to mark a dropdown)
 
 ## Robrix look (USE THIS by default)
 

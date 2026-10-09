@@ -431,6 +431,13 @@ impl Harness {
         self.call(app, name, &args)
     }
 
+    fn call_index_text(&mut self, app: &WidgetRef, name: &str, index: u32, text: &str) -> bool {
+        let source = app.borrow::<Splash>().unwrap().view.source.clone();
+        let vm_id = self.cx.script_ref_vm_id(&source).unwrap();
+        let text = self.cx.with_script_vm_id(vm_id, |vm| vm.new_string_with(|_, out| out.push_str(text)));
+        self.call(app, name, &[index.into(), text])
+    }
+
     fn call_object(&mut self, app: &WidgetRef, name: &str, json: &str) -> bool {
         let source = app.borrow::<Splash>().unwrap().view.source.clone();
         let vm_id = self.cx.script_ref_vm_id(&source).unwrap();
@@ -589,6 +596,10 @@ impl Harness {
                     BrokerAsk::Notify { summary, .. } => audit.notifications.push(summary),
                     BrokerAsk::BackgroundComplete { reply, run_id, success } => {
                         audit.completions.push((run_id, success));
+                        self.reply(reply, "{}");
+                    }
+                    BrokerAsk::McpToolResult { reply, ok, text, .. } => {
+                        audit.tool_results.push((ok, text));
                         self.reply(reply, "{}");
                     }
                     BrokerAsk::Used { .. } => {},
@@ -772,6 +783,7 @@ struct StockAudit {
     completions: Vec<(u64, bool)>,
     write_setups: usize,
     matrix_args: Vec<String>,
+    tool_results: Vec<(bool, String)>,
 }
 
 fn matrix_recipe(call: &services::MatrixServiceCall) -> String {
@@ -851,7 +863,7 @@ fn every_stock_app_finishes_its_primary_action_with_strict_permissions() {
 
 fn run_every_stock_app(strict: bool) {
     let stock = a2app_core::builtin::builtin_apps();
-    assert_eq!(stock.len(), 19);
+    assert_eq!(stock.len(), 20);
     for manifest in stock {
         let mut host = Harness::new();
         host.permissions.set_strict(strict);
@@ -900,9 +912,14 @@ fn run_every_stock_app(strict: bool) {
                 assert!(host.call(&app, "answer_invite", &[true.into()]));
             }
             "room-stats" => { assert!(host.call(&app, "open_sender", &[0_u32.into()])); }
-            "watcher" => {
+            "simple-watcher" => {
                 app.text_input(&host.cx, ids!(keyword_input)).set_text(&mut host.cx, "release");
                 assert!(host.call(&app, "add_rule", &[]));
+                assert!(host.call_strings(&app, "on_room_message", &[r#"[{"room_id":"!private:test","event_id":"$message:test","sender":"alice","sender_id":"@alice:test","sender_name":"Alice","body":"release today","ts":1,"msgtype":"m.text","is_own":false}]"#]));
+            }
+            "watcher" => {
+                assert!(host.call_index_text(&app, "set_value", 0, "release"));
+                assert!(host.call(&app, "save_rule", &[]));
                 assert!(host.call_strings(&app, "on_room_message", &[r#"[{"room_id":"!private:test","event_id":"$message:test","sender":"alice","sender_id":"@alice:test","sender_name":"Alice","body":"release today","ts":1,"msgtype":"m.text","is_own":false}]"#]));
             }
             _ => {},
@@ -913,7 +930,7 @@ fn run_every_stock_app(strict: bool) {
             "website-watch" | "keyword-alert" => (0, 2),
             "room-info" => (0, 0),
             "room-peek" | "room-members" | "room-threads" | "presence" => (2, 1),
-            "account" | "inspector" | "room-pins" | "room-tools" | "spaces" | "inbox" | "room-stats" | "watcher" => (1, 1),
+            "account" | "inspector" | "room-pins" | "room-tools" | "spaces" | "inbox" | "room-stats" | "watcher" | "simple-watcher" => (1, 1),
             _ => (1, 0),
         };
         eprintln!("stock permission audit: {} strict={} initial={} action={} initial_reviews={} action_reviews={}",
@@ -1297,6 +1314,48 @@ fn stock_roll_call_first_post_finishes_after_enabling_matrix_writes() {
 }
 
 #[test]
+fn stock_simple_watcher_saves_without_write_permission_and_tests_only_the_selected_rule_actions() {
+    let mut host = Harness::new();
+    let (app, context) = host.launch_stock_permissions("simple-watcher", false, false);
+    host.permissions.set_matrix_write(false);
+    host.boot();
+    let mut audit = StockAudit::default();
+    host.settle_stock(&app, "simple-watcher", &mut audit);
+    app.text_input(&host.cx, ids!(keyword_input)).set_text(&mut host.cx, "release");
+    app.text_input(&host.cx, ids!(reply_input)).set_text(&mut host.cx, "Thanks for the release update");
+    host.flow.borrow_mut().add_sources(&context, [Source::Account { account: ACCOUNT.into() }]).unwrap();
+    assert!(host.call(&app, "add_rule", &[]));
+    host.settle_stock(&app, "simple-watcher", &mut audit);
+    assert_eq!(audit.write_setups, 0, "saving a rule cannot enable Matrix writes");
+    assert!(audit.notifications.is_empty());
+    assert!(audit.services.is_empty());
+    assert!(host.call_object(&app, "test_rule", r#"{"keyword":"release","notify":true,"reply":"Thanks for the release update"}"#));
+    host.settle_stock(&app, "simple-watcher", &mut audit);
+    assert_eq!(audit.batch_prompts, 0, "an already approved watcher needs no new blanket setup");
+    assert_eq!(audit.write_setups, 1, "testing a reply explicitly enables writes and grants its declared room-send ability");
+    assert_eq!(audit.notifications, ["Simple Watcher test: Test alert for 'release'."]);
+    assert_eq!(audit.services, ["matrix.room.message.send"]);
+    host.flow.borrow_mut().add_sources(&context, [Source::Room { account: ACCOUNT.into(), room: ROOM.into() }]).unwrap();
+    host.flow.borrow_mut().add_influences(&context, [Influence::RoomContent { account: ACCOUNT.into(), room: ROOM.into() }]).unwrap();
+    assert!(host.call_strings(&app, "on_room_message", &[r#"[{"event_id":"$message:test","sender_name":"Alice","body":"release today","is_own":false}]"#]));
+    host.settle_stock(&app, "simple-watcher", &mut audit);
+    host.boot(); // The notification callback paces the queued reply with a timer.
+    host.settle_stock(&app, "simple-watcher", &mut audit);
+    assert_eq!(audit.notifications, ["Simple Watcher test: Test alert for 'release'.", "Simple Watcher: release: Alice: release today"]);
+    assert_eq!(audit.services, ["matrix.room.message.send", "matrix.room.message.send"]);
+    let reviews = audit.reviews;
+    assert!((1..=2).contains(&reviews), "the test and first influenced reply each have at most one combined review");
+    host.boot(); // Finish the action pacing timer before delivering another batch.
+    assert!(host.call_strings(&app, "on_room_message", &[r#"[{"event_id":"$message:test","sender_name":"Alice","body":"release tomorrow","is_own":false}]"#]));
+    host.settle_stock(&app, "simple-watcher", &mut audit);
+    host.boot();
+    host.settle_stock(&app, "simple-watcher", &mut audit);
+    assert_eq!(audit.reviews, reviews, "session permission prevents repeated auto-reply reviews");
+    assert_eq!(audit.services.len(), 3);
+    assert_eq!(audit.write_setups, 1, "automatic replies reuse the approved write setup");
+}
+
+#[test]
 fn stock_watcher_saves_without_write_permission_and_tests_only_the_selected_rule_actions() {
     let mut host = Harness::new();
     let (app, context) = host.launch_stock_permissions("watcher", false, false);
@@ -1304,19 +1363,19 @@ fn stock_watcher_saves_without_write_permission_and_tests_only_the_selected_rule
     host.boot();
     let mut audit = StockAudit::default();
     host.settle_stock(&app, "watcher", &mut audit);
-    app.text_input(&host.cx, ids!(keyword_input)).set_text(&mut host.cx, "release");
+    assert!(host.call_index_text(&app, "set_value", 0, "release"));
     app.text_input(&host.cx, ids!(reply_input)).set_text(&mut host.cx, "Thanks for the release update");
     host.flow.borrow_mut().add_sources(&context, [Source::Account { account: ACCOUNT.into() }]).unwrap();
-    assert!(host.call(&app, "add_rule", &[]));
+    assert!(host.call(&app, "save_rule", &[]));
     host.settle_stock(&app, "watcher", &mut audit);
     assert_eq!(audit.write_setups, 0, "saving a rule cannot enable Matrix writes");
     assert!(audit.notifications.is_empty());
     assert!(audit.services.is_empty());
-    assert!(host.call_object(&app, "test_rule", r#"{"keyword":"release","notify":true,"reply":"Thanks for the release update"}"#));
+    assert!(host.call_object(&app, "test_rule", r#"{"match":"all","filters":[{"field":"text","op":"contains","value":"release"}],"notify":true,"reply":"Thanks for the release update"}"#));
     host.settle_stock(&app, "watcher", &mut audit);
     assert_eq!(audit.batch_prompts, 0, "an already approved watcher needs no new blanket setup");
     assert_eq!(audit.write_setups, 1, "testing a reply explicitly enables writes and grants its declared room-send ability");
-    assert_eq!(audit.notifications, ["Watcher test: Test alert for 'release'."]);
+    assert_eq!(audit.notifications, ["Watcher test: Test alert: Message contains “release”"]);
     assert_eq!(audit.services, ["matrix.room.message.send"]);
     host.flow.borrow_mut().add_sources(&context, [Source::Room { account: ACCOUNT.into(), room: ROOM.into() }]).unwrap();
     host.flow.borrow_mut().add_influences(&context, [Influence::RoomContent { account: ACCOUNT.into(), room: ROOM.into() }]).unwrap();
@@ -1324,7 +1383,7 @@ fn stock_watcher_saves_without_write_permission_and_tests_only_the_selected_rule
     host.settle_stock(&app, "watcher", &mut audit);
     host.boot(); // The notification callback paces the queued reply with a timer.
     host.settle_stock(&app, "watcher", &mut audit);
-    assert_eq!(audit.notifications, ["Watcher test: Test alert for 'release'.", "Watcher: release: Alice: release today"]);
+    assert_eq!(audit.notifications, ["Watcher test: Test alert: Message contains “release”", "Watcher: Message contains “release”: Alice: release today"]);
     assert_eq!(audit.services, ["matrix.room.message.send", "matrix.room.message.send"]);
     let reviews = audit.reviews;
     assert!((1..=2).contains(&reviews), "the test and first influenced reply each have at most one combined review");
@@ -1336,6 +1395,111 @@ fn stock_watcher_saves_without_write_permission_and_tests_only_the_selected_rule
     assert_eq!(audit.reviews, reviews, "session permission prevents repeated auto-reply reviews");
     assert_eq!(audit.services.len(), 3);
     assert_eq!(audit.write_setups, 1, "automatic replies reuse the approved write setup");
+}
+
+#[test]
+fn stock_watcher_legacy_rule_defaults_ignore_nested_optional_keys() {
+    let mut host = Harness::new();
+    let (app, context) = host.launch_stock("watcher", false);
+    host.boot();
+    let mut audit = StockAudit::default();
+    host.settle_stock(&app, "watcher", &mut audit);
+    // Optional rule fields are absent at the top level. Unrelated nested
+    // metadata with the same keys cannot turn them into present properties.
+    assert!(host.call_object(&app, "restore", r#"{"keyword":"lunch","notify":true,"reply":"","metadata":{"match":"any","filters":[],"by_ai":true}}"#));
+    assert!(host.call(&app, "save", &[]));
+    host.settle_stock(&app, "watcher", &mut audit);
+    let rules_path = host.flow.borrow().context_storage_path(&context).unwrap().join("rules.json");
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(rules_path).unwrap()).unwrap();
+    assert_eq!(saved.as_array().unwrap().len(), 1);
+    assert_eq!(saved[0]["match"], "all");
+    assert_eq!(saved[0]["filters"][0]["value"], "lunch");
+    assert_eq!(saved[0]["by_ai"], false);
+    assert!(audit.notifications.is_empty());
+    assert!(audit.services.is_empty());
+}
+
+#[test]
+fn stock_watcher_filters_combine_any_all_and_negation_and_the_ai_adds_notify_only_rules() {
+    let mut host = Harness::new();
+    let (app, context) = host.launch_stock("watcher", false);
+    host.boot();
+    let mut audit = StockAudit::default();
+    host.settle_stock(&app, "watcher", &mut audit);
+    assert!(host.call(&app, "save_rule", &[]));
+    assert!(app.widget(&host.cx, ids!(status)).text().starts_with("Rule not saved: Message needs a value."));
+
+    // Message contains any of "wifi, password", doesn't contain "solved", and Alice sent it.
+    assert!(host.call(&app, "toggle_advanced", &[]));
+    assert!(host.call_index_text(&app, "open_menu", 0, "op"));
+    assert!(host.call_strings(&app, "choose", &["any_of"]));
+    assert!(host.call_index_text(&app, "set_value", 0, "wifi, password"));
+    assert!(host.call(&app, "add_filter", &[]));
+    assert!(host.call_index_text(&app, "open_menu", 1, "op"));
+    assert!(host.call_strings(&app, "choose", &["not_contains"]));
+    assert!(host.call_index_text(&app, "set_value", 1, "solved"));
+    assert!(host.call(&app, "add_filter", &[]));
+    assert!(host.call_index_text(&app, "open_menu", 2, "field"));
+    assert!(host.call_strings(&app, "choose", &["sender"]));
+    assert!(host.call_index_text(&app, "set_value", 2, "alice"));
+    assert!(host.call(&app, "save_rule", &[]));
+    // An older Watcher's single keyword comes back as "Message contains".
+    assert!(host.call_object(&app, "restore", r#"{"keyword":"lunch","notify":true,"reply":""}"#));
+    host.settle_stock(&app, "watcher", &mut audit);
+
+    // The AI adds an `any` rule over advanced fields; a bad operator is refused.
+    let call = r#"{"call_id":7,"tool":"app_watcher_add_rule","name":"add_rule","arguments":{"match":"any","filters":[{"field":"type","op":"is","value":"m.notice"},{"field":"link","op":"has","value":""}]}}"#;
+    assert!(host.call_strings(&app, "on_tool_call", &[call]));
+    host.settle_stock(&app, "watcher", &mut audit);
+    let bad = r#"{"call_id":8,"tool":"app_watcher_add_rule","name":"add_rule","arguments":{"match":"all","filters":[{"field":"sender","op":"has","value":"x"}]}}"#;
+    assert!(host.call_strings(&app, "on_tool_call", &[bad]));
+    host.settle_stock(&app, "watcher", &mut audit);
+    assert_eq!(audit.tool_results.len(), 2);
+    assert!(audit.tool_results[0].0 && audit.tool_results[0].1.contains("Message type is bot notice or Link has a link"), "{:?}", audit.tool_results);
+    assert!(!audit.tool_results[1].0 && audit.tool_results[1].1.starts_with("Rule not added:"), "{:?}", audit.tool_results);
+    assert!(audit.notifications.is_empty());
+
+    // Reserved-key escaping must preserve the existing JSON schema, including
+    // a restored keyword rule and the AI's `any` rule.
+    let rules_path = host.flow.borrow().context_storage_path(&context).unwrap().join("rules.json");
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(rules_path).unwrap()).unwrap();
+    assert_eq!(saved.as_array().unwrap().len(), 3);
+    assert_eq!(saved[0]["match"], "all");
+    assert_eq!(saved[1]["match"], "all");
+    assert_eq!(saved[1]["filters"][0]["value"], "lunch");
+    assert_eq!(saved[2]["match"], "any");
+    assert_eq!(saved[2]["by_ai"], true);
+    assert!(host.call(&app, "edit_rule", &[2_u32.into()]));
+    assert_eq!(app.widget(&host.cx, ids!(match_btn)).text(), "any ▼");
+    assert!(host.call(&app, "toggle_match", &[]));
+    assert_eq!(app.widget(&host.cx, ids!(match_btn)).text(), "all ▼");
+    assert!(host.call(&app, "toggle_match", &[]));
+    assert_eq!(app.widget(&host.cx, ids!(match_btn)).text(), "any ▼");
+    assert!(host.call(&app, "clear_editor", &[]));
+
+    let batch = r#"[
+        {"event_id":"$1:test","sender_id":"@alice:test","sender_name":"Alice","body":"What's the Wi-Fi password?","msgtype":"m.text","is_own":false},
+        {"event_id":"$2:test","sender_id":"@alice:test","sender_name":"Alice","body":"wifi solved, thanks","msgtype":"m.text","is_own":false},
+        {"event_id":"$3:test","sender_id":"@bob:test","sender_name":"Bob","body":"the wifi password changed","msgtype":"m.text","is_own":false},
+        {"event_id":"$4:test","sender_id":"@ci:test","sender_name":"CI","body":"Build finished","msgtype":"m.notice","is_own":false},
+        {"event_id":"$5:test","sender_id":"@bob:test","sender_name":"Bob","body":"slides: https://example.org/talk","msgtype":"m.text","is_own":false},
+        {"event_id":"$6:test","sender_id":"@bob:test","sender_name":"Bob","body":"Lunch at noon?","msgtype":"m.text","is_own":false},
+        {"event_id":"$7:test","sender_id":"@bob:test","sender_name":"Bob","body":"plain words","msgtype":"m.text","is_own":false}
+    ]"#;
+    assert!(host.call_strings(&app, "on_room_message", &[batch]));
+    for _ in 0..4 {
+        host.settle_stock(&app, "watcher", &mut audit);
+        host.boot(); // Watcher paces its automatic notifications with a timer.
+    }
+    host.settle_stock(&app, "watcher", &mut audit);
+    let wifi = "Message contains any of “wifi, password” and Message doesn't contain “solved” and Sender is “alice”";
+    let ai = "Message type is bot notice or Link has a link";
+    assert_eq!(audit.notifications, [
+        format!("Watcher: {wifi}: Alice: What's the Wi-Fi password?"),
+        format!("Watcher: {ai}: CI: Build finished"),
+        format!("Watcher: {ai}: Bob: slides: https://example.org/talk"),
+        "Watcher: Message contains “lunch”: Bob: Lunch at noon?".to_string(),
+    ]);
 }
 
 #[test]
@@ -1799,6 +1963,7 @@ fn stock_live_apps_resubscribe_after_revocation_and_regrant_without_prompting_ag
         ("room-peek", Permission::MatrixRoomWatch), ("room-members", Permission::MatrixRoomWatch),
         ("room-pins", Permission::MatrixRoomInfo), ("room-threads", Permission::MatrixRoomWatch),
         ("presence", Permission::MatrixRoomWatch), ("watcher", Permission::MatrixRoomWatch),
+        ("simple-watcher", Permission::MatrixRoomWatch),
         ("inbox", Permission::MatrixRoomsList), ("inspector", Permission::RobrixObserve),
     ] {
         let mut host = Harness::new();
@@ -1811,7 +1976,7 @@ fn stock_live_apps_resubscribe_after_revocation_and_regrant_without_prompting_ag
         host.permissions.set(app_id, permission, GrantState::Denied);
         host.publish_grants(&app, app_id);
         host.settle_stock(&app, app_id, &mut audit);
-        if app_id == "watcher" {
+        if matches!(app_id, "watcher" | "simple-watcher") {
             assert!(app.widget(&host.cx, ids!(status)).text().starts_with("Not watching: permission is off."));
         }
         let before = audit.subscriptions.len();
@@ -1824,7 +1989,7 @@ fn stock_live_apps_resubscribe_after_revocation_and_regrant_without_prompting_ag
         assert!(!restored.is_empty(), "{app_id} must resume its live updates after regrant");
         assert!(restored.iter().all(|hook| hooks.contains(hook)));
         assert!(audit.prompts.is_empty());
-        if app_id == "watcher" {
+        if matches!(app_id, "watcher" | "simple-watcher") {
             assert!(app.widget(&host.cx, ids!(status)).text().starts_with("Watching this room."));
         }
     }

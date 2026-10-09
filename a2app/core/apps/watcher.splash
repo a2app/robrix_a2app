@@ -1,11 +1,12 @@
 // name: Watcher
 // icon: 👁
 // tint: #D9822B
-// description: Keyword rules that notify you, and can auto-reply.
-// permissions: matrix-room-watch, notifications, matrix-room-send, on_room_message, notifications.post, matrix.room.message.send
+// description: Filter rules that notify you, and can auto-reply. Match a message's text, sender, type or links.
+// permissions: matrix-room-watch, notifications, matrix-room-send, mcp-tools, on_room_message, notifications.post, matrix.room.message.send, mcp.tools.register, mcp.tools.unregister, on_tool_call
 // why-matrix-room-watch: Sees new messages so it can match your rules.
 // why-notifications: Tells you when a message matches a rule.
 // why-matrix-room-send: Posts your reply when a rule says to.
+// why-mcp-tools: Lets this room's AI add rules, once you turn that on.
 
 let watch_pending = false
 let watch_ready = false
@@ -22,28 +23,78 @@ let hits = []
 let watch_line = "Starting…"
 let metas = ["\\", ".", "*", "+", "?", "(", ")", "[", "]", "{", "}", "|", "^", "$"]
 
-fn save(){ fs.write("/rules.json", rules.to_json()) }
+// A rule matches `all` or `any` of its filters; each filter is a field, an
+// operator and a value. Advanced fields and operators stay hidden until asked for.
+let fields = [
+    {id: "text", label: "Message", advanced: false},
+    {id: "sender", label: "Sender", advanced: false},
+    {id: "type", label: "Message type", advanced: true},
+    {id: "link", label: "Link", advanced: true}
+]
+let ops = [
+    {field: "text", id: "contains", label: "contains", advanced: false},
+    {field: "text", id: "not_contains", label: "doesn't contain", advanced: false},
+    {field: "text", id: "any_of", label: "contains any of", advanced: true},
+    {field: "text", id: "starts_with", label: "starts with", advanced: true},
+    {field: "text", id: "is", label: "is exactly", advanced: true},
+    {field: "sender", id: "is", label: "is", advanced: false},
+    {field: "sender", id: "is_not", label: "is not", advanced: false},
+    {field: "sender", id: "contains", label: "contains", advanced: true},
+    {field: "type", id: "is", label: "is", advanced: true},
+    {field: "type", id: "is_not", label: "is not", advanced: true},
+    {field: "link", id: "has", label: "has a link", advanced: true},
+    {field: "link", id: "lacks", label: "has no link", advanced: true}
+]
+let types = [
+    {id: "m.text", label: "text"},
+    {id: "m.notice", label: "bot notice"},
+    {id: "m.emote", label: "emote (/me)"},
+    {id: "m.image", label: "image"},
+    {id: "m.file", label: "file"},
+    {id: "m.video", label: "video"},
+    {id: "m.audio", label: "audio"}
+]
 
-fn load(){
-    if fs.exists("/rules.json") {
-        let parsed = fs.read("/rules.json").parse_json()
-        if parsed.is_array() {
-            for rule in parsed {
-                if rule.is_object() && rule.keyword.is_string() && rule.reply.is_string()
-                    && (rule.notify == true || rule.notify == false)
-                    && rule.keyword.trim() != "" && rule.keyword.len() <= 100 && rule.reply.len() <= 4096
-                {
-                    rules.push({keyword: rule.keyword, pattern: keyword_pattern(rule.keyword), notify: rule.notify, reply: rule.reply})
-                }
-            }
-            nil
-        }
-    }
+// The rule being written or edited.
+let draft = {"match": "all", notify: true, filters: [{field: "text", op: "contains", value: ""}]}
+let editing = -1
+let advanced = false
+let menu_row = -1
+let menu_kind = ""
+
+// Whether this room's AI may add rules, through Watcher's one tool.
+let ai_rules = false
+let ai_line = ""
+let tool_pending = false
+let tool_ready = false
+let tool_description = "Add a rule to Watcher in this room. Watcher then notifies the user whenever a new message here matches. Each filter is {field, op, value}. Fields and ops: text (the message): contains, not_contains, any_of (value is a comma-separated list), starts_with, is; sender: is, is_not, contains (value is a display name or @user:server); type: is, is_not (value m.text, m.notice, m.emote, m.image, m.file, m.video or m.audio); link: has, lacks (value is ignored). Returns the room's rules after adding."
+
+fn text_of(v){
+    if v.is_string() { return v }
+    return ""
 }
 
-// Escapes regex metacharacters so a keyword always matches literally.
-fn keyword_pattern(keyword){
-    let out = keyword
+// Reading a missing field is an error, so optional fields go through here.
+fn get(obj, key, fallback){
+    if !obj.is_object() { return fallback }
+    for field value in obj {
+        if field.to_string() == key { return value }
+    }
+    return fallback
+}
+
+fn clean_filters(list){
+    let out = []
+    if !list.is_array() { return out }
+    for f in list {
+        out.push({field: text_of(get(f, "field", "")), op: text_of(get(f, "op", "")), value: text_of(get(f, "value", ""))})
+    }
+    return out
+}
+
+// Escapes regex metacharacters so a value always matches literally.
+fn literal(value){
+    let out = value
     for c in metas {
         let parts = out.split(c)
         let first = true
@@ -59,6 +110,196 @@ fn keyword_pattern(keyword){
     return out
 }
 
+fn field_of(id){
+    for f in fields { if f.id == id { return f } }
+    return nil
+}
+
+fn op_of(field, id){
+    for o in ops { if o.field == field && o.id == id { return o } }
+    return nil
+}
+
+fn type_of(id){
+    for t in types { if t.id == id { return t } }
+    return nil
+}
+
+fn first_op(field){
+    for o in ops { if o.field == field { return o.id } }
+    return ""
+}
+
+fn field_label(id){
+    let f = field_of(id)
+    if !f.is_object() { return text_of(id) }
+    return f.label
+}
+
+fn op_label(field, id){
+    let o = op_of(field, id)
+    if !o.is_object() { return text_of(id) }
+    return o.label
+}
+
+fn type_label(id){
+    let t = type_of(id)
+    if !t.is_object() { return "Choose a type" }
+    return t.label
+}
+
+fn needs_text(f){ return f.field == "text" || f.field == "sender" }
+fn needs_choice(f){ return f.field == "type" }
+
+fn value_hint(f){
+    if f.op == "any_of" { return "Words, separated by commas" }
+    if f.field == "sender" { return "Name or @user:server" }
+    return "Enter value"
+}
+
+fn any_words(value){
+    let out = []
+    for w in text_of(value).split(",") {
+        let t = w.trim()
+        if t != "" { out.push(t) }
+    }
+    return out
+}
+
+fn describe_filter(f){
+    let line = field_label(f.field) + " " + op_label(f.field, f.op)
+    if needs_text(f) { line = line + " “" + f.value + "”" }
+    if needs_choice(f) { line = line + " " + type_label(f.value) }
+    return line
+}
+
+fn describe(rule){
+    let joiner = " and "
+    if rule["match"] == "any" { joiner = " or " }
+    let out = ""
+    for f in rule.filters {
+        if out != "" { out = out + joiner }
+        out = out + describe_filter(f)
+    }
+    return out
+}
+
+// Checks a rule's filters; returns "" when they are usable.
+fn filter_problem(f){
+    if !f.is_object() { return "Each filter needs a field, an operator and a value." }
+    if !field_of(f.field).is_object() { return "Unknown field: " + text_of(f.field) }
+    if !op_of(f.field, f.op).is_object() { return field_label(f.field) + " can't use “" + text_of(f.op) + "”." }
+    if needs_choice(f) && !type_of(f.value).is_object() { return "Choose a message type." }
+    if !needs_text(f) { return "" }
+    if text_of(f.value).trim() == "" { return field_label(f.field) + " needs a value." }
+    if f.value.len() > 200 { return "Keep each value within 200 characters." }
+    if f.op == "any_of" && any_words(f.value).len() == 0 { return "List words, separated by commas." }
+    return ""
+}
+
+fn problem(spec){
+    if spec["match"] != "all" && spec["match"] != "any" { return "Choose all or any." }
+    if !spec.filters.is_array() { return "Add at least one filter." }
+    if spec.filters.len() == 0 { return "Add at least one filter." }
+    if spec.filters.len() > 8 { return "Use at most 8 filters." }
+    for f in spec.filters {
+        let why = filter_problem(f)
+        if why != "" { return why }
+    }
+    return ""
+}
+
+// Prepares a filter's pattern once, so matching a message stays cheap.
+fn compile(f){
+    let value = text_of(f.value).trim()
+    let pat = literal(value)
+    if f.op == "any_of" {
+        pat = ""
+        for w in any_words(value) {
+            if pat != "" { pat = pat + "|" }
+            pat = pat + literal(w)
+        }
+    }
+    if f.field == "text" && f.op == "starts_with" { pat = "^\\s*" + literal(value) }
+    if f.field == "text" && f.op == "is" { pat = "^\\s*" + literal(value) + "\\s*$" }
+    if f.field == "sender" && f.op != "contains" { pat = "^" + literal(value) + "$" }
+    return {field: f.field, op: f.op, value: value, pat: pat}
+}
+
+fn make_rule(spec, notify, reply, by_ai){
+    let filters = []
+    for f in spec.filters { filters.push(compile(f)) }
+    return {"match": spec["match"], filters: filters, notify: notify, reply: reply, by_ai: by_ai}
+}
+
+fn filter_matches(f, m){
+    if f.field == "link" {
+        let has = regex("https?://", "i").test(m.body)
+        if f.op == "has" { return has }
+        return !has
+    }
+    if f.field == "type" {
+        if f.op == "is" { return m.msgtype == f.value }
+        return m.msgtype != f.value
+    }
+    if f.field == "sender" {
+        let hit = regex(f.pat, "i").test(m.sender_name) || regex(f.pat, "i").test(m.sender_id)
+        if f.op == "is_not" { return !hit }
+        return hit
+    }
+    let found = regex(f.pat, "i").test(m.body)
+    if f.op == "not_contains" { return !found }
+    return found
+}
+
+fn rule_matches(rule, m){
+    if rule["match"] == "any" {
+        for f in rule.filters { if filter_matches(f, m) { return true } }
+        return false
+    }
+    for f in rule.filters { if !filter_matches(f, m) { return false } }
+    return true
+}
+
+fn save(){
+    let out = []
+    for r in rules {
+        let filters = []
+        for f in r.filters { filters.push({field: f.field, op: f.op, value: f.value}) }
+        out.push({"match": r["match"], filters: filters, notify: r.notify, reply: r.reply, by_ai: r.by_ai})
+    }
+    fs.write("/rules.json", out.to_json())
+    return nil
+}
+
+// Older Watchers saved one keyword per rule; it comes back as "Message contains".
+fn restore(saved){
+    if !saved.is_object() { return nil }
+    let reply = text_of(get(saved, "reply", ""))
+    let notify = get(saved, "notify", true) != false
+    if reply.len() > 4096 { return nil }
+    let spec = {"match": text_of(get(saved, "match", "all")), filters: clean_filters(get(saved, "filters", nil))}
+    let keyword = text_of(get(saved, "keyword", ""))
+    if keyword != "" && spec.filters.len() == 0 {
+        spec = {"match": "all", filters: [{field: "text", op: "contains", value: keyword}]}
+    }
+    if problem(spec) != "" { return nil }
+    rules.push(make_rule(spec, notify, reply, get(saved, "by_ai", false) == true))
+    return nil
+}
+
+fn load(){
+    if fs.exists("/ai.json") {
+        let saved = fs.read("/ai.json").parse_json()
+        if saved.is_object() && saved.on == true { ai_rules = true }
+    }
+    if !fs.exists("/rules.json") { return nil }
+    let parsed = fs.read("/rules.json").parse_json()
+    if !parsed.is_array() { return nil }
+    for saved in parsed { restore(saved) }
+    return nil
+}
+
 fn show_status(){
     let line = watch_line
     if !host.has("matrix.room.message.send") {
@@ -66,6 +307,7 @@ fn show_status(){
     }
     if actions_paused { line = line + " Automatic actions are paused. Test a rule to resume them." }
     ui.status.set_text(line)
+    return nil
 }
 
 fn subscribe(){
@@ -88,9 +330,12 @@ fn subscribe(){
             else { finish_test("Test stopped: " + r.error) }
         } else { show_status() }
     })
+    return nil
 }
 
 fn on_permissions_changed(caps){
+    if !host.has("mcp.tools.register") { tool_ready = false }
+    elif ai_rules { register_tool() }
     if host.has("on_room_message") {
         subscribe()
     } else {
@@ -107,12 +352,133 @@ fn on_permissions_changed(caps){
             finish_test("Room watching was not allowed. Test the rule again when you want to allow it.")
         } else if !test_pending { show_status() }
     }
+    return nil
 }
 
-fn add_rule(){
-    let keyword = ui.keyword_input.text().trim()
-    if keyword == "" || keyword.len() > 100 {
-        ui.status.set_text("Enter a keyword between 1 and 100 characters.")
+// ---- The rule editor
+
+fn show_editor(){
+    ui.match_btn.set_text(draft["match"] + " ▼")
+    if draft.notify { ui.notify_btn.set_text("🔔 Notify me") } else { ui.notify_btn.set_text("🔕 Silent") }
+    if editing >= 0 { ui.editor_title.set_text("EDITING RULE") } else { ui.editor_title.set_text("NEW RULE") }
+    if advanced { ui.adv_btn.set_text("Hide advanced ▲") } else { ui.adv_btn.set_text("Show advanced ▼") }
+    ui.filter_list.render()
+    return nil
+}
+
+fn clear_editor(){
+    draft = {"match": "all", notify: true, filters: [{field: "text", op: "contains", value: ""}]}
+    editing = -1
+    menu_row = -1
+    ui.reply_input.set_text("")
+    show_editor()
+    return nil
+}
+
+fn toggle_match(){
+    if draft["match"] == "all" { draft["match"] = "any" } else { draft["match"] = "all" }
+    show_editor()
+    return nil
+}
+
+fn toggle_notify(){
+    draft.notify = !draft.notify
+    show_editor()
+    return nil
+}
+
+fn toggle_advanced(){
+    advanced = !advanced
+    menu_row = -1
+    show_editor()
+    return nil
+}
+
+fn add_filter(){
+    if draft.filters.len() >= 8 {
+        ui.status.set_text("Use at most 8 filters.")
+        return nil
+    }
+    draft.filters.push({field: "text", op: "contains", value: ""})
+    menu_row = -1
+    ui.filter_list.render()
+    return nil
+}
+
+fn copy_filter(i){
+    if i >= draft.filters.len() || draft.filters.len() >= 8 { return nil }
+    let out = []
+    let k = 0
+    for f in draft.filters {
+        out.push(f)
+        if k == i { out.push({field: f.field, op: f.op, value: f.value}) }
+        k = k + 1
+    }
+    draft.filters = out
+    menu_row = -1
+    ui.filter_list.render()
+    return nil
+}
+
+fn remove_filter(i){
+    if i >= draft.filters.len() { return nil }
+    draft.filters.remove(i)
+    if draft.filters.len() == 0 { draft.filters.push({field: "text", op: "contains", value: ""}) }
+    menu_row = -1
+    ui.filter_list.render()
+    return nil
+}
+
+fn set_value(i, text){
+    if i < draft.filters.len() { draft.filters[i].value = text }
+    return nil
+}
+
+fn open_menu(i, kind){
+    if menu_row == i && menu_kind == kind { menu_row = -1 } else {
+        menu_row = i
+        menu_kind = kind
+    }
+    ui.filter_list.render()
+    return nil
+}
+
+fn menu_options(){
+    let out = []
+    if menu_row < 0 || menu_row >= draft.filters.len() { return out }
+    let f = draft.filters[menu_row]
+    if menu_kind == "field" {
+        for o in fields { if advanced || !o.advanced { out.push(o) } }
+        return out
+    }
+    if menu_kind == "op" {
+        for o in ops { if o.field == f.field && (advanced || !o.advanced) { out.push(o) } }
+        return out
+    }
+    for t in types { out.push(t) }
+    return out
+}
+
+fn choose(id){
+    if menu_row < 0 || menu_row >= draft.filters.len() { return nil }
+    let i = menu_row
+    if menu_kind == "op" { draft.filters[i].op = id }
+    elif menu_kind == "value" { draft.filters[i].value = id }
+    elif draft.filters[i].field != id {
+        draft.filters[i].field = id
+        draft.filters[i].op = first_op(id)
+        draft.filters[i].value = ""
+        if id == "type" { draft.filters[i].value = "m.notice" }
+    }
+    menu_row = -1
+    ui.filter_list.render()
+    return nil
+}
+
+fn save_rule(){
+    let why = problem(draft)
+    if why != "" {
+        ui.status.set_text("Rule not saved: " + why)
         return nil
     }
     let reply = ui.reply_input.text().trim()
@@ -120,29 +486,54 @@ fn add_rule(){
         ui.status.set_text("Keep the reply within 4096 characters.")
         return nil
     }
-    rules.push({
-        keyword: keyword
-        pattern: keyword_pattern(keyword)
-        notify: !ui.silent_toggle.checked()
-        reply: reply
-    })
+    let rule = make_rule(draft, draft.notify, reply, false)
+    if editing >= 0 && editing < rules.len() {
+        let out = []
+        let k = 0
+        for r in rules {
+            if k == editing { out.push(rule) } else { out.push(r) }
+            k = k + 1
+        }
+        rules = out
+    } else { rules.push(rule) }
     save()
-    ui.keyword_input.set_text("")
-    ui.reply_input.set_text("")
+    clear_editor()
     ui.rule_list.render()
     show_status()
+    return nil
 }
+
+fn edit_rule(i){
+    if i >= rules.len() { return nil }
+    let r = rules[i]
+    let filters = []
+    for f in r.filters {
+        filters.push({field: f.field, op: f.op, value: f.value})
+        if field_of(f.field).advanced || op_of(f.field, f.op).advanced { advanced = true }
+    }
+    draft = {"match": r["match"], notify: r.notify, filters: filters}
+    editing = i
+    menu_row = -1
+    ui.reply_input.set_text(r.reply)
+    ui.status.set_text("Editing a rule. Save it to replace the old one.")
+    show_editor()
+    return nil
+}
+
+// ---- Testing and running rules
 
 fn finish_test(text){
     test_pending = false
     pending_test = nil
     ui.status.set_text(text)
+    return nil
 }
 
 fn complete_test(text){
     actions_paused = false
     finish_test(text)
     run_next_action()
+    return nil
 }
 
 fn run_rule_test(test){
@@ -162,13 +553,14 @@ fn run_rule_test(test){
     // Queue the selected concrete effects together. The host can review
     // their contents in one prompt; neither grants an unused rule action.
     if test.notify {
-        host.request("notify.post", {title: "Watcher test", body: "Test alert for '" + test.keyword + "'."}, fn(r){
+        host.request("notify.post", {title: "Watcher test", body: "Test alert: " + test.title}, fn(r){
             done(r, "Test notification")
         })
     }
     if test.reply != "" {
         host.request("matrix.send_message", {body: test.reply}, fn(r){ done(r, "Test reply") })
     }
+    return nil
 }
 
 fn start_rule_test(test){
@@ -176,6 +568,7 @@ fn start_rule_test(test){
         pending_test = test
         subscribe()
     } else { run_rule_test(test) }
+    return nil
 }
 
 fn test_rule(rule){
@@ -184,9 +577,9 @@ fn test_rule(rule){
         ui.status.set_text("This rule has no notification or reply to test.")
         return nil
     }
-    let test = {keyword: rule.keyword, notify: rule.notify, reply: rule.reply}
+    let test = {title: describe(rule), notify: rule.notify, reply: rule.reply}
     test_pending = true
-    ui.status.set_text("Testing '" + test.keyword + "'…")
+    ui.status.set_text("Testing “" + test.title + "”…")
     if host.has("on_room_message") { start_rule_test(test) return nil }
     host.request("permissions.request", {perms: ["matrix-room-watch"], retry: true}, fn(r){
         if !r.is_ok { finish_test("Test stopped: " + r.error) return nil }
@@ -196,19 +589,24 @@ fn test_rule(rule){
         }
         start_rule_test(test)
     })
+    return nil
 }
 
 fn remove_rule(i){
     if i >= rules.len() { return nil }
     rules.remove(i)
+    if editing == i { clear_editor() }
+    elif editing > i { editing = editing - 1 }
     save()
     ui.rule_list.render()
+    return nil
 }
 
 fn rule_line(rule){
     let line = "notify off"
     if rule.notify { line = "notify on" }
     if rule.reply.len() > 0 { line = line + "  ·  reply: " + rule.reply }
+    if rule.by_ai { line = line + "  ·  added by this room's AI" }
     return line
 }
 
@@ -232,6 +630,7 @@ fn run_next_action(){
             run_next_action()
         })
     })
+    return nil
 }
 
 fn queue_action(service, args){
@@ -242,17 +641,24 @@ fn queue_action(service, args){
     }
     action_queue.push({service: service, args: args})
     run_next_action()
+    return nil
 }
 
 // Own messages never match, so a rule can't loop on its own replies.
 fn check(m){
-    if m.is_own { return nil }
-    let line = m.sender_name + ": " + m.body
+    if get(m, "is_own", false) == true { return nil }
+    let msg = {
+        body: text_of(get(m, "body", ""))
+        sender_id: text_of(get(m, "sender_id", ""))
+        sender_name: text_of(get(m, "sender_name", ""))
+        msgtype: text_of(get(m, "msgtype", ""))
+    }
+    let line = msg.sender_name + ": " + msg.body
     for rule in rules {
-        if regex(rule.pattern, "i").test(m.body) {
+        if rule_matches(rule, msg) {
             hits.push(line)
             if rule.notify {
-                queue_action("notify.post", {title: "Watcher: " + rule.keyword, body: line})
+                queue_action("notify.post", {title: "Watcher: " + describe(rule), body: line})
             }
             if rule.reply.len() > 0 {
                 queue_action("matrix.send_message", {body: rule.reply})
@@ -260,6 +666,7 @@ fn check(m){
         }
     }
     while hits.len() > 20 { hits.remove(0) }
+    return nil
 }
 
 fn on_room_message(json){
@@ -268,10 +675,102 @@ fn on_room_message(json){
     ui.hit_list.render()
 }
 
+// ---- Letting this room's AI add rules
+
+fn show_ai(){
+    if !ai_rules {
+        ui.ai_button.set_text("Let this room's AI add rules")
+        ui.ai_status.set_text("Off. When on, the AI in this room can add rules for you. You review its tool first, and you still approve what rules do.")
+        return nil
+    }
+    ui.ai_button.set_text("Stop the AI adding rules")
+    ui.ai_status.set_text(ai_line)
+    return nil
+}
+
+fn register_tool(){
+    if !ai_rules || tool_pending || tool_ready { return nil }
+    tool_pending = true
+    host.request("mcp.tools.register", {
+        name: "add_rule",
+        description: tool_description,
+        args: [
+            {name: "filters", type: "array", description: "The filters, e.g. [{\"field\": \"text\", \"op\": \"any_of\", \"value\": \"wifi, password\"}, {\"field\": \"text\", \"op\": \"not_contains\", \"value\": \"solved\"}]"},
+            {name: "match", type: "string", description: "all: every filter must match. any: at least one must."}
+        ]
+    }, fn(r){
+        tool_pending = false
+        if r.is_ok && !ai_rules {
+            host.request("mcp.tools.unregister", {name: "add_rule"}, fn(u){ return nil })
+            return nil
+        }
+        tool_ready = r.is_ok
+        if r.is_ok { ai_line = "On. The AI in this room can add rules here." }
+        else { ai_line = "The AI can't add rules here yet: " + r.error }
+        show_ai()
+        return nil
+    })
+    return nil
+}
+
+fn toggle_ai(){
+    ai_rules = !ai_rules
+    let saved = {on: ai_rules}
+    fs.write("/ai.json", saved.to_json())
+    if ai_rules {
+        ai_line = "Offering Watcher's tool to this room's AI…"
+        register_tool()
+        show_ai()
+        return nil
+    }
+    if tool_ready {
+        tool_ready = false
+        host.request("mcp.tools.unregister", {name: "add_rule"}, fn(r){ return nil })
+    }
+    show_ai()
+    return nil
+}
+
+fn answer(call_id, is_ok, result){
+    host.request("mcp.tools.result", {call_id: call_id, "ok": is_ok, result: result}, fn(r){
+        if !r.is_ok { ui.status.set_text("Couldn't answer the AI: " + r.error) }
+        return nil
+    })
+    return nil
+}
+
+fn summaries(){
+    let out = []
+    for r in rules { out.push({rule: describe(r), notify: r.notify, reply: r.reply}) }
+    return out
+}
+
+// The AI's rules only notify; replies stay something you set up yourself.
+fn on_tool_call(json){
+    let ev = json.parse_json()
+    if !ev.is_object() { return nil }
+    if ev.name != "add_rule" { return answer(ev.call_id, false, "Unknown tool.") }
+    let args = get(ev, "arguments", nil)
+    let spec = {"match": text_of(get(args, "match", "all")), filters: clean_filters(get(args, "filters", nil))}
+    if spec["match"] == "" { spec["match"] = "all" }
+    let why = problem(spec)
+    if why != "" { return answer(ev.call_id, false, "Rule not added: " + why) }
+    if rules.len() >= 50 { return answer(ev.call_id, false, "Watcher already has 50 rules in this room.") }
+    let rule = make_rule(spec, true, "", true)
+    rules.push(rule)
+    save()
+    ui.rule_list.render()
+    ui.status.set_text("This room's AI added a rule: " + describe(rule))
+    return answer(ev.call_id, true, summaries().to_json())
+}
+
 let _init = load()
 let _boot = start_timeout(0.05, || {
     subscribe()
+    show_editor()
     ui.rule_list.render()
+    show_ai()
+    register_tool()
 })
 
 View{
@@ -286,15 +785,79 @@ View{
         RoundedView{
             width: Fill height: Fit flow: Down spacing: 8 padding: 10
             show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
-            keyword_input := TextInput{ width: Fill empty_text: "Keyword to watch for" on_return: |t| add_rule() }
-            reply_input := TextInput{ width: Fill empty_text: "Auto-reply text (optional)" on_return: |t| add_rule() }
+            editor_title := Label{
+                text: "NEW RULE" padding: 0 margin: 0
+                draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+            }
+            View{
+                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 6 align: Align{y: 0.5}
+                Label{
+                    text: "Match" padding: 0 margin: 0
+                    draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                }
+                match_btn := Button{ text: "all ▼" on_click: || toggle_match() draw_text +: { color: #x1C274C } }
+                Label{
+                    text: "of these filters:" padding: 0 margin: 0
+                    draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                }
+            }
+            filter_list := View{
+                width: Fill height: Fit flow: Down spacing: 6
+                on_render: || {
+                    let i = 0
+                    for f in draft.filters {
+                        let index = i
+                        i = i + 1
+                        let field_text = field_label(f.field) + " ▼"
+                        let op_text = op_label(f.field, f.op) + " ▼"
+                        let choice_text = type_label(f.value) + " ▼"
+                        let value_text = text_of(f.value)
+                        let hint = value_hint(f)
+                        let show_text = needs_text(f)
+                        let show_choice = needs_choice(f)
+                        let menu_open = menu_row == index
+                        RoundedView{
+                            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 6 padding: 6 align: Align{y: 0.5}
+                            show_bg: true draw_bg +: { color: #xFFFFFF border_radius: 8.0 }
+                            Button{ text: field_text on_click: || open_menu(index, "field") draw_text +: { color: #x1C274C } }
+                            Button{ text: op_text on_click: || open_menu(index, "op") draw_text +: { color: #x1C274C } }
+                            View{
+                                visible: show_text width: Fill height: Fit
+                                TextInput{ width: Fill text: value_text empty_text: hint on_change: |t| set_value(index, t) on_return: |t| save_rule() }
+                            }
+                            View{
+                                visible: show_choice width: Fit height: Fit
+                                Button{ text: choice_text on_click: || open_menu(index, "value") draw_text +: { color: #x1C274C } }
+                            }
+                            Button{ text: "📋" on_click: || copy_filter(index) draw_text +: { color: #x1C274C } }
+                            Button{ text: "×" on_click: || remove_filter(index) draw_text +: { color: #xB91C1C } }
+                        }
+                        if menu_open {
+                            for o in menu_options() {
+                                let id = o.id
+                                let label = "   " + o.label
+                                Button{ text: label on_click: || choose(id) draw_text +: { color: #x0f88fe } }
+                            }
+                        }
+                    }
+                    nil
+                }
+            }
             View{
                 width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8 align: Align{y: 0.5}
-                silent_toggle := Toggle{
-                    text: "Silent (no notification)"
-                    draw_text +: { color: #x333333 }
-                }
-                Button{ text: "Add rule" on_click: || add_rule() draw_text +: { color: #x1C274C } }
+                Button{ text: "➕ Add filter" on_click: || add_filter() draw_text +: { color: #x1C274C } }
+                adv_btn := Button{ text: "Show advanced ▼" on_click: || toggle_advanced() draw_text +: { color: #x0f88fe } }
+            }
+            Label{
+                text: "WHEN A MESSAGE MATCHES" padding: 0 margin: 0
+                draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+            }
+            reply_input := TextInput{ width: Fill empty_text: "Auto-reply text (optional)" }
+            View{
+                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8 align: Align{y: 0.5}
+                notify_btn := Button{ text: "🔔 Notify me" on_click: || toggle_notify() draw_text +: { color: #x1C274C } }
+                Button{ text: "Save rule" on_click: || save_rule() draw_text +: { color: #x1C274C } }
+                Button{ text: "Clear" on_click: || clear_editor() draw_text +: { color: #x66708F } }
             }
         }
         Label{
@@ -306,7 +869,7 @@ View{
             on_render: || {
                 if rules.len() == 0 {
                     Label{
-                        text: "No rules yet. Add a keyword above." width: Fill padding: 0 margin: 0
+                        text: "No rules yet. Build one above." width: Fill padding: 0 margin: 0
                         draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
                     }
                 } else {
@@ -314,19 +877,22 @@ View{
                     for rule in rules {
                         let index = i
                         i = i + 1
+                        let title = describe(rule)
+                        let line = rule_line(rule)
                         RoundedView{
                             width: Fill height: Fit flow: Down spacing: 2 padding: 8
                             show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
                             Label{
-                                text: rule.keyword width: Fill padding: 0 margin: 0
+                                text: title width: Fill padding: 0 margin: 0
                                 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} }
                             }
                             Label{
-                                text: rule_line(rule) width: Fill padding: 0 margin: 0
+                                text: line width: Fill padding: 0 margin: 0
                                 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 11} }
                             }
                             View{
                                 width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
+                                Button{text: "Edit" on_click: || edit_rule(index)}
                                 Button{text: "Test rule" on_click: || test_rule(rule)}
                                 Button{text: "Remove rule" on_click: || remove_rule(index)}
                             }
@@ -336,8 +902,17 @@ View{
                 }
             }
         }
+        RoundedView{
+            width: Fill height: Fit flow: Down spacing: 6 padding: 10
+            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
+            ai_status := Label{
+                text: "" width: Fill padding: 0 margin: 0
+                draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} }
+            }
+            ai_button := Button{ text: "Let this room's AI add rules" on_click: || toggle_ai() draw_text +: { color: #x1C274C } }
+        }
         Label{
-            text: "Test a rule to show its notification and post its saved reply to this room. Choose Until you quit Robrix or Forever and Approve in the prompts to permit future matching messages. Adding a rule only saves it."
+            text: "Test a rule to show its notification and post its saved reply to this room. Choose Until you quit Robrix or Forever and Approve in the prompts to permit future matching messages. Saving a rule only saves it."
             width: Fill padding: 0 margin: 0
             draw_text +: {color: #x66708F text_style: theme.font_regular{font_size: 11}}
         }

@@ -310,7 +310,8 @@ fn permissions_for(id: &str) -> Vec<String> {
         "room-info" => &["matrix-room-info"],
         "room-members" | "room-threads" => &["matrix-room-read", "robrix-navigation", "matrix-room-watch"],
         "search" => &["matrix-room-read", "matrix-rooms-list", "matrix-rooms-read", "robrix-navigation"],
-        "watcher" => &["matrix-room-watch", "notifications", "matrix-room-send"],
+        "simple-watcher" => &["matrix-room-watch", "notifications", "matrix-room-send"],
+        "watcher" => &["matrix-room-watch", "notifications", "matrix-room-send", "mcp-tools"],
         "presence" => &["matrix-room-read", "matrix-room-watch", "robrix-navigation"],
         "room-tools" => &["matrix-room-read", "matrix-room-info", "matrix-room-manage", "clipboard-write", "robrix-navigation"],
         "spaces" => &["matrix-spaces", "matrix-rooms-list", "robrix-navigation", "matrix-membership"],
@@ -374,10 +375,16 @@ fn reasons_for(id: &str) -> std::collections::BTreeMap<String, String> {
             ("matrix-rooms-read", "Searches messages across the rooms you pick."),
             ("robrix-navigation", "Jumps to a result you tap."),
         ],
+        "simple-watcher" => &[
+            ("matrix-room-watch", "Sees new messages so it can match your rules."),
+            ("notifications", "Tells you when a message matches a rule."),
+            ("matrix-room-send", "Posts your reply when a rule says to."),
+        ],
         "watcher" => &[
             ("matrix-room-watch", "Sees new messages so it can match your rules."),
             ("notifications", "Tells you when a message matches a rule."),
             ("matrix-room-send", "Posts your reply when a rule says to."),
+            ("mcp-tools", "Lets this room's AI add rules, once you turn that on."),
         ],
         "presence" => &[
             ("matrix-room-read", "Shows how far each person has read."),
@@ -444,6 +451,7 @@ pub fn builtin_apps() -> Vec<MiniAppManifest> {
         app("room-pins", "Pinned Messages", "📌", 0xC0533E, app_source!("room_pins.splash")),
         app("room-threads", "Room Threads", "🧵", 0x8A5CA8, app_source!("room_threads.splash")),
         app("search", "Search", "🔍", 0x0F88FE, app_source!("search.splash")),
+        app("simple-watcher", "Simple Watcher", "👁", 0xE09F3E, app_source!("simple_watcher.splash")),
         app("watcher", "Watcher", "👁", 0xD9822B, app_source!("watcher.splash")),
         app("presence", "Who's Here", "👀", 0x3A86FF, app_source!("presence.splash")),
         app("room-tools", "Room Tools", "🧰", 0x8D6E63, app_source!("room_tools.splash")),
@@ -702,7 +710,7 @@ mod tests {
     #[test]
     fn catalog_matches_the_splash_headers() {
         let apps = builtin_apps();
-        assert_eq!(apps.len(), 19);
+        assert_eq!(apps.len(), 20);
         for m in &apps {
             assert!(m.builtin);
             assert!(m.widget.is_none());

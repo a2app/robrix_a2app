@@ -84,8 +84,10 @@ cargo run --features a2app
   **Room Peek** (room info + recent messages + send),
   **Roll Call** (dice roller that can post its roll), **Room Info**,
   **Room Members**, **Pinned Messages**, **Room Threads**, **Search**
-  (messages across one room or many), **Watcher** (keyword rules that notify
-  and can auto-reply), **Who's Here** (typing and read positions), **Room
+  (messages across one room or many), **Simple Watcher** (keyword rules that
+  notify and can auto-reply), **Watcher** (Simple Watcher, customized: filter
+  rules on a message's text, sender, type or links; this room's AI can add
+  rules once you allow it), **Who's Here** (typing and read positions), **Room
   Tools** (favorite, low priority, unread, pins, links), **Room Stats** (who
   posts when), **Spaces** (explore and join), **Inbox** (invites and unread
   rooms), **Account** (you, this device, look up a user), and **Inspector**
