@@ -13,6 +13,7 @@ use a2app_core::{
 };
 use makepad_widgets::{*, splash::Splash, splash_host::SplashHostRequest, widget_async::CxSplashVmExt};
 use makepad_widgets::{makepad_script::ScriptFnRef, widget_async::CxWidgetToScriptCallExt};
+use makepad_widgets::{makepad_script::ScriptRunBudget, widget_async::{SplashVmId, with_isolate}};
 
 const ACCOUNT: &str = "@owner:test";
 const ROOM: &str = "!private:test";
@@ -27,9 +28,26 @@ thread_local! {
 fn capture_callback_error(message: &str, _: LogLevel) {
     // splash_host_respond drains synchronous errors into the logger before
     // the caller can inspect its VM. Observe that real path without replacing it.
-    if message.starts_with("splash host callback error:") {
+    if message.starts_with("splash host callback error:") || message.starts_with("splash: ") {
         CALLBACK_ERRORS.with(|errors| errors.borrow_mut().push(message.into()));
     }
+}
+
+fn headless_splash_entry<R>(cx: &mut Cx, vm_id: SplashVmId, run: impl FnOnce(&mut Cx) -> R) -> R {
+    // The UI's 64ms wall deadline includes time a parallel test is descheduled.
+    // Keep Splash's own 200,000-instruction guards, with the longer wall budget
+    // used by Makepad's headless script benchmark instead of testing CPU load.
+    with_isolate(cx, vm_id, |cx| {
+        let previous = cx.with_vm(|vm| vm.bx.run_budget.replace(ScriptRunBudget::from_durations(
+            std::time::Duration::from_secs(10), std::time::Duration::from_secs(10), 512,
+        )));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(cx)));
+        cx.with_vm(|vm| vm.bx.run_budget = previous);
+        match result {
+            Ok(result) => result,
+            Err(error) => std::panic::resume_unwind(error),
+        }
+    })
 }
 
 struct Harness {
@@ -65,6 +83,27 @@ impl Harness {
         }
     }
 
+    fn load_splash(&mut self, splash: &mut Splash, app: &str, source: &str) -> usize {
+        splash.set_debug_name(app);
+        // Allocate Splash's private VM with an empty view before running the
+        // actual guest source. This lets the test install its entry budget
+        // without replacing the real Splash evaluator or its instruction cap.
+        splash.set_text(&mut self.cx, " ");
+        let vm_id = self.cx.script_ref_vm_id(&splash.view.source).expect("empty Splash owns an isolate");
+        headless_splash_entry(&mut self.cx, vm_id, |cx| {
+            cx.with_script_vm_id_trusted(vm_id, |vm| vm.bx.captured_errors = Some(Vec::new()));
+            splash.set_text(cx, source);
+        });
+        let logged = CALLBACK_ERRORS.with(|errors| std::mem::take(&mut *errors.borrow_mut()));
+        assert!(logged.is_empty(), "{app} source startup errors: {logged:?}");
+        self.cx.with_script_vm_id_trusted(vm_id, |vm| {
+            let errors = vm.take_errors();
+            assert!(errors.is_empty(), "{app} source startup errors: {errors:?}");
+            vm.bx.captured_errors = Some(Vec::new());
+        });
+        splash.isolate_heap_key(&mut self.cx).expect("script isolate was created")
+    }
+
     fn launch(&mut self, app: &str, public: bool, source: &str) -> (usize, ContextId) {
         let context = if public { ContextId::PublicApp { account: ACCOUNT.into(), app: app.into() } }
             else { ContextId::App { account: ACCOUNT.into(), app: app.into(), room: Some(ROOM.into()) } };
@@ -83,6 +122,7 @@ impl Harness {
         self.permissions.allow_network(app, NetworkScope::AllHosts, RoomScope::AllRooms, GrantDuration::Always, None).unwrap();
         let mut splash = self.cx.with_vm(|vm| {
             let value = vm.eval(script! { use mod.widgets.* Splash{} });
+            assert!(!value.is_err(), "{app} host widget startup errors: {:?}", vm.take_errors());
             Splash::script_from_value(vm, value)
         });
         splash.set_host_io_only(true);
@@ -91,8 +131,7 @@ impl Harness {
         let jail = self.flow.borrow().context_storage_path(&context).unwrap();
         std::fs::create_dir_all(&jail).unwrap();
         splash.set_sandbox_dir(&mut self.cx, Some(jail));
-        splash.set_text(&mut self.cx, source);
-        let heap = splash.isolate_heap_key(&mut self.cx).expect("script isolate was created");
+        let heap = self.load_splash(&mut splash, app, source);
         self.contexts.insert(heap, context.clone());
         self.splashes.push(splash);
         (heap, context)
@@ -119,6 +158,7 @@ impl Harness {
         }
         let host = self.cx.with_vm(|vm| {
             let value = vm.eval(script! { use mod.widgets.* Splash{} });
+            assert!(!value.is_err(), "{app} host widget startup errors: {:?}", vm.take_errors());
             WidgetRef::script_from_value(vm, value)
         });
         makepad_widgets::widget_tree::set_ui_root(&mut self.cx, &host);
@@ -131,8 +171,7 @@ impl Harness {
             splash.set_host_tag(&mut self.cx, Some(instance_tag(app, context.room())));
             splash.set_host_caps(&mut self.cx, self.permissions.granted_caps(&manifest));
             splash.set_sandbox_dir(&mut self.cx, Some(jail));
-            splash.set_text(&mut self.cx, &manifest.source);
-            splash.isolate_heap_key(&mut self.cx).expect("stock app isolate")
+            self.load_splash(&mut splash, app, &manifest.source)
         };
         self.contexts.insert(heap, context.clone());
         self.panes.insert(heap, PaneState { surface: "dock", side: None, foreground: true, width: 460.0, height: 700.0 });
@@ -361,18 +400,24 @@ impl Harness {
         asks
     }
 
-    fn call(&mut self, app: &WidgetRef, name: &str, args: &[ScriptValue]) -> bool {
-        let called = app.borrow_mut::<Splash>().unwrap().call_script_fn(&mut self.cx, LiveId::from_str(name), args);
+    fn call_guest(&mut self, app: &WidgetRef, name: &str, call: impl FnOnce(&mut Splash, &mut Cx) -> bool) -> bool {
+        let source = app.borrow::<Splash>().unwrap().view.source.clone();
+        let vm_id = self.cx.script_ref_vm_id(&source).expect("guest call belongs to its live isolate");
+        let called = headless_splash_entry(&mut self.cx, vm_id, |cx|
+            call(&mut app.borrow_mut::<Splash>().unwrap(), cx));
+        // Restore MAIN before pumping continuations: widget async dispatch
+        // owns cross-VM routing and must not run with this isolate installed.
         self.cx.with_vm_and_async(|_| {});
         self.assert_callback_errors(name);
         called
     }
 
+    fn call(&mut self, app: &WidgetRef, name: &str, args: &[ScriptValue]) -> bool {
+        self.call_guest(app, name, |splash, cx| splash.call_script_fn(cx, LiveId::from_str(name), args))
+    }
+
     fn call_strings(&mut self, app: &WidgetRef, name: &str, args: &[&str]) -> bool {
-        let called = app.borrow_mut::<Splash>().unwrap().call_script_fn_with_strings(&mut self.cx, LiveId::from_str(name), args);
-        self.cx.with_vm_and_async(|_| {});
-        self.assert_callback_errors(name);
-        called
+        self.call_guest(app, name, |splash, cx| splash.call_script_fn_with_strings(cx, LiveId::from_str(name), args))
     }
 
     fn call_json(&mut self, app: &WidgetRef, name: &str, text: &str, json: &str) -> bool {
@@ -631,6 +676,19 @@ impl Drop for Harness {
     }
 }
 
+#[test]
+fn headless_guest_startup_keeps_the_instruction_ceiling_and_reports_errors_immediately() {
+    let mut host = Harness::new();
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+        host.launch("runaway-headless-fixture", false,
+            "let total = 0\nfor i in 1000000 { total += i }\nLabel{text: \"should not reach this\"}")))
+        .expect_err("a longer headless wall budget must not allow a runaway guest");
+    let message = failure.downcast_ref::<String>().map(String::as_str)
+        .or_else(|| failure.downcast_ref::<&str>().copied()).unwrap_or("");
+    assert!(message.contains("source startup errors") && message.contains("script instruction limit exceeded"),
+        "the actual Splash evaluator must report its instruction refusal at startup: {message}");
+}
+
 fn matrix_reply(asks: Vec<BrokerAsk>) -> Reply {
     let mut response = None;
     for ask in asks {
@@ -797,8 +855,9 @@ fn run_every_stock_app(strict: bool) {
     for manifest in stock {
         let mut host = Harness::new();
         host.permissions.set_strict(strict);
-        let errors = makepad_widgets::splash::validate_splash_body(&mut host.cx, &manifest.source, false);
-        assert!(errors.is_empty(), "{} script errors: {errors:?}", manifest.id);
+        // load_splash checks the real evaluator's source errors with its
+        // 200,000-instruction guard and the headless wall budget. A separate
+        // validator here would duplicate that parse under the UI's 64ms limit.
         let (app, _) = host.launch_stock_permissions(&manifest.id, false, false);
         host.boot();
         host.call(&app, "on_app_resize", &[460_f64.into(), 700_f64.into()]);
@@ -844,7 +903,7 @@ fn run_every_stock_app(strict: bool) {
             "watcher" => {
                 app.text_input(&host.cx, ids!(keyword_input)).set_text(&mut host.cx, "release");
                 assert!(host.call(&app, "add_rule", &[]));
-                assert!(host.call_strings(&app, "on_room_message", &[r#"[{"event_id":"$message:test","sender_name":"Alice","body":"release today","is_own":false}]"#]));
+                assert!(host.call_strings(&app, "on_room_message", &[r#"[{"room_id":"!private:test","event_id":"$message:test","sender":"alice","sender_id":"@alice:test","sender_name":"Alice","body":"release today","ts":1,"msgtype":"m.text","is_own":false}]"#]));
             }
             _ => {},
         }
@@ -1261,7 +1320,7 @@ fn stock_watcher_saves_without_write_permission_and_tests_only_the_selected_rule
     assert_eq!(audit.services, ["matrix.room.message.send"]);
     host.flow.borrow_mut().add_sources(&context, [Source::Room { account: ACCOUNT.into(), room: ROOM.into() }]).unwrap();
     host.flow.borrow_mut().add_influences(&context, [Influence::RoomContent { account: ACCOUNT.into(), room: ROOM.into() }]).unwrap();
-    assert!(host.call_strings(&app, "on_room_message", &[r#"[{"event_id":"$message:test","sender_name":"Alice","body":"release today","is_own":false}]"#]));
+    assert!(host.call_strings(&app, "on_room_message", &[r#"[{"room_id":"!private:test","event_id":"$message:test","sender":"alice","sender_id":"@alice:test","sender_name":"Alice","body":"release today","ts":1,"msgtype":"m.text","is_own":false}]"#]));
     host.settle_stock(&app, "watcher", &mut audit);
     host.boot(); // The notification callback paces the queued reply with a timer.
     host.settle_stock(&app, "watcher", &mut audit);
@@ -1270,7 +1329,7 @@ fn stock_watcher_saves_without_write_permission_and_tests_only_the_selected_rule
     let reviews = audit.reviews;
     assert!((1..=2).contains(&reviews), "the test and first influenced reply each have at most one combined review");
     host.boot(); // Finish the action pacing timer before delivering another batch.
-    assert!(host.call_strings(&app, "on_room_message", &[r#"[{"event_id":"$message:test","sender_name":"Alice","body":"release tomorrow","is_own":false}]"#]));
+    assert!(host.call_strings(&app, "on_room_message", &[r#"[{"room_id":"!private:test","event_id":"$message:test","sender":"alice","sender_id":"@alice:test","sender_name":"Alice","body":"release tomorrow","ts":2,"msgtype":"m.text","is_own":false}]"#]));
     host.settle_stock(&app, "watcher", &mut audit);
     host.boot();
     host.settle_stock(&app, "watcher", &mut audit);
