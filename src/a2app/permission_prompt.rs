@@ -8,6 +8,7 @@ use a2app_core::permissions::{GrantDuration, NetworkScope, NetworkScopeKind, Per
 use crate::home::rooms_list::RoomsListRef;
 use crate::shared::collapsible_header::CollapsibleHeaderWidgetExt;
 use super::permission_choices::*;
+use super::permission_message_preview::PermissionMessageContentWidgetRefExt;
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -153,6 +154,8 @@ script_mod! {
                 mod.widgets.PermissionPromptTextBlock {
                     spacing: 12
                     prompt_blurb := ModalBody { margin: 0, padding: 0 }
+                    prompt_message := PermissionMessageContent { visible: false }
+                    prompt_write_warning := mod.widgets.PermissionOptionLabel { visible: false }
                     prompt_context := mod.widgets.PermissionOptionLabel {}
                     prompt_reason := mod.widgets.PermissionOptionLabel { visible: false }
                 }
@@ -170,6 +173,8 @@ script_mod! {
                         Request := mod.widgets.PermissionPromptTextBlock {
                             spacing: 4
                             request_action := mod.widgets.PermissionPromptHeading {}
+                            request_message := PermissionMessageContent { visible: false }
+                            request_write_warning := mod.widgets.PermissionOptionLabel { visible: false }
                             request_context := mod.widgets.PermissionOptionLabel {}
                             request_reason := mod.widgets.PermissionOptionLabel {}
                             request_tool := mod.widgets.PermissionOptionLabel {}
@@ -261,6 +266,13 @@ pub struct ToolPreview {
     pub args: Vec<(String, String, String)>,
 }
 
+/// The captured message content, using the same formatting as its send path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PermissionMessagePreview {
+    pub body: String,
+    pub formatted_html: Option<String>,
+}
+
 /// What the prompt modal needs to display one request.
 #[derive(Clone, Debug)]
 pub struct PromptInfo {
@@ -274,6 +286,7 @@ pub struct PromptInfo {
     /// The specific ability that triggered the ask (its catalog title), when
     /// a parked request identifies one.
     pub capability: Option<String>,
+    pub message_preview: Option<PermissionMessagePreview>,
     /// Whether the asker is a room's AI agent (vs an installed mini-app):
     /// changes the wording of the blurb and reason lines.
     pub agent: bool,
@@ -309,7 +322,10 @@ pub struct FlowPromptInfo {
     pub destination: String,
     pub sources: Vec<String>,
     pub payload: String,
+    pub message_preview: Option<PermissionMessagePreview>,
     pub allow_once: bool,
+    /// Host notice displayed outside the captured message content.
+    pub write_warning: Option<String>,
     /// The host can preserve an approval beyond the current request.
     pub allow_lasting: bool,
     /// Room-relevant requests offer this captured scope as their default.
@@ -382,6 +398,21 @@ impl PermissionPromptInfo {
         match self {
             Self::Ordinary(info) => ordinary_action(info),
             Self::Flow(info) => info.action.clone(),
+        }
+    }
+
+    fn message_preview(&self) -> Option<&PermissionMessagePreview> {
+        match self {
+            Self::Ordinary(info) => info.message_preview.as_ref(),
+            Self::Flow(info) => info.message_preview.as_ref(),
+        }
+    }
+
+    fn write_warning(&self) -> &str {
+        match self {
+            Self::Ordinary(info) if info.enable_writes && info.message_preview.is_some() => ROOM_WRITE_WARNING,
+            Self::Flow(info) => info.write_warning.as_deref().unwrap_or(""),
+            _ => "",
         }
     }
 
@@ -525,7 +556,7 @@ impl Widget for MiniAppPermissionPrompt {
             self.refresh_duration(cx);
         }
         let details = self.view.collapsible_header(cx, ids!(flow_payload_toggle));
-        if self.flow_mode && let Some(expanded) = details.expansion_changed(actions) {
+        if let Some(expanded) = details.expansion_changed(actions) {
             self.flow_payload_expanded = expanded;
             self.view.widget(cx, ids!(flow_payload_body)).set_visible(cx, expanded);
             self.view.widget(cx, ids!(flow_payload)).set_visible(cx, self.flow_payload_expanded);
@@ -569,6 +600,10 @@ impl Widget for MiniAppPermissionPrompt {
                         let action = if self.group_selected.get(index).copied().unwrap_or(false) { action }
                             else { format!("Not selected: {action}") };
                         row.label(cx, ids!(request_action)).set_text(cx, &review_text(&action));
+                        row.widget(cx, ids!(request_message)).as_permission_message_content().set_message(cx, request.message_preview());
+                        let warning = request.write_warning();
+                        row.label(cx, ids!(request_write_warning)).set_text(cx, warning);
+                        row.widget(cx, ids!(request_write_warning)).set_visible(cx, !warning.is_empty());
                         let context = request.context(cx);
                         row.label(cx, ids!(request_context)).set_text(cx, &review_text(&context));
                         row.widget(cx, ids!(request_context)).set_visible(cx, !context.is_empty());
@@ -692,6 +727,7 @@ impl MiniAppPermissionPrompt {
             match request {
                 PermissionPromptInfo::Flow(info) => text.push_str(&format!("\n{}\n\n{}", info.destination, info.payload)),
                 PermissionPromptInfo::Ordinary(info) => {
+                    if let Some(message) = &info.message_preview { text.push_str(&format!("\n\n{}", message.body)); }
                     let context = ordinary_context(cx, info);
                     if !context.is_empty() { text.push_str(&format!("\n{context}")); }
                     if let Some(tool) = info.tool.as_ref() { text.push_str(&format!("\n\n{}", tool_text(tool))); }
@@ -860,10 +896,17 @@ impl MiniAppPermissionPromptRef {
         inner.network = info.network_url.as_deref().and_then(|url| NetworkScope::from_url(url, NetworkScopeKind::Origin).ok());
         inner.request_valid = info.perm != Permission::Network || inner.network.is_some();
         inner.view.view(cx, ids!(dialog_scroll)).set_scroll_pos(cx, Vec2d::default());
-        inner.view.widget(cx, ids!(flow_section)).set_visible(cx, false);
+        inner.view.widget(cx, ids!(flow_section)).set_visible(cx, info.message_preview.is_some());
+        inner.view.widget(cx, ids!(flow_destination_row)).set_visible(cx, false);
+        inner.view.widget(cx, ids!(flow_payload)).set_visible(cx, false);
+        inner.view.label(cx, ids!(flow_payload)).set_text(cx, &review_text(info.message_preview.as_ref().map(|message| message.body.as_str()).unwrap_or("")));
         inner.view.label(cx, ids!(prompt_title)).set_text(cx, &review_text(&format!("{} {} needs permission", info.app_icon, info.app_name)));
         let blurb = ordinary_action(info);
         inner.view.label(cx, ids!(prompt_blurb)).set_text(cx, &review_text(&blurb));
+        inner.view.widget(cx, ids!(prompt_message)).as_permission_message_content().set_message(cx, info.message_preview.as_ref());
+        let warning = if info.enable_writes && info.message_preview.is_some() { ROOM_WRITE_WARNING } else { "" };
+        inner.view.label(cx, ids!(prompt_write_warning)).set_text(cx, warning);
+        inner.view.widget(cx, ids!(prompt_write_warning)).set_visible(cx, !warning.is_empty());
         let context = ordinary_context(cx, info);
         inner.view.label(cx, ids!(prompt_context)).set_text(cx, &review_text(&context));
         inner.view.widget(cx, ids!(prompt_context)).set_visible(cx, !context.is_empty());
@@ -900,7 +943,11 @@ impl MiniAppPermissionPromptRef {
         inner.network = None;
         inner.request_valid = true;
         inner.view.view(cx, ids!(dialog_scroll)).set_scroll_pos(cx, Vec2d::default());
-        for id in [ids!(prompt_context), ids!(prompt_reason), ids!(prompt_tool)] { inner.view.widget(cx, id).set_visible(cx, false); }
+        for id in [ids!(prompt_context), ids!(prompt_reason), ids!(prompt_tool), ids!(prompt_write_warning)] { inner.view.widget(cx, id).set_visible(cx, false); }
+        inner.view.widget(cx, ids!(prompt_message)).as_permission_message_content().set_message(cx, info.message_preview.as_ref());
+        let warning = info.write_warning.as_deref().unwrap_or("");
+        inner.view.label(cx, ids!(prompt_write_warning)).set_text(cx, &review_text(warning));
+        inner.view.widget(cx, ids!(prompt_write_warning)).set_visible(cx, !warning.is_empty());
         inner.view.widget(cx, ids!(flow_section)).set_visible(cx, true);
         inner.view.widget(cx, ids!(flow_payload)).set_visible(cx, false);
         inner.view.label(cx, ids!(prompt_title)).set_text(cx, &review_text(&format!("{} {} needs permission", info.app_icon, info.app_name)));
@@ -927,6 +974,7 @@ impl MiniAppPermissionPromptRef {
         inner.group_choices_expanded = false;
         inner.spatial_choice_changed = false;
         let has_flow = info.requests.iter().any(|request| matches!(request, PermissionPromptInfo::Flow(_)));
+        let has_details = has_flow || info.requests.iter().any(|request| request.message_preview().is_some());
         inner.flow_mode = has_flow;
         inner.flow_payload_expanded = false;
         inner.space_membership_ready = true;
@@ -937,8 +985,8 @@ impl MiniAppPermissionPromptRef {
         inner.view.widget(cx, ids!(group_section)).set_visible(cx, true);
         inner.view.widget(cx, ids!(group_choices_toggle)).set_visible(cx, info.requests.len() > 1);
         inner.view.widget(cx, ids!(group_choices_body)).set_visible(cx, false);
-        inner.view.widget(cx, ids!(flow_section)).set_visible(cx, has_flow);
-        for id in [ids!(prompt_context), ids!(prompt_reason), ids!(prompt_tool), ids!(flow_destination_row), ids!(flow_payload_body), ids!(flow_payload)] {
+        inner.view.widget(cx, ids!(flow_section)).set_visible(cx, has_details);
+        for id in [ids!(prompt_message), ids!(prompt_write_warning), ids!(prompt_context), ids!(prompt_reason), ids!(prompt_tool), ids!(flow_destination_row), ids!(flow_payload_body), ids!(flow_payload)] {
             inner.view.widget(cx, id).set_visible(cx, false);
         }
         let (name, icon) = info.requests.first().map(PermissionPromptInfo::identity).unwrap_or(("Mini-app", ""));
@@ -998,10 +1046,12 @@ fn review_text(payload: &str) -> String {
     displayed
 }
 
+const ROOM_WRITE_WARNING: &str = "Approving also turns on room changes. Other apps still need their own permission.";
+
 fn ordinary_action(info: &PromptInfo) -> String {
     let action = info.capability.as_deref().filter(|action| !action.trim().is_empty()).unwrap_or_else(|| permission_action_text(info.perm));
-    if info.enable_writes {
-        format!("{action}. Approving also turns on room changes. Other apps still need their own permission.")
+    if info.enable_writes && info.message_preview.is_none() {
+        format!("{action}. {ROOM_WRITE_WARNING}")
     } else { action.to_string() }
 }
 
@@ -1533,6 +1583,7 @@ mod tests {
             makepad_widgets::script_mod(vm);
             crate::shared::script_mod(vm);
             super::super::permission_choices::script_mod(vm);
+            super::super::permission_message_preview::script_mod(vm);
             super::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppPermissionPrompt {} });
             WidgetRef::script_from_value(vm, value).as_mini_app_permission_prompt()
@@ -1546,6 +1597,7 @@ mod tests {
             makepad_widgets::script_mod(vm);
             crate::shared::script_mod(vm);
             super::super::permission_choices::script_mod(vm);
+            super::super::permission_message_preview::script_mod(vm);
             super::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.PermissionScopeEditor {} });
             WidgetRef::script_from_value(vm, value)
@@ -1686,7 +1738,7 @@ mod tests {
         PromptInfo {
             prompt_id: 17, app_name: "Search".into(), app_icon: "🔎".into(), perm: Permission::MatrixRoomRead,
             reason: Some("Search messages in this room.".into()), capability: Some("Search messages".into()),
-            agent: false, tool: None, room_id: Some("!target:example.org".into()), origin_room_id: Some("!origin:example.org".into()),
+            agent: false, tool: None, message_preview: None, room_id: Some("!target:example.org".into()), origin_room_id: Some("!origin:example.org".into()),
             network_url: None, can_allow_once: true, collection: false, enable_writes: false, scope: Some(RoomScope::room("!target:example.org")),
             scope_targets: vec![("!target:example.org".into(), vec!["!parent:example.org".into()])],
         }
@@ -1707,6 +1759,42 @@ mod tests {
     fn answer_for_duration(prompt: &MiniAppPermissionPromptRef, cx: &mut Cx, duration: ApprovalDuration) -> PermissionPromptResponse {
         let index = prompt.borrow().unwrap().durations.iter().position(|candidate| *candidate == duration).expect("duration is available");
         answer(prompt, cx, index, false)
+    }
+
+    #[test]
+    fn truncated_message_details_expand_for_ordinary_requests_and_reset_between_prompts() {
+        let (mut cx, prompt) = prompt();
+        let body = "First line\nSecond line\nThird line\nFourth line remains available for review";
+        let mut message = ordinary_info();
+        message.perm = Permission::MatrixRoomSend;
+        message.capability = Some("Post this message:".into());
+        message.message_preview = Some(PermissionMessagePreview { body: body.into(), formatted_html: Some("<p>First line</p>".into()) });
+        let ordinary_group = PermissionPromptGroupInfo {
+            group_id: 71,
+            requests: vec![PermissionPromptInfo::Ordinary(message.clone())],
+        };
+        for grouped in [false, true] {
+            if grouped { prompt.show_group(&mut cx, &ordinary_group); }
+            else { prompt.show(&mut cx, &message); }
+            let inner = prompt.borrow().unwrap();
+            assert!(!inner.flow_mode, "reviewing text must not change the permission decision kind");
+            assert!(inner.view.widget(&cx, ids!(flow_section)).visible());
+            assert!(!inner.view.widget(&cx, ids!(flow_payload)).visible());
+            assert!(inner.view.label(&cx, ids!(flow_payload)).text().contains(body));
+            let details = inner.view.collapsible_header(&cx, ids!(flow_payload_toggle)).widget_uid();
+            drop(inner);
+            let expanded = cx.capture_actions(|cx| cx.widget_action(details, crate::shared::collapsible_header::CollapsibleHeaderAction::ExpansionChanged(true)));
+            prompt.borrow_mut().unwrap().handle_event(&mut cx, &Event::Actions(expanded), &mut Scope::empty());
+            assert!(prompt.borrow().unwrap().view.widget(&cx, ids!(flow_payload)).visible());
+            prompt.show(&mut cx, &ordinary_info());
+            let inner = prompt.borrow().unwrap();
+            assert!(!inner.view.widget(&cx, ids!(prompt_message)).visible());
+            assert!(!inner.view.widget(&cx, ids!(flow_section)).visible());
+            assert!(!inner.view.widget(&cx, ids!(flow_payload)).visible());
+            assert!(inner.view.label(&cx, ids!(flow_payload)).text().is_empty());
+            drop(inner);
+            assert_eq!(answer_for_duration(&prompt, &mut cx, ApprovalDuration::Session).prompt_id, 17);
+        }
     }
 
     fn group_answer(prompt: &MiniAppPermissionPromptRef, cx: &mut Cx, duration: usize, deny: bool) -> PermissionPromptGroupResponse {
@@ -1730,7 +1818,7 @@ mod tests {
             prompt_id: 33, app_name: "Room AI".into(), app_icon: "🤖".into(), agent: true,
             action: "Send your answer to this room".into(), destination: "Room: Selected room".into(),
             sources: vec!["Room messages".into()], payload: "{\"message\":\"Your answer\"}".into(),
-            allow_once: true, allow_lasting: true, scope: None, scope_targets: Vec::new(), room_id: None, origin_room_id: None,
+            message_preview: None, write_warning: None, allow_once: true, allow_lasting: true, scope: None, scope_targets: Vec::new(), room_id: None, origin_room_id: None,
         };
         prompt.show_flow(&mut cx, &info);
         let help = prompt.borrow().unwrap().view.label(&cx, ids!(permission_help)).text();
@@ -1770,7 +1858,7 @@ mod tests {
         let flow = FlowPromptInfo {
             prompt_id: 35, app_name: "Search".into(), app_icon: "🔎".into(), agent: false,
             action: "Open this message".into(), destination: "Robrix".into(), sources: Vec::new(), payload: "{}".into(),
-            allow_once: true, allow_lasting: false, scope: None, scope_targets: Vec::new(), room_id: None, origin_room_id: None,
+            message_preview: None, write_warning: None, allow_once: true, allow_lasting: false, scope: None, scope_targets: Vec::new(), room_id: None, origin_room_id: None,
         };
         let info = PermissionPromptGroupInfo {
             group_id: 8, requests: vec![PermissionPromptInfo::Ordinary(ongoing), PermissionPromptInfo::Flow(flow)],
@@ -1967,7 +2055,7 @@ mod tests {
         let mut info = FlowPromptInfo {
             prompt_id: 39, app_name: "Search".into(), app_icon: "🔎".into(), agent: false,
             action: "Search another room".into(), destination: "Your Matrix server".into(), sources: vec!["Account data".into()],
-            payload: "{}".into(), allow_once: true, allow_lasting: true,
+            payload: "{}".into(), message_preview: None, write_warning: None, allow_once: true, allow_lasting: true,
             scope: Some(RoomScope::room("!target:example.org")), scope_targets: vec![("!target:example.org".into(), Vec::new())],
             room_id: Some("!target:example.org".into()), origin_room_id: Some("!origin:example.org".into()),
         };
@@ -2009,7 +2097,7 @@ mod tests {
         let info = FlowPromptInfo {
             prompt_id: 19, app_name: "Search".into(), app_icon: "🔎".into(), agent: false, action: "Search room messages and send your search text to your Matrix server.".into(),
             destination: "Your Matrix server".into(), sources: vec!["Account data".into(), "Unknown private data".into()],
-            payload: "{\n  \"query\": \"nexus \u{202e}4\"\n}".into(), allow_once: true, allow_lasting: true,
+            payload: "{\n  \"query\": \"nexus \u{202e}4\"\n}".into(), message_preview: None, write_warning: None, allow_once: true, allow_lasting: true,
             scope: None, scope_targets: Vec::new(), room_id: None, origin_room_id: None,
         };
         for (index, duration) in [(0, None), (1, Some(GrantDuration::RobrixSession)), (2, Some(GrantDuration::Always))] {
@@ -2044,7 +2132,7 @@ mod tests {
         let info = FlowPromptInfo {
             prompt_id: 27, app_name: "Search".into(), app_icon: "🔎".into(), agent: false, action: "Search for nexus in this room".into(),
             destination: "Your Matrix server: https://matrix.example.org".into(), sources: vec!["Account data".into(), "Unknown private data".into()],
-            payload: "{\"query\":\"nexus\"}".into(), allow_once: true, allow_lasting: true,
+            payload: "{\"query\":\"nexus\"}".into(), message_preview: None, write_warning: None, allow_once: true, allow_lasting: true,
             scope: None, scope_targets: Vec::new(), room_id: None, origin_room_id: None,
         };
         prompt.show_flow(&mut cx, &info);
@@ -2068,7 +2156,7 @@ mod tests {
         let info = FlowPromptInfo {
             prompt_id: 28, app_name: "Search".into(), app_icon: "🔎".into(), agent: false, action: "Search for nexus in the selected room".into(),
             destination: "Room: Selected room".into(), sources: vec!["Data from a different account".into()],
-            payload: "{\"query\":\"nexus\"}".into(), allow_once: true, allow_lasting: false,
+            payload: "{\"query\":\"nexus\"}".into(), message_preview: None, write_warning: None, allow_once: true, allow_lasting: false,
             scope: None, scope_targets: Vec::new(), room_id: None, origin_room_id: None,
         };
         prompt.show_flow(&mut cx, &info);
@@ -2168,7 +2256,7 @@ mod tests {
         let mut info = FlowPromptInfo {
             prompt_id: 31, app_name: "Search".into(), app_icon: "🔎".into(), agent: false, action: "Search the current room".into(),
             destination: "Your Matrix server: https://matrix.example.org".into(), sources: vec!["Account data".into()],
-            payload: "{\"query\":\"nexus\"}".into(), allow_once: true, allow_lasting: true,
+            payload: "{\"query\":\"nexus\"}".into(), message_preview: None, write_warning: None, allow_once: true, allow_lasting: true,
             scope: Some(RoomScope::room("!target:example.org")),
             scope_targets: vec![("!target:example.org".into(), vec!["!parent:example.org".into()])],
             room_id: Some("!target:example.org".into()), origin_room_id: None,

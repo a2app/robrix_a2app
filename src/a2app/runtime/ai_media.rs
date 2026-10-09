@@ -51,6 +51,15 @@ fn draft(room: &OwnedRoomId, id: &str) -> Result<Arc<PreparedMedia>, String> {
     }).unwrap_or_else(|| Err("Mini Apps is unavailable.".into()))
 }
 
+/// Reads immutable caption metadata while the caller already owns state.
+pub(super) fn message_preview(state: &A2AppState, room: &OwnedRoomId, draft_id: &str) -> Option<PermissionMessagePreview> {
+    let draft = state.ai_media_drafts.get(&(room.clone(), draft_id.to_string()))?;
+    let context = super::super::information_flow::agent_context(room.as_str()).ok()?;
+    if draft.context != context || flow::ensure_context_epoch(&context, draft.epoch).is_err() { return None; }
+    let body = draft.media.caption().filter(|caption| !caption.is_empty())?;
+    Some(PermissionMessagePreview { body: body.into(), formatted_html: None })
+}
+
 pub(super) fn restore_provenance(room: &OwnedRoomId, job: &SessionJob) -> Result<(), String> {
     match job {
         SessionJob::AttachMedia { draft_id, .. } | SessionJob::PostRoomMedia { draft_id, .. } => { draft(room, draft_id)?; }

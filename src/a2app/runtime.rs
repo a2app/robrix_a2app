@@ -37,10 +37,11 @@ use a2app_agent::prefs::AgentPrefs;
 
 use crate::a2app::host_pane::{MiniAppHostPaneAction, MiniAppHostPaneWidgetRefExt};
 use crate::a2app::permission_prompt::{
-    MiniAppPermissionPromptWidgetRefExt, PermissionPromptAction, PermissionPromptResponse, PromptInfo, FlowPromptInfo, ToolPreview,
+    MiniAppPermissionPromptWidgetRefExt, PermissionPromptAction, PermissionPromptResponse, PromptInfo, FlowPromptInfo, PermissionMessagePreview, ToolPreview,
     PermissionPromptGroupInfo, PermissionPromptGroupResponse, PermissionPromptInfo,
 };
 mod permission_batch;
+mod permission_message;
 mod room_session;
 mod app_media;
 pub use app_media::AppMediaPost;
@@ -4792,6 +4793,9 @@ fn flow_prompt_info(state: &A2AppState, rooms: Option<&RoomsListRef>, flow: &Flo
             .and_then(|payload| payload["operation"].as_str().and_then(a2app_core::capabilities::by_id)));
     let payload = serde_json::from_str::<serde_json::Value>(&review.payload).unwrap_or_default();
     let (scope, scope_targets) = flow_prompt_scope(state, flow, capability, &payload);
+    let message_preview = capability.and_then(|capability| permission_message::from_flow_payload(capability.id, &payload,
+        matches!(review.context, a2app_core::information_flow::ContextId::Agent { .. })));
+    let mut write_warning = None;
     let mut action = capability.map(|capability| permission_action(capability,
         payload.get("parameters").unwrap_or(&payload))).unwrap_or_else(|| "Send this request".into());
     if capability.is_some_and(|capability| matches!(capability.id,
@@ -4822,7 +4826,11 @@ fn flow_prompt_info(state: &A2AppState, rooms: Option<&RoomsListRef>, flow: &Flo
         let args = serde_json::from_str::<serde_json::Value>(&request.args_json).unwrap_or_default();
         if manifest.is_some_and(|manifest| services::can_enable_permission_writes(&state.permissions, manifest, *permission,
             services::permission_context(&request.service, &args, review.context.room())))
-        { action.push_str(". Approving also turns on room changes for mini-apps. Each app still needs its own permission."); }
+        {
+            let warning = "Approving also turns on room changes for mini-apps. Each app still needs its own permission.";
+            if message_preview.is_some() { write_warning = Some(warning.into()); }
+            else { action.push_str(&format!(". {warning}")); }
+        }
     }
     let (app_name, app_icon) = if let FlowContinuation::Generated { .. } = flow {
         if let Some(pending) = state.pending_generated.as_ref().filter(|pending| pending.matches_review(review)) {
@@ -4839,6 +4847,7 @@ fn flow_prompt_info(state: &A2AppState, rooms: Option<&RoomsListRef>, flow: &Flo
         app_name,
         app_icon,
         action, destination,
+        message_preview, write_warning,
         sources: review.sources.iter().map(|source| match source {
             Source::Account { .. } => "Your account data or text entered in this app".into(),
             Source::Room { room, .. } => format!("Data from {}", room_name(room)),
@@ -5193,11 +5202,8 @@ fn permission_action(capability: &a2app_core::capabilities::Capability, args: &s
         "host.nav.user" => "View this person's profile".into(),
         "host.nav.room" | "host.nav.space" => "Open this room or space".into(),
         "matrix.room.message.send" | "matrix.rooms.message.send" => {
-            if let Some(body) = args["body"].as_str() {
-                let mut shown = body.chars().take(240).collect::<String>();
-                if body.chars().count() > 240 { shown.push('…'); }
-                format!("Post this message:\n{shown}")
-            } else { "Post a message".into() }
+            if args["body"].is_string() || args["text"].is_string() { "Post this message:".into() }
+            else { "Post a message".into() }
         }
         "matrix.room.message.reply" | "matrix.room.thread.reply" => "Reply to a message".into(),
         "matrix.room.pin.set" => (if args["pinned"].as_bool() == Some(false) { "Unpin this message" } else { "Pin this message" }).into(),
@@ -5376,6 +5382,7 @@ fn prompt_info_for(
             perm,
             reason: Some(ai_prompt_reason(rooms, perm, parked)),
             capability: Some(ai_prompt_action(rooms, perm, parked)),
+            message_preview: permission_message::from_parked(state, parked),
             agent: true,
             tool: tool_preview,
             scope: prompt_room_scope(perm, parked),
@@ -5425,7 +5432,8 @@ fn prompt_info_for(
             permission_action(c, &args)
         })
     };
-    PromptInfo { prompt_id: 0, app_name, app_icon, perm, reason, capability, agent: false, tool: tool_preview, scope: prompt_room_scope(perm, parked), scope_targets: parked_scope_targets(state, parked), room_id, origin_room_id, network_url, can_allow_once,
+    PromptInfo { prompt_id: 0, app_name, app_icon, perm, reason, capability,
+        message_preview: permission_message::from_parked(state, parked), agent: false, tool: tool_preview, scope: prompt_room_scope(perm, parked), scope_targets: parked_scope_targets(state, parked), room_id, origin_room_id, network_url, can_allow_once,
         collection: parked.iter().filter_map(parked_capability).any(services::is_room_collection), enable_writes: false }
 }
 

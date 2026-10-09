@@ -633,7 +633,7 @@ impl MatrixLinkPill {
 
 /// A widget used to display a single HTML `<span>` tag or a `<font>` tag.
 #[derive(Script, Widget)]
-struct MatrixHtmlSpan {
+pub struct MatrixHtmlSpan {
     #[uid] uid: WidgetUid,
     // TODO: this is unused; just here to invalidly satisfy the area provider.
     //       I'm not sure how to implement `fn area()` given that it has multiple area rects.

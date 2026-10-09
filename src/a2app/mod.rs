@@ -39,6 +39,8 @@ pub mod mini_apps_screen;
 pub mod room_app_picker;
 /// Visible choices shared by mini-app permission and task screens.
 pub mod permission_choices;
+/// Compact, formatted message content shown before approving a send.
+pub mod permission_message_preview;
 /// The runtime permission prompt modal.
 pub mod permission_prompt;
 /// The upfront task permission prompt: one modal per task, with the agent's
@@ -60,6 +62,7 @@ pub mod timeline_card;
 pub fn script_mod(vm: &mut ScriptVm) {
     host_set::script_mod(vm);
     permission_choices::script_mod(vm);
+    permission_message_preview::script_mod(vm);
     permission_prompt::script_mod(vm);
     task_permission_prompt::script_mod(vm);
     data_sharing::script_mod(vm);

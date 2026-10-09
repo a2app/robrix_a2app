@@ -682,6 +682,7 @@ mod tests {
             makepad_code_editor::script_mod(vm);
             crate::shared::script_mod(vm);
             crate::a2app::permission_choices::script_mod(vm);
+            crate::a2app::permission_message_preview::script_mod(vm);
             crate::a2app::permission_prompt::script_mod(vm);
             super::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.ProtectionInspector {} });
@@ -709,6 +710,7 @@ mod tests {
             makepad_code_editor::script_mod(vm);
             crate::shared::script_mod(vm);
             crate::a2app::permission_choices::script_mod(vm);
+            crate::a2app::permission_message_preview::script_mod(vm);
             crate::a2app::permission_prompt::script_mod(vm);
             super::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.ProtectionInspector {} });

@@ -909,6 +909,7 @@ mod tests {
             makepad_code_editor::script_mod(vm);
             crate::shared::script_mod(vm);
             super::super::permission_choices::script_mod(vm);
+            super::super::permission_message_preview::script_mod(vm);
             super::super::permission_prompt::script_mod(vm);
             super::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.DataSharing {} });

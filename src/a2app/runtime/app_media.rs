@@ -34,6 +34,10 @@ impl AppMediaPost {
         a2app_core::capabilities::by_id("matrix.media.upload").unwrap()
     }
 
+    pub(super) fn message_preview(&self) -> Option<PermissionMessagePreview> {
+        permission_message::from_flow_payload("matrix.media.send", &self.request.media_post_payload()?, false)
+    }
+
     pub(super) fn permits_send(&self, store: &PermissionStore) -> bool {
         self.send.permits_request(store)
     }
