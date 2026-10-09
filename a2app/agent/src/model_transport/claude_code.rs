@@ -488,11 +488,17 @@ mod tests {
         let directory = tempfile::tempdir().unwrap(); let working_path = directory.path().to_path_buf();
         let mut command = Command::new(&path); command.env("FIXTURE_PID", &pid_file);
         configure(&mut command, &config, &ChatConfig::default(), directory.path());
-        let task = tokio::spawn(invoke(command, b"{}".to_vec(), config, guard(yes(), yes(), yes()), directory, Duration::from_secs(5), verify()));
+        // Leave room for scheduling and filesystem cleanup under parallel test
+        // load, but keep cleanup's deadline well before the request timeout so
+        // ordinary timeout cleanup cannot satisfy the cancellation assertion.
+        let task = tokio::spawn(invoke(command, b"{}".to_vec(), config, guard(yes(), yes(), yes()), directory, Duration::from_secs(30), verify()));
         for _ in 0..300 { if pid_file.exists() { break; } tokio::time::sleep(Duration::from_millis(10)).await; }
         assert!(pid_file.exists()); task.abort(); let _ = task.await;
-        for _ in 0..200 { if !working_path.exists() { break; } tokio::time::sleep(Duration::from_millis(10)).await; }
-        assert!(!working_path.exists(), "cancelled worker retained its working directory");
+        let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+        while working_path.exists() {
+            assert!(Instant::now() < cleanup_deadline, "cancelled worker retained its working directory");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         reaped(std::fs::read_to_string(pid_file).unwrap().parse().unwrap());
     }
 
