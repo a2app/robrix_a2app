@@ -244,7 +244,16 @@ script_mod! {
                 }
                 approval_duration := PermissionDurationDropDown { labels: ["Until you quit Robrix", "Forever"] }
                 mod.widgets.PermissionPromptTextBlock {
-                    duration_summary := mod.widgets.PermissionOptionLabel {}
+                    RoundedView {
+                        width: Fill, height: Fit, flow: Down, padding: 12
+                        draw_bg +: {
+                            color: (COLOR_BG_LAVENDER), border_radius: 6.0
+                            border_color: (COLOR_BG_LAVENDER_DOWN), border_size: 1.0
+                        }
+                        duration_summary := mod.widgets.PermissionOptionLabel {
+                            draw_text +: { color: (COLOR_TEXT) }
+                        }
+                    }
                 }
             }
             mod.widgets.PermissionPromptTextBlock {
