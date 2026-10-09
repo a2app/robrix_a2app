@@ -330,11 +330,12 @@ and scope (this room, account, device, app-local). Available today:
 | matrix-room-info | `matrix.room.info.read` | read · this room |
 | matrix-room-read | `matrix.room.messages.read`, `matrix.room.members.read`, `matrix.room.pins.read`, `matrix.room.threads.read`, `matrix.room.messages.search` | read · this room |
 | matrix-room-send | `matrix.room.message.send` | write · this room |
+| matrix-media | `matrix.media.upload`, `matrix.media.send` | write · homeserver / this room |
 | matrix-profile | `matrix.profile.read` | read · account |
 | matrix-rooms-list | `matrix.rooms.list` | read · many rooms |
 | matrix-rooms-read | `matrix.rooms.messages.search` | read · many rooms · critical |
 | robrix-navigation | `host.nav.user`, `host.nav.thread`, `host.nav.event`, `host.nav.room`, `host.nav.space`, `host.nav.screen`, `host.nav.link`, `host.nav.app` | act · app→Robrix · this room / account |
-| robrix-composer | `host.composer.insert`, `host.composer.reply_to` | act · app→Robrix · this room |
+| robrix-composer | `host.composer.insert`, `host.composer.attach`, `host.composer.reply_to` | act · local draft in Robrix · room |
 | matrix-room-watch | `on_room_message`, `on_room_message_changed`, `on_room_reaction`, `on_room_typing`, `on_room_receipt`, `on_room_members_changed` (Robrix→app hooks) | read · this room |
 | matrix-room-info | `on_room_pins_changed`, `on_room_info_changed`, `on_room_unread_changed` (Robrix→app hooks) | read · this room |
 | matrix-rooms-list | `on_rooms_changed`, `on_invite_received`, `on_unread_totals_changed` (Robrix→app hooks) | read · many rooms |
@@ -613,6 +614,15 @@ All I/O goes through the host:
   `"permissions.query"`, `"permissions.request"`, the `"nav.*"` and
   `"composer.*"` services (see Acting inside Robrix below).
   `host.capabilities()` / `host.has("network")` report current grants.
+
+`files.pick` opens the user's file picker and returns
+`{name, size, text, data_base64, mime_type}` for a selected file up to 1 MiB.
+`text` preserves UTF-8 content and replaces invalid characters for binary
+files; use `data_base64` for the exact bytes. `mime_type` is inferred from
+the filename, or `application/octet-stream` when unknown. Cancellation returns
+`{cancelled:true}` without those fields. Larger files return `r.is_ok == false`
+with a size error. Picking grants access to the chosen bytes; uploading or
+posting them needs a separate operation and permission.
 - HTTP uses `host.request("network.http", {url: u}, fn(r){ ... })`.
   A success returns `r.data.status`, `r.data.headers`, and a UTF-8 string
   `r.data.body`; parse the body only when the HTTP status and content fit
@@ -728,7 +738,20 @@ burning a permission.
   messages, oldest first. `sender` is the short name, `sender_id` the full
   `@user:server`, `event_id` what the `nav.*` / `composer.*` services take.
 - `"matrix.send_message"` (needs `matrix-room-send`): `{body: "text"}` -> `{}`
-  — sends a plain text message to the attached room as the user.
+  — sends a plain text message to the attached room as the user. Use this only
+  for an explicit Send/Post action. A Draft action uses `composer.insert`
+  with its separate composer permission; a draft grant does not authorize sending.
+- `"matrix.send_media"` (needs both `matrix.media.upload` and `matrix.media.send`
+  in `matrix-media`): `{data_base64, filename, mime_type, caption?}` ->
+  `{room_id, event_id, media}`. Uploads and posts a native image, audio, video
+  or file message to the app's attached room. The inline limits and field
+  rules are the same as `composer.attach`; `room_id` is not accepted here.
+  Call only from an explicit Send/Post control. Upload and sending permissions,
+  room/space write protection, homeserver sharing and exact-action review
+  all apply; a composer grant grants none of them. The host handles room
+  encryption. Report success only after `r.is_ok == true`; preserve the user's
+  input after refusal, cancellation or failure, and do not switch to a draft
+  or another sending service automatically.
 - `"matrix.profile"` (needs `matrix-profile`): `{}` ->
   `{user_id, display_name}` — the Robrix user's own identity.
 - `"matrix.room_members"` (needs `matrix-room-read`): `{limit: N}` (max 200)
@@ -919,13 +942,49 @@ Needs `robrix-navigation` (prompts on first use):
 - `"nav.app"` `{app_id}`: opens another installed mini-app, in this
   room's dock when attached.
 
-Needs `robrix-composer` (prompts on first use); nothing is ever sent, the
-user still presses Send:
+Needs `robrix-composer` (prompts on first use). These are local draft
+operations: the user reviews the content and presses Send. Composer grants
+work independently of Matrix posting grants and the Matrix writes switch.
+Declare just the composer capabilities your app uses, check each exact
+capability with `host.has()` at use time, and keep draft actions usable when
+message sending is denied. Room protection and exact-action review still apply:
 
 - `"composer.insert"` `{text}`: appends text to the room's draft and
-  focuses the message box.
+  focuses the message box. Needs `host.composer.insert`.
+- `"composer.attach"` `{data_base64, filename, mime_type, caption?, room_id?}`:
+  opens Robrix's native attachment preview with lossless inline bytes. Needs
+  `host.composer.attach`. The default target is the app's attached room;
+  `room_id` selects another approved room. `data_base64` must be standard raw
+  base64, at most 4 MiB encoded; `filename` is one name without a path, at most
+  255 bytes; `mime_type` is concrete, such as `image/png`, without parameters;
+  `caption` is optional text, at most 16 KiB. No local paths or data URLs.
+  This service does not upload or post media. Handle `r.is_ok == false` and
+  cancellation; never fall back to a send operation when drafting is refused.
 - `"composer.reply_to"` `{event_id}`: puts the message box into reply
   mode for that message.
+
+For a file attachment, request `files.pick` from a visible Choose file button,
+then call `composer.attach` from an Attach draft button using the selected
+`data_base64`, `name` as `filename`, and `mime_type`. A text-only drafting app
+should not declare Matrix send permissions. Mini-apps do not have the room
+agent's `post_room_media` tool. For an explicit immediate media post, use
+`matrix.send_media` with separate upload and send grants; draft attachment
+actions continue to use `composer.attach`.
+
+```splash
+// permissions: host.composer.insert, host.composer.attach
+// why-robrix-composer: Prepares drafts for you to review and send.
+fn attach_note(){
+    host.request("composer.attach", {
+        data_base64:"UmV2aWV3IHRoaXMgbm90ZS4="
+        filename:"note.txt"
+        mime_type:"text/plain"
+    }, fn(r){
+        ui.header.set_text(if r.is_ok {"Attachment ready to review"} else {r.error})
+        return nil
+    })
+}
+```
 
 ```splash
 fn open_member(i){

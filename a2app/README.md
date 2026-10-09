@@ -329,6 +329,10 @@ bodies; only the mini-app services clip.
 | `list_rooms` | Lists the user's joined rooms and DMs | `matrix.rooms.list` (default on) |
 | `read_other_room_messages` | Reads another joined room the model names | `matrix.rooms.messages.read` |
 | `post_room_message` | Posts a notice into another joined room | `matrix.rooms.message.send` (per room) |
+| `draft_message` | Puts text in this room's composer for the user to send | `host.composer.insert` |
+| `draft_media` | Prepares local media from one HTTP(S) URL, Matrix attachment event, verified Matrix `mxc` URI or inline base64 and returns an opaque session draft id | HTTP(S): exact website and data-sharing rules; Matrix: `matrix.media.download` and authenticated media transport; local preparation: no upload |
+| `attach_media` | Stages a prepared media draft in this room's composer for the user to review and send | `host.composer.attach` |
+| `post_room_media` | Uploads and posts a native image, audio, video or file message here or into another joined room | `matrix.media.upload`, `matrix.media.send`; another room also needs `matrix.rooms.message.send` |
 | `list_spaces` | Lists the spaces the user has joined | `matrix.spaces.list` (default on) |
 | `space_info` | Reads one space's details | `matrix.space.info.read` (default on) |
 | `list_space_rooms` | Lists the rooms/subspaces inside one space | `matrix.space.rooms.list` (default on) |
@@ -338,6 +342,49 @@ bodies; only the mini-app services clip.
 | `call_mini_app_tool` | Calls one registered mini-app tool by id, forwarding `arguments` | `mcp-tools` (per tool) |
 | `launch_splash_app` | Builds and runs a NEW mini-app from a description | `apps.generate` |
 | `request_task_permissions` | Asks once, up front, for everything a task needs (rooms to read, places to write, URLs, app tools), and applies the approved subset as one turn-scoped batch | none (it raises the prompt the other gates would) |
+
+Media preparation, attachment and posting are separate operations. Text and
+media composer grants work independently of upload and message-send grants,
+including when Matrix writes are off. Staging a draft keeps it local until
+the user sends it; source access and exact-action review still apply. The agent
+provides a single filename, MIME type and optional caption with one HTTP(S)
+URL, Matrix attachment `event_id`, Matrix `mxc_uri`, or raw base64 bytes; it never gains local filesystem
+access. Matrix attachment resolution uses the SDK and downloads use the host's
+bounded authenticated Matrix transport under `matrix.media.download`
+and do not require internet access. For existing attachments, use `event_id`
+and optional `source_room` from the message read tools: the host retrieves the
+trusted Matrix media source, decrypts encrypted attachments and tracks the
+actual source room. An `mxc_uri` must match an attachment in this room's verified
+cached original events, so the host can resolve its actual media descriptor
+and encryption metadata. For an unknown URI, use `event_id` with its
+`source_room`. Inline base64
+is capped at 4 MiB, and downloads are bounded by the host. Draft ids belong to
+the session and are discarded when it ends. `attach_media` uses Robrix's
+existing attachment preview and send flow. `post_room_media` sends a native
+Matrix attachment, which the timeline can display as media, after the upload,
+send and data-sharing checks succeed. Plan media permissions with the source
+reads, destination rooms and exact media URLs in `request_task_permissions`.
+
+Mini-apps use `host.request("composer.insert", {text}, callback)` for text
+drafts and `host.request("composer.attach", {data_base64, filename, mime_type,
+caption?, room_id?}, callback)` for media drafts, declaring the corresponding
+`host.composer.insert` and `host.composer.attach` capabilities. The attachment
+service accepts raw base64 up to 4 MiB encoded and a single filename, then
+opens the native preview without uploading. `files.pick` returns lossless
+`data_base64` and filename-inferred `mime_type` alongside the existing `name`,
+`size` and `text` fields for selected files up to 1 MiB; cancellation and
+larger files are reported to the callback. Direct text posting through
+`matrix.send_message` requires its separate send grant. Direct media posting
+uses `matrix.send_media` with the same bounded inline media fields, without
+`room_id`, for the attached room. It requires both `matrix.media.upload` and
+`matrix.media.send`, preserves native media types and room encryption, and
+returns the sent event id only after the post succeeds. Both sending services
+require an explicit Send/Post action, independent of composer grants.
+Generated apps receive these rules in their authoring guide
+and every generation prompt.
+
+The host tools prepare existing bytes or fetch a known media URL; they do not
+provide image search or an image generation model.
 
 #### Upfront task permissions
 

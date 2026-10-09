@@ -638,6 +638,21 @@ const PERMISSION_POLICY: &str = "The app is SANDBOXED. Anything beyond its own U
      checks. Use `{retry:true}` only from a visible Refresh/Test click after denial. \
      Single Fetch/Post/Open actions call their concrete service directly to keep \
      one-time approval; never batch unspecified network access or unused writes. \
+     Draft/Prepare/Attach controls use `composer.insert` or `composer.attach`: \
+     declare only `host.composer.insert`/`host.composer.attach` for local composer \
+     changes, independently of Matrix message-send or media-upload permissions. \
+     `composer.attach` takes raw `data_base64` (4 MiB encoded max), one `filename`, \
+     concrete `mime_type`, and optional `caption`/`room_id`; it opens a local \
+     attachment preview and never posts. `files.pick` supplies lossless \
+     `data_base64`/`mime_type` plus `name`, `size`, and `text` for selected files \
+     up to 1 MiB; handle cancellation and oversize errors. A Send/Post control \
+     may call `matrix.send_message` for text or `matrix.send_media` for native \
+     media only when the user explicitly asks to post. `matrix.send_media` \
+     targets only the attached room and accepts the same inline media fields \
+     as composer.attach without room_id; declare `matrix.media.upload` and \
+     `matrix.media.send` and handle each grant independently from composer \
+     grants. Label buttons for their \
+     actual effect and never replace a refused draft with a direct send. \
      Ask for the least it needs. The host also limits HOW OFTEN an app may ask: requests are charged \
      against a per-app budget, so ask on user action or when data goes stale — never \
      poll in a loop, never request from a fast timer, never retry a failure \
