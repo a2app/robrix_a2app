@@ -367,14 +367,21 @@ atomic apply live in `a2app/core/src/task_grants.rs`; the prompt is
 prompts, so every grantable item is re-checked against the live permission
 store when it is applied: an item that became allowed is skipped (no duplicate
 grant), and an item the user blocked in the meantime is reported
-`blocked_by_room_policy` and not granted while the rest of the batch applies.
+`blocked_by_room_policy` for room protection or `blocked_by_permission` for a
+permission setting. That item is not granted while the rest of the batch
+applies. Saved group, capability, website, and mini-app-tool denials are checked
+both when resolving the plan and when applying it.
 
 **The room and space directory is on by default.** `list_rooms`,
 `list_spaces`, `space_info` and `list_space_rooms` are granted once, on an AI
-room's first session start (unless the user has denied that group), so the
-agent can name real rooms without asking first. A persisted per-room marker
-means the defaults are never re-applied: once the user sets one of those
-groups back to Ask or Deny, that choice sticks across sessions. The room's own
+room's first session start only when the user has no saved choice for that
+capability or its group, so a new agent can name real rooms without asking
+first. Explicit Ask or Deny, Ask again, selected-room allowances, and withdrawn
+or expired allowances are preserved even on an upgrade before the defaults
+first run. Each default is a durable all-rooms grant for the exact directory
+capability; it does not enable other capabilities in the same group. A
+persisted per-room marker means the defaults are never re-applied: once the
+user changes or withdraws one, that choice sticks across sessions. The room's own
 messages, its info, and the installed-app list are **not** defaulted; they go
 through `request_task_permissions` like any other need. Directory results carry
 no message content but are still other people's words, so they are labelled
@@ -393,15 +400,17 @@ agent did not list:
   to the room and the whole-label output check would otherwise refuse them;
 - each named output (a post target, a fetched origin) is allowed to receive the
   sources that feed the task;
-- a target-room read adds a rule to that room's server, because the query
-  leaves Robrix;
+- reading another room does not share the task's data into that room. Cached
+  reads stay local; remote query parameters require sharing with the
+  homeserver origin before the SDK request;
 - the rows are pre-checked and shown in the same Details list as the requested
   needs, and each is tagged with the reads that cause it; unchecking a read
   drops the rules that depend on it (`dependent_approval`);
 - they last until the turn ends.
 
-**What is on by default.** Grants: the four directory tools listed above and
-nothing else. Sharing: the `RoomDirectory` source and the room's own source to
+**What is on by default.** For a room with no saved permission choices, grants
+cover the four directory tools listed above and nothing else. Sharing: the
+`RoomDirectory` source and the room's own source to
 the current model provider, plus the room's own source and the `RoomDirectory`
 to the homeserver origin and to the room itself (reply/activity plumbing). The
 provider is the configured endpoint, and it therefore sees the names, unread
@@ -445,7 +454,8 @@ returns an error telling the agent to ask again with the new need. The agent
 may make at most three requests per turn, and each after the first must contain
 a need not already declined. "Not now" is remembered by the plan's needs, so a
 re-labeled request with the same needs, or a subset, is refused without a modal
-and only a strict superset re-prompts.
+and combining needs from earlier declined plans is also refused. A request
+must contain at least one new need to raise another prompt.
 
 `launch_splash_app` is create-only: it never rewrites an installed app. Running
 an app that already exists is `launch_app`'s job — list the ids with
