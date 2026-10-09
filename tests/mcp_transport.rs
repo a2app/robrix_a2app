@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use a2app_agent::mcp::McpServer;
 use robrix::a2app::ai::server::ToolServer;
-use robrix::a2app::ai::tools::{AiHost, ReadToolKind, register_session_tools};
+use robrix::a2app::ai::tools::{AiHost, MediaDraftRequest, ReadToolKind, register_session_tools};
 use serde_json::{Value, json};
 
 /// How long a reply may take before the test gives up. A local socket round
@@ -60,6 +60,26 @@ impl RecordingHost {
 }
 
 impl AiHost for RecordingHost {
+    fn draft_message(&self, text: &str) -> Result<String, String> {
+        self.calls.lock().unwrap().push(format!("draft_message({text:?})"));
+        Ok("drafted".into())
+    }
+
+    fn draft_media(&self, request: MediaDraftRequest) -> Result<String, String> {
+        self.calls.lock().unwrap().push(format!("draft_media({request:?})"));
+        Ok(json!({"draft_id":"media-fixture","filename":request.filename,"mime_type":request.mime_type}).to_string())
+    }
+
+    fn attach_media(&self, draft_id: &str) -> Result<String, String> {
+        self.calls.lock().unwrap().push(format!("attach_media({draft_id:?})"));
+        Ok("attached".into())
+    }
+
+    fn post_room_media(&self, draft_id: &str, room: Option<&str>) -> Result<String, String> {
+        self.calls.lock().unwrap().push(format!("post_room_media({draft_id:?}, {room:?})"));
+        Ok("posted media".into())
+    }
+
     fn launch_splash_app(&self, description: &str) -> Result<String, String> {
         self.calls
             .lock()
@@ -386,6 +406,10 @@ fn a_full_mcp_session_over_the_relay_child() {
             "request_task_permissions",
             "web_fetch",
             "post_room_message",
+            "draft_message",
+            "draft_media",
+            "attach_media",
+            "post_room_media",
         ]
     );
     for tool in tools {
@@ -412,6 +436,30 @@ fn a_full_mcp_session_over_the_relay_child() {
     );
     assert_eq!(result["isError"], false);
     assert_eq!(result["content"][0]["text"], "posted");
+
+    // Media preparation and the two independent effects remain callable over
+    // the real relay; the native host receives the source and target intact.
+    let media_request = json!({"url":"https://example.org/diagram.png","filename":"diagram.png","mime_type":"image/png","caption":"The diagram"});
+    let result = client.request("tools/call", json!({"name":"draft_media","arguments":media_request}));
+    assert_eq!(result["isError"], false);
+    let draft: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(draft["draft_id"], "media-fixture");
+    let result = client.request("tools/call", json!({"name":"attach_media","arguments":{"draft_id":draft["draft_id"]}}));
+    assert_eq!(result["content"][0]["text"], "attached");
+    let result = client.request("tools/call", json!({"name":"post_room_media","arguments":{"draft_id":draft["draft_id"],"room":"!target:example.org"}}));
+    assert_eq!(result["content"][0]["text"], "posted media");
+    let result = client.request("tools/call", json!({"name":"post_room_media","arguments":{"draft_id":draft["draft_id"]}}));
+    assert_eq!(result["content"][0]["text"], "posted media");
+    let result = client.request("tools/call", json!({"name":"draft_message","arguments":{"text":"Review this image"}}));
+    assert_eq!(result["content"][0]["text"], "drafted");
+    let result = client.request("tools/call", json!({"name":"draft_media","arguments":{
+        "mxc_uri":"mxc://example.org/diagram","filename":"diagram.png","mime_type":"image/png"
+    }}));
+    assert_eq!(result["isError"], false, "Matrix media uses its own source field");
+    let result = client.request("tools/call", json!({"name":"draft_media","arguments":{
+        "event_id":"$diagram","source_room":"!source:example.org","filename":"diagram.png","mime_type":"image/png"
+    }}));
+    assert_eq!(result["isError"], false, "attachment events retain their source room");
 
     // list_apps: the stub host's JSON app list comes back verbatim.
     let result = client.request("tools/call", json!({"name": "list_apps", "arguments": {}}));
@@ -474,6 +522,13 @@ fn a_full_mcp_session_over_the_relay_child() {
         vec![
             "launch_splash_app(\"a counter app\")".to_string(),
             "send_room_message(\"hello room\")".to_string(),
+            "draft_media(MediaDraftRequest { source: Url(\"https://example.org/diagram.png\"), filename: \"diagram.png\", mime_type: \"image/png\", caption: Some(\"The diagram\") })".to_string(),
+            "attach_media(\"media-fixture\")".to_string(),
+            "post_room_media(\"media-fixture\", Some(\"!target:example.org\"))".to_string(),
+            "post_room_media(\"media-fixture\", None)".to_string(),
+            "draft_message(\"Review this image\")".to_string(),
+            "draft_media(MediaDraftRequest { source: MatrixUri(\"mxc://example.org/diagram\"), filename: \"diagram.png\", mime_type: \"image/png\", caption: None })".to_string(),
+            "draft_media(MediaDraftRequest { source: MatrixEvent { event_id: \"$diagram\", room_id: Some(\"!source:example.org\") }, filename: \"diagram.png\", mime_type: \"image/png\", caption: None })".to_string(),
             "list_apps()".to_string(),
             "launch_app(\"smoke-app\")".to_string(),
             "list_mini_app_tools()".to_string(),

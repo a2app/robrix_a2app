@@ -97,7 +97,7 @@ pub fn contract(id: &str) -> Option<FlowContract> {
         | "matrix.rooms.info.read" | "matrix.rooms.messages.read"
         | "matrix.space.info.read"
             => (S::TargetRoom, O::Local, true, false),
-        "matrix.room.thread.read" | "matrix.room.event.read" | "matrix.space.rooms.list"
+        "matrix.room.thread.read" | "matrix.room.event.read" | "matrix.space.rooms.list" | "matrix.media.download"
             => (S::TargetRoom, O::MatrixServer, true, false),
         "matrix.room.messages.paginate" => (S::TargetRoom, O::MatrixPagination, true, false),
         "matrix.room.messages.search" => (S::TargetRoom, O::MatrixSearch, true, false),
@@ -106,9 +106,11 @@ pub fn contract(id: &str) -> Option<FlowContract> {
         | "matrix.rooms.message.send" | "matrix.room.typing.send" | "matrix.room.receipt.send"
         | "matrix.room.pin.set" | "matrix.room.favorite.set" | "matrix.room.low_priority.set"
         | "matrix.room.unread.set" | "matrix.room.invite.send" | "matrix.invites.respond"
+        | "matrix.media.send"
             => (S::None, O::TargetRoom, false, true),
         "matrix.room.reaction.toggle" => (S::TargetRoom, O::TargetRoom, true, true),
         "matrix.rooms.join" => (S::None, O::MatrixServer, false, true),
+        "matrix.media.upload" => (S::None, O::MatrixServer, false, true),
         "matrix.user.dm.open" => (S::Account, O::MatrixServer, true, true),
         "matrix.profile.read" | "matrix.account.device.read" | "matrix.account.info.read"
         | "matrix.account.ignored.read" | "matrix.user.dm.find" | "matrix.rooms.list"
@@ -125,8 +127,8 @@ pub fn contract(id: &str) -> Option<FlowContract> {
             => (S::None, O::Local, false, true),
         "host.nav.event" | "host.nav.thread" | "host.nav.user" | "host.nav.link"
             => (S::None, O::MatrixServer, false, true),
-        "host.composer.insert" | "host.composer.reply_to"
-            => (S::None, O::TargetRoom, false, true),
+        "host.composer.insert" | "host.composer.reply_to" | "host.composer.attach"
+            => (S::None, O::Local, false, true),
         "host.nav.app" | "apps.launch" => (S::None, O::Peer(FlowPeer::App), false, true),
         "apps.generate" => (S::None, O::Peer(FlowPeer::Generator), false, true),
         "mcp.tools.register" | "mcp.tools.unregister" | "mcp.tools.result"
@@ -180,6 +182,8 @@ impl FlowContract {
                 },
                 FlowOutput::MatrixServer if capability == "matrix.user.dm.open" => "host".into(),
                 FlowOutput::TargetRoom | FlowOutput::MatrixServer => target_room.unwrap_or("host").into(),
+                FlowOutput::Local if matches!(capability, "host.composer.insert" | "host.composer.attach" | "host.composer.reply_to")
+                    => target_room.unwrap_or("host").into(),
                 FlowOutput::External => "external".into(),
                 FlowOutput::Clipboard => "clipboard".into(),
                 FlowOutput::Peer(_) => args["app_id"].as_str().unwrap_or("apps").into(),

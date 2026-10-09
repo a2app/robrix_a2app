@@ -12,6 +12,7 @@ use url::Url;
 const MAX_URL: usize = 8192;
 const MAX_REQUEST_BODY: usize = 256 * 1024;
 const MAX_RESPONSE_BODY: usize = 1024 * 1024;
+pub const MAX_MEDIA_RESPONSE_BODY: usize = 16 * 1024 * 1024;
 const MAX_HEADERS: usize = 32 * 1024;
 const DEADLINE: Duration = Duration::from_secs(30);
 static REQUESTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
@@ -33,6 +34,22 @@ pub struct Request {
     method: Method,
     headers: HeaderMap,
     body: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct BinaryResponse {
+    pub status: u16,
+    pub headers: BTreeMap<String, Vec<String>>,
+    pub body: Vec<u8>,
+}
+
+impl BinaryResponse {
+    fn into_text_json(self) -> Result<String, String> {
+        let body = String::from_utf8(self.body)
+            .map_err(|_| "Only UTF-8 text HTTP responses are currently supported.".to_string())?;
+        serde_json::to_string(&serde_json::json!({"status":self.status,"headers":self.headers,"body":body}))
+            .map_err(|_| "Could not encode the HTTP response.".to_string())
+    }
 }
 
 impl Request {
@@ -107,6 +124,32 @@ pub async fn run(
     consent: PermissionStore,
     lifetime: Option<Arc<AtomicBool>>,
 ) -> Result<String, String> {
+    run_response(request, context, subject, origin_room, consent, lifetime, MAX_RESPONSE_BODY)
+        .await?.into_text_json()
+}
+
+/// Fetch binary media through the same permission, DNS and streaming checks
+/// as text requests, with a separate bounded media response size.
+pub async fn run_bytes(
+    request: Request,
+    context: ContextId,
+    subject: String,
+    origin_room: Option<String>,
+    consent: PermissionStore,
+    lifetime: Option<Arc<AtomicBool>>,
+) -> Result<BinaryResponse, String> {
+    run_response(request, context, subject, origin_room, consent, lifetime, MAX_MEDIA_RESPONSE_BODY).await
+}
+
+async fn run_response(
+    request: Request,
+    context: ContextId,
+    subject: String,
+    origin_room: Option<String>,
+    consent: PermissionStore,
+    lifetime: Option<Arc<AtomicBool>>,
+    max_response_body: usize,
+) -> Result<BinaryResponse, String> {
     if lifetime.as_ref().is_some_and(|alive| !alive.load(Ordering::Acquire)) {
         return Err("This mini-app instance is no longer running.".into());
     }
@@ -152,7 +195,7 @@ pub async fn run(
             Some(Recipient::network_origin(request.url.as_str())?), a2app_core::protection_audit::ActivityKind::HttpRequest));
         Ok(())
     };
-    let response = send(&request, &addresses, &authorize, commit).await;
+    let response = send_bytes(&request, &addresses, &authorize, commit, max_response_body).await;
     if let Some(attempt) = attempt { attempt.finish(response.is_ok()); }
     authorize()?;
     response
@@ -223,12 +266,23 @@ impl reqwest::dns::Resolve for PinnedResolver {
     }
 }
 
+#[cfg(test)]
 async fn send(
     request: &Request,
     addresses: &[SocketAddr],
     authorize: impl Fn() -> Result<(), String>,
     commit: impl FnOnce() -> Result<(), String>,
 ) -> Result<String, String> {
+    send_bytes(request, addresses, authorize, commit, MAX_RESPONSE_BODY).await?.into_text_json()
+}
+
+async fn send_bytes(
+    request: &Request,
+    addresses: &[SocketAddr],
+    authorize: impl Fn() -> Result<(), String>,
+    commit: impl FnOnce() -> Result<(), String>,
+    max_response_body: usize,
+) -> Result<BinaryResponse, String> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -252,7 +306,7 @@ async fn send(
     if response.status().is_redirection() {
         return Err("Redirects are not followed. Request the destination URL separately.".into());
     }
-    if response.content_length().is_some_and(|length| length > MAX_RESPONSE_BODY as u64) {
+    if response.content_length().is_some_and(|length| length > max_response_body as u64) {
         return Err("The HTTP response exceeds its size limit.".into());
     }
     let status = response.status().as_u16();
@@ -267,13 +321,11 @@ async fn send(
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| "Reading the HTTP response failed.".to_string())? {
         authorize()?;
-        if chunk.len() > MAX_RESPONSE_BODY - bytes.len() { return Err("The HTTP response exceeds its size limit.".into()); }
+        if chunk.len() > max_response_body - bytes.len() { return Err("The HTTP response exceeds its size limit.".into()); }
         bytes.extend_from_slice(&chunk);
     }
     authorize()?;
-    let body = String::from_utf8(bytes).map_err(|_| "Only UTF-8 text HTTP responses are currently supported.".to_string())?;
-    serde_json::to_string(&serde_json::json!({"status":status,"headers":headers,"body":body}))
-        .map_err(|_| "Could not encode the HTTP response.".to_string())
+    Ok(BinaryResponse { status, headers, body: bytes })
 }
 
 #[cfg(test)]
@@ -325,7 +377,10 @@ mod tests {
     }
 
     fn server(response: impl Into<String>) -> (SocketAddr, std::thread::JoinHandle<()>) {
-        let response = response.into();
+        server_bytes(response.into().into_bytes())
+    }
+
+    fn server_bytes(response: Vec<u8>) -> (SocketAddr, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -337,9 +392,36 @@ mod tests {
             let request = std::str::from_utf8(&bytes[..read]).unwrap();
             assert!(!request.to_ascii_lowercase().contains("authorization:"));
             assert!(!request.to_ascii_lowercase().contains("cookie:"));
-            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(&response);
         });
         (address, thread)
+    }
+
+    #[tokio::test]
+    async fn binary_media_preserves_non_utf8_and_uses_its_own_limit() {
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 3\r\n\r\n".to_vec();
+        response.extend_from_slice(&[0xff, 0x00, 0x80]);
+        let (address, thread) = server_bytes(response);
+        let request = Request::parse(&serde_json::json!({"url":format!("http://example.invalid:{}/",address.port())})).unwrap();
+        let response = send_bytes(&request, &[address], || Ok(()), || Ok(()), MAX_MEDIA_RESPONSE_BODY).await.unwrap();
+        assert_eq!(response.body, [0xff, 0x00, 0x80]);
+        assert_eq!(response.headers["content-type"], ["image/png"]);
+        assert!(response.into_text_json().is_err());
+        thread.join().unwrap();
+
+        let body = "x".repeat(MAX_RESPONSE_BODY + 1);
+        let (address, thread) = server(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", body.len(), body));
+        let request = Request::parse(&serde_json::json!({"url":format!("http://example.invalid:{}/",address.port())})).unwrap();
+        assert_eq!(send_bytes(&request, &[address], || Ok(()), || Ok(()), MAX_MEDIA_RESPONSE_BODY).await.unwrap().body.len(), body.len());
+        thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn binary_media_limit_applies_to_streamed_chunks() {
+        let (address, thread) = server("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\n12345678\r\n0\r\n\r\n");
+        let request = Request::parse(&serde_json::json!({"url":format!("http://example.invalid:{}/",address.port())})).unwrap();
+        assert!(send_bytes(&request, &[address], || Ok(()), || Ok(()), 7).await.unwrap_err().contains("size limit"));
+        thread.join().unwrap();
     }
 
     #[tokio::test]

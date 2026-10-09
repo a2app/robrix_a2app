@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Mutex;
 
+use base64::Engine;
 use makepad_widgets::splash_host::{
     splash_host_respond, take_splash_host_requests, SplashHostRequest,
 };
@@ -357,6 +358,8 @@ pub enum BrokerAsk {
         room: Option<String>,
         capability: &'static str,
         consent: Box<PermissionStore>,
+        /// Preserve the caller's foreground consent policy for compound calls.
+        may_prompt: bool,
         call: MatrixServiceCall,
         /// Immutable caller arguments, captured for the host's action review.
         args: serde_json::Value,
@@ -438,6 +441,8 @@ pub enum HostAction {
     OpenLink { room: Option<String>, url: String },
     OpenApp { room: Option<String>, app_id: MiniAppId },
     ComposerInsert { room: Option<String>, text: String },
+    /// Inline bytes staged for the user's review; no upload or message send.
+    ComposerAttach { room: Option<String>, data_base64: String, filename: String, mime_type: String, caption: Option<String> },
     ComposerReplyTo { room: Option<String>, event_id: String },
     /// The `ui.pane.*` calls, acting on the calling instance's own pane.
     ClosePane,
@@ -445,6 +450,104 @@ pub enum HostAction {
     BreakOut,
     Minimize,
     Restore,
+}
+
+/// Inline bytes stay below the bridge's bounded message budget. The host
+/// decodes and validates the bytes again before opening an attachment preview.
+pub const MAX_COMPOSER_MEDIA_BASE64_BYTES: usize = 4 * 1024 * 1024;
+
+pub fn parse_composer_attachment(args: &serde_json::Value, origin_room: Option<&str>) -> Result<HostAction, String> {
+    let object = args.as_object().ok_or("composer.attach needs an object of attachment fields")?;
+    if let Some(field) = object.keys().find(|field| !matches!(field.as_str(), "data_base64" | "filename" | "mime_type" | "caption" | "room_id")) {
+        return Err(format!("composer.attach does not accept `{field}`"));
+    }
+    let required = |field: &str| args[field].as_str().map(str::trim).filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("composer.attach needs a non-empty string `{field}`"));
+    let filename = required("filename")?;
+    if filename.len() > 255 || matches!(filename, "." | "..")
+        || filename.chars().any(|ch| ch.is_control() || ch == '/' || ch == '\\') {
+        return Err("filename must be one name without path separators or control characters (255 bytes max)".into());
+    }
+    let mime_type = required("mime_type")?;
+    let token = |value: &str| !value.is_empty() && value.bytes().all(|ch| ch.is_ascii_alphanumeric()
+        || matches!(ch, b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'));
+    if mime_type.len() > 127 || !mime_type.split_once('/').is_some_and(|(major, minor)| token(major) && token(minor)) {
+        return Err("mime_type must be one concrete MIME type without parameters, e.g. image/png".into());
+    }
+    let encoded = required("data_base64")?;
+    if encoded.len() > MAX_COMPOSER_MEDIA_BASE64_BYTES
+        || base64::engine::general_purpose::STANDARD.decode(encoded).is_err() {
+        return Err("data_base64 must be raw base64 bytes (4 MiB max); local paths and data URLs are not accepted".into());
+    }
+    let caption = match args.get("caption") {
+        None => None,
+        Some(serde_json::Value::String(text)) if text.len() <= 16 * 1024 => Some(text.clone()),
+        _ => return Err("caption must be a string (16 KiB max)".into()),
+    };
+    let room = if args.get("room_id").is_some() {
+        let room = required("room_id")?;
+        if !room.starts_with('!') || room.len() < 2 || room.len() > 255 || room.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+            return Err("room_id must name a Matrix room, e.g. !room:example.org".into());
+        }
+        Some(room.to_string())
+    } else { origin_room.map(str::to_string) };
+    Ok(HostAction::ComposerAttach { room, data_base64: encoded.to_string(), filename: filename.to_string(), mime_type: mime_type.to_ascii_lowercase(), caption })
+}
+
+#[cfg(test)]
+mod composer_attachment_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn attachment_parser_preserves_bytes_caption_and_the_explicit_room() {
+        let args = json!({"data_base64":"bWVkaWE=","filename":"diagram.png","mime_type":"image/png","caption":"Review this diagram","room_id":" !target:test "});
+        let HostAction::ComposerAttach { room, data_base64, filename, mime_type, caption } = parse_composer_attachment(&args, Some("!origin:test")).unwrap()
+            else { panic!("expected composer attachment") };
+        assert_eq!(room.as_deref(), Some("!target:test"));
+        assert_eq!(data_base64, "bWVkaWE=");
+        assert_eq!(filename, "diagram.png");
+        assert_eq!(mime_type, "image/png");
+        assert_eq!(caption.as_deref(), Some("Review this diagram"));
+        let args = json!({"data_base64":"bWVkaWE=","filename":"fixture.txt","mime_type":"text/plain"});
+        assert!(matches!(parse_composer_attachment(&args, Some("!origin:test")).unwrap(),
+            HostAction::ComposerAttach { room: Some(room), caption: None, .. } if room == "!origin:test"));
+        assert_eq!(crate::capabilities::for_service("composer.attach").unwrap().id, "host.composer.attach");
+        assert_eq!(permission_context("composer.attach", &json!({"room_id":" !target:test "}), Some("!origin:test")).target_room, Some("!target:test"));
+    }
+
+    #[test]
+    fn attachment_parser_refuses_paths_sources_unknown_fields_and_unbounded_payloads() {
+        let valid = json!({"data_base64":"bWVkaWE=","filename":"fixture.txt","mime_type":"text/plain"});
+        for (field, value) in [
+            ("filename", json!("../private.txt")),
+            ("filename", json!("C:\\private.txt")),
+            ("filename", json!("file\n.txt")),
+            ("mime_type", json!("image/*")),
+            ("mime_type", json!("text/plain; charset=utf-8")),
+            ("mime_type", json!(false)),
+            ("data_base64", json!("data:image/png;base64,bWVkaWE=")),
+            ("data_base64", json!("b=WVk")),
+            ("data_base64", json!("====")),
+            ("data_base64", json!("x".repeat(MAX_COMPOSER_MEDIA_BASE64_BYTES + 1))),
+            ("caption", json!(false)),
+            ("caption", json!("x".repeat(16 * 1024 + 1))),
+            ("room_id", json!(42)),
+            ("room_id", json!("#alias:test")),
+            ("room_id", json!("!target: test")),
+            ("url", json!("https://example.org/private.png")),
+            ("path", json!("/Users/someone/private.png")),
+        ] {
+            let mut args = valid.clone();
+            args[field] = value;
+            assert!(parse_composer_attachment(&args, Some("!origin:test")).is_err(), "accepted invalid {field}");
+        }
+        for missing in ["data_base64", "filename", "mime_type"] {
+            let mut args = valid.clone();
+            args.as_object_mut().unwrap().remove(missing);
+            assert!(parse_composer_attachment(&args, Some("!origin:test")).is_err(), "accepted missing {missing}");
+        }
+    }
 }
 
 
@@ -505,7 +608,7 @@ pub fn permission_context<'a>(
         "matrix.space_info" | "matrix.space_rooms" | "nav.space" => arg("space_id"),
         "matrix.room_preview" | "matrix.join" => arg("room"),
         "nav.event" | "nav.thread" | "nav.user" | "nav.app"
-        | "composer.insert" | "composer.reply_to" => arg("room_id").or(origin_room),
+        | "composer.insert" | "composer.attach" | "composer.reply_to" => arg("room_id").or(origin_room),
         _ => origin_room,
     };
     PermissionContext { origin_room, target_room }
@@ -525,7 +628,9 @@ pub fn is_room_collection(capability: &crate::capabilities::Capability) -> bool 
 pub fn can_enable_writes(store: &PermissionStore, manifest: &crate::manifest::MiniAppManifest,
     capability: &crate::capabilities::Capability, context: PermissionContext<'_>) -> bool
 {
-    if store.matrix_write() || capability.status != crate::capabilities::Status::RefusedBySwitch { return false; }
+    if store.matrix_write() || !capability.is_available()
+        || crate::permissions::capability_room_access(capability) != Some(RoomAccess::Write)
+    { return false; }
     let Some(permission) = capability.group else { return false };
     if !manifest.declares(permission) || !manifest.declares_capability(capability) { return false; }
     let mut enabled = store.clone();
@@ -539,6 +644,19 @@ pub fn can_enable_permission_writes(store: &PermissionStore, manifest: &crate::m
 {
     crate::capabilities::in_group(permission).any(|capability|
         capability.is_available() && can_enable_writes(store, manifest, capability, context))
+}
+
+/// A media post requires separately declared upload authority. The host owns
+/// its second consent phase and preserves the send receipt across that phase;
+/// the broker rejects hard upload denials before any information-flow effect.
+pub fn media_upload_preflight(store: &PermissionStore, manifest: &crate::manifest::MiniAppManifest,
+    context: PermissionContext<'_>) -> Result<(), Effective>
+{
+    let upload = crate::capabilities::by_id("matrix.media.upload").unwrap();
+    match store.effective_capability_in_context(manifest, upload, context) {
+        Effective::Granted | Effective::NeedsPrompt => Ok(()),
+        denied => Err(denied),
+    }
 }
 
 /// A group query describes whether this instance can already use a declared
@@ -910,6 +1028,14 @@ impl Broker {
         let ordinary_context = permission_context(&req.service, &args, instance_room.as_deref());
         let context = PermissionContext { origin_room: ordinary_context.origin_room,
             target_room: resolved_target.as_deref().or(ordinary_context.target_room) };
+        if req.service == "matrix.send_media" {
+            match media_upload_preflight(ctx.permissions, &manifest, context) {
+                Ok(()) => {},
+                Err(Effective::Undeclared) => return respond(cx, reply, Err("permission not declared: matrix.media.upload")),
+                Err(_) => return Self::respond_policy_denied(cx, &req, ctx.permissions, &manifest,
+                    crate::capabilities::by_id("matrix.media.upload").unwrap(), context),
+            }
+        }
         let collection = is_room_collection(capability);
         let denied = if collection && req.service != "matrix.space_rooms" {
             ctx.permissions.global_policy(RoomAccess::Read) == PolicyDecision::Deny
@@ -1367,6 +1493,7 @@ impl Broker {
                         room: instance_room.clone(),
                         capability: capability.id,
                         consent: Box::new(ctx.permissions.clone()),
+                        may_prompt,
                         call,
                         args,
                     }),
@@ -1436,7 +1563,7 @@ impl Broker {
             }
             "nav.room" | "nav.event" | "nav.thread" | "nav.user" | "nav.space"
             | "nav.screen" | "nav.link" | "nav.app" | "composer.insert"
-            | "composer.reply_to" => {
+            | "composer.attach" | "composer.reply_to" => {
                 let arg = |key: &str| args[key].as_str().map(str::trim).filter(|v| !v.is_empty());
                 let room = arg("room_id").map(str::to_string).or_else(|| instance_room.clone());
                 let need = |key: &str| arg(key).map(str::to_string).ok_or(format!("{} needs {{{key}}}", req.service));
@@ -1450,6 +1577,7 @@ impl Broker {
                     "nav.link" => need("url").map(|url| HostAction::OpenLink { room, url }),
                     "nav.app" => need("app_id").map(|app_id| HostAction::OpenApp { room, app_id }),
                     "composer.reply_to" => need("event_id").map(|event_id| HostAction::ComposerReplyTo { room, event_id }),
+                    "composer.attach" => parse_composer_attachment(&args, instance_room.as_deref()),
                     "composer.insert" => need("text").and_then(|text| {
                         // A draft is the app's words in the user's composer, so it
                         // gets the same ceiling a sent message does.
@@ -1676,21 +1804,72 @@ fn picked_to_json(
             if size.is_some_and(|n| n > MAX_PICK_BYTES) {
                 return Err("file is too large (1MB max)".to_string());
             }
-            let bytes = file.read_bytes().map_err(|e| format!("couldn't read the file: {e:?}"))?;
-            if bytes.len() as u64 > MAX_PICK_BYTES {
-                return Err("file is too large (1MB max)".to_string());
-            }
-            let text = String::from_utf8(bytes)
-                .map_err(|_| "only text files are supported for now".to_string())?;
             let name = file.display_name().unwrap_or("file").to_string();
-            Ok(serde_json::json!({
-                "name": name,
-                "size": text.len(),
-                "text": text,
-            })
-            .to_string())
+            // URI-backed picks are streamed into a host-owned local file;
+            // paths stay inside the native picker. Bound the actual read too,
+            // including when size is unknown or the selected file grows.
+            use std::io::Read;
+            let local = file.into_local_file().map_err(|e| format!("couldn't read the file: {e:?}"))?;
+            let reader = std::fs::File::open(local.path()).map_err(|e| format!("couldn't read the file: {e:?}"))?;
+            let mut bytes = Vec::new();
+            reader.take(MAX_PICK_BYTES + 1).read_to_end(&mut bytes).map_err(|e| format!("couldn't read the file: {e:?}"))?;
+            picked_bytes_to_json(&name, &bytes)
         }
         Err(e) => Err(format!("file picker failed: {e:?}")),
+    }
+}
+
+/// Keep the original text fields while exposing lossless bytes for local
+/// attachment drafting. The display name reveals no device file path.
+fn picked_bytes_to_json(name: &str, bytes: &[u8]) -> Result<String, String> {
+    if bytes.len() > 1024 * 1024 {
+        return Err("file is too large (1MB max)".into());
+    }
+    Ok(serde_json::json!({
+        "name": name,
+        "size": bytes.len(),
+        "text": String::from_utf8_lossy(bytes),
+        "data_base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+        "mime_type": mime_guess::from_path(name).first_or_octet_stream().as_ref(),
+    }).to_string())
+}
+
+#[cfg(test)]
+mod file_pick_attachment_tests {
+    use super::*;
+
+    #[test]
+    fn picked_text_fields_remain_compatible_and_bytes_are_lossless() {
+        let text = "Résumé\n";
+        let json: serde_json::Value = serde_json::from_str(&picked_bytes_to_json("notes.txt", text.as_bytes()).unwrap()).unwrap();
+        assert_eq!(json["name"], "notes.txt");
+        assert_eq!(json["size"], text.len());
+        assert_eq!(json["text"], text);
+        assert_eq!(json["mime_type"], "text/plain");
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(json["data_base64"].as_str().unwrap()).unwrap(), text.as_bytes());
+    }
+
+    #[test]
+    fn binary_pick_is_attachment_ready_without_a_device_path() {
+        let bytes = [0x89, b'P', b'N', b'G', 0xff];
+        let json: serde_json::Value = serde_json::from_str(&picked_bytes_to_json("picture.png", &bytes).unwrap()).unwrap();
+        assert_eq!(json["mime_type"], "image/png");
+        assert_eq!(json["size"], bytes.len());
+        assert!(!json.as_object().unwrap().contains_key("path"));
+        let args = serde_json::json!({"filename":json["name"],"data_base64":json["data_base64"],"mime_type":json["mime_type"]});
+        assert!(matches!(parse_composer_attachment(&args, Some("!room:test")).unwrap(), HostAction::ComposerAttach { .. }));
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(json["data_base64"].as_str().unwrap()).unwrap(), bytes);
+        let unknown: serde_json::Value = serde_json::from_str(&picked_bytes_to_json("opaque", &bytes).unwrap()).unwrap();
+        assert_eq!(unknown["mime_type"], "application/octet-stream");
+    }
+
+    #[test]
+    fn picker_size_limit_and_cancellation_remain_bounded() {
+        assert_eq!(picked_to_json(Ok(None)).unwrap(), "{\"cancelled\": true}");
+        let max = vec![b'x'; 1024 * 1024];
+        let json: serde_json::Value = serde_json::from_str(&picked_bytes_to_json("max.bin", &max).unwrap()).unwrap();
+        assert!(json["data_base64"].as_str().unwrap().len() <= MAX_COMPOSER_MEDIA_BASE64_BYTES);
+        assert_eq!(picked_bytes_to_json("too-large.bin", &vec![b'x'; max.len() + 1]).unwrap_err(), "file is too large (1MB max)");
     }
 }
 
@@ -1725,6 +1904,99 @@ mod room_context_tests {
             "permissions": permissions.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
             "capabilities": capabilities,
         })).unwrap()
+    }
+
+    #[test]
+    fn media_can_enable_room_changes_only_without_other_denials() {
+        for (id, permission) in [("matrix.media.send", Permission::MatrixMedia)] {
+            let manifest = permission_manifest(&[permission], &[id]);
+            let capability = crate::capabilities::by_id(id).unwrap();
+            let context = PermissionContext { origin_room: Some("!origin:s"), target_room: Some("!target:s") };
+            let mut store = PermissionStore::default();
+            assert!(can_enable_writes(&store, &manifest, capability, context));
+            assert!(can_enable_permission_writes(&store, &manifest, permission, context));
+            store.set_room_policy("!target:s", RoomAccess::Write, PolicyDecision::Deny);
+            assert!(!can_enable_writes(&store, &manifest, capability, context));
+            store.set_room_policy("!target:s", RoomAccess::Write, PolicyDecision::Ask);
+            store.set(&manifest.id, permission, crate::permissions::GrantState::Denied);
+            assert!(!can_enable_writes(&store, &manifest, capability, context));
+            store.set(&manifest.id, permission, crate::permissions::GrantState::Ask);
+            store.set_capability(&manifest.id, id, crate::permissions::GrantState::Denied);
+            assert!(!can_enable_writes(&store, &manifest, capability, context));
+            store.set_capability(&manifest.id, id, crate::permissions::GrantState::Ask);
+            store.set_matrix_write(true);
+            assert!(!can_enable_writes(&store, &manifest, capability, context));
+        }
+    }
+
+    #[test]
+    fn media_upload_preflight_keeps_send_and_upload_consent_separate() {
+        use crate::permissions::{GrantDuration, RoomScope};
+        let manifest = permission_manifest(&[Permission::MatrixMedia], &["matrix.media.send", "matrix.media.upload"]);
+        let context = PermissionContext { origin_room: Some("!attached:s"), target_room: Some("!attached:s") };
+        let mut store = PermissionStore::default();
+        store.set_matrix_write(true);
+        let send = crate::capabilities::by_id("matrix.media.send").unwrap();
+        let upload = crate::capabilities::by_id("matrix.media.upload").unwrap();
+        let grant = store.grant_scoped(&manifest.id, Permission::MatrixMedia, Some(send.id),
+            RoomScope::room("!attached:s"), GrantDuration::RobrixSession, context.origin_room).unwrap();
+        store.mark_request_once(grant);
+        assert_eq!(store.effective_capability_in_context(&manifest, send, context), Effective::Granted);
+        assert_eq!(store.effective_capability_in_context(&manifest, upload, context), Effective::NeedsPrompt);
+        assert_eq!(media_upload_preflight(&store, &manifest, context), Ok(()), "the host prompts for upload after capturing the send receipt");
+        assert!(store.has_request_once(&manifest.id, send.id, context), "preflight must not consume the primary receipt");
+        assert!(!store.has_request_once(&manifest.id, upload.id, context));
+
+        store.remove_scoped_grant(grant);
+        store.grant_scoped(&manifest.id, Permission::MatrixMedia, Some(upload.id),
+            RoomScope::room("!attached:s"), GrantDuration::RobrixSession, context.origin_room).unwrap();
+        assert_eq!(media_upload_preflight(&store, &manifest, context), Ok(()));
+        assert_eq!(store.effective_capability_in_context(&manifest, send, context), Effective::NeedsPrompt, "uploading never grants posting");
+        store.set_room_policy("!attached:s", RoomAccess::Write, PolicyDecision::Deny);
+        assert_eq!(store.effective_capability_in_context(&manifest, send, context), Effective::Denied);
+    }
+
+    #[test]
+    fn media_upload_preflight_rejects_missing_authority_and_live_denials() {
+        use crate::permissions::GrantState;
+        let context = PermissionContext { origin_room: Some("!attached:s"), target_room: Some("!attached:s") };
+        let manifest = permission_manifest(&[Permission::MatrixMedia], &["matrix.media.send"]);
+        let mut store = PermissionStore::default();
+        store.set(&manifest.id, Permission::MatrixMedia, GrantState::Granted);
+        assert_eq!(media_upload_preflight(&store, &manifest, context), Err(Effective::Undeclared), "a group grant cannot extend the declared capability list");
+        let manifest = permission_manifest(&[Permission::MatrixMedia], &["matrix.media.send", "matrix.media.upload"]);
+        store.set_capability(&manifest.id, "matrix.media.upload", GrantState::Denied);
+        assert_eq!(media_upload_preflight(&store, &manifest, context), Err(Effective::Denied));
+        store.set_capability(&manifest.id, "matrix.media.upload", GrantState::Granted);
+        store.set(&manifest.id, Permission::MatrixMedia, GrantState::Denied);
+        assert_eq!(media_upload_preflight(&store, &manifest, context), Err(Effective::Denied), "capability consent cannot override the group denial");
+        store.set(&manifest.id, Permission::MatrixMedia, GrantState::Granted);
+        store.restrict(&manifest.id, "test restriction", 0, 1);
+        assert_eq!(media_upload_preflight(&store, &manifest, context), Err(Effective::Denied));
+    }
+
+    #[test]
+    fn composer_setup_never_needs_or_enables_sending() {
+        for id in ["host.composer.insert", "host.composer.attach", "host.composer.reply_to"] {
+            let manifest = permission_manifest(&[Permission::RobrixComposer], &[id]);
+            let capability = crate::capabilities::by_id(id).unwrap();
+            let context = PermissionContext { origin_room: Some("!origin:s"), target_room: Some("!target:s") };
+            let mut store = PermissionStore::default();
+            store.set_room_policy("!target:s", RoomAccess::Write, PolicyDecision::Deny);
+            store.set_room_spaces("!target:s", vec!["!parent:s".into()]);
+            store.set_space_policy("!parent:s", RoomAccess::Write, PolicyDecision::Deny);
+            assert_eq!(permission_request_status(&store, &manifest, Permission::RobrixComposer, context), Effective::NeedsPrompt);
+            assert_eq!(permission_setup_status(&store, &manifest, Permission::RobrixComposer, context), Effective::NeedsPrompt);
+            assert!(!can_enable_writes(&store, &manifest, capability, context));
+            assert!(!can_enable_permission_writes(&store, &manifest, Permission::RobrixComposer, context));
+            store.grant_scoped(&manifest.id, Permission::RobrixComposer, Some(id), crate::permissions::RoomScope::room("!target:s"),
+                crate::permissions::GrantDuration::RobrixSession, Some("!origin:s")).unwrap();
+            assert_eq!(permission_request_status(&store, &manifest, Permission::RobrixComposer, context), Effective::Granted);
+            assert_eq!(permission_setup_status(&store, &manifest, Permission::RobrixComposer, context), Effective::Granted);
+            assert!(!store.matrix_write());
+            store.set_space_policy("!parent:s", RoomAccess::Read, PolicyDecision::Deny);
+            assert_eq!(permission_setup_status(&store, &manifest, Permission::RobrixComposer, context), Effective::Denied);
+        }
     }
 
     #[test]

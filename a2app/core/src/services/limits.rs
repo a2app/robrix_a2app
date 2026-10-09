@@ -62,7 +62,7 @@ fn cost_of(service: &str) -> f64 {
         "files.pick" | "files.save" | "auth.check" | "share" | "url.open" => 8.0,
         // Steer Robrix itself: a pane, a room switch, the composer.
         "nav.room" | "nav.event" | "nav.thread" | "nav.user" | "nav.space" | "nav.screen"
-        | "nav.link" | "nav.app" | "composer.insert" | "composer.reply_to"
+        | "nav.link" | "nav.app" | "composer.insert" | "composer.attach" | "composer.reply_to"
         | "ui.pane.close" | "ui.pane.set_side" | "ui.pane.break_out"
         | "ui.pane.minimize" | "ui.pane.restore" => 8.0,
         // Unknown services are refused upstream; price them like the worst.
@@ -78,7 +78,7 @@ pub fn is_ui_service(service: &str) -> bool {
         service,
         "files.pick" | "files.save" | "auth.check" | "share" | "url.open"
         | "nav.room" | "nav.event" | "nav.thread" | "nav.user" | "nav.space" | "nav.screen"
-        | "nav.link" | "nav.app" | "composer.insert" | "composer.reply_to"
+        | "nav.link" | "nav.app" | "composer.insert" | "composer.attach" | "composer.reply_to"
     )
 }
 
@@ -318,6 +318,13 @@ mod tests {
         );
         l.dialog_finished("t");
         assert!(matches!(l.check("t", "files.pick", true), Verdict::Allow));
+    }
+
+    #[test]
+    fn composer_attachment_preview_requires_the_calling_app_to_be_foreground() {
+        let mut limiter = AbuseLimiter::default();
+        assert!(matches!(limiter.check("attachment", "composer.attach", false), Verdict::Refuse(Refusal::NotForeground)));
+        assert!(matches!(limiter.check("attachment", "composer.attach", true), Verdict::Allow));
     }
 
     /// Waiting out a cooldown buys a partial bucket, not a fresh one — the

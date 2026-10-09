@@ -811,6 +811,12 @@ impl Selection {
 }
 
 fn capability_selection(cap: &Capability, targets: &[String], room: &str) -> Result<Selection, TaskReason> {
+    // Upload is an account-side effect of this AI room's agent. The room
+    // selected for the eventual post has its separate media-send grant.
+    if cap.id == "matrix.media.upload" && targets.iter().any(|target| {
+        let target = target.trim();
+        !target.is_empty() && target != room
+    }) { return Err(TaskReason::InvalidTarget); }
     let mut rooms = Vec::new();
     let mut spaces = Vec::new();
     for target in targets {
@@ -826,7 +832,7 @@ fn capability_selection(cap: &Capability, targets: &[String], room: &str) -> Res
     }
     if rooms.is_empty() && spaces.is_empty() {
         if matches!(cap.scope, Scope::Room | Scope::Instance)
-            || matches!(cap.id, "apps.list" | "apps.launch")
+            || matches!(cap.id, "apps.list" | "apps.launch" | "matrix.media.upload")
         {
             rooms.push(room.to_string());
         } else {
@@ -879,6 +885,11 @@ fn collect_contract_flow(
         FlowOutput::TargetRoom => {
             for target in targets {
                 outputs.push((need_id.to_string(), Recipient::MatrixRoom { account: inputs.account.into(), room: target.clone() }));
+            }
+        }
+        FlowOutput::MatrixServer if matches!(cap.id, "matrix.media.upload" | "matrix.media.download") => {
+            if let Some(homeserver) = &inputs.homeserver_recipient {
+                outputs.push((need_id.to_string(), homeserver.clone()));
             }
         }
         // A network output is the website need's own item; peer routes carry
@@ -1026,8 +1037,10 @@ fn requested_approval(plan: &TaskPlan, approved: &BTreeSet<String>, overrides: &
 
 /// Computes the usable requested subset without weakening any sharing check.
 /// A missing output rule removes that output; a missing provider/reply rule
-/// removes the reads introducing its source. Rules for an omitted read never
-/// become dependencies of an otherwise usable output.
+/// removes the reads introducing its source. When that source is already
+/// held, writes to the reply recipient also depend on its sharing rule.
+/// Rules for an omitted read never become dependencies of an otherwise
+/// usable output.
 fn approval_state(plan: &TaskPlan, approved: &BTreeSet<String>, overrides: &BTreeMap<String, ItemState>) -> ApprovalState {
     let mut usable = requested_approval(plan, approved, overrides);
     let mut declined_dependency = BTreeSet::new();
@@ -1044,12 +1057,18 @@ fn approval_state(plan: &TaskPlan, approved: &BTreeSet<String>, overrides: &BTre
                 _ => false,
             };
             if available { continue; }
-            let causes = match plan.flow_dependencies.get(&item.id) {
-                Some(dependencies) if !dependencies.recipient_always => &dependencies.recipient_needs,
-                Some(dependencies) => &dependencies.source_needs,
-                None => because,
-            };
-            remove.extend(causes.iter().filter(|id| usable.contains(*id)).cloned());
+            match plan.flow_dependencies.get(&item.id) {
+                Some(dependencies) if !dependencies.recipient_always => {
+                    remove.extend(dependencies.recipient_needs.iter().filter(|id| usable.contains(*id)).cloned());
+                }
+                Some(dependencies) => {
+                    remove.extend(dependencies.source_needs.iter().filter(|id| usable.contains(*id)).cloned());
+                    if dependencies.source_already_held {
+                        remove.extend(dependencies.recipient_needs.iter().filter(|id| usable.contains(*id)).cloned());
+                    }
+                }
+                None => remove.extend(because.iter().filter(|id| usable.contains(*id)).cloned()),
+            }
         }
         if remove.is_empty() { break; }
         for id in remove {
@@ -1409,6 +1428,11 @@ mod tests {
         "matrix.space.rooms.list",
         "apps.list",
         "apps.launch",
+        "matrix.media.upload",
+        "matrix.media.download",
+        "matrix.media.send",
+        "host.composer.insert",
+        "host.composer.attach",
     ];
 
     fn tool_name(tool: &str) -> Option<String> {
@@ -1452,6 +1476,151 @@ mod tests {
 
     fn checked(plan: &TaskPlan) -> Vec<String> {
         plan.grantable().map(|item| item.id.clone()).collect()
+    }
+
+    #[test]
+    fn media_upload_needs_default_to_this_room_and_include_homeserver_sharing() {
+        let mut store = PermissionStore::default();
+        let lookup = FakeLookup { allowed: Default::default() };
+        let plan = resolve(&request(vec![TaskNeed::Capability { id: "upload".into(),
+            capability: "matrix.media.upload".into(), targets: vec![], why: None }]),
+            &inputs(&store, &|_| true, &lookup)).unwrap();
+        assert_eq!(plan.items[0].state, ItemState::NeedsGrant);
+        assert_eq!(plan.items[0].action.scope(), Some(&RoomScope::room("!ai:example.org")));
+        let homeserver = Recipient::network_origin("https://hs.example.org").unwrap();
+        let sharing = plan.items.iter().find(|item| matches!(&item.action,
+            PlanAction::Flow { source: Source::Room { room, .. }, recipient }
+                if room == "!ai:example.org" && recipient == &homeserver)).unwrap();
+        assert!(matches!(&sharing.origin, ItemOrigin::Implied { because } if because == &["upload"]));
+        let approved: BTreeSet<String> = checked(&plan).into_iter().filter(|id| id != &sharing.id).collect();
+        let applied = apply(&plan, &approved, &mut store, &FakeFlow::new()).unwrap();
+        assert!(store.scoped_grants(&plan.subject).is_empty());
+        assert_eq!(outcome_of(&plan, &approved, &applied)["not_granted"][0]["reason"], "declined_dependency");
+    }
+
+    #[test]
+    fn media_upload_grants_cannot_be_scoped_to_another_rooms_agent() {
+        let store = PermissionStore::default();
+        let lookup = FakeLookup { allowed: Default::default() };
+        for (target, expected) in [
+            ("!ai:example.org", ItemState::NeedsGrant),
+            ("!destination:example.org", ItemState::NotOffered(TaskReason::InvalidTarget)),
+        ] {
+            let plan = resolve(&request(vec![TaskNeed::Capability { id: "upload".into(),
+                capability: "matrix.media.upload".into(), targets: vec![target.into()], why: None }]),
+                &inputs(&store, &|_| true, &lookup)).unwrap();
+            assert_eq!(plan.items[0].state, expected);
+            assert_eq!(plan.items[0].action.scope(), Some(&RoomScope::room("!ai:example.org")));
+        }
+    }
+
+    #[test]
+    fn posting_in_this_room_depends_on_its_sharing_rule() {
+        for capability in ["matrix.media.send"] {
+            let mut store = PermissionStore::default();
+            store.set_matrix_write(true);
+            let lookup = FakeLookup { allowed: Default::default() };
+            let plan = resolve(&request(vec![TaskNeed::Capability { id: "draft".into(),
+                capability: capability.into(), targets: vec![], why: None }]),
+                &inputs(&store, &|_| true, &lookup)).unwrap();
+            assert_eq!(plan.items[0].state, ItemState::NeedsGrant);
+            let sharing = plan.items.iter().find(|item| matches!(&item.action,
+                PlanAction::Flow { source: Source::Room { room, .. }, recipient: Recipient::MatrixRoom { room: target, .. } }
+                    if room == "!ai:example.org" && target == room)).unwrap();
+            let approved: BTreeSet<String> = checked(&plan).into_iter().filter(|id| id != &sharing.id).collect();
+            let applied = apply(&plan, &approved, &mut store, &FakeFlow::new()).unwrap();
+            assert!(store.scoped_grants(&plan.subject).is_empty());
+            assert_eq!(outcome_of(&plan, &approved, &applied)["not_granted"][0]["reason"], "declined_dependency");
+        }
+    }
+
+    #[test]
+    fn composer_only_needs_grant_drafts_without_sending_or_outgoing_sharing() {
+        for capability in ["host.composer.insert", "host.composer.attach"] {
+            let mut store = PermissionStore::default();
+            let lookup = FakeLookup { allowed: Default::default() };
+            store.set_room_policy("!target:example.org", RoomAccess::Write, PolicyDecision::Deny);
+            store.set_room_spaces("!target:example.org", vec!["!parent:example.org".into()]);
+            store.set_space_policy("!parent:example.org", RoomAccess::Write, PolicyDecision::Deny);
+            for permission in [Permission::MatrixRoomSend, Permission::MatrixRoomsSend, Permission::MatrixMedia] {
+                store.set("ai-room:!ai:example.org", permission, GrantState::Denied);
+            }
+            let plan = resolve(&request(vec![TaskNeed::Capability { id: "draft".into(),
+                capability: capability.into(), targets: vec!["!target:example.org".into()], why: None }]),
+                &inputs(&store, &|_| true, &lookup)).unwrap();
+            assert_eq!(plan.items[0].state, ItemState::NeedsGrant);
+            assert!(plan.items.iter().all(|item| !matches!(&item.action,
+                PlanAction::Flow { recipient: Recipient::MatrixRoom { room, .. }, .. } if room == "!target:example.org")));
+            // Baseline agent reply/provider rules remain separate from the
+            // draft and do not need approval to prepare local content.
+            assert!(plan.items.iter().all(|item| !matches!(&item.origin,
+                ItemOrigin::Implied { because } if because.contains(&String::from("draft")))));
+            let approved = [String::from("draft")].into_iter().collect();
+            let applied = apply(&plan, &approved, &mut store, &FakeFlow::new()).unwrap();
+            assert!(outcome_of(&plan, &approved, &applied)["granted"].as_array().unwrap().contains(&serde_json::json!("draft")));
+            let grants = store.scoped_grants(&plan.subject);
+            assert_eq!(grants.len(), 1);
+            assert_eq!(grants[0].capability.as_deref(), Some(capability));
+            assert!(!store.matrix_write());
+            let context = PermissionContext { origin_room: Some("!ai:example.org"), target_room: Some("!target:example.org") };
+            let cap = capabilities::by_id(capability).unwrap();
+            assert_eq!(store.effective_capability_for_in_context(&plan.subject, |_| true, |_| true, cap, context), Effective::Granted);
+            for send in ["matrix.room.message.send", "matrix.rooms.message.send", "matrix.media.send", "matrix.media.upload"] {
+                assert_eq!(store.effective_capability_for_in_context(&plan.subject, |_| true, |_| true,
+                    capabilities::by_id(send).unwrap(), context), Effective::Denied);
+            }
+        }
+    }
+
+    #[test]
+    fn upfront_media_needs_respect_room_and_explicit_capability_denials() {
+        for (capability, access) in [("matrix.media.send", RoomAccess::Write), ("host.composer.attach", RoomAccess::Read)] {
+            let mut store = PermissionStore::default();
+            store.set_matrix_write(true);
+            let lookup = FakeLookup { allowed: Default::default() };
+            let need = request(vec![TaskNeed::Capability { id: "media".into(),
+                capability: capability.into(), targets: vec!["!target:example.org".into()], why: None }]);
+            let plan = resolve(&need, &inputs(&store, &|_| true, &lookup)).unwrap();
+            assert_eq!(plan.items[0].state, ItemState::NeedsGrant);
+            store.set_room_policy("!target:example.org", access, PolicyDecision::Deny);
+            let plan = resolve(&need, &inputs(&store, &|_| true, &lookup)).unwrap();
+            assert_eq!(plan.items[0].state, ItemState::Blocked(TaskReason::BlockedByRoomPolicy));
+            store.set_room_policy("!target:example.org", access, PolicyDecision::Ask);
+            store.set_capability("ai-room:!ai:example.org", capability, GrantState::Denied);
+            let plan = resolve(&need, &inputs(&store, &|_| true, &lookup)).unwrap();
+            assert_eq!(plan.items[0].state, ItemState::Blocked(TaskReason::BlockedByPermission));
+        }
+        let mut store = PermissionStore::default();
+        store.set("ai-room:!ai:example.org", Permission::MatrixMedia, GrantState::Denied);
+        let lookup = FakeLookup { allowed: Default::default() };
+        let plan = resolve(&request(vec![TaskNeed::Capability { id: "upload".into(),
+            capability: "matrix.media.upload".into(), targets: vec![], why: None }]),
+            &inputs(&store, &|_| true, &lookup)).unwrap();
+        assert_eq!(plan.items[0].state, ItemState::Blocked(TaskReason::BlockedByPermission));
+    }
+
+    #[test]
+    fn matrix_attachment_preparation_uses_source_room_reads_and_homeserver_sharing() {
+        let mut store = PermissionStore::default();
+        let lookup = FakeLookup { allowed: Default::default() };
+        let need = request(vec![TaskNeed::Capability { id: "fetch".into(),
+            capability: "matrix.media.download".into(), targets: vec!["!source:example.org".into()], why: None }]);
+        let plan = resolve(&need, &inputs(&store, &|_| true, &lookup)).unwrap();
+        assert_eq!(plan.items[0].state, ItemState::NeedsGrant, "downloading does not need the room write switch");
+        let source = Source::Room { account: "alice".into(), room: "!source:example.org".into() };
+        for recipient in [Recipient::ModelProvider("provider".into()),
+            Recipient::network_origin("https://hs.example.org").unwrap()]
+        {
+            assert!(plan.items.iter().any(|item| matches!(&item.action,
+                PlanAction::Flow { source: item_source, recipient: item_recipient }
+                    if item_source == &source && item_recipient == &recipient)));
+        }
+        store.set_room_policy("!source:example.org", RoomAccess::Write, PolicyDecision::Deny);
+        let plan = resolve(&need, &inputs(&store, &|_| true, &lookup)).unwrap();
+        assert_eq!(plan.items[0].state, ItemState::NeedsGrant);
+        store.set_room_policy("!source:example.org", RoomAccess::Read, PolicyDecision::Deny);
+        let plan = resolve(&need, &inputs(&store, &|_| true, &lookup)).unwrap();
+        assert_eq!(plan.items[0].state, ItemState::Blocked(TaskReason::BlockedByRoomPolicy));
     }
 
     #[test]

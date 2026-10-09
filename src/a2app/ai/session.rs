@@ -42,7 +42,7 @@ use matrix_sdk::ruma::OwnedRoomId;
 use serde_json::{Map, Value};
 
 use super::server::ToolServer;
-use super::tools::{AiHost, MiniAppTool, MiniAppToolBridge, ReadToolKind, register_session_tools};
+use super::tools::{AiHost, MediaDraftRequest, MiniAppTool, MiniAppToolBridge, ReadToolKind, register_session_tools};
 
 /// A tool call that arrived on a session's MCP serve thread, waiting for the
 /// UI thread to execute it. Each variant carries the channel the answer goes
@@ -78,6 +78,22 @@ pub enum SessionJob {
     },
     /// `send_message`: post plain text into the session's room.
     SendRoomMessage { text: String, answer: Sender<Result<String, String>> },
+    /// `draft_message`: insert text into this room's composer for review.
+    DraftMessage { text: String, answer: Sender<Result<String, String>> },
+    /// `draft_media`: prepare local bytes; URL acquisition remains host-gated.
+    DraftMedia { request: MediaDraftRequest, answer: Sender<Result<String, String>> },
+    /// `attach_media`: stage a session-owned draft in the attached room's composer.
+    AttachMedia { draft_id: String, answer: Sender<Result<String, String>> },
+    /// `post_room_media`: upload and send native media under its upload/send
+    /// permissions. `permission` is the runtime's current gate, never an agent argument.
+    PostRoomMedia {
+        draft_id: String,
+        room_id: Option<String>,
+        permission: &'static str,
+        /// Captured consent belongs to this request through later prompts.
+        authorizations: Vec<crate::a2app::matrix::policy::MatrixAuthorization>,
+        answer: Sender<Result<String, String>>,
+    },
     /// `request_task_permissions`: the agent's upfront plan for a whole task.
     /// The runtime resolves it against the capability catalog, room policy and
     /// information-flow rules, shows one prompt, and applies the approved
@@ -215,6 +231,33 @@ impl AiHost for SessionHost {
         answer_rx
             .recv()
             .map_err(|_| "this session ended before the message was posted".to_string())?
+    }
+
+    fn draft_message(&self, text: &str) -> Result<String, String> {
+        let (answer, result) = channel();
+        self.submit(SessionJob::DraftMessage { text: text.to_string(), answer })?;
+        result.recv().map_err(|_| "this session ended before the message draft was inserted".to_string())?
+    }
+
+    fn draft_media(&self, request: MediaDraftRequest) -> Result<String, String> {
+        let (answer, result) = channel();
+        self.submit(SessionJob::DraftMedia { request, answer })?;
+        result.recv().map_err(|_| "this session ended before the media draft was prepared".to_string())?
+    }
+
+    fn attach_media(&self, draft_id: &str) -> Result<String, String> {
+        let (answer, result) = channel();
+        self.submit(SessionJob::AttachMedia { draft_id: draft_id.to_string(), answer })?;
+        result.recv().map_err(|_| "this session ended before the media draft was attached".to_string())?
+    }
+
+    fn post_room_media(&self, draft_id: &str, room: Option<&str>) -> Result<String, String> {
+        let (answer, result) = channel();
+        self.submit(SessionJob::PostRoomMedia {
+            draft_id: draft_id.to_string(), room_id: room.map(str::to_string),
+            permission: "matrix.media.upload", authorizations: Vec::new(), answer,
+        })?;
+        result.recv().map_err(|_| "this session ended before the media was posted".to_string())?
     }
 
     fn post_room_message(&self, room: &str, text: &str) -> Result<String, String> {
@@ -790,6 +833,24 @@ impl Drop for AiSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_posts_start_with_the_hosts_upload_gate_and_keep_the_target() {
+        let (jobs_tx, jobs_rx) = channel();
+        let host = Arc::new(SessionHost { jobs: jobs_tx });
+        for room in [None, Some("!target:example.org")] {
+            let caller_host = host.clone();
+            let caller = std::thread::spawn(move || caller_host.post_room_media("draft-1", room));
+            let job = jobs_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let SessionJob::PostRoomMedia { draft_id, room_id, permission, authorizations, answer } = job else { panic!("expected media post") };
+            assert_eq!(draft_id, "draft-1");
+            assert_eq!(room_id.as_deref(), room);
+            assert_eq!(permission, "matrix.media.upload", "the agent cannot choose or skip the first gate");
+            assert!(authorizations.is_empty(), "a fresh call must not inherit another job's Allow once receipts");
+            answer.send(Err("permission denied".into())).unwrap();
+            assert_eq!(caller.join().unwrap(), Err("permission denied".into()));
+        }
+    }
 
     /// The rendezvous at the heart of the session host: a tool call made on
     /// one thread parks until the "UI thread" drains the job, does the work,

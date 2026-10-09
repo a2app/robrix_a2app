@@ -14,6 +14,9 @@ pub enum MatrixServiceCall {
     ReadMessages { limit: u32 },
     /// Send a plain text message to the attached room as the user.
     SendMessage { body: String },
+    /// Upload and post inline media to the attached room as the user.
+    /// Upload/send grants are separate from local composer drafting.
+    SendMedia { data_base64: String, filename: String, mime_type: String, caption: Option<String> },
     /// `{user_id, display_name}` — the user's own identity.
     Profile,
     /// `{count, members: [{name, user_id, power}]}` for the attached room.
@@ -214,6 +217,15 @@ pub fn parse(service: &str, args: &serde_json::Value, has_room: bool) -> Result<
             limit: args["limit"].as_u64().unwrap_or(20).clamp(1, 50) as u32,
         },
         "matrix.send_message" => MatrixServiceCall::SendMessage { body: text_body(service, args)? },
+        "matrix.send_media" => {
+            if args.get("room_id").is_some() {
+                return Err("matrix.send_media only posts to the attached room; room_id is not accepted".into());
+            }
+            let super::HostAction::ComposerAttach { data_base64, filename, mime_type, caption, .. } =
+                super::parse_composer_attachment(args, None).map_err(|error| error.replace("composer.attach", service))?
+                else { unreachable!("the inline parser only returns an attachment") };
+            MatrixServiceCall::SendMedia { data_base64, filename, mime_type, caption }
+        },
 
         // --- room ---
         "matrix.thread_replies" => {
@@ -379,6 +391,7 @@ pub fn cost(service: &str) -> f64 {
         "matrix.user_profile" => 5.0,
         // ----- send: speaks as the user -----
         "matrix.send_message" => 5.0,
+        "matrix.send_media" => 8.0,
         "matrix.typing" => 1.0,
         "matrix.favorite" | "matrix.low_priority" | "matrix.mark_unread" => 5.0,
         "matrix.reply" | "matrix.thread_reply" | "matrix.react" | "matrix.read_receipt"
@@ -606,6 +619,44 @@ mod send_tests {
             Ok(_) => panic!("{service} should be rejected"),
             Err(e) => e,
         }
+    }
+
+    #[test]
+    fn media_send_keeps_exact_inline_bytes_and_caption_for_the_attached_room() {
+        let args = json!({"data_base64":"AAH/","filename":"fixture.bin","mime_type":"Application/Octet-Stream","caption":"  Please review this file  "});
+        let MatrixServiceCall::SendMedia { data_base64, filename, mime_type, caption } = parse_ok("matrix.send_media", args.clone())
+            else { panic!("expected a native media send") };
+        assert_eq!(data_base64, "AAH/");
+        assert_eq!(filename, "fixture.bin");
+        assert_eq!(mime_type, "application/octet-stream");
+        assert_eq!(caption.as_deref(), Some("  Please review this file  "));
+        assert!(matches!(parse("matrix.send_media", &args, false), Err(error) if error.contains("not attached to a room")));
+        assert_eq!(cost("matrix.send_media"), 8.0);
+    }
+
+    #[test]
+    fn media_send_rejects_remote_targets_paths_invalid_or_oversized_inline_data() {
+        let valid = json!({"data_base64":"bWVkaWE=","filename":"fixture.txt","mime_type":"text/plain"});
+        for (field, value) in [
+            ("room_id", json!("!another:test")), ("room_id", serde_json::Value::Null),
+            ("path", json!("/private/file")), ("url", json!("https://example.test/file")),
+            ("filename", json!("../file")), ("mime_type", json!("image/*")),
+            ("caption", json!(true)), ("data_base64", json!("data:image/png;base64,bWVkaWE=")),
+            ("data_base64", json!("bWVkaWE")),
+            ("data_base64", json!("x".repeat(super::super::MAX_COMPOSER_MEDIA_BASE64_BYTES + 1))),
+        ] {
+            let mut args = valid.clone();
+            args[field] = value;
+            assert!(parse("matrix.send_media", &args, true).is_err(), "accepted invalid {field}");
+        }
+        for field in ["data_base64", "filename", "mime_type"] {
+            let mut args = valid.clone();
+            args.as_object_mut().unwrap().remove(field);
+            assert!(parse_err("matrix.send_media", args).contains(field));
+        }
+        let mut args = valid;
+        args["unknown"] = json!("anything");
+        assert!(parse_err("matrix.send_media", args).starts_with("matrix.send_media"));
     }
 
     #[test]

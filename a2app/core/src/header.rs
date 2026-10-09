@@ -141,6 +141,15 @@ mod tests {
     }
 
     #[test]
+    fn composer_draft_header_declares_no_posting_permissions() {
+        let header = parse_app_header("// permissions: host.composer.insert, host.composer.attach\nView{}");
+        assert_eq!(header.permissions, ["robrix-composer"]);
+        assert_eq!(header.capabilities, ["host.composer.insert", "host.composer.attach"]);
+        assert_eq!(crate::capabilities::for_service("composer.attach").unwrap().id, "host.composer.attach");
+        assert!(!header.permissions.iter().any(|permission| permission == "matrix-room-send" || permission == "matrix-media"));
+    }
+
+    #[test]
     fn background_support_requires_explicit_header_opt_in() {
         assert!(parse_app_header("// background: true\nView{}").background);
         assert!(!parse_app_header("// background: yes\nView{}").background);

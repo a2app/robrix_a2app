@@ -70,6 +70,20 @@ pub trait AiHost: Send + Sync {
     /// Posts `text` into the room associated with this session.
     fn send_room_message(&self, text: &str) -> Result<String, String>;
 
+    /// Inserts a text draft into this room's composer; the user presses Send.
+    fn draft_message(&self, text: &str) -> Result<String, String>;
+
+    /// Prepares bounded media bytes locally and returns an opaque session draft id.
+    /// URL sources use the same destination and sharing gates as [`Self::fetch_url`].
+    fn draft_media(&self, request: MediaDraftRequest) -> Result<String, String>;
+
+    /// Attaches a prepared draft to this room's composer for the user to send.
+    fn attach_media(&self, draft_id: &str) -> Result<String, String>;
+
+    /// Uploads and posts a prepared draft as a native Matrix media message.
+    /// An omitted room means this session's room; another room requires its send grant.
+    fn post_room_media(&self, draft_id: &str, room: Option<&str>) -> Result<String, String>;
+
     /// Posts `text` into ANOTHER joined room as an `m.notice` message, gated
     /// per room (the user is asked the first time this agent posts into each
     /// room).
@@ -261,6 +275,11 @@ pub const AI_ROOM_SESSION_CAP_IDS: &[&str] = &[
     "apps.list",
     "apps.launch",
     "matrix.rooms.message.send",
+    "host.composer.insert",
+    "host.composer.attach",
+    "matrix.media.upload",
+    "matrix.media.send",
+    "matrix.media.download",
     // The AI room can invoke tools a mini-app registered in it (each tool is
     // granted per tool, see `PermissionStore::tool_effective`); declaring the
     // incoming hook puts the `mcp-tools` group in the room's AI panel so the
@@ -327,10 +346,13 @@ impl Tool for ReadRoomMessagesTool {
     }
 
     fn description(&self) -> &str {
-        "Returns this room's recent text messages, oldest first, as JSON \
+        "Returns this room's recent messages, oldest first, as JSON \
          rows. Each row has the sender, the sender_id, the event_id, the \
          room_id, the body, and whether the user has already read it \
          (unread: true means it arrived after the user's last read receipt). \
+         Attachment rows include media metadata (filename, MIME type, URI \
+         and encrypted flag, without keys); use their event_id with draft_media \
+         to prepare media through the host, including encrypted attachments. \
          Use it to catch up on conversation you have not been told about — \
          when asked to summarize, focus on the rows where unread is true."
     }
@@ -374,7 +396,8 @@ impl Tool for ReadOlderMessagesTool {
          already saw. Pass `before` — the event id of the earliest message \
          you have — to get the messages that came before it. Rows carry the \
          sender, sender_id, event_id, room_id, body and an unread flag, as \
-         in read_room_messages."
+         in read_room_messages, including attachment metadata; use the row's \
+         event_id with draft_media to prepare its bytes through the host."
     }
 
     fn input_schema(&self) -> Value {
@@ -452,11 +475,13 @@ impl Tool for ReadOtherRoomMessagesTool {
     }
 
     fn description(&self) -> &str {
-        "Returns the recent text messages of another joined room you name, as \
+        "Returns the recent messages of another joined room you name, as \
          JSON rows with the sender, sender_id, event_id, the row's own \
          room_id, body, and an unread flag (true when the user hasn't read it \
          yet). The user is asked to allow each room the first time you read \
-         from it; once allowed that one room stays allowed, but a different \
+         from it. Attachment rows include media metadata without keys; pass \
+         their event_id and use their room_id as source_room in draft_media. Once \
+         allowed that one room stays allowed, but a different \
          room is a fresh ask. Use list_rooms to see which rooms exist."
     }
 
@@ -1035,6 +1060,202 @@ impl Tool for SendMessageTool {
     }
 }
 
+/// A media source supplied by the agent. No source grants filesystem access;
+/// URL fetching and byte decoding remain in the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaSource {
+    Url(String),
+    Base64(String),
+    MatrixUri(String),
+    MatrixEvent { event_id: String, room_id: Option<String> },
+}
+
+/// Validated metadata for a local, session-owned media draft. Preparing this
+/// draft does not upload it; attaching and posting are separate gated effects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaDraftRequest {
+    pub source: MediaSource,
+    pub filename: String,
+    pub mime_type: String,
+    pub caption: Option<String>,
+}
+
+/// Keeps inline tool arguments comfortably below the MCP and broker frame caps.
+/// Larger media can be prepared from a URL, subject to the host's download limit.
+pub const MAX_INLINE_MEDIA_BASE64_BYTES: usize = 4 * 1024 * 1024;
+
+fn reject_unknown_arguments(arguments: &Map<String, Value>, allowed: &[&str]) -> Result<(), String> {
+    if let Some(name) = arguments.keys().find(|name| !allowed.contains(&name.as_str())) {
+        return Err(format!("unsupported argument `{name}`"));
+    }
+    Ok(())
+}
+
+fn required_string(arguments: &Map<String, Value>, name: &str) -> Result<String, String> {
+    arguments.get(name).and_then(Value::as_str).map(str::trim)
+        .filter(|value| !value.is_empty()).map(str::to_string)
+        .ok_or_else(|| format!("this tool needs a non-empty string `{name}`"))
+}
+
+impl MediaDraftRequest {
+    pub fn from_arguments(arguments: &Map<String, Value>) -> Result<Self, String> {
+        reject_unknown_arguments(arguments, &["url", "data_base64", "mxc_uri", "event_id", "source_room", "filename", "mime_type", "caption"])?;
+        if arguments.contains_key("source_room") && !arguments.contains_key("event_id") {
+            return Err("`source_room` applies only to an `event_id` source".into());
+        }
+        let filename = required_string(arguments, "filename")?;
+        if filename.len() > 255 || matches!(filename.as_str(), "." | "..")
+            || filename.chars().any(|ch| ch.is_control() || ch == '/' || ch == '\\') {
+            return Err("`filename` must be a single filename, at most 255 bytes, without path separators or control characters".into());
+        }
+        let mime_type = required_string(arguments, "mime_type")?;
+        let parsed: mime::Mime = mime_type.parse().map_err(|_| "`mime_type` must be a concrete media type, e.g. image/png")?;
+        if parsed.type_() == mime::STAR || parsed.subtype() == mime::STAR || parsed.params().next().is_some() {
+            return Err("`mime_type` must name one media type without wildcards or parameters".into());
+        }
+        let caption = match arguments.get("caption") {
+            None => None,
+            Some(Value::String(text)) if text.len() <= 16 * 1024 => Some(text.clone()),
+            _ => return Err("`caption` must be a string at most 16 KiB long".into()),
+        };
+        let source = match (arguments.get("url"), arguments.get("data_base64"), arguments.get("mxc_uri"), arguments.get("event_id")) {
+            (Some(_), None, None, None) => {
+                let url = required_string(arguments, "url")?;
+                if url.len() > 8192 { return Err("`url` must be at most 8192 bytes long".into()); }
+                let parsed = url::Url::parse(&url).map_err(|_| "`url` must be a complete HTTP(S) URL")?;
+                if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none()
+                    || !parsed.username().is_empty() || parsed.password().is_some() {
+                    return Err("`url` must be a complete HTTP(S) URL without credentials".into());
+                }
+                MediaSource::Url(url)
+            }
+            (None, Some(_), None, None) => {
+                let data = required_string(arguments, "data_base64")?;
+                if data.len() > MAX_INLINE_MEDIA_BASE64_BYTES {
+                    return Err("inline media exceeds the 4 MiB base64 limit; use a media URL for larger files".into());
+                }
+                MediaSource::Base64(data)
+            }
+            (None, None, Some(_), None) => {
+                let uri = required_string(arguments, "mxc_uri")?;
+                if uri.len() > 8192 || !<&matrix_sdk::ruma::MxcUri>::from(uri.as_str()).is_valid() {
+                    return Err("`mxc_uri` must be a valid Matrix media URI, e.g. mxc://example.org/media-id".into());
+                }
+                MediaSource::MatrixUri(uri)
+            }
+            (None, None, None, Some(_)) => {
+                let event_id = required_string(arguments, "event_id")?;
+                if matrix_sdk::ruma::EventId::parse(&event_id).is_err() {
+                    return Err("`event_id` must be a valid Matrix event id".into());
+                }
+                let room_id = if arguments.contains_key("source_room") {
+                    let room = required_string(arguments, "source_room")?;
+                    if matrix_sdk::ruma::RoomId::parse(&room).is_err() {
+                        return Err("`source_room` must be a valid Matrix room id".into());
+                    }
+                    Some(room)
+                } else { None };
+                MediaSource::MatrixEvent { event_id, room_id }
+            }
+            _ => return Err("`draft_media` needs exactly one source: `url`, `data_base64`, `mxc_uri` or `event_id`".into()),
+        };
+        Ok(Self { source, filename, mime_type: parsed.to_string(), caption })
+    }
+}
+
+/// Stages text using the established composer permission.
+pub struct DraftMessageTool { host: Arc<dyn AiHost> }
+impl DraftMessageTool {
+    pub fn new(host: Arc<dyn AiHost>) -> Self { Self { host } }
+}
+impl Tool for DraftMessageTool {
+    fn name(&self) -> &str { "draft_message" }
+    fn description(&self) -> &str {
+        "Put a text draft in this room's message box for the user to review and send. Requires host.composer.insert, independently of message-send permissions and the Matrix writes switch; it does not post the message."
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type":"object","properties":{"text":{"type":"string","description":"Text to put in the message box."}},"required":["text"],"additionalProperties":false})
+    }
+    fn call(&self, arguments: &Map<String, Value>) -> Result<String, String> {
+        reject_unknown_arguments(arguments, &["text"])?;
+        self.host.draft_message(&required_string(arguments, "text")?)
+    }
+}
+
+/// Prepares media without either uploading it or posting a message.
+pub struct DraftMediaTool { host: Arc<dyn AiHost> }
+impl DraftMediaTool {
+    pub fn new(host: Arc<dyn AiHost>) -> Self { Self { host } }
+}
+impl Tool for DraftMediaTool {
+    fn name(&self) -> &str { "draft_media" }
+    fn description(&self) -> &str {
+        "Prepare image, audio, video or file bytes locally. Supply exactly one of url (HTTP(S)), mxc_uri (an attachment verified in this room's cached events), event_id (a room attachment, including encrypted media), or data_base64 (raw base64, at most 4 MiB), plus filename and mime_type. event_id defaults here; source_room selects another joined source room. Unknown mxc_uri requires event_id and source_room. HTTP(S) uses website and sharing approvals. Matrix downloads require matrix.media.download and no internet permission. Returns draft_id and metadata; nothing uploaded or posted. Use attach_media or post_room_media next."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "url":{"type":"string","description":"Complete HTTP(S) media URL, approved as a website need before fetching."},
+                "mxc_uri":{"type":"string","description":"Matrix media URI verified against an attachment in this room's cached original events. Unknown URI: use event_id and source_room instead. Uses matrix.media.download, not website access."},
+                "event_id":{"type":"string","description":"Matrix event id of an existing image, audio, video or file attachment. Use this for encrypted media and to preserve room provenance."},
+                "source_room":{"type":"string","description":"Joined room containing event_id. Omit for this room. Only valid with event_id."},
+                "data_base64":{"type":"string","maxLength":MAX_INLINE_MEDIA_BASE64_BYTES,"description":"Raw base64 of media bytes. Do not include a data: URL prefix."},
+                "filename":{"type":"string","maxLength":255,"description":"A single filename, e.g. diagram.png; never a local path."},
+                "mime_type":{"type":"string","description":"Concrete MIME type, e.g. image/png, audio/mpeg, video/mp4 or application/pdf."},
+                "caption":{"type":"string","maxLength":16384,"description":"Optional caption for the prepared attachment."}
+            },
+            "required":["filename","mime_type"],
+            "oneOf":[{"required":["url"]},{"required":["data_base64"]},{"required":["mxc_uri"]},{"required":["event_id"]}],
+            "additionalProperties":false
+        })
+    }
+    fn call(&self, arguments: &Map<String, Value>) -> Result<String, String> {
+        self.host.draft_media(MediaDraftRequest::from_arguments(arguments)?)
+    }
+}
+
+pub struct AttachMediaTool { host: Arc<dyn AiHost> }
+impl AttachMediaTool {
+    pub fn new(host: Arc<dyn AiHost>) -> Self { Self { host } }
+}
+impl Tool for AttachMediaTool {
+    fn name(&self) -> &str { "attach_media" }
+    fn description(&self) -> &str {
+        "Attach a draft_media draft to this room's composer so the user can review and press Send. Requires host.composer.attach, independently of upload/send permissions and the Matrix writes switch. Pass only a draft_id returned by draft_media in this session; this tool does not upload or post it."
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type":"object","properties":{"draft_id":{"type":"string","description":"Opaque draft_id returned by draft_media."}},"required":["draft_id"],"additionalProperties":false})
+    }
+    fn call(&self, arguments: &Map<String, Value>) -> Result<String, String> {
+        reject_unknown_arguments(arguments, &["draft_id"])?;
+        self.host.attach_media(&required_string(arguments, "draft_id")?)
+    }
+}
+
+pub struct PostRoomMediaTool { host: Arc<dyn AiHost> }
+impl PostRoomMediaTool {
+    pub fn new(host: Arc<dyn AiHost>) -> Self { Self { host } }
+}
+impl Tool for PostRoomMediaTool {
+    fn name(&self) -> &str { "post_room_media" }
+    fn description(&self) -> &str {
+        "Upload and post a prepared draft_media draft as a native Matrix image, audio, video or file message. Omit room to post here, or name another joined room from list_rooms. Request matrix.media.upload and matrix.media.send before posting; another room also requires matrix.rooms.message.send for that room. Private-data sharing and exact-action review still apply. Pass only a draft_id returned by draft_media in this session."
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type":"object","properties":{
+            "draft_id":{"type":"string","description":"Opaque draft_id returned by draft_media."},
+            "room":{"type":"string","description":"Optional joined Matrix room id. Omit to post in this room."}
+        },"required":["draft_id"],"additionalProperties":false})
+    }
+    fn call(&self, arguments: &Map<String, Value>) -> Result<String, String> {
+        reject_unknown_arguments(arguments, &["draft_id", "room"])?;
+        let draft_id = required_string(arguments, "draft_id")?;
+        let room = if arguments.contains_key("room") { Some(required_string(arguments, "room")?) } else { None };
+        self.host.post_room_media(&draft_id, room.as_deref())
+    }
+}
+
 /// `request_task_permissions` — ask once, for the whole task.
 ///
 /// The agent plans every room it must read, every place it will write, every
@@ -1255,12 +1476,87 @@ pub fn register_session_tools(server: &mut a2app_agent::mcp::McpServer, host: Ar
     // the fallback for anything the agent did not list.
     server.add_tool(RequestTaskPermissionsTool::new(host.clone()));
     server.add_tool(WebFetchTool::new(host.clone()));
-    server.add_tool(PostRoomMessageTool::new(host));
+    server.add_tool(PostRoomMessageTool::new(host.clone()));
+    server.add_tool(DraftMessageTool::new(host.clone()));
+    server.add_tool(DraftMediaTool::new(host.clone()));
+    server.add_tool(AttachMediaTool::new(host.clone()));
+    server.add_tool(PostRoomMediaTool::new(host));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_drafts_accept_one_source_and_preserve_caption() {
+        let url = json!({"url":"https://example.org/photo.png","filename":"photo.png","mime_type":"image/png","caption":"A photo"});
+        let request = MediaDraftRequest::from_arguments(url.as_object().unwrap()).unwrap();
+        assert_eq!(request.source, MediaSource::Url("https://example.org/photo.png".into()));
+        assert_eq!(request.caption.as_deref(), Some("A photo"));
+        let inline = json!({"data_base64":"aGVsbG8=","filename":"hello.txt","mime_type":"text/plain"});
+        let request = MediaDraftRequest::from_arguments(inline.as_object().unwrap()).unwrap();
+        assert_eq!(request.source, MediaSource::Base64("aGVsbG8=".into()));
+        assert_eq!(request.caption, None);
+        let matrix = json!({"mxc_uri":"mxc://example.org/photo","filename":"photo.png","mime_type":"image/png"});
+        let request = MediaDraftRequest::from_arguments(matrix.as_object().unwrap()).unwrap();
+        assert_eq!(request.source, MediaSource::MatrixUri("mxc://example.org/photo".into()));
+        let event = json!({"event_id":"$photo","source_room":"!source:example.org","filename":"photo.png","mime_type":"image/png"});
+        let request = MediaDraftRequest::from_arguments(event.as_object().unwrap()).unwrap();
+        assert_eq!(request.source, MediaSource::MatrixEvent { event_id: "$photo".into(), room_id: Some("!source:example.org".into()) });
+        let event = json!({"event_id":"$photo","filename":"photo.png","mime_type":"image/png"});
+        let request = MediaDraftRequest::from_arguments(event.as_object().unwrap()).unwrap();
+        assert_eq!(request.source, MediaSource::MatrixEvent { event_id: "$photo".into(), room_id: None });
+    }
+
+    #[test]
+    fn media_drafts_refuse_paths_ambiguous_sources_credentials_and_unbounded_data() {
+        let valid = json!({"url":"https://example.org/photo.png","filename":"photo.png","mime_type":"image/png"});
+        for (name, value) in [
+            ("filename", json!("../photo.png")),
+            ("filename", json!("C:\\photo.png")),
+            ("filename", json!("photo\n.png")),
+            ("filename", json!("..")),
+            ("mime_type", json!("image/*")),
+            ("mime_type", json!("image/png; charset=utf-8")),
+            ("url", json!("file:///Users/someone/photo.png")),
+            ("url", json!("https://user:secret@example.org/photo.png")),
+            ("url", json!(42)),
+            ("caption", json!(false)),
+            ("caption", json!("x".repeat(16 * 1024 + 1))),
+            ("path", json!("/Users/someone/photo.png")),
+        ] {
+            let mut args = valid.as_object().unwrap().clone();
+            args.insert(name.into(), value);
+            assert!(MediaDraftRequest::from_arguments(&args).is_err(), "accepted invalid {name}");
+        }
+        let mut args = valid.as_object().unwrap().clone();
+        args.insert("data_base64".into(), json!("aGVsbG8="));
+        assert!(MediaDraftRequest::from_arguments(&args).is_err(), "two sources must be refused");
+        args.remove("url");
+        args.insert("data_base64".into(), json!("x".repeat(MAX_INLINE_MEDIA_BASE64_BYTES + 1)));
+        assert!(MediaDraftRequest::from_arguments(&args).is_err(), "inline payload must stay bounded");
+        args.remove("data_base64");
+        assert!(MediaDraftRequest::from_arguments(&args).is_err(), "a source must be supplied");
+        args.insert("mxc_uri".into(), json!("https://example.org/photo.png"));
+        assert!(MediaDraftRequest::from_arguments(&args).is_err(), "Matrix sources must use valid mxc URIs");
+        args.insert("mxc_uri".into(), json!("mxc://example.org/photo"));
+        args.insert("url".into(), json!("https://example.org/photo.png"));
+        assert!(MediaDraftRequest::from_arguments(&args).is_err(), "Matrix and HTTP sources cannot be combined");
+        let event = json!({"event_id":"not-an-event","filename":"photo.png","mime_type":"image/png"});
+        assert!(MediaDraftRequest::from_arguments(event.as_object().unwrap()).is_err(), "event ids must be valid");
+        let event = json!({"event_id":"$photo","source_room":"not-a-room","filename":"photo.png","mime_type":"image/png"});
+        assert!(MediaDraftRequest::from_arguments(event.as_object().unwrap()).is_err(), "source room ids must be valid");
+        let event = json!({"url":"https://example.org/photo.png","source_room":"!source:example.org","filename":"photo.png","mime_type":"image/png"});
+        assert!(MediaDraftRequest::from_arguments(event.as_object().unwrap()).is_err(), "source_room must not decorate another source");
+    }
+
+    #[test]
+    fn media_and_composer_capabilities_are_in_the_agent_profile() {
+        for id in ["host.composer.insert", "host.composer.attach", "matrix.media.upload", "matrix.media.send", "matrix.media.download"] {
+            assert!(AI_ROOM_SESSION_CAP_IDS.contains(&id));
+            assert!(by_id(id).is_some_and(|cap| cap.is_available()), "{id} must be implemented before it is offered");
+        }
+    }
 
     /// Each read tool maps onto exactly the catalog capability its prompt and
     /// access record should name; a typo in `capability_id` is caught here.

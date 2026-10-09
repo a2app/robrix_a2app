@@ -178,8 +178,15 @@ impl MatrixAuthorization {
     pub fn commit_action(&self, target: &str, payload: &serde_json::Value) -> Result<(), String> {
         self.check_context()?;
         let context = self.flow_context.as_ref().ok_or("Missing host information-flow context.")?;
-        flow::commit_exact_action_for_activation(context, self.flow_epoch.ok_or("Missing information-flow activation.")?,
-            &SensitiveAction { kind: self.capability.clone(), target: target.into() }, payload)
+        let epoch = self.flow_epoch.ok_or("Missing information-flow activation.")?;
+        let action = SensitiveAction { kind: self.capability.clone(), target: target.into() };
+        // Agents use their exact-action queue; mini-app bridge calls use the
+        // effect-review queue. Both approvals are for local staging only.
+        if matches!(context, ContextId::Agent { .. }) {
+            flow::commit_exact_action_for_activation(context, epoch, &action, payload)
+        } else {
+            flow::commit_effect_for_activation(context, epoch, None, Some(&action), payload)
+        }
     }
 
     pub fn permits(&self, store: &PermissionStore, room: Option<&str>) -> bool {

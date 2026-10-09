@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use a2app_agent::mcp::McpServer;
 use robrix::a2app::ai::server::ToolServer;
-use robrix::a2app::ai::tools::{AiHost, ReadToolKind, register_session_tools};
+use robrix::a2app::ai::tools::{AiHost, MediaDraftRequest, ReadToolKind, register_session_tools};
 use rmcp::model::{CallToolRequestParams, ClientInfo, Implementation};
 use rmcp::service::{RoleClient, RunningService, serve_client};
 use rmcp::transport::child_process::TokioChildProcess;
@@ -49,6 +49,26 @@ struct RecordingHost {
 }
 
 impl AiHost for RecordingHost {
+    fn draft_message(&self, text: &str) -> Result<String, String> {
+        self.calls.lock().unwrap().push(format!("draft_message({text:?})"));
+        Ok("drafted".into())
+    }
+
+    fn draft_media(&self, request: MediaDraftRequest) -> Result<String, String> {
+        self.calls.lock().unwrap().push(format!("draft_media({request:?})"));
+        Ok(json!({"draft_id":"media-fixture","filename":request.filename,"mime_type":request.mime_type}).to_string())
+    }
+
+    fn attach_media(&self, draft_id: &str) -> Result<String, String> {
+        self.calls.lock().unwrap().push(format!("attach_media({draft_id:?})"));
+        Ok("attached".into())
+    }
+
+    fn post_room_media(&self, draft_id: &str, room: Option<&str>) -> Result<String, String> {
+        self.calls.lock().unwrap().push(format!("post_room_media({draft_id:?}, {room:?})"));
+        Ok("posted media".into())
+    }
+
     fn launch_splash_app(&self, description: &str) -> Result<String, String> {
         self.calls
             .lock()
@@ -178,6 +198,9 @@ async fn an_rmcp_client_lists_and_calls_robrix_tools_over_the_relay() {
     assert!(names.iter().any(|n| n == "list_mini_app_tools"), "tools advertised: {names:?}");
     assert!(names.iter().any(|n| n == "call_mini_app_tool"), "tools advertised: {names:?}");
     assert!(names.iter().any(|n| n == "request_task_permissions"), "tools advertised: {names:?}");
+    for name in ["draft_message", "draft_media", "attach_media", "post_room_media"] {
+        assert!(names.iter().any(|offered| offered == name), "tools advertised: {names:?}");
+    }
 
     // send_message round trip through rmcp -> relay -> socket -> host.
     let mut params = CallToolRequestParams::new("send_message");

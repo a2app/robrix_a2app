@@ -30,8 +30,12 @@ pub(super) fn forget_gesture(subject: &str) {
 }
 
 pub(super) fn retry_parked(subject: &str, perm: Permission, parked: &ParkedRequest) {
-    let ParkedRequest::Bridge(Some(request)) = parked else { return };
-    let Ok(context) = super::super::information_flow::context_for_heap(request.heap_key) else { return };
+    let context = match parked {
+        ParkedRequest::Bridge(Some(request)) => super::super::information_flow::context_for_heap(request.heap_key).ok(),
+        ParkedRequest::AppMedia(post) => post.activation().map(|(_, _, context, _)| context),
+        _ => None,
+    };
+    let Some(context) = context else { return };
     with_a2app(|state| {
         if gesture_is_current(state, &context) {
             if perm == Permission::McpTools { state.permissions.clear_tool_denials_for(subject); }
@@ -75,6 +79,7 @@ fn identity(prompt: &PermissionPrompt) -> Option<(a2app_core::information_flow::
 fn live(prompt: &PermissionPrompt) -> bool {
     if let Some(flow) = &prompt.flow { return flow.can_prompt() && !flow.is_cancelled(); }
     !prompt.parked.is_empty() && prompt.parked.iter().all(|parked| match parked {
+        ParkedRequest::AppMedia(post) => post.can_prompt(),
         ParkedRequest::Bridge(Some(request)) => bridge_activation_can_prompt(request, &prompt.activations),
         _ => true,
     })
@@ -109,10 +114,14 @@ fn prepare(cx: &mut Cx, ui: &WidgetRef, mut prompt: PermissionPrompt) -> Option<
         }
     } else if prompt.setup.is_none()
         && with_a2app(|state| prompt_already_granted(state, &prompt)).unwrap_or(false)
-        && prompt.parked.iter().all(|request| matches!(request, ParkedRequest::Bridge(_)))
+        && prompt.parked.iter().all(|request| matches!(request, ParkedRequest::Bridge(_) | ParkedRequest::AppMedia(_)))
     {
         for parked in prompt.parked {
-            if let ParkedRequest::Bridge(Some(request)) = parked { replay_bridge_request(cx, ui, request); }
+            match parked {
+                ParkedRequest::Bridge(Some(request)) => replay_bridge_request(cx, ui, request),
+                ParkedRequest::AppMedia(post) => post.resume(cx, ui),
+                _ => {},
+            }
         }
         return None;
     }
@@ -356,6 +365,7 @@ fn live_with_state(state: &A2AppState, prompt: &PermissionPrompt) -> bool {
             && !matches!(flow, FlowContinuation::Worker(worker) if worker.is_cancelled());
     }
     !prompt.parked.is_empty() && prompt.parked.iter().all(|parked| match parked {
+        ParkedRequest::AppMedia(post) => post.can_prompt() && post.permits_send(&state.permissions),
         ParkedRequest::Bridge(Some(request)) => bridge_activation_can_prompt(request, &prompt.activations),
         _ => true,
     })

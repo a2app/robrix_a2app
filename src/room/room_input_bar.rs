@@ -954,15 +954,40 @@ impl RoomInputBarRef {
         replying_to: (EventTimelineItem, EmbeddedEvent),
         timeline_kind: &TimelineKind,
     ) {
-        let Some(mut inner) = self.borrow_mut() else { return };
+        let _ = self.try_show_replying_to(cx, replying_to, timeline_kind);
+    }
+
+    /// Reports whether the local composer accepted a reply target.
+    pub fn try_show_replying_to(
+        &self,
+        cx: &mut Cx,
+        replying_to: (EventTimelineItem, EmbeddedEvent),
+        timeline_kind: &TimelineKind,
+    ) -> Result<(), String> {
+        let mut inner = self.borrow_mut().ok_or("The room composer is not available.")?;
+        if inner.text_input(cx, ids!(input_bar.mentionable_text_input.text_input)).borrow().is_none() {
+            return Err("The room's message input is not available.".into());
+        }
         inner.show_replying_to(cx, replying_to, timeline_kind, true);
+        Ok(())
     }
 
     /// Appends `text` to the draft, cursor after it, and focuses the input
     /// so the user reviews before sending.
     pub fn append_draft(&self, cx: &mut Cx, text: &str) {
-        let Some(inner) = self.borrow() else { return };
+        if let Err(error) = self.try_append_draft(cx, text) {
+            enqueue_popup_notification(error, PopupKind::Error, Some(5.0));
+        }
+    }
+
+    /// Reports whether the local composer accepted this text. No Matrix
+    /// request or typing action is emitted by programmatic draft insertion.
+    pub fn try_append_draft(&self, cx: &mut Cx, text: &str) -> Result<(), String> {
+        let inner = self.borrow().ok_or("The room composer is not available.")?;
         let text_input = inner.text_input(cx, ids!(input_bar.mentionable_text_input.text_input));
+        if text_input.borrow().is_none() {
+            return Err("The room's message input is not available.".into());
+        }
         let mut draft = text_input.text();
         if !draft.is_empty() && !draft.ends_with(char::is_whitespace) {
             draft.push(' ');
@@ -972,6 +997,7 @@ impl RoomInputBarRef {
         text_input.set_text(cx, &draft);
         text_input.set_cursor(cx, end, false);
         text_input.set_key_focus(cx);
+        Ok(())
     }
 
     /// Fills the input bar with the content of a message that failed to send (so the user can retry it).
@@ -1053,6 +1079,25 @@ impl RoomInputBarRef {
             return;
         }
         stage_local_file(path, caption, inner.attachment_builder(cx, timeline_kind));
+    }
+
+    /// Attach immutable prepared media using the normal user-confirmed preview.
+    #[cfg(feature = "a2app")]
+    pub fn stage_media(
+        &self,
+        cx: &mut Cx,
+        timeline_kind: TimelineKind,
+        media: Arc<crate::a2app::ai::media::PreparedMedia>,
+    ) -> Result<(), String> {
+        let inner = self.borrow().ok_or("The room composer is not available.")?;
+        if inner.check_if_upload_in_progress() {
+            return Err("Finish or cancel the current upload before adding another attachment.".into());
+        }
+        #[cfg(feature = "tsp")]
+        if inner.is_tsp_signing_enabled(cx) {
+            return Err("Disable TSP signing before attaching media; signed attachments are not supported yet.".into());
+        }
+        crate::shared::file_upload_modal::stage_prepared_media(media, inner.attachment_builder(cx, timeline_kind))
     }
 
     /// Shows the preview flow for sending the current location into this room.
@@ -1297,4 +1342,25 @@ enum ShowEditingPaneBehavior {
     RestoreExisting {
         editing_pane_state: EditingPaneState,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_draft_refuses_an_unavailable_composer_or_message_input() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let absent = RoomInputBarRef::default();
+        assert!(absent.try_append_draft(&mut cx, "Draft text").is_err());
+        let widget = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            let input_bar_type = RoomInputBar::register_widget(vm);
+            let value = script_eval!(vm, { #(input_bar_type) {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let input_bar = widget.as_room_input_bar();
+        assert!(input_bar.borrow().is_some());
+        assert!(input_bar.try_append_draft(&mut cx, "Draft text").is_err());
+    }
 }

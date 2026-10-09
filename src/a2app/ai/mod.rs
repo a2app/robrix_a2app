@@ -25,6 +25,8 @@
 
 pub mod tools;
 
+pub mod media;
+
 #[cfg(unix)]
 pub mod bridge;
 #[cfg(unix)]

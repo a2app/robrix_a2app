@@ -41,6 +41,10 @@ use crate::a2app::permission_prompt::{
     PermissionPromptGroupInfo, PermissionPromptGroupResponse, PermissionPromptInfo,
 };
 mod permission_batch;
+mod app_media;
+pub use app_media::AppMediaPost;
+#[cfg(unix)]
+mod ai_media;
 pub(super) mod permission_lifecycle;
 use crate::room::room_pane::{self, RoomPaneKind, RoomPaneOp};
 use crate::a2app::instances::{self, MiniAppInstanceAction, Surface};
@@ -232,6 +236,8 @@ pub enum ParkedRequest {
     /// A mini-app request waiting on its group's answer (`None` when the
     /// prompt was raised for a group without a specific request behind it).
     Bridge(Option<SplashHostRequest>),
+    /// A prepared media post awaiting its independent upload permission.
+    AppMedia(Box<AppMediaPost>),
     /// An AI session tool call waiting on its room subject's answer.
     #[cfg(unix)]
     AiTool { room_id: OwnedRoomId, job: SessionJob },
@@ -823,6 +829,10 @@ pub struct A2AppState {
     pub ai_posts: HashMap<u64, AiPostPending>,
     #[cfg(unix)]
     ai_fetches: HashMap<u64, (OwnedRoomId, Sender<Result<String, String>>, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
+    #[cfg(unix)]
+    ai_media_drafts: HashMap<(OwnedRoomId, String), ai_media::Draft>,
+    #[cfg(unix)]
+    ai_media_pending: HashMap<u64, ai_media::Pending>,
     /// `send_message` writes in flight, keyed by request id; see
     /// [`AiReplyPending`].
     #[cfg(unix)]
@@ -1005,6 +1015,10 @@ fn initialize_state(registry: AppRegistry, permissions: PermissionStore, persist
             #[cfg(unix)]
             ai_fetches: HashMap::new(),
             #[cfg(unix)]
+            ai_media_drafts: HashMap::new(),
+            #[cfg(unix)]
+            ai_media_pending: HashMap::new(),
+            #[cfg(unix)]
             ai_replies: HashMap::new(),
             #[cfg(unix)]
             once_rooms: HashSet::new(),
@@ -1169,8 +1183,16 @@ pub enum RoomAction {
     JumpToEvent(OwnedEventId),
     ReplyTo(OwnedEventId),
     InsertDraft(String),
+    StageAppMessage { text: String, reply: AppComposerCompletion },
+    StageAppReply { event_id: OwnedEventId, reply: AppComposerCompletion },
     /// Pre-fills the room's file upload with a file Robrix wrote.
     StageAttachment { path: PathBuf, caption: String },
+    /// Opens a user-reviewed preview of immutable mini-app media.
+    StagePreparedMedia { media: std::sync::Arc<super::ai::media::PreparedMedia>, reply: AppComposerCompletion },
+    #[cfg(unix)]
+    AttachAgentMedia { media: std::sync::Arc<super::ai::media::PreparedMedia>, answer: Sender<Result<String, String>> },
+    #[cfg(unix)]
+    DraftAgentMessage { text: String, answer: Sender<Result<String, String>> },
     /// Docks the app into the room's pane.
     OpenApp(MiniAppId),
 }
@@ -1209,6 +1231,17 @@ struct PendingRoomAction {
     close_after: Option<instances::InstanceKey>,
 }
 
+/// Keeps a mini-app callback alive until its draft reaches the native UI.
+#[derive(Clone, Debug)]
+pub struct AppComposerCompletion {
+    reply: Reply,
+    requester: Option<(instances::InstanceKey, a2app_core::information_flow::ContextId, u64)>,
+}
+
+impl AppComposerCompletion {
+    fn new(reply: Reply) -> Self { Self { reply, requester: None } }
+}
+
 impl PendingRoomAction {
     /// Replacing a request from the same activation keeps its deferred
     /// teardown attached to the new request.
@@ -1232,9 +1265,18 @@ impl PendingRoomAction {
         if let Some(authorization) = &self.authorization {
             let permitted = with_a2app(|state| self.permitted(&state.permissions)).unwrap_or(false);
             if !permitted { return Err("Permission for the queued room action was revoked.".into()); }
-            authorization.check_flow(Some(self.room_id.as_str()), RoomAccess::Write)?;
+            // Composer changes are local drafts. They retain protected-room
+            // checks but never require permission to send into this room.
+            authorization.check_flow(Some(self.room_id.as_str()), RoomAccess::Read)?;
             let payload = match &self.action {
                 RoomAction::InsertDraft(text) => serde_json::json!({ "text": text }),
+                RoomAction::StageAppMessage { text, .. } => serde_json::json!({ "text": text }),
+                RoomAction::StageAppReply { event_id, .. } => serde_json::json!({ "event_id": event_id }),
+                RoomAction::StagePreparedMedia { media, .. } => serde_json::json!({ "media": media.metadata() }),
+                #[cfg(unix)]
+                RoomAction::DraftAgentMessage { text, .. } => serde_json::json!({ "text": text }),
+                #[cfg(unix)]
+                RoomAction::AttachAgentMedia { media, .. } => serde_json::json!({ "media": media.metadata() }),
                 RoomAction::ReplyTo(event_id) => serde_json::json!({ "event_id": event_id }),
                 _ => return Err("Unsupported protected composer action.".into()),
             };
@@ -1271,7 +1313,7 @@ pub enum A2AppRoomAction {
 /// Hands the pending action for `room_id` to the one RoomScreen that asks
 /// first; a stale one (its room never opened) is dropped instead.
 pub fn take_room_action(cx: &mut Cx, room_id: &RoomId) -> Option<RoomAction> {
-    let pending = with_a2app(|state| {
+    let mut pending = with_a2app(|state| {
         let pending = state.room_action.as_ref()?;
         if pending.room_id != room_id {
             return None;
@@ -1279,14 +1321,53 @@ pub fn take_room_action(cx: &mut Cx, room_id: &RoomId) -> Option<RoomAction> {
         state.room_action.take()
     }).flatten()?;
     let result = pending.check();
-    pending.close_requester(cx);
     match result {
-        Ok(()) => Some(pending.action),
+        Ok(()) => {
+            if let RoomAction::StagePreparedMedia { reply, .. } | RoomAction::StageAppMessage { reply, .. }
+                | RoomAction::StageAppReply { reply, .. } = &mut pending.action {
+                reply.requester = pending.close_after.take().and_then(|key| {
+                    let authorization = pending.authorization.as_ref()?;
+                    Some((key, authorization.flow_context.clone()?, authorization.flow_epoch?))
+                });
+            } else { pending.close_requester(cx); }
+            Some(pending.action)
+        }
         Err(error) => {
+            refuse_composer_action(cx, room_id, &pending.action, &error);
+            pending.close_requester(cx);
             enqueue_popup_notification(error, PopupKind::Warning, Some(6.0));
             None
         }
     }
+}
+
+/// Answers only after the native composer/preview accepted the draft.
+pub fn finish_app_composer(cx: &mut Cx, completion: AppComposerCompletion, result: Result<String, String>) {
+    let response = result.map(|message| serde_json::json!({ "drafted": true, "message": message }).to_string());
+    services::respond(cx, completion.reply, response.as_deref().map_err(String::as_str));
+    if let Some((key, context, epoch)) = completion.requester
+        && instances::context_of_key(&key).as_ref() == Some(&context)
+        && instances::surface_of(&key).is_none()
+        && a2app_core::information_flow::ensure_context_epoch(&context, epoch).is_ok()
+        && instances::quit(cx, &key)
+    { app_stopped(cx, &key.0); }
+}
+
+fn refuse_composer_action(cx: &mut Cx, room: &RoomId, action: &RoomAction, error: &str) {
+    if let RoomAction::StagePreparedMedia { reply, .. } | RoomAction::StageAppMessage { reply, .. }
+        | RoomAction::StageAppReply { reply, .. } = action {
+        finish_app_composer(cx, reply.clone(), Err(error.into()));
+    }
+    #[cfg(unix)]
+    ai_media::refuse_room_action(room, action, error);
+    #[cfg(not(unix))]
+    let _ = room;
+}
+
+#[cfg(unix)]
+pub fn finish_agent_composer(room: &RoomId, tool: &str, answer: &Sender<Result<String, String>>, result: Result<String, String>) {
+    note_ai_tool_call(&room.to_owned(), tool, result.is_ok(), "");
+    ai_media::finish_composer(room, tool, answer, result);
 }
 
 
@@ -1301,7 +1382,10 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
         _ => {}
     }
     let expired = with_a2app(|state| state.room_action.take_if(|pending| pending.since.elapsed() > ROOM_ACTION_TTL)).flatten();
-    if let Some(pending) = expired { pending.close_requester(cx); }
+    if let Some(pending) = expired {
+        refuse_composer_action(cx, &pending.room_id, &pending.action, "The queued composer action expired.");
+        pending.close_requester(cx);
+    }
     if let Event::NetworkResponses(e) = event {
         with_a2app(|state| state.broker.handle_network(cx, e, &super::information_flow::check_response));
         instances::handle_network_responses(cx, event, &mut Scope::empty());
@@ -1461,6 +1545,11 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
             }
             if action.downcast_ref::<AppPreferencesAction>().is_some() {
                 host_events.push(("on_prefs_changed", prefs_json(cx)));
+            }
+            #[cfg(unix)]
+            if let Some(result) = action.downcast_ref::<ai_media::MediaResult>() {
+                ai_media::apply_result(result.clone());
+                continue;
             }
             #[cfg(unix)]
             if let Some(result) = action.downcast_ref::<AgentNetworkResult>() {
@@ -3316,7 +3405,7 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
                 Err(error) => services::respond(cx, reply, Err(&error)),
             }
         }
-        BrokerAsk::Matrix { reply, app_id, room, call, capability, consent, args } => {
+        BrokerAsk::Matrix { reply, app_id, room, call, capability, consent, args, may_prompt } => {
             let flow_context = match super::information_flow::context_for_heap(reply.heap_key) {
                 Ok(context) => context,
                 Err(error) => return services::respond(cx, reply, Err(&error)),
@@ -3324,10 +3413,12 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
             let origin = room.clone();
             let room = room.and_then(|r| OwnedRoomId::try_from(r.as_str()).ok());
             match matrix::request_for(call, room, reply) {
+                Ok(request) if request.media_post_payload().is_some() =>
+                    app_media::start(cx, ui, request, app_id, origin, consent, flow_context, reply, may_prompt),
                 Ok(request) => submit_async_request(MatrixRequest::A2App(request.authorized(app_id, capability, origin, consent, flow_context, args))),
                 Err(e) => {
                     with_a2app(|state| state.broker.note(reply, &app_id));
-                    services::respond(cx, reply, Err(e));
+                    services::respond(cx, reply, Err(&e));
                 }
             }
         }
@@ -3385,13 +3476,15 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
         BrokerAsk::HostAction { reply, app_id, action } => {
             // Queued composer actions retain their requester until the room
             // checks its live authority. Other modal departures quit now.
-            let queued_composer = matches!(action, HostAction::ComposerInsert { .. } | HostAction::ComposerReplyTo { .. });
+            let queued_composer = matches!(action, HostAction::ComposerInsert { .. } | HostAction::ComposerReplyTo { .. }
+                | HostAction::ComposerAttach { .. });
             let leaves_modal = !matches!(action, HostAction::OpenApp { .. } | HostAction::Minimize | HostAction::Restore)
                 && host_pane(cx, ui).active().is_some_and(|key| {
                     key.0 == app_id && instances::heap_of(&key) == Some(reply.heap_key)
                 });
-            match perform_host_action(cx, ui, reply.heap_key, action) {
-                Ok(()) => services::respond(cx, reply, Ok("{}")),
+            match perform_host_action(cx, ui, reply, action) {
+                Ok(()) if !queued_composer => services::respond(cx, reply, Ok("{}")),
+                Ok(()) => {},
                 Err(e) => {
                     services::respond(cx, reply, Err(&e));
                     return;
@@ -3659,7 +3752,10 @@ fn queue_authorized_room_action(
         if let Some(previous) = state.room_action.as_mut() { pending.inherit_requester(previous); }
         state.room_action.replace(pending)
     }).flatten();
-    if let Some(previous) = previous { previous.close_requester(cx); }
+    if let Some(previous) = previous {
+        refuse_composer_action(cx, &previous.room_id, &previous.action, "Another composer action replaced this draft.");
+        previous.close_requester(cx);
+    }
     cx.action(NavigationBarAction::GoToHome);
     cx.action(AppStateAction::NavigateToRoom { room_to_close: None, destination_room });
     cx.action(A2AppRoomAction::Pending { room_id });
@@ -3675,7 +3771,7 @@ fn queue_composer_action(cx: &mut Cx, heap: usize, room_id: OwnedRoomId, action:
     };
     let authorization = with_a2app(|state| matrix::policy::MatrixAuthorization::new(app, capability, origin_room, &state.permissions))
         .ok_or("Mini Apps is unavailable.")?.with_flow(context);
-    authorization.check_flow(Some(room_id.as_str()), RoomAccess::Write)?;
+    authorization.check_flow(Some(room_id.as_str()), RoomAccess::Read)?;
     queue_authorized_room_action(cx, room_id, action, Some(authorization))
 }
 
@@ -3798,6 +3894,7 @@ pub(super) fn host_action_target_room(action: &HostAction) -> Option<&str> {
         HostAction::JumpToEvent { room, .. } | HostAction::OpenThread { room, .. }
         | HostAction::ShowUser { room, .. } | HostAction::OpenApp { room, .. }
         | HostAction::ComposerInsert { room, .. } | HostAction::ComposerReplyTo { room, .. }
+        | HostAction::ComposerAttach { room, .. }
             => room.as_deref(),
         _ => None,
     }
@@ -3898,7 +3995,8 @@ mod matrix_link_scope_tests {
     }
 }
 
-fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, heap: usize, action: HostAction) -> Result<(), String> {
+fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, reply: Reply, action: HostAction) -> Result<(), String> {
+    let heap = reply.heap_key;
     let room_of = |room: Option<String>| -> Result<OwnedRoomId, String> {
         let room = room.ok_or("this mini-app is not attached to a room; pass {room_id}")?;
         OwnedRoomId::try_from(room.as_str()).map_err(|_| String::from("not a valid room id"))
@@ -3949,7 +4047,7 @@ fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, heap: usize, action: HostAct
                 }) == Effective::Granted
             }).unwrap_or(false);
             if !allowed { return Err("Opening this link is not allowed for its destination room.".into()); }
-            return perform_host_action(cx, ui, heap, action);
+            return perform_host_action(cx, ui, reply, action);
         }
         HostAction::OpenApp { room, app_id } => {
             let from = super::information_flow::context_for_heap(heap)?;
@@ -3992,11 +4090,19 @@ fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, heap: usize, action: HostAct
         }
         HostAction::ComposerInsert { room, text } => {
             let room_id = room_of(room)?;
-            queue_composer_action(cx, heap, room_id, RoomAction::InsertDraft(text), "host.composer.insert")?;
+            queue_composer_action(cx, heap, room_id, RoomAction::StageAppMessage { text, reply: AppComposerCompletion::new(reply) }, "host.composer.insert")?;
         }
         HostAction::ComposerReplyTo { room, event_id } => {
             let room_id = room_of(room)?;
-            queue_composer_action(cx, heap, room_id, RoomAction::ReplyTo(event_of(&event_id)?), "host.composer.reply_to")?;
+            queue_composer_action(cx, heap, room_id, RoomAction::StageAppReply { event_id: event_of(&event_id)?, reply: AppComposerCompletion::new(reply) }, "host.composer.reply_to")?;
+        }
+        HostAction::ComposerAttach { room, data_base64, filename, mime_type, caption } => {
+            let room_id = room_of(room)?;
+            let request = super::ai::tools::MediaDraftRequest {
+                source: super::ai::tools::MediaSource::Base64(data_base64), filename, mime_type, caption,
+            };
+            let media = std::sync::Arc::new(super::ai::media::PreparedMedia::from_base64(&request)?);
+            queue_composer_action(cx, heap, room_id, RoomAction::StagePreparedMedia { media, reply: AppComposerCompletion::new(reply) }, "host.composer.attach")?;
         }
         HostAction::ClosePane | HostAction::SetSide { .. } | HostAction::BreakOut
         | HostAction::Minimize | HostAction::Restore => {
@@ -4111,6 +4217,7 @@ fn queue_permission_prompt(
     }
     with_a2app(|state| {
         let activation = match &parked {
+            ParkedRequest::AppMedia(post) => post.activation(),
             ParkedRequest::Bridge(Some(request)) => super::information_flow::context_for_heap(request.heap_key).ok()
                 .and_then(|context| a2app_core::information_flow::context_epoch(&context).ok()
                     .map(|epoch| (request.heap_key, request.req_id, context, epoch))),
@@ -4143,19 +4250,46 @@ fn combined_bridge_review(request: &SplashHostRequest) -> Result<Option<a2app_co
         return Ok((!review.allowed).then_some(review));
     }
     if request.service.starts_with("matrix.") { return matrix_permission_review(request, &context, &args); }
-    if matches!(request.service.as_str(),
-        "host.composer.insert" | "host.composer.reply_to" | "host.nav.app") { return Ok(None); }
+    if request.service == "nav.app" { return Ok(None); }
     let Some(capability) = a2app_core::capabilities::for_service(&request.service) else { return Ok(None) };
     let contract = capability.flow_contract().ok_or("Missing data-flow contract.")?;
     let target_room = permission_target_room(&request.service, &args, context.room());
     let target = target_room.as_deref();
     let homeserver = crate::sliding_sync::get_client().map(|client| client.homeserver().to_string());
     let recipient = contract.recipient(context.account(), target, &args, homeserver.as_deref())?;
-    let action = contract.sensitive_action(capability.id, &args, target);
+    let payload = composer_review_payload(&request.service, &args, context.room())?.unwrap_or_else(|| args.clone());
+    let action = contract.sensitive_action(capability.id, &payload, target);
     if recipient.is_none() && action.is_none() { return Ok(None); }
     let epoch = a2app_core::information_flow::context_epoch(&context)?;
-    let review = a2app_core::information_flow::prepare_effect_for_activation(&context, epoch, recipient.as_ref(), action.as_ref(), &args)?;
+    let review = a2app_core::information_flow::prepare_effect_for_activation(&context, epoch, recipient.as_ref(), action.as_ref(), &payload)?;
     Ok((!review.allowed).then_some(review))
+}
+
+/// Reviews the local contents that will actually reach the composer. Media
+/// prompts carry an immutable byte digest rather than a large base64 body.
+pub(super) fn composer_review_payload(service: &str, args: &serde_json::Value, origin_room: Option<&str>) -> Result<Option<serde_json::Value>, String> {
+    let payload = match service {
+        "composer.insert" => {
+            let text = args["text"].as_str().map(str::trim).filter(|text| !text.is_empty()).ok_or("The text draft is missing its text.")?;
+            if text.chars().count() > 4096 { return Err("text is too long (4096 characters max)".into()); }
+            serde_json::json!({ "text": text })
+        }
+        "composer.reply_to" => {
+            let event = args["event_id"].as_str().map(str::trim).ok_or("The draft reply is missing its event id.")?;
+            let event = OwnedEventId::try_from(event).map_err(|_| "not a valid event id")?;
+            serde_json::json!({ "event_id": event })
+        }
+        "composer.attach" => {
+            let HostAction::ComposerAttach { data_base64, filename, mime_type, caption, .. } = services::parse_composer_attachment(args, origin_room)? else { unreachable!() };
+            let request = super::ai::tools::MediaDraftRequest {
+                source: super::ai::tools::MediaSource::Base64(data_base64), filename, mime_type, caption,
+            };
+            let media = super::ai::media::PreparedMedia::from_base64(&request)?;
+            serde_json::json!({ "media": media.metadata() })
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(payload))
 }
 
 /// Capture local SDK metadata before asking about a remote Matrix operation.
@@ -4177,6 +4311,15 @@ fn matrix_permission_review(request: &SplashHostRequest, context: &a2app_core::i
         Ok((recipient, Some(SensitiveAction { kind: capability.id.into(), target: target.into() }), payload))
     };
     let (recipient, action, payload) = match call {
+        services::MatrixServiceCall::SendMedia { data_base64, filename, mime_type, caption } => {
+            let room = permission_context.target_room.ok_or("Missing media destination.")?;
+            let room_id = OwnedRoomId::try_from(room).map_err(|_| "invalid room_id")?;
+            let request = super::ai::tools::MediaDraftRequest {
+                source: super::ai::tools::MediaSource::Base64(data_base64), filename, mime_type, caption,
+            };
+            let media = super::ai::media::PreparedMedia::from_base64(&request)?;
+            sensitive(room, media.post_payload(&room_id))?
+        }
         services::MatrixServiceCall::SendMessage { body }
         | services::MatrixServiceCall::RoomsSend { body, .. } => {
             let room = permission_context.target_room.ok_or("Missing message destination.")?;
@@ -4357,12 +4500,18 @@ fn bridge_activation_can_prompt(request: &SplashHostRequest, activations: &[(usi
         .is_some_and(|(_, _, context, epoch)| instances::context_can_prompt(context, *epoch))
 }
 
-fn retain_live_bridge_requests(prompt: &mut PermissionPrompt) {
+fn retain_live_bridge_requests(cx: &mut Cx, prompt: &mut PermissionPrompt) {
     let activations = &prompt.activations;
-    prompt.parked.retain(|parked| match parked {
-        ParkedRequest::Bridge(Some(request)) => bridge_activation_can_prompt(request, activations),
-        _ => true,
-    });
+    let mut retained = Vec::new();
+    for parked in std::mem::take(&mut prompt.parked) {
+        match parked {
+            ParkedRequest::AppMedia(post) if !post.can_prompt() =>
+                post.refuse(cx, "The media request is no longer allowed. Nothing was posted."),
+            ParkedRequest::Bridge(Some(request)) if !bridge_activation_can_prompt(&request, activations) => {},
+            parked => retained.push(parked),
+        }
+    }
+    prompt.parked = retained;
 }
 
 fn sweep_permission_prompts(cx: &mut Cx, ui: &WidgetRef) {
@@ -4380,6 +4529,10 @@ fn ai_job_tool_name(job: &SessionJob) -> String {
         SessionJob::LaunchApp { .. } => String::from("launch_app"),
         SessionJob::SendRoomMessage { .. } => String::from("send_message"),
         SessionJob::PostRoomMessage { .. } => String::from("post_room_message"),
+        SessionJob::DraftMessage { .. } => String::from("draft_message"),
+        SessionJob::DraftMedia { .. } => String::from("draft_media"),
+        SessionJob::AttachMedia { .. } => String::from("attach_media"),
+        SessionJob::PostRoomMedia { .. } => String::from("post_room_media"),
         // Not a tool call: the agent's web tool is already shown by its ACP
         // events; this job only asks whether a host may be reached.
         SessionJob::NetworkAccess { .. } => String::from("network_access"),
@@ -4402,6 +4555,8 @@ fn session_job_detail(rooms: Option<&RoomsListRef>, job: &SessionJob) -> Option<
         SessionJob::PostRoomMessage { room_id, .. } => {
             Some(format!("into “{}”", resolve_room_label(rooms, room_id)))
         }
+        SessionJob::PostRoomMedia { room_id: Some(room), .. } => Some(format!("into “{}”", resolve_room_label(rooms, room))),
+        SessionJob::DraftMedia { request, .. } => Some(request.filename.clone()),
         SessionJob::LaunchSplashApp { description, .. } => {
             let description = description.trim();
             if description.is_empty() {
@@ -4437,7 +4592,7 @@ fn session_job_detail(rooms: Option<&RoomsListRef>, job: &SessionJob) -> Option<
         // A listing has no single target of its own.
         SessionJob::ListMiniAppTools { .. } => None,
         // The task prompt names its own task in the modal title.
-        SessionJob::RequestTaskPermissions { .. } => None,
+        SessionJob::RequestTaskPermissions { .. } | SessionJob::DraftMessage { .. } | SessionJob::AttachMedia { .. } | SessionJob::PostRoomMedia { room_id: None, .. } => None,
     }
 }
 
@@ -4494,6 +4649,7 @@ fn read_kind_detail(kind: &ReadToolKind, room_label: &impl Fn(&str) -> String) -
 /// act on.
 fn refuse_parked_request(cx: &mut Cx, perm: Permission, parked: ParkedRequest) {
     match parked {
+        ParkedRequest::AppMedia(post) => post.refuse(cx, "Media upload was not approved. Nothing was posted."),
         ParkedRequest::Bridge(request) => {
             if let Some(request) = request {
                 with_a2app(|state| state.broker.declined(&request));
@@ -4601,6 +4757,7 @@ fn flow_bridge_permission_granted(flow: &FlowContinuation) -> bool {
 
 fn prompt_already_granted(state: &A2AppState, prompt: &PermissionPrompt) -> bool {
     prompt.parked.iter().all(|parked| {
+        if let ParkedRequest::AppMedia(post) = parked && !post.permits_send(&state.permissions) { return false; }
         let (origin, target) = parked_rooms(parked);
         let context = PermissionContext { origin_room: origin.as_deref(), target_room: target.as_deref() };
         if let Some(url) = parked_network_url(parked) { return state.permissions.is_url_allowed(&prompt.subject, &url, context); }
@@ -4792,6 +4949,10 @@ fn ai_prompt_action(
                     format!("post a message into “{}”", resolve_room_label(rooms, room))
                 }
                 SessionJob::SendRoomMessage { .. } => continue,
+                SessionJob::DraftMessage { .. } => String::from("prepare a message in your composer"),
+                SessionJob::AttachMedia { .. } => String::from("attach media for you to review and send"),
+                SessionJob::PostRoomMedia { room_id, .. } => format!("post media into “{}”", resolve_room_label(rooms, room_id.as_deref().unwrap_or(_room_id.as_str()))),
+                SessionJob::DraftMedia { .. } => String::from("download media for this draft"),
                 // A network-access job never reaches this arm (it parks as
                 // `ParkedRequest::NetworkAccess` and is handled above).
                 SessionJob::NetworkAccess { .. } | SessionJob::FetchUrl { .. } => continue,
@@ -4866,6 +5027,9 @@ fn ai_prompt_reason(
                     format!("It wants to post a message into “{}”, outside this room. It can only post there if you allow this room.", resolve_room_label(rooms, room))
                 }
                 SessionJob::SendRoomMessage { .. } => continue,
+                SessionJob::DraftMessage { .. } | SessionJob::AttachMedia { .. } => String::from("It is preparing a draft for you to review. You still choose whether to send it."),
+                SessionJob::PostRoomMedia { .. } => String::from("It will upload and post a native media message into the selected room."),
+                SessionJob::DraftMedia { .. } => String::from("It needs to download the image or file used by this draft."),
                 // A network-access job never reaches this arm (handled above).
                 SessionJob::NetworkAccess { .. } | SessionJob::FetchUrl { .. } => continue,
                 SessionJob::InvokeMiniAppTool { tool, .. } => format!(
@@ -4901,6 +5065,7 @@ fn ai_prompt_reason(
 /// shows its actual target so consent cannot silently spread to other rooms.
 fn parked_rooms(parked: &ParkedRequest) -> (Option<String>, Option<String>) {
     match parked {
+        ParkedRequest::AppMedia(post) => post.rooms(),
         ParkedRequest::Bridge(Some(request)) => {
             let (_, room) = a2app_core::manifest::split_instance_tag(&request.app_tag);
             let origin = room.map(str::to_string);
@@ -4913,6 +5078,9 @@ fn parked_rooms(parked: &ParkedRequest) -> (Option<String>, Option<String>) {
         ParkedRequest::AiTool { room_id, job } => {
             let target = match job {
                 SessionJob::PostRoomMessage { room_id, .. } => room_id.clone(),
+                SessionJob::PostRoomMedia { permission: "matrix.media.upload", .. } => room_id.to_string(),
+                SessionJob::PostRoomMedia { room_id: Some(target), .. } => target.clone(),
+                SessionJob::DraftMedia { request: super::ai::tools::MediaDraftRequest { source: super::ai::tools::MediaSource::MatrixEvent { room_id: Some(target), .. }, .. }, .. } => target.clone(),
                 SessionJob::ReadTool { kind: ReadToolKind::OtherRoom { room, .. }, .. } => room.clone(),
                 SessionJob::ReadTool { kind: ReadToolKind::SpaceInfo { space } | ReadToolKind::SpaceRooms { space }, .. } => space.clone(),
                 _ => room_id.to_string(),
@@ -4925,6 +5093,13 @@ fn parked_rooms(parked: &ParkedRequest) -> (Option<String>, Option<String>) {
 }
 
 fn parked_can_enable_writes(state: &A2AppState, subject: &str, permission: Permission, parked: &ParkedRequest) -> bool {
+    #[cfg(unix)]
+    if let ParkedRequest::AiTool { room_id, .. } = parked && let Some(cap) = parked_capability(parked) {
+        let (_, target) = parked_rooms(parked);
+        if let Some(target) = target.and_then(|room| OwnedRoomId::try_from(room).ok()) {
+            return ai_media::can_enable_writes(state, subject, cap, room_id, &target);
+        }
+    }
     let Some(manifest) = state.registry.get(subject) else { return false };
     let (origin, target) = parked_rooms(parked);
     let context = PermissionContext { origin_room: origin.as_deref(), target_room: target.as_deref() };
@@ -4943,6 +5118,7 @@ fn parked_can_enable_writes(state: &A2AppState, subject: &str, permission: Permi
 
 fn parked_capability(parked: &ParkedRequest) -> Option<&'static a2app_core::capabilities::Capability> {
     match parked {
+        ParkedRequest::AppMedia(_) => Some(AppMediaPost::capability()),
         ParkedRequest::Bridge(Some(request)) => {
             if request.service == "permissions.request" { return None; }
             if request.service == "events.subscribe" {
@@ -4958,6 +5134,13 @@ fn parked_capability(parked: &ParkedRequest) -> Option<&'static a2app_core::capa
         ParkedRequest::AiTool { job, .. } => match job {
             SessionJob::ReadTool { kind, .. } => kind.capability(),
             SessionJob::PostRoomMessage { .. } => a2app_core::capabilities::by_id("matrix.rooms.message.send"),
+            SessionJob::DraftMessage { .. } => a2app_core::capabilities::by_id("host.composer.insert"),
+            SessionJob::AttachMedia { .. } => a2app_core::capabilities::by_id("host.composer.attach"),
+            SessionJob::PostRoomMedia { permission, .. } => a2app_core::capabilities::by_id(permission),
+            SessionJob::DraftMedia { request, .. } => a2app_core::capabilities::by_id(match &request.source {
+                super::ai::tools::MediaSource::Url(_) => "network.http",
+                _ => "matrix.media.download",
+            }),
             SessionJob::ListApps { .. } => a2app_core::capabilities::by_id(LIST_APPS_CAP_ID),
             SessionJob::LaunchApp { .. } => a2app_core::capabilities::by_id(LAUNCH_APP_CAP_ID),
             SessionJob::LaunchSplashApp { .. } => a2app_core::capabilities::by_id("apps.generate"),
@@ -4970,6 +5153,11 @@ fn parked_network_url(parked: &ParkedRequest) -> Option<String> {
     match parked {
         #[cfg(unix)]
         ParkedRequest::AiTool { job: SessionJob::FetchUrl { url, .. }, .. } => Some(url.clone()),
+        #[cfg(unix)]
+        ParkedRequest::AiTool { job: SessionJob::DraftMedia { request, .. }, .. } => match &request.source {
+            super::ai::tools::MediaSource::Url(url) => Some(url.clone()),
+            _ => None,
+        },
         ParkedRequest::Bridge(Some(request)) if request.service == "network.http" => {
             serde_json::from_str::<serde_json::Value>(&request.args_json).ok()?
                 .get("url")?.as_str().map(str::to_owned)
@@ -4982,6 +5170,7 @@ fn parked_network_url(parked: &ParkedRequest) -> Option<String> {
 
 fn parked_can_allow_once(parked: &ParkedRequest) -> bool {
     match parked {
+        ParkedRequest::AppMedia(_) => true,
         ParkedRequest::Bridge(None) => false,
         ParkedRequest::Bridge(Some(request)) => !matches!(request.service.as_str(), "permissions.request" | "events.subscribe"),
         #[cfg(unix)]
@@ -5208,6 +5397,7 @@ fn prompt_info_for(
         })
     } else {
         parked.iter().find_map(|p| match p {
+            ParkedRequest::AppMedia(_) => Some(AppMediaPost::capability()),
             ParkedRequest::Bridge(request) => {
                 let Some(request) = request else { return None };
                 let hook_name = (request.service == "events.subscribe")
@@ -5250,6 +5440,10 @@ fn answer_session_job(job: SessionJob, result: Result<String, String>) {
         | SessionJob::ListApps { answer, .. }
         | SessionJob::LaunchApp { answer, .. }
         | SessionJob::SendRoomMessage { answer, .. }
+        | SessionJob::DraftMessage { answer, .. }
+        | SessionJob::DraftMedia { answer, .. }
+        | SessionJob::AttachMedia { answer, .. }
+        | SessionJob::PostRoomMedia { answer, .. }
         | SessionJob::ReadTool { answer, .. }
         | SessionJob::PostRoomMessage { answer, .. }
         | SessionJob::NetworkAccess { answer, .. }
@@ -5417,7 +5611,7 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, response: PermissionPro
     }
     let setup = prompt.setup;
     let parked_count = prompt.parked.len();
-    retain_live_bridge_requests(&mut prompt);
+    retain_live_bridge_requests(cx, &mut prompt);
     if prompt.parked.is_empty() || prompt.parked.len() != parked_count {
         // An answer belongs to the displayed batch. Retired requests cannot
         // grant authority or redirect that answer onto a surviving request.
@@ -5551,6 +5745,10 @@ fn answer_permission_prompt(cx: &mut Cx, ui: &WidgetRef, response: PermissionPro
     for parked in prompt.parked {
         if setup.is_some() { continue; }
         match parked {
+            ParkedRequest::AppMedia(post) => {
+                if granted { post.resume(cx, ui); }
+                else { post.refuse(cx, "Media upload was not approved. Nothing was posted."); }
+            }
             ParkedRequest::Bridge(request) => {
                 if let Some(request) = request.as_ref()
                     && !bridge_activation_is_live(request, &activations)
@@ -7154,6 +7352,7 @@ fn stop_ai_session(room_id: &OwnedRoomId) {
     let session = with_a2app(|state| state.ai_sessions.remove(room_id)).flatten();
     drop(session);
     with_a2app(|state| {
+        ai_media::cancel(state, room_id);
         state.ai_reads.retain(|_, (r, _, _)| r != room_id);
         state.ai_posts.retain(|_, (r, _)| r != room_id);
         state.ai_replies.retain(|_, (r, _, _, _)| r != room_id);
@@ -9243,6 +9442,7 @@ fn session_job_exact_action(
     job: &SessionJob,
 ) -> Option<(a2app_core::information_flow::SensitiveAction, serde_json::Value)> {
     use a2app_core::information_flow::SensitiveAction;
+    if let Some(action) = ai_media::exact_action(room_id, job) { return Some(action); }
     match job {
         SessionJob::PostRoomMessage { room_id: target, text, .. } => Some((
             SensitiveAction { kind: "matrix.rooms.message.send".into(), target: target.clone() },
@@ -9355,12 +9555,21 @@ fn resume_exact(cx: &mut Cx, ui: &WidgetRef, room_id: OwnedRoomId, resume: Exact
 /// result back to the serve thread that called the tool.
 #[cfg(unix)]
 fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: SessionJob) {
+    if let Err(error) = ai_media::restore_provenance(room_id, &job) { answer_session_job(job, Err(error)); return; }
     // Deriving tool-card details reads host metadata too. Label that input
     // before any description or result can be written back to the room.
     let recorded = super::information_flow::agent_context(room_id.as_str()).and_then(|context| {
         super::information_flow::current_context(&context)?;
         match &job {
             SessionJob::ReadTool { kind, .. } if is_directory_kind(kind) => {
+                super::information_flow::record_directory_response(&context)?;
+            }
+            SessionJob::PostRoomMedia { room_id: Some(target), .. } if target != room_id.as_str() => {
+                super::information_flow::record_directory_response(&context)?;
+            }
+            SessionJob::DraftMedia { request: super::ai::tools::MediaDraftRequest {
+                source: super::ai::tools::MediaSource::MatrixEvent { room_id: Some(source), .. }, ..
+            }, .. } if source != room_id.as_str() => {
                 super::information_flow::record_directory_response(&context)?;
             }
             SessionJob::ReadTool { kind: ReadToolKind::OtherRoom { room, .. }, .. } => {
@@ -9398,6 +9607,7 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
     let detail = session_job_detail(rooms.as_ref(), &job);
     record_tool_call_detail(room_id, &ai_job_tool_name(&job), detail);
     match job {
+        job @ (SessionJob::DraftMessage { .. } | SessionJob::DraftMedia { .. } | SessionJob::AttachMedia { .. } | SessionJob::PostRoomMedia { .. }) => ai_media::run(cx, ui, room_id, job),
         SessionJob::SendRoomMessage { text, answer } => {
             // The call's state row finishes when its message is on its way;
             // the receipt chip rides the same `ai_reply` card below. A failed
@@ -11238,7 +11448,6 @@ View{note := Label{text:"waiting"}}
     #[test]
     fn queued_composer_rechecks_revocation_and_hard_room_protection() {
         let mut permissions = PermissionStore::default();
-        permissions.set_global_policy(RoomAccess::Write, PolicyDecision::Ask);
         let capability = a2app_core::capabilities::by_id("host.composer.insert").unwrap();
         let grant = permissions.grant_scoped("composer-test", capability.group.unwrap(), Some(capability.id),
             RoomScope::room(TARGET), GrantDuration::RobrixSession, Some(TARGET)).unwrap();
@@ -11252,10 +11461,34 @@ View{note := Label{text:"waiting"}}
         permissions.remove_scoped_grant(grant);
         assert!(pending.permitted(&permissions), "consuming Allow once does not cancel its already queued action");
         permissions.set_room_policy(TARGET, RoomAccess::Write, PolicyDecision::Deny);
+        assert!(pending.permitted(&permissions), "a send block must not revoke a local draft");
+        permissions.set_room_policy(TARGET, RoomAccess::Read, PolicyDecision::Deny);
         assert!(!pending.permitted(&permissions), "hard protection overrides the queued receipt");
-        permissions.set_room_policy(TARGET, RoomAccess::Write, PolicyDecision::Ask);
+        permissions.set_room_policy(TARGET, RoomAccess::Read, PolicyDecision::Ask);
         permissions.set("composer-test", capability.group.unwrap(), GrantState::Denied);
         assert!(!pending.permitted(&permissions), "explicit revocation overrides the queued receipt");
+    }
+
+    #[test]
+    fn composer_media_review_binds_decoded_bytes_without_exposing_base64() {
+        let args = serde_json::json!({ "room_id": TARGET, "data_base64": "bWVkaWE=",
+            "filename": "fixture.txt", "mime_type": "text/plain", "caption": "Review this" });
+        let payload = composer_review_payload("composer.attach", &args, Some(SOURCE)).unwrap().unwrap();
+        assert_eq!(payload["media"]["size"], 5);
+        assert_eq!(payload["media"]["caption"], "Review this");
+        assert_eq!(payload["media"]["sha256"].as_str().unwrap().len(), 64);
+        assert!(!payload.to_string().contains("bWVkaWE="));
+        let mut changed = args.clone();
+        changed["data_base64"] = "b3RoZXI=".into();
+        let changed_payload = composer_review_payload("composer.attach", &changed, Some(SOURCE)).unwrap().unwrap();
+        assert_ne!(payload["media"]["sha256"], changed_payload["media"]["sha256"]);
+        let cap = a2app_core::capabilities::for_service("composer.attach").unwrap();
+        let contract = cap.flow_contract().unwrap();
+        assert_eq!(contract.recipient("alice", Some(TARGET), &payload, None).unwrap(), None);
+        assert_eq!(contract.sensitive_action(cap.id, &payload, Some(TARGET)).unwrap().target, TARGET);
+        assert_eq!(composer_review_payload("composer.insert", &serde_json::json!({ "text": " draft ", "room_id": TARGET }), Some(SOURCE)).unwrap(),
+            Some(serde_json::json!({ "text": "draft" })));
+        assert!(composer_review_payload("composer.attach", &serde_json::json!({ "data_base64": "ciphertext", "filename": "invalid.png", "mime_type": "image/png" }), Some(SOURCE)).is_err());
     }
 
     #[test]

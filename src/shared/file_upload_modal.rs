@@ -6,7 +6,7 @@ use makepad_code_editor::code_view::CodeViewWidgetExt;
 use makepad_widgets::*;
 use makepad_widgets::image_cache::{ImageBuffer, decode_image_from_data};
 use ruma::OwnedEventId;
-use std::{io::Read, path::{Path, PathBuf}, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}};
+use std::{io::Read, path::{Path, PathBuf}, sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}}};
 use crate::{
     settings::account_settings::AccountSettingsAction,
     shared::popup_list::{PopupKind, enqueue_popup_notification},
@@ -21,6 +21,8 @@ pub const LARGE_ATTACHMENT_WARNING_THRESHOLD_BYTES: u64 = 10 * 1000 * 1000;
 
 /// Unique identifier for a single file-upload attempt.
 pub type FileUploadAttemptId = u64;
+
+static UPLOAD_PREVIEW_PENDING: AtomicBool = AtomicBool::new(false);
 
 fn next_file_upload_attempt_id() -> FileUploadAttemptId {
     static NEXT_FILE_UPLOAD_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
@@ -332,6 +334,10 @@ pub enum UploadSource {
     Picked(robius_file_picker::LocalFile),
     /// A file Robrix wrote itself, e.g. an exported mini-app bundle.
     Path(PathBuf),
+    /// Immutable prepared bytes, retaining the temporary file through preview
+    /// cancellation and queued upload completion.
+    #[cfg(feature = "a2app")]
+    PreparedMedia(Arc<crate::a2app::ai::media::PreparedMedia>),
 }
 
 impl UploadSource {
@@ -339,6 +345,8 @@ impl UploadSource {
         match self {
             Self::Picked(file) => file.path(),
             Self::Path(path) => path,
+            #[cfg(feature = "a2app")]
+            Self::PreparedMedia(media) => media.path(),
         }
     }
 
@@ -347,6 +355,8 @@ impl UploadSource {
         match self {
             Self::Picked(file) => file.mime_type(),
             Self::Path(_) => None,
+            #[cfg(feature = "a2app")]
+            Self::PreparedMedia(media) => Some(media.mime_type()),
         }
     }
 }
@@ -401,6 +411,16 @@ pub struct TextPreview {
 }
 
 impl FileUploadMetadata {
+    /// Prepared media keeps the reviewed bytes immutable, even if its preview
+    /// file is subsequently changed or removed by another local process.
+    pub async fn read_bytes(&self) -> std::io::Result<Vec<u8>> {
+        #[cfg(feature = "a2app")]
+        if let UploadSource::PreparedMedia(media) = &self.source {
+            return Ok(media.bytes().to_vec());
+        }
+        tokio::fs::read(self.path()).await
+    }
+
     /// The local filesystem path of the file to upload.
     pub fn path(&self) -> &Path {
         self.source.path()
@@ -677,6 +697,9 @@ impl FileUploadModal {
 
     /// Clears state and frees every preview resource (texture, text, source file).
     fn reset(&mut self, cx: &mut Cx) {
+        if self.preview_id.is_some() {
+            UPLOAD_PREVIEW_PENDING.store(false, Ordering::Release);
+        }
         self.upload = None;
         self.preview_id = None;
         self.is_text_preview = false;
@@ -767,6 +790,39 @@ pub fn stage_local_file(
     });
 }
 
+/// Reserve the existing upload preview before acknowledging an agent's
+/// attachment, so an active preview cannot be replaced by another tool call.
+#[cfg(feature = "a2app")]
+pub fn stage_prepared_media(
+    media: Arc<crate::a2app::ai::media::PreparedMedia>,
+    into_upload: impl FnOnce(FileUploadMetadata) -> Result<PendingUpload, String> + Send + 'static,
+) -> Result<(), String> {
+    let mime_type = media.mime_type().to_owned();
+    let size = media.bytes().len() as u64;
+    let caption = media.caption().map(str::to_owned);
+    let source = UploadSource::PreparedMedia(media);
+    let file_data = FileUploadMetadata {
+        source: source.clone(), caption, mime_type: mime_type.clone(),
+        preview: FilePreview::Loading, size,
+    };
+    let upload = into_upload(file_data)?;
+    reserve_upload_preview()?;
+    let preview_source = PreviewSource { source, mime_type, file_size: size, is_mime_guaranteed: true };
+    let preview_id = next_file_preview_id();
+    Cx::post_action(FileUploadModalAction::Show { upload, preview_id });
+    std::thread::spawn(move || {
+        Cx::post_action(FileUploadModalAction::PreviewReady {
+            preview_id, preview: PreviewPayload::new(preview_source.build()),
+        });
+    });
+    Ok(())
+}
+
+fn reserve_upload_preview() -> Result<(), String> {
+    UPLOAD_PREVIEW_PENDING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map(|_| ()).map_err(|_| "Finish or cancel the current attachment preview before adding another attachment.".into())
+}
+
 /// Shows the preview modal instantly, then re-uses this bg thread to read
 /// the file and generate the preview.
 fn show_upload_modal(staged: Result<(PendingUpload, PreviewSource), String>) {
@@ -777,6 +833,10 @@ fn show_upload_modal(staged: Result<(PendingUpload, PreviewSource), String>) {
             return;
         }
     };
+    if let Err(error) = reserve_upload_preview() {
+        enqueue_popup_notification(error, PopupKind::Warning, Some(7.0));
+        return;
+    }
     let preview_id = next_file_preview_id();
     Cx::post_action(FileUploadModalAction::Show { upload, preview_id });
     let preview = preview_source.build();
@@ -862,6 +922,25 @@ impl PreviewSource {
     ///       like reading files, scanning file data for strings, and decoding images.
     pub fn build(self) -> FilePreview {
         let path = self.source.path();
+        #[cfg(feature = "a2app")]
+        if let UploadSource::PreparedMedia(media) = &self.source {
+            if crate::image_utils::is_displayable_image(&self.mime_type) {
+                return decode_image_from_data(media.bytes()).map(FilePreview::Image)
+                    .unwrap_or(FilePreview::None);
+            }
+            if crate::utils::mimetype_might_be_text(&self.mime_type, true) {
+                let end = media.bytes().len().min(TEXT_PREVIEW_MAX_BYTES as usize);
+                let truncated = end < media.bytes().len();
+                if let Some(content) = bytes_to_string_excerpt(&media.bytes()[..end], truncated)
+                    .filter(|content| !content.trim().is_empty())
+                {
+                    return FilePreview::Text(TextPreview {
+                        content, truncated, is_code: crate::utils::is_code_file(path),
+                    });
+                }
+            }
+            return FilePreview::None;
+        }
         if crate::image_utils::is_displayable_image(&self.mime_type) {
             match std::fs::read(path) {
                 Ok(data) => match decode_image_from_data(&data) {

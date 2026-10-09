@@ -99,7 +99,8 @@ pub struct Capability {
     pub risk: Risk,
     /// Broker service ids (outgoing) or the script hook name (incoming)
     /// that carry it on the wire. Wire ids never change; capability ids
-    /// are the user-facing layer over them.
+    /// are the user-facing layer over them. Agent-only capabilities have
+    /// no Splash wire id and are checked by the host's agent-tool gate.
     pub wire: &'static [&'static str],
 }
 
@@ -204,9 +205,9 @@ macro_rules! cap {
 
 use Permission as P;
 
-/// Every capability, grouped by permission in display order. Available
-/// rows map 1:1 onto the broker services and hooks that exist today; the
-/// planned and never rows document the full intended surface.
+/// Every capability, grouped by permission in display order. Available rows
+/// cover broker services, hooks and host-owned agent tools; the planned and
+/// never rows document the full intended surface.
 pub const CATALOG: &[Capability] = &[
     // ----- core -----
     cap!("host.env.read", "App environment", "Its app id, attached room, instance tag, surface, platform and view mode.", Read, Outgoing, Instance, None, Available, Low, ["env"]),
@@ -279,7 +280,7 @@ pub const CATALOG: &[Capability] = &[
     // ----- open-url -----
     cap!("device.url.open", "Open a link", "http(s)/mailto in the system handler; scheme allowlist, 2048 chars, foreground-only. matrix.to links route to host.nav.link instead.", Act, Outgoing, Device, Some(P::OpenUrl), Available, Medium, ["url.open"]),
     // ----- files -----
-    cap!("device.files.pick", "Pick a text file", "OS open dialog returning UTF-8 text up to 1MB. Modal, one at a time, foreground-only.", Read, Outgoing, Device, Some(P::Files), Available, Medium, ["files.pick"]),
+    cap!("device.files.pick", "Pick a file", "OS open dialog returning text and lossless base64 bytes up to 1MB. Modal, one at a time, foreground-only; picking does not upload or send the file.", Read, Outgoing, Device, Some(P::Files), Available, Medium, ["files.pick"]),
     cap!("device.files.save", "Save a file", "OS save dialog with a suggested name for app text.", Write, Outgoing, Device, Some(P::Files), Available, Low, ["files.save"]),
     cap!("device.files.pick_binary", "Pick a binary file", "Open dialog returning an opaque handle the app can pass to share.file or attachment.send, so bytes never enter the script heap; base64 only on request.", Read, Outgoing, Device, Some(P::Files), PlannedNewPlumbing, Medium, []),
     // ----- share -----
@@ -305,7 +306,7 @@ pub const CATALOG: &[Capability] = &[
     cap!("on_network_changed", "Connectivity changed", "Called when Robrix goes offline or online; coalesced to one per pass.", Read, Incoming, Device, Some(P::DeviceInfo), PlannedNewPlumbing, Low, []),
     cap!("on_sync_state_changed", "Sync state changed", "connecting / syncing / offline / error, coalesced.", Read, Incoming, Account, Some(P::DeviceInfo), PlannedNewPlumbing, Low, []),
     // ----- camera -----
-    cap!("device.camera.capture", "Take a photo", "OS camera returning a handle or base64; until it exists, files.pick_binary(accept:'image') is the honest route.", Read, Outgoing, Device, Some(P::Camera), PlannedNewPlumbing, High, []),
+    cap!("device.camera.capture", "Take a photo", "OS camera returning a handle or base64; until it exists, files.pick can select an existing image up to 1MB.", Read, Outgoing, Device, Some(P::Camera), PlannedNewPlumbing, High, []),
     // ----- microphone -----
     cap!("device.microphone.record", "Record audio", "OS recorder returning a clip handle for share or attachment.", Read, Outgoing, Device, Some(P::Microphone), PlannedNewPlumbing, High, []),
     // ----- matrix-account-read -----
@@ -353,12 +354,13 @@ pub const CATALOG: &[Capability] = &[
     // ----- matrix-room-invite -----
     cap!("matrix.room.invite.send", "Invite someone", "Invite a user to the attached room as you; the user id is shown on every prompt.", Write, Outgoing, Room, Some(P::MatrixRoomInvite), RefusedBySwitch, High, ["matrix.invite"]),
     // ----- matrix-media -----
-    cap!("matrix.media.download", "Fetch an attachment", "Bytes of an attachment or thumbnail from the attached room, size-capped, base64 or handle.", Read, Outgoing, Room, Some(P::MatrixMedia), PlannedMachinery, High, []),
+    cap!("matrix.media.download", "Fetch an attachment", "Let an agent prepare a local, size-capped copy of an image or file from an approved room. Your room and space read rules apply, and Matrix requests go to your homeserver.", Read, Outgoing, Room, Some(P::MatrixMedia), Available, High, []),
     cap!("matrix.media.save", "Download to disk", "Save an attachment from the attached room to Downloads with host progress UI.", Act, Outgoing, Room, Some(P::MatrixMedia), PlannedMachinery, Medium, []),
     cap!("matrix.media.share", "Share an attachment", "Hand a room attachment to the system share sheet.", Act, Outgoing, Room, Some(P::MatrixMedia), PlannedMachinery, Medium, []),
     cap!("matrix.media.avatar.read", "Avatars", "A member's or the room's avatar thumbnail.", Read, Outgoing, Room, Some(P::MatrixMedia), PlannedMachinery, Low, []),
     cap!("matrix.media.url_preview.read", "Link preview", "Title, description and image of a URL via the homeserver (the homeserver sees the URL).", Read, Outgoing, Account, Some(P::MatrixMedia), PlannedMachinery, Medium, []),
-    cap!("matrix.media.upload", "Upload media", "Upload bytes to the media repo and get an mxc uri without sending an event.", Write, Outgoing, Account, Some(P::MatrixMedia), PlannedMachinery, Medium, []),
+    cap!("matrix.media.upload", "Upload media", "Let an agent or mini-app upload prepared images, audio, video, or files to your homeserver when posting media. Posting also requires permission to send media to that room.", Write, Outgoing, Account, Some(P::MatrixMedia), Available, High, []),
+    cap!("matrix.media.send", "Post images and files", "Let an agent or mini-app upload and post prepared media as you in an approved room. Upload permission and your room and space write rules also apply.", Write, Outgoing, Room, Some(P::MatrixMedia), Available, High, ["matrix.send_media"]),
     cap!("on_upload_progress", "Upload progress hook", "Be told how an upload it started is progressing, and cancel it.", Read, Incoming, Room, Some(P::MatrixMedia), PlannedMachinery, Low, []),
     // ----- matrix-rooms-list -----
     cap!("matrix.rooms.list", "Your rooms", "Joined rooms and DMs with name, unread, mentions, tags, is_direct, is_space; no message previews; optionally limited to a space.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsList), Available, High, ["matrix.rooms_list"]),
@@ -397,6 +399,7 @@ pub const CATALOG: &[Capability] = &[
     cap!("host.nav.app", "Open another mini-app", "Open an installed app in this room's dock; target must be installed and unrestricted.", Act, Outgoing, Apps, Some(P::RobrixNavigation), Available, Low, ["nav.app"]),
     // ----- robrix-composer -----
     cap!("host.composer.insert", "Draft a message for you", "Put text into the attached room's message box; the user still presses send.", Act, Outgoing, Room, Some(P::RobrixComposer), Available, Medium, ["composer.insert"]),
+    cap!("host.composer.attach", "Attach images and files for you", "Put prepared media in an approved room's message box for you to review and send. Preparing an attachment does not upload or post it.", Act, Outgoing, Room, Some(P::RobrixComposer), Available, Medium, ["composer.attach"]),
     cap!("host.composer.reply_to", "Set reply target", "Put the attached room's composer into reply mode for a message.", Act, Outgoing, Room, Some(P::RobrixComposer), Available, Low, ["composer.reply_to"]),
     // ----- robrix-ui -----
     cap!("ui.pane.request_size", "Preferred size", "Hint the size along the pane's resizable axis; the dock clamps and the user's drag always wins; rate-limited harder since it reflows the timeline.", Act, Outgoing, Instance, Some(P::RobrixUi), PlannedNewPlumbing, Low, []),
@@ -509,9 +512,43 @@ mod tests {
         assert_eq!(for_service("network.http").unwrap().flow_contract().unwrap().output, FlowOutput::Network);
         assert_eq!(for_service("matrix.event").unwrap().flow_contract().unwrap().output, FlowOutput::MatrixServer);
         assert_eq!(for_service("matrix.rooms_search").unwrap().flow_contract().unwrap().output, FlowOutput::Local);
-        assert_eq!(for_service("composer.insert").unwrap().flow_contract().unwrap().output, FlowOutput::TargetRoom);
+        assert_eq!(for_service("composer.insert").unwrap().flow_contract().unwrap().output, FlowOutput::Local);
         assert!(for_service("matrix.send_message").unwrap().flow_contract().unwrap().privileged_effect);
         assert_eq!(for_hook("on_tool_call").unwrap().flow_contract().unwrap().source, FlowSource::Peer);
+    }
+
+    #[test]
+    fn media_upload_and_drafts_have_separate_release_destinations() {
+        use crate::information_flow::Recipient;
+        for (id, output, recipient) in [
+            ("matrix.media.upload", FlowOutput::MatrixServer, Recipient::NetworkOrigin("https://hs.example".into())),
+            ("matrix.media.send", FlowOutput::TargetRoom, Recipient::MatrixRoom { account: "alice".into(), room: "!target:s".into() }),
+        ] {
+            let capability = by_id(id).unwrap();
+            assert!(capability.is_available());
+            let contract = capability.flow_contract().unwrap();
+            assert_eq!(contract.source, FlowSource::None, "the prepared bytes retain the agent's existing label");
+            assert_eq!(contract.output, output);
+            assert!(contract.privileged_effect);
+            assert_eq!(contract.recipient("alice", Some("!target:s"), &serde_json::json!({}), Some("https://hs.example/")).unwrap(), Some(recipient));
+        }
+        assert!(by_id("matrix.media.upload").unwrap().wire.is_empty(), "upload is a prerequisite rather than a separate mini-app service");
+        assert_eq!(for_service("matrix.send_media").unwrap().id, "matrix.media.send");
+        for id in ["host.composer.insert", "host.composer.attach", "host.composer.reply_to"] {
+            let contract = by_id(id).unwrap().flow_contract().unwrap();
+            assert_eq!(contract.source, FlowSource::None);
+            assert_eq!(contract.output, FlowOutput::Local, "the user reviews a draft before any release");
+            assert!(contract.privileged_effect, "untrusted influences still require exact-action review");
+            assert_eq!(contract.recipient("alice", Some("!target:s"), &serde_json::json!({}), Some("https://hs.example/")).unwrap(), None);
+            assert_eq!(contract.sensitive_action(id, &serde_json::json!({}), Some("!target:s")).unwrap().target, "!target:s");
+        }
+        let download = by_id("matrix.media.download").unwrap().flow_contract().unwrap();
+        assert_eq!(download.source_labels("alice", Some("!attached:s"), Some("!source:s")).unwrap(),
+            [crate::information_flow::Source::Room { account: "alice".into(), room: "!source:s".into() }].into_iter().collect());
+        assert_eq!(download.recipient("alice", Some("!source:s"), &serde_json::json!({}), Some("https://hs.example/")).unwrap(),
+            Some(Recipient::NetworkOrigin("https://hs.example".into())));
+        assert!(download.untrusted_content);
+        assert!(!download.privileged_effect);
     }
 
     #[test]

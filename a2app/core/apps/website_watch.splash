@@ -3,10 +3,11 @@
 // tint: #2A7F92
 // description: Check a website for a keyword on a saved schedule, then notify you or post to this room.
 // background: true
-// permissions: network, notifications, matrix-room-send, network.http, notifications.post, matrix.room.message.send
+// permissions: network, notifications, matrix-room-send, robrix-composer, network.http, notifications.post, matrix.room.message.send, host.composer.insert
 // why-network: Fetches the URL you save when your background task runs.
 // why-notifications: Shows a popup when the keyword first appears.
-// why-matrix-room-send: Optionally reports a match to this task's attached room.
+// why-matrix-room-send: Posts test reports and scheduled matches when you choose room messages.
+// why-robrix-composer: Prepares a test report in the message box for you to review and send.
 
 let config = {url: "https://example.com/", keyword: "Example Domain", post: false}
 let matched = false
@@ -120,6 +121,18 @@ fn check_website(run){
 
 fn test_website(){ check_website(0) }
 
+fn draft_report(){
+    if busy { return nil }
+    busy = true
+    show_status("Preparing a draft…")
+    let text = "Website Watch test for '" + config.keyword + "' at " + config.url
+    host.request("composer.insert", {text: text}, fn(r){
+        busy = false
+        if r.is_ok { show_status("Test report drafted. Review and send it in Robrix. The website was not checked.") }
+        else { show_status(r.error) }
+    })
+}
+
 fn on_background(json){ check_website(json.parse_json().run_id) }
 
 fn on_app_resize(width, height){
@@ -145,7 +158,8 @@ View{
         post_button := Button{text: "Report: Robrix popup" on_click: || toggle_post()}
         Button{text: "Save configuration" on_click: || save()}
         Button{text: "Test saved website and report" on_click: || test_website()}
+        Button{text: "Draft test report" on_click: || draft_report()}
         status := Label{text: "Default: example.com, keyword Example Domain, popup. Save settings, then test the saved website and report before scheduling checks." width: Fill draw_text +: {color: #x2A7F92 text_style: theme.font_regular{font_size: 12}}}
-        Label{text: "Save your settings, then test the website and report while this app is open. A test sends one report even if the keyword is absent or already reported. Choose Until you quit Robrix or Forever and Approve in the prompts before scheduling checks and reports. Each prompt shows what will happen and where. Automated runs do not open permission dialogs. Robrix must be running." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
+        Label{text: "Draft test report prepares local text for your review and needs no sending permission. Test saved website and report checks the website and sends one report even if the keyword is absent or already reported. Room-message reports need separate sending permission. Choose Until you quit Robrix or Forever and Approve before scheduling checks and reports. Automated runs do not open permission dialogs. Robrix must be running." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
     }
 }

@@ -1,16 +1,18 @@
 // name: Simple Watcher
 // icon: 👁
 // tint: #E09F3E
-// description: Keyword rules that notify you, and can auto-reply.
-// permissions: matrix-room-watch, notifications, matrix-room-send, on_room_message, notifications.post, matrix.room.message.send
+// description: Keyword rules that notify you, draft replies for review, or send saved auto-replies.
+// permissions: matrix-room-watch, notifications, matrix-room-send, robrix-composer, on_room_message, notifications.post, matrix.room.message.send, host.composer.insert
 // why-matrix-room-watch: Sees new messages so it can match your rules.
 // why-notifications: Tells you when a message matches a rule.
-// why-matrix-room-send: Posts your reply when a rule says to.
+// why-matrix-room-send: Sends saved auto-replies when rules match and when you test them.
+// why-robrix-composer: Puts a reply in the message box only when you press Draft reply.
 
 let watch_pending = false
 let watch_ready = false
 let watch_generation = 0
 let test_pending = false
+let reply_draft_pending = false
 let pending_test = nil
 let action_queue = []
 let action_pending = false
@@ -62,7 +64,7 @@ fn keyword_pattern(keyword){
 fn show_status(){
     let line = watch_line
     if !host.has("matrix.room.message.send") {
-        line = line + " Replies are off until this app may send to the room."
+        line = line + " Automatic sending is off until this app may send to the room. Draft reply remains separate."
     }
     if actions_paused { line = line + " Automatic actions are paused. Test a rule to resume them." }
     ui.status.set_text(line)
@@ -131,6 +133,22 @@ fn add_rule(){
     ui.reply_input.set_text("")
     ui.rule_list.render()
     show_status()
+}
+
+fn draft_reply(text){
+    if reply_draft_pending { return nil }
+    let reply = text.trim()
+    if reply == "" || reply.len() > 4096 {
+        ui.status.set_text("Enter a reply between 1 and 4096 characters to draft.")
+        return nil
+    }
+    reply_draft_pending = true
+    ui.status.set_text("Preparing a reply draft…")
+    host.request("composer.insert", {text: reply}, fn(r){
+        reply_draft_pending = false
+        if r.is_ok { ui.status.set_text("Reply drafted. Review and send it in Robrix. Automatic sending is unchanged.") }
+        else { ui.status.set_text(r.error) }
+    })
 }
 
 fn finish_test(text){
@@ -295,6 +313,7 @@ View{
                     draw_text +: { color: #x333333 }
                 }
                 Button{ text: "Add rule" on_click: || add_rule() draw_text +: { color: #x1C274C } }
+                Button{ text: "Draft reply" on_click: || draft_reply(ui.reply_input.text()) draw_text +: { color: #x1C274C } }
             }
         }
         Label{
@@ -327,7 +346,8 @@ View{
                             }
                             View{
                                 width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
-                                Button{text: "Test rule" on_click: || test_rule(rule)}
+                                Button{text: "Draft reply" on_click: || draft_reply(rule.reply)}
+                                Button{text: if rule.reply != "" { "Test and send reply" } else { "Test notification" } on_click: || test_rule(rule)}
                                 Button{text: "Remove rule" on_click: || remove_rule(index)}
                             }
                         }
@@ -337,7 +357,7 @@ View{
             }
         }
         Label{
-            text: "Test a rule to show its notification and post its saved reply to this room. Choose Until you quit Robrix or Forever and Approve in the prompts to permit future matching messages. Adding a rule only saves it."
+            text: "Draft reply prepares local text for review and needs no sending permission. Test and send reply posts the saved reply and shows any notification. Separate sending permission allows saved auto-replies on future matches. Adding a rule only saves it."
             width: Fill padding: 0 margin: 0
             draw_text +: {color: #x66708F text_style: theme.font_regular{font_size: 11}}
         }

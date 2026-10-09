@@ -1,13 +1,17 @@
 // name: Roll Call
 // icon: 🎲
 // tint: #7C6CF0
-// description: Rolls dice and can post the result to the room.
-// permissions: matrix-room-send, matrix.room.message.send
-// why-matrix-room-send: Posts your roll into this room.
+// description: Rolls dice, prepares a draft, or posts the result to the room.
+// permissions: robrix-composer, matrix-room-send, host.composer.insert, matrix.room.message.send
+// why-robrix-composer: Puts your roll in the message box for you to review and send.
+// why-matrix-room-send: Posts your roll into this room only when you press Post to room.
 
 let die_a = 1
 let die_b = 1
 let posting = false
+let drafting = false
+
+fn result_text(){ return "🎲 Rolled " + die_a + " + " + die_b + " = " + (die_a + die_b) }
 
 fn roll(){
     let t = floor(time_now() * 997.0)
@@ -21,9 +25,8 @@ fn roll(){
 }
 
 fn post(){
-    if posting { return nil }
-    let total = die_a + die_b
-    let msg = "🎲 Rolled " + die_a + " + " + die_b + " = " + total
+    if posting || drafting { return nil }
+    let msg = result_text()
     posting = true
     ui.note.set_text("Posting…")
     host.request("matrix.send_message", {body: msg}, fn(r){
@@ -33,6 +36,17 @@ fn post(){
             return nil
         }
         ui.note.set_text(r.error)
+    })
+}
+
+fn draft_result(){
+    if posting || drafting { return nil }
+    drafting = true
+    ui.note.set_text("Preparing a draft…")
+    host.request("composer.insert", {text: result_text()}, fn(r){
+        drafting = false
+        if r.is_ok { ui.note.set_text("Draft ready. Review and send it in Robrix.") }
+        else { ui.note.set_text(r.error) }
     })
 }
 
@@ -60,9 +74,18 @@ View{
                 draw_text +: { color: #x1C274C }
             }
             Button{
+                text: "Draft result" on_click: || draft_result()
+                draw_text +: { color: #x1C274C }
+            }
+            Button{
                 text: "Post to room" on_click: || post()
                 draw_text +: { color: #x1C274C }
             }
+        }
+        Label{
+            text: "Draft result prepares text for review. Post to room sends it immediately and needs separate permission."
+            width: Fill padding: 0 margin: 0
+            draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 11} }
         }
         note := Label{
             text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0

@@ -2661,7 +2661,7 @@ async fn matrix_worker_task(
                             return false;
                         }
 
-                        let bytes = match tokio::fs::read(upload.file_data.path()).await {
+                        let bytes = match upload.file_data.read_bytes().await {
                             Ok(bytes) => bytes,
                             Err(e) => {
                                 error!("Failed to read attachment {:?} for {timeline_kind}: {e:?}", upload.file_data.path());

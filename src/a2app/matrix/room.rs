@@ -3,7 +3,7 @@
 use matrix_sdk::deserialized_responses::TimelineEvent;
 use matrix_sdk::ruma::events::receipt::{ReceiptThread, ReceiptType};
 use matrix_sdk::ruma::events::room::message::sanitize::remove_plain_reply_fallback;
-use matrix_sdk::ruma::events::room::message::{OriginalSyncRoomMessageEvent, Relation};
+use matrix_sdk::ruma::events::room::{MediaSource, message::{MessageType, OriginalSyncRoomMessageEvent, Relation}};
 use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent};
 use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
 use std::collections::HashMap;
@@ -27,7 +27,7 @@ fn as_message(event: &TimelineEvent) -> Option<OriginalSyncRoomMessageEvent> {
 /// wrote — a truncated body makes it report that the tool cut the message.
 const SERVICE_BODY_CLIP: usize = 500;
 
-/// The `{sender, sender_id, event_id, body, ts, msgtype}` shape every message list carries.
+/// The `{sender, sender_id, event_id, body, ts, msgtype, media}` shape every message list carries.
 ///
 /// `full_body` keeps the whole message text; only the mini-app services clip
 /// (to `SERVICE_BODY_CLIP`), so a scripted reader does not have to guard
@@ -44,7 +44,46 @@ fn message_json(msg: &OriginalSyncRoomMessageEvent, full_body: bool) -> serde_js
         "body": body,
         "ts": u64::from(msg.origin_server_ts.0),
         "msgtype": msg.content.msgtype(),
+        "media": media_json(&msg.content.msgtype),
     })
+}
+
+/// Attachment discovery never returns decryption keys. An agent can request
+/// `draft_media` with the row's event id and room id; the host then resolves
+/// the original event and decrypts its verified media source itself.
+fn media_json(msgtype: &MessageType) -> Option<serde_json::Value> {
+    let (source, filename, mime_type, size, width, height, duration) = match msgtype {
+        MessageType::Image(media) => (&media.source, media.filename(),
+            media.info.as_ref().and_then(|info| info.mimetype.as_deref()),
+            media.info.as_ref().and_then(|info| info.size),
+            media.info.as_ref().and_then(|info| info.width),
+            media.info.as_ref().and_then(|info| info.height), None),
+        MessageType::Audio(media) => (&media.source, media.filename(),
+            media.info.as_ref().and_then(|info| info.mimetype.as_deref()),
+            media.info.as_ref().and_then(|info| info.size), None, None,
+            media.info.as_ref().and_then(|info| info.duration)),
+        MessageType::Video(media) => (&media.source, media.filename(),
+            media.info.as_ref().and_then(|info| info.mimetype.as_deref()),
+            media.info.as_ref().and_then(|info| info.size),
+            media.info.as_ref().and_then(|info| info.width),
+            media.info.as_ref().and_then(|info| info.height),
+            media.info.as_ref().and_then(|info| info.duration)),
+        MessageType::File(media) => (&media.source, media.filename(),
+            media.info.as_ref().and_then(|info| info.mimetype.as_deref()),
+            media.info.as_ref().and_then(|info| info.size), None, None, None),
+        _ => return None,
+    };
+    let (uri, encrypted) = match source {
+        MediaSource::Plain(uri) => (uri.as_str(), false),
+        MediaSource::Encrypted(file) => (file.url.as_str(), true),
+    };
+    let mut filename = filename.to_string();
+    clip_chars(&mut filename, SERVICE_BODY_CLIP);
+    Some(serde_json::json!({
+        "uri": uri, "encrypted": encrypted, "filename": filename,
+        "mime_type": mime_type, "size": size, "width": width, "height": height,
+        "duration_ms": duration.and_then(|duration| u64::try_from(duration.as_millis()).ok()),
+    }))
 }
 
 /// The timestamp of the user's own newest read receipt (public or private)
@@ -492,4 +531,57 @@ pub(crate) async fn read_messages(room_id: matrix_sdk::ruma::OwnedRoomId, limit:
     // Backward pagination is newest-first; apps read oldest-first.
     out.reverse();
     Ok(serde_json::json!({ "messages": out, "unread_count": room.num_unread_messages() }).to_string())
+}
+
+#[cfg(test)]
+mod media_metadata_tests {
+    use super::*;
+
+    fn message(content: serde_json::Value) -> OriginalSyncRoomMessageEvent {
+        serde_json::from_value(serde_json::json!({
+            "type": "m.room.message", "event_id": "$media:test", "sender": "@sender:test",
+            "origin_server_ts": 1, "content": content,
+        })).unwrap()
+    }
+
+    #[test]
+    fn room_reads_identify_native_media_sources_and_metadata() {
+        for (msgtype, mime_type) in [("m.image", "image/png"), ("m.audio", "audio/ogg"),
+            ("m.video", "video/mp4"), ("m.file", "application/pdf")]
+        {
+            let row = message_json(&message(serde_json::json!({
+                "msgtype": msgtype, "body": "A caption", "filename": "sample.bin",
+                "url": "mxc://media.test/example", "info": {"mimetype": mime_type, "size": 17},
+            })), true);
+            assert_eq!(row["event_id"], "$media:test");
+            assert_eq!(row["body"], "A caption");
+            assert_eq!(row["media"]["filename"], "sample.bin");
+            assert_eq!(row["media"]["uri"], "mxc://media.test/example");
+            assert_eq!(row["media"]["encrypted"], false);
+            assert_eq!(row["media"]["mime_type"], mime_type);
+            assert_eq!(row["media"]["size"], 17);
+        }
+        let row = message_json(&message(serde_json::json!({"msgtype": "m.text", "body": "Text"})), true);
+        assert!(row["media"].is_null());
+    }
+
+    #[test]
+    fn encrypted_attachment_discovery_keeps_crypto_material_in_the_host() {
+        let row = message_json(&message(serde_json::json!({
+            "msgtype": "m.image", "body": "image.png", "info": {"mimetype": "image/png", "w": 42, "h": 24},
+            "file": {
+                "url": "mxc://media.test/encrypted",
+                "key": {"kty": "oct", "key_ops": ["encrypt", "decrypt"], "alg": "A256CTR",
+                    "k": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "ext": true},
+                "iv": "AAAAAAAAAAAAAAAAAAAAAA", "hashes": {"sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}, "v": "v2",
+            },
+        })), true);
+        assert_eq!(row["media"]["encrypted"], true);
+        assert_eq!(row["media"]["uri"], "mxc://media.test/encrypted");
+        assert_eq!(row["media"]["filename"], "image.png");
+        assert_eq!(row["media"]["width"], 42);
+        assert_eq!(row["media"]["height"], 24);
+        for field in ["file", "key", "iv", "hashes"] { assert!(row["media"].get(field).is_none()); }
+        assert!(!row.to_string().contains("AAAAAAAA"));
+    }
 }

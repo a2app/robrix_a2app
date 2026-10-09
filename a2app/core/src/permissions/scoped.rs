@@ -291,10 +291,15 @@ pub struct NetworkGrant {
     pub origin_room: Option<String>,
 }
 
-/// The read/write boundary touched by a room capability. Mixed operations
-/// return Write here; `capability_room_policy` checks both sides.
+/// The room protection boundary touched by a capability. Local composer
+/// drafts follow room access protection, independently of sending policies.
+/// This does not grant any capability to read messages or unsent drafts.
+/// Mixed operations return Write; `capability_room_policy` checks both sides.
 pub fn capability_room_access(cap: &Capability) -> Option<RoomAccess> {
-    if cap.status == Status::RefusedBySwitch || cap.group == Some(Permission::RobrixComposer) {
+    if cap.group == Some(Permission::RobrixComposer) {
+        return Some(RoomAccess::Read);
+    }
+    if cap.status == Status::RefusedBySwitch {
         return Some(RoomAccess::Write);
     }
     if !matches!(cap.scope, Scope::Room | Scope::MultiRoom | Scope::Space) { return None; }
@@ -862,6 +867,102 @@ mod tests {
 
     fn effective(store: &PermissionStore, cap: &str, ctx: PermissionContext<'_>) -> Effective {
         store.effective_capability_for_in_context("app", |_| true, |_| true, crate::capabilities::by_id(cap).unwrap(), ctx)
+    }
+
+    #[test]
+    fn media_posting_grants_follow_target_and_room_write_protection() {
+        for (id, permission) in [("matrix.media.send", Permission::MatrixMedia)] {
+            let mut store = PermissionStore::default();
+            let target = context("!origin:s", "!target:s");
+            let grant = store.grant_scoped("app", permission, Some(id), RoomScope::room("!target:s"),
+                GrantDuration::RobrixSession, Some("!origin:s")).unwrap();
+            assert_eq!(effective(&store, id, target), Effective::Denied, "the room write switch still blocks a granted media action");
+            store.set_matrix_write(true);
+            assert_eq!(effective(&store, id, target), Effective::Granted);
+            assert_eq!(effective(&store, id, context("!origin:s", "!other:s")), Effective::NeedsPrompt);
+            store.set_room_spaces("!target:s", vec!["!parent:s".into()]);
+            store.set_space_policy("!parent:s", RoomAccess::Write, PolicyDecision::Deny);
+            assert_eq!(effective(&store, id, target), Effective::Denied, "a grant cannot override a protected parent space");
+            store.set_space_policy("!parent:s", RoomAccess::Write, PolicyDecision::Ask);
+            store.set("app", permission, GrantState::Denied);
+            assert_eq!(effective(&store, id, target), Effective::Denied);
+            store.set("app", permission, GrantState::Ask);
+            store.set_capability("app", id, GrantState::Denied);
+            assert_eq!(effective(&store, id, target), Effective::Denied);
+            store.set_capability("app", id, GrantState::Ask);
+            assert_eq!(effective(&store, id, target), Effective::Granted);
+            store.remove_scoped_grant(grant);
+            assert_eq!(effective(&store, id, target), Effective::NeedsPrompt);
+        }
+    }
+
+    #[test]
+    fn composer_drafts_are_grantable_without_sending_or_reading_messages() {
+        for subject in ["app", "ai-room:!origin:s"] {
+            let manifest: MiniAppManifest = serde_json::from_value(serde_json::json!({
+                "id": subject, "name": "Test", "icon": "t", "tint": 0, "source": "",
+                "allow_net": false, "builtin": false,
+                "permissions": Permission::ALL.iter().map(|permission| permission.as_str()).collect::<Vec<_>>(),
+            })).unwrap();
+            for id in ["host.composer.insert", "host.composer.attach", "host.composer.reply_to"] {
+                let cap = crate::capabilities::by_id(id).unwrap();
+                let target = context("!origin:s", "!target:s");
+                let mut store = PermissionStore::default();
+                store.set_room_spaces("!target:s", vec!["!parent:s".into()]);
+                store.set_room_policy("!target:s", RoomAccess::Write, PolicyDecision::Deny);
+                store.set_space_policy("!parent:s", RoomAccess::Write, PolicyDecision::Deny);
+                for permission in [Permission::MatrixRoomSend, Permission::MatrixRoomsSend, Permission::MatrixMedia] {
+                    store.set(subject, permission, GrantState::Denied);
+                }
+                for send in ["matrix.room.message.send", "matrix.rooms.message.send", "matrix.media.send"] {
+                    store.set_capability(subject, send, GrantState::Denied);
+                }
+                let evaluate = |store: &PermissionStore, cap, target| {
+                    if subject == "app" { store.effective_capability_in_context(&manifest, cap, target) }
+                    else { store.effective_capability_for_in_context(subject, |_| true, |_| true, cap, target) }
+                };
+                assert!(!store.matrix_write());
+                assert_eq!(evaluate(&store, cap, target), Effective::NeedsPrompt);
+                let grant = store.grant_scoped(subject, Permission::RobrixComposer, Some(id), RoomScope::room("!target:s"),
+                    GrantDuration::RobrixSession, Some("!origin:s")).unwrap();
+                assert_eq!(evaluate(&store, cap, target), Effective::Granted);
+                assert_eq!(evaluate(&store, cap, context("!origin:s", "!other:s")), Effective::NeedsPrompt);
+                assert!(!store.matrix_write(), "draft approval does not enable sending");
+                for send in ["matrix.room.message.send", "matrix.rooms.message.send", "matrix.media.send", "matrix.media.upload"] {
+                    assert_eq!(evaluate(&store, crate::capabilities::by_id(send).unwrap(), target), Effective::Denied);
+                }
+                assert_eq!(evaluate(&store, crate::capabilities::by_id("matrix.room.messages.read").unwrap(), target),
+                    Effective::NeedsPrompt, "composer approval grants no message-reading capability");
+                store.remove_scoped_grant(grant);
+                assert_eq!(evaluate(&store, cap, target), Effective::NeedsPrompt);
+            }
+        }
+    }
+
+    #[test]
+    fn composer_drafts_keep_room_and_space_access_protection() {
+        for id in ["host.composer.insert", "host.composer.attach", "host.composer.reply_to"] {
+            let target = context("!origin:s", "!target:s");
+            let mut store = PermissionStore::default();
+            store.grant_scoped("app", Permission::RobrixComposer, Some(id), RoomScope::room("!target:s"),
+                GrantDuration::RobrixSession, Some("!origin:s")).unwrap();
+            assert_eq!(effective(&store, id, target), Effective::Granted);
+            store.set_room_policy("!target:s", RoomAccess::Read, PolicyDecision::Deny);
+            assert_eq!(effective(&store, id, target), Effective::Denied);
+            store.set_room_policy("!target:s", RoomAccess::Read, PolicyDecision::Ask);
+            store.set_space_policy("!parent:s", RoomAccess::Read, PolicyDecision::Deny);
+            assert_eq!(effective(&store, id, target), Effective::Denied, "unresolved ancestry cannot bypass a protected space");
+            store.set_room_spaces("!target:s", vec!["!parent:s".into()]);
+            assert_eq!(effective(&store, id, target), Effective::Denied);
+            store.set_room_spaces("!target:s", vec![]);
+            assert_eq!(effective(&store, id, target), Effective::Granted);
+            store.set_policy_mode(RoomAccess::Read, RoomPolicyMode::WhitelistOnly);
+            assert_eq!(effective(&store, id, target), Effective::Denied);
+            store.set_room_policy("!target:s", RoomAccess::Read, PolicyDecision::Allow);
+            assert_eq!(effective(&store, id, target), Effective::Granted);
+            store.set_global_policy(RoomAccess::Read, PolicyDecision::Deny);
+            assert_eq!(effective(&store, id, target), Effective::Denied);
+        }
     }
 
     #[test]

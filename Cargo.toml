@@ -30,6 +30,8 @@ robius-use-makepad = "0.1.1" ## auto-configures all `robius-*` crates to work wi
 ## Mini-app (a2app) support crates; see the `a2app` feature below.
 a2app-core  = { path = "a2app/core",  optional = true }
 a2app-agent = { path = "a2app/agent", optional = true }
+sha2 = { version = "0.10", optional = true }
+tempfile = { version = "3", optional = true }
 
 anyhow = "1.0"
 bitflags = "2.6.0"
@@ -133,7 +135,7 @@ tsp = ["dep:tsp_sdk", "dep:quinn", "dep:aws-lc-rs", "dep:percent-encoding", "dep
 ## Enables Splash mini-apps: AI-generated sandboxed apps that run in isolates,
 ## managed via the Mini Apps pane and shareable into rooms.
 ## Protected desktop agents run in a confined Octos process by default.
-a2app = ["dep:a2app-core", "dep:a2app-agent"]
+a2app = ["dep:a2app-core", "dep:a2app-agent", "dep:sha2", "dep:tempfile"]
 ## Runs the agent in-process with the same guarded model transport and host tools.
 ## Required on iOS, where exec() is prohibited.
 a2app-embedded-agent = ["a2app", "a2app-agent/embedded"]

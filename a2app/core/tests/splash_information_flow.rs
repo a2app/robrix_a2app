@@ -2367,3 +2367,306 @@ fn hidden_instance_cannot_navigate_through_another_foreground_instance_of_the_sa
     notifications.sort();
     assert_eq!(notifications, ["navigation accepted", "this needs the app to be on screen"]);
 }
+
+#[test]
+fn mini_apps_can_draft_text_and_media_while_message_sending_stays_denied() {
+    let mut host = Harness::new();
+    host.review_effects = true;
+    let source = r#"
+        fn text_draft() {
+            host.request("composer.insert", {text:"Review this attachment"}, fn(r) {
+                host.request("notify.post", {body:if r.is_ok {"text drafted"} else {r.error}})
+            })
+        }
+        fn attach() {
+            host.request("composer.attach", {data_base64:"bWVkaWE=" filename:"fixture.txt" mime_type:"text/plain" caption:"Review this file"}, fn(r) {
+                host.request("notify.post", {body:if r.is_ok {"attachment drafted"} else {r.error}})
+            })
+        }
+        fn send() {
+            host.request("matrix.send_message", {body:"The user has not sent this draft"}, fn(r) {
+                host.request("notify.post", {body:if r.is_ok {"message sent"} else {"sending denied"}})
+            })
+        }
+        Label{text:"fixture"}
+    "#;
+    let app = "draft-only";
+    let (heap, context) = host.launch(app, false, source);
+    host.panes.insert(heap, PaneState { surface:"dock", side:None, foreground:true, width:460.0, height:700.0 });
+    host.apps.get_mut(app).unwrap().capabilities = vec![
+        "host.composer.insert".into(), "host.composer.attach".into(),
+        "matrix.room.message.send".into(), "notifications.post".into(),
+    ];
+    host.permissions.set_matrix_write(false);
+    host.permissions.set(app, Permission::RobrixComposer, GrantState::Granted);
+    host.permissions.set(app, Permission::MatrixRoomSend, GrantState::Denied);
+    host.flow.borrow_mut().add_sources(&context, [Source::Room { account: ACCOUNT.into(), room: ROOM.into() }]).unwrap();
+
+    assert!(host.splashes[0].call_script_fn(&mut host.cx, id!(text_draft), &[]));
+    host.cx.with_vm_and_async(|_| {});
+    let (request, review) = effect_review(host.process());
+    assert_eq!(request.service, "composer.insert");
+    assert!(review.recipient.is_none());
+    host.flow.borrow_mut().approve_effect_once(&review).unwrap();
+    let actions = host.dispatch(Some(request)).into_iter().filter_map(|ask| match ask {
+        BrokerAsk::HostAction { reply, action, .. } => Some((reply, action)),
+        BrokerAsk::Used { .. } => None,
+        _ => panic!("text drafting must not need message-send approval"),
+    }).collect::<Vec<_>>();
+    assert_eq!(actions.len(), 1, "draft response: {:?}", host.notifications());
+    let (reply, action) = actions.into_iter().next().unwrap();
+    assert!(matches!(action, HostAction::ComposerInsert { room: Some(room), text } if room == ROOM && text == "Review this attachment"));
+    host.reply(reply, "{\"status\":\"drafted\"}");
+    assert_eq!(host.notifications(), ["text drafted"]);
+
+    assert!(host.splashes[0].call_script_fn(&mut host.cx, id!(attach), &[]));
+    host.cx.with_vm_and_async(|_| {});
+    let (request, review) = effect_review(host.process());
+    assert_eq!(request.service, "composer.attach");
+    assert!(review.recipient.is_none());
+    host.flow.borrow_mut().approve_effect_once(&review).unwrap();
+    let actions = host.dispatch(Some(request)).into_iter().filter_map(|ask| match ask {
+        BrokerAsk::HostAction { reply, action, .. } => Some((reply, action)),
+        BrokerAsk::Used { .. } => None,
+        _ => panic!("attachment drafting must not need upload, send or remote-sharing approval"),
+    }).collect::<Vec<_>>();
+    assert_eq!(actions.len(), 1);
+    let (reply, action) = actions.into_iter().next().unwrap();
+    let HostAction::ComposerAttach { room, data_base64, filename, mime_type, caption } = action else { panic!("expected native attachment staging") };
+    assert_eq!(room.as_deref(), Some(ROOM));
+    assert_eq!(data_base64, "bWVkaWE=");
+    assert_eq!(filename, "fixture.txt");
+    assert_eq!(mime_type, "text/plain");
+    assert_eq!(caption.as_deref(), Some("Review this file"));
+    host.reply(reply, "{\"status\":\"drafted\"}");
+    assert_eq!(host.notifications(), ["attachment drafted"]);
+
+    assert!(host.splashes[0].call_script_fn(&mut host.cx, id!(send), &[]));
+    host.cx.with_vm_and_async(|_| {});
+    let asks = host.process();
+    assert!(!asks.iter().any(|ask| matches!(ask, BrokerAsk::Matrix { .. } | BrokerAsk::EnableWrites { .. })),
+        "a draft permission must never authorize a Matrix send or offer to bypass the denial");
+    assert_eq!(host.notifications(), ["sending denied"]);
+    assert!(!host.permissions.matrix_write());
+}
+
+#[test]
+fn stock_room_peek_prepares_text_and_picked_media_with_posting_denied() {
+    fn draft_action(host: &mut Harness, app: &WidgetRef) -> (Reply, HostAction) {
+        let mut asks = host.process();
+        if asks.iter().any(|ask| matches!(ask, BrokerAsk::FlowReview { .. })) {
+            let (request, review) = effect_review(asks);
+            assert!(review.recipient.is_none(), "local drafting must not request a remote sharing grant");
+            assert!(matches!(request.service.as_str(), "composer.insert" | "composer.attach"));
+            host.flow.borrow_mut().approve_effect_once(&review).unwrap();
+            asks = host.dispatch(Some(request));
+        }
+        let mut action = None;
+        for ask in asks {
+            match ask {
+                BrokerAsk::HostAction { reply, action: item, .. } => assert!(action.replace((reply, item)).is_none()),
+                BrokerAsk::Used { .. } => {},
+                _ => panic!("a stock draft must not request uploading, posting, or enabling writes"),
+            }
+        }
+        action.unwrap_or_else(|| panic!("stock draft reaches the native composer: {}", app.widget(&host.cx, ids!(send_note)).text()))
+    }
+
+    let mut host = Harness::new();
+    let (app, context) = host.launch_stock("room-peek", false);
+    host.permissions.set_matrix_write(false);
+    host.permissions.set("room-peek", Permission::MatrixRoomSend, GrantState::Denied);
+    host.permissions.set("room-peek", Permission::MatrixMedia, GrantState::Denied);
+    host.boot();
+    host.settle_stock(&app, "room-peek", &mut StockAudit::default());
+    // The fixture compresses boot reads and several UI clicks into one turn;
+    // isolate the user-action budget instead of sleeping for its refill.
+    host.broker.forget_app("room-peek");
+    app.text_input(&host.cx, ids!(msg_input)).set_text(&mut host.cx, "Prepare this for review");
+    assert!(host.call(&app, "draft_msg", &[]));
+    let (reply, action) = draft_action(&mut host, &app);
+    assert!(matches!(action, HostAction::ComposerInsert { room:Some(room), text } if room == ROOM && text == "Prepare this for review"));
+    host.reply(reply, "{\"status\":\"drafted\"}");
+    host.cx.with_vm_and_async(|_| {});
+    assert_eq!(app.widget(&host.cx, ids!(send_note)).text(), "Draft ready. Review and send it in Robrix.");
+
+    // Fixture only the already-authorized picker callback: no OS dialog or
+    // device path is exposed, while the real stock script stages the bytes.
+    for result in [r#"{"cancelled":true}"#, r#"{"name":"notes.txt","size":5,"text":"media","data_base64":"bWVkaWE=","mime_type":"text/plain"}"#] {
+        app.text_input(&host.cx, ids!(msg_input)).set_text(&mut host.cx, "Attachment caption");
+        assert!(host.call(&app, "attach_file", &[]));
+        let requests = makepad_widgets::splash_host::take_splash_host_requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.service, "files.pick");
+        let cap = a2app_core::capabilities::for_service("files.pick").unwrap();
+        assert_eq!(host.permissions.effective_capability_in_context(host.apps.get("room-peek").unwrap(), cap,
+            services::permission_context("files.pick", &serde_json::Value::Null, context.room())), Effective::Granted);
+        host.flow.borrow_mut().add_sources(&context, [Source::Account { account:ACCOUNT.into() }]).unwrap();
+        host.flow.borrow_mut().add_influences(&context, [Influence::Unknown]).unwrap();
+        host.reply(Reply { heap_key:request.heap_key, req_id:request.req_id }, result);
+        host.cx.with_vm_and_async(|_| {});
+        if result.contains("cancelled") {
+            assert_eq!(app.widget(&host.cx, ids!(send_note)).text(), "No attachment selected.");
+            assert!(host.process().is_empty(), "canceling a picker must not stage or post content");
+        } else {
+            let (reply, action) = draft_action(&mut host, &app);
+            assert!(matches!(action, HostAction::ComposerAttach { room:Some(room), filename, data_base64, mime_type, caption:Some(caption) }
+                if room == ROOM && filename == "notes.txt" && data_base64 == "bWVkaWE=" && mime_type == "text/plain" && caption == "Attachment caption"));
+            host.reply(reply, "{\"status\":\"drafted\"}");
+            host.cx.with_vm_and_async(|_| {});
+            assert_eq!(app.widget(&host.cx, ids!(send_note)).text(), "Attachment ready. Review and send it in Robrix.");
+        }
+    }
+    app.text_input(&host.cx, ids!(msg_input)).set_text(&mut host.cx, "Keep this local");
+    assert!(host.call(&app, "send_msg", &[]));
+    assert!(!host.process().iter().any(|ask| matches!(ask, BrokerAsk::Matrix { .. } | BrokerAsk::EnableWrites { .. })),
+        "composer consent must not authorize the stock Send now action");
+    assert!(!host.permissions.matrix_write());
+}
+
+#[test]
+fn stock_room_peek_sends_picked_media_only_from_its_explicit_send_control() {
+    fn answer_picker(host: &mut Harness, context: &ContextId, result: &str) {
+        let requests = makepad_widgets::splash_host::take_splash_host_requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.service, "files.pick", "each direct send first asks the user to select its file");
+        let cap = a2app_core::capabilities::for_service("files.pick").unwrap();
+        assert_eq!(host.permissions.effective_capability_in_context(host.apps.get("room-peek").unwrap(), cap,
+            services::permission_context("files.pick", &serde_json::Value::Null, context.room())), Effective::Granted);
+        host.flow.borrow_mut().add_sources(context, [Source::Account { account:ACCOUNT.into() }]).unwrap();
+        host.flow.borrow_mut().add_influences(context, [Influence::Unknown]).unwrap();
+        host.reply(Reply { heap_key:request.heap_key, req_id:request.req_id }, result);
+        host.cx.with_vm_and_async(|_| {});
+    }
+
+    let mut host = Harness::new();
+    let (app, context) = host.launch_stock("room-peek", false);
+    assert!(host.process().is_empty());
+    app.text_input(&host.cx, ids!(msg_input)).set_text(&mut host.cx, "This caption belongs to the selected file");
+    assert!(host.call(&app, "send_file_now", &[]));
+    answer_picker(&mut host, &context, r#"{"cancelled":true}"#);
+    assert_eq!(app.widget(&host.cx, ids!(send_note)).text(), "No file sent.");
+    assert!(host.process().is_empty(), "canceling a picker must not stage, upload or post");
+    let file = r#"{"name":"notes.txt","size":5,"text":"media","data_base64":"bWVkaWE=","mime_type":"text/plain"}"#;
+
+    host.permissions.set("room-peek", Permission::MatrixMedia, GrantState::Denied);
+    assert!(host.call(&app, "send_file_now", &[]));
+    answer_picker(&mut host, &context, file);
+    assert!(!host.process().iter().any(|ask| matches!(ask, BrokerAsk::Matrix { .. } | BrokerAsk::HostAction { .. } | BrokerAsk::EnableWrites { .. })),
+        "a refused file send must not post or fall back to staging");
+    assert_eq!(app.text_input(&host.cx, ids!(msg_input)).text(), "This caption belongs to the selected file");
+    assert!(!app.widget(&host.cx, ids!(send_note)).text().is_empty());
+
+    host.permissions.set("room-peek", Permission::MatrixMedia, GrantState::Granted);
+    host.permissions.set_capability("room-peek", "matrix.media.upload", GrantState::Denied);
+    assert!(host.call(&app, "send_file_now", &[]));
+    answer_picker(&mut host, &context, file);
+    assert!(!host.process().iter().any(|ask| matches!(ask, BrokerAsk::Matrix { .. } | BrokerAsk::HostAction { .. } | BrokerAsk::EnableWrites { .. })),
+        "a media-send grant must not bypass an explicit upload denial");
+
+    host.permissions.set_capability("room-peek", "matrix.media.upload", GrantState::Granted);
+    host.permissions.set("room-peek", Permission::RobrixComposer, GrantState::Denied);
+    host.broker.forget_app("room-peek");
+    assert!(host.call(&app, "send_file_now", &[]));
+    answer_picker(&mut host, &context, file);
+    let (request, review) = effect_review(host.process());
+    assert_eq!(request.service, "matrix.send_media");
+    assert_eq!(review.recipient, Some(Recipient::MatrixRoom { account:ACCOUNT.into(), room:ROOM.into() }));
+    assert_eq!(review.action.as_ref().unwrap().kind, "matrix.media.send");
+    host.flow.borrow_mut().approve_effect_once(&review).unwrap();
+    let mut posted = None;
+    for ask in host.dispatch(Some(request)) {
+        match ask {
+            BrokerAsk::Matrix { reply, room, capability, consent, call:services::MatrixServiceCall::SendMedia { data_base64, filename, mime_type, caption }, .. } => {
+                assert_eq!(room.as_deref(), Some(ROOM));
+                assert_eq!(capability, "matrix.media.send");
+                assert_eq!(filename, "notes.txt");
+                assert_eq!(data_base64, "bWVkaWE=");
+                assert_eq!(mime_type, "text/plain");
+                assert_eq!(caption.as_deref(), Some("This caption belongs to the selected file"));
+                assert_eq!(consent.capability_state("room-peek", "matrix.media.upload"), GrantState::Granted);
+                assert!(posted.replace(reply).is_none());
+            },
+            BrokerAsk::Used { .. } => {},
+            _ => panic!("the explicit direct send reaches only the native media worker"),
+        }
+    }
+    host.reply(posted.expect("explicit file send dispatches exactly once"), r#"{"room_id":"!private:test","event_id":"$media:test"}"#);
+    host.cx.with_vm_and_async(|_| {});
+    assert_eq!(app.widget(&host.cx, ids!(send_note)).text(), "File sent!");
+    assert_eq!(app.text_input(&host.cx, ids!(msg_input)).text(), "");
+}
+
+#[test]
+fn stock_roll_call_drafts_results_while_direct_posting_is_denied() {
+    let mut host = Harness::new();
+    let (app, _) = host.launch_stock("roll-call", false);
+    host.permissions.set_matrix_write(false);
+    host.permissions.set("roll-call", Permission::MatrixRoomSend, GrantState::Denied);
+    assert!(host.call(&app, "draft_result", &[]));
+    let mut result = None;
+    for ask in host.process() {
+        match ask {
+            BrokerAsk::HostAction { reply, action:HostAction::ComposerInsert { room, text }, .. } => {
+                assert_eq!(room.as_deref(), Some(ROOM));
+                assert_eq!(text, "🎲 Rolled 1 + 1 = 2");
+                assert!(result.replace(reply).is_none());
+            },
+            BrokerAsk::Used { .. } => {},
+            _ => panic!("dice drafting must not ask to enable posting"),
+        }
+    }
+    host.reply(result.expect("dice result reaches composer"), "{\"status\":\"drafted\"}");
+    host.cx.with_vm_and_async(|_| {});
+    assert_eq!(app.widget(&host.cx, ids!(note)).text(), "Draft ready. Review and send it in Robrix.");
+    assert!(host.call(&app, "post", &[]));
+    assert!(!host.process().iter().any(|ask| matches!(ask, BrokerAsk::Matrix { .. } | BrokerAsk::EnableWrites { .. })));
+    assert!(!host.permissions.matrix_write());
+}
+
+#[test]
+fn stock_watcher_drafts_leave_fetching_watching_and_automatic_sending_denied() {
+    for app_id in ["website-watch", "simple-watcher", "watcher"] {
+        let mut host = Harness::new();
+        let (app, _) = host.launch_stock(app_id, false);
+        host.permissions.set_matrix_write(false);
+        for permission in [Permission::MatrixRoomSend, Permission::MatrixRoomWatch, Permission::Network, Permission::Notifications] {
+            host.permissions.set(app_id, permission, GrantState::Denied);
+        }
+        assert!(host.process().is_empty(), "{app_id} waits for user startup or action");
+        if app_id == "website-watch" {
+            assert!(host.call(&app, "on_app_resize", &[460_u32.into(), 700_u32.into()]));
+            assert!(host.process().is_empty());
+            assert!(host.call(&app, "draft_report", &[]));
+        } else {
+            assert!(host.call_strings(&app, "draft_reply", &["  Please review this reply  "]));
+        }
+        let mut reply = None;
+        for ask in host.process() {
+            match ask {
+                BrokerAsk::HostAction { reply:callback, action:HostAction::ComposerInsert { room, text }, .. } => {
+                    assert_eq!(room.as_deref(), Some(ROOM));
+                    if app_id == "website-watch" {
+                        assert_eq!(text, "Website Watch test for 'Example Domain' at https://example.com/");
+                    } else { assert_eq!(text, "Please review this reply"); }
+                    assert!(reply.replace(callback).is_none());
+                },
+                BrokerAsk::Used { perm:Permission::RobrixComposer, .. } => {},
+                _ => panic!("{app_id} drafting must not fetch, subscribe, test rules, or enable automatic sending"),
+            }
+        }
+        host.reply(reply.expect("stock watcher draft reaches the composer"), "{\"status\":\"drafted\"}");
+        host.cx.with_vm_and_async(|_| {});
+        let expected = if app_id == "website-watch" {
+            "Test report drafted. Review and send it in Robrix. The website was not checked."
+        } else { "Reply drafted. Review and send it in Robrix. Automatic sending is unchanged." };
+        assert_eq!(app.widget(&host.cx, ids!(status)).text(), expected);
+        assert!(host.process().is_empty(), "draft completion must not enqueue automatic work");
+        assert!(!host.permissions.matrix_write());
+        for permission in [Permission::MatrixRoomSend, Permission::MatrixRoomWatch, Permission::Network, Permission::Notifications] {
+            assert_eq!(host.permissions.state(app_id, permission), GrantState::Denied);
+        }
+    }
+}

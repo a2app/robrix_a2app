@@ -314,10 +314,21 @@ pub fn check_request(request: &SplashHostRequest, capability: &Capability, args:
     let contract = capability.flow_contract().ok_or("This service has no information-flow contract.")?;
     let target_room = super::runtime::permission_target_room(&request.service, args, room);
     let target = target_room.as_deref();
+    if let Some(payload) = super::runtime::composer_review_payload(&request.service, args, room)? {
+        let action = contract.sensitive_action(capability.id, &payload, target);
+        let epoch = flow::context_epoch(&context)?;
+        let review = flow::prepare_effect_for_activation(&context, epoch, None, action.as_ref(), &payload)?;
+        // Keep any one-time exact approval until the native UI consumes the
+        // queued draft, where current capability and room protection are
+        // checked again. Staging has no remote room/server recipient.
+        if !review.allowed { return Ok(Some(review)); }
+        record_contract_source(&context, contract, room, target, registry)?;
+        return Ok(None);
+    }
     // Deferred Matrix/network/UI effects capture their resolved contents at
     // the final sink. Immediate platform effects commit this immutable call.
     let deferred = request.service.starts_with("matrix.") || request.service == "network.http"
-        || matches!(capability.id, "host.composer.insert" | "host.composer.reply_to" | "host.nav.app");
+        || capability.id == "host.nav.app";
     let final_effect = deferred && (contract.privileged_effect || request.service == "network.http"
         || matches!(contract.output, a2app_core::capabilities::FlowOutput::MatrixSearch
             | a2app_core::capabilities::FlowOutput::MatrixServer | a2app_core::capabilities::FlowOutput::MatrixPagination));

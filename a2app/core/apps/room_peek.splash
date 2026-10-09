@@ -1,11 +1,14 @@
 // name: Room Peek
 // icon: 👀
 // tint: #4A90D9
-// description: Room details, the latest messages and a quick way to send one.
-// permissions: matrix-room-info, matrix-room-read, matrix-room-send, robrix-navigation, matrix-room-watch, matrix.room.info.read, matrix.room.messages.read, matrix.room.event.read, matrix.room.message.send, host.nav.event, on_room_message, on_room_members_changed, on_room_typing, on_room_reaction, on_room_message_changed
+// description: Room details and separate actions to draft text/media or send text/files now.
+// permissions: matrix-room-info, matrix-room-read, matrix-room-send, robrix-composer, files, matrix-media, robrix-navigation, matrix-room-watch, matrix.room.info.read, matrix.room.messages.read, matrix.room.event.read, matrix.room.message.send, host.composer.insert, host.composer.attach, device.files.pick, matrix.media.upload, matrix.media.send, host.nav.event, on_room_message, on_room_members_changed, on_room_typing, on_room_reaction, on_room_message_changed
 // why-matrix-room-info: Shows this room's name and member count.
 // why-matrix-room-read: Lists the latest messages in this room and their reactions.
-// why-matrix-room-send: Sends the message you type into this room.
+// why-matrix-room-send: Sends your typed message only when you press Send now.
+// why-robrix-composer: Prepares draft text or a picked attachment for you to review and send in Robrix.
+// why-files: Opens the picker only for Attach file or Send file now; selected files are limited to 1 MiB.
+// why-matrix-media: Uploads and posts the file only when you press Send file now. Local attachment drafts need no media-send grant.
 // why-robrix-navigation: Jumps to a message you tap.
 // why-matrix-room-watch: Shows new messages, typing, edits and reactions as they arrive.
 
@@ -19,6 +22,8 @@ let messages_loading = false
 let messages_loaded = false
 let messages_reload_pending = false
 let sending = false
+let drafting = false
+let attaching = false
 let setup_pending = false
 
 let room_name = ""
@@ -163,8 +168,56 @@ fn jump_to_message(i){
     })
 }
 
+fn draft_msg(){
+    if sending || drafting || attaching { return nil }
+    let text = ui.msg_input.text()
+    if text.trim() == "" {
+        ui.send_note.set_text("Type a message first.")
+        return nil
+    }
+    drafting = true
+    ui.send_note.set_text("Preparing a draft…")
+    host.request("composer.insert", {text: text}, fn(r){
+        drafting = false
+        if r.is_ok {
+            ui.send_note.set_text("Draft ready. Review and send it in Robrix.")
+            if ui.msg_input.text() == text { ui.msg_input.set_text("") }
+        } else { ui.send_note.set_text(r.error) }
+    })
+}
+
+fn optional_field(obj, key){
+    if !obj.is_object() { return nil }
+    for field value in obj {
+        if field.to_string() == key { return value }
+    }
+    return nil
+}
+
+fn attach_file(){
+    if sending || drafting || attaching { return nil }
+    attaching = true
+    let caption = ui.msg_input.text()
+    ui.send_note.set_text("Choose an image or file to draft…")
+    host.request("files.pick", nil, fn(r){
+        if !r.is_ok { attaching = false ui.send_note.set_text(r.error) return nil }
+        if optional_field(r.data, "cancelled") == true {
+            attaching = false
+            ui.send_note.set_text("No attachment selected.")
+            return nil
+        }
+        host.request("composer.attach", {data_base64: r.data.data_base64, filename: r.data.name, mime_type: r.data.mime_type, caption: caption}, fn(out){
+            attaching = false
+            if out.is_ok {
+                ui.send_note.set_text("Attachment ready. Review and send it in Robrix.")
+                if ui.msg_input.text() == caption { ui.msg_input.set_text("") }
+            } else { ui.send_note.set_text(out.error) }
+        })
+    })
+}
+
 fn send_msg(){
-    if sending { return nil }
+    if sending || drafting || attaching { return nil }
     let draft = ui.msg_input.text()
     let body = draft.trim()
     if body == "" {
@@ -182,6 +235,32 @@ fn send_msg(){
             return nil
         }
         ui.send_note.set_text(r.error)
+    })
+}
+
+fn send_file_now(){
+    if sending || drafting || attaching { return nil }
+    sending = true
+    let caption = ui.msg_input.text()
+    ui.send_note.set_text("Choose an image or file to send now…")
+    host.request("files.pick", nil, fn(r){
+        if !r.is_ok { sending = false ui.send_note.set_text(r.error) return nil }
+        if optional_field(r.data, "cancelled") == true {
+            sending = false
+            ui.send_note.set_text("No file sent.")
+            return nil
+        }
+        ui.send_note.set_text("Sending selected file…")
+        host.request("matrix.send_media", {data_base64: r.data.data_base64, filename: r.data.name, mime_type: r.data.mime_type, caption: caption}, fn(out){
+            sending = false
+            if out.is_ok {
+                ui.send_note.set_text("File sent!")
+                if ui.msg_input.text() == caption { ui.msg_input.set_text("") }
+                if messages_loading { messages_reload_pending = true } else { load_messages() }
+                return nil
+            }
+            ui.send_note.set_text(out.error)
+        })
     })
 }
 
@@ -380,15 +459,23 @@ View{
             typing := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 11} } }
         }
         View{
-            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+            width: Fill height: Fit flow: Down spacing: 8
             msg_input := TextInput{
-                width: Fill empty_text: "Message this room…"
-                on_return: |t| send_msg()
+                width: Fill empty_text: "Message or attachment caption…"
+                on_return: |t| draft_msg()
             }
-            Button{
-                text: "Send" on_click: || send_msg()
-                draw_text +: { color: #x1C274C }
+            View{
+                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
+                Button{ text: "Draft message" on_click: || draft_msg() draw_text +: { color: #x1C274C } }
+                Button{ text: "Attach file" on_click: || attach_file() draw_text +: { color: #x1C274C } }
+                Button{ text: "Send now" on_click: || send_msg() draw_text +: { color: #x1C274C } }
+                Button{ text: "Send file now" on_click: || send_file_now() draw_text +: { color: #x1C274C } }
             }
+        }
+        Label{
+            text: "Draft message and Attach file prepare local content for review without sending permission. Send now posts text; Send file now uploads and posts the selected file. Both need separate sending permission. Picked files are limited to 1 MiB."
+            width: Fill padding: 0 margin: 0
+            draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 11} }
         }
         send_note := Label{
             text: "" padding: 0 margin: 0

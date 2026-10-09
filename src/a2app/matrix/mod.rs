@@ -7,7 +7,7 @@
 //! dispatch. Add a service by adding its variant, its `request_for` arm and
 //! its dispatch arm in the domain's section, and its body in the domain file.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use makepad_widgets::*;
 use matrix_sdk::RoomState;
@@ -39,6 +39,7 @@ pub enum A2AppMatrixRequest {
     RoomInfo { room_id: OwnedRoomId, reply: Reply },
     ReadMessages { room_id: OwnedRoomId, limit: u32, reply: Reply },
     SendMessage { room_id: OwnedRoomId, body: String, reply: Reply },
+    SendMedia { room_id: OwnedRoomId, media: Arc<super::ai::media::PreparedMedia>, upload_authorization: Option<MatrixAuthorization>, reply: Reply },
     Profile { reply: Reply },
     Members { room_id: OwnedRoomId, limit: u32, reply: Reply },
     PinnedEvents { room_id: OwnedRoomId, reply: Reply },
@@ -139,6 +140,26 @@ impl A2AppMatrixResult {
 }
 
 impl A2AppMatrixRequest {
+    /// Bind both captured permissions to this exact immutable attachment.
+    /// Posting through ordinary single-capability dispatch fails closed.
+    pub fn authorized_media(mut self, primary: MatrixAuthorization, upload: MatrixAuthorization) -> Result<Self, String> {
+        let Self::SendMedia { room_id, media, upload_authorization, .. } = &mut self else {
+            return Err("This request is not a media post.".into());
+        };
+        send::validate_media_authorizations(room_id, &primary, &upload, &media.post_payload(room_id))?;
+        *upload_authorization = Some(upload);
+        Ok(Self::Authorized { authorization: primary, request: Box::new(self) })
+    }
+
+    /// Permission review receives metadata and a content digest, never base64.
+    pub fn media_post_payload(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::SendMedia { room_id, media, .. } => Some(media.post_payload(room_id)),
+            Self::Authorized { request, .. } => request.media_post_payload(),
+            _ => None,
+        }
+    }
+
     pub fn authorized(self, subject: String, capability: &str, origin_room: Option<String>, consent: Box<PermissionStore>, flow_context: a2app_core::information_flow::ContextId, args: serde_json::Value) -> Self {
         let flow_epoch = a2app_core::information_flow::context_epoch(&flow_context).ok();
         let target_room = self.room_target().map(|(room, _, _)| room).or_else(|| match &self {
@@ -155,7 +176,7 @@ impl A2AppMatrixRequest {
     fn reply(&self) -> Option<Reply> {
         use A2AppMatrixRequest::*;
         match self {
-            RoomInfo { reply, .. } | ReadMessages { reply, .. } | SendMessage { reply, .. }
+            RoomInfo { reply, .. } | ReadMessages { reply, .. } | SendMessage { reply, .. } | SendMedia { reply, .. }
             | Profile { reply } | Members { reply, .. } | PinnedEvents { reply, .. }
             | Threads { reply, .. } | RoomsList { reply } | Search { reply, .. }
             | ThreadReplies { reply, .. } | OlderMessages { reply, .. } | Event { reply, .. }
@@ -187,7 +208,7 @@ impl A2AppMatrixRequest {
             | Successor { room_id, reply } | RoomsInfo { room_id, reply }
             | RoomsMessages { room_id, reply, .. } => (room_id, RoomAccess::Read, Some(*reply)),
             SpaceInfo { space_id, reply } => (space_id, RoomAccess::Read, Some(*reply)),
-            SendMessage { room_id, reply, .. } | Reply { room_id, reply, .. }
+            SendMessage { room_id, reply, .. } | SendMedia { room_id, reply, .. } | Reply { room_id, reply, .. }
             | React { room_id, reply, .. } | Typing { room_id, reply, .. }
             | ReadReceipt { room_id, reply, .. } | Pin { room_id, reply, .. }
             | RoomFlag { room_id, reply, .. } | Invite { room_id, reply, .. }
@@ -219,7 +240,7 @@ pub fn request_for(
     call: MatrixServiceCall,
     room: Option<OwnedRoomId>,
     reply: Reply,
-) -> Result<A2AppMatrixRequest, &'static str> {
+) -> Result<A2AppMatrixRequest, String> {
     Ok(match (call, room) {
         (MatrixServiceCall::Profile, _) => A2AppMatrixRequest::Profile { reply },
         (MatrixServiceCall::RoomsList, _) => A2AppMatrixRequest::RoomsList { reply },
@@ -230,7 +251,7 @@ pub fn request_for(
                 .filter_map(|id| OwnedRoomId::try_from(id.as_str()).ok())
                 .collect();
             if ids.is_empty() {
-                return Err("no valid room ids");
+                return Err("no valid room ids".into());
             }
             A2AppMatrixRequest::Search { rooms: SearchRooms::Some(ids), query, limit, server, reply }
         }
@@ -283,6 +304,13 @@ pub fn request_for(
             A2AppMatrixRequest::ReadMessages { room_id, limit, reply },
         (MatrixServiceCall::SendMessage { body }, Some(room_id)) =>
             A2AppMatrixRequest::SendMessage { room_id, body, reply },
+        (MatrixServiceCall::SendMedia { data_base64, filename, mime_type, caption }, Some(room_id)) => {
+            let request = super::ai::tools::MediaDraftRequest {
+                source: super::ai::tools::MediaSource::Base64(data_base64), filename, mime_type, caption,
+            };
+            let media = Arc::new(super::ai::media::PreparedMedia::from_base64(&request)?);
+            A2AppMatrixRequest::SendMedia { room_id, media, upload_authorization: None, reply }
+        }
         (MatrixServiceCall::Members { limit }, Some(room_id)) =>
             A2AppMatrixRequest::Members { room_id, limit, reply },
         (MatrixServiceCall::PinnedEvents, Some(room_id)) =>
@@ -293,25 +321,25 @@ pub fn request_for(
         // --- room ---
         (MatrixServiceCall::ThreadReplies { event_id, limit }, Some(room_id)) => {
             let Ok(event_id) = OwnedEventId::try_from(event_id.as_str()) else {
-                return Err("not a valid event id");
+                return Err("not a valid event id".into());
             };
             A2AppMatrixRequest::ThreadReplies { room_id, event_id, limit, reply }
         }
         (MatrixServiceCall::OlderMessages { before, limit }, Some(room_id)) => {
             let Ok(before) = before.map(|id| OwnedEventId::try_from(id.as_str())).transpose() else {
-                return Err("not a valid event id");
+                return Err("not a valid event id".into());
             };
             A2AppMatrixRequest::OlderMessages { room_id, before, limit, reply }
         }
         (MatrixServiceCall::Event { event_id }, Some(room_id)) => {
             let Ok(event_id) = OwnedEventId::try_from(event_id.as_str()) else {
-                return Err("not a valid event id");
+                return Err("not a valid event id".into());
             };
             A2AppMatrixRequest::Event { room_id, event_id, reply }
         }
         (MatrixServiceCall::ReadReceipts { user_id }, Some(room_id)) => {
             let Ok(user_id) = user_id.map(|id| OwnedUserId::try_from(id.as_str())).transpose() else {
-                return Err("not a valid user id");
+                return Err("not a valid user id".into());
             };
             A2AppMatrixRequest::ReadReceipts { room_id, user_id, reply }
         }
@@ -321,7 +349,7 @@ pub fn request_for(
             A2AppMatrixRequest::PowerLevels { room_id, reply },
         (MatrixServiceCall::Permalink { event_id, use_matrix_scheme }, Some(room_id)) => {
             let Ok(event_id) = event_id.map(|id| OwnedEventId::try_from(id.as_str())).transpose() else {
-                return Err("not a valid event id");
+                return Err("not a valid event id".into());
             };
             A2AppMatrixRequest::Permalink { room_id, event_id, use_matrix_scheme, reply }
         }
@@ -394,7 +422,7 @@ pub fn request_for(
         },
 
         (_, None) => {
-            return Err("this mini-app is not attached to a room");
+            return Err("this mini-app is not attached to a room".into());
         }
     })
 }
@@ -456,6 +484,8 @@ async fn run_matrix_request(request: A2AppMatrixRequest, authorization: Option<M
             (reply, room::read_messages(room_id, limit, false).await),
         A2AppMatrixRequest::SendMessage { room_id, body, reply } =>
             (reply, send::message(room_id, body).await),
+        A2AppMatrixRequest::SendMedia { room_id, media, upload_authorization, reply } =>
+            (reply, send::media(room_id, media, authorization.as_ref(), upload_authorization.as_ref()).await),
         A2AppMatrixRequest::Members { room_id, limit, reply } => {
             let result: Result<String, String> = async {
                 use matrix_sdk::RoomMemberships;
@@ -812,4 +842,32 @@ async fn run_matrix_request(request: A2AppMatrixRequest, authorization: Option<M
         target: target.map(|(room, access, _)| (room, access)), reads_rooms,
     });
     SignalToUI::set_ui_signal();
+}
+
+#[cfg(test)]
+mod media_request_tests {
+    use super::*;
+
+    fn media_call(mime_type: &str) -> MatrixServiceCall {
+        MatrixServiceCall::SendMedia { data_base64: "AAH/".into(), filename: "fixture.bin".into(),
+            mime_type: mime_type.into(), caption: Some(String::new()) }
+    }
+
+    #[test]
+    fn media_dispatch_prepares_immutable_bytes_and_reviews_metadata_for_the_attached_room() {
+        let room: OwnedRoomId = "!media:test".try_into().unwrap();
+        let reply = Reply { heap_key: 1, req_id: 2 };
+        assert!(request_for(media_call("application/octet-stream"), None, reply).unwrap_err().contains("not attached"));
+        let request = request_for(media_call("application/octet-stream"), Some(room.clone()), reply).unwrap();
+        let A2AppMatrixRequest::SendMedia { media, upload_authorization, .. } = &request else { panic!("wrong worker request") };
+        assert_eq!(media.bytes(), &[0, 1, 255]);
+        assert!(upload_authorization.is_none(), "posting must still capture upload permission");
+        let payload = request.media_post_payload().unwrap();
+        assert_eq!(payload["room_id"], room.as_str());
+        assert_eq!(payload["media"]["size"], 3);
+        assert_eq!(payload["media"]["sha256"].as_str().unwrap().len(), 64);
+        assert!(payload.get("data_base64").is_none());
+        assert!(payload["media"].get("data_base64").is_none());
+        assert!(request_for(media_call("image/png"), Some(room), reply).unwrap_err().contains("image bytes"));
+    }
 }

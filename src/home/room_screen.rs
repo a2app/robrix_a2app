@@ -3418,6 +3418,71 @@ impl RoomScreen {
                 self.view.room_input_bar(cx, ids!(room_input_bar))
                     .stage_file(cx, tl.kind.clone(), path, Some(caption));
             }
+            RoomAction::StagePreparedMedia { media, reply } => {
+                let result = match (self.room_id(), self.tl_state.as_ref()) {
+                    (Some(_), Some(tl)) => self.view.room_input_bar(cx, ids!(room_input_bar)).stage_media(cx, tl.kind.clone(), media)
+                        .map(|()| String::from("Media attached for review. The user can choose Send.")),
+                    _ => Err(String::from("The room's composer is unavailable.")),
+                };
+                crate::a2app::runtime::finish_app_composer(cx, reply, result);
+            }
+            RoomAction::StageAppMessage { text, reply } => {
+                let result = match self.room_id() {
+                    Some(_) => self.view.room_input_bar(cx, ids!(room_input_bar)).try_append_draft(cx, &text)
+                        .map(|()| String::from("Draft inserted. The user can review and send it.")),
+                    None => Err(String::from("The room's composer is unavailable.")),
+                };
+                crate::a2app::runtime::finish_app_composer(cx, reply, result);
+            }
+            RoomAction::StageAppReply { event_id, reply } => {
+                let result = match (self.room_id(), self.tl_state.as_ref()) {
+                    (Some(_), Some(tl)) => {
+                        let event_tl_item = index_of_event(&tl.items, &event_id, tl.items.len(), tl.items.len())
+                            .and_then(|index| tl.items.get(index))
+                            .and_then(|item| item.as_event())
+                            .cloned();
+                        match event_tl_item {
+                            Some(event_tl_item) => {
+                                let replied_to_info = EmbeddedEvent::from_timeline_item(&event_tl_item);
+                                self.view.room_input_bar(cx, ids!(room_input_bar))
+                                    .try_show_replying_to(cx, (event_tl_item, replied_to_info), &tl.kind)
+                                    .map(|()| String::from("Reply selected. The user can review and send it."))
+                            }
+                            None => Err(String::from("Could not find that message in the timeline to reply to.")),
+                        }
+                    }
+                    _ => Err(String::from("The room's composer is unavailable.")),
+                };
+                crate::a2app::runtime::finish_app_composer(cx, reply, result);
+            }
+            #[cfg(unix)]
+            RoomAction::DraftAgentMessage { text, answer } => {
+                let room = self.room_id().cloned();
+                let result = match room.as_ref() {
+                    Some(_) => self.view.room_input_bar(cx, ids!(room_input_bar)).try_append_draft(cx, &text)
+                        .map(|()| String::from("Draft inserted. The user can review and send it.")),
+                    None => Err(String::from("The room's composer is unavailable.")),
+                };
+                if let Some(room) = room {
+                    crate::a2app::runtime::finish_agent_composer(&room, "draft_message", &answer, result);
+                } else {
+                    let _ = answer.send(result);
+                }
+            }
+            #[cfg(unix)]
+            RoomAction::AttachAgentMedia { media, answer } => {
+                let room = self.room_id().cloned();
+                let result = match (room.as_ref(), self.tl_state.as_ref()) {
+                    (Some(_), Some(tl)) => self.view.room_input_bar(cx, ids!(room_input_bar)).stage_media(cx, tl.kind.clone(), media)
+                        .map(|()| String::from("Media attached for review. The user can choose Send.")),
+                    _ => Err(String::from("The room's composer is unavailable.")),
+                };
+                if let Some(room) = room {
+                    crate::a2app::runtime::finish_agent_composer(&room, "attach_media", &answer, result);
+                } else {
+                    let _ = answer.send(result);
+                }
+            }
             RoomAction::OpenApp(app_id) => {
                 let Some(room_id) = self.room_id().cloned() else { return };
                 cx.action(crate::a2app::runtime::A2AppOp::OpenApp {

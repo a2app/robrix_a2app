@@ -302,16 +302,16 @@ pub fn union_stock_declarations(manifest: &mut MiniAppManifest) {
 fn permissions_for(id: &str) -> Vec<String> {
     let p: &[&str] = match id {
         "public-web" => &["network"],
-        "website-watch" => &["network", "notifications", "matrix-room-send"],
+        "website-watch" => &["network", "notifications", "matrix-room-send", "robrix-composer"],
         "reminder" => &["notifications"],
         "keyword-alert" => &["matrix-room-watch", "notifications"],
-        "room-peek" => &["matrix-room-info", "matrix-room-read", "matrix-room-send", "robrix-navigation", "matrix-room-watch"],
-        "roll-call" => &["matrix-room-send"],
+        "room-peek" => &["matrix-room-info", "matrix-room-read", "matrix-room-send", "robrix-composer", "files", "matrix-media", "robrix-navigation", "matrix-room-watch"],
+        "roll-call" => &["robrix-composer", "matrix-room-send"],
         "room-info" => &["matrix-room-info"],
         "room-members" | "room-threads" => &["matrix-room-read", "robrix-navigation", "matrix-room-watch"],
         "search" => &["matrix-room-read", "matrix-rooms-list", "matrix-rooms-read", "robrix-navigation"],
-        "simple-watcher" => &["matrix-room-watch", "notifications", "matrix-room-send"],
-        "watcher" => &["matrix-room-watch", "notifications", "matrix-room-send", "mcp-tools"],
+        "simple-watcher" => &["matrix-room-watch", "notifications", "matrix-room-send", "robrix-composer"],
+        "watcher" => &["matrix-room-watch", "notifications", "matrix-room-send", "robrix-composer", "mcp-tools"],
         "presence" => &["matrix-room-read", "matrix-room-watch", "robrix-navigation"],
         "room-tools" => &["matrix-room-read", "matrix-room-info", "matrix-room-manage", "clipboard-write", "robrix-navigation"],
         "spaces" => &["matrix-spaces", "matrix-rooms-list", "robrix-navigation", "matrix-membership"],
@@ -334,7 +334,8 @@ fn reasons_for(id: &str) -> std::collections::BTreeMap<String, String> {
         "website-watch" => &[
             ("network", "Fetches the URL you save when your background task runs."),
             ("notifications", "Shows a popup when the keyword first appears."),
-            ("matrix-room-send", "Optionally reports a match to this task's attached room."),
+            ("matrix-room-send", "Posts test reports and scheduled matches when you choose room messages."),
+            ("robrix-composer", "Prepares a test report in the message box for you to review and send."),
         ],
         "reminder" => &[("notifications", "Shows the reminder text you save when your task is due.")],
         "keyword-alert" => &[
@@ -344,12 +345,16 @@ fn reasons_for(id: &str) -> std::collections::BTreeMap<String, String> {
         "room-peek" => &[
             ("matrix-room-info", "Shows this room's name and member count."),
             ("matrix-room-read", "Lists the latest messages in this room and their reactions."),
-            ("matrix-room-send", "Sends the message you type into this room."),
+            ("matrix-room-send", "Sends your typed message only when you press Send now."),
+            ("robrix-composer", "Prepares draft text or a picked attachment for you to review and send in Robrix."),
+            ("files", "Opens the picker only for Attach file or Send file now; selected files are limited to 1 MiB."),
+            ("matrix-media", "Uploads and posts the file only when you press Send file now. Local attachment drafts need no media-send grant."),
             ("robrix-navigation", "Jumps to a message you tap."),
             ("matrix-room-watch", "Shows new messages, typing, edits and reactions as they arrive."),
         ],
         "roll-call" => &[
-            ("matrix-room-send", "Posts your roll into this room."),
+            ("matrix-room-send", "Posts your roll into this room only when you press Post to room."),
+            ("robrix-composer", "Puts your roll in the message box for you to review and send."),
         ],
         "room-info" => &[
             ("matrix-room-info", "Shows this room's name, topic, and settings."),
@@ -378,12 +383,14 @@ fn reasons_for(id: &str) -> std::collections::BTreeMap<String, String> {
         "simple-watcher" => &[
             ("matrix-room-watch", "Sees new messages so it can match your rules."),
             ("notifications", "Tells you when a message matches a rule."),
-            ("matrix-room-send", "Posts your reply when a rule says to."),
+            ("matrix-room-send", "Sends saved auto-replies when rules match and when you test them."),
+            ("robrix-composer", "Puts a reply in the message box only when you press Draft reply."),
         ],
         "watcher" => &[
             ("matrix-room-watch", "Sees new messages so it can match your rules."),
             ("notifications", "Tells you when a message matches a rule."),
-            ("matrix-room-send", "Posts your reply when a rule says to."),
+            ("matrix-room-send", "Sends saved auto-replies when rules match and when you test them."),
+            ("robrix-composer", "Puts a reply in the message box only when you press Draft reply."),
             ("mcp-tools", "Lets this room's AI add rules, once you turn that on."),
         ],
         "presence" => &[
@@ -728,6 +735,41 @@ mod tests {
                     crate::capabilities::by_id(id).unwrap().group == Some(permission)),
                     "{} leaves {permission:?} unrestricted", m.id);
             }
+        }
+    }
+
+    #[test]
+    fn composing_builtins_keep_drafting_separate_from_sending() {
+        use crate::permissions::{Effective, GrantState, Permission, PermissionContext, PermissionStore};
+        let composers = ["website-watch", "room-peek", "roll-call", "simple-watcher", "watcher"];
+        let context = PermissionContext { origin_room: Some("!room:test"), target_room: Some("!room:test") };
+        for manifest in builtin_apps() {
+            let composes = composers.contains(&manifest.id.as_str());
+            assert_eq!(manifest.declares(Permission::RobrixComposer), composes, "{}", manifest.id);
+            assert_eq!(manifest.declares(Permission::MatrixRoomSend), composes, "{}", manifest.id);
+            if !composes { continue; }
+            let mut permissions = PermissionStore::default();
+            permissions.set(&manifest.id, Permission::MatrixRoomSend, GrantState::Denied);
+            permissions.set(&manifest.id, Permission::MatrixMedia, GrantState::Denied);
+            permissions.set(&manifest.id, Permission::RobrixComposer, GrantState::Granted);
+            for cap in crate::capabilities::in_group(Permission::RobrixComposer).filter(|cap| manifest.declares_capability(cap)) {
+                assert_eq!(permissions.effective_capability_in_context(&manifest, cap, context), Effective::Granted, "{}: {}", manifest.id, cap.id);
+                assert_eq!(cap.flow_contract().unwrap().output, crate::capabilities::FlowOutput::Local);
+            }
+            assert_eq!(permissions.effective_capability_in_context(&manifest,
+                crate::capabilities::by_id("matrix.room.message.send").unwrap(), context), Effective::Denied);
+            assert!(!permissions.matrix_write());
+            // Built-ins declare only the composer operations used by their
+            // foreground controls; automatic watcher/background actions send
+            // under the separately declared send capability.
+            assert!(manifest.declares_capability(crate::capabilities::by_id("host.composer.insert").unwrap()));
+            assert_eq!(manifest.declares_capability(crate::capabilities::by_id("host.composer.attach").unwrap()), manifest.id == "room-peek");
+            assert!(!manifest.declares_capability(crate::capabilities::by_id("host.composer.reply_to").unwrap()));
+            assert_eq!(manifest.declares(Permission::MatrixMedia), manifest.id == "room-peek");
+            for id in ["matrix.media.send", "matrix.media.upload"] {
+                assert_eq!(manifest.declares_capability(crate::capabilities::by_id(id).unwrap()), manifest.id == "room-peek");
+            }
+            assert!(!manifest.declares_capability(crate::capabilities::by_id("matrix.media.download").unwrap()));
         }
     }
 

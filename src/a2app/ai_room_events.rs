@@ -817,6 +817,10 @@ fn quoted_values(json: &str, key: &str) -> Vec<String> {
 /// catches every call (including an agent-finished call overwriting the host's
 /// summary with the same result).
 fn format_json_result(value: &serde_json::Value) -> Option<String> {
+    if let Some(filename) = value.get("media").and_then(|media| media.get("filename")).and_then(|name| name.as_str()) {
+        let verb = if value.get("event_id").is_some() { "Posted" } else { "Prepared" };
+        return Some(format!("{verb} {filename}"));
+    }
     let array = |key: &str| value.get(key).filter(|entry| entry.is_array()).map(named_items).unwrap_or_default();
     let rooms = array("rooms");
     let spaces = array("spaces");
@@ -1038,6 +1042,10 @@ pub fn ai_tool_display_name(name: &str) -> String {
         "call_mini_app_tool" => String::from("Used a mini-app tool"),
         "send_message" => String::from("Replied"),
         "post_room_message" => String::from("Posted a message"),
+        "draft_message" => String::from("Drafted a message"),
+        "draft_media" => String::from("Prepared media"),
+        "attach_media" => String::from("Attached media for review"),
+        "post_room_media" => String::from("Posted media"),
         // octos's own tools, kept on the session's profile (see
         // `a2app_agent::robrix_session_profile`). Robrix doesn't execute
         // these; the agent closes their card itself.
@@ -1071,6 +1079,10 @@ pub fn ai_tool_display_name_running(name: &str) -> String {
         "call_mini_app_tool" => String::from("Using a mini-app tool"),
         "send_message" => String::from("Replying"),
         "post_room_message" => String::from("Posting a message"),
+        "draft_message" => String::from("Drafting a message"),
+        "draft_media" => String::from("Preparing media"),
+        "attach_media" => String::from("Attaching media for review"),
+        "post_room_media" => String::from("Posting media"),
         "web_search" => String::from("Searching the web"),
         "web_fetch" => String::from("Reading a web page"),
         "browser" => String::from("Browsing the web"),
