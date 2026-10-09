@@ -513,15 +513,11 @@ mod params_tests {
     #[test]
     fn spawned_agent_sees_the_tool_servers_in_session_new() {
         use std::os::unix::fs::PermissionsExt;
-        // Fresh run each time: the recording file outlives the test (this dir
-        // is shared, not a per-run tempdir), and a stale capture would silently
-        // pass assertions against an old wire format.
-        let dir = std::env::temp_dir().join("acp_mcpservers_wire_test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join("record.sh");
-        let out = dir.join("session_new.json");
-        let _ = std::fs::remove_file(&out);
+        // Concurrent test runs must not replace another child's script or
+        // capture, and a previous recording must never satisfy this run.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("record.sh");
+        let out = dir.path().join("session_new.json");
         // Reads stdin; answers `initialize` (its id is always 1, the first
         // request this client sends) so the reader thread proceeds to
         // session/new, and copies that request to `$out` before replying.
@@ -549,20 +545,24 @@ done
             vec!["--mcp-bridge".to_string(), "--socket".to_string(), "/tmp/s/tools.sock".to_string()],
         )];
         let mut client =
-            AcpClient::spawn(script.to_str().unwrap(), &dir, &[], &[], &servers).unwrap();
-        // Let the reader thread drive the handshake to session/new.
+            AcpClient::spawn(script.to_str().unwrap(), dir.path(), &[], &[], &servers).unwrap();
+        // Opening the capture creates it before echo finishes writing. Keep
+        // the child alive until a complete JSON request has been recorded.
+        let mut recorded = None;
         for _ in 0..50 {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            if out.exists() {
-                break;
+            if let Ok(line) = std::fs::read_to_string(&out) {
+                if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                    recorded = Some(value);
+                    break;
+                }
             }
             let _ = client.drain_events();
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
         drop(client);
 
-        let line = std::fs::read_to_string(&out).expect("the agent recorded session/new");
-        let value: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(value["params"]["cwd"], dir.to_string_lossy().into_owned());
+        let value = recorded.expect("the agent recorded a complete session/new request within one second");
+        assert_eq!(value["params"]["cwd"], dir.path().to_string_lossy().into_owned());
         let advertised = value["params"]["mcpServers"].as_array().unwrap();
         assert_eq!(advertised.len(), 1);
         assert_eq!(advertised[0]["name"], "robrix-tools");
