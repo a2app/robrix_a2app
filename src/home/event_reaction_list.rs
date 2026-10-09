@@ -39,16 +39,12 @@ script_mod! {
 
 
     mod.widgets.COLOR_BUTTON_GREY = #B6BABF
-    mod.widgets.REACTION_LIST_PADDING_RIGHT = 30.0;
 
     mod.widgets.ReactionList = #(ReactionList::register_widget(vm)) {
         width: Fill,
         height: Fit,
         flow: Flow.Right{wrap: true},
         margin: Inset{top: 5.0}
-        padding: Inset{
-            right: (mod.widgets.REACTION_LIST_PADDING_RIGHT)
-        }
         item: Button {
             width: Fit,
             height: Fit,
@@ -129,6 +125,10 @@ pub struct ReactionList {
 }
 impl Widget for ReactionList {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        if self.children.is_empty() {
+            self.area = Area::Empty;
+            return DrawStep::done();
+        }
         cx.begin_turtle(walk, self.layout);
         for (button, _) in self.children.iter_mut() {
             let _ = button.draw(cx, scope);

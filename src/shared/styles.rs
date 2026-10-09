@@ -15,11 +15,14 @@ script_mod! {
     mod.widgets.ICON_CHEVRON_DOWN     = crate_resource("self://resources/icons/chevron_down.svg")
     mod.widgets.ICON_CHEVRON_UP       = crate_resource("self://resources/icons/chevron_up.svg")
     mod.widgets.ICON_CLOSE            = crate_resource("self://resources/icons/close.svg")
+    mod.widgets.ICON_CLOSE_THIN       = crate_resource("self://resources/icons/close_thin.svg")
     mod.widgets.ICON_CLOUD_CHECKMARK  = crate_resource("self://resources/icons/cloud_checkmark.svg")
     mod.widgets.ICON_CLOUD_OFFLINE    = crate_resource("self://resources/icons/cloud_offline.svg")
     mod.widgets.ICON_ROTATE_CW        = crate_resource("self://resources/icons/rotate_right.svg")
+    mod.widgets.ICON_ROTATE_CW_THIN   = crate_resource("self://resources/icons/rotate_right_thin.svg")
     mod.widgets.ICON_COPY             = crate_resource("self://resources/icons/copy.svg")
     mod.widgets.ICON_DOWNLOAD         = crate_resource("self://resources/icons/download.svg")
+    mod.widgets.ICON_DOWNLOAD_THIN    = crate_resource("self://resources/icons/download_thin.svg")
     mod.widgets.ICON_EDIT             = crate_resource("self://resources/icons/edit.svg")
     mod.widgets.ICON_EXTERNAL_LINK    = crate_resource("self://resources/icons/external_link.svg")
     mod.widgets.ICON_IMPORT           = crate_resource("self://resources/icons/import.svg")
@@ -44,6 +47,7 @@ script_mod! {
     mod.widgets.ICON_SEND_UNENCRYPTED = crate_resource("self://resources/icons/send_unencrypted.svg")
     mod.widgets.ICON_SETTINGS         = crate_resource("self://resources/icons/settings.svg")
     mod.widgets.ICON_SHARE            = crate_resource("self://resources/icons/share.svg")
+    mod.widgets.ICON_SHARE_THIN       = crate_resource("self://resources/icons/share_thin.svg")
     mod.widgets.ICON_SQUARES          = crate_resource("self://resources/icons/squares_filled.svg")
     mod.widgets.ICON_TOMBSTONE        = crate_resource("self://resources/icons/tombstone.svg")
     mod.widgets.ICON_TRASH            = crate_resource("self://resources/icons/trash.svg")
@@ -156,8 +160,8 @@ script_mod! {
     mod.widgets.COLOR_SECONDARY = #E3E3E3
     mod.widgets.COLOR_SECONDARY_DARKER = #C8C8C8
 
-    // What a rooms list entry or timeline message darkens to on hover or press.
-    mod.widgets.COLOR_LIST_ITEM_BG_HOVER = #f4f4f4
+    // What a list item, e.g., a room, message, or menu item, darkens to on hover or press.
+    mod.widgets.COLOR_LIST_ITEM_BG_HOVER = #xEFF3F8
 
     // Every scroll bar uses this styling.
     mod.widgets.ScrollBar.draw_bg.color = #00000040
@@ -171,6 +175,8 @@ script_mod! {
     mod.widgets.COLOR_BG_PREVIEW = #F0F5FF
 
     // The light lavender of the room action buttons and room pane headers.
+    // Looks like COLOR_BG_PREVIEW atop white, but it also darkens a hovered or highlighted message behind it.
+    mod.widgets.COLOR_BG_PREVIEW_TRANSLUCENT = #x1060FF10
     mod.widgets.COLOR_BG_LAVENDER = #xEDE8FD
     mod.widgets.COLOR_BG_LAVENDER_HOVER = #xE8E1FA
     mod.widgets.COLOR_BG_LAVENDER_DOWN = #xE1D7F7
@@ -230,7 +236,7 @@ script_mod! {
 
     mod.widgets.COLOR_IMAGE_VIEWER_BACKGROUND = #333333CC // 80% Opacity
 
-    mod.widgets.COLOR_IMAGE_VIEWER_META_BACKGROUND = #E8E8E8
+    mod.widgets.COLOR_IMAGE_VIEWER_META_BACKGROUND = #18181BCC
 
     // Ensure all settings buttons have a consistent height
     mod.widgets.SETTINGS_BUTTON_HEIGHT = 40

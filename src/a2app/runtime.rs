@@ -1450,7 +1450,7 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
             if let Some(nav) = action.downcast_ref::<NavigationBarAction>() {
                 let (screen, space_id) = match nav {
                     NavigationBarAction::GoToHome => ("home", None),
-                    NavigationBarAction::GoToAddRoom => ("add_room", None),
+                    NavigationBarAction::GoToAddRoom { .. } => ("add_room", None),
                     NavigationBarAction::GoToMiniApps => ("mini_apps", None),
                     NavigationBarAction::OpenSettings => ("settings", None),
                     NavigationBarAction::GoToSpace { space_name_id } => ("space", Some(space_name_id.room_id().to_string())),
@@ -3931,7 +3931,7 @@ fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, heap: usize, action: HostAct
         HostAction::OpenScreen { screen } => {
             let action = match screen.as_str() {
                 "home" => NavigationBarAction::GoToHome,
-                "add_room" => NavigationBarAction::GoToAddRoom,
+                "add_room" => NavigationBarAction::GoToAddRoom { search_for: None },
                 "mini_apps" => NavigationBarAction::GoToMiniApps,
                 "settings" => NavigationBarAction::OpenSettings,
                 _ => return Err(String::from("screen must be one of home, add_room, mini_apps, settings")),

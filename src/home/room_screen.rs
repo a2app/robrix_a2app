@@ -1,15 +1,15 @@
 //! The `RoomScreen` widget is the UI view that displays a single room or thread's timeline
 //! of events (messages，state changes, etc.), along with an input bar at the bottom.
 
-use std::{borrow::Cow, cell::RefCell, ops::{DerefMut, Range}, sync::Arc, time::{Duration, Instant}};
+use std::{borrow::Cow, cell::RefCell, ops::{DerefMut, Range}, path::PathBuf, sync::Arc, time::{Duration, Instant}};
 
 use hashbrown::{HashMap, HashSet};
 use imbl::Vector;
 use makepad_widgets::{image_cache::ImageBuffer, makepad_platform::event::finger::TouchState, *};
 use matrix_sdk::reqwest::StatusCode;
 use matrix_sdk::{
-    OwnedServerName, media::{MediaFormat, MediaRequestParameters}, room::{RoomMember, reply::{EnforceThread, Reply}}, serde_helpers::extract_bundled_thread, ruma::{
-        EventId, MatrixToUri, MatrixUri, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedTransactionId, RoomId, UserId, events::{
+    RoomState, media::{MediaFormat, MediaRequestParameters}, room::{RoomMember, reply::{EnforceThread, Reply}}, serde_helpers::extract_bundled_thread, ruma::{
+        EventId, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedRoomOrAliasId, OwnedTransactionId, RoomId, UserId, events::{
             receipt::Receipt,
             room::{
                 ImageInfo, MediaSource, message::{
@@ -27,15 +27,15 @@ use ruma::{OwnedUserId, api::client::receipt::create_receipt::v3::ReceiptType, e
 
 use matrix_sdk_ui::sync_service::State;
 use crate::{
-    app::{AppStateAction, ConfirmDeleteAction, SelectedRoom}, event_preview::{plaintext_body_of_timeline_item, text_preview_of_thread_reply, text_preview_of_timeline_item}, home::{edited_indicator::EditedIndicatorWidgetRefExt, invite_modal::InviteModalAction, link_preview::{LinkPreviewCache, LinkPreviewRef, LinkPreviewWidgetRefExt}, loading_pane::LoadingPaneWidgetExt, room_image_viewer::{fetch_full_image_for_viewer, get_image_name_and_filesize}, rooms_list::{RoomsListAction, RoomsListRef}, rooms_list_header::RoomsListHeaderAction, tombstone_footer::SuccessorRoomDetails}, media_cache::{MediaCache, MediaCacheEntry}, profile::{
+    app::{AppStateAction, ConfirmDeleteAction, SelectedRoom}, event_preview::{plaintext_body_of_timeline_item, text_preview_of_thread_reply, text_preview_of_timeline_item}, home::{edited_indicator::EditedIndicatorWidgetRefExt, invite_modal::InviteModalAction, link_preview::{LinkPreviewCache, LinkPreviewRef, LinkPreviewWidgetRefExt}, loading_pane::LoadingPaneWidgetExt, navigation_tab_bar::NavigationBarAction, room_image_viewer::{fetch_full_image_for_viewer, get_image_file_details}, rooms_list::{RoomsListAction, RoomsListRef, RoomsListUpdate, enqueue_rooms_list_update}, rooms_list_header::RoomsListHeaderAction, tombstone_footer::SuccessorRoomDetails}, media_cache::{get_image_cache_key, MediaCache, MediaCacheEntry}, profile::{
         user_profile::{ShowUserProfileAction, UserProfile, UserProfileAndRoomId, UserProfilePaneAction, UserProfilePaneInfo, UserProfileSlidingPaneRef, UserProfileSlidingPaneWidgetExt},
         user_profile_cache,
     },
-    room::{BasicRoomDetails, reply_preview::{CollapsiblePreviewRef, CollapsiblePreviewWidgetRefExt}, room_input_bar::{RoomInputBarState, RoomInputBarWidgetRefExt}, typing_notice::TypingNoticeWidgetExt},
+    room::{reply_preview::{CollapsiblePreviewRef, CollapsiblePreviewWidgetRefExt}, room_input_bar::{RoomInputBarState, RoomInputBarWidgetRefExt}, typing_notice::TypingNoticeWidgetExt},
     shared::{
         attachment_download::{enqueue_already_downloading_notification, DownloadDisplayState, DownloadKind, DownloadableAttachment, PendingDownload, PendingDownloadState, TimelineUpdateSenderOption, TransferKind, media_source_mxc, start_attachment_download, start_attachment_share}, avatar::{AvatarState, AvatarWidgetRefExt}, confirmation_modal::ConfirmationModalContent, context_menu::ContextMenuClosed, file_upload_modal::FileUploadAttemptId, hover_highlight::handle_hover_hit, html_or_plaintext::{HtmlOrPlaintextRef, HtmlOrPlaintextWidgetRefExt, RobrixHtmlLinkAction}, image_viewer::{ImageViewerAction, ImageViewerMetaData, LoadState}, jump_to_bottom_button::{JumpToBottomButtonWidgetExt, UnreadMessageCount, SCROLL_TO_BOTTOM_SPEED}, popup_list::{PopupKind, enqueue_popup_notification}, restore_status_view::RestoreStatusViewWidgetExt, room_input_popup_menu::{RoomInputPopupMenuAction, RoomInputPopupMenuRef, RoomInputPopupMenuWidgetExt}, styles::*, text_or_image::{TextOrImageAction, TextOrImageRef, TextOrImageWidgetRefExt}, timestamp::TimestampWidgetRefExt
     },
-    sliding_sync::{BackwardsPaginateUntilEventRequest, MatrixRequest, PaginationDirection, TimelineEndpoints, TimelineKind, TimelineRequestSender, UserPowerLevels, submit_async_request, take_timeline_endpoints, TimelineEndpointsRecreated}, utils::{self, MEDIA_THUMBNAIL_FORMAT, RoomNameId, unix_time_millis_to_datetime}
+    sliding_sync::{BackwardsPaginateUntilEventRequest, MatrixRequest, PaginationDirection, TimelineEndpoints, TimelineKind, TimelineRequestSender, UserPowerLevels, submit_async_request, take_timeline_endpoints, TimelineEndpointsRecreated}, utils::{self, ANIMATED_MEDIA_THUMBNAIL_FORMAT, MEDIA_THUMBNAIL_FORMAT, RoomNameId, unix_time_millis_to_datetime}
 };
 #[cfg(feature = "a2app")]
 use matrix_sdk_ui::timeline::OtherMessageLike;
@@ -53,7 +53,7 @@ use crate::room::{
     pinned_messages_list::{PinnedMessagesListAction, confirm_unpin_message},
     room_action_bar::{RoomActionBarAction, RoomActionBarWidgetExt},
     room_members_list::{RoomMembersChanged, RoomMembersListAction, show_member_profile},
-    room_pane::{RoomPaneKind, mini_app_panes},
+    room_pane::{self, RoomPaneKind, mini_app_panes},
 };
 use crate::home::failed_send_banner::{BlockedSend, FailedSendBannerWidgetExt};
 use crate::home::send_status_indicator::{SendStatusIndicatorAction, SendStatusIndicatorRef, SendStatusIndicatorWidgetExt};
@@ -246,6 +246,8 @@ script_mod! {
         thread_summary_latest := MessageHtml {
             max_lines: 2
             text_overflow: Ellipsis
+            // A two-line preview keeps its paragraphs close together.
+            paragraph_margin: Inset{ top: 0.33, bottom: 0.33 }
         }
     }
 
@@ -267,15 +269,15 @@ script_mod! {
             color: instance((COLOR_PRIMARY)) // default color)
             color_hover: instance(COLOR_LIST_ITEM_BG_HOVER)
 
-            mentions_bar_color: instance((COLOR_PRIMARY))
+            mentions_bar_color: instance(#0000)
             mentions_bar_width: instance(4.0)
+            border_radius: uniform(4.0)
+            border_inset: uniform(vec4(4.0, 0.0, 4.0, 0.0))
 
             pixel: fn() {
-                // Multiply rather than replace, so a mention-highlighted message
-                // keeps its yellow on hover, just darker.
                 let base_color = mix(
                     self.color,
-                    self.color * self.color_hover,
+                    self.color_hover,
                     self.hover
                 );
 
@@ -287,12 +289,23 @@ script_mod! {
 
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size);
 
+                // A mention's highlight covers the full width, while other highlights are inset.
+                let not_mention = 1.0 - step(0.001, self.mentions_bar_color.w);
+                let inset = self.border_inset * not_mention;
+
                 // draw bg
-                sdf.rect(0., 0., self.rect_size.x, self.rect_size.y);
-                sdf.fill(with_highlight);
+                sdf.box(
+                    inset.x,
+                    inset.y,
+                    self.rect_size.x - (inset.x + inset.z),
+                    self.rect_size.y - (inset.y + inset.w),
+                    self.border_radius
+                );
+                sdf.fill_keep(with_highlight);
 
                 // draw the left vertical line
-                sdf.rect(0., 0., self.mentions_bar_width, self.rect_size.y);
+                sdf.rect(inset.x, 0., self.mentions_bar_width, self.rect_size.y);
+                sdf.intersect(); // clip it to the bg's rounded corners
                 sdf.fill(self.mentions_bar_color);
 
                 return sdf.result;
@@ -304,8 +317,8 @@ script_mod! {
                 default: @off
                 off: AnimatorState{
                     redraw: true,
-                    from: { all: Forward {duration: 2.0} }
-                    ease: ExpDecay {d1: 0.80, d2: 0.97}
+                    from: { all: Forward {duration: 4.5} }
+                    ease: InQuart
                     apply: { draw_bg: {highlight: 0.0} }
                 }
                 on: AnimatorState{
@@ -335,30 +348,53 @@ script_mod! {
             flow: Down
             margin: Inset{ bottom: 3, top: 10 }
             preview_content +: {
-                margin +: { left: 29 }
+                margin +: { left: 20 }
                 padding +: { bottom: 10 }
+            }
+        }
+
+        // The sender's avatar and username, which a condensed message hides.
+        header := View {
+            width: Fill,
+            height: Fit
+            flow: Right,
+            padding: Inset{left: 8, right: 10},
+
+            avatar := Avatar {
+                width: 42,
+                height: 42,
+                // Centered over the timestamp column below it.
+                margin: Inset{top: 7.5, bottom: 6.1, left: 4, right: 12}
+            }
+            username := Label {
+                width: Fill,
+                flow: Flow.Right { wrap: false },
+                padding: 0,
+                margin: Inset{top: 20.0, right: 10.0} // centers it on the avatar
+                max_lines: 1
+                text_overflow: Ellipsis
+                draw_text +: {
+                    text_style: USERNAME_TEXT_STYLE {},
+                    color: (USERNAME_TEXT_COLOR)
+                }
+                text: "<Username not available>"
             }
         }
 
         body := View {
             width: Fill,
             height: Fit
-            flow: Right,
-            padding: Inset{top: 0, bottom: 10, left: 10, right: 10},
+            // Aligns the timestamp with the baseline of the content's first line
+            flow: Flow.Right{row_align: RowAlign.Baseline},
+            padding: Inset{top: 0, bottom: 7.5, left: 8, right: 10},
 
             profile := View {
                 align: Align{x: 0.5, y: 0.0} // centered horizontally, top aligned
-                width: 65.0,
+                width: 50.0,
                 height: Fit,
-                margin: Inset{top: 4.5, right: 10}
+                margin: Inset{right: 8}
                 flow: Down,
-                avatar := Avatar {
-                    width: 48,
-                    height: 48,
-                }
-                timestamp := Timestamp {
-                    margin: Inset{ top: 5.9 }
-                }
+                timestamp := Timestamp { }
                 edited_indicator := EditedIndicator { }
                 tsp_sign_indicator := TspSignIndicator { }
             }
@@ -368,25 +404,6 @@ script_mod! {
                 height: Fit
                 flow: Down,
                 padding: 0.0
-
-                username_view := View {
-                    flow: Right,
-                    width: Fill,
-                    height: Fit,
-                    username := Label {
-                        width: Fill,
-                        flow: Flow.Right { wrap: false },
-                        padding: 0,
-                        margin: Inset{bottom: 9.0, top: 20.0, right: 10.0,}
-                        max_lines: 1
-                        text_overflow: Ellipsis
-                        draw_text +: {
-                            text_style: USERNAME_TEXT_STYLE {},
-                            color: (USERNAME_TEXT_COLOR)
-                        }
-                        text: "<Username not available>"
-                    }
-                }
 
                 message := HtmlOrPlaintext { }
                 link_preview_view := mod.widgets.LinkPreview {}
@@ -410,44 +427,12 @@ script_mod! {
         padding: Inset{ top: 2.0, bottom: 2.0 }
         replied_to_message +: {
             preview_content +: {
-                margin: Inset{ left: 74, bottom: 5.0 }
+                margin: Inset{ left: 55, bottom: 5.0 }
             }
         }
-        body := View {
-            width: Fill,
-            height: Fit
-            flow: Right,
-            padding: Inset{ top: 0, bottom: 2.5, left: 10.0, right: 10.0 },
-            profile := View {
-                align: Align{x: 0.5, y: 0.0} // centered horizontally, top aligned
-                width: 65.0,
-                height: Fit,
-                flow: Down,
-                timestamp := Timestamp {
-                    margin: Inset{top: 2.5}
-                }
-                edited_indicator := EditedIndicator { }
-                tsp_sign_indicator := TspSignIndicator { }
-            }
-            content := View {
-                width: Fill,
-                height: Fit,
-                flow: Down,
-                padding: Inset{ left: 10.0 }
-
-                message := HtmlOrPlaintext { }
-                link_preview_view := mod.widgets.LinkPreview {}
-                download_section := mod.widgets.MessageDownloadSection {}
-                View {
-                    width: Fill,
-                    height: Fit
-                    flow: Right,
-                    reaction_list := mod.widgets.ReactionList { }
-                    avatar_row := mod.widgets.AvatarRow {}
-                    send_status_indicator := mod.widgets.SendStatusIndicator {}
-                }
-                thread_root_summary := mod.widgets.ThreadRootSummary {}
-            }
+        header +: { visible: false }
+        body +: {
+            padding: Inset{ top: 2.5, bottom: 2.5, left: 8.0, right: 10.0 },
         }
     }
 
@@ -472,9 +457,13 @@ script_mod! {
                         caption := HtmlOrPlaintext {}
                     }
                     image := TextOrImage {
-                        image_view +: { image +: {
-                            height: (mod.widgets.IMG_MSG_FIT)
-                        } }
+                        image_view +: {
+                            // The same spacing as timestamps in other text-based messages
+                            baseline: Baseline.At(13.57)
+                            image +: {
+                                height: (mod.widgets.IMG_MSG_FIT)
+                            }
+                        }
                     }
                 }
                 download_section := mod.widgets.MessageDownloadSection {}
@@ -508,9 +497,13 @@ script_mod! {
                         caption := HtmlOrPlaintext {}
                     }
                     image := TextOrImage {
-                        image_view +: { image +: {
-                            height: (mod.widgets.IMG_MSG_FIT)
-                        } }
+                        image_view +: {
+                            // The same spacing as timestamps in other text-based messages
+                            baseline: Baseline.At(13.57)
+                            image +: {
+                                height: (mod.widgets.IMG_MSG_FIT)
+                            }
+                        }
                     }
                 }
                 download_section := mod.widgets.MessageDownloadSection {}
@@ -1302,13 +1295,32 @@ impl Widget for RoomScreen {
                 // Handle actions related to restoring the previously-saved state of rooms.
                 if let Some(AppStateAction::RoomLoadedSuccessfully { room_name_id, ..}) = action.downcast_ref() {
                     if self.room_name_id.as_ref().is_some_and(|rn| rn.room_id() == room_name_id.room_id()) {
+                        let was_shown = self.tl_state.is_some();
                         // `set_displayed_room()` does nothing if the room_name_id is unchanged, so we clear it first.
                         self.room_name_id = None;
                         let thread_root_event_id = self.timeline_kind.as_ref()
                             .and_then(|k| k.thread_root_event_id().cloned());
                         self.set_displayed_room(cx, room_name_id, thread_root_event_id);
+                        if was_shown {
+                            // If the timeline was already shown, continue processing actions for it.
+                            continue;
+                        }
                         return;
                     }
+                }
+
+                // Once we resolve a clicked link, navigate to that destination (unless the user canceled it already).
+                if let Some(RoomLinkResolved { link, result }) = action.downcast_ref()
+                    && loading_pane.is_resolving_link(link)
+                {
+                    match result {
+                        Ok(destination) => {
+                            loading_pane.hide(cx);
+                            self.show_link_destination(cx, link, destination, &loading_pane, &portal_list);
+                        }
+                        Err(error_message) => loading_pane.show_error(cx, error_message.clone()),
+                    }
+                    continue;
                 }
 
                 // Handle InviteResultAction to show popup notifications.
@@ -1500,7 +1512,7 @@ impl Widget for RoomScreen {
         // Here, we handle and remove any general actions that are relevant to only this RoomScreen.
         // Removing the handled actions ensures they are not mistakenly handled by other RoomScreen widget instances.
         actions_generated_within_this_room_screen.retain(|action| {
-            if self.handle_link_clicked(cx, action, &user_profile_sliding_pane, &portal_list, &loading_pane) {
+            if self.handle_link_clicked(cx, action, &user_profile_sliding_pane, &loading_pane, &portal_list) {
                 return false;
             }
 
@@ -1547,11 +1559,7 @@ impl Widget for RoomScreen {
 
             // Handle a message being clicked in the pinned messages pane.
             if let PinnedMessagesListAction::MessageClicked { timeline_kind, event_id, description, .. } = action.as_widget_action().cast() {
-                // A thread's timeline also includes its root message.
-                let is_in_this_timeline = self.tl_state.as_ref().is_some_and(|tl|
-                    tl.kind == timeline_kind || tl.kind.thread_root_event_id() == Some(&event_id)
-                );
-                if !is_in_this_timeline {
+                if !self.is_event_in_this_timeline(&timeline_kind, &event_id) {
                     // Our parent will show the timeline that contains this message,
                     // so jump to it in that room screen's timeline instead of here.
                     return true;
@@ -2579,143 +2587,149 @@ impl RoomScreen {
         cx: &mut Cx,
         action: &Action,
         pane: &UserProfileSlidingPaneRef,
-        portal_list: &PortalListRef,
         loading_pane: &LoadingPaneRef,
+        portal_list: &PortalListRef,
     ) -> bool {
-        // A closure that handles both MatrixToUri and MatrixUri links,
-        // and returns whether the link was handled.
-        let mut handle_matrix_link = |id: &MatrixId, _via: &[OwnedServerName]| -> bool {
-            match id {
-                MatrixId::User(user_id) => {
-                    let Some(room_name_id) = self.room_name_id.as_ref() else {
-                        return false;
-                    };
-                    // There is no synchronous way to get the user's full profile info
-                    // including the details of their room membership,
-                    // so we fill in with the details we *do* know currently,
-                    // show the UserProfileSlidingPane, and then after that,
-                    // the UserProfileSlidingPane itself will fire off
-                    // an async request to get the rest of the details.
-                    self.show_user_profile(
-                        cx,
-                        pane,
-                        UserProfilePaneInfo {
-                            profile_and_room_id: UserProfileAndRoomId {
-                                user_profile: UserProfile {
-                                    user_id: user_id.to_owned(),
-                                    username: None,
-                                    avatar_state: AvatarState::Unknown,
-                                },
-                                room_id: room_name_id.room_id().clone(),
-                            },
-                            room_name: room_name_id.to_string(),
-                            // TODO: use the extra `via` parameters
-                            room_member: None,
-                        },
-                    );
-                    true
-                }
-                MatrixId::Room(room_id) => {
-                    if self.room_name_id.as_ref().is_some_and(|r| r.room_id() == room_id) {
-                        enqueue_popup_notification(
-                            "You are already viewing that room.",
-                            PopupKind::Info,
-                            Some(4.0),
-                        );
-                        return true;
-                    }
-                    if let Some(room_name_id) = cx.get_global::<RoomsListRef>().get_room_name(room_id) {
-                        cx.action(AppStateAction::NavigateToRoom {
-                            room_to_close: None,
-                            destination_room: BasicRoomDetails::Name(room_name_id),
-                        });
-                        return true;
-                    } else {
-                        log!("TODO: fetch and display room preview for room {}", room_id);
-                    }
-                    false
-                }
-                MatrixId::RoomAlias(room_alias) => {
-                    log!("TODO: open room alias {}", room_alias);
-                    // TODO: open a room loading screen that shows a spinner
-                    //       while our background async task calls Client::resolve_room_alias()
-                    //       and then either jumps to the room if known, or fetches and displays
-                    //       a room preview for that room.
-                    false
-                }
-                MatrixId::Event(room, event_id) => {
-                    // A link to a specific message: jump to it in-app. A
-                    // same-room link (an AI reply quoting this room's own
-                    // content, or any chat permalink) scrolls the current
-                    // timeline to that message and highlights it; a link to
-                    // another room's message — as an AI reply's cross-room
-                    // reference is — brings that room forward at the message
-                    // (a2app builds, where the jump machinery lives).
-                    if self.timeline_kind.as_ref().is_some_and(|k| k.room_id().as_str() == room.as_str()) {
-                        self.jump_to_event(
-                            cx,
-                            event_id,
-                            None,
-                            String::from("the message that link points to"),
-                            portal_list,
-                            loading_pane,
-                        );
-                        return true;
-                    }
-                    // An alias can't name a room we can open; only concrete ids.
-                    #[cfg(feature = "a2app")]
-                    if let Ok(room_id) = OwnedRoomId::try_from(room.as_str())
-                        && crate::a2app::runtime::open_event_in_room(cx, room_id, event_id.clone()).is_ok()
-                    {
-                        return true;
-                    }
-                    log!("Couldn't open event {} in room {} in-app; falling back to the external link.", event_id, room);
-                    false
-                }
-                _ => false,
-            }
+        let (url, matrix_id) = if let HtmlLinkAction::Clicked { url, .. } = action.as_widget_action().cast() {
+            let matrix_id = utils::parse_matrix_link(&url).map(|(matrix_id, _via)| matrix_id);
+            (url, matrix_id)
+        } else if let RobrixHtmlLinkAction::ClickedMatrixLink { url, matrix_id, .. } = action.as_widget_action().cast() {
+            (url, Some(matrix_id))
+        } else {
+            return false;
         };
 
-        if let HtmlLinkAction::Clicked { url, .. } = action.as_widget_action().cast() {
-            let mut link_was_handled = false;
-            if let Ok(matrix_to_uri) = MatrixToUri::parse(&url) {
-                link_was_handled |= handle_matrix_link(matrix_to_uri.id(), matrix_to_uri.via());
+        let (room_or_alias_id, event_id) = match matrix_id {
+            Some(MatrixId::Room(room_id)) => (room_id.into(), None),
+            Some(MatrixId::RoomAlias(alias)) => (alias.into(), None),
+            Some(MatrixId::Event(room_or_alias_id, event_id)) => (room_or_alias_id, Some(event_id)),
+            Some(MatrixId::User(user_id)) => {
+                let Some(room_name_id) = self.room_name_id.as_ref() else {
+                    utils::open_url(&url);
+                    return true;
+                };
+                // There is no synchronous way to get the user's full profile info
+                // including the details of their room membership,
+                // so we fill in with the details we *do* know currently
+                // and then show the UserProfileSlidingPane immediately.
+                // Then, the UserProfileSlidingPane itself will fire off an async request
+                // to get the rest of the details.
+                self.show_user_profile(
+                    cx,
+                    pane,
+                    UserProfilePaneInfo {
+                        profile_and_room_id: UserProfileAndRoomId {
+                            user_profile: UserProfile {
+                                user_id,
+                                username: None,
+                                avatar_state: AvatarState::Unknown,
+                            },
+                            room_id: room_name_id.room_id().clone(),
+                        },
+                        room_name: room_name_id.to_string(),
+                        room_member: None,
+                    },
+                );
+                return true;
             }
-            else if let Ok(matrix_uri) = MatrixUri::parse(&url) {
-                link_was_handled |= handle_matrix_link(matrix_uri.id(), matrix_uri.via());
+            _ => {
+                utils::open_url(&url);
+                return true;
             }
+        };
+        let link = RoomLink { room_or_alias_id, event_id, url };
 
-            if !link_was_handled {
-                log!("Opening URL \"{}\"", url);
-                if let Err(e) = robius_open::Uri::new(&url).open() {
-                    error!("Failed to open URL {:?}. Error: {:?}", url, e);
-                    enqueue_popup_notification(
-                        format!("Could not open URL: {url}"),
-                        PopupKind::Error,
-                        Some(10.0),
-                    );
-                }
+        // Fast path: first check the rooms list to see if we already know the room.
+        let rooms_list_ref = cx.get_global::<RoomsListRef>();
+        let known_room = match <&RoomId>::try_from(&*link.room_or_alias_id) {
+            Ok(room_id) => rooms_list_ref.get_room_name(&room_id.to_owned()),
+            Err(alias) => rooms_list_ref.get_room_name_by_alias(alias),
+        };
+        let known_room_state = known_room.as_ref().and_then(|rn| rooms_list_ref.get_room_state(rn.room_id()));
+        let destination = match (&known_room, known_room_state, &link.event_id) {
+            (Some(room_name_id), Some(RoomState::Invited), _) => Some(RoomLinkDestination::Invite(room_name_id.clone())),
+            (Some(room_name_id), Some(RoomState::Joined), None) => Some(RoomLinkDestination::Timeline {
+                room_name_id: room_name_id.clone(),
+                timeline_kind: TimelineKind::MainRoom { room_id: room_name_id.room_id().clone() },
+            }),
+            (Some(room_name_id), Some(RoomState::Joined), Some(event_id)) => self.tl_state.as_ref()
+                .filter(|tl| tl.kind.room_id() == room_name_id.room_id()
+                    && index_of_event(&tl.items, event_id, tl.items.len(), MAX_ITEMS_TO_SEARCH_THROUGH).is_some()
+                )
+                .map(|tl| RoomLinkDestination::Timeline { room_name_id: room_name_id.clone(), timeline_kind: tl.kind.clone() }),
+            _ => None,
+        };
+        match destination {
+            Some(destination) => self.show_link_destination(cx, &link, &destination, loading_pane, portal_list),
+            None => {
+                loading_pane.start_resolving_link(cx, link.clone());
+                submit_async_request(MatrixRequest::ResolveRoomLink {
+                    link,
+                    known_room_id: known_room.map(|rn| rn.room_id().clone()),
+                });
+                self.redraw(cx);
             }
-            true
         }
-        else if let RobrixHtmlLinkAction::ClickedMatrixLink { url, matrix_id, via, .. } = action.as_widget_action().cast() {
-            let link_was_handled = handle_matrix_link(&matrix_id, &via);
-            if !link_was_handled {
-                log!("Opening URL \"{}\"", url);
-                if let Err(e) = robius_open::Uri::new(&url).open() {
-                    error!("Failed to open URL {:?}. Error: {:?}", url, e);
-                    enqueue_popup_notification(
-                        format!("Could not open URL: {url}"),
-                        PopupKind::Error,
-                        Some(10.0),
-                    );
+        true
+    }
+
+    /// Returns `true` if this RoomScreen's timeline shows the given event from the given timeline.
+    fn is_event_in_this_timeline(&self, timeline_kind: &TimelineKind, event_id: &OwnedEventId) -> bool {
+        // A thread's timeline also includes its root message.
+        self.tl_state.as_ref().is_some_and(|tl|
+            &tl.kind == timeline_kind || tl.kind.thread_root_event_id() == Some(event_id)
+        )
+    }
+
+    /// Shows the given destination of a clicked link to a room, space, or event.
+    fn show_link_destination(
+        &mut self,
+        cx: &mut Cx,
+        link: &RoomLink,
+        destination: &RoomLinkDestination,
+        loading_pane: &LoadingPaneRef,
+        portal_list: &PortalListRef,
+    ) {
+        let (room_name_id, navigation) = match destination {
+            RoomLinkDestination::Timeline { room_name_id, timeline_kind } => match &link.event_id {
+                Some(event_id) => {
+                    let description = String::from("the linked message");
+                    if self.is_event_in_this_timeline(timeline_kind, event_id) {
+                        self.jump_to_event(cx, event_id, None, description, portal_list, loading_pane);
+                        return;
+                    }
+                    (room_name_id, NavigateToLinkAction::Event {
+                        room_name_id: room_name_id.clone(),
+                        timeline_kind: timeline_kind.clone(),
+                        event_id: event_id.clone(),
+                        description,
+                    })
                 }
+                None if self.timeline_kind.as_ref() == Some(timeline_kind) => {
+                    enqueue_popup_notification(
+                        "You are already viewing that room.",
+                        PopupKind::Info,
+                        Some(4.0),
+                    );
+                    return;
+                }
+                None => (room_name_id, NavigateToLinkAction::Screen(room_pane::timeline_screen(room_name_id, timeline_kind))),
+            },
+            RoomLinkDestination::Space(space_name_id) => (
+                space_name_id,
+                NavigateToLinkAction::Screen(SelectedRoom::Space { space_name_id: space_name_id.clone() }),
+            ),
+            RoomLinkDestination::Invite(room_name_id) => (
+                room_name_id,
+                NavigateToLinkAction::Screen(SelectedRoom::InvitedRoom { room_name_id: room_name_id.clone() }),
+            ),
+            RoomLinkDestination::NotJoined => {
+                cx.action(NavigationBarAction::GoToAddRoom { search_for: Some(link.url.clone()) });
+                return;
             }
-            true
-        }
-        else {
-            false
-        }
+        };
+        enqueue_rooms_list_update(RoomsListUpdate::ScrollToRoom(room_name_id.room_id().clone()));
+        cx.action(navigation);
     }
 
     /// Handles image clicks in message content by opening the image viewer.
@@ -2733,18 +2747,20 @@ impl RoomScreen {
         let Some(event_tl_item) = tl_state.items.get(item_id).and_then(|item| item.as_event()) else { return };
 
         let timestamp_millis = event_tl_item.timestamp();
-        let (image_name, image_file_size) = get_image_name_and_filesize(event_tl_item);
+        let image_details = get_image_file_details(event_tl_item);
         let downloadable = Some(DownloadableAttachment {
             media_source: media_source.clone(),
-            filename: image_name.clone(),
-            size: (image_file_size > 0).then_some(image_file_size),
+            filename: image_details.name.clone(),
+            size: image_details.size_in_bytes,
             kind: DownloadKind::Image,
         });
         cx.action(ImageViewerAction::Show(LoadState::Loading(
             texture.clone(),
             Some(ImageViewerMetaData {
-                image_name,
-                image_file_size,
+                image_name: image_details.name,
+                image_caption: image_details.caption,
+                image_format: image_details.format,
+                image_file_size: image_details.size_in_bytes,
                 timestamp: unix_time_millis_to_datetime(timestamp_millis),
                 avatar_parameter: Some((
                     tl_state.kind.clone(),
@@ -3421,7 +3437,7 @@ impl RoomScreen {
         let room_id = kind.room_id().clone();
         let owner = self.widget_uid();
 
-        let (mut tl_state, mut is_first_time_being_loaded) = match timeline_state_store::take(cx, &kind, owner) {
+        let (mut tl_state, is_new_tl_state) = match timeline_state_store::take(cx, &kind, owner) {
             timeline_state_store::TakeResult::Taken(existing) => (existing, false),
             timeline_state_store::TakeResult::AlreadyTaken { owner: current_owner } => {
                 error!("RoomScreen::show_timeline(): timeline {kind} is already taken by widget {current_owner:?}");
@@ -3500,6 +3516,7 @@ impl RoomScreen {
                 (tl_state, true)
             }
         };
+        let mut is_first_time_being_loaded = is_new_tl_state;
 
         // It is possible that this room has already been loaded (received from the server)
         // but that the RoomsList doesn't yet know about it.
@@ -3598,7 +3615,9 @@ impl RoomScreen {
         // Kick off a back pagination request if it's the first time loading this room, so the user
         // sees some messages asap. This comes after processing updates in case the rooms list already sent
         // one for this room, since that request's `PaginationCompleted` would make us think ours was done too.
-        if is_first_time_being_loaded
+        //
+        // If it's NOT the first time loading this room, don't paginate, since that'll mess up our indices.
+        if is_new_tl_state
             && let Some(tl) = self.tl_state.as_mut()
             && !tl.backwards_pagination.is_fully_paginated()
             && !tl.backwards_pagination.is_loading()
@@ -4354,6 +4373,14 @@ pub enum TimelineUpdate {
     AttachmentDownloadReset(OwnedMxcUri),
 }
 
+/// An action indicating that the main UI thread can now free the given set
+/// of decoded images from makepad's image cache.
+///
+/// This is typically used for when a timeline has been closed and its
+/// decoded images are no longer needed, so they can be dropped to save memory.
+#[derive(Debug)]
+pub struct DropDecodedImagesAction(pub Vec<PathBuf>);
+
 /// Stores timeline UI state that is not currently owned by a `RoomScreen`.
 mod timeline_state_store {
     use super::*;
@@ -4441,6 +4468,9 @@ mod timeline_state_store {
         TIMELINE_STATES.with_borrow_mut(|states| {
             match states.remove(&kind) {
                 Some(StateEntry::Taken { owner: current_owner, invalidated, was_closed }) if current_owner == owner => {
+                    if invalidated || was_closed {
+                        drop_decoded_images(&state);
+                    }
                     // If it was invalidated and we (the `owner`) was the RoomScreen currently showing it,
                     // just return here to keep it removed from the TIMELINE_STATES.
                     if invalidated {
@@ -4465,9 +4495,13 @@ mod timeline_state_store {
     }
 
     /// Drops the loaded data of the given timeline's docked panes.
+    /// Since its screen was closed, its decoded images get freed too.
     pub(super) fn drop_pane_data(_cx: &mut Cx, kind: &TimelineKind) {
         TIMELINE_STATES.with_borrow_mut(|states| match states.get_mut(kind) {
-            Some(StateEntry::Stored(state)) => state.saved_state.room_panes.iter_mut().for_each(SavedRoomPane::drop_data),
+            Some(StateEntry::Stored(state)) => {
+                state.saved_state.room_panes.iter_mut().for_each(SavedRoomPane::drop_data);
+                drop_decoded_images(state);
+            }
             Some(StateEntry::Taken { was_closed, .. }) => *was_closed = true,
             None => {}
         });
@@ -4479,6 +4513,11 @@ mod timeline_state_store {
     /// during logout or session teardown.
     pub(super) fn clear_all(_cx: &mut Cx) {
         TIMELINE_STATES.with_borrow_mut(|states| {
+            for entry in states.values() {
+                if let StateEntry::Stored(state) = entry {
+                    drop_decoded_images(state);
+                }
+            }
             states.clear();
         });
     }
@@ -4498,7 +4537,9 @@ mod timeline_state_store {
             }
 
             // Otherwise, if it's not being shown, just remove it now.
-            states.remove(kind);
+            if let Some(StateEntry::Stored(state)) = states.remove(kind) {
+                drop_decoded_images(&state);
+            }
         });
     }
 
@@ -4510,16 +4551,28 @@ mod timeline_state_store {
                 if kind.room_id() != room_id {
                     return true;
                 }
-                // Same as `invalidate()`: keep the shown UI state but flag it
-                // such that `put_back()` drops it when the RoomScreen hides it.
-                if let StateEntry::Taken { invalidated, .. } = entry {
-                    *invalidated = true;
-                    true
-                } else {
-                    false
+                match entry {
+                    // Same as `invalidate()`: keep the shown UI state but flag it
+                    // such that `put_back()` drops it when the RoomScreen hides it.
+                    StateEntry::Taken { invalidated, .. } => {
+                        *invalidated = true;
+                        true
+                    }
+                    StateEntry::Stored(state) => {
+                        drop_decoded_images(state);
+                        false
+                    }
                 }
             });
         });
+    }
+
+    /// Frees the decoded images of a timeline that nothing shows anymore.
+    fn drop_decoded_images(state: &TimelineUiState) {
+        let image_keys = state.media_cache.get_image_cache_keys();
+        if !image_keys.is_empty() {
+            Cx::post_action(DropDecodedImagesAction(image_keys));
+        }
     }
 
     /// Returns `true` if the given timeline's state was invalidated while a RoomScreen was still displaying it,
@@ -5048,7 +5101,7 @@ fn populate_message_view(
                         (item, true)
                     } else {
                         // Draw the profile up front here because we need the username for the emote body.
-                        let (username, profile_drawn) = item.avatar(cx, ids!(profile.avatar)).set_avatar_and_get_username(
+                        let (username, profile_drawn) = item.avatar(cx, ids!(header.avatar)).set_avatar_and_get_username(
                             cx,
                             timeline_kind,
                             event_tl_item.sender(),
@@ -5497,11 +5550,11 @@ fn populate_message_view(
         new_drawn_status.profile_drawn = true;
     } else {
         // log!("\t --> populate_message_view(): DRAWING  profile draw for item_id: {item_id}");
-        let mut username_label = item.label(cx, ids!(content.username));
+        let mut username_label = item.label(cx, ids!(header.username));
 
         if !is_server_notice { // the normal case
             let (username, profile_drawn) = set_username_and_get_avatar_retval.unwrap_or_else(||
-                item.avatar(cx, ids!(profile.avatar)).set_avatar_and_get_username(
+                item.avatar(cx, ids!(header.avatar)).set_avatar_and_get_username(
                     cx,
                     timeline_kind,
                     event_tl_item.sender(),
@@ -5522,7 +5575,7 @@ fn populate_message_view(
         }
         else {
             // Server notices are drawn with a red color avatar background and username.
-            let avatar = item.avatar(cx, ids!(profile.avatar));
+            let avatar = item.avatar(cx, ids!(header.avatar));
             avatar.show_text(cx, Some(COLOR_FG_DANGER_RED), None, "⚠");
             username_label.set_text(cx, "Server notice");
             script_apply_eval!(cx, username_label, {
@@ -5628,7 +5681,7 @@ fn populate_text_message_content(
         .and_then(|fb| (fb.format == MessageFormat::Html).then_some(fb))
     {
         let linkified_html = utils::linkify_get_urls(
-            utils::trim_start_html_whitespace(&fb.body),
+            utils::trim_start_html_line_breaks(&fb.body),
             true,
             Some(&mut links),
         );
@@ -5748,125 +5801,151 @@ fn populate_image_message_content(
         }
     }
 
-    let mut fully_drawn = false;
+    let Some(image_info) = image_info_source else {
+        text_or_image_ref.show_text(cx, format!("{body}\n\nImage message had no source URL."));
+        return true;
+    };
 
-    // Fall back to fetching the full-size image instead of a failed thumbnail if it's not too big.
-    const MAX_FULL_IMAGE_SIZE: u64 = 1024 * 1024; // 1MiB
-    let should_fetch_full_size = image_info_source
-        .and_then(|info| info.size)
-        .is_none_or(|size| u64::from(size) <= MAX_FULL_IMAGE_SIZE);
+    // A still thumbnail only shows an animated image's first frame, which is often blank.
+    // Encrypted media can't be thumbnailed, so asking for one downloads the whole original.
+    let mut should_animate = image_info.is_animated.unwrap_or_else(||
+        mimetype.is_some_and(|mime| matches!(mime, "image/gif" | "image/webp" | "image/apng"))
+    );
+    let is_encrypted = matches!(original_source, MediaSource::Encrypted(_));
+    // Use the provided thumbnail URI if it exists; otherwise use the original URI.
+    let get_still_thumbnail_source = || image_info.thumbnail_source.clone().unwrap_or_else(|| original_source.clone());
+    let (mut media_source, requested_format) = if should_animate {
+        (original_source.clone(), ANIMATED_MEDIA_THUMBNAIL_FORMAT.into())
+    } else {
+        (get_still_thumbnail_source(), MEDIA_THUMBNAIL_FORMAT.into())
+    };
+    let mut media_entry = media_cache.try_get_media_or_fetch(&media_source, requested_format);
+    // If the original image can't be found, try its thumbnail, which may have been uploaded separately.
+    if should_animate && matches!(
+        media_entry,
+        (MediaCacheEntry::Failed(StatusCode::NOT_FOUND), MediaFormat::Thumbnail(_))
+    ) {
+        should_animate = false;
+        media_source = get_still_thumbnail_source();
+        media_entry = media_cache.try_get_media_or_fetch(&media_source, MEDIA_THUMBNAIL_FORMAT.into());
+    }
+    // The server can't thumbnail this image (the spec's errors for that), so show the original instead.
+    if matches!(
+        media_entry,
+        (MediaCacheEntry::Failed(StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE | StatusCode::BAD_GATEWAY), MediaFormat::Thumbnail(_))
+    ) {
+        media_entry = media_cache.try_get_media_or_fetch(&media_source, MediaFormat::File);
+    }
 
-    let mut fetch_and_show_media_source = |cx: &mut Cx, media_source: MediaSource, image_info: &ImageInfo| {
-        match media_cache.try_get_media_or_fetch(&media_source, MEDIA_THUMBNAIL_FORMAT.into()) {
-            (MediaCacheEntry::Loaded(data), media_format) => {
-                // Include the file type (full or thumbnail) in the cache key to disambiguate.
-                let variant = if matches!(media_format, MediaFormat::File) { "full" } else { "thumb" };
-                let cache_key = format!("{}#{variant}", media_source_mxc(&media_source));
-                let show_image_result = text_or_image_ref.show_image(cx, Some(media_source), |cx, img| {
-                    utils::load_image_with_cache_key(&img, cx, std::path::Path::new(&cache_key), Arc::clone(&data))
-                        .map(|()| img.size_in_pixels(cx).unwrap_or_default())
+    // The image keeps the original source rather than the thumbnail's,
+    // so that clicking on it opens (or downloads) the original image.
+    // A placeholder texture stays visible until the new image is decoded.
+    let show_loaded_image = |cx: &mut Cx, media_format: MediaFormat, data: Arc<[u8]>, placeholder: Option<Texture>| {
+        let cache_key = get_image_cache_key(media_source_mxc(&media_source), &media_format);
+        let show_image_result = text_or_image_ref.show_image(cx, Some(original_source.clone()), |cx, img| {
+            if placeholder.is_some() {
+                img.set_texture(cx, placeholder);
+            }
+            utils::load_image_with_cache_key(&img, cx, &cache_key, data)
+                .map(|()| img.size_in_pixels(cx).unwrap_or_default())
+        });
+        if let Err(e) = show_image_result {
+            let err_str = format!("{body}\n\nFailed to display image: {e:?}");
+            error!("{err_str}");
+            text_or_image_ref.show_text(cx, &err_str);
+        }
+    };
+
+    match media_entry {
+        // The server sent a non-animated thumbnail, so we show that while fetching
+        // the original image that *can* be animated.
+        (MediaCacheEntry::Loaded(data), MediaFormat::Thumbnail(settings))
+            if should_animate && !is_encrypted && !is_animated_image(&data) =>
+        {
+            match media_cache.try_get_media_or_fetch(&media_source, MediaFormat::File) {
+                (MediaCacheEntry::Loaded(full_data), MediaFormat::File) => {
+                    // Keep showing the thumbnail until the original is full decoded.
+                    let still = text_or_image_ref.is_showing_image_from(&original_source)
+                        .then(|| text_or_image_ref.get_texture(cx))
+                        .flatten();
+                    show_loaded_image(cx, MediaFormat::File, full_data, still);
+                    true
+                }
+                (MediaCacheEntry::Failed(_), _) => {
+                    show_loaded_image(cx, MediaFormat::Thumbnail(settings), data, None);
+                    true
+                }
+                _ => {
+                    show_loaded_image(cx, MediaFormat::Thumbnail(settings), data, None);
+                    false
+                }
+            }
+        }
+        (MediaCacheEntry::Loaded(data), media_format) => {
+            show_loaded_image(cx, media_format, data, None);
+            // We're done drawing the image, so mark it as fully drawn.
+            true
+        }
+        (MediaCacheEntry::Requested, _media_format) => {
+            // If the image is being fetched, we try to show its blurhash.
+            // Only decode the image once, not on every draw while we're wait.
+            if !text_or_image_ref.is_showing_image_from(&original_source)
+                && let (Some(blurhash), Some(width), Some(height)) = (image_info.blurhash.as_deref(), image_info.width, image_info.height)
+            {
+                let show_image_result = text_or_image_ref.show_image(cx, Some(original_source.clone()), |cx, img| {
+                    let (Ok(width), Ok(height)) = (width.try_into(), height.try_into()) else {
+                        return Err(image_cache::ImageError::EmptyData)
+                    };
+                    let (width, height): (u32, u32) = (width, height);
+                    if width == 0 || height == 0 {
+                        warning!("Image had an invalid aspect ratio (width or height of 0).");
+                        return Err(image_cache::ImageError::EmptyData);
+                    }
+                    let aspect_ratio: f32 = width as f32 / height as f32;
+                    // Cap the blurhash to a max size of 500 pixels in each dimension
+                    // because the `blurhash::decode()` function can be rather expensive.
+                    let (mut capped_width, mut capped_height) = (width, height);
+                    if capped_height > BLURHASH_IMAGE_MAX_SIZE {
+                        capped_height = BLURHASH_IMAGE_MAX_SIZE;
+                        capped_width = (capped_height as f32 * aspect_ratio).floor() as u32;
+                    }
+                    if capped_width > BLURHASH_IMAGE_MAX_SIZE {
+                        capped_width = BLURHASH_IMAGE_MAX_SIZE;
+                        capped_height = (capped_width as f32 / aspect_ratio).floor() as u32;
+                    }
+
+                    match blurhash::decode(blurhash, capped_width, capped_height, 1.0) {
+                        Ok(data) => {
+                            ImageBuffer::new(&data, capped_width as usize, capped_height as usize).map(|img_buff| {
+                                let texture = Some(img_buff.into_new_texture(cx));
+                                img.set_texture(cx, texture);
+                                img.size_in_pixels(cx).unwrap_or_default()
+                            })
+                        }
+                        Err(e) => {
+                            error!("Failed to decode blurhash {e:?}");
+                            Err(image_cache::ImageError::EmptyData)
+                        }
+                    }
                 });
                 if let Err(e) = show_image_result {
                     let err_str = format!("{body}\n\nFailed to display image: {e:?}");
                     error!("{err_str}");
                     text_or_image_ref.show_text(cx, &err_str);
                 }
-
-                // We're done drawing the image, so mark it as fully drawn.
-                fully_drawn = true;
             }
-            (MediaCacheEntry::Requested, _media_format) => {
-                // If the image is being fetched, we try to show its blurhash.
-                if let (Some(blurhash), Some(width), Some(height)) = (image_info.blurhash.as_deref(), image_info.width, image_info.height) {
-                    let show_image_result = text_or_image_ref.show_image(cx, Some(media_source), |cx, img| {
-                        let (Ok(width), Ok(height)) = (width.try_into(), height.try_into()) else {
-                            return Err(image_cache::ImageError::EmptyData)
-                        };
-                        let (width, height): (u32, u32) = (width, height);
-                        if width == 0 || height == 0 {
-                            warning!("Image had an invalid aspect ratio (width or height of 0).");
-                            return Err(image_cache::ImageError::EmptyData);
-                        }
-                        let aspect_ratio: f32 = width as f32 / height as f32;
-                        // Cap the blurhash to a max size of 500 pixels in each dimension
-                        // because the `blurhash::decode()` function can be rather expensive.
-                        let (mut capped_width, mut capped_height) = (width, height);
-                        if capped_height > BLURHASH_IMAGE_MAX_SIZE {
-                            capped_height = BLURHASH_IMAGE_MAX_SIZE;
-                            capped_width = (capped_height as f32 * aspect_ratio).floor() as u32;
-                        }
-                        if capped_width > BLURHASH_IMAGE_MAX_SIZE {
-                            capped_width = BLURHASH_IMAGE_MAX_SIZE;
-                            capped_height = (capped_width as f32 / aspect_ratio).floor() as u32;
-                        }
-
-                        match blurhash::decode(blurhash, capped_width, capped_height, 1.0) {
-                            Ok(data) => {
-                                ImageBuffer::new(&data, capped_width as usize, capped_height as usize).map(|img_buff| {
-                                    let texture = Some(img_buff.into_new_texture(cx));
-                                    img.set_texture(cx, texture);
-                                    img.size_in_pixels(cx).unwrap_or_default()
-                                })
-                            }
-                            Err(e) => {
-                                error!("Failed to decode blurhash {e:?}");
-                                Err(image_cache::ImageError::EmptyData)
-                            }
-                        }
-                    });
-                    if let Err(e) = show_image_result {
-                        let err_str = format!("{body}\n\nFailed to display image: {e:?}");
-                        error!("{err_str}");
-                        text_or_image_ref.show_text(cx, &err_str);
-                    }
-                }
-                fully_drawn = false;
-            }
-            (MediaCacheEntry::Failed(status_code), MediaFormat::Thumbnail(_))
-                if should_fetch_full_size && status_code != StatusCode::NOT_FOUND =>
-            {
-                match media_cache.try_get_media_or_fetch(&media_source, MediaFormat::File) {
-                    (MediaCacheEntry::Loaded(data), _) => {
-                        let cache_key = format!("{}#full", media_source_mxc(&media_source));
-                        let res = text_or_image_ref.show_image(cx, Some(media_source.clone()), |cx, img| {
-                            utils::load_image_with_cache_key(&img, cx, std::path::Path::new(&cache_key), Arc::clone(&data))
-                                .map(|()| img.size_in_pixels(cx).unwrap_or_default())
-                        });
-                        if let Err(e) = res {
-                            error!("Failed to display full-size image: {e:?}");
-                        }
-                        fully_drawn = true;
-                    }
-                    (MediaCacheEntry::Requested, _) => fully_drawn = false,
-                    (MediaCacheEntry::Failed(_), _) => fully_drawn = true,
-                }
-            }
-            (MediaCacheEntry::Failed(_status_code), _media_format) => {
-                text_or_image_ref.show_text(
-                    cx,
-                    format!("{body}\n\nFailed to fetch image from {:?}", media_source_mxc(&media_source)),
-                );
-                // For now, we consider this as being "complete". In the future, we could support
-                // retrying to fetch thumbnail of the image on a user click/tap.
-                fully_drawn = true;
-            }
+            false
         }
-    };
-
-    match image_info_source {
-        Some(image_info) => {
-            // Use the provided thumbnail URI if it exists; otherwise use the original URI.
-            let media_source = image_info.thumbnail_source.clone()
-                .unwrap_or(original_source);
-            fetch_and_show_media_source(cx, media_source, image_info);
-        }
-        None => {
-            text_or_image_ref.show_text(cx, format!("{body}\n\nImage message had no source URL."));
-            fully_drawn = true;
+        (MediaCacheEntry::Failed(_status_code), _media_format) => {
+            text_or_image_ref.show_text(
+                cx,
+                format!("{body}\n\nFailed to fetch image from {:?}", media_source_mxc(&media_source)),
+            );
+            // For now, we consider this as being "complete". In the future, we could support
+            // retrying to fetch thumbnail of the image on a user click/tap.
+            true
         }
     }
-
-    fully_drawn
 }
 
 
@@ -6645,6 +6724,59 @@ pub enum InviteResultAction {
 }
 
 
+/// A clicked link to a room, or space, or an event within a room.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoomLink {
+    pub room_or_alias_id: OwnedRoomOrAliasId,
+    pub event_id: Option<OwnedEventId>,
+    /// The full link, which the AddRoom screen can show and search for.
+    pub url: String,
+}
+
+/// The screen that should show the room, space, or event that a [`RoomLink`] points to.
+#[derive(Debug)]
+pub enum RoomLinkDestination {
+    /// A joined room's timeline, which also contains the linked event, if there is one.
+    Timeline {
+        room_name_id: RoomNameId,
+        timeline_kind: TimelineKind,
+    },
+    /// A joined space's lobby.
+    Space(RoomNameId),
+    /// The invite to a room or space.
+    Invite(RoomNameId),
+    /// A room or space that the user hasn't joined, so show it in the AddRoom screen.
+    NotJoined,
+}
+
+/// The result of a [`MatrixRequest::ResolveRoomLink`] request.
+///
+/// This is NOT a widget action.
+#[derive(Debug)]
+pub struct RoomLinkResolved {
+    pub link: RoomLink,
+    /// The resolved link's destination, or an error message if it couldn't be resolved.
+    pub result: Result<RoomLinkDestination, String>,
+}
+
+/// A request to show the room, space, or event that a clicked link leads to.
+///
+/// This is NOT a widget action, and is handled by `MainDesktopUI` or the mobile `HomeScreen`.
+#[derive(Debug)]
+pub enum NavigateToLinkAction {
+    /// Show the given room, space, thread, or invite screen.
+    Screen(SelectedRoom),
+    /// Show the given timeline, and then jump to the given event in it.
+    Event {
+        room_name_id: RoomNameId,
+        timeline_kind: TimelineKind,
+        event_id: OwnedEventId,
+        /// How to describe this event to the user while searching for it.
+        description: String,
+    },
+}
+
+
 /// Actions related to a specific message within a room timeline.
 #[derive(Clone, Default, Debug)]
 pub enum MessageAction {
@@ -6956,7 +7088,9 @@ impl Widget for Message {
 
                 match action.as_widget_action().widget_uid_eq(room_screen_widget_uid).cast_ref() {
                     MessageAction::HighlightMessage(id) if id == &self.details.as_ref().unwrap().item_id => { // guaranteed to be Some()
-                        self.animator_play(cx, ids!(highlight.on));
+                        // Always start the highlight animation sequence from the beginning.
+                        self.animator_cut(cx, ids!(highlight.off)); // stop it first
+                        self.animator_play(cx, ids!(highlight.on)); // then start it over
                         self.redraw(cx);
                         continue;
                     }
@@ -7014,10 +7148,14 @@ impl Widget for Message {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        if self.animator.is_animating() {
+            self.animator.next_frame = cx.new_next_frame();
+        }
         if self.details.as_ref().is_some_and(|d| d.should_be_highlighted) {
             script_apply_eval!(cx, self, {
                 draw_bg +: {
                     color: #ffffd1,
+                    color_hover: #xfff9c2,
                     mentions_bar_color: #ffd54f
                 }
             });
@@ -7104,6 +7242,7 @@ impl Message {
             self.is_context_menu_open = false;
             self.pressed_touch_uid = None;
             self.animator_cut(cx, ids!(bg_hover.off));
+            self.animator_cut(cx, ids!(highlight.off));
         }
 
         self.details = Some(details);

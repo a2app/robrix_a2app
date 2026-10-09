@@ -63,7 +63,7 @@ script_mod! {
         width: Fill,
         height: Fit,
         margin: Inset{top: 4.0}
-        padding: Inset{ left: 82.0, top: 2.0, bottom: 2.0 }
+        padding: Inset{ left: 63.0, top: 2.0, bottom: 2.0 }
         cursor: MouseCursor.Hand
 
         show_bg: true
@@ -71,9 +71,20 @@ script_mod! {
             hover: instance(0.0)
             color: instance((COLOR_PRIMARY))
             color_hover: instance(COLOR_LIST_ITEM_BG_HOVER)
+            border_radius: uniform(4.0)
+            border_inset: uniform(vec4(4.0, 0.0, 4.0, 0.0))
 
             pixel: fn() {
-                return Pal.premul(mix(self.color, self.color_hover, self.hover))
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(
+                    self.border_inset.x,
+                    self.border_inset.y,
+                    self.rect_size.x - (self.border_inset.x + self.border_inset.z),
+                    self.rect_size.y - (self.border_inset.y + self.border_inset.w),
+                    self.border_radius
+                )
+                sdf.fill(mix(self.color, self.color_hover, self.hover))
+                return sdf.result
             }
         }
 
@@ -111,9 +122,20 @@ script_mod! {
         draw_bg +: {
             highlight: instance(0.0)
             color_highlight: instance(#c5d6fa)
+            border_radius: uniform(4.0)
+            border_inset: uniform(vec4(4.0, 0.0, 4.0, 0.0))
 
             pixel: fn() {
-                return Pal.premul(vec4(self.color_highlight.xyz, self.color_highlight.w * self.highlight))
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(
+                    self.border_inset.x,
+                    self.border_inset.y,
+                    self.rect_size.x - (self.border_inset.x + self.border_inset.z),
+                    self.rect_size.y - (self.border_inset.y + self.border_inset.w),
+                    self.border_radius
+                )
+                sdf.fill(vec4(self.color_highlight.xyz, self.color_highlight.w * self.highlight))
+                return sdf.result
             }
         }
 
@@ -122,8 +144,8 @@ script_mod! {
                 default: @off
                 off: AnimatorState{
                     redraw: true,
-                    from: { all: Forward {duration: 2.0} }
-                    ease: ExpDecay {d1: 0.80, d2: 0.97}
+                    from: { all: Forward {duration: 4.5} }
+                    ease: InQuart
                     apply: { draw_bg: {highlight: 0.0} }
                 }
                 on: AnimatorState{
@@ -139,16 +161,16 @@ script_mod! {
             width: Fill,
             height: Fit
             flow: Right,
-            padding: Inset{ left: 7.0, top: 3.0, bottom: 3.0, right: 10.0 }
+            padding: Inset{ left: 8.0, top: 3.0, bottom: 3.0, right: 10.0 }
             spacing: 5.0
 
             left_container := View {
                 align: Align{x: 0.5, y: 0}
-                width: 70.0,
+                width: 50.0,
                 height: Fit
 
                 timestamp := Timestamp {
-                    margin: Inset{top: 3}
+                    margin: Inset{top: 3.13} // puts its baseline on the state text's baseline
                 }
             }
 
@@ -237,9 +259,20 @@ script_mod! {
             hover: instance(0.0)
             color: instance((COLOR_PRIMARY))
             color_hover: instance(COLOR_LIST_ITEM_BG_HOVER)
+            border_radius: uniform(4.0)
+            border_inset: uniform(vec4(4.0, 0.0, 4.0, 0.0))
 
             pixel: fn() {
-                return Pal.premul(mix(self.color, self.color_hover, self.hover))
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(
+                    self.border_inset.x,
+                    self.border_inset.y,
+                    self.rect_size.x - (self.border_inset.x + self.border_inset.z),
+                    self.rect_size.y - (self.border_inset.y + self.border_inset.w),
+                    self.border_radius
+                )
+                sdf.fill(mix(self.color, self.color_hover, self.hover))
+                return sdf.result
             }
         }
 
@@ -263,7 +296,7 @@ script_mod! {
             width: Fill,
             height: Fit
             // Align it with the avatar/content column (left padding that's the same width as a timestamp).
-            padding: Inset{ left: 82.0, top: 1.0, bottom: 1.0 }
+            padding: Inset{ left: 63.0, top: 1.0, bottom: 1.0 }
 
             toggle := mod.widgets.GroupToggle {}
         }
@@ -273,16 +306,16 @@ script_mod! {
             width: Fill,
             height: Fit
             flow: Right,
-            padding: Inset{ left: 7.0, top: 2.0, bottom: 2.0, right: 10.0 }
+            padding: Inset{ left: 8.0, top: 2.0, bottom: 2.0, right: 10.0 }
             spacing: 5.0
 
             left_container := View {
                 align: Align{x: 0.5, y: 0}
-                width: 70.0,
+                width: 50.0,
                 height: Fit
 
                 timestamp := Timestamp {
-                    margin: Inset{top: 3}
+                    margin: Inset{top: 3.13} // puts its baseline on the state text's baseline
                 }
             }
 
@@ -1272,6 +1305,10 @@ impl Widget for SmallStateEvent {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        // Resume a highlight that got stuck mid-way while its RoomScreen was hidden (see `Message::draw_walk`).
+        if self.animator.is_animating() {
+            self.animator.next_frame = cx.new_next_frame();
+        }
         self.view.draw_walk(cx, scope, walk)
     }
 }
@@ -1287,6 +1324,7 @@ impl SmallStateEventRef {
     /// Flashes this event's highlight, like a message's after a jump to it.
     pub fn highlight(&self, cx: &mut Cx) {
         if let Some(mut inner) = self.borrow_mut() {
+            inner.animator_cut(cx, ids!(highlight.off));
             inner.animator_play(cx, ids!(highlight.on));
             inner.redraw(cx);
         }

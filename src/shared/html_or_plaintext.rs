@@ -2,7 +2,7 @@
 
 
 use makepad_widgets::*;
-use matrix_sdk::{ruma::{matrix_uri::MatrixId, MatrixToUri, MatrixUri, RoomOrAliasId}, OwnedServerName};
+use matrix_sdk::{ruma::{matrix_uri::MatrixId, RoomOrAliasId}, OwnedServerName};
 
 use crate::{avatar_cache::{self, AvatarCacheEntry}, profile::user_profile_cache, room_preview_cache::{self, CachedRoomPreview}, sliding_sync::current_user_id, utils};
 
@@ -133,8 +133,9 @@ script_mod! {
         draw_block +: {
             line_color: (MESSAGE_TEXT_COLOR)
             sep_color: (MESSAGE_TEXT_COLOR)
-            code_color: (#EDEDED)
-            quote_bg_color: (#EDEDED)
+            // #EDEDED atop white, but translucent so it also stands out on a hovered or highlighted message.
+            code_color: (#x00000012)
+            quote_bg_color: (#x00000012)
             quote_fg_color: (MESSAGE_TEXT_COLOR)
         }
 
@@ -145,14 +146,14 @@ script_mod! {
 
         list_item_layout: Layout{ flow: Flow.Right{wrap: true, row_align: RowAlign.Baseline}, padding: Inset{left: 5.0, top: 1.0, bottom: 1.0}, }
         list_item_marker_pad: 8.0
-        list_item_walk: Walk{ margin: Inset{ left: 0, right: 0, top: 1, bottom: 3 } }
+        list_item_walk: Walk{ margin: Inset{ left: 0, right: 0, top: 1, bottom: 7 } }
         table_row_layout: Layout{ flow: Flow.Right{row_align: RowAlign.Center} }
         table_cell_layout: Layout{ flow: Flow.Right{wrap: true, row_align: RowAlign.Baseline}, padding: Inset{left: 6, right: 6, top: 4, bottom: 4} }
         code_layout: Layout{ flow: Flow.Right{wrap: true, row_align: RowAlign.Baseline}, padding: Inset{top: 15.0, bottom: 15.0, left: 15, right: 5 } }
         code_walk: Walk{ margin: Inset{ top: 10, bottom: 10, left: 0, right: 0 } }
 
         heading_margin: Inset{ top: 1.0, bottom: 0.1 }
-        paragraph_margin: Inset{ top: 0.33, bottom: 0.33 }
+        paragraph_margin: Inset{ top: 1.8, bottom: 1.8 }
 
         inline_code_padding: Inset{top: 2.5, bottom: 1.5, left: 5, right: 5 }
         inline_code_margin: Inset{ left: 0, right: 0, bottom: 2, top: 2 }
@@ -187,6 +188,8 @@ script_mod! {
                 flow: Flow.Right{wrap: true},
                 padding: 0,
                 draw_text +: {
+                    // Keeps plaintext on the same baseline as Html, which doesn't ink-center its text.
+                    ink_centered: false
                     color: (MESSAGE_TEXT_COLOR),
                     text_style: mod.widgets.MESSAGE_TEXT_STYLE { font_size: (MESSAGE_FONT_SIZE) },
                 }
@@ -209,6 +212,8 @@ script_mod! {
                     font_size: 9.3
                     max_lines: 2
                     text_overflow: Ellipsis
+                    // A two-line preview keeps its paragraphs close together.
+                    paragraph_margin: Inset{ top: 0.33, bottom: 0.33 }
                     text_style_normal +: { font_size: 9.3, line_spacing: 1.32 }
                     text_style_italic +: { font_size: 9.3, line_spacing: 1.32 }
                     text_style_bold +: { font_size: 9.3, line_spacing: 1.32 }
@@ -291,13 +296,8 @@ impl ScriptHook for RobrixHtmlLink {
             }
         }
 
-        (self.matrix_id, self.via) = if let Ok(uri) = MatrixToUri::parse(&self.url) {
-            (Some(uri.id().to_owned()), uri.via().to_vec())
-        } else if let Ok(uri) = MatrixUri::parse(&self.url) {
-            (Some(uri.id().to_owned()), uri.via().to_vec())
-        } else {
-            (None, Vec::new())
-        };
+        (self.matrix_id, self.via) = utils::parse_matrix_link(&self.url)
+            .map_or((None, Vec::new()), |(matrix_id, via)| (Some(matrix_id), via));
     }
 }
 
@@ -560,7 +560,11 @@ impl MatrixLinkPill {
                 };
                 // For @room mentions, show "@room" as the title, not the room name.
                 let display_name = if is_room_mention { "@room" } else { resolved_name.as_str() };
-                self.label(cx, ids!(title)).set_text(cx, display_name);
+                if matches!(matrix_id, MatrixId::Event(..)) {
+                    self.label(cx, ids!(title)).set_text(cx, &format!("{display_name} → 💬"));
+                } else {
+                    self.label(cx, ids!(title)).set_text(cx, display_name);
+                }
                 let avatar_final = self.populate_avatar(cx, &room_avatar, display_name);
                 self.is_waiting_for_data = !avatar_final;
                 return;
@@ -568,17 +572,21 @@ impl MatrixLinkPill {
         }
         // While waiting for the async request to complete, show "@room" or the room ID/alias.
         let fallback_name = if is_room_mention {
-            "@room".to_owned()
+            "@room"
         } else {
             match matrix_id {
-                MatrixId::Room(room_id) => room_id.as_str().to_owned(),
-                MatrixId::RoomAlias(alias) => alias.as_str().to_owned(),
-                MatrixId::Event(room_or_alias, _) => format!("Message in {}", room_or_alias.as_str()),
-                _ => String::new(),
+                MatrixId::Room(room_id) => room_id.as_str(),
+                MatrixId::RoomAlias(alias) => alias.as_str(),
+                MatrixId::Event(room_or_alias, _) => room_or_alias.as_str(),
+                _ => "",
             }
         };
-        self.set_text(cx, &fallback_name);
-        self.populate_avatar(cx, &AvatarState::Unknown, &fallback_name);
+        if matches!(matrix_id, MatrixId::Event(..)) {
+            self.set_text(cx, &format!("{fallback_name} → 💬"));
+        } else {
+            self.set_text(cx, fallback_name);
+        }
+        self.populate_avatar(cx, &AvatarState::Unknown, fallback_name);
         self.is_waiting_for_data = true;
     }
 

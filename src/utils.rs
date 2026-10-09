@@ -5,7 +5,7 @@ use url::Url;
 use unicode_segmentation::UnicodeSegmentation;
 use chrono::{DateTime, Duration, Local, TimeZone};
 use makepad_widgets::{error, log, Align, Cx, DrawText, Event, ImageRef, image_cache::{looks_like_svg, ImageError}};
-use matrix_sdk::{media::{MediaFormat, MediaThumbnailSettings}, ruma::{api::client::media::get_content_thumbnail::v3::Method, MilliSecondsSinceUnixEpoch, OwnedRoomAliasId, OwnedRoomId, RoomId}, RoomDisplayName};
+use matrix_sdk::{media::{MediaFormat, MediaThumbnailSettings}, ruma::{api::client::media::get_content_thumbnail::v3::Method, matrix_uri::MatrixId, MatrixToUri, MatrixUri, MilliSecondsSinceUnixEpoch, OwnedRoomAliasId, OwnedRoomId, OwnedServerName, RoomId}, RoomDisplayName};
 use matrix_sdk_ui::timeline::{EventTimelineItem, PaginationError, TimelineDetails};
 
 use crate::{
@@ -28,6 +28,14 @@ pub fn open_url(url: &str) {
             Some(6.0),
         );
     }
+}
+
+/// Parses a `https://matrix.to/#/...` or `matrix:` link into its Matrix ID and `via` servers.
+pub fn parse_matrix_link(url: &str) -> Option<(MatrixId, Vec<OwnedServerName>)> {
+    MatrixToUri::parse(url)
+        .map(|uri| (uri.id().clone(), uri.via().to_owned()))
+        .or_else(|_| MatrixUri::parse(url).map(|uri| (uri.id().clone(), uri.via().to_owned())))
+        .ok()
 }
 
 
@@ -108,6 +116,7 @@ pub fn is_supported_image_mimetype(mimetype: &str) -> bool {
     matches!(
         mimetype,
         "image/png"
+            | "image/apng"
             | "image/jpeg"
             | "image/jpg"
             | "image/gif"
@@ -665,7 +674,7 @@ pub fn stringify_pagination_error(
 /// - **Less than 60 seconds ago**: Returns `"Just now"`.
 /// - **Less than 60 minutes ago**: Returns `"X min(s) ago"`, where X is the number of minutes.
 /// - **Same day**: Returns `"HH:MM"` (current time format for today).
-/// - **Yesterday**: Returns `"Yesterday at HH:MM"` for messages from the previous day.
+/// - **Yesterday**: Returns `"Yesterday` for messages from the previous day.
 /// - **2 to 6 days ago**: Returns the name of the day (e.g., "Tuesday").
 /// - **Older**: Returns `"YYYY-MM-DD"` as the absolute date.
 ///
@@ -677,7 +686,7 @@ pub fn relative_format(millis: MilliSecondsSinceUnixEpoch) -> Option<Cow<'static
 }
 
 /// Formats the given `datetime` relative to the given `now`; see [`relative_format()`].
-fn relative_format_at(datetime: DateTime<Local>, now: DateTime<Local>) -> Cow<'static, str> {
+pub fn relative_format_at(datetime: DateTime<Local>, now: DateTime<Local>) -> Cow<'static, str> {
     let duration = now - datetime;
     if duration < Duration::seconds(60) {
         "Just now".into()
@@ -692,7 +701,7 @@ fn relative_format_at(datetime: DateTime<Local>, now: DateTime<Local>) -> Cow<'s
         // We count calendar days, since a day isn't always 24 hours long (e.g., upon a DST change).
         match (now.date_naive() - datetime.date_naive()).num_days() {
             0 => datetime.format("%H:%M").to_string().into(),
-            1 => format!("Yesterday at {}", datetime.format("%H:%M")).into(),
+            1 => "Yesterday".into(),
             // A week ago is shown as a date, else it'd have the same day name as today.
             2..=6 => datetime.format("%A").to_string().into(),
             _ => datetime.format("%F").to_string().into(),
@@ -800,22 +809,42 @@ pub const AVATAR_THUMBNAIL_FORMAT: MediaFormatConst = MediaFormatConst::Thumbnai
     }
 );
 
+/// The thumbnail settings to use for regular media images.
+const MEDIA_THUMBNAIL_SETTINGS: MediaThumbnailSettingsConst = MediaThumbnailSettingsConst {
+    method: Method::Scale,
+    width: 400,
+    height: 400,
+    animated: false,
+};
+
 /// The thumbnail format to use for regular media images.
-pub const MEDIA_THUMBNAIL_FORMAT: MediaFormatConst = MediaFormatConst::Thumbnail(
-    MediaThumbnailSettingsConst {
-        method: Method::Scale,
-        width: 400,
-        height: 400,
-        animated: false,
-    }
+pub const MEDIA_THUMBNAIL_FORMAT: MediaFormatConst = MediaFormatConst::Thumbnail(MEDIA_THUMBNAIL_SETTINGS);
+
+/// The thumbnail format to use for media images that may be animated, e.g., GIFs.
+pub const ANIMATED_MEDIA_THUMBNAIL_FORMAT: MediaFormatConst = MediaFormatConst::Thumbnail(
+    MediaThumbnailSettingsConst { animated: true, ..MEDIA_THUMBNAIL_SETTINGS }
 );
 
 /// Removes leading whitespace and HTML whitespace tags (`<p>` and `<br>`) from the given `text`.
 pub fn trim_start_html_whitespace(mut text: &str) -> &str {
     let mut prev_text_len = text.len();
     loop {
+        text = trim_start_html_line_breaks(text).trim_start_matches("<p>");
+
+        if text.len() == prev_text_len {
+            break;
+        }
+        prev_text_len = text.len();
+    }
+    text
+}
+
+/// Removes leading whitespace and `<br>` tags from the given `text`, but keeps a leading `<p>`
+/// so that the first paragraph still gets its bottom margin.
+pub fn trim_start_html_line_breaks(mut text: &str) -> &str {
+    let mut prev_text_len = text.len();
+    loop {
         text = text
-            .trim_start_matches("<p>")
             .trim_start_matches("<br>")
             .trim_start_matches("<br/>")
             .trim_start_matches("<br />")
@@ -1370,7 +1399,7 @@ mod tests_relative_format {
         // 2026-09-23 is a Wednesday.
         let now = local("2026-09-23 00:30");
         assert_eq!(relative_format_at(local("2026-09-23 00:00"), now), "30 mins ago");
-        assert_eq!(relative_format_at(local("2026-09-22 23:00"), now), "Yesterday at 23:00");
+        assert_eq!(relative_format_at(local("2026-09-22 23:00"), now), "Yesterday");
         assert_eq!(relative_format_at(local("2026-09-21 23:00"), now), "Monday");
 
         let now = local("2026-09-23 10:00");
