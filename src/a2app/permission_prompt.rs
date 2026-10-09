@@ -188,8 +188,20 @@ script_mod! {
                         }
                         group_choices := FlatList {
                             width: Fill, height: Fit, flow: Down
+                            padding: Inset{left: (PERMISSION_TEXT_INSET), right: (PERMISSION_TEXT_INSET)}
                             scroll_bars: ScrollBars { show_scroll_x: false, show_scroll_y: false }
-                            Request := RobrixSettingsCheckBox {}
+                            Request := RobrixSettingsCheckBox {
+                                align: Align{x: 0.0, y: 0.0}
+                                label_align: Align{x: 0.0, y: 0.0}
+                                draw_bg +: {
+                                    // Reuse the checkbox material with its mark centered on
+                                    // the first line's 40px row, even when the label wraps.
+                                    fragment: fn() {
+                                        self.pos.y = self.pos.y + 0.5 - 20.0 / self.rect_size.y
+                                        self.fb0 = depth_clip(self.world, self.pixel(), self.depth_clip)
+                                    }
+                                }
+                            }
                         }
                     }
                     mod.widgets.PermissionPromptTextBlock {
