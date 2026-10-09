@@ -15,7 +15,8 @@ pub(crate) fn context_matches_subject(context: &ContextId, account: &str, subjec
 }
 
 pub(crate) fn sharing_matches_subject(grant: &SharingGrant, account: &str, subject: &str, include_shared: bool) -> bool {
-    if !matches!(&grant.source, Source::Account { account: owner } | Source::Room { account: owner, .. } if owner == account) { return false; }
+    if !matches!(&grant.source, Source::Account { account: owner } | Source::Room { account: owner, .. }
+        | Source::RoomDirectory { account: owner } if owner == account) { return false; }
     match &grant.reader {
         ReaderScope::AllReaders => include_shared,
         ReaderScope::App { account: owner, app } => owner == account && app == subject,
@@ -197,6 +198,21 @@ mod tests {
         grant.reader = ReaderScope::App { account: "a".into(), app: "search".into() };
         assert!(sharing_matches_subject(&grant, "a", "search", false));
         assert!(!sharing_matches_subject(&grant, "a", "other", false));
+    }
+
+    #[test]
+    fn directory_sharing_is_visible_and_resettable_only_for_its_account_and_agent() {
+        let context = ContextId::Agent { account: "alice".into(), room: "!ai:test".into() };
+        let subject = a2app_core::permissions::agent_subject("!ai:test");
+        let grant = SharingGrant {
+            id: 7, source: Source::RoomDirectory { account: "alice".into() },
+            recipient: flow::Recipient::ModelProvider("provider".into()),
+            reader: ReaderScope::Context(context), duration: flow::SharingDuration::Permanent,
+        };
+        assert!(sharing_matches_subject(&grant, "alice", &subject, true), "Saved approvals must display directory rules");
+        assert!(sharing_matches_subject(&grant, "alice", &subject, false), "subject reset must revoke its directory rules");
+        assert!(!sharing_matches_subject(&grant, "bob", &subject, true));
+        assert!(!sharing_matches_subject(&grant, "alice", &a2app_core::permissions::agent_subject("!other:test"), true));
     }
 
     #[test]

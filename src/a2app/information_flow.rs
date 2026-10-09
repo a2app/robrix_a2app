@@ -47,12 +47,11 @@ pub fn begin_agent_session(room: &str) -> Result<ContextId, String> {
     Ok(context)
 }
 
-/// Appends the re-ask instruction to a flow refusal caused by a grown label.
-/// The agent must not retry the same call: it asks again with the newly
-/// revealed need so the user can approve it for the rest of the turn.
+/// Appends task-permission guidance to a missing sharing permission without
+/// assuming whether the source was already held or newly read.
 pub fn with_task_reask_hint(error: String) -> String {
-    if error.contains("Information flow blocked") {
-        format!("{error} This refusal is because the label grew since the last permission request. Call request_task_permissions again with the new need (the room, URL or mini-app tool this task now requires); a need already declined this turn must not be requested again.")
+    if error.contains("Information flow blocked") || error == "Your permission is needed before this data can be sent." {
+        format!("{error} Call request_task_permissions with any additional room, URL or mini-app tool this task needs so its sharing rules can be reviewed; a need already declined this turn must not be requested again.")
     } else {
         error
     }
@@ -441,11 +440,12 @@ mod tests {
     }
 
     #[test]
-    fn a_flow_refusal_tells_the_agent_to_re_ask_for_the_new_need() {
-        let refusal = String::from("Information flow blocked: this context has private data that is not allowed to reach this recipient. Review the blocked flow in Mini Apps.");
+    fn a_flow_refusal_tells_the_agent_how_to_request_missing_sharing() {
+        let refusal = String::from("Your permission is needed before this data can be sent.");
         let hint = with_task_reask_hint(refusal);
         assert!(hint.contains("request_task_permissions"));
-        assert!(hint.contains("label grew"));
+        assert!(hint.contains("sharing rules can be reviewed"));
+        assert!(!hint.contains("label grew"));
         // An unresolvable unknown-source refusal must not send the agent in a
         // re-ask loop: no sharing rule can ever release it.
         let unknown = String::from("Stored data with unknown sources cannot be shared.");

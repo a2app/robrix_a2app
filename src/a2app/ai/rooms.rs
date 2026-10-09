@@ -73,7 +73,12 @@ pub enum AiRoomRequest {
     CheckMarker { room_id: OwnedRoomId },
     /// Persists the last-forwarded event id, best-effort: a failure here
     /// just means a restart re-forwards a few already-answered messages.
-    SaveCursor { room_id: OwnedRoomId, cursor: OwnedEventId, flow_epoch: u64, flow_context: ContextId },
+    SaveCursor { room_id: OwnedRoomId, cursor: OwnedEventId, write_id: u64, flow_epoch: u64, flow_context: ContextId },
+    /// Explicit host cancellation records which member events it discarded.
+    /// Only the host's abort path creates this fixed metadata request: the
+    /// room and event IDs come from its timeline queue, and no accumulated
+    /// agent content or context is transmitted after that agent is retired.
+    SaveCancellationCursor { account: String, room_id: OwnedRoomId, cursor: OwnedEventId, write_id: u64 },
     /// Writes one agent turn (a completed reply, or a `send_message` tool
     /// call) as an `ai_reply` state event. `answer_id` is set when a tool
     /// call is parked on the write: the room may refuse it (too little state
@@ -82,6 +87,8 @@ pub enum AiRoomRequest {
         room_id: OwnedRoomId,
         content: AiReplyContent,
         answer_id: Option<u64>,
+        /// Matches this write's completion even when later turns also reply.
+        write_id: u64,
         flow_epoch: u64, flow_context: ContextId,
     },
     /// Posts one agent turn into ANOTHER joined room as an `m.notice`
@@ -136,6 +143,7 @@ pub enum AiRoomAction {
     PostReplyResult {
         room_id: OwnedRoomId,
         answer_id: Option<u64>,
+        write_id: u64,
         result: Result<(), String>,
     },
     /// A granted [`AiRoomRequest::PostToRoom`] finished; `result` is the text
@@ -211,7 +219,8 @@ pub async fn handle_ai_room_request(request: AiRoomRequest) {
         | AiRoomRequest::PostToRoom { flow_context, flow_epoch, .. }
         | AiRoomRequest::PostAiStateEvent { flow_context, flow_epoch, .. }
         | AiRoomRequest::ToolRead { flow_context, flow_epoch, .. } => Some((flow_context.clone(), *flow_epoch)),
-        AiRoomRequest::Create { .. } | AiRoomRequest::Mark { .. } | AiRoomRequest::CheckMarker { .. } => None,
+        AiRoomRequest::Create { .. } | AiRoomRequest::Mark { .. } | AiRoomRequest::CheckMarker { .. }
+        | AiRoomRequest::SaveCancellationCursor { .. } => None,
     };
     if let Some((context, epoch)) = activation {
         policy::with_flow_activation(context, epoch, handle_ai_room_request_inner(request)).await;
@@ -251,29 +260,46 @@ async fn handle_ai_room_request_inner(request: AiRoomRequest) {
                 Cx::post_action(action);
             }
         }
-        AiRoomRequest::SaveCursor { room_id, cursor, flow_context, .. } => {
+        AiRoomRequest::SaveCursor { room_id, cursor, write_id, flow_context, .. } => {
             let Some(room) = get_client().and_then(|c| c.get_room(&room_id)) else {
                 log!("AI Rooms worker: can't save cursor for {room_id}: room not found in client.");
                 return;
             };
-            if let Err(e) = save_cursor(&room, &cursor, &flow_context).await {
+            if let Err(e) = ordered_cursor_write(flow_context.account(), &room_id, write_id,
+                save_cursor(&room, &cursor, &flow_context)).await
+            {
                 warning!("Failed to save AI session cursor for room {room_id}: {e}");
             } else {
                 log!("AI Rooms worker: saved forwarding cursor {cursor} for {room_id}.");
             }
         }
-        AiRoomRequest::PostReply { room_id, content, answer_id, flow_context, .. } => {
+        AiRoomRequest::SaveCancellationCursor { account, room_id, cursor, write_id } => {
+            let Some(client) = get_client() else { return };
+            let Some(room) = client.get_room(&room_id) else { return };
+            let write = async {
+                let current = crate::sliding_sync::current_user_id();
+                ensure_host_cursor_access(&account, current.as_deref().map(|user| user.as_str()), &room_id)?;
+                if room.client().user_id().map(|user| user.as_str()) != Some(account.as_str()) {
+                    return Err("The cursor's account is no longer active.".into());
+                }
+                write_cursor_account_data(&room, &cursor).await
+            };
+            if let Err(error) = ordered_cursor_write(&account, &room_id, write_id, write).await {
+                warning!("Failed to save canceled member-message cursor for {room_id}: {error}");
+            }
+        }
+        AiRoomRequest::PostReply { room_id, content, answer_id, write_id, flow_context, .. } => {
             let Some(room) = get_client().and_then(|c| c.get_room(&room_id)) else {
                 let msg = format!("room {room_id} not found in client");
                 log!("AI Rooms worker: can't post ai_reply to {room_id}: {msg}");
-                Cx::post_action(AiRoomAction::PostReplyResult { room_id, answer_id, result: Err(msg) });
+                Cx::post_action(AiRoomAction::PostReplyResult { room_id, answer_id, write_id, result: Err(msg) });
                 return;
             };
             let result = post_reply(&room, &content, &flow_context).await;
             if let Err(e) = &result {
                 log!("AI Rooms worker: FAILED to post ai_reply to {room_id}: {e}");
             }
-            Cx::post_action(AiRoomAction::PostReplyResult { room_id, answer_id, result });
+            Cx::post_action(AiRoomAction::PostReplyResult { room_id, answer_id, write_id, result });
         }
         AiRoomRequest::PostToRoom { id, target, content, flow_context, .. } => {
             let Some(room) = get_client().and_then(|c| c.get_room(&target)) else {
@@ -316,25 +342,9 @@ async fn handle_ai_room_request_inner(request: AiRoomRequest) {
         }
         AiRoomRequest::ToolRead { id, room_id, tool, authorization, flow_context, .. } => {
             let read = async {
-                policy::ensure_live_activation()?;
-                crate::a2app::information_flow::current_context(&flow_context)?;
-                let target = match &tool {
-                    ReadToolKind::OtherRoom { room, .. } => Some(room.as_str()),
-                    ReadToolKind::SpaceInfo { space } | ReadToolKind::SpaceRooms { space } => Some(space.as_str()),
-                    ReadToolKind::ListRooms | ReadToolKind::ListSpaces => None,
-                    _ => Some(room_id.as_str()),
-                };
-                if let Some(target) = target {
-                    policy::ensure_room_flow_output(&flow_context, target)?;
-                    policy::ensure_room_access(target, RoomAccess::Read)?;
-                }
+                ensure_tool_read_access(&room_id, &tool, &flow_context, authorization.as_ref())?;
                 let result = read_tool(&room_id, tool.clone(), &flow_context).await?;
-                policy::ensure_live_activation()?;
-                crate::a2app::information_flow::current_context(&flow_context)?;
-                if let Some(target) = target {
-                    policy::ensure_room_flow_output(&flow_context, target)?;
-                    policy::ensure_room_access(target, RoomAccess::Read)?;
-                }
+                ensure_tool_read_access(&room_id, &tool, &flow_context, authorization.as_ref())?;
                 policy::filter_current_read_result(&result)
             };
             let result = match &authorization {
@@ -358,6 +368,36 @@ async fn handle_ai_room_request_inner(request: AiRoomRequest) {
             Cx::post_action(AiRoomAction::ToolReadResult { id, result, authorization });
         }
     }
+}
+
+/// Rechecks activation and current consent before fetching and delivery.
+/// Directory metadata is not output to its listed rooms or spaces; remote
+/// query parameters still check sharing at the homeserver SDK boundary.
+fn ensure_tool_read_access(
+    room_id: &OwnedRoomId,
+    tool: &ReadToolKind,
+    context: &ContextId,
+    authorization: Option<&policy::MatrixAuthorization>,
+) -> Result<(), String> {
+    policy::ensure_live_activation()?;
+    crate::a2app::information_flow::current_context(context)?;
+    if let Some(authorization) = authorization {
+        authorization.check_current_permission()?;
+    } else if tool.capability().is_some() {
+        return Err("Missing host authorization for this AI read.".into());
+    }
+    let target = match tool {
+        ReadToolKind::OtherRoom { room, .. } => Some(room.as_str()),
+        ReadToolKind::SpaceInfo { space } => Some(space.as_str()),
+        // Child-scoped hierarchy consent does not grant its root. The query
+        // authorization checks root denials and the service filters each child.
+        ReadToolKind::ListRooms | ReadToolKind::ListSpaces | ReadToolKind::SpaceRooms { .. } => None,
+        _ => Some(room_id.as_str()),
+    };
+    if let Some(target) = target {
+        policy::ensure_room_access(target, RoomAccess::Read)?;
+    }
+    Ok(())
 }
 
 /// Runs one granted attached-room read against the same matrix machinery the
@@ -471,7 +511,7 @@ async fn room_memory(room_id: &OwnedRoomId, limit: u32, flow_context: &ContextId
         let mut from: Option<String> = None;
         for _ in 0..4 {
             policy::ensure_room_access(room_id.as_str(), RoomAccess::Read)?;
-            policy::ensure_room_flow_output(flow_context, room_id.as_str())?;
+            policy::ensure_flow_output(flow_context, &flow::Recipient::network_origin(client.homeserver().as_str())?)?;
             let mut options = MessagesOptions::backward();
             options.limit = 50u32.into();
             options.from = from;
@@ -689,7 +729,7 @@ async fn read_marker_from_server(room: &Room) -> Result<Option<AiRoomMarkerConte
     );
     match room.client().send(request).await {
         Ok(response) => {
-            // A present but unparseable (or foreign) marker is an authoritative
+            // A present but unparsable (or foreign) marker is an authoritative
             // "not an AI room for this client", not a transient failure.
             let Ok(event) = serde_json::from_str::<serde_json::Value>(response.event_or_content.get())
             else {
@@ -736,11 +776,39 @@ async fn read_cursor(room: &Room) -> Option<AiSessionCursorContent> {
 /// Persists the last-forwarded event id as room account data.
 async fn save_cursor(room: &Room, cursor: &OwnedEventId, flow_context: &ContextId) -> Result<(), String> {
     policy::ensure_room_access(room.room_id().as_str(), RoomAccess::Write)?;
+    policy::ensure_room_flow_output(flow_context, room.room_id().as_str())?;
+    write_cursor_account_data(room, cursor).await
+}
+
+fn ensure_host_cursor_access(account: &str, current_account: Option<&str>, room_id: &OwnedRoomId) -> Result<(), String> {
+    if current_account != Some(account) { return Err("The cursor's account is no longer active.".into()); }
+    policy::ensure_room_access(room_id.as_str(), RoomAccess::Write)
+}
+
+/// Cursor requests share one ordered writer per account and room. Requests
+/// are spawned independently, so a late older worker must not move a newer
+/// delivered/canceled cursor backward in room account data.
+async fn ordered_cursor_write(
+    account: &str,
+    room_id: &OwnedRoomId,
+    write_id: u64,
+    write: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<(), String> {
+    type CursorWriter = std::sync::Arc<tokio::sync::Mutex<u64>>;
+    static WRITERS: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeMap<(String, OwnedRoomId), CursorWriter>>> =
+        std::sync::LazyLock::new(Default::default);
+    let writer = WRITERS.lock().unwrap().entry((account.to_string(), room_id.clone())).or_default().clone();
+    let mut latest = writer.lock().await;
+    if write_id <= *latest { return Ok(()); }
+    *latest = write_id;
+    write.await
+}
+
+async fn write_cursor_account_data(room: &Room, cursor: &OwnedEventId) -> Result<(), String> {
     let content = AiSessionCursorContent { cursor: Some(cursor.to_string()), last_turn: None };
     let raw_content: Raw<AnyRoomAccountDataEventContent> = Raw::new(&content)
         .map_err(|e| e.to_string())?
         .cast_unchecked();
-    policy::ensure_room_flow_output(flow_context, room.room_id().as_str())?;
     room.set_account_data_raw(RoomAccountDataEventType::from(AI_SESSION_DATA_EVENT_TYPE), raw_content)
         .await
         .map(|_| ())
@@ -886,6 +954,92 @@ async fn post_notice(room: &Room, content: &AiReplyContent, flow_context: &Conte
 
 
 #[cfg(test)]
+mod directory_read_tests {
+    use super::*;
+    use a2app_core::permissions::{GrantDuration, GrantState, PermissionStore, RoomScope, agent_subject};
+
+    // Each Tokio test owns a separate runtime/test thread. Keep the global
+    // policy guard through authorization awaits so another test cannot replace it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn cross_room_read_worker_requires_read_consent_without_output_to_room_members() {
+        let _policy_guard = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
+        let account = format!("@cross-room-read-worker-{}:test", std::process::id());
+        let previous_account = crate::a2app::information_flow::TEST_ACCOUNT.with(|a| a.replace(Some(account.clone())));
+        let room: OwnedRoomId = "!cross-room-read-worker:test".try_into().unwrap();
+        let context = crate::a2app::information_flow::begin_agent_session(room.as_str()).unwrap();
+        let target = "!foreign-read-worker:test";
+        flow::add_sources(&context, [flow::Source::Room { account, room: target.into() }]).unwrap();
+        let epoch = flow::context_epoch(&context).unwrap();
+        let tool = ReadToolKind::OtherRoom { room: target.into(), limit: 20 };
+        let cap = tool.capability().unwrap();
+        let subject = agent_subject(room.as_str());
+        let mut store = PermissionStore::default();
+        store.grant_scoped(&subject, cap.group.unwrap(), Some(cap.id), RoomScope::room(target), GrantDuration::Always, None).unwrap();
+        let mut auth = policy::MatrixAuthorization::new(&subject, cap.id, Some(room.as_str()), &store).with_flow(context.clone());
+        auth.target_room = Some(target.into());
+        policy::publish_permission_policy(&store);
+        policy::with_flow_activation(context.clone(), epoch, policy::with_authorization(auth.clone(), async {
+            assert!(flow::ensure_allowed(&context, &flow::Recipient::MatrixRoom {
+                account: context.account().into(), room: target.into(),
+            }).is_err(), "reading grants no permission to output into the source room");
+            ensure_tool_read_access(&room, &tool, &context, Some(&auth)).unwrap();
+            assert!(ensure_tool_read_access(&room, &tool, &context, None).is_err());
+            store.set_capability(&subject, cap.id, GrantState::Denied);
+            policy::publish_permission_policy(&store);
+            assert!(ensure_tool_read_access(&room, &tool, &context, Some(&auth)).is_err());
+            store.set_capability(&subject, cap.id, GrantState::Granted);
+            store.set_room_policy(target, RoomAccess::Read, a2app_core::permissions::PolicyDecision::Deny);
+            policy::publish_permission_policy(&store);
+            assert!(ensure_tool_read_access(&room, &tool, &context, Some(&auth)).is_err());
+        })).await;
+        policy::publish_permission_policy(&PermissionStore::default());
+        flow::remove_context(&context).unwrap();
+        crate::a2app::information_flow::TEST_ACCOUNT.with(|a| { a.replace(previous_account); });
+    }
+
+    // Each Tokio test owns a separate runtime/test thread. Keep the global
+    // policy guard through authorization awaits so another test cannot replace it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn space_directory_workers_need_current_consent_without_share_to_space() {
+        let _policy_guard = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
+        let account = format!("@directory-worker-{}:test", std::process::id());
+        let previous_account = crate::a2app::information_flow::TEST_ACCOUNT.with(|a| a.replace(Some(account)));
+        let room: OwnedRoomId = "!directory-worker:test".try_into().unwrap();
+        let context = crate::a2app::information_flow::begin_agent_session(room.as_str()).unwrap();
+        crate::a2app::information_flow::record_directory_response(&context).unwrap();
+        let epoch = flow::context_epoch(&context).unwrap();
+        let subject = agent_subject(room.as_str());
+        for tool in [ReadToolKind::SpaceInfo { space: "!space:test".into() }, ReadToolKind::SpaceRooms { space: "!space:test".into() }] {
+            let cap = tool.capability().unwrap();
+            let mut store = PermissionStore::default();
+            let scope = if matches!(tool, ReadToolKind::SpaceRooms { .. }) { RoomScope::room("!child:test") } else { RoomScope::AllRooms };
+            store.grant_scoped(&subject, cap.group.unwrap(), Some(cap.id), scope, GrantDuration::Always, None).unwrap();
+            let mut auth = policy::MatrixAuthorization::new(&subject, cap.id, Some(room.as_str()), &store).with_flow(context.clone());
+            auth.target_room = Some("!space:test".into());
+            policy::publish_permission_policy(&store);
+            policy::with_flow_activation(context.clone(), epoch,
+                policy::with_authorization(auth.clone(), async {
+                    assert!(flow::ensure_allowed(&context, &flow::Recipient::MatrixRoom {
+                        account: context.account().into(), room: "!space:test".into(),
+                    }).is_err(), "the fixture deliberately has no share-to-space rule");
+                    ensure_tool_read_access(&room, &tool, &context, Some(&auth)).unwrap();
+                    assert!(ensure_tool_read_access(&room, &tool, &context, None).is_err());
+                    store.set_capability(&subject, cap.id, GrantState::Denied);
+                    policy::publish_permission_policy(&store);
+                    assert!(ensure_tool_read_access(&room, &tool, &context, Some(&auth)).is_err(),
+                        "a capability revoked during the read must block delivery");
+                })
+            ).await;
+        }
+        policy::publish_permission_policy(&PermissionStore::default());
+        flow::remove_context(&context).unwrap();
+        crate::a2app::information_flow::TEST_ACCOUNT.with(|a| { a.replace(previous_account); });
+    }
+}
+
+#[cfg(test)]
 mod exact_reply_tests {
     use super::*;
 
@@ -909,5 +1063,84 @@ mod exact_reply_tests {
             name: "extra_tool".into(), detail: None, ok: true, summary: "Additional room content".into(),
         });
         assert_ne!(reply_review_payload(&content).unwrap(), reviewed);
+    }
+}
+
+#[cfg(test)]
+mod cursor_write_tests {
+    use super::*;
+
+    // Each Tokio test owns a separate runtime/test thread. Keep the global
+    // policy guard through authorization awaits so another test cannot replace it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn host_cancellation_cursor_survives_retirement_and_still_obeys_account_and_room_policy() {
+        let _policy_guard = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
+        let account = format!("@host-cancel-cursor-{}:test", std::process::id());
+        let previous_account = crate::a2app::information_flow::TEST_ACCOUNT.with(|a| a.replace(Some(account.clone())));
+        let room: OwnedRoomId = "!host-cancel:test".try_into().unwrap();
+        let context = crate::a2app::information_flow::begin_agent_session(room.as_str()).unwrap();
+        let epoch = flow::context_epoch(&context).unwrap();
+        let request = AiRoomRequest::SaveCancellationCursor {
+            account: account.clone(), room_id: room.clone(), cursor: "$canceled:test".try_into().unwrap(), write_id: 1,
+        };
+        flow::remove_context_for_activation(&context, epoch).unwrap();
+        let mut store = a2app_core::permissions::PermissionStore::default();
+        store.set_matrix_write(true);
+        policy::publish_permission_policy(&store);
+        let AiRoomRequest::SaveCancellationCursor { account: captured, room_id, .. } = request else { panic!("host-only request") };
+        assert!(ensure_host_cursor_access(&captured, Some(&account), &room_id).is_ok(),
+            "host-selected cursor metadata has no dependency on the retired agent context");
+        assert!(ensure_host_cursor_access(&captured, Some("@another:test"), &room_id).is_err());
+        assert!(ensure_host_cursor_access(&captured, None, &room_id).is_err());
+        assert!(policy::with_flow_activation(context.clone(), epoch, async {
+            policy::ensure_room_flow_output(&context, room.as_str())
+        }).await.is_err(), "ordinary agent cursor writes retain their activation check");
+        store.set_room_policy(room.as_str(), RoomAccess::Write, a2app_core::permissions::PolicyDecision::Deny);
+        policy::publish_permission_policy(&store);
+        assert!(ensure_host_cursor_access(&captured, Some(&account), &room_id).is_err());
+        policy::publish_permission_policy(&a2app_core::permissions::PermissionStore::default());
+        crate::a2app::information_flow::TEST_ACCOUNT.with(|a| { a.replace(previous_account); });
+    }
+
+    #[tokio::test]
+    async fn cursor_writes_are_serial_and_a_late_older_write_cannot_replace_cancellation() {
+        let account = format!("cursor-order-{}", std::process::id());
+        let room: OwnedRoomId = "!cursor-order:test".try_into().unwrap();
+        let saved = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let old_saved = saved.clone();
+        let old_account = account.clone();
+        let old_room = room.clone();
+        let old = tokio::spawn(async move {
+            ordered_cursor_write(&old_account, &old_room, 1, async move {
+                entered.send(()).unwrap();
+                wait.await.unwrap();
+                old_saved.lock().unwrap().push("delivered");
+                Ok(())
+            }).await
+        });
+        started.await.unwrap();
+        let canceled_saved = saved.clone();
+        let canceled_account = account.clone();
+        let canceled_room = room.clone();
+        let canceled = tokio::spawn(async move {
+            ordered_cursor_write(&canceled_account, &canceled_room, 2, async move {
+                canceled_saved.lock().unwrap().push("canceled");
+                Ok(())
+            }).await
+        });
+        tokio::task::yield_now().await;
+        assert!(saved.lock().unwrap().is_empty(), "cancellation waits for the preceding cursor request");
+        release.send(()).unwrap();
+        old.await.unwrap().unwrap();
+        canceled.await.unwrap().unwrap();
+        assert_eq!(*saved.lock().unwrap(), vec!["delivered", "canceled"]);
+        ordered_cursor_write(&account, &room, 1, async { panic!("late old cursor must be skipped"); }).await.unwrap();
+        assert_eq!(*saved.lock().unwrap(), vec!["delivered", "canceled"]);
+        // The account is part of the ordering key; another login's own cursor
+        // never depends on or supersedes this account's sequence.
+        ordered_cursor_write("another-cursor-account", &room, 1, async { Ok(()) }).await.unwrap();
     }
 }

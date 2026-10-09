@@ -44,7 +44,7 @@ pub enum Permission {
     Camera,
     /// Record an audio clip through the system recorder.
     Microphone,
-    /// See this device's ID and verification state, your homeserver, and app-owned account settin
+    /// See this device's ID and verification state, your homeserver, and app-owned account settings.
     MatrixAccountRead,
     /// Change your display name or avatar, block people, or store app settings on your account. A
     MatrixAccountWrite,
@@ -612,6 +612,23 @@ impl PermissionStore {
             .and_then(|m| m.get(perm.as_str()))
             .copied()
             .unwrap_or_default()
+    }
+
+    /// Whether the user has already answered or narrowed this capability.
+    /// One-time host defaults must not replace an explicit Ask, widen a
+    /// selected-room allowance, or recreate a withdrawn/expired allowance.
+    pub fn has_capability_choice(&self, subject: &str, cap: &crate::capabilities::Capability) -> bool {
+        let Some(group) = cap.group else { return false };
+        self.grants.get(subject).is_some_and(|grants| grants.contains_key(group.as_str()))
+            || self.cap_overrides.get(subject).is_some_and(|grants| grants.contains_key(cap.id))
+            || self.once.contains(&(subject.to_string(), group))
+            || self.until.get(subject).is_some_and(|grants| grants.contains_key(group.as_str()))
+            || self.needs_explicit_review(subject, group)
+            || self.scoped_ask.get(subject).is_some_and(|choices|
+                choices.contains(group.as_str()) || choices.contains(cap.id))
+            || self.scoped_grants(subject).iter().any(|grant|
+                grant.permission == group.as_str()
+                    && (grant.capability.is_none() || grant.capability.as_deref() == Some(cap.id)))
     }
 
     pub fn set(&mut self, app_id: &str, perm: Permission, state: GrantState) {

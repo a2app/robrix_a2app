@@ -140,7 +140,11 @@ fn info(state: &A2AppState, rooms: Option<&RoomsListRef>, prompt: &PermissionPro
 }
 
 pub(super) fn show_next(cx: &mut Cx, ui: &WidgetRef) {
-    if with_a2app(|state| state.permission_batch_busy || state.active_prompt.is_some()).unwrap_or(true) { return; }
+    show_next_permission_prompt(cx, ui);
+}
+
+pub(super) fn show_next_ordinary(cx: &mut Cx, ui: &WidgetRef) {
+    if with_a2app(|state| permission_modal_is_open(state)).unwrap_or(true) { return; }
     with_a2app(|state| state.permission_batch_busy = true);
     let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
     let first = loop {

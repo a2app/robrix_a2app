@@ -335,7 +335,7 @@ pub enum PromptOutcome {
 /// How many un-sent user requests a session will hold before dropping the
 /// oldest. A chat that outruns a slow agent should degrade by forgetting the
 /// oldest ask, not by buffering without bound.
-const MAX_QUEUED_PROMPTS: usize = 16;
+pub(crate) const MAX_QUEUED_PROMPTS: usize = 16;
 
 /// Truncates `text` for a log line, with an ellipsis when it was cut.
 fn clip(text: &str, max_chars: usize) -> String {

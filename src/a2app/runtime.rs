@@ -118,10 +118,6 @@ static NEXT_AI_TOOL_ID: AtomicU64 = AtomicU64::new(1);
 /// token it registered.
 #[cfg(unix)]
 static NEXT_AI_WRITE_ID: AtomicU64 = AtomicU64::new(1);
-/// The final-write token for a closed turn's natural reply. Only one can be
-/// outstanding per turn, and the reply result carries no write id.
-#[cfg(unix)]
-const FINAL_REPLY_WRITE_ID: u64 = u64::MAX;
 /// How long a closed turn's grants may outlive a final write that never
 /// reports back before the runtime gives up and revokes them anyway.
 #[cfg(unix)]
@@ -552,6 +548,9 @@ pub struct AiRoomInfo {
     /// [`AiRoomAction::StateEventPosted`]; no further `ai_turn` write is sent
     /// while it is set, so the SDK's own 429 retries are not compounded.
     ai_turn_in_flight: bool,
+    /// The submitted snapshot whose result may release the current gate.
+    /// Results from a stopped activation must not release its replacement.
+    ai_turn_write_id: Option<u64>,
     /// When this room's last `ai_turn` write was submitted, so writes are
     /// spaced under the server's state-event rate limit.
     last_ai_turn_post: Option<Instant>,
@@ -567,6 +566,10 @@ pub struct AiRoomInfo {
     /// state actually changes (and hides once the agent goes idle).
     status_busy: bool,
     status_queued: usize,
+    /// Member messages wait in the host until the preceding turn's final
+    /// writes settle and its grants are revoked. Held events keep their IDs
+    /// and do not advance the cursor, so a restart may refetch them.
+    pending_member_prompts: VecDeque<(OwnedEventId, String)>,
     /// The turn whose first `ai_turn` snapshot has been written: the card's
     /// anchor row, decided at flush time (see `flush_pending_ai_turns`).
     first_posted_turn: Option<String>,
@@ -585,10 +588,10 @@ pub struct AiRoomInfo {
     /// Whether the turn is closed and only its final writes keep its grants
     /// alive. Set by [`close_active_turn`], cleared when the revoke runs.
     final_writes_pending_revoke: bool,
-    /// The state key of the final `ai_turn` (Done) snapshot waiting to be
-    /// written. While this is set, the Done has not been submitted yet, so
-    /// [`settle_closed_turn`] must not revoke.
-    final_turn_key: Option<String>,
+    /// Final `ai_turn` (Done) snapshots still queued for closed turns. Each
+    /// must be submitted before [`settle_closed_turn`] may revoke, including
+    /// when several short turns close before the next flush.
+    pending_final_turns: BTreeSet<String>,
     /// When the closed turn's grants were parked. If a final write never
     /// reports back, [`flush_pending_ai_turns`] revokes at this point so a
     /// stuck write cannot keep grants alive forever.
@@ -611,16 +614,18 @@ impl AiRoomInfo {
             active_turn: None,
             pending_ai_turns: VecDeque::new(),
             ai_turn_in_flight: false,
+            ai_turn_write_id: None,
             last_ai_turn_post: None,
             ai_turn_backoff: AI_TURN_POST_MIN_INTERVAL,
             status_busy: false,
             status_queued: 0,
+            pending_member_prompts: VecDeque::new(),
             first_posted_turn: None,
             anchor_in_flight: None,
             start_failed_at: None,
             pending_final_writes: BTreeSet::new(),
             final_writes_pending_revoke: false,
-            final_turn_key: None,
+            pending_final_turns: BTreeSet::new(),
             final_writes_deadline: None,
             retire_after_final_writes: false,
         }
@@ -633,12 +638,14 @@ impl AiRoomInfo {
         self.active_turn = None;
         self.pending_ai_turns.clear();
         self.ai_turn_in_flight = false;
+        self.ai_turn_write_id = None;
         self.anchor_in_flight = None;
         self.status_busy = false;
         self.status_queued = 0;
+        self.pending_member_prompts.clear();
         self.pending_final_writes.clear();
         self.final_writes_pending_revoke = false;
-        self.final_turn_key = None;
+        self.pending_final_turns.clear();
         self.final_writes_deadline = None;
         self.retire_after_final_writes = false;
     }
@@ -965,6 +972,7 @@ fn initialize_state(registry: AppRegistry, permissions: PermissionStore, persist
             next_task_id: 0,
             #[cfg(unix)]
             dismissed_task_plans: HashMap::new(),
+            #[cfg(unix)]
             task_request_counts: HashMap::new(),
             dismissed_prompts: HashSet::new(),
             dismissed_net_hosts: HashSet::new(),
@@ -4528,7 +4536,21 @@ fn refuse_room_prompts(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
     show_next_permission_prompt(cx, ui);
 }
 
+fn permission_modal_is_open(state: &A2AppState) -> bool {
+    if state.permission_batch_busy || state.active_prompt.is_some() {
+        return true;
+    }
+    #[cfg(unix)]
+    if state.active_task.is_some() || state.active_exact_review.is_some() {
+        return true;
+    }
+    false
+}
+
 fn show_next_permission_prompt(cx: &mut Cx, ui: &WidgetRef) {
+    if with_a2app(|state| permission_modal_is_open(state)).unwrap_or(true) {
+        return;
+    }
     // Exact-action reviews and task prompts show ahead of single-permission
     // prompts, one modal at a time; reviews come first.
     #[cfg(unix)]
@@ -4542,7 +4564,7 @@ fn show_next_permission_prompt(cx: &mut Cx, ui: &WidgetRef) {
         show_next_task_prompt(cx, ui);
         return;
     }
-    permission_batch::show_next(cx, ui);
+    permission_batch::show_next_ordinary(cx, ui);
 }
 
 fn cancel_subject_permission_prompts(cx: &mut Cx, ui: &WidgetRef, subject: &str) {
@@ -5675,11 +5697,9 @@ fn run_request_task_permissions(    cx: &mut Cx,
         let Ok(room) = OwnedRoomId::try_from(id) else { return false };
         client.get_room(&room).is_some()
     };
-    // A tool need is valid only if a mini-app registered that name in this
-    // room; match `full_name` or `raw_name` as `task_prompt_info` does.
-    let app_tool_exists = |tool: &str| {
-        with_a2app(|state| state.app_tools.values().any(|reg| reg.full_name == tool || reg.raw_name == tool))
-            .unwrap_or(false)
+    // Seal the same room-local, unambiguous name the invocation will check.
+    let app_tool_name = |tool: &str| {
+        with_a2app(|state| canonical_app_tool_name(state, room_id, tool)).flatten()
     };
     let inputs = ResolveInputs {
         task_id,
@@ -5692,7 +5712,7 @@ fn run_request_task_permissions(    cx: &mut Cx,
         homeserver_recipient,
         joined: &joined,
         declared_capabilities: AI_ROOM_SESSION_CAP_IDS,
-        app_tool_exists: &app_tool_exists,
+        app_tool_name: &app_tool_name,
         store: &store,
         flow: &task_grants::GlobalFlow,
     };
@@ -5721,20 +5741,22 @@ fn run_request_task_permissions(    cx: &mut Cx,
     with_a2app(|state| {
         state.task_prompts.push_back(TaskPrompt { room_id: room_id.clone(), plan, resume: TaskResume::AgentTool(answer) });
     });
-    show_next_task_prompt(cx, ui);
+    show_next_permission_prompt(cx, ui);
 }
 
 /// The tool-call receipt for a plan that needed no prompt: success only when
-/// every item is already allowed, a failed "Blocked by room policy" when every
-/// item is blocked by policy, a failed "Not offered" when every item is
+/// every item is already allowed, a failed block receipt when every
+/// item is blocked, a failed "Not offered" when every item is
 /// unofferable, and a failed mixed note otherwise.
 #[cfg(unix)]
 fn settled_task_receipt(plan: &TaskPlan) -> (bool, &'static str) {
     let all = |pred: fn(&ItemState) -> bool| !plan.items.is_empty() && plan.items.iter().all(|item| pred(&item.state));
     if all(|state| matches!(state, ItemState::AlreadyAllowed)) {
         (true, "Nothing new to allow")
-    } else if all(|state| matches!(state, ItemState::Blocked(_))) {
+    } else if all(|state| matches!(state, ItemState::Blocked(TaskReason::BlockedByRoomPolicy))) {
         (false, "Blocked by room policy")
+    } else if all(|state| matches!(state, ItemState::Blocked(_))) {
+        (false, "Blocked by permission settings")
     } else if all(|state| matches!(state, ItemState::NotOffered(_))) {
         (false, "Not offered")
     } else {
@@ -5751,18 +5773,20 @@ fn count_task_request(counts: &mut HashMap<String, u32>, room: &str) -> bool {
     *count <= 3
 }
 
-/// Whether a plan's needs are already covered by a dismissed request for the
-/// room: equal or a subset is dismissed, a strict superset is a new request.
+/// Whether every need was already declined in this room during the turn.
+/// Combining earlier declined requests must not open another permission modal.
 #[cfg(unix)]
 fn task_plan_is_dismissed(
     dismissed: &HashMap<(String, [u8; 32]), BTreeSet<String>>,
     room: &str,
     needs: &BTreeSet<String>,
 ) -> bool {
-    dismissed
+    let previous: Vec<_> = dismissed
         .iter()
         .filter(|((dismissed_room, _), _)| dismissed_room == room)
-        .any(|(_, dismissed_needs)| needs.is_subset(dismissed_needs))
+        .map(|(_, dismissed_needs)| dismissed_needs)
+        .collect();
+    !previous.is_empty() && needs.iter().all(|need| previous.iter().any(|declined| declined.contains(need)))
 }
 
 /// Shows the next task prompt, if none is already open. Task prompts are
@@ -5773,7 +5797,7 @@ fn show_next_task_prompt(cx: &mut Cx, ui: &WidgetRef) {
     // "General" rather than `!abc:server`.
     let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
     let info = with_a2app(|state| {
-        if state.active_task.is_some() || state.active_prompt.is_some() || state.active_exact_review.is_some() {
+        if permission_modal_is_open(state) {
             return None;
         }
         let prompt = state.task_prompts.pop_front()?;
@@ -5802,7 +5826,7 @@ fn show_next_task_prompt(cx: &mut Cx, ui: &WidgetRef) {
 #[cfg(unix)]
 fn show_next_exact_review(cx: &mut Cx, ui: &WidgetRef) {
     let info = with_a2app(|state| {
-        if state.active_exact_review.is_some() || state.active_prompt.is_some() {
+        if permission_modal_is_open(state) {
             return None;
         }
         let prompt = state.exact_reviews.pop_front()?;
@@ -5977,6 +6001,7 @@ fn task_reason_label(reason: TaskReason) -> &'static str {
         TaskReason::Declined => "the user declined",
         TaskReason::DeclinedDependency => "a sharing rule it needed was left unchecked",
         TaskReason::BlockedByRoomPolicy => "a room's protection blocks it",
+        TaskReason::BlockedByPermission => "blocked by permission settings",
         TaskReason::NotOffered => "not offered here",
         TaskReason::InvalidTarget => "not a room or space you have joined",
         TaskReason::AlreadyAllowed => "already allowed",
@@ -6055,9 +6080,6 @@ fn answer_task_prompt(cx: &mut Cx, ui: &WidgetRef, action: TaskPermissionAction)
     // A host-raised carried-over prompt is not the agent's tool call, so it
     // leaves no `ai_tool_call` row of its own.
     let agent_tool = matches!(&resume, TaskResume::AgentTool(_));
-    if agent_tool && matches!(action, TaskPermissionAction::NotNow) {
-        note_ai_tool_call(&room_id, "request_task_permissions", false, "Declined");
-    }
     // Apply outside the state borrow: information-flow rules live in their own
     // registry, and a partial apply is rolled back by `task_grants::apply`.
     let mut guard = PermissionStoreGuard::take();
@@ -6067,12 +6089,16 @@ fn answer_task_prompt(cx: &mut Cx, ui: &WidgetRef, action: TaskPermissionAction)
         Ok(task) => {
             // Report the states re-checked at apply time, then keep the task in
             // the ledger for the turn's close to revoke.
-            let outcome = task_grants::outcome_of(&plan, &approved, &task).to_string();
+            let outcome = task_grants::outcome_of(&plan, &approved, &task);
             applied = Some(task);
             if agent_tool {
-                note_ai_tool_call(&room_id, "request_task_permissions", true, &format!("Approved: {}", plan.title));
+                let fully_allowed = outcome["status"] == "granted";
+                let note = if fully_allowed { format!("Approved: {}", plan.title) }
+                    else if outcome["status"] == "declined" { "Declined".to_string() }
+                    else { format!("Some needs were refused: {}", plan.title) };
+                note_ai_tool_call(&room_id, "request_task_permissions", fully_allowed, &note);
             }
-            Ok(outcome)
+            Ok(outcome.to_string())
         }
         Err(error) => {
             let message = error.message();
@@ -6141,7 +6167,7 @@ fn answer_exact_review(cx: &mut Cx, ui: &WidgetRef, review: ExactReviewPrompt, a
                     room_id, context, epoch, action, payload, expected: new_expected,
                     request_id: new_request, info, resume,
                 }));
-                show_next_exact_review(cx, ui);
+                show_next_permission_prompt(cx, ui);
             } else {
                 refuse_exact_resume(resume, error);
                 show_next_permission_prompt(cx, ui);
@@ -6202,7 +6228,7 @@ fn revoke_task_grants(room_id: &OwnedRoomId) {
         if let Some(info) = state.ai_rooms.get_mut(room_id) {
             info.pending_final_writes.clear();
             info.final_writes_pending_revoke = false;
-            info.final_turn_key = None;
+            info.pending_final_turns.clear();
             info.final_writes_deadline = None;
         }
         let ids: Vec<u64> = state
@@ -6223,6 +6249,7 @@ fn revoke_task_grants(room_id: &OwnedRoomId) {
         revoked_cleanly &= task_grants::rollback(task, guard.store(), &task_grants::GlobalFlowApply);
     }
     guard.restore(|_| {});
+    publish_current_grants();
     if !revoked_cleanly {
         enqueue_popup_notification(
             "Some of this turn's sharing rules could not be revoked. Review Data Sharing to be sure no access was left behind.",
@@ -6630,6 +6657,12 @@ fn refresh_permission_policy(cx: &mut Cx, ui: &WidgetRef) {
 
 /// Republishes the grant snapshot that isolate-creation sites read.
 fn publish_grants(_cx: &mut Cx) {
+    publish_current_grants();
+}
+
+/// Publishes permission changes at the worker boundary, including rollbacks
+/// that finish without a UI event handler or a `Cx`.
+fn publish_current_grants() {
     super::background::changed();
     let account = super::information_flow::account().ok();
     let effect_spaces: std::collections::BTreeSet<String> = a2app_core::information_flow::effect_authorities().unwrap_or_default()
@@ -6892,7 +6925,7 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
                 attach_ai_session(cx, ui, &room_id, name);
             }
         }
-        AiRoomAction::PostReplyResult { room_id, answer_id, result } => {
+        AiRoomAction::PostReplyResult { room_id, answer_id, write_id, result } => {
             let parked = answer_id
                 .and_then(|id| with_a2app(|state| state.ai_replies.remove(&id)).flatten());
             if let Err(error) = &result {
@@ -6905,11 +6938,10 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
             // A natural reply is the closed turn's final output. Its result
             // releases the turn's task grants once every other final write has
             // landed; a `send_message` reply belongs to a still-live turn and
-            // never releases them. A natural reply that lands after a newer
-            // turn has started leaves the room's ledger to that newer turn's
-            // close, which removes every entry the room applied.
+            // never releases them. The next member turn waits until every
+            // final write has landed and the closed turn's grants are revoked.
             if answer_id.is_none() {
-                final_write_landed(&room_id, FINAL_REPLY_WRITE_ID);
+                final_write_landed(&room_id, write_id);
             }
             let Some((_, turn, answer, receipts)) = parked else { return };
             // The write outlives a turn the user cancelled (its tool call is
@@ -6992,8 +7024,8 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
                         _ => room_id.as_str(),
                     };
                     if state.permissions.room_policy(Some(target), RoomAccess::Read) == PolicyDecision::Deny
-                        || (!is_directory_kind(&kind)
-                            && auth.as_ref().is_some_and(|auth| !auth.permits(&state.permissions, Some(target))))
+                        || auth.as_ref().is_some_and(|auth| !auth.permits_request(&state.permissions))
+                        || (kind.capability().is_some() && auth.is_none())
                     { return Err("Reading this room is now blocked in Mini Apps permissions.".into()); }
                     matrix::policy::filter_read_result(&result, &state.permissions, auth.as_ref())
                 }).unwrap_or_else(|| Err("Permissions are unavailable.".into())));
@@ -7041,12 +7073,15 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
             // Release the coalescing guard for this room's turn card so the
             // next pending snapshot can be written (see
             // `flush_pending_ai_turns`), and adapt the write spacing: a rate
-            // limit widens it, a success narrows it back. Other event types
-            // share this feedback but gate nothing.
+            // limit widens it, a success narrows it back. Only the captured
+            // write id may release this gate; other event types release their
+            // own final-write tokens below.
             if event_type.as_str() == AI_TURN_EVENT_TYPE {
                 with_a2app(|state| {
                     if let Some(info) = state.ai_rooms.get_mut(&room_id) {
+                        if info.ai_turn_write_id != Some(write_id) { return; }
                         info.ai_turn_in_flight = false;
+                        info.ai_turn_write_id = None;
                         if let Some(key) = info.anchor_in_flight.take()
                             && !success
                             && info.first_posted_turn.as_deref() == Some(key.as_str())
@@ -7078,7 +7113,7 @@ fn retire_ai_session(room_id: &OwnedRoomId) {
     let deferred = with_a2app(|state| {
         let info = state.ai_rooms.get_mut(room_id)?;
         if info.final_writes_pending_revoke
-            && (info.final_turn_key.is_some() || !info.pending_final_writes.is_empty())
+            && (!info.pending_final_turns.is_empty() || !info.pending_final_writes.is_empty())
         {
             info.retire_after_final_writes = true;
             Some(true)
@@ -7502,13 +7537,7 @@ fn apply_ai_room_panel_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomPanelAc
 /// results carry no message content but stay untrusted input.
 #[cfg(unix)]
 fn is_directory_kind(kind: &ReadToolKind) -> bool {
-    matches!(
-        kind,
-        ReadToolKind::ListRooms
-            | ReadToolKind::ListSpaces
-            | ReadToolKind::SpaceInfo { .. }
-            | ReadToolKind::SpaceRooms { .. }
-    )
+    kind.is_directory()
 }
 
 /// Grants an AI room the room/space directory (`list_rooms`, `list_spaces`,
@@ -7546,9 +7575,9 @@ fn apply_directory_capability_defaults(permissions: &mut PermissionStore, room_i
     for cap_id in a2app_core::task_grants::DIRECTORY_CAP_IDS {
         let Some(cap) = a2app_core::capabilities::by_id(cap_id) else { continue };
         let Some(group) = cap.group else { continue };
-        // A stored Deny is a hard block and must never be overridden by the
-        // once-per-room default.
-        if permissions.state(&subject, group) == GrantState::Denied {
+        // Saved answers and narrowed or withdrawn allowances predate this
+        // default on upgrade. Preserve them instead of widening their scope.
+        if permissions.has_capability_choice(&subject, cap) {
             continue;
         }
         let already = permissions.scoped_grants(&subject).iter().any(|grant| {
@@ -7698,7 +7727,7 @@ pub fn ai_room_status(room_id: &OwnedRoomId) -> Option<AiRoomStatus> {
         let session = state.ai_sessions.get(room_id)?;
         Some(AiRoomStatus {
             busy: session.is_busy(),
-            queued: session.queued_len(),
+            queued: session.queued_len() + state.ai_rooms.get(room_id).map(|info| info.pending_member_prompts.len()).unwrap_or(0),
         })
     })
     .flatten()
@@ -7710,7 +7739,8 @@ pub fn ai_room_status(room_id: &OwnedRoomId) -> Option<AiRoomStatus> {
 #[cfg(unix)]
 pub fn ai_room_is_busy(room_id: &OwnedRoomId) -> bool {
     with_a2app(|state| {
-        state.ai_sessions.get(room_id).map(|s| s.is_busy() || s.queued_len() > 0)
+        state.ai_sessions.get(room_id).map(|s| s.is_busy() || s.queued_len() > 0
+            || state.ai_rooms.get(room_id).is_some_and(|info| !info.pending_member_prompts.is_empty()))
     })
     .flatten()
     .unwrap_or(false)
@@ -7746,6 +7776,17 @@ pub fn ai_room_active_turn(_room_id: &OwnedRoomId) -> Option<String> {
 /// (or another room) started keeps running.
 #[cfg(unix)]
 fn abort_ai_room_work(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
+    // Explicit cancellation forgets held asks too. Keep the cursor at the
+    // newest canceled event so the next timeline pass does not restart them.
+    // Session death and failed startup keep their old cursor for refetch.
+    if let Some(cursor) = discard_member_prompts_for_cancel(room_id)
+        && let Ok(account) = super::information_flow::account()
+    {
+        submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::SaveCancellationCursor {
+            account, room_id: room_id.clone(), cursor,
+            write_id: NEXT_AI_WRITE_ID.fetch_add(1, Ordering::Relaxed),
+        }));
+    }
     // Withdraw a task prompt first, so the modal closes and no serve thread
     // hangs on a task whose turn is being cancelled.
     #[cfg(unix)]
@@ -7793,8 +7834,8 @@ fn abort_ai_room_work(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
 /// silent, and its first (and only) inputs are real user messages.
 ///
 /// Before starting a turn, if the agent's still-live label carries a source
-/// the current model provider may no longer see (a room read in an earlier
-/// turn whose turn-scoped rule was revoked), the host raises one carried-over
+/// the model provider, this room or its homeserver may no longer receive (a
+/// room read in an earlier turn whose sharing rule was revoked), the host raises one carried-over
 /// task prompt and holds these messages until the user answers. On approval
 /// the host applies the same turn-scoped rules and delivers the messages; on
 /// a decline the messages are still delivered, so the model call is refused
@@ -7808,6 +7849,52 @@ pub fn forward_ai_room_texts(
     new_texts: Vec<(OwnedEventId, String)>,
 ) {
     forward_ai_room_texts_inner(room_id, new_texts, true);
+}
+
+#[cfg(unix)]
+fn queue_member_prompts(info: &mut AiRoomInfo, texts: Vec<(OwnedEventId, String)>) {
+    for (event_id, text) in texts {
+        if info.cursor.as_ref() == Some(&event_id)
+            || info.pending_member_prompts.iter().any(|(held, _)| held == &event_id)
+        { continue; }
+        if info.pending_member_prompts.len() >= super::ai::session::MAX_QUEUED_PROMPTS {
+            if let Some((forgotten, _)) = info.pending_member_prompts.pop_front() {
+                info.cursor = Some(forgotten);
+            }
+        }
+        info.pending_member_prompts.push_back((event_id, text));
+    }
+}
+
+#[cfg(unix)]
+fn discard_member_prompts_for_cancel(room_id: &OwnedRoomId) -> Option<OwnedEventId> {
+    with_a2app(|state| {
+        let info = state.ai_rooms.get_mut(room_id)?;
+        let cursor = info.pending_member_prompts.back()?.0.clone();
+        info.cursor = Some(cursor.clone());
+        info.pending_member_prompts.clear();
+        Some(cursor)
+    }).flatten()
+}
+
+#[cfg(unix)]
+fn member_prompt_may_start(info: &AiRoomInfo, session_busy: bool, session_queued: usize) -> bool {
+    !session_busy && session_queued == 0 && !info.final_writes_pending_revoke
+}
+
+#[cfg(unix)]
+fn send_next_member_prompt(
+    info: &mut AiRoomInfo,
+    session_busy: bool,
+    session_queued: usize,
+    send: impl FnOnce(String) -> PromptOutcome,
+) -> Option<OwnedEventId> {
+    if !member_prompt_may_start(info, session_busy, session_queued) { return None; }
+    let (event_id, text) = info.pending_member_prompts.front()?.clone();
+    if send(text) != PromptOutcome::Sent { return None; }
+    info.pending_member_prompts.pop_front();
+    info.cursor = Some(event_id.clone());
+    Some(event_id)
 }
 
 #[cfg(unix)]
@@ -7839,73 +7926,67 @@ fn forward_ai_room_texts_inner(
         log!("AI Rooms: room {room_id}'s agent failed to start recently; not retrying yet.");
         return;
     }
-    if check_carried {
-        // Start the session first: `begin_agent_session` resets the label for
-        // a fresh session, so a restart is not treated as a carried-over turn.
-        if let Err(error) = ensure_ai_session(room_id) {
-            log!("AI Rooms: FAILED to start/use room {room_id}'s agent session: {error}");
-            enqueue_popup_notification(
-                format!("Couldn't start this AI room's agent: {error}"),
-                PopupKind::Error, Some(6.0),
-            );
-            return;
-        }
-        if raise_carried_permission_prompt(room_id, &new_texts) {
-            log!("AI Rooms: holding {} message(s) for room {room_id} behind a carried-over permission prompt.", new_texts.len());
-            return;
-        }
+    // Member prompts stay here until startup and final-write rollback have
+    // completed, so neither a model call nor its host tools can inherit the old grants.
+    if let Err(error) = ensure_ai_session(room_id) {
+        log!("AI Rooms: FAILED to start/use room {room_id}'s agent session: {error}");
+        enqueue_popup_notification(
+            format!("Couldn't start this AI room's agent: {error}"),
+            PopupKind::Error, Some(6.0),
+        );
+        return;
     }
-    let prefs = with_a2app(|state| state.agent_prefs.clone())
-        .unwrap_or_else(a2app_agent::prefs::load_agent_prefs);
-    let mut last_cursor = None;
-    for (event_id, text) in new_texts {
-        let outcome: Result<PromptOutcome, String> = with_a2app(|state| {
-            if !state.ai_sessions.contains_key(room_id) {
-                let started = start_ai_session(state, room_id, prefs.clone());
-                if let Some(info) = state.ai_rooms.get_mut(room_id) {
-                    info.start_failed_at = started.is_err().then(Instant::now);
-                }
-                state.ai_sessions.insert(room_id.clone(), started?);
-            }
-            let outcome = state.ai_sessions.get_mut(room_id)
-                .map(|session| session.prompt(text.clone()))
-                .unwrap_or(PromptOutcome::Dead);
-            if outcome != PromptOutcome::Dead {
-                if let Some(info) = state.ai_rooms.get_mut(room_id) {
-                    info.cursor = Some(event_id.clone());
-                }
-            }
-            Ok(outcome)
-        }).unwrap_or(Ok(PromptOutcome::Dead));
-        match outcome {
-            Ok(PromptOutcome::Dead) => {
-                log!("AI Rooms: room {room_id}'s agent session is dead; NOT forwarding {event_id}.");
-                enqueue_popup_notification(
-                    "This AI room's agent has stopped; it restarts on your next message.",
-                    PopupKind::Warning, Some(6.0),
-                );
-                return;
-            }
-            Err(e) => {
-                log!("AI Rooms: FAILED to start/use room {room_id}'s agent session: {e}");
-                enqueue_popup_notification(
-                    format!("Couldn't start this AI room's agent: {e}"),
-                    PopupKind::Error, Some(6.0),
-                );
-                return;
-            }
-            Ok(other) => log!("AI Rooms: forwarded {event_id} to room {room_id}'s session: {other:?}"),
-        }
-        last_cursor = Some(event_id);
+    let texts = with_a2app(|state| {
+        let blocked = session_has_inflight_tool(state, room_id);
+        let session = state.ai_sessions.get(room_id)?;
+        let (busy, queued, dead, ready) = (session.is_busy(), session.queued_len(), session.dead(), session.is_ready());
+        let info = state.ai_rooms.get_mut(room_id)?;
+        queue_member_prompts(info, new_texts);
+        let may_start = member_prompt_may_start(info, busy, queued);
+        let texts = info.pending_member_prompts.iter().cloned().collect::<Vec<_>>();
+        update_pending_carried_texts(state, room_id, &texts);
+        if dead || !ready || blocked || !may_start { return None; }
+        Some(texts)
+    }).flatten();
+    let Some(texts) = texts.filter(|texts| !texts.is_empty()) else { return };
+    if check_carried && raise_carried_permission_prompt(room_id, &texts) {
+        log!("AI Rooms: holding {} message(s) for room {room_id} behind a carried-over permission prompt.", texts.len());
+        return;
     }
-    if let Some(cursor) = last_cursor {
+    let sent = with_a2app(|state| {
+        let session = state.ai_sessions.get_mut(room_id)?;
+        let info = state.ai_rooms.get_mut(room_id)?;
+        send_next_member_prompt(info, session.is_busy(), session.queued_len(), |text| session.prompt(text))
+    }).flatten();
+    if let Some(cursor) = sent {
+        log!("AI Rooms: forwarded {cursor} to room {room_id}'s session.");
         let Ok(flow_context) = super::information_flow::agent_context(room_id.as_str()) else { return };
         submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::SaveCursor {
+            write_id: NEXT_AI_WRITE_ID.fetch_add(1, Ordering::Relaxed),
             flow_epoch: a2app_core::information_flow::context_epoch(&flow_context).unwrap_or(0),
             flow_context,
             room_id: room_id.clone(),
             cursor,
         }));
+    }
+}
+
+/// Recheck carried sharing after the preceding turn's final grants have been
+/// removed, then deliver at most one held member message per idle room.
+#[cfg(unix)]
+fn drain_pending_member_prompts() {
+    let ready: Vec<(OwnedRoomId, Vec<(OwnedEventId, String)>)> = with_a2app(|state| {
+        state.ai_rooms.iter().filter_map(|(room_id, info)| {
+            let session = state.ai_sessions.get(room_id)?;
+            if info.pending_member_prompts.is_empty() || session.dead() || !session.is_ready()
+                || !member_prompt_may_start(info, session.is_busy(), session.queued_len())
+                || session_has_inflight_tool(state, room_id)
+            { return None; }
+            Some((room_id.clone(), info.pending_member_prompts.iter().cloned().collect()))
+        }).collect()
+    }).unwrap_or_default();
+    for (room_id, texts) in ready {
+        forward_ai_room_texts_inner(&room_id, texts, true);
     }
 }
 
@@ -7988,6 +8069,7 @@ fn build_carried_task_plan(
         title: "Keep using earlier context".to_string(),
         explanation,
         items,
+        flow_dependencies: BTreeMap::new(),
         plan_hash: [0; 32],
         needs_fingerprint: [0; 32],
     };
@@ -7996,7 +8078,7 @@ fn build_carried_task_plan(
 }
 
 /// Holds `texts` behind one carried-over prompt when the agent's live label
-/// has sources the model provider may no longer see. Returns true when the
+/// has sources the provider or final reply recipients may no longer receive. Returns true when the
 /// texts were queued (a prompt already pending or freshly raised); false lets
 /// the caller deliver them.
 #[cfg(unix)]
@@ -8012,36 +8094,38 @@ fn raise_carried_permission_prompt(room_id: &OwnedRoomId, texts: &[(OwnedEventId
     })
     .unwrap_or((None, None, 0));
     let Some(provider) = provider else { return false };
-    let carried = match a2app_core::information_flow::carried_over_sources(&context, &provider) {
-        Ok(carried) if !carried.is_empty() => carried,
-        _ => return false,
-    };
+    hold_carried_permission_prompt(room_id, texts, &context, &provider, homeserver.as_ref(), task_id)
+}
+
+#[cfg(unix)]
+fn hold_carried_permission_prompt(
+    room_id: &OwnedRoomId,
+    texts: &[(OwnedEventId, String)],
+    context: &a2app_core::information_flow::ContextId,
+    provider: &Recipient,
+    homeserver: Option<&Recipient>,
+    task_id: u64,
+) -> bool {
+    let texts = &texts[texts.len().saturating_sub(super::ai::session::MAX_QUEUED_PROMPTS)..];
+    let own_room = Recipient::MatrixRoom { account: context.account().into(), room: room_id.to_string() };
+    let mut recipients = vec![provider, &own_room];
+    if let Some(homeserver) = homeserver { recipients.push(homeserver); }
+    let mut carried = BTreeSet::new();
+    for recipient in recipients {
+        match a2app_core::information_flow::carried_over_sources(context, recipient) {
+            Ok(sources) => carried.extend(sources),
+            Err(_) => return false,
+        }
+    }
+    if carried.is_empty() { return false; }
     // A prompt already waiting (or showing) for this room absorbs the text
     // instead of raising a second one.
-    let appended = with_a2app(|state| {
-        let existing = state
-            .active_task
-            .as_mut()
-            .filter(|prompt| &prompt.room_id == room_id && matches!(&prompt.resume, TaskResume::UserPrompt { .. }))
-            .or_else(|| {
-                state.task_prompts.iter_mut().find(|prompt| {
-                    &prompt.room_id == room_id && matches!(&prompt.resume, TaskResume::UserPrompt { .. })
-                })
-            });
-        let Some(prompt) = existing else { return false };
-        let TaskResume::UserPrompt { texts: held } = &mut prompt.resume else { return false };
-        for (event_id, text) in texts {
-            if !held.iter().any(|(held_id, _)| held_id == event_id) {
-                held.push((event_id.clone(), text.clone()));
-            }
-        }
-        true
-    })
+    let appended = with_a2app(|state| update_pending_carried_texts(state, room_id, texts))
     .unwrap_or(false);
     if appended {
         return true;
     }
-    let plan = build_carried_task_plan(room_id, &context, &carried, &provider, homeserver.as_ref(), task_id);
+    let plan = build_carried_task_plan(room_id, context, &carried, provider, homeserver, task_id);
     // A decline is remembered for the turn by the plan's needs, exactly as an
     // agent-requested plan is: do not raise the same carried prompt twice.
     let dismissed = with_a2app(|state| {
@@ -8063,6 +8147,24 @@ fn raise_carried_permission_prompt(room_id: &OwnedRoomId, texts: &[(OwnedEventId
     // pass that shows queued prompts may already have run; wake it so the
     // carried-over modal appears without waiting for another event.
     makepad_widgets::SignalToUI::set_ui_signal();
+    true
+}
+
+#[cfg(unix)]
+fn update_pending_carried_texts(
+    state: &mut A2AppState,
+    room_id: &OwnedRoomId,
+    texts: &[(OwnedEventId, String)],
+) -> bool {
+    let existing = state.active_task.as_mut()
+        .filter(|prompt| &prompt.room_id == room_id && matches!(&prompt.resume, TaskResume::UserPrompt { .. }))
+        .or_else(|| state.task_prompts.iter_mut().find(|prompt|
+            &prompt.room_id == room_id && matches!(&prompt.resume, TaskResume::UserPrompt { .. })));
+    let Some(prompt) = existing else { return false };
+    let TaskResume::UserPrompt { texts: held } = &mut prompt.resume else { return false };
+    // The host retains ownership while the modal is open. Its bounded,
+    // deduplicated snapshot also removes asks evicted from the queue.
+    *held = texts[texts.len().saturating_sub(super::ai::session::MAX_QUEUED_PROMPTS)..].to_vec();
     true
 }
 
@@ -8156,7 +8258,8 @@ fn sweep_app_tools() {
 /// answered, so a session's tools run serially.
 #[cfg(unix)]
 fn session_has_inflight_tool(state: &A2AppState, room_id: &OwnedRoomId) -> bool {
-    state.ai_reads.values().any(|(r, _, _)| r == room_id)
+    state.ai_rooms.get(room_id).is_some_and(|info| info.final_writes_pending_revoke)
+        || state.ai_reads.values().any(|(r, _, _)| r == room_id)
         || state.ai_posts.values().any(|(r, _)| r == room_id)
         || state.app_tool_calls.values().any(|p| &p.room_id == room_id)
         || state
@@ -8169,6 +8272,10 @@ fn session_has_inflight_tool(state: &A2AppState, room_id: &OwnedRoomId) -> bool 
             .is_some_and(|p| prompt_parks_room_tool(p, room_id))
         || state.active_prompt_batch.iter().any(|p| prompt_parks_room_tool(p, room_id))
         || state.prompts.iter().any(|p| prompt_parks_room_tool(p, room_id))
+        || state.active_task.as_ref().is_some_and(|p| &p.room_id == room_id)
+        || state.task_prompts.iter().any(|p| &p.room_id == room_id)
+        || state.active_exact_review.as_ref().is_some_and(|p| &p.room_id == room_id)
+        || state.exact_reviews.iter().any(|p| &p.room_id == room_id)
 }
 
 /// Drives every room's AI session for one event pass. First the tool calls
@@ -8339,7 +8446,7 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
     for (room_id, text) in to_post {
         post_ai_reply(&room_id, text, None);
         // The natural reply registered its final-write token; settle now that
-        // it is queued (a newer turn leaves the ledger to that turn's close).
+        // it is queued before any subsequent member turn is released.
         settle_closed_turn(&room_id);
     }
     for msg in errors {
@@ -8369,6 +8476,12 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
         ui.redraw(cx);
     }
 
+    // Final writes must settle before another member turn is released. The
+    // fresh carried-source check runs after rollback, while host jobs remain
+    // gated during the drain of the preceding turn's writes.
+    flush_pending_ai_turns(cx);
+    drain_pending_member_prompts();
+
     // 3. Keep each room's busy/queued status row honest between timeline
     //    updates: a turn ending with no reply, the queue flushing the next
     //    prompt, or the agent finishing its startup all change it without a
@@ -8377,8 +8490,8 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
     let status_changed: Vec<OwnedRoomId> = with_a2app(|state| {
         let mut changed = Vec::new();
         for (room_id, session) in state.ai_sessions.iter() {
-            let (busy, queued) = (session.is_busy(), session.queued_len());
             let Some(info) = state.ai_rooms.get_mut(room_id) else { continue };
+            let (busy, queued) = (session.is_busy(), session.queued_len() + info.pending_member_prompts.len());
             if info.status_busy != busy || info.status_queued != queued {
                 info.status_busy = busy;
                 info.status_queued = queued;
@@ -8392,10 +8505,6 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
         ui.redraw(cx);
     }
 
-    // 4. Emit at most one coalesced turn snapshot per room, spaced under the
-    //    homeserver's state-event rate limit. Any room whose write is still
-    //    in flight (or cooling down) keeps the flush timer armed.
-    flush_pending_ai_turns(cx);
 }
 
 /// Whether an AI room's profile declares one permission group: it does if any
@@ -8466,6 +8575,32 @@ fn ai_capability_verdict(
 /// a first use parks the call behind the permission prompt until the user
 /// answers.
 #[cfg(unix)]
+fn ai_read_authorization(
+    room_id: &OwnedRoomId,
+    kind: &ReadToolKind,
+    context: &a2app_core::information_flow::ContextId,
+    permissions: &PermissionStore,
+) -> Option<matrix::policy::MatrixAuthorization> {
+    let cap = kind.capability()?;
+    let mut auth = matrix::policy::MatrixAuthorization::new(
+        &agent_subject(room_id.as_str()), cap.id, Some(room_id.as_str()), permissions,
+    ).with_flow(context.clone());
+    auth.target_room = Some(match kind {
+        ReadToolKind::OtherRoom { room, .. } => room.clone(),
+        ReadToolKind::SpaceInfo { space } | ReadToolKind::SpaceRooms { space } => space.clone(),
+        _ => room_id.to_string(),
+    });
+    if let ReadToolKind::SpaceRooms { space } = kind {
+        // The hierarchy service reviews the immutable query before its first
+        // page, and later pages retain this capability and scope proof.
+        auth = auth.with_payload(serde_json::json!({ "space_id": space }));
+    } else if let ReadToolKind::Older { before, limit } = kind {
+        auth = auth.with_payload(serde_json::json!({ "room_id": room_id, "before": before, "limit": limit }));
+    }
+    Some(auth)
+}
+
+#[cfg(unix)]
 fn run_ai_read_tool(
     cx: &mut Cx,
     ui: &WidgetRef,
@@ -8479,23 +8614,14 @@ fn run_ai_read_tool(
         _ => room_id.as_str(),
     };
     let flow_context = match super::information_flow::prepare_agent(room_id.as_str()).and_then(|context| {
-        // Caller-controlled identifiers and pagination can be sent to the server.
-        // Directory reads are the agent's own map, not an output into a target
-        // room, so they need no room-output rule.
-        if !is_directory_kind(&kind) {
-            super::information_flow::ensure_room_output(&context, target)?;
-        }
+        // Reading cached data sends nothing to room members. Any remote
+        // fallback checks the actual homeserver immediately before the SDK call.
         // The directory tools carry one `RoomDirectory` source (and its
         // untrusted influence) instead of one source per listed room, so one
         // provider rule covers the whole directory and other recipients do not
         // inherit every listed room. Everything else labels its target room.
         if is_directory_kind(&kind) {
-            let source = super::information_flow::directory_source(&context);
-            let influence = a2app_core::information_flow::Influence::RoomDirectory {
-                account: super::information_flow::context_account(&context).into(),
-            };
-            a2app_core::information_flow::add_sources(&context, [source])?;
-            a2app_core::information_flow::add_influences(&context, [influence])?;
+            super::information_flow::record_directory_response(&context)?;
         } else {
             let source = super::information_flow::room_source(&context, target);
             a2app_core::information_flow::add_sources(&context, [source])?;
@@ -8621,22 +8747,11 @@ fn run_ai_read_tool(
             with_a2app(|state| {
                 state.ai_reads.insert(id, (room_id.clone(), kind.clone(), answer));
             });
-            // A directory read (`list_rooms` / `list_spaces` / space info) is
-            // the agent's own map, not an output into each listed room. Passing
-            // an authorization would make `room_access_allowed` run the flow
-            // check per listed room (`auth.check_flow(Some(room), Read)`),
-            // which requires the label to be allowed to reach every room and so
-            // filters the whole list away. The capability verdict above already
-            // gated the directory as a whole.
-            let authorization = if is_directory_kind(&kind) {
-                None
-            } else {
-                with_a2app(|state| {
-                    let mut auth = matrix::policy::MatrixAuthorization::new(&subject, cap.id, Some(room_id.as_str()), &state.permissions).with_flow(flow_context.clone());
-                    auth.target_room = target_room.as_ref().map(ToString::to_string).or_else(|| Some(room_id.to_string()));
-                    auth
-                })
-            };
+            // Collection consent starts the read; its authorization still
+            // filters every directory row and rechecks current user consent.
+            let authorization = with_a2app(|state| {
+                ai_read_authorization(room_id, &kind, &flow_context, &state.permissions)
+            }).flatten();
             submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::ToolRead {
                 id,
                 room_id: room_id.clone(),
@@ -9212,7 +9327,7 @@ fn park_exact_review_if_needed(
         room_id: room_id.clone(), context, epoch, action, payload, expected, request_id, info,
         resume: ExactResume::Job(job),
     }));
-    show_next_exact_review(cx, ui);
+    show_next_permission_prompt(cx, ui);
     None
 }
 
@@ -9245,9 +9360,10 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
     let recorded = super::information_flow::agent_context(room_id.as_str()).and_then(|context| {
         super::information_flow::current_context(&context)?;
         match &job {
-            SessionJob::ReadTool { kind: ReadToolKind::OtherRoom { room, .. }, .. }
-            | SessionJob::ReadTool { kind: ReadToolKind::SpaceInfo { space: room }, .. }
-            | SessionJob::ReadTool { kind: ReadToolKind::SpaceRooms { space: room }, .. } => {
+            SessionJob::ReadTool { kind, .. } if is_directory_kind(kind) => {
+                super::information_flow::record_directory_response(&context)?;
+            }
+            SessionJob::ReadTool { kind: ReadToolKind::OtherRoom { room, .. }, .. } => {
                 a2app_core::information_flow::add_sources(&context, [super::information_flow::room_source(&context, room)])?;
             }
             SessionJob::LaunchApp { app_id, .. } => {
@@ -9335,6 +9451,19 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
     }
 }
 
+/// Resolves exactly the room-local tool name that both task grants and an
+/// invocation check. A raw name is accepted only when it is unambiguous.
+#[cfg(unix)]
+fn canonical_app_tool_name(state: &A2AppState, room_id: &OwnedRoomId, tool: &str) -> Option<String> {
+    if let Some(registration) = state.app_tools.get(tool) {
+        return (&registration.room_id == room_id).then(|| registration.full_name.clone());
+    }
+    let mut matches = state.app_tools.values()
+        .filter(|registration| &registration.room_id == room_id && registration.raw_name == tool);
+    let first = matches.next()?;
+    matches.next().is_none().then(|| first.full_name.clone())
+}
+
 /// Gate 2 for a mini-app tool: an invocation — whether the model called the
 /// tool directly or through the stable `call_mini_app_tool` bridge — is
 /// granted per tool for this room's AI; first use parks behind a prompt that
@@ -9363,21 +9492,7 @@ fn run_mini_app_tool_call(
     // list exposes `app_tic-tac-toe_ttt_play`, and the model should not have
     // to know which is which. A raw name matching more than one tool in the
     // room is ambiguous and refused rather than guessed at.
-    let resolved_tool: Option<String> =
-        if with_a2app(|state| state.app_tools.contains_key(&tool)).unwrap_or(false) {
-            Some(tool.clone())
-        } else {
-            with_a2app(|state| {
-                let mut matches = state
-                    .app_tools
-                    .values()
-                    .filter(|reg| &reg.room_id == room_id && reg.raw_name == tool)
-                    .map(|reg| reg.full_name.clone());
-                let first = matches.next()?;
-                if matches.next().is_none() { Some(first) } else { None }
-            })
-            .flatten()
-        };
+    let resolved_tool = with_a2app(|state| canonical_app_tool_name(state, room_id, &tool)).flatten();
     let Some(tool) = resolved_tool else {
         let reason = format!(
             "There is no mini-app tool `{tool}` registered in this room. \
@@ -9554,7 +9669,7 @@ fn run_app_tool_invocation(
                     room_id: room_id.clone(), context, epoch, action, payload: exact_payload, expected, request_id, info,
                     resume: ExactResume::AppTool { tool, arguments, display_name, answer },
                 }));
-                show_next_exact_review(cx, ui);
+                show_next_permission_prompt(cx, ui);
                 return;
             }
             let _ = answer.send(Err(super::information_flow::with_task_reask_hint(error)));
@@ -10082,9 +10197,9 @@ fn final_write_landed(room_id: &OwnedRoomId, token: u64) {
 }
 
 /// Revokes a closed turn's grants once its `Done` snapshot is no longer queued,
-/// every outstanding final-write token has landed, and no newer turn has taken
-/// over the room's ledger. A newer turn's own close revokes whatever both turns
-/// applied, so this leaves the ledger alone when an active turn exists.
+/// every outstanding final-write token has landed. The host holds the next
+/// member turn until this rollback completes, so a late activity notification
+/// cannot retain the closed turn's grants by opening a stray turn card.
 ///
 /// A dead session's teardown waits here too: its flow context must outlive the
 /// writes it still has queued (`Gone`).
@@ -10093,17 +10208,13 @@ fn settle_closed_turn(room_id: &OwnedRoomId) {
     let (revoke, retire) = with_a2app(|state| {
         let info = state.ai_rooms.get_mut(room_id)?;
         if !info.final_writes_pending_revoke
-            || info.final_turn_key.is_some()
+            || !info.pending_final_turns.is_empty()
             || !info.pending_final_writes.is_empty()
         {
             return Some((false, false));
         }
         info.final_writes_pending_revoke = false;
         info.final_writes_deadline = None;
-        // A newer turn owns the ledger now; its own close revokes it.
-        if info.active_turn.is_some() {
-            return Some((false, false));
-        }
         Some((true, info.retire_after_final_writes))
     })
     .flatten()
@@ -10127,7 +10238,7 @@ fn settle_closed_turn(room_id: &OwnedRoomId) {
 ///
 /// When `revoke_grants` is false, the turn's task grants are kept until its
 /// final writes land: this queues the `Done` snapshot (tracked by
-/// [`AiRoomInfo::final_turn_key`] until the flush submits it), and the caller
+/// [`AiRoomInfo::pending_final_turns`] until the flush submits it), and the caller
 /// finishes with [`settle_closed_turn`] after it has queued the turn's reply or
 /// error/stopped row. Those later writes register their own tokens, so the last
 /// one to land revokes. `revoke_grants` true revokes at once, for the rare
@@ -10144,7 +10255,7 @@ fn close_active_turn(room_id: &OwnedRoomId, revoke_grants: bool) {
         turn.seq = turn.seq.saturating_add(1);
         if !revoke_grants {
             info.final_writes_pending_revoke = true;
-            info.final_turn_key = Some(turn.key.clone());
+            info.pending_final_turns.insert(turn.key.clone());
             info.final_writes_deadline = Some(Instant::now() + FINAL_WRITE_FAILSAFE);
         }
         Some((
@@ -10252,7 +10363,7 @@ fn flush_pending_ai_turns(cx: &mut Cx) {
             })
             .map(|(room_id, info)| {
                 info.pending_final_writes.clear();
-                info.final_turn_key = None;
+                info.pending_final_turns.clear();
                 room_id.clone()
             })
             .collect()
@@ -10305,10 +10416,7 @@ fn flush_pending_ai_turns(cx: &mut Cx) {
                 }
                 // This is the closed turn's final snapshot: consume the
                 // marker so its write result is matched to the final tally.
-                let final_turn = info.final_turn_key.as_deref() == Some(key.as_str());
-                if final_turn {
-                    info.final_turn_key = None;
-                }
+                let final_turn = info.pending_final_turns.remove(&key);
                 info.ai_turn_in_flight = true;
                 info.last_ai_turn_post = Some(now);
                 to_post.push((room_id.clone(), key, content, final_turn));
@@ -10353,7 +10461,10 @@ fn post_ai_state_event(
         with_a2app(|state| {
             if let Some(info) = state.ai_rooms.get_mut(room_id) {
                 info.ai_turn_in_flight = false;
+                info.ai_turn_write_id = None;
                 info.pending_ai_turns.clear();
+                info.pending_final_turns.clear();
+                info.anchor_in_flight = None;
             }
         });
         return None;
@@ -10367,7 +10478,10 @@ fn post_ai_state_event(
             with_a2app(|state| {
                 if let Some(info) = state.ai_rooms.get_mut(room_id) {
                     info.ai_turn_in_flight = false;
+                    info.ai_turn_write_id = None;
                     info.pending_ai_turns.clear();
+                    info.pending_final_turns.clear();
+                    info.anchor_in_flight = None;
                 }
             });
             return None;
@@ -10377,10 +10491,30 @@ fn post_ai_state_event(
         Ok(json) => json,
         Err(e) => {
             log!("AI Rooms: couldn't serialize an {event_type} state row: {e}");
+            if event_type == AI_TURN_EVENT_TYPE {
+                with_a2app(|state| {
+                    if let Some(info) = state.ai_rooms.get_mut(room_id) {
+                        info.ai_turn_in_flight = false;
+                        info.ai_turn_write_id = None;
+                        if let Some(key) = info.anchor_in_flight.take()
+                            && info.first_posted_turn.as_deref() == Some(key.as_str())
+                        {
+                            info.first_posted_turn = None;
+                        }
+                    }
+                });
+            }
             return None;
         }
     };
     let write_id = NEXT_AI_WRITE_ID.fetch_add(1, Ordering::Relaxed);
+    if event_type == AI_TURN_EVENT_TYPE {
+        with_a2app(|state| {
+            if let Some(info) = state.ai_rooms.get_mut(room_id) {
+                info.ai_turn_write_id = Some(write_id);
+            }
+        });
+    }
     submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::PostAiStateEvent {
         room_id: room_id.clone(),
         event_type: event_type.to_string(),
@@ -10411,10 +10545,10 @@ fn post_ai_reply(room_id: &OwnedRoomId, text: String, answer_id: Option<u64>) {
         };
         log!("AI Rooms: refusing to post an ai_reply to {room_id}: {reason}");
         // The reply could not even be queued. A natural reply has no worker
-        // result to release the turn's task grants, so drop them here; a
+        // result to release a token. Settle the other final writes; a
         // parked `send_message` is answered below and its turn keeps them.
         if answer_id.is_none() {
-            revoke_task_grants(room_id);
+            settle_closed_turn(room_id);
         }
         if let Some(id) = answer_id
             && let Some((_, _, answer, _)) = with_a2app(|state| state.ai_replies.remove(&id)).flatten()
@@ -10449,9 +10583,11 @@ fn post_ai_reply(room_id: &OwnedRoomId, text: String, answer_id: Option<u64>) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    let write_id = NEXT_AI_WRITE_ID.fetch_add(1, Ordering::Relaxed);
     submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::PostReply {
         room_id: room_id.clone(),
         answer_id,
+        write_id,
         flow_epoch: flow_context.as_ref().ok().and_then(|context| a2app_core::information_flow::context_epoch(context).ok()).unwrap_or(0),
         flow_context: flow_context.expect("checked above"),
         content: AiReplyContent {
@@ -10471,7 +10607,7 @@ fn post_ai_reply(room_id: &OwnedRoomId, text: String, answer_id: Option<u64>) {
     // the write result lands (see [`AiRoomAction::PostReplyResult`]). A parked
     // `send_message` reply belongs to a still-live turn and is not counted.
     if answer_id.is_none() {
-        register_final_write(room_id, FINAL_REPLY_WRITE_ID);
+        register_final_write(room_id, write_id);
     }
 }
 
@@ -11169,6 +11305,7 @@ View{note := Label{text:"waiting"}}
         info.status_busy = true;
         info.status_queued = 3;
         info.ai_turn_in_flight = true;
+        info.ai_turn_write_id = Some(17);
         info.anchor_in_flight = Some("old-turn".into());
         info.active_turn = Some(ActiveTurn {
             key: "old-turn".into(), tool_calls: Vec::new(), thinking: true, seq: 1, created_at: 1,
@@ -11185,6 +11322,7 @@ View{note := Label{text:"waiting"}}
         assert!(info.pending_ai_turns.is_empty(), "a new activation cannot publish old snapshots");
         assert!(info.pending_tool_calls.is_empty());
         assert!(!info.ai_turn_in_flight && info.anchor_in_flight.is_none());
+        assert!(info.ai_turn_write_id.is_none());
         assert!(!info.posted_by_tool_this_turn && !info.status_busy && info.status_queued == 0);
         assert!(info.session_on, "the next member prompt may start a fresh session");
         assert_eq!(info.cursor, Some(cursor), "already forwarded messages must not be replayed");
@@ -11258,6 +11396,125 @@ View{note := Label{text:"waiting"}}
 
     #[cfg(unix)]
     #[test]
+    fn directory_defaults_preserve_saved_ask_and_narrow_or_withdrawn_choices() {
+        let room: OwnedRoomId = SOURCE.try_into().unwrap();
+        let subject = agent_subject(SOURCE);
+        for cap_id in a2app_core::task_grants::DIRECTORY_CAP_IDS {
+            let cap = a2app_core::capabilities::by_id(cap_id).unwrap();
+            let group = cap.group.unwrap();
+            for choice in 0..6 {
+                let mut permissions = PermissionStore::default();
+                match choice {
+                    0 => permissions.set(&subject, group, GrantState::Ask),
+                    1 => permissions.ask_again(&subject, group),
+                    4 => permissions.grant_until(&subject, group, 0),
+                    5 => permissions.grant_once(&subject, group),
+                    _ => {
+                        let grant = permissions.grant_scoped(&subject, group, Some(cap.id),
+                            RoomScope::room(TARGET), GrantDuration::Always, None).unwrap();
+                        if choice == 3 { permissions.remove_scoped_grant(grant); }
+                    }
+                }
+                apply_directory_capability_defaults(&mut permissions, &room);
+                assert!(!permissions.scoped_grants(&subject).iter().any(|grant|
+                    grant.capability.as_deref() == Some(cap.id) && grant.scope == RoomScope::AllRooms),
+                    "{cap_id}: defaults must not broaden saved choice {choice}");
+                if choice == 5 { permissions.clear_once_for(&subject); }
+                assert_ne!(permissions.effective_capability_for_in_context(
+                    &subject, ai_room_declares_perm, ai_room_declares_cap, cap,
+                    PermissionContext { origin_room: Some(SOURCE), target_room: Some(SPACE) },
+                ), Effective::Granted, "{cap_id}: saved choice {choice} must still gate other rooms");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn space_directory_dispatch_keeps_only_directory_provenance_and_query_authorization() {
+        use a2app_core::information_flow::{self as flow, Source};
+        let account = format!("@space-directory-dispatch-{}:test", std::process::id());
+        let previous_account = super::super::information_flow::TEST_ACCOUNT.with(|a| a.replace(Some(account)));
+        let previous_state = A2APP.with(|state| state.replace(None));
+        initialize_state(AppRegistry::new(Vec::new()), PermissionStore::default(), A2AppPersistedState::default(), Default::default());
+        let room: OwnedRoomId = SOURCE.try_into().unwrap();
+        let context = super::super::information_flow::begin_agent_session(SOURCE).unwrap();
+        let provider = flow::Recipient::ModelProvider(format!("space-directory-provider-{}", std::process::id()));
+        super::super::information_flow::ensure_agent_default_sharing(
+            &context, SOURCE, Some(match &provider { flow::Recipient::ModelProvider(id) => id, _ => unreachable!() }),
+            None, &mut BTreeSet::new(),
+        );
+        with_a2app(|state| {
+            state.ai_rooms.insert(room.clone(), AiRoomInfo::new(None));
+            apply_directory_capability_defaults(&mut state.permissions, &room);
+        });
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        for kind in [ReadToolKind::SpaceInfo { space: SPACE.into() }, ReadToolKind::SpaceRooms { space: SPACE.into() }] {
+            let (answer, _reply) = std::sync::mpsc::channel();
+            execute_session_job(&mut cx, &WidgetRef::empty(), &room, SessionJob::ReadTool { kind: kind.clone(), answer });
+            assert!(with_a2app(|state| state.ai_reads.values().any(|(_, dispatched, _)|
+                read_tool_name(dispatched) == read_tool_name(&kind))).unwrap(), "the directory read was dispatched");
+            let labels = flow::labels(&context).unwrap();
+            assert!(labels.contains(&super::super::information_flow::directory_source(&context)));
+            assert!(!labels.contains(&Source::Room { account: context.account().into(), room: SPACE.into() }));
+            assert!(flow::ensure_allowed(&context, &provider).is_ok(), "directory tools must not block the next model call");
+            let auth = with_a2app(|state| ai_read_authorization(&room, &kind, &context, &state.permissions)).flatten().unwrap();
+            assert!(with_a2app(|state| auth.permits_request(&state.permissions)).unwrap());
+            if matches!(kind, ReadToolKind::SpaceRooms { .. }) {
+                assert_eq!(auth.flow_payload, Some(serde_json::json!({ "space_id": SPACE })));
+            }
+        }
+        let _ = flow::remove_context(&context);
+        A2APP.with(|state| { state.replace(previous_state); });
+        super::super::information_flow::TEST_ACCOUNT.with(|a| { a.replace(previous_account); });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_result_delivery_obeys_selected_scope_and_current_denials() {
+        use a2app_core::information_flow as flow;
+        let account = format!("@directory-delivery-{}:test", std::process::id());
+        let previous_account = super::super::information_flow::TEST_ACCOUNT.with(|a| a.replace(Some(account)));
+        let previous_state = A2APP.with(|state| state.replace(None));
+        initialize_state(AppRegistry::new(Vec::new()), PermissionStore::default(), A2AppPersistedState::default(), Default::default());
+        let room: OwnedRoomId = SOURCE.try_into().unwrap();
+        let context = super::super::information_flow::begin_agent_session(SOURCE).unwrap();
+        let cap = a2app_core::capabilities::by_id("matrix.rooms.list").unwrap();
+        let subject = agent_subject(SOURCE);
+        with_a2app(|state| {
+            state.permissions.grant_scoped(&subject, cap.group.unwrap(), Some(cap.id),
+                RoomScope::room(TARGET), GrantDuration::Always, None).unwrap();
+        });
+        let auth = with_a2app(|state| ai_read_authorization(&room, &ReadToolKind::ListRooms, &context, &state.permissions)).flatten().unwrap();
+        let response = serde_json::json!({ "rooms": [
+            { "room_id": TARGET, "name": "Allowed" }, { "room_id": SPACE, "name": "Private" },
+        ] }).to_string();
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        for denial in 0..3 {
+            let (answer, reply) = std::sync::mpsc::channel();
+            with_a2app(|state| {
+                if denial == 1 { state.permissions.set_capability(&subject, cap.id, GrantState::Denied); }
+                if denial == 2 {
+                    state.permissions.set_capability(&subject, cap.id, GrantState::Ask);
+                    state.permissions.set(&subject, cap.group.unwrap(), GrantState::Denied);
+                }
+                state.ai_reads.insert(99, (room.clone(), ReadToolKind::ListRooms, answer));
+            });
+            apply_ai_room_action(&mut cx, &WidgetRef::empty(), AiRoomAction::ToolReadResult {
+                id: 99, result: Ok(response.clone()), authorization: Some(auth.clone()),
+            });
+            let result = reply.try_recv().unwrap();
+            if denial == 0 {
+                let value: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+                assert_eq!(value["rooms"], serde_json::json!([{ "room_id": TARGET, "name": "Allowed" }]));
+            } else { assert!(result.is_err(), "a current directory denial must win over captured consent"); }
+        }
+        let _ = flow::remove_context(&context);
+        A2APP.with(|state| { state.replace(previous_state); });
+        super::super::information_flow::TEST_ACCOUNT.with(|a| { a.replace(previous_account); });
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn session_jobs_expose_the_worker_exact_action_and_payload() {
         let room: OwnedRoomId = SOURCE.try_into().unwrap();
         let (answer, _) = std::sync::mpsc::channel();
@@ -11288,6 +11545,158 @@ View{note := Label{text:"waiting"}}
         assert!(info.items[0].detail.contains(TARGET));
         assert!(info.items[0].detail.contains("hello"));
         assert!(info.items[0].grantable && info.items[0].checked, "the exact item starts checked");
+    }
+
+    #[cfg(unix)]
+    struct ModalTestGuard {
+        previous_state: Option<A2AppState>,
+        previous_account: Option<String>,
+        contexts: Vec<a2app_core::information_flow::ContextId>,
+    }
+
+    #[cfg(unix)]
+    impl ModalTestGuard {
+        fn new(name: &str) -> Self {
+            let previous_state = A2APP.with(|state| state.replace(None));
+            let account = format!("modal-{name}-{}", std::process::id());
+            let previous_account = super::super::information_flow::TEST_ACCOUNT.with(|a| a.replace(Some(account)));
+            let mut guard = Self { previous_state, previous_account, contexts: Vec::new() };
+            initialize_state(AppRegistry::new(Vec::new()), PermissionStore::default(), A2AppPersistedState::default(), Default::default());
+            for room in [SOURCE, TARGET] {
+                guard.contexts.push(super::super::information_flow::prepare_agent(room).unwrap());
+            }
+            guard
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ModalTestGuard {
+        fn drop(&mut self) {
+            for context in &self.contexts { let _ = a2app_core::information_flow::remove_context(context); }
+            A2APP.with(|state| { state.replace(self.previous_state.take()); });
+            super::super::information_flow::TEST_ACCOUNT.with(|a| { a.replace(self.previous_account.take()); });
+        }
+    }
+
+    #[cfg(unix)]
+    fn modal_task_fixture(task_id: u64, answer: Sender<Result<String, String>>) -> TaskPrompt {
+        use a2app_core::task_grants::{ItemOrigin, PlanAction, PlanItem};
+        let context = super::super::information_flow::agent_context(SOURCE).unwrap();
+        let epoch = a2app_core::information_flow::context_epoch(&context).unwrap();
+        let mut plan = TaskPlan {
+            task_id,
+            subject: agent_subject(SOURCE),
+            context, epoch,
+            title: "Read a status page".into(),
+            explanation: "I want to read the status page.".into(),
+            items: vec![PlanItem {
+                id: "website".into(), origin: ItemOrigin::Requested,
+                action: PlanAction::Network { url: "https://status.example.org/".into(), scope: RoomScope::room(SOURCE) },
+                state: ItemState::NeedsGrant, why: None, risk: a2app_core::capabilities::Risk::High,
+            }],
+            flow_dependencies: BTreeMap::new(), plan_hash: [0; 32], needs_fingerprint: [0; 32],
+        };
+        plan.seal();
+        TaskPrompt { room_id: SOURCE.try_into().unwrap(), plan, resume: TaskResume::AgentTool(answer) }
+    }
+
+    #[cfg(unix)]
+    fn modal_exact_fixture(request_id: u64, answer: Sender<Result<String, String>>) -> ExactReviewPrompt {
+        let action = a2app_core::information_flow::SensitiveAction { kind: "matrix.rooms.message.send".into(), target: TARGET.into() };
+        let payload = serde_json::json!({ "room_id": TARGET, "text": "A reviewed message" });
+        let context = super::super::information_flow::agent_context(TARGET).unwrap();
+        let epoch = a2app_core::information_flow::context_epoch(&context).unwrap();
+        ExactReviewPrompt {
+            room_id: TARGET.try_into().unwrap(),
+            context, epoch, info: exact_review_info(&action, &payload), action, payload,
+            expected: Default::default(), request_id,
+            resume: ExactResume::Job(SessionJob::PostRoomMessage { room_id: TARGET.into(), text: "A reviewed message".into(), answer }),
+        }
+    }
+
+    #[cfg(unix)]
+    fn modal_ordinary_fixture() -> PermissionPrompt {
+        PermissionPrompt {
+            id: next_permission_prompt_id(), setup: None, subject: agent_subject(SOURCE),
+            perm: Permission::MatrixRoomRead, parked: Vec::new(), tool: None,
+            flow: None, enable_writes: false, activations: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_task_keeps_its_caller_and_dispatches_a_queued_exact_review_after_answer() {
+        let _restore = ModalTestGuard::new("task-first");
+        let (task_answer, task_reply) = std::sync::mpsc::channel();
+        let (exact_answer, exact_reply) = std::sync::mpsc::channel();
+        let review_id = u64::MAX - 1;
+        with_a2app(|state| {
+            state.active_task = Some(modal_task_fixture(101, task_answer));
+            state.exact_reviews.push_back(modal_exact_fixture(review_id, exact_answer));
+            state.prompts.push_back(modal_ordinary_fixture());
+        });
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let ui = WidgetRef::empty();
+        show_next_exact_review(&mut cx, &ui);
+        permission_batch::show_next_ordinary(&mut cx, &ui);
+        permission_batch::show_next(&mut cx, &ui);
+        with_a2app(|state| {
+            assert_eq!(state.active_task.as_ref().unwrap().plan.task_id, 101);
+            assert!(state.active_exact_review.is_none() && state.active_prompt.is_none());
+            assert_eq!(state.exact_reviews.len(), 1);
+            assert_eq!(state.prompts.len(), 1);
+        });
+        assert!(matches!(task_reply.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        assert!(matches!(exact_reply.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+
+        answer_task_prompt(&mut cx, &ui, TaskPermissionAction::NotNow);
+        let outcome: serde_json::Value = serde_json::from_str(&task_reply.try_recv().unwrap().unwrap()).unwrap();
+        assert_eq!(outcome["task_id"], 101);
+        assert_eq!(outcome["status"], "declined", "the answer must reach the displayed task's caller");
+        with_a2app(|state| {
+            assert!(state.active_task.is_none() && state.active_prompt.is_none());
+            assert_eq!(state.active_exact_review.as_ref().unwrap().request_id, review_id);
+            assert!(state.exact_reviews.is_empty());
+            assert_eq!(state.prompts.len(), 1, "ordinary prompts wait behind the exact review");
+        });
+        assert!(matches!(exact_reply.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_exact_review_keeps_task_and_ordinary_prompts_queued_until_answer() {
+        let _restore = ModalTestGuard::new("exact-first");
+        let (task_answer, task_reply) = std::sync::mpsc::channel();
+        let (exact_answer, exact_reply) = std::sync::mpsc::channel();
+        let review_id = u64::MAX - 2;
+        with_a2app(|state| {
+            state.active_exact_review = Some(modal_exact_fixture(review_id, exact_answer));
+            state.task_prompts.push_back(modal_task_fixture(102, task_answer));
+            state.prompts.push_back(modal_ordinary_fixture());
+        });
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let ui = WidgetRef::empty();
+        show_next_task_prompt(&mut cx, &ui);
+        permission_batch::show_next_ordinary(&mut cx, &ui);
+        permission_batch::show_next(&mut cx, &ui);
+        with_a2app(|state| {
+            assert_eq!(state.active_exact_review.as_ref().unwrap().request_id, review_id);
+            assert!(state.active_task.is_none() && state.active_prompt.is_none());
+            assert_eq!(state.task_prompts.len(), 1);
+            assert_eq!(state.prompts.len(), 1);
+        });
+        assert!(matches!(task_reply.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        assert!(matches!(exact_reply.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+
+        answer_task_prompt(&mut cx, &ui, TaskPermissionAction::NotNow);
+        assert!(exact_reply.try_recv().unwrap().unwrap_err().contains("did not allow"));
+        with_a2app(|state| {
+            assert!(state.active_exact_review.is_none() && state.active_prompt.is_none());
+            assert_eq!(state.active_task.as_ref().unwrap().plan.task_id, 102);
+            assert!(state.task_prompts.is_empty());
+            assert_eq!(state.prompts.len(), 1, "ordinary prompts wait behind the task");
+        });
+        assert!(matches!(task_reply.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
     }
 
     #[cfg(unix)]
@@ -11383,6 +11792,21 @@ View{note := Label{text:"waiting"}}
 
     #[cfg(unix)]
     #[test]
+    fn combining_separately_declined_needs_does_not_reopen_the_prompt() {
+        let mut dismissed = HashMap::new();
+        dismissed.insert((SOURCE.to_string(), [1; 32]), BTreeSet::from(["needs:a".into()]));
+        dismissed.insert((SOURCE.to_string(), [2; 32]), BTreeSet::from(["needs:b".into()]));
+        dismissed.insert((TARGET.to_string(), [3; 32]), BTreeSet::from(["needs:c".into()]));
+        let combined = BTreeSet::from(["needs:a".into(), "needs:b".into()]);
+        assert!(task_plan_is_dismissed(&dismissed, SOURCE, &combined));
+        assert!(!task_plan_is_dismissed(&dismissed, TARGET, &combined));
+        let with_new = BTreeSet::from(["needs:b".into(), "needs:c".into()]);
+        assert!(!task_plan_is_dismissed(&dismissed, SOURCE, &with_new), "another room's decline does not cover a new need");
+        assert!(!task_plan_is_dismissed(&HashMap::new(), SOURCE, &BTreeSet::new()));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn the_turn_anchor_skips_the_adaptive_backoff_but_keeps_the_hard_floor() {
         let backoff = Duration::from_secs(20);
         // No prior post: anything may go now.
@@ -11408,7 +11832,14 @@ View{note := Label{text:"waiting"}}
             epoch: 1,
             title: "t".into(),
             explanation: "e".into(),
-            items: Vec::new(),
+            items: vec![a2app_core::task_grants::PlanItem {
+                id: "n1".into(), origin: a2app_core::task_grants::ItemOrigin::Requested,
+                action: a2app_core::task_grants::PlanAction::Network {
+                    url: "https://example.org/".into(), scope: RoomScope::room(SOURCE),
+                },
+                state: ItemState::NeedsGrant, why: None, risk: a2app_core::capabilities::Risk::High,
+            }],
+            flow_dependencies: BTreeMap::new(),
             plan_hash: [0; 32],
             needs_fingerprint: [9; 32],
         };
@@ -11427,6 +11858,7 @@ View{note := Label{text:"waiting"}}
     #[cfg(unix)]
     #[test]
     fn revoking_a_turn_drops_its_grants_dismissals_and_request_budget() {
+        let _published_grants = PublishedGrantsTestGuard::new();
         initialize_state(
             AppRegistry::new(Vec::new()),
             PermissionStore::default(),
@@ -11481,12 +11913,14 @@ View{note := Label{text:"waiting"}}
                 task_id: 1, subject: "s".into(),
                 context: a2app_core::information_flow::ContextId::Agent { account: "a".into(), room: SOURCE.into() },
                 epoch: 1, title: "t".into(), explanation: "e".into(),
-                plan_hash: [0; 32], needs_fingerprint: [0; 32], items,
+                plan_hash: [0; 32], needs_fingerprint: [0; 32], items, flow_dependencies: BTreeMap::new(),
             }
         };
         assert_eq!(settled_task_receipt(&plan(vec![ItemState::AlreadyAllowed])), (true, "Nothing new to allow"));
         assert_eq!(settled_task_receipt(&plan(vec![ItemState::Blocked(TaskReason::BlockedByRoomPolicy)])),
             (false, "Blocked by room policy"));
+        assert_eq!(settled_task_receipt(&plan(vec![ItemState::Blocked(TaskReason::BlockedByPermission)])),
+            (false, "Blocked by permission settings"));
         assert_eq!(settled_task_receipt(&plan(vec![ItemState::NotOffered(TaskReason::NotOffered)])),
             (false, "Not offered"));
         assert_eq!(settled_task_receipt(&plan(vec![ItemState::AlreadyAllowed, ItemState::NotOffered(TaskReason::NotOffered)])),
@@ -11574,6 +12008,214 @@ View{note := Label{text:"waiting"}}
         super::super::information_flow::TEST_ACCOUNT.with(|a| { a.replace(previous_account); });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn mini_app_tool_names_resolve_only_unambiguous_tools_in_the_requested_room() {
+        let previous_state = A2APP.with(|state| state.replace(None));
+        initialize_state(AppRegistry::new(Vec::new()), PermissionStore::default(), A2AppPersistedState::default(), Default::default());
+        let room: OwnedRoomId = SOURCE.try_into().unwrap();
+        let other: OwnedRoomId = TARGET.try_into().unwrap();
+        with_a2app(|state| {
+            let registration = |full: &str, target: &OwnedRoomId| AppToolRegistration {
+                full_name: full.into(), raw_name: "play".into(), room_id: target.clone(),
+                app_id: "game".into(), heap_key: 1, description: String::new(),
+                schema: serde_json::json!({}), args: Vec::new(),
+            };
+            state.app_tools.insert("app_game_play".into(), registration("app_game_play", &room));
+            state.app_tools.insert("app_other_play".into(), registration("app_other_play", &other));
+            assert_eq!(canonical_app_tool_name(state, &room, "play").as_deref(), Some("app_game_play"));
+            assert_eq!(canonical_app_tool_name(state, &room, "app_game_play").as_deref(), Some("app_game_play"));
+            assert_eq!(canonical_app_tool_name(state, &room, "app_other_play"), None);
+            assert_eq!(canonical_app_tool_name(state, &room, "missing"), None);
+            state.app_tools.insert("app_second_play".into(), registration("app_second_play", &room));
+            assert_eq!(canonical_app_tool_name(state, &room, "play"), None);
+            assert_eq!(canonical_app_tool_name(state, &room, "app_game_play").as_deref(), Some("app_game_play"));
+        });
+        A2APP.with(|state| { state.replace(previous_state); });
+    }
+
+    #[cfg(unix)]
+    struct PublishedGrantsTestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl PublishedGrantsTestGuard {
+        fn new() -> Self {
+            Self { _lock: super::super::effect_review::TEST_LOCK.lock().unwrap() }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PublishedGrantsTestGuard {
+        fn drop(&mut self) {
+            let permissions = PermissionStore::default();
+            a2app_core::permissions::publish_snapshot(permissions.snapshot(&AppRegistry::new(Vec::new())));
+            matrix::publish_permission_policy(&permissions);
+            matrix::policy::publish_effect_space_roots(BTreeSet::new());
+        }
+    }
+
+    #[cfg(unix)]
+    struct FinalWriteTestState {
+        room: OwnedRoomId,
+        context: a2app_core::information_flow::ContextId,
+        previous_state: Option<A2AppState>,
+        previous_account: Option<String>,
+        _published_grants: PublishedGrantsTestGuard,
+    }
+
+    #[cfg(unix)]
+    impl FinalWriteTestState {
+        fn new(name: &str) -> Self {
+            let published_grants = PublishedGrantsTestGuard::new();
+            let account = format!("{name}-{}", std::process::id());
+            let previous_account = super::super::information_flow::TEST_ACCOUNT.with(|a| a.replace(Some(account)));
+            let previous_state = A2APP.with(|state| state.replace(None));
+            let mut permissions = PermissionStore::default();
+            permissions.set_matrix_write(true);
+            initialize_state(AppRegistry::new(Vec::new()), permissions, A2AppPersistedState::default(), Default::default());
+            let room: OwnedRoomId = SOURCE.try_into().unwrap();
+            let context = super::super::information_flow::prepare_agent(SOURCE).unwrap();
+            with_a2app(|state| {
+                state.ai_rooms.insert(room.clone(), AiRoomInfo::new(None));
+                state.task_ledger.insert(a2app_core::task_grants::AppliedTask {
+                    task_id: 1, subject: agent_subject(SOURCE), context: context.clone(), epoch: 1,
+                    title: "task".into(), plan_hash: [0; 32], grants: Vec::new(), item_states: BTreeMap::new(),
+                });
+            });
+            Self { room, context, previous_state, previous_account, _published_grants: published_grants }
+        }
+
+        fn close(&self, key: &str) {
+            with_a2app(|state| state.ai_rooms.get_mut(&self.room).unwrap().active_turn = Some(ActiveTurn {
+                key: key.into(), tool_calls: Vec::new(), thinking: false, seq: 0, created_at: 0,
+            }));
+            close_active_turn(&self.room, false);
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FinalWriteTestState {
+        fn drop(&mut self) {
+            let _ = a2app_core::information_flow::remove_context(&self.context);
+            A2APP.with(|state| { state.replace(self.previous_state.take()); });
+            super::super::information_flow::TEST_ACCOUNT.with(|a| { a.replace(self.previous_account.take()); });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn turn_rollback_immediately_revokes_worker_permission_without_restarting_context() {
+        let fixture = FinalWriteTestState::new("task-worker-rollback");
+        let subject = agent_subject(SOURCE);
+        let capability = a2app_core::capabilities::by_id("matrix.rooms.messages.read").unwrap();
+        let epoch = a2app_core::information_flow::context_epoch(&fixture.context).unwrap();
+        let authorization = with_a2app(|state| {
+            let grant = state.permissions.grant_scoped(&subject, capability.group.unwrap(), Some(capability.id),
+                RoomScope::room(TARGET), GrantDuration::RobrixSession, Some(SOURCE)).unwrap();
+            state.task_ledger.insert(task_grants::AppliedTask {
+                task_id: 2, subject: subject.clone(), context: fixture.context.clone(), epoch,
+                title: "Read another room".into(), plan_hash: [0; 32],
+                grants: vec![task_grants::GrantRef::Scoped(grant)], item_states: BTreeMap::new(),
+            });
+            let mut authorization = matrix::MatrixAuthorization::new(&subject, capability.id, Some(SOURCE), &state.permissions)
+                .with_flow(fixture.context.clone());
+            authorization.target_room = Some(TARGET.into());
+            authorization
+        }).unwrap();
+        publish_current_grants();
+        assert!(authorization.check_current_permission().is_ok(), "the worker sees the applied task grant");
+
+        revoke_task_grants(&fixture.room);
+
+        assert!(authorization.check_context().is_ok(), "the still-live agent retains its activation");
+        assert_eq!(a2app_core::information_flow::context_epoch(&fixture.context).unwrap(), epoch);
+        assert!(authorization.check_current_permission().is_err(), "the captured worker loses the revoked consent immediately");
+        assert!(with_a2app(|state| state.task_ledger.is_empty()).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn natural_replies_have_distinct_tokens_and_stale_results_cannot_release_a_new_reply() {
+        let fixture = FinalWriteTestState::new("natural-reply-tokens");
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let ui = WidgetRef::empty();
+        close_active_turn(&fixture.room, false);
+        post_ai_reply(&fixture.room, "first".into(), None);
+        let first = with_a2app(|state| *state.ai_rooms[&fixture.room].pending_final_writes.first().unwrap()).unwrap();
+        close_active_turn(&fixture.room, false);
+        post_ai_reply(&fixture.room, "second".into(), None);
+        let second = with_a2app(|state| {
+            let writes = &state.ai_rooms[&fixture.room].pending_final_writes;
+            assert_eq!(writes.len(), 2);
+            *writes.iter().find(|&&id| id != first).unwrap()
+        }).unwrap();
+        for _ in 0..2 {
+            apply_ai_room_action(&mut cx, &ui, AiRoomAction::PostReplyResult {
+                room_id: fixture.room.clone(), answer_id: None, write_id: first, result: Ok(()),
+            });
+            assert_eq!(with_a2app(|state| state.ai_rooms[&fixture.room].pending_final_writes.clone()).unwrap(), BTreeSet::from([second]));
+            assert!(with_a2app(|state| !state.task_ledger.is_empty()).unwrap());
+        }
+        apply_ai_room_action(&mut cx, &ui, AiRoomAction::PostReplyResult {
+            room_id: fixture.room.clone(), answer_id: None, write_id: second, result: Ok(()),
+        });
+        assert!(with_a2app(|state| state.task_ledger.is_empty()).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_queued_done_snapshot_keeps_the_grants_until_its_own_completion() {
+        let fixture = FinalWriteTestState::new("queued-done-snapshots");
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let ui = WidgetRef::empty();
+        fixture.close("turn-one");
+        fixture.close("turn-two");
+        assert_eq!(with_a2app(|state| state.ai_rooms[&fixture.room].pending_final_turns.len()).unwrap(), 2);
+        flush_pending_ai_turns(&mut cx);
+        let first = with_a2app(|state| *state.ai_rooms[&fixture.room].pending_final_writes.first().unwrap()).unwrap();
+        apply_ai_room_action(&mut cx, &ui, AiRoomAction::StateEventPosted {
+            room_id: fixture.room.clone(), event_type: AI_TURN_EVENT_TYPE.into(), write_id: first, success: true,
+        });
+        assert!(with_a2app(|state| !state.task_ledger.is_empty()).unwrap(), "the queued second Done still holds the grants");
+        with_a2app(|state| state.ai_rooms.get_mut(&fixture.room).unwrap().last_ai_turn_post = None);
+        flush_pending_ai_turns(&mut cx);
+        let second = with_a2app(|state| {
+            let info = &state.ai_rooms[&fixture.room];
+            assert!(info.pending_final_turns.is_empty());
+            *info.pending_final_writes.first().unwrap()
+        }).unwrap();
+        assert_ne!(first, second);
+        apply_ai_room_action(&mut cx, &ui, AiRoomAction::StateEventPosted {
+            room_id: fixture.room.clone(), event_type: AI_TURN_EVENT_TYPE.into(), write_id: second, success: true,
+        });
+        assert!(with_a2app(|state| state.task_ledger.is_empty()).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refusing_queued_snapshots_clears_their_markers_without_releasing_other_writes() {
+        let fixture = FinalWriteTestState::new("refused-done-snapshots");
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        post_ai_reply(&fixture.room, "pending".into(), None);
+        let reply = with_a2app(|state| *state.ai_rooms[&fixture.room].pending_final_writes.first().unwrap()).unwrap();
+        fixture.close("turn-one");
+        fixture.close("turn-two");
+        with_a2app(|state| state.permissions.set_room_policy(SOURCE, RoomAccess::Write, PolicyDecision::Deny));
+        flush_pending_ai_turns(&mut cx);
+        post_ai_reply(&fixture.room, "refused".into(), None);
+        with_a2app(|state| {
+            let info = &state.ai_rooms[&fixture.room];
+            assert!(info.pending_ai_turns.is_empty());
+            assert!(info.pending_final_turns.is_empty());
+            assert_eq!(info.pending_final_writes, BTreeSet::from([reply]));
+            assert!(!state.task_ledger.is_empty());
+        });
+        final_write_landed(&fixture.room, reply);
+        assert!(with_a2app(|state| state.task_ledger.is_empty()).unwrap());
+    }
+
     /// Item 3's acceptance: a turn that read another room keeps its grants
     /// until the last final write (the `Done` snapshot, an error/stopped row,
     /// the reply) lands, so the whole-label output check those writes need
@@ -11582,6 +12224,7 @@ View{note := Label{text:"waiting"}}
     #[test]
     fn the_turn_grants_survive_until_the_last_final_write_lands() {
         use a2app_core::information_flow as flow;
+        let _published_grants = PublishedGrantsTestGuard::new();
         let account = format!("final-writes-{}", std::process::id());
         let previous_account = super::super::information_flow::TEST_ACCOUNT.with(|a| a.replace(Some(account.clone())));
         let previous_state = A2APP.with(|state| state.replace(None));
@@ -11626,7 +12269,7 @@ View{note := Label{text:"waiting"}}
         flush_pending_ai_turns(&mut cx);
         let token = with_a2app(|state| {
             let info = state.ai_rooms.get(&room_id)?;
-            assert!(info.final_turn_key.is_none(), "the flush consumed the queued Done");
+            assert!(info.pending_final_turns.is_empty(), "the flush consumed the queued Done");
             info.pending_final_writes.iter().next().copied()
         })
         .flatten()
@@ -11657,6 +12300,7 @@ View{note := Label{text:"waiting"}}
     #[cfg(unix)]
     #[test]
     fn closing_a_cardless_turn_keeps_grants_for_the_reply() {
+        let _published_grants = PublishedGrantsTestGuard::new();
         let account = format!("cardless-{}", std::process::id());
         let previous_account = super::super::information_flow::TEST_ACCOUNT.with(|a| a.replace(Some(account.clone())));
         let previous_state = A2APP.with(|state| state.replace(None));
@@ -11677,11 +12321,12 @@ View{note := Label{text:"waiting"}}
             "a cardless turn must keep its grants until the reply is queued");
         // The reply final write is the only outstanding token; it keeps the
         // grants until it lands.
-        register_final_write(&room_id, FINAL_REPLY_WRITE_ID);
+        let write_id = NEXT_AI_WRITE_ID.fetch_add(1, Ordering::Relaxed);
+        register_final_write(&room_id, write_id);
         settle_closed_turn(&room_id);
         assert!(with_a2app(|state| state.task_ledger.get(9).is_some()).unwrap(),
             "the queued reply keeps the grants until it lands");
-        final_write_landed(&room_id, FINAL_REPLY_WRITE_ID);
+        final_write_landed(&room_id, write_id);
         assert!(with_a2app(|state| state.task_ledger.is_empty()).unwrap(),
             "the landed reply empties the room's ledger");
         A2APP.with(|state| { state.replace(previous_state); });
@@ -11694,6 +12339,7 @@ View{note := Label{text:"waiting"}}
     #[cfg(unix)]
     #[test]
     fn two_final_writes_each_hold_the_grants_until_they_land() {
+        let _published_grants = PublishedGrantsTestGuard::new();
         let previous_state = A2APP.with(|state| state.replace(None));
         initialize_state(AppRegistry::new(Vec::new()), PermissionStore::default(), A2AppPersistedState::default(), Default::default());
         let room_id: OwnedRoomId = SOURCE.try_into().unwrap();
@@ -11725,6 +12371,7 @@ View{note := Label{text:"waiting"}}
     #[cfg(unix)]
     #[test]
     fn a_stuck_final_write_is_released_by_the_failsafe_deadline() {
+        let _published_grants = PublishedGrantsTestGuard::new();
         let previous_state = A2APP.with(|state| state.replace(None));
         initialize_state(AppRegistry::new(Vec::new()), PermissionStore::default(), A2AppPersistedState::default(), Default::default());
         let room_id: OwnedRoomId = SOURCE.try_into().unwrap();
@@ -11749,7 +12396,8 @@ View{note := Label{text:"waiting"}}
 
     /// Withdrawing a held carried-over prompt must not advance the room's
     /// cursor: the message was never delivered, so the next timeline update
-    /// re-forwards it (and re-raises the prompt).    #[cfg(unix)]
+    /// re-forwards it (and re-raises the prompt).
+    #[cfg(unix)]
     #[test]
     fn withdrawing_a_held_carried_prompt_leaves_the_cursor_for_refetch() {
         let previous_state = A2APP.with(|state| state.replace(None));
@@ -11760,7 +12408,7 @@ View{note := Label{text:"waiting"}}
         let context = a2app_core::information_flow::ContextId::Agent { account: "alice".into(), room: SOURCE.into() };
         let plan = TaskPlan {
             task_id: 1, subject: "s".into(), context, epoch: 1, title: "t".into(), explanation: "e".into(),
-            items: Vec::new(), plan_hash: [0; 32], needs_fingerprint: [0; 32],
+            items: Vec::new(), flow_dependencies: BTreeMap::new(), plan_hash: [0; 32], needs_fingerprint: [0; 32],
         };
         with_a2app(|state| {
             state.ai_rooms.insert(room_id.clone(), AiRoomInfo::new(Some(prior.clone())));
@@ -11785,6 +12433,7 @@ View{note := Label{text:"waiting"}}
     #[cfg(unix)]
     #[test]
     fn a_dead_session_waits_for_its_final_writes_before_teardown() {
+        let _published_grants = PublishedGrantsTestGuard::new();
         let previous_state = A2APP.with(|state| state.replace(None));
         initialize_state(AppRegistry::new(Vec::new()), PermissionStore::default(), A2AppPersistedState::default(), Default::default());
         let room_id: OwnedRoomId = SOURCE.try_into().unwrap();
@@ -11810,11 +12459,12 @@ View{note := Label{text:"waiting"}}
         A2APP.with(|state| { state.replace(previous_state); });
     }
 
-    /// A natural reply that lands after a newer turn has started does not
-    /// revoke the room's ledger; the newer turn's close removes every entry.
+    /// A stray late activity card cannot retain a closed turn's grants. The
+    /// next legitimate member turn waits for this rollback before dispatch.
     #[cfg(unix)]
     #[test]
-    fn a_natural_reply_after_a_newer_turn_leaves_the_ledger_to_that_turns_close() {
+    fn a_late_activity_card_cannot_keep_closed_turn_grants_alive() {
+        let _published_grants = PublishedGrantsTestGuard::new();
         let previous_state = A2APP.with(|state| state.replace(None));
         initialize_state(AppRegistry::new(Vec::new()), PermissionStore::default(), A2AppPersistedState::default(), Default::default());
         let room_id: OwnedRoomId = SOURCE.try_into().unwrap();
@@ -11822,8 +12472,7 @@ View{note := Label{text:"waiting"}}
         with_a2app(|state| {
             state.ai_rooms.insert(room_id.clone(), AiRoomInfo::new(None));
             let info = state.ai_rooms.get_mut(&room_id).unwrap();
-            // A newer turn is live, so the older turn's last final write must
-            // not revoke the ledger both turns share.
+            // A late notification opened a card while the final write drained.
             info.active_turn = Some(ActiveTurn {
                 key: "turn-2".into(), tool_calls: Vec::new(), thinking: false, seq: 0, created_at: 0,
             });
@@ -11842,23 +12491,265 @@ View{note := Label{text:"waiting"}}
                 });
             }
         });
-        // The older turn's last final write lands while a newer turn is live:
-        // the newer turn owns the ledger, so nothing is revoked yet.
         final_write_landed(&room_id, 5);
-        assert!(with_a2app(|state| !state.task_ledger.is_empty()).unwrap(),
-            "the newer turn owns the room's ledger");
-        // The newer turn closes: its close removes every ledger entry of the
-        // room, including the older turn's.
-        with_a2app(|state| {
-            if let Some(info) = state.ai_rooms.get_mut(&room_id) {
-                info.active_turn = None;
-                info.final_writes_pending_revoke = true;
-                info.pending_final_writes.clear();
-            }
-        });
-        settle_closed_turn(&room_id);
         assert!(with_a2app(|state| state.task_ledger.is_empty()).unwrap(),
-            "the newer turn's close removes every ledger entry of the room");
+            "a late card must not extend the closed turn's permissions");
         A2APP.with(|state| { state.replace(previous_state); });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_turn_completion_cannot_release_the_replacements_write_gate() {
+        let fixture = FinalWriteTestState::new("stale-turn-write-result");
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let ui = WidgetRef::empty();
+        fixture.close("old-turn");
+        flush_pending_ai_turns(&mut cx);
+        let old = with_a2app(|state| state.ai_rooms[&fixture.room].ai_turn_write_id.unwrap()).unwrap();
+        stop_ai_session(&fixture.room);
+        assert!(with_a2app(|state| state.ai_rooms[&fixture.room].ai_turn_write_id.is_none()).unwrap());
+
+        fixture.close("replacement-turn");
+        with_a2app(|state| state.ai_rooms.get_mut(&fixture.room).unwrap().last_ai_turn_post = None);
+        flush_pending_ai_turns(&mut cx);
+        let replacement = with_a2app(|state| {
+            let info = state.ai_rooms.get_mut(&fixture.room).unwrap();
+            info.ai_turn_backoff = Duration::from_secs(20);
+            info.ai_turn_write_id.unwrap()
+        }).unwrap();
+        assert_ne!(old, replacement);
+        for success in [true, false] {
+            apply_ai_room_action(&mut cx, &ui, AiRoomAction::StateEventPosted {
+                room_id: fixture.room.clone(), event_type: AI_TURN_EVENT_TYPE.into(), write_id: old, success,
+            });
+            with_a2app(|state| {
+                let info = &state.ai_rooms[&fixture.room];
+                assert!(info.ai_turn_in_flight);
+                assert_eq!(info.ai_turn_write_id, Some(replacement));
+                assert_eq!(info.anchor_in_flight.as_deref(), Some("replacement-turn"));
+                assert_eq!(info.first_posted_turn.as_deref(), Some("replacement-turn"));
+                assert_eq!(info.ai_turn_backoff, Duration::from_secs(20));
+            });
+        }
+        // Ordinary activity completions still release their own final token,
+        // while the replacement snapshot keeps the turn's coalescing gate.
+        let activity = post_ai_state_event(&fixture.room, AI_ACTIVITY_EVENT_TYPE, "activity", &serde_json::json!({})).unwrap();
+        register_final_write(&fixture.room, activity);
+        apply_ai_room_action(&mut cx, &ui, AiRoomAction::StateEventPosted {
+            room_id: fixture.room.clone(), event_type: AI_ACTIVITY_EVENT_TYPE.into(), write_id: activity, success: true,
+        });
+        assert!(with_a2app(|state| {
+            let info = &state.ai_rooms[&fixture.room];
+            info.ai_turn_in_flight && info.ai_turn_write_id == Some(replacement)
+                && info.pending_final_writes == BTreeSet::from([replacement])
+        }).unwrap());
+        apply_ai_room_action(&mut cx, &ui, AiRoomAction::StateEventPosted {
+            room_id: fixture.room.clone(), event_type: AI_TURN_EVENT_TYPE.into(), write_id: replacement, success: false,
+        });
+        with_a2app(|state| {
+            let info = &state.ai_rooms[&fixture.room];
+            assert!(!info.ai_turn_in_flight && info.ai_turn_write_id.is_none());
+            assert!(info.anchor_in_flight.is_none() && info.first_posted_turn.is_none());
+            assert_eq!(info.ai_turn_backoff, Duration::from_secs(40));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_snapshot_serialization_failure_releases_its_gate_and_anchor() {
+        struct CannotSerialize;
+        impl serde::Serialize for CannotSerialize {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("fixture failure"))
+            }
+        }
+        let fixture = FinalWriteTestState::new("snapshot-serialization-failure");
+        with_a2app(|state| {
+            let info = state.ai_rooms.get_mut(&fixture.room).unwrap();
+            info.ai_turn_in_flight = true;
+            info.first_posted_turn = Some("failed-turn".into());
+            info.anchor_in_flight = Some("failed-turn".into());
+        });
+        assert!(post_ai_state_event(&fixture.room, AI_TURN_EVENT_TYPE, "failed-turn", &CannotSerialize).is_none());
+        with_a2app(|state| {
+            let info = &state.ai_rooms[&fixture.room];
+            assert!(!info.ai_turn_in_flight && info.ai_turn_write_id.is_none());
+            assert!(info.anchor_in_flight.is_none() && info.first_posted_turn.is_none());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn member_messages_wait_for_final_rollback_before_a_fresh_carried_review() {
+        use a2app_core::information_flow as flow;
+        let fixture = FinalWriteTestState::new("member-turn-final-boundary");
+        let provider = Recipient::ModelProvider("member-turn-provider".into());
+        super::super::information_flow::ensure_agent_default_sharing(
+            &fixture.context, SOURCE, Some("member-turn-provider"), None, &mut BTreeSet::new(),
+        );
+        let private = Source::Room { account: fixture.context.account().into(), room: TARGET.into() };
+        flow::add_sources(&fixture.context, [private.clone()]).unwrap();
+        let plan = build_carried_task_plan(&fixture.room, &fixture.context, &BTreeSet::from([private.clone()]),
+            &provider, None, 2);
+        let approved = plan.items.iter().map(|item| item.id.clone()).collect();
+        let applied = task_grants::apply(&plan, &approved, &mut PermissionStore::default(), &task_grants::GlobalFlowApply).unwrap();
+        with_a2app(|state| state.task_ledger.insert(applied));
+        close_active_turn(&fixture.room, false);
+        post_ai_reply(&fixture.room, "old turn's final reply".into(), None);
+        let prior: OwnedEventId = "$prior:example.org".try_into().unwrap();
+        let texts = vec![
+            ("$first-held:example.org".try_into().unwrap(), "first next turn".into()),
+            ("$second-held:example.org".try_into().unwrap(), "second next turn".into()),
+        ];
+        let token = with_a2app(|state| {
+            let info = state.ai_rooms.get_mut(&fixture.room).unwrap();
+            info.cursor = Some(prior.clone());
+            queue_member_prompts(info, texts.clone());
+            assert!(send_next_member_prompt(info, false, 0, |_| panic!("a new model prompt must wait for final writes")).is_none());
+            assert_eq!(info.cursor, Some(prior.clone()));
+            assert_eq!(info.pending_member_prompts.len(), 2);
+            *info.pending_final_writes.first().unwrap()
+        }).unwrap();
+        assert!(with_a2app(|state| session_has_inflight_tool(state, &fixture.room)).unwrap(),
+            "late host jobs must not spend the preceding turn's grants");
+        assert!(flow::ensure_allowed(&fixture.context, &provider).is_ok());
+        assert!(!hold_carried_permission_prompt(&fixture.room, &texts, &fixture.context, &provider, None, 3));
+        final_write_landed(&fixture.room, token);
+        assert!(flow::ensure_allowed(&fixture.context, &provider).is_err(), "the old turn's sharing was rolled back");
+        assert!(!with_a2app(|state| session_has_inflight_tool(state, &fixture.room)).unwrap());
+        assert!(hold_carried_permission_prompt(&fixture.room, &texts, &fixture.context, &provider, None, 3));
+        with_a2app(|state| {
+            let prompt = state.task_prompts.front().unwrap();
+            assert!(prompt.plan.items.iter().any(|item| matches!(&item.action,
+                task_grants::PlanAction::Flow { source, recipient } if source == &private && recipient == &provider)
+                && item.state == ItemState::NeedsGrant));
+            let TaskResume::UserPrompt { texts: held } = &prompt.resume else { panic!("held member prompt") };
+            assert_eq!(held, &texts);
+            assert_eq!(state.ai_rooms[&fixture.room].cursor, Some(prior));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn member_prompt_dispatch_sends_one_and_keeps_held_or_dead_messages_unforwarded() {
+        let prior: OwnedEventId = "$prior:example.org".try_into().unwrap();
+        let first: OwnedEventId = "$first:example.org".try_into().unwrap();
+        let second: OwnedEventId = "$second:example.org".try_into().unwrap();
+        let texts = vec![(first.clone(), "one".into()), (second.clone(), "two".into())];
+        let mut info = AiRoomInfo::new(Some(prior.clone()));
+        queue_member_prompts(&mut info, texts.clone());
+        queue_member_prompts(&mut info, texts);
+        assert_eq!(info.pending_member_prompts.len(), 2, "timeline rescans do not duplicate held asks");
+        for (busy, queued) in [(true, 0), (false, 1)] {
+            assert!(send_next_member_prompt(&mut info, busy, queued, |_| panic!("a turn or startup prompt is already queued")).is_none());
+            assert_eq!(info.cursor, Some(prior.clone()));
+        }
+        assert!(send_next_member_prompt(&mut info, false, 0, |_| PromptOutcome::Dead).is_none());
+        assert_eq!(info.cursor, Some(prior));
+        assert_eq!(info.pending_member_prompts.len(), 2);
+        let mut sent = Vec::new();
+        assert!(send_next_member_prompt(&mut info, false, 0, |_| PromptOutcome::Queued).is_none());
+        assert_eq!(info.pending_member_prompts.len(), 2, "a startup ask is not delivered until the transport sends it");
+        assert_eq!(send_next_member_prompt(&mut info, false, 0, |text| { sent.push(text); PromptOutcome::Sent }), Some(first.clone()));
+        assert_eq!(sent, vec!["one"]);
+        assert_eq!(info.cursor, Some(first));
+        assert_eq!(info.pending_member_prompts.front().unwrap().0, second);
+        // An unexpected internal startup queue still prevents a second ask
+        // from entering it before the host can review the next turn.
+        assert!(send_next_member_prompt(&mut info, false, 1, |_| panic!("startup's first prompt must run alone")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_member_queues_and_carried_modals_keep_only_current_held_events() {
+        let fixture = FinalWriteTestState::new("bounded-member-prompts");
+        let limit = super::super::ai::session::MAX_QUEUED_PROMPTS;
+        let texts = (0..limit + 3).map(|index|
+            (format!("$held-{index}:example.org").try_into().unwrap(), index.to_string())).collect::<Vec<_>>();
+        with_a2app(|state| {
+            let info = state.ai_rooms.get_mut(&fixture.room).unwrap();
+            queue_member_prompts(info, texts.clone());
+            assert_eq!(info.pending_member_prompts.len(), limit);
+            assert_eq!(info.cursor.as_ref(), Some(&texts[2].0), "only evicted asks advance the cursor");
+            assert_eq!(info.pending_member_prompts.front().unwrap(), &texts[3]);
+        });
+        let provider = Recipient::ModelProvider("bounded-member-provider".into());
+        a2app_core::information_flow::add_sources(&fixture.context, [Source::Room {
+            account: fixture.context.account().into(), room: TARGET.into(),
+        }]).unwrap();
+        assert!(hold_carried_permission_prompt(&fixture.room, &texts, &fixture.context, &provider, None, 9));
+        with_a2app(|state| {
+            let TaskResume::UserPrompt { texts: held } = &state.task_prompts.front().unwrap().resume else { panic!("held prompt") };
+            assert_eq!(held, &texts[3..]);
+            let replacement = vec![("$latest:example.org".try_into().unwrap(), "latest".into())];
+            assert!(update_pending_carried_texts(state, &fixture.room, &replacement));
+            let TaskResume::UserPrompt { texts: held } = &state.task_prompts.front().unwrap().resume else { panic!("held prompt") };
+            assert_eq!(held, &replacement, "evicted modal payloads cannot return to the host queue on approval");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_cancel_forgets_held_asks_but_session_death_retains_refetch_cursor() {
+        let fixture = FinalWriteTestState::new("cancel-held-member-prompts");
+        let prior: OwnedEventId = "$prior:example.org".try_into().unwrap();
+        let held: OwnedEventId = "$cancel-held:example.org".try_into().unwrap();
+        with_a2app(|state| {
+            let info = state.ai_rooms.get_mut(&fixture.room).unwrap();
+            info.cursor = Some(prior.clone());
+            queue_member_prompts(info, vec![(held.clone(), "held".into())]);
+            info.discard_session_work();
+            assert_eq!(info.cursor, Some(prior.clone()), "a dead session leaves undelivered messages for refetch");
+            queue_member_prompts(info, vec![(held.clone(), "held".into())]);
+        });
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        abort_ai_room_work(&mut cx, &WidgetRef::empty(), &fixture.room);
+        with_a2app(|state| {
+            let info = &state.ai_rooms[&fixture.room];
+            assert_eq!(info.cursor, Some(held));
+            assert!(info.pending_member_prompts.is_empty());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn carried_review_checks_reply_recipients_even_with_durable_provider_sharing() {
+        use a2app_core::information_flow as flow;
+        let fixture = FinalWriteTestState::new("carried-reply-recipients");
+        let provider = Recipient::ModelProvider("carried-reply-provider".into());
+        let homeserver = Recipient::network_origin("https://carried-reply.example.org").unwrap();
+        let own_room = Recipient::MatrixRoom { account: fixture.context.account().into(), room: SOURCE.into() };
+        super::super::information_flow::ensure_agent_default_sharing(
+            &fixture.context, SOURCE, Some("carried-reply-provider"), Some("https://carried-reply.example.org"),
+            &mut BTreeSet::new(),
+        );
+        let private = Source::Room { account: fixture.context.account().into(), room: TARGET.into() };
+        flow::add_sources(&fixture.context, [private.clone(), Source::UnknownPrivate]).unwrap();
+        let texts = vec![("$carried-reply:test".try_into().unwrap(), "next turn".into())];
+        for (missing, present) in [(&own_room, &homeserver), (&homeserver, &own_room)] {
+            let provider_grant = flow::grant_sharing(private.clone(), provider.clone(),
+                flow::ReaderScope::Context(fixture.context.clone()), flow::SharingDuration::Permanent).unwrap();
+            let reply_grant = flow::grant_sharing(private.clone(), present.clone(),
+                flow::ReaderScope::Context(fixture.context.clone()), flow::SharingDuration::RoomSession {
+                    account: fixture.context.account().into(), room: SOURCE.into(),
+                }).unwrap();
+            assert!(flow::carried_over_sources(&fixture.context, &provider).unwrap().is_empty(),
+                "provider-only discovery misses the withdrawn reply permission");
+            assert!(hold_carried_permission_prompt(&fixture.room, &texts, &fixture.context, &provider, Some(&homeserver), 11));
+            with_a2app(|state| {
+                let prompt = state.task_prompts.pop_front().unwrap();
+                assert_eq!(prompt.plan.items.len(), 3, "baseline and unknown sources keep their existing filtering");
+                assert!(prompt.plan.items.iter().any(|item| matches!(&item.action,
+                    task_grants::PlanAction::Flow { source, recipient } if source == &private && recipient == missing)
+                    && item.state == ItemState::NeedsGrant));
+                assert!(prompt.plan.items.iter().any(|item| matches!(&item.action,
+                    task_grants::PlanAction::Flow { source, recipient } if source == &private && recipient == &provider)
+                    && item.state == ItemState::AlreadyAllowed));
+                let TaskResume::UserPrompt { texts: held } = prompt.resume else { panic!("host carried prompt") };
+                assert_eq!(held, texts, "the member message is reviewed before forwarding");
+            });
+            flow::revoke_sharing(provider_grant).unwrap();
+            flow::revoke_sharing(reply_grant).unwrap();
+        }
     }
 }

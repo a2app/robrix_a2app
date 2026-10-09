@@ -193,6 +193,12 @@ pub enum ReadToolKind {
 }
 
 impl ReadToolKind {
+    /// Directory metadata has one account directory source, rather than a
+    /// source for every room or space named by the result.
+    pub fn is_directory(&self) -> bool {
+        matches!(self, Self::ListRooms | Self::ListSpaces | Self::SpaceInfo { .. } | Self::SpaceRooms { .. })
+    }
+
     /// The catalog capability this tool exercises — what the user is asked
     /// about and what the access record names. [`Self::Memory`] has none (it
     /// is ungated room plumbing); the runtime special-cases it before ever
@@ -1059,7 +1065,8 @@ pub const REQUEST_TASK_PERMISSIONS_DESCRIPTION: &str =
      who must approve it: what you want to do, and what data you need in \
      order to do it (which rooms, which websites, which mini-app tools). \
      Use room names, not ids. Give each need a short `why`. Use room ids \
-     from list_rooms (which needs no request). The result lists `granted` \
+     from list_rooms (normally allowed by default; saved Ask or Deny still \
+     applies). The result lists `granted` \
      and `not_granted` with a reason; grants last only until this turn \
      ends. If the work later needs something you did not list, call this tool \
      again with that new need: you get at most three requests in one turn, and \

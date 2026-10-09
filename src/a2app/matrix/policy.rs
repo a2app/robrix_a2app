@@ -120,13 +120,13 @@ impl MatrixAuthorization {
             self.flow_epoch.ok_or("Missing information-flow activation.")?)
     }
 
-    fn check_current_permission(&self) -> Result<(), String> {
+    pub fn check_current_permission(&self) -> Result<(), String> {
         self.check_context()?;
         if with_current_policy(|store| self.permits_request(store)) { Ok(()) }
         else { Err(ROOM_ACCESS_DENIED.into()) }
     }
 
-    fn permits_request(&self, store: &PermissionStore) -> bool {
+    pub fn permits_request(&self, store: &PermissionStore) -> bool {
         let Some(cap) = a2app_core::capabilities::by_id(&self.capability) else { return false };
         if !a2app_core::services::is_room_collection(cap) { return self.permits(store, self.target_room.as_deref()); }
         let context = PermissionContext { origin_room: self.origin_room.as_deref(), target_room: self.target_room.as_deref() };
@@ -238,6 +238,29 @@ pub async fn audit_server_operation<T, E>(url: &str, operation: impl std::future
     } else { operation.into_future().await }
 }
 
+/// Fixed host pagination still sends the current context's inputs to the
+/// homeserver. Check its captured activation and live sharing before polling
+/// the SDK future, while keeping caller-selected query review separate.
+pub(super) async fn read_server_operation<T, E: std::fmt::Display>(url: &str, query: Option<&ServerQueryApproval>, operation: impl std::future::IntoFuture<Output = Result<T, E>>) -> Result<T, String> {
+    ensure_live_activation()?;
+    AUTHORIZATION.try_with(|authorization| authorization.check_current_permission()).unwrap_or(Ok(()))?;
+    let context = operation_context().ok_or("Missing host information-flow authorization.")?;
+    let recipient = Recipient::network_origin(url)?;
+    if let Some(query) = query {
+        if query.recipient != recipient { return Err("The reviewed query belongs to a different homeserver.".into()); }
+        let same_worker = AUTHORIZATION.try_with(|authorization|
+            authorization.subject == query.authorization.subject
+                && authorization.capability == query.authorization.capability
+                && authorization.target_room == query.authorization.target_room
+                && authorization.flow_context == query.authorization.flow_context
+                && authorization.flow_epoch == query.authorization.flow_epoch
+                && authorization.flow_payload == query.authorization.flow_payload).unwrap_or(false);
+        if !same_worker { return Err("The reviewed query belongs to a different worker request.".into()); }
+        query.check()?;
+    } else { ensure_flow_output(&context, &recipient)?; }
+    audit_server_operation(url, operation).await.map_err(|error| error.to_string())
+}
+
 pub fn ensure_live_activation() -> Result<(), String> {
     FLOW_ACTIVATION.try_with(|(context, epoch)| a2app_core::information_flow::ensure_context_epoch(context, *epoch))
         .unwrap_or(Ok(()))
@@ -316,6 +339,7 @@ pub async fn ensure_server_output_with_payload(url: &str, parameters: &serde_jso
 /// Each page still checks current capability consent, activation and inputs.
 pub(super) struct ServerQueryApproval {
     authorization: MatrixAuthorization,
+    recipient: Recipient,
     sources: flow::Label,
     influences: flow::Influences,
 }
@@ -351,7 +375,7 @@ async fn approve_server_query(url: &str, parameters: &serde_json::Value) -> Resu
     authorization.check_current_permission()?;
     let capture = flow::prepare_effect_for_activation(context, epoch, Some(&recipient), None, &payload)?;
     flow::commit_effect_for_activation(context, epoch, Some(&recipient), None, &payload)?;
-    Ok(ServerQueryApproval { authorization, sources: capture.sources, influences: capture.influences })
+    Ok(ServerQueryApproval { authorization, recipient, sources: capture.sources, influences: capture.influences })
 }
 
 pub fn room_access_allowed(room: &str, access: RoomAccess) -> bool {
@@ -677,6 +701,71 @@ mod tests {
         assert!(authorization.check_flow(Some("!room:s"), RoomAccess::Read).is_err());
     }
 
+    // Each Tokio test owns a separate runtime/test thread. Keep the global
+    // policy guard through authorization awaits so another test cannot replace it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn remote_read_boundary_checks_live_sharing_and_bound_query_before_polling_sdk() {
+        use std::{cell::Cell, future::Future, task::{Context, Poll, Waker}};
+        let _review_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
+        let account = format!("@remote-read-boundary-{}:test", std::process::id());
+        let previous_account = crate::a2app::information_flow::TEST_ACCOUNT.with(|a| a.replace(Some(account)));
+        let context = crate::a2app::information_flow::begin_agent_session("!remote-read-boundary:test").unwrap();
+        flow::add_sources(&context, [flow::Source::Room { account: context.account().into(), room: "!private-remote-read:test".into() }]).unwrap();
+        let subject = a2app_core::permissions::agent_subject(context.room().unwrap());
+        let mut store = PermissionStore::default();
+        store.grant_scoped(&subject, Permission::MatrixRoomRead, Some("matrix.room.messages.paginate"),
+            RoomScope::room(context.room().unwrap()), GrantDuration::Always, None).unwrap();
+        let auth = MatrixAuthorization::new(&subject, "matrix.room.messages.paginate", context.room(), &store)
+            .with_flow(context.clone()).with_payload(serde_json::json!({ "before": "$anchor:test", "limit": 20 }));
+        publish_permission_policy(&store);
+        let url = "https://remote-read-boundary.test";
+        let recipient = Recipient::network_origin(url).unwrap();
+        let polled = Cell::new(0);
+        with_authorization(auth.clone(), async {
+            assert!(read_server_operation(url, None, async { polled.set(polled.get() + 1); Ok::<_, &str>(()) }).await.is_err());
+            assert_eq!(polled.get(), 0, "missing homeserver sharing must stop before the SDK future");
+            let grants: Vec<_> = flow::labels(&context).unwrap().into_iter().map(|source|
+                flow::grant_sharing(source, recipient.clone(), flow::ReaderScope::Context(context.clone()), flow::SharingDuration::RobrixSession).unwrap()).collect();
+            read_server_operation(url, None, async { polled.set(polled.get() + 1); Ok::<_, &str>(()) }).await.unwrap();
+            for grant in grants { flow::revoke_sharing(grant).unwrap(); }
+            assert!(read_server_operation(url, None, async { polled.set(polled.get() + 1); Ok::<_, &str>(()) }).await.is_err());
+            assert_eq!(polled.get(), 1, "revocation must block the next fixed pagination page");
+
+            // One exact anchor approval covers its bounded top-up pages, while
+            // retaining no arbitrary sharing grant for the homeserver.
+            let mut approval = Box::pin(begin_server_query(url));
+            assert!(approval.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+            let mut pending = crate::a2app::effect_review::take_pending();
+            assert_eq!(pending.len(), 1);
+            pending[0].approve(flow::approve_effect_once).unwrap();
+            pending.pop().unwrap().finish(Ok(()));
+            let query = match approval.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(Ok(query)) => query,
+                _ => panic!("the approved query must resume"),
+            };
+            assert!(flow::ensure_allowed(&context, &recipient).is_err());
+            for _ in 0..2 {
+                read_server_operation(url, Some(&query), async { polled.set(polled.get() + 1); Ok::<_, &str>(()) }).await.unwrap();
+            }
+            assert_eq!(polled.get(), 3);
+            assert!(read_server_operation("https://different-server.test", Some(&query), async { polled.set(polled.get() + 1); Ok::<_, &str>(()) }).await.is_err());
+            let changed = auth.clone().with_payload(serde_json::json!({ "before": "$different:test", "limit": 20 }));
+            assert!(with_authorization(changed, read_server_operation(url, Some(&query), async { polled.set(polled.get() + 1); Ok::<_, &str>(()) })).await.is_err());
+            store.set_capability(&subject, "matrix.room.messages.paginate", GrantState::Denied);
+            publish_permission_policy(&store);
+            assert!(read_server_operation(url, Some(&query), async { polled.set(polled.get() + 1); Ok::<_, &str>(()) }).await.is_err());
+            assert_eq!(polled.get(), 3, "a mismatched or revoked query must not poll the SDK");
+        }).await;
+        store.set_capability(&subject, "matrix.room.messages.paginate", GrantState::Granted);
+        publish_permission_policy(&store);
+        flow::remove_context(&context).unwrap();
+        assert!(with_authorization(auth, read_server_operation(url, None, async { polled.set(polled.get() + 1); Ok::<_, &str>(()) })).await.is_err());
+        assert_eq!(polled.get(), 3, "a retired activation must not poll the SDK");
+        publish_permission_policy(&PermissionStore::default());
+        crate::a2app::information_flow::TEST_ACCOUNT.with(|a| { a.replace(previous_account); });
+    }
+
     #[tokio::test]
     async fn saved_edited_search_reads_locally_after_one_ordinary_approval() {
         use makepad_widgets::*;
@@ -869,6 +958,46 @@ mod tests {
         }
         flow::remove_context(&context).unwrap();
         crate::a2app::information_flow::TEST_ACCOUNT.with(|account| { account.replace(previous_account); });
+    }
+
+    // Each Tokio test owns a separate runtime/test thread. Keep the global
+    // policy guard through authorization awaits so another test cannot replace it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn directory_hierarchy_query_uses_captured_scope_and_current_consent() {
+        let _review_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
+        let account = format!("@directory-query-{}:test", std::process::id());
+        let previous_account = crate::a2app::information_flow::TEST_ACCOUNT.with(|a| a.replace(Some(account)));
+        let context = crate::a2app::information_flow::begin_agent_session("!directory-query:test").unwrap();
+        crate::a2app::information_flow::record_directory_response(&context).unwrap();
+        let recipient = Recipient::network_origin("https://directory-query.test").unwrap();
+        let mut grants = Vec::new();
+        for source in flow::labels(&context).unwrap() {
+            grants.push(flow::grant_sharing(source, recipient.clone(), flow::ReaderScope::Context(context.clone()),
+                flow::SharingDuration::RobrixSession).unwrap());
+        }
+        let subject = a2app_core::permissions::agent_subject(context.room().unwrap());
+        let mut store = PermissionStore::default();
+        store.grant_scoped(&subject, Permission::MatrixSpaces, Some("matrix.space.rooms.list"),
+            RoomScope::room("!child:test"), GrantDuration::Always, None).unwrap();
+        let mut auth = MatrixAuthorization::new(&subject, "matrix.space.rooms.list", context.room(), &store)
+            .with_flow(context.clone()).with_payload(serde_json::json!({ "space_id": "!space:test" }));
+        auth.target_room = Some("!space:test".into());
+        publish_permission_policy(&store);
+        with_authorization(auth.clone(), async {
+            assert!(auth.permits_request(&store));
+            assert!(!auth.permits(&store, Some("!space:test")), "the root itself is outside the selected child scope");
+            let query = begin_server_query("https://directory-query.test").await.unwrap();
+            query.check().unwrap();
+            store.set(&subject, Permission::MatrixSpaces, GrantState::Denied);
+            publish_permission_policy(&store);
+            assert!(query.check().is_err(), "a denied directory permission cancels later hierarchy pages");
+            assert!(begin_server_query("https://directory-query.test").await.is_err());
+        }).await;
+        publish_permission_policy(&PermissionStore::default());
+        for grant in grants { flow::revoke_sharing(grant).unwrap(); }
+        flow::remove_context(&context).unwrap();
+        crate::a2app::information_flow::TEST_ACCOUNT.with(|a| { a.replace(previous_account); });
     }
 
     #[tokio::test]

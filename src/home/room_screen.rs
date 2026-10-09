@@ -1880,12 +1880,12 @@ impl RoomScreen {
                 },
             )
         } else if status.queued > 0 {
-            // Not busy yet but prompts are waiting: the agent is still
-            // starting up (they flush as soon as it reports ready).
+            // Prompts can wait for startup, permission review, or the
+            // preceding turn's final writes.
             (
                 true,
                 format!(
-                    "Message queued — AI agent is starting up… · {} queued",
+                    "Message queued — waiting for the AI agent… · {} queued",
                     status.queued
                 ),
             )

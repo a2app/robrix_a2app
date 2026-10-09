@@ -139,11 +139,15 @@ pub(crate) async fn older_messages(room_id: OwnedRoomId, before: Option<OwnedEve
     }
     let mut out: Vec<serde_json::Value> = Vec::new();
     let mut from: Option<String> = None;
+    // One reviewed anchor query covers its bounded context/pagination walk.
+    // Host-selected cache anchors need only sharing with the actual server.
+    let query = if caller_selected_anchor {
+        Some(super::policy::begin_server_query(client.homeserver().as_str()).await?)
+    } else { None };
     if let Some(anchor) = &anchor {
         // /context splits its budget across both sides of the anchor.
         super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Read)?;
-        if caller_selected_anchor { super::policy::ensure_server_output(client.homeserver().as_str()).await?; }
-        let context = super::policy::audit_server_operation(client.homeserver().as_str(), room.event_with_context(anchor, true, (limit as u32 * 2).into(), None)).await
+        let context = super::policy::read_server_operation(client.homeserver().as_str(), query.as_ref(), room.event_with_context(anchor, true, (limit as u32 * 2).into(), None)).await
             .map_err(|e| format!("couldn't load older messages: {e}"))?;
         out.extend(context.events_before.iter().filter_map(as_message).map(|m| {
             add_row_context(message_json(&m, full_body), &m, &room_id, my_read_ts, &me)
@@ -159,7 +163,7 @@ pub(crate) async fn older_messages(room_id: OwnedRoomId, before: Option<OwnedEve
         let mut options = MessagesOptions::backward();
         options.limit = 50u32.into();
         options.from = from;
-        let messages = super::policy::audit_server_operation(client.homeserver().as_str(), room.messages(options)).await
+        let messages = super::policy::read_server_operation(client.homeserver().as_str(), query.as_ref(), room.messages(options)).await
             .map_err(|e| format!("couldn't load older messages: {e}"))?;
         out.extend(messages.chunk.iter().filter_map(as_message).map(|m| {
             add_row_context(message_json(&m, full_body), &m, &room_id, my_read_ts, &me)
@@ -468,7 +472,7 @@ pub(crate) async fn read_messages(room_id: matrix_sdk::ruma::OwnedRoomId, limit:
             let mut options = MessagesOptions::backward();
             options.limit = 50u32.into();
             options.from = from;
-            let messages = super::policy::audit_server_operation(client.homeserver().as_str(), room.messages(options)).await
+            let messages = super::policy::read_server_operation(client.homeserver().as_str(), None, room.messages(options)).await
                 .map_err(|e| format!("couldn't read messages: {e}"))?;
             for event in messages.chunk {
                 let Ok(AnySyncTimelineEvent::MessageLike(
