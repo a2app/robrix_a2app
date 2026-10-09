@@ -55,6 +55,7 @@ script_mod! {
                 target_filter := RobrixTextInput { width: Fill, empty_text: "Find rooms or spaces…" }
                 editor_targets := View {
                     width: Fill, height: Fit
+                    padding: Inset{left: (PERMISSION_TEXT_INSET), right: (PERMISSION_TEXT_INSET)}
                     targets := PortalList {
                         width: Fill, height: 168, flow: Down
                         target := RobrixSettingsCheckBox {}
@@ -62,6 +63,7 @@ script_mod! {
                 }
                 popup_targets_section := View {
                     visible: false, width: Fill, height: Fit, flow: Down
+                    padding: Inset{left: (PERMISSION_TEXT_INSET), right: (PERMISSION_TEXT_INSET)}
                     popup_targets := FlatList {
                         width: Fill, height: Fit, flow: Down
                         scroll_bars: ScrollBars { show_scroll_x: false, show_scroll_y: false }
