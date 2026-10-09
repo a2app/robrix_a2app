@@ -13,6 +13,7 @@ script_mod! {
     mod.widgets.RoomAppPicker = View { visible: false }
     mod.widgets.MiniAppHostPane = View { visible: false }
     mod.widgets.MiniAppPermissionPrompt = View { visible: false }
+    mod.widgets.TaskPermissionPrompt = View { visible: false }
     mod.widgets.AiRoomPanel = View { visible: false }
     mod.widgets.MiniAppTimelineCard = View { visible: false }
     mod.widgets.MiniAppAttachmentAction = View { visible: false }

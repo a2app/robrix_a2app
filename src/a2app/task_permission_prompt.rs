@@ -24,7 +24,8 @@ script_mod! {
         width: Fill { max: 660 }
         height: Fill { max: 780 }
         padding: 20
-        scroll_bars: ScrollBars { show_scroll_x: false, show_scroll_y: false }
+        // Keep SmallModal's vertical scrolling: the explanation and expanded
+        // Details may be taller than a narrow or short window.
 
         prompt_title := ModalTitle {
             margin: Inset{bottom: 10}
