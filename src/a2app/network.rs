@@ -393,7 +393,7 @@ mod tests {
 
     #[tokio::test]
     async fn pinned_resolver_has_no_system_dns_fallback() {
-        use reqwest::dns::Resolve;
+        use super::reqwest::dns::Resolve;
         let address: SocketAddr = "1.1.1.1:443".parse().unwrap();
         let resolver = PinnedResolver { host: "example.com".into(), addresses: vec![address] };
         let addresses = resolver.resolve("example.com".parse().unwrap()).await.unwrap().collect::<Vec<_>>();

@@ -45,6 +45,7 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 #[derive(Default)]
 struct RecordingHost {
     calls: Mutex<Vec<String>>,
+    task_requests: Mutex<Vec<serde_json::Value>>,
 }
 
 impl AiHost for RecordingHost {
@@ -80,6 +81,7 @@ impl AiHost for RecordingHost {
     }
 
     fn request_task_permissions(&self, request: serde_json::Value) -> Result<String, String> {
+        self.task_requests.lock().unwrap().push(request.clone());
         self.calls.lock().unwrap().push(format!("request_task_permissions({request:?})"));
         Ok(json!({ "task_id": 1, "status": "granted", "granted": [], "not_granted": [] }).to_string())
     }
@@ -175,6 +177,7 @@ async fn an_rmcp_client_lists_and_calls_robrix_tools_over_the_relay() {
     assert!(names.iter().any(|n| n == "launch_app"), "tools advertised: {names:?}");
     assert!(names.iter().any(|n| n == "list_mini_app_tools"), "tools advertised: {names:?}");
     assert!(names.iter().any(|n| n == "call_mini_app_tool"), "tools advertised: {names:?}");
+    assert!(names.iter().any(|n| n == "request_task_permissions"), "tools advertised: {names:?}");
 
     // send_message round trip through rmcp -> relay -> socket -> host.
     let mut params = CallToolRequestParams::new("send_message");
@@ -184,6 +187,29 @@ async fn an_rmcp_client_lists_and_calls_robrix_tools_over_the_relay() {
         .expect("tools/call timed out")
         .expect("tools/call failed");
     assert!(!result.is_error.unwrap_or(false), "send_message must not report isError");
+
+    // Octos's rmcp client must pass a structured plan through the real relay
+    // and receive the host's structured permission outcome.
+    let task_request = json!({
+        "task": "Summarize Operations",
+        "explanation": "I want to read Operations and compare it with the status page.",
+        "needs": [
+            {"id": "messages", "kind": "capability", "capability": "matrix.rooms.messages.read", "targets": ["!ops:example.org"]},
+            {"id": "status", "kind": "website", "url": "https://status.example.org/"},
+        ],
+    });
+    let mut params = CallToolRequestParams::new("request_task_permissions");
+    params.arguments = Some(task_request.as_object().unwrap().clone());
+    let result = timeout(REPLY_TIMEOUT, service.call_tool(params))
+        .await
+        .expect("request_task_permissions timed out")
+        .expect("request_task_permissions failed");
+    assert!(!result.is_error.unwrap_or(false), "request_task_permissions must not report isError");
+    let content = serde_json::to_value(&result.content).unwrap();
+    let outcome: serde_json::Value =
+        serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(outcome, json!({"task_id": 1, "status": "granted", "granted": [], "not_granted": []}));
+    assert_eq!(*host.task_requests.lock().unwrap(), vec![task_request]);
     let host_calls = host.calls.lock().unwrap();
     assert!(
         host_calls.iter().any(|c| c.contains("ping from rmcp")),

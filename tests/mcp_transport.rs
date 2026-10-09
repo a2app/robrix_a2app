@@ -50,6 +50,7 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Default)]
 struct RecordingHost {
     calls: Mutex<Vec<String>>,
+    task_requests: Mutex<Vec<Value>>,
 }
 
 impl RecordingHost {
@@ -93,6 +94,7 @@ impl AiHost for RecordingHost {
     }
 
     fn request_task_permissions(&self, request: serde_json::Value) -> Result<String, String> {
+        self.task_requests.lock().unwrap().push(request.clone());
         self.calls.lock().unwrap().push(format!("request_task_permissions({request:?})"));
         Ok(json!({ "task_id": 1, "status": "granted", "granted": [], "not_granted": [] }).to_string())
     }
@@ -381,6 +383,7 @@ fn a_full_mcp_session_over_the_relay_child() {
             "call_mini_app_tool",
             "read_room_memory",
             "send_message",
+            "request_task_permissions",
             "web_fetch",
             "post_room_message",
         ]
@@ -443,6 +446,27 @@ fn a_full_mcp_session_over_the_relay_child() {
     assert_eq!(result["isError"], false);
     assert_eq!(result["content"][0]["text"], "{\"result\":\"ok\"}");
 
+    // The upfront permission plan crosses the relay intact, and its outcome
+    // returns as model-visible JSON rather than a JSON-RPC error.
+    let task_request = json!({
+        "task": "Summarize Operations",
+        "explanation": "I want to read Operations and compare it with the status page.",
+        "needs": [
+            {"id": "messages", "kind": "capability", "capability": "matrix.rooms.messages.read", "targets": ["!ops:example.org"]},
+            {"id": "status", "kind": "website", "url": "https://status.example.org/"},
+            {"id": "tool", "kind": "app_tool", "tool": "app_smoke-app_play"},
+        ],
+    });
+    let result = client.request(
+        "tools/call",
+        json!({"name": "request_task_permissions", "arguments": task_request.clone()}),
+    );
+    assert_eq!(result["isError"], false);
+    let outcome: Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(outcome, json!({"task_id": 1, "status": "granted", "granted": [], "not_granted": []}));
+    assert_eq!(*host.task_requests.lock().unwrap(), vec![task_request.clone()]);
+
     // The host (this process) saw every call with the model's arguments.
     let calls = host.calls();
     assert_eq!(
@@ -454,6 +478,7 @@ fn a_full_mcp_session_over_the_relay_child() {
             "launch_app(\"smoke-app\")".to_string(),
             "list_mini_app_tools()".to_string(),
             "call_mini_app_tool(\"app_smoke-app_play\", {\"move\": String(\"center\")})".to_string(),
+            format!("request_task_permissions({task_request:?})"),
         ]
     );
 
