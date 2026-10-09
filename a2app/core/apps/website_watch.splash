@@ -160,6 +160,6 @@ View{
         Button{text: "Test saved website and report" on_click: || test_website()}
         Button{text: "Draft test report" on_click: || draft_report()}
         status := Label{text: "Default: example.com, keyword Example Domain, popup. Save settings, then test the saved website and report before scheduling checks." width: Fill draw_text +: {color: #x2A7F92 text_style: theme.font_regular{font_size: 12}}}
-        Label{text: "Draft test report prepares local text for your review and needs no sending permission. Test saved website and report checks the website and sends one report even if the keyword is absent or already reported. Room-message reports need separate sending permission. Choose Until you quit Robrix or Forever and Approve before scheduling checks and reports. Automated runs do not open permission dialogs. Robrix must be running." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
+        Label{text: "Draft test report prepares local text for your review and needs no sending permission. Test saved website and report checks the website and sends one report even if the keyword is absent or already reported. Room-message reports need separate sending permission. Until this room closes expires when the open room closes; use Until you quit Robrix or Forever for scheduled checks after closing. Automated runs cannot renew permissions or open dialogs. Robrix must be running." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
     }
 }

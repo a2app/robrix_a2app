@@ -57,6 +57,23 @@ open the task's app and keep it open, use Run now, review the current blocked
 action, then retry. A stopped activation's one-time approval cannot be reused by
 a new background run. Use the popup output for unattended Website Watch checks.
 
+**Until this room closes** is a foreground choice for an app attached to an open
+room or space. It expires when that origin closes, even if the allowed target
+scope includes other rooms. A saved scheduled task's room target is not an
+open-room session: detached tasks and scheduled reviews without a live origin
+omit that duration. Choose **Until you quit Robrix** or **Forever** for permissions
+needed by jobs after the room closes. The first lasts for the Robrix application
+session, including restored workers; only **Forever** survives restarting Robrix.
+**One time** covers one concrete request rather than recurring subscription or
+setup. None of these durations authorizes a new output or private data source
+outside the reviewed permission and sharing scope.
+
+On expiry, saved schedules and configuration remain, but hidden work cannot
+renew permission or open a dialog. Open the app and use its foreground Test or
+Refresh control, or review its permission settings, before retrying the task.
+Room Peek attachments and other accepted local drafts remain separate from
+direct posting permission; retaining a draft never enables a scheduled send.
+
 ## Scheduling and recovery
 
 - Intervals are at least 60 seconds. Missed intervals coalesce into one run;

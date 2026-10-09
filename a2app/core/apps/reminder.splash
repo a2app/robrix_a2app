@@ -69,7 +69,7 @@ View{
         Button{text: "Save reminder" on_click: || save()}
         Button{text: "Test saved reminder" on_click: || test_reminder()}
         status := Label{text: "Set a schedule in Mini Apps > Background tasks. Default reminder: Time for a break." width: Fill draw_text +: {color: #x8A5FB0 text_style: theme.font_regular{font_size: 12}}}
-        Label{text: "Save your reminder, then test it. Choose Until you quit Robrix or Forever and Approve in the notification prompt before scheduling it." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
+        Label{text: "Save your reminder, then test it and approve notifications. Until this room closes is available while attached to an open room or space; that approval expires on closing it. Choose Until you quit Robrix or Forever for scheduled reminders after closing. Detached account tasks have no room-close option." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
         Label{text: "Reminders appear as Robrix popups while Robrix is running. An overdue alarm runs once after reopening; missed recurring intervals are combined into one run. This is not an OS alarm and cannot wake a closed or suspended app." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
     }
 }

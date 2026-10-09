@@ -122,9 +122,6 @@ pub(super) fn validate_authority(grant: &EffectAuthority) -> Result<(), String> 
     }
     if let Some(scope) = &grant.room_scope {
         if normalize_scope(scope.clone())? != *scope { return Err("Invalid approved room selection.".into()); }
-        if matches!(grant.duration, SharingDuration::RoomSession { .. }) {
-            return Err("A scoped operation approval must use the Robrix session or Forever.".into());
-        }
     }
     for influence in &grant.influences { integrity::validate_influence(influence)?; }
     if let SharingDuration::RoomSession { account, room } = &grant.duration
@@ -322,10 +319,9 @@ impl Registry {
     /// Approve this app operation for the room/space selection shown by the host.
     ///
     /// Non-room destinations and influences retain their exact reviewed floor.
+    /// A room-session duration expires with the initiating context's room,
+    /// independently of the selected destinations.
     pub fn approve_effect_scoped(&mut self, expected: &EffectReview, scope: RoomScope, duration: SharingDuration) -> Result<(), String> {
-        if !matches!(duration, SharingDuration::RobrixSession | SharingDuration::Permanent) {
-            return Err("Choose Until you quit Robrix or Forever for a room selection.".into());
-        }
         self.approve_effect_duration_scoped(expected, duration, Some(normalize_scope(scope)?))
     }
 
@@ -712,7 +708,10 @@ mod tests {
 
     #[test]
     fn all_rooms_approval_reuses_only_this_apps_room_operation_and_reviewed_non_room_inputs() {
-        for permanent in [false, true] {
+        for duration in [SharingDuration::RobrixSession, SharingDuration::Permanent,
+            SharingDuration::RoomSession { account: "alice".into(), room: "room-a".into() }]
+        {
+            let permanent = duration == SharingDuration::Permanent;
             let root = TestRoot::new(); let mut registry = root.registry();
             let first = scoped_context("room-a"); let second = scoped_context("room-b");
             scoped_private(&mut registry, &first); scoped_private(&mut registry, &second);
@@ -721,7 +720,6 @@ mod tests {
             let epoch = registry.context_epoch(&first).unwrap();
             let payload = serde_json::json!({"body":"first"});
             let review = registry.prepare_effect_for_activation(&first, epoch, Some(&destination("room-a")), Some(&action("room-a")), &payload).unwrap();
-            let duration = if permanent { SharingDuration::Permanent } else { SharingDuration::RobrixSession };
             registry.approve_effect_scoped(&review, RoomScope::AllRooms, duration).unwrap();
             let next_epoch = registry.context_epoch(&second).unwrap();
             registry.commit_effect_for_activation(&second, next_epoch, Some(&destination("room-b")), Some(&action("room-b")), &serde_json::json!({"body":"second"})).unwrap();
@@ -738,6 +736,93 @@ mod tests {
             assert!(registry.commit_effect_for_activation(&second, next_epoch, Some(&destination("room-b")), Some(&action("room-b")), &payload).is_err());
             let id = registry.effect_authorities().unwrap()[0].id;
             assert!(registry.revoke_effect_authority(id).unwrap());
+        }
+    }
+
+    #[test]
+    fn scoped_room_session_expires_with_origin_not_selected_rooms_or_spaces() {
+        fn membership(account: &str, scope: &RoomScope, room: &str) -> bool {
+            account == "alice" && room == "target"
+                && matches!(scope, RoomScope::Selection { spaces, .. } if spaces.iter().any(|space| space == "space"))
+        }
+        for scope in [RoomScope::room("target"), RoomScope::AllRooms,
+            RoomScope::Selection { rooms: Vec::new(), spaces: vec!["space".into()] }]
+        {
+            let root = TestRoot::new(); let mut registry = root.registry();
+            let origin = scoped_context("origin"); let target = scoped_context("target");
+            scoped_private(&mut registry, &origin); scoped_private(&mut registry, &target);
+            registry.set_effect_room_scope_matcher(membership).unwrap();
+            let epoch = registry.context_epoch(&origin).unwrap();
+            let target_epoch = registry.context_epoch(&target).unwrap();
+            let destination = Recipient::MatrixRoom { account: "alice".into(), room: "target".into() };
+            let action = SensitiveAction { kind: "matrix.room.message.send".into(), target: "target".into() };
+            let payload = serde_json::json!({"body":"first reviewed report"});
+            let review = registry.prepare_effect_for_activation(&origin, epoch, Some(&destination), Some(&action), &payload).unwrap();
+            let duration = SharingDuration::RoomSession { account: "alice".into(), room: "origin".into() };
+            registry.approve_effect_scoped(&review, scope.clone(), duration.clone()).unwrap();
+            let authorities = registry.effect_authorities().unwrap();
+            assert_eq!(authorities.len(), 1);
+            assert_eq!(authorities[0].duration, duration);
+            assert_eq!(authorities[0].room_scope.as_ref(), Some(&scope));
+            assert!(root.registry().effect_authorities().unwrap().is_empty(), "room-session approval must never persist");
+            let next = serde_json::json!({"body":"next reviewed operation contents"});
+            for (account, room) in [("bob", "origin"), ("alice", "target"), ("alice", "space"), ("alice", "unrelated")] {
+                registry.close_room_session(account, room).unwrap();
+                registry.commit_effect_for_activation(&origin, epoch, Some(&destination), Some(&action), &next).unwrap();
+                registry.commit_effect_for_activation(&target, target_epoch, Some(&destination), Some(&action), &next).unwrap();
+            }
+            let different = SensitiveAction { kind: "matrix.room.invite.send".into(), target: "target".into() };
+            assert!(registry.commit_effect_for_activation(&origin, epoch, Some(&destination), Some(&different), &next).is_err());
+            assert!(registry.commit_effect_for_activation(&origin, epoch, Some(&recipient()), Some(&action), &next).is_err());
+            if scope != RoomScope::AllRooms {
+                let outside = Recipient::MatrixRoom { account: "alice".into(), room: "outside".into() };
+                let outside_action = SensitiveAction { kind: action.kind.clone(), target: "outside".into() };
+                assert!(registry.commit_effect_for_activation(&origin, epoch, Some(&outside), Some(&outside_action), &next).is_err());
+            }
+            registry.add_influences(&origin, [Influence::InternetOrigin("https://new.example".into())]).unwrap();
+            assert!(registry.commit_effect_for_activation(&origin, epoch, Some(&destination), Some(&action), &next).is_err());
+            registry.commit_effect_for_activation(&target, target_epoch, Some(&destination), Some(&action), &next).unwrap();
+            let stale = registry.prepare_effect_for_activation(&origin, epoch, Some(&destination), Some(&different), &next).unwrap();
+            assert!(!stale.allowed);
+            registry.close_room_session("alice", "origin").unwrap();
+            assert!(registry.effect_authorities().unwrap().is_empty());
+            assert!(registry.approve_effect_scoped(&stale, scope, duration).is_err(), "closing the origin retires unanswered reviews too");
+            assert!(registry.commit_effect_for_activation(&target, target_epoch, Some(&destination), Some(&action), &next).is_err());
+        }
+    }
+
+    #[test]
+    fn room_session_effects_reject_wrong_or_absent_initiating_rooms_without_approving() {
+        for context in [scoped_context("origin"),
+            ContextId::Agent { account: "alice".into(), room: "origin".into() },
+            ContextId::App { account: "alice".into(), app: "scoped-app".into(), room: None },
+            ContextId::PublicApp { account: "alice".into(), app: "scoped-app".into() }]
+        {
+            let root = TestRoot::new(); let mut registry = root.registry();
+            if matches!(context, ContextId::PublicApp { .. }) { registry.register_context(&context).unwrap(); }
+            else { private(&mut registry, &context); }
+            registry.add_influences(&context, [Influence::Unknown]).unwrap();
+            let epoch = registry.context_epoch(&context).unwrap();
+            let payload = serde_json::json!({"operation":"network.POST","body":"private"});
+            let review = registry.prepare_effect_for_activation(&context, epoch, Some(&recipient()), Some(&action()), &payload).unwrap();
+            assert!(!review.allowed);
+            for duration in [SharingDuration::RoomSession { account: "bob".into(), room: "origin".into() },
+                SharingDuration::RoomSession { account: "alice".into(), room: "target".into() }]
+            {
+                assert!(registry.approve_effect_session(&review, duration.clone()).is_err());
+                assert!(registry.approve_effect_scoped(&review, RoomScope::AllRooms, duration).is_err());
+                assert!(registry.effect_authorities().unwrap().is_empty());
+                assert!(registry.commit_effect_for_activation(&context, epoch, Some(&recipient()), Some(&action()), &payload).is_err());
+            }
+            let duration = SharingDuration::RoomSession { account: "alice".into(), room: "origin".into() };
+            if context.room().is_some() {
+                registry.approve_effect_scoped(&review, RoomScope::AllRooms, duration).unwrap();
+            } else {
+                assert!(registry.approve_effect_session(&review, duration.clone()).is_err());
+                assert!(registry.approve_effect_scoped(&review, RoomScope::AllRooms, duration).is_err());
+                registry.approve_effect_once(&review).unwrap();
+            }
+            registry.commit_effect_for_activation(&context, epoch, Some(&recipient()), Some(&action()), &payload).unwrap();
         }
     }
 
@@ -779,20 +864,24 @@ mod tests {
             account == "alice" && room == "child" && MEMBER.load(Ordering::SeqCst)
                 && matches!(scope, RoomScope::Selection { spaces, .. } if spaces.iter().any(|space| space == "space"))
         }
-        let root = TestRoot::new(); let mut registry = root.registry();
-        let context = scoped_context("child"); scoped_private(&mut registry, &context);
-        let epoch = registry.context_epoch(&context).unwrap();
-        let destination = Recipient::MatrixRoom { account: "alice".into(), room: "child".into() };
-        let action = SensitiveAction { kind: "matrix.room.message.send".into(), target: "child".into() };
-        let payload = serde_json::json!({"body":"test"});
-        let review = registry.prepare_effect_for_activation(&context, epoch, Some(&destination), Some(&action), &payload).unwrap();
-        let scope = RoomScope::Selection { rooms: Vec::new(), spaces: vec!["space".into()] };
-        assert!(registry.approve_effect_scoped(&review, scope.clone(), SharingDuration::Permanent).is_err());
-        registry.set_effect_room_scope_matcher(membership).unwrap(); MEMBER.store(true, Ordering::SeqCst);
-        registry.approve_effect_scoped(&review, scope, SharingDuration::Permanent).unwrap();
-        registry.commit_effect_for_activation(&context, epoch, Some(&destination), Some(&action), &payload).unwrap();
-        MEMBER.store(false, Ordering::SeqCst);
-        assert!(registry.commit_effect_for_activation(&context, epoch, Some(&destination), Some(&action), &payload).is_err());
+        for duration in [SharingDuration::Permanent,
+            SharingDuration::RoomSession { account: "alice".into(), room: "child".into() }]
+        {
+            let root = TestRoot::new(); let mut registry = root.registry();
+            let context = scoped_context("child"); scoped_private(&mut registry, &context);
+            let epoch = registry.context_epoch(&context).unwrap();
+            let destination = Recipient::MatrixRoom { account: "alice".into(), room: "child".into() };
+            let action = SensitiveAction { kind: "matrix.room.message.send".into(), target: "child".into() };
+            let payload = serde_json::json!({"body":"test"});
+            let review = registry.prepare_effect_for_activation(&context, epoch, Some(&destination), Some(&action), &payload).unwrap();
+            let scope = RoomScope::Selection { rooms: Vec::new(), spaces: vec!["space".into()] };
+            assert!(registry.approve_effect_scoped(&review, scope.clone(), duration.clone()).is_err());
+            registry.set_effect_room_scope_matcher(membership).unwrap(); MEMBER.store(true, Ordering::SeqCst);
+            registry.approve_effect_scoped(&review, scope, duration).unwrap();
+            registry.commit_effect_for_activation(&context, epoch, Some(&destination), Some(&action), &payload).unwrap();
+            MEMBER.store(false, Ordering::SeqCst);
+            assert!(registry.commit_effect_for_activation(&context, epoch, Some(&destination), Some(&action), &payload).is_err());
+        }
     }
 
     #[test]
@@ -1008,11 +1097,15 @@ mod tests {
         let blocked = registry.prepare_effect_for_activation(&context, epoch, Some(&recipient()), Some(&action()), &payload).unwrap();
         assert!(registry.approve_effect_once(&blocked).is_err());
         assert!(registry.approve_effect_session(&blocked, SharingDuration::RobrixSession).is_err());
+        assert!(registry.approve_effect_scoped(&blocked, RoomScope::AllRooms,
+            SharingDuration::RoomSession { account: "alice".into(), room: "room-a".into() }).is_err());
         registry.grant_sharing(foreign, recipient(), ReaderScope::AllReaders, SharingDuration::Permanent).unwrap();
         let reviewed = registry.prepare_effect_for_activation(&context, epoch, Some(&recipient()), Some(&action()), &payload).unwrap();
         assert!(reviewed.denied_sources.is_empty()); assert!(!reviewed.allowed);
         assert!(!reviewed.allow_session());
         assert!(registry.approve_effect_always(&reviewed).is_err());
+        assert!(registry.approve_effect_scoped(&reviewed, RoomScope::AllRooms,
+            SharingDuration::RoomSession { account: "alice".into(), room: "room-a".into() }).is_err());
         registry.approve_effect_once(&reviewed).unwrap();
         registry.commit_effect_for_activation(&context, epoch, Some(&recipient()), Some(&action()), &payload).unwrap();
     }

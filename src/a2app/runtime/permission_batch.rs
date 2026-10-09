@@ -77,6 +77,7 @@ fn identity(prompt: &PermissionPrompt) -> Option<(a2app_core::information_flow::
 }
 
 fn live(prompt: &PermissionPrompt) -> bool {
+    if with_a2app(|state| room_session::prompt_is_closing(state, prompt)).unwrap_or(true) { return false; }
     if let Some(flow) = &prompt.flow { return flow.can_prompt() && !flow.is_cancelled(); }
     !prompt.parked.is_empty() && prompt.parked.iter().all(|parked| match parked {
         ParkedRequest::AppMedia(post) => post.can_prompt(),
@@ -201,6 +202,7 @@ pub(super) fn show_next_ordinary(cx: &mut Cx, ui: &WidgetRef) {
 }
 
 pub(super) fn answer_group(cx: &mut Cx, ui: &WidgetRef, response: PermissionPromptGroupResponse) {
+    room_session::cancel_closing_prompts(cx, ui);
     let matches = with_a2app(|state| state.active_prompt.as_ref().is_some_and(|prompt| prompt.id == response.group_id)
         && !state.active_prompt_batch.is_empty()).unwrap_or(false);
     if !matches { return; }
@@ -328,7 +330,14 @@ fn finish_setup(cx: &mut Cx, key: (usize, u64)) {
 
 pub(super) fn refuse_prompt(cx: &mut Cx, mut prompt: PermissionPrompt, reason: &str) {
     if let Some(key) = prompt.setup { complete_setup(cx, key, prompt.id, false); }
-    else { for parked in prompt.parked { refuse_parked_request(cx, prompt.perm, parked); } }
+    else {
+        for parked in prompt.parked {
+            if let ParkedRequest::Bridge(Some(request)) = &parked
+                && !bridge_activation_is_live(request, &prompt.activations)
+            { continue; }
+            refuse_parked_request(cx, prompt.perm, parked);
+        }
+    }
     if let Some(flow) = prompt.flow.take() { refuse_flow(cx, flow, reason); }
 }
 
@@ -349,7 +358,41 @@ pub(super) fn cancel_subject(cx: &mut Cx, ui: &WidgetRef, subject: &str) {
     if closed { ui.modal(cx, ids!(a2app_permission_modal)).close(cx); }
 }
 
+/// Retire only the initiating room, including its queued setup and effect reviews.
+/// A changed grouped display receives fresh IDs so a late answer cannot target survivors.
+pub(super) fn cancel_room(cx: &mut Cx, ui: &WidgetRef, account: &str, room: &str) {
+    let (prompts, closed) = with_a2app(|state| {
+        let matches = |prompt: &PermissionPrompt| room_session::prompt_originates_in(prompt, account, room);
+        let closed = state.active_prompt.iter().chain(state.active_prompt_batch.iter()).any(&matches);
+        let mut mine = Vec::new();
+        if closed {
+            let mut displayed = state.active_prompt.take().into_iter().collect::<Vec<_>>();
+            displayed.append(&mut state.active_prompt_batch);
+            for mut prompt in displayed {
+                if matches(&prompt) { mine.push(prompt); }
+                else {
+                    let old_id = prompt.id;
+                    prompt.id = next_permission_prompt_id();
+                    // Setup completion keys also capture the displayed member ID.
+                    if let Some(key) = prompt.setup
+                        && let Some(setup) = state.permission_setups.get_mut(&key)
+                        && let Some(permission) = setup.pending.remove(&old_id)
+                    { setup.pending.insert(prompt.id, permission); }
+                    state.prompts.push_front(prompt);
+                }
+            }
+        }
+        let (queued, rest): (Vec<_>, Vec<_>) = state.prompts.drain(..).partition(matches);
+        mine.extend(queued);
+        state.prompts = rest.into();
+        (mine, closed)
+    }).unwrap_or_default();
+    for prompt in prompts { refuse_prompt(cx, prompt, "The initiating room closed before this request was approved."); }
+    if closed { ui.modal(cx, ids!(a2app_permission_modal)).close(cx); }
+}
+
 pub(super) fn sweep(cx: &mut Cx, ui: &WidgetRef) {
+    room_session::cancel_closing_prompts(cx, ui);
     let stale = with_a2app(|state| {
         state.active_prompt.as_ref().filter(|prompt|
             !live_with_state(state, prompt) || state.active_prompt_batch.iter().any(|sibling| !live_with_state(state, sibling)))
@@ -360,6 +403,7 @@ pub(super) fn sweep(cx: &mut Cx, ui: &WidgetRef) {
 
 // Avoid re-entering runtime state while checking a Generated continuation.
 fn live_with_state(state: &A2AppState, prompt: &PermissionPrompt) -> bool {
+    if room_session::prompt_is_closing(state, prompt) { return false; }
     if let Some(flow) = &prompt.flow {
         return flow.can_prompt_with_state(state)
             && !matches!(flow, FlowContinuation::Worker(worker) if worker.is_cancelled());

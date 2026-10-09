@@ -316,6 +316,47 @@ fn later_influences_require_fresh_review_and_session_end_revokes_authority() {
 }
 
 #[test]
+fn room_session_action_authority_uses_initiating_context_not_action_target() {
+    for context in [app("alice", "origin"),
+        ContextId::Agent { account: "alice".into(), room: "origin".into() },
+        ContextId::App { account: "alice".into(), app: "tool".into(), room: None },
+        ContextId::PublicApp { account: "alice".into(), app: "tool".into() }]
+    {
+        let root = TestRoot::new(); let mut registry = root.registry();
+        registry.register_context(&context).unwrap();
+        registry.add_influences(&context, [internet()]).unwrap();
+        let epoch = registry.context_epoch(&context).unwrap();
+        let reviewed = registry.influences(&context).unwrap();
+        let action = SensitiveAction { kind: "matrix.room.invite.send".into(), target: "target".into() };
+        for session in [AuthoritySession::RoomSession { account: "bob".into(), room: "origin".into() },
+            AuthoritySession::RoomSession { account: "alice".into(), room: "target".into() }]
+        {
+            assert!(registry.grant_authority_for_activation(&context, action.clone(), session, &reviewed, epoch).is_err());
+            assert!(registry.authorities().unwrap().is_empty());
+            assert!(registry.ensure_action_allowed(&context, &action).is_err());
+        }
+        let session = AuthoritySession::RoomSession { account: "alice".into(), room: "origin".into() };
+        if context.room().is_none() {
+            assert!(registry.grant_authority_for_activation(&context, action, session, &reviewed, epoch).is_err());
+            continue;
+        }
+        registry.grant_authority_for_activation(&context, action.clone(), session.clone(), &reviewed, epoch).unwrap();
+        assert!(root.registry().authorities().unwrap().is_empty());
+        for (account, room) in [("bob", "origin"), ("alice", "target"), ("alice", "unrelated")] {
+            registry.close_room_session(account, room).unwrap();
+            assert!(registry.ensure_action_allowed(&context, &action).is_ok());
+        }
+        let other = SensitiveAction { target: "another-target".into(), ..action.clone() };
+        assert!(registry.ensure_action_allowed(&context, &other).is_err());
+        registry.add_influences(&context, [Influence::Model("new-model".into())]).unwrap();
+        assert!(registry.ensure_action_allowed(&context, &action).is_err());
+        assert!(registry.grant_authority_for_activation(&context, action.clone(), session, &reviewed, epoch).is_err());
+        registry.close_room_session("alice", "origin").unwrap();
+        assert!(registry.authorities().unwrap().is_empty());
+    }
+}
+
+#[test]
 fn confidentiality_grants_and_action_authority_do_not_imply_each_other() {
     let root = TestRoot::new();
     let mut registry = root.registry();

@@ -99,7 +99,7 @@ View{
         Button{text: "Save keyword" on_click: || save()}
         Button{text: "Set up and test saved keyword" on_click: || test_alert()}
         status := Label{text: "Default keyword: release. Enable New room messages in Background tasks for this same room." width: Fill draw_text +: {color: #xD9822B text_style: theme.font_regular{font_size: 12}}}
-        Label{text: "Save a keyword, then set up and test alerts. Choose Until you quit Robrix or Forever and Approve for room watching and notifications before scheduling this room's task." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
+        Label{text: "Save a keyword, then set up and test alerts. Approve room watching and notifications. Until this room closes permits alerts while this room stays open; closing it expires that approval. Choose Until you quit Robrix or Forever for scheduled alerts after closing the room. Saved tasks cannot renew expired permissions." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
         Label{text: "Uses new messages delivered by Robrix's live room timeline, with bounded message previews. It does not replay offline history, edits or messages dropped while a run is busy. Read protection and notification permissions always apply." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
     }
 }

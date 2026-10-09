@@ -318,6 +318,8 @@ pub struct FlowPromptInfo {
     pub scope_targets: Vec<(String, Vec<String>)>,
     /// The current room for a collection request that defaults to all rooms.
     pub room_id: Option<String>,
+    /// The initiating room whose closure expires approval, independent of target scope.
+    pub origin_room_id: Option<String>,
 }
 
 /// The user's answer, carried with the request id in a `PermissionPromptResponse`.
@@ -416,6 +418,13 @@ impl PermissionPromptInfo {
         match self { Self::Ordinary(_) => true, Self::Flow(info) => info.allow_lasting }
     }
 
+    fn origin_room_id(&self) -> Option<&str> {
+        match self {
+            Self::Ordinary(info) => info.origin_room_id.as_deref(),
+            Self::Flow(info) => info.origin_room_id.as_deref(),
+        }.filter(|room| !room.is_empty())
+    }
+
     fn valid(&self) -> bool {
         match self {
             Self::Ordinary(info) => info.perm != Permission::Network || info.network_url.as_deref()
@@ -426,7 +435,25 @@ impl PermissionPromptInfo {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ApprovalDuration { Choose, Once, Session, Forever }
+enum ApprovalDuration { Choose, Once, RoomSession, Session, Forever }
+
+impl ApprovalDuration {
+    fn grant(self) -> Option<GrantDuration> {
+        match self {
+            Self::RoomSession => Some(GrantDuration::RoomSession),
+            Self::Session => Some(GrantDuration::RobrixSession),
+            Self::Forever => Some(GrantDuration::Always),
+            Self::Choose | Self::Once => None,
+        }
+    }
+}
+
+/// A grouped room lifetime must have one shared, host-captured closing boundary.
+fn shared_origin_room(requests: &[&PermissionPromptInfo]) -> Option<String> {
+    let origin = requests.first()?.origin_room_id()?;
+    requests.iter().all(|request| request.allows_lasting() && request.origin_room_id() == Some(origin))
+        .then(|| origin.to_owned())
+}
 
 #[derive(Script, ScriptHook, Widget)]
 pub struct MiniAppPermissionPrompt {
@@ -440,6 +467,7 @@ pub struct MiniAppPermissionPrompt {
     #[rust] flow_payload_expanded: bool,
     #[rust] durations: Vec<ApprovalDuration>,
     #[rust] duration: usize,
+    #[rust] duration_origin_room_id: Option<String>,
     #[rust] scope: Option<RoomScope>,
     #[rust] captured_scope: Option<RoomScope>,
     #[rust] current_scope: Option<RoomScope>,
@@ -512,14 +540,15 @@ impl Widget for MiniAppPermissionPrompt {
                 (true, ApprovalDuration::Once) => PermissionPromptAction::AllowFlowOnce,
                 (true, duration) if self.spatial_available => PermissionPromptAction::AllowFlowScoped {
                     scope: self.scope.clone().unwrap_or(RoomScope::AllRooms),
-                    duration: if duration == ApprovalDuration::Forever { GrantDuration::Always } else { GrantDuration::RobrixSession },
+                    duration: duration.grant().unwrap(),
                 },
+                (true, ApprovalDuration::RoomSession) => PermissionPromptAction::AllowFlow { duration: GrantDuration::RoomSession },
                 (true, ApprovalDuration::Session) => PermissionPromptAction::AllowFlow { duration: GrantDuration::RobrixSession },
                 (true, ApprovalDuration::Forever) => PermissionPromptAction::AllowFlow { duration: GrantDuration::Always },
                 (false, ApprovalDuration::Once) => PermissionPromptAction::AllowOnce,
                 (false, duration) => PermissionPromptAction::AllowScoped {
                     scope: self.scope.clone().unwrap_or(RoomScope::AllRooms),
-                    duration: if duration == ApprovalDuration::Forever { GrantDuration::Always } else { GrantDuration::RobrixSession },
+                    duration: duration.grant().unwrap(),
                     network: self.network.clone(),
                 },
             };
@@ -580,7 +609,7 @@ impl MiniAppPermissionPrompt {
     }
 
     fn group_answer(&self, request: &PermissionPromptInfo, duration: ApprovalDuration) -> PermissionPromptAction {
-        let lasting = if duration == ApprovalDuration::Forever { GrantDuration::Always } else { GrantDuration::RobrixSession };
+        let lasting = duration.grant().unwrap_or(GrantDuration::RobrixSession);
         match request {
             PermissionPromptInfo::Flow(_) if duration == ApprovalDuration::Once => PermissionPromptAction::AllowFlowOnce,
             PermissionPromptInfo::Flow(info) if info.scope.is_some() => PermissionPromptAction::AllowFlowScoped {
@@ -599,6 +628,7 @@ impl MiniAppPermissionPrompt {
 
     fn configure_group_selection(&mut self, cx: &mut Cx, reset: bool) {
         let old_duration = (!reset).then(|| self.durations.get(self.duration).copied()).flatten();
+        let old_origin_room = self.duration_origin_room_id.clone();
         let old_scope = self.scope.clone();
         let old_mode = self.spatial_mode;
         let old_spatial = self.spatial_available;
@@ -607,6 +637,7 @@ impl MiniAppPermissionPrompt {
         let count = selected.len();
         let once = count > 0 && selected.iter().all(|request| request.allows_once());
         let lasting = count > 0 && selected.iter().all(|request| request.allows_lasting());
+        let origin_room = shared_origin_room(&selected);
         self.request_valid = count > 0 && selected.iter().all(|request| request.valid());
         let mut rooms = BTreeSet::new();
         let mut spaces = BTreeSet::new();
@@ -639,10 +670,12 @@ impl MiniAppPermissionPrompt {
                 self.view.permission_scope_editor(cx, ids!(spatial_picker)).configure_popup(cx, scope, old_mode == 2);
             }
         }
-        self.configure_duration(cx, once, lasting);
+        self.configure_duration(cx, once, lasting, origin_room.as_deref());
         if !reset {
             // Losing a chosen duration must require a new choice, not broaden consent.
-            if let Some(index) = old_duration.and_then(|old| self.durations.iter().position(|duration| *duration == old)) {
+            if let Some(index) = old_duration.filter(|old| *old != ApprovalDuration::RoomSession || old_origin_room == self.duration_origin_room_id)
+                .and_then(|old| self.durations.iter().position(|duration| *duration == old))
+            {
                 self.duration = index;
             } else {
                 self.durations.insert(0, ApprovalDuration::Choose);
@@ -671,9 +704,11 @@ impl MiniAppPermissionPrompt {
         self.view.redraw(cx);
     }
 
-    fn configure_duration(&mut self, cx: &mut Cx, once: bool, lasting: bool) {
+    fn configure_duration(&mut self, cx: &mut Cx, once: bool, lasting: bool, origin_room: Option<&str>) {
         self.durations.clear();
         if once { self.durations.push(ApprovalDuration::Once); }
+        self.duration_origin_room_id = origin_room.filter(|room| lasting && !room.is_empty()).map(str::to_owned);
+        if self.duration_origin_room_id.is_some() { self.durations.push(ApprovalDuration::RoomSession); }
         if lasting { self.durations.extend([ApprovalDuration::Session, ApprovalDuration::Forever]); }
         self.duration = self.durations.iter().position(|duration| *duration == ApprovalDuration::Session).unwrap_or(0);
         self.request_valid &= !self.durations.is_empty();
@@ -764,11 +799,19 @@ impl MiniAppPermissionPrompt {
             popup_scope_summary(cx, scope)
         } else { String::new() };
         self.view.label(cx, ids!(spatial_summary)).set_text(cx, &spatial_summary);
+        let room_summary = self.duration_origin_room_id.as_deref().map(|origin| {
+            let name = if cx.has_global::<RoomsListRef>() {
+                cx.get_global::<RoomsListRef>().permission_targets().into_iter()
+                    .find(|(id, _, _)| id == origin).map(|(_, name, _)| name)
+            } else { None }.unwrap_or_else(|| "the starting room".into());
+            format!("Closing the last room tab or screen for {name} expires this approval, even if the mini-app stays open separately.")
+        });
         let summary = match self.durations.get(self.duration) {
             Some(ApprovalDuration::Choose) => "Your previous duration does not apply to every selected permission. Choose a duration above.",
             Some(ApprovalDuration::Once) if self.durations.len() == 1 => "Approval applies only to the request shown.",
             Some(ApprovalDuration::Once) if self.group_id.is_some() => "Only the selected requests. Ask again next time.",
             Some(ApprovalDuration::Once) => "Only this request. Ask again next time.",
+            Some(ApprovalDuration::RoomSession) => room_summary.as_deref().unwrap_or("Choose how long to allow this action."),
             Some(ApprovalDuration::Session) if self.group_id.is_some() => "Use these permissions without asking again until you quit Robrix.",
             Some(ApprovalDuration::Session) => "Repeat this action without asking again until you quit Robrix.",
             Some(ApprovalDuration::Forever) if self.group_id.is_some() => "Keep these approvals until you remove them in Mini Apps.",
@@ -776,7 +819,7 @@ impl MiniAppPermissionPrompt {
             None => "Choose how long to allow this action.",
         };
         self.view.label(cx, ids!(duration_summary)).set_text(cx, summary);
-        let duration_valid = matches!(self.durations.get(self.duration), Some(ApprovalDuration::Once | ApprovalDuration::Session | ApprovalDuration::Forever));
+        let duration_valid = matches!(self.durations.get(self.duration), Some(ApprovalDuration::Once | ApprovalDuration::RoomSession | ApprovalDuration::Session | ApprovalDuration::Forever));
         let has_duration_choices = self.durations.iter().any(|duration| *duration != ApprovalDuration::Choose);
         self.view.widget(cx, ids!(approval_duration_section)).set_visible(cx, has_duration_choices);
         let can_approve = self.request_valid && self.scope_valid && duration_valid;
@@ -787,7 +830,8 @@ impl MiniAppPermissionPrompt {
     fn duration_labels(&self) -> Vec<String> {
         self.durations.iter().map(|duration| match duration {
             ApprovalDuration::Choose => "Choose a duration…",
-            ApprovalDuration::Once => "One time", ApprovalDuration::Session => "Until you quit Robrix", ApprovalDuration::Forever => "Forever",
+            ApprovalDuration::Once => "One time", ApprovalDuration::RoomSession => "Until this room closes",
+            ApprovalDuration::Session => "Until you quit Robrix", ApprovalDuration::Forever => "Forever",
         }.into()).collect()
     }
 }
@@ -835,7 +879,7 @@ impl MiniAppPermissionPromptRef {
             None => inner.view.widget(cx, ids!(prompt_tool)).set_visible(cx, false),
         }
         inner.view.label(cx, ids!(permission_help)).set_text(cx, &review_text(&permission_help(&info.app_name, info.agent, false)));
-        inner.configure_duration(cx, info.can_allow_once && !info.enable_writes, true);
+        inner.configure_duration(cx, info.can_allow_once && !info.enable_writes, true, info.origin_room_id.as_deref());
         inner.view.redraw(cx);
     }
 
@@ -870,7 +914,7 @@ impl MiniAppPermissionPromptRef {
         let details = if matrix_server { format!("{}\n\n{}", info.destination, info.payload) } else { info.payload.clone() };
         inner.view.label(cx, ids!(flow_payload)).set_text(cx, &review_text(&details));
         inner.view.label(cx, ids!(permission_help)).set_text(cx, &review_text(&permission_help(&info.app_name, info.agent, false)));
-        inner.configure_duration(cx, info.allow_once, info.allow_lasting);
+        inner.configure_duration(cx, info.allow_once, info.allow_lasting, info.origin_room_id.as_deref());
         inner.view.redraw(cx);
     }
 
@@ -1660,6 +1704,11 @@ mod tests {
         actions.iter().find_map(|action| action.downcast_ref::<PermissionPromptResponse>().cloned()).expect("one decision response")
     }
 
+    fn answer_for_duration(prompt: &MiniAppPermissionPromptRef, cx: &mut Cx, duration: ApprovalDuration) -> PermissionPromptResponse {
+        let index = prompt.borrow().unwrap().durations.iter().position(|candidate| *candidate == duration).expect("duration is available");
+        answer(prompt, cx, index, false)
+    }
+
     fn group_answer(prompt: &MiniAppPermissionPromptRef, cx: &mut Cx, duration: usize, deny: bool) -> PermissionPromptGroupResponse {
         let inner = prompt.borrow().unwrap();
         let dropdown = inner.view.drop_down2(cx, ids!(approval_duration)).widget_uid();
@@ -1681,7 +1730,7 @@ mod tests {
             prompt_id: 33, app_name: "Room AI".into(), app_icon: "🤖".into(), agent: true,
             action: "Send your answer to this room".into(), destination: "Room: Selected room".into(),
             sources: vec!["Room messages".into()], payload: "{\"message\":\"Your answer\"}".into(),
-            allow_once: true, allow_lasting: true, scope: None, scope_targets: Vec::new(), room_id: None,
+            allow_once: true, allow_lasting: true, scope: None, scope_targets: Vec::new(), room_id: None, origin_room_id: None,
         };
         prompt.show_flow(&mut cx, &info);
         let help = prompt.borrow().unwrap().view.label(&cx, ids!(permission_help)).text();
@@ -1721,7 +1770,7 @@ mod tests {
         let flow = FlowPromptInfo {
             prompt_id: 35, app_name: "Search".into(), app_icon: "🔎".into(), agent: false,
             action: "Open this message".into(), destination: "Robrix".into(), sources: Vec::new(), payload: "{}".into(),
-            allow_once: true, allow_lasting: false, scope: None, scope_targets: Vec::new(), room_id: None,
+            allow_once: true, allow_lasting: false, scope: None, scope_targets: Vec::new(), room_id: None, origin_room_id: None,
         };
         let info = PermissionPromptGroupInfo {
             group_id: 8, requests: vec![PermissionPromptInfo::Ordinary(ongoing), PermissionPromptInfo::Flow(flow)],
@@ -1764,10 +1813,10 @@ mod tests {
     fn one_simple_prompt_emits_selected_duration_with_captured_room_scope() {
         let (mut cx, prompt) = prompt();
         let info = ordinary_info();
-        for (index, duration) in [(0, None), (1, Some(GrantDuration::RobrixSession)), (2, Some(GrantDuration::Always))] {
+        for (index, duration) in [(0, None), (1, Some(GrantDuration::RoomSession)), (2, Some(GrantDuration::RobrixSession)), (3, Some(GrantDuration::Always))] {
             prompt.show(&mut cx, &info);
             let inner = prompt.borrow().unwrap();
-            assert_eq!(inner.duration, 1, "a new request defaults to the session");
+            assert_eq!(inner.duration, 2, "a new request defaults to the Robrix session");
             assert_eq!(inner.view.button(&cx, ids!(allow_button)).text(), "Approve");
             assert_eq!(inner.view.button(&cx, ids!(not_now_button)).text(), "Deny");
             assert!(inner.view.widget(&cx, ids!(approval_duration)).visible());
@@ -1800,7 +1849,7 @@ mod tests {
         prompt.show(&mut cx, &info);
         assert!(!prompt.borrow().unwrap().view.widget(&cx, ids!(spatial_section)).visible());
         assert!(prompt.borrow().unwrap().view.label(&cx, ids!(prompt_context)).text().contains("Website: https://example.org"));
-        assert!(matches!(answer(&prompt, &mut cx, 1, false).answer,
+        assert!(matches!(answer_for_duration(&prompt, &mut cx, ApprovalDuration::Session).answer,
             PermissionPromptAction::AllowScoped { scope, duration: GrantDuration::RobrixSession, network: Some(NetworkScope::Origin(origin)) }
                 if scope == RoomScope::room("!target:example.org") && origin == "https://example.org"));
         info.collection = true;
@@ -1809,12 +1858,12 @@ mod tests {
         info.network_url = None;
         prompt.show(&mut cx, &info);
         assert!(prompt.borrow().unwrap().view.label(&cx, ids!(prompt_context)).text().contains("Your rooms and spaces"));
-        assert!(matches!(answer(&prompt, &mut cx, 1, false).answer,
+        assert!(matches!(answer_for_duration(&prompt, &mut cx, ApprovalDuration::Session).answer,
             PermissionPromptAction::AllowScoped { scope: RoomScope::AllRooms, .. }));
         info.collection = false;
         info.scope = Some(RoomScope::room("!target:example.org"));
         prompt.show(&mut cx, &info);
-        assert!(matches!(answer(&prompt, &mut cx, 1, false).answer,
+        assert!(matches!(answer_for_duration(&prompt, &mut cx, ApprovalDuration::Session).answer,
             PermissionPromptAction::AllowScoped { scope, .. } if scope == RoomScope::room("!target:example.org")));
     }
 
@@ -1830,7 +1879,7 @@ mod tests {
         let context = prompt.borrow().unwrap().view.label(&cx, ids!(prompt_context)).text();
         assert!(context.contains("First room") && context.contains("Second room"));
         assert!(!context.contains("Your rooms and spaces"));
-        assert!(matches!(answer(&prompt, &mut cx, 1, false).answer,
+        assert!(matches!(answer_for_duration(&prompt, &mut cx, ApprovalDuration::Session).answer,
             PermissionPromptAction::AllowScoped { scope: captured, .. } if captured == scope));
     }
 
@@ -1842,15 +1891,103 @@ mod tests {
             info.can_allow_once = !ongoing;
             info.enable_writes = enable_writes;
             prompt.show(&mut cx, &info);
-            assert_eq!(prompt.borrow().unwrap().durations, [ApprovalDuration::Session, ApprovalDuration::Forever]);
-            assert!(matches!(answer(&prompt, &mut cx, 0, false).answer,
-                PermissionPromptAction::AllowScoped { duration: GrantDuration::RobrixSession, .. }));
+            assert_eq!(prompt.borrow().unwrap().durations, [ApprovalDuration::RoomSession, ApprovalDuration::Session, ApprovalDuration::Forever]);
+            assert!(matches!(answer_for_duration(&prompt, &mut cx, ApprovalDuration::RoomSession).answer,
+                PermissionPromptAction::AllowScoped { duration: GrantDuration::RoomSession, .. }));
             if enable_writes { assert!(prompt.borrow().unwrap().view.label(&cx, ids!(prompt_blurb)).text().contains("turns on room changes")); }
         }
         info.can_allow_once = true;
         info.enable_writes = false;
         prompt.show(&mut cx, &info);
         assert_eq!(prompt.borrow().unwrap().durations[0], ApprovalDuration::Once, "the next request restores its own choices");
+    }
+
+    #[test]
+    fn room_duration_requires_an_origin_and_never_uses_the_target_room_as_its_lifetime() {
+        let (mut cx, prompt) = prompt();
+        let mut info = ordinary_info();
+        info.can_allow_once = false;
+        prompt.show(&mut cx, &info);
+        assert_eq!(prompt.borrow().unwrap().duration_origin_room_id.as_deref(), Some("!origin:example.org"));
+        prompt.borrow_mut().unwrap().select_spatial_scope(&mut cx, 1);
+        assert!(matches!(answer_for_duration(&prompt, &mut cx, ApprovalDuration::RoomSession).answer,
+            PermissionPromptAction::AllowScoped { scope: RoomScope::AllRooms, duration: GrantDuration::RoomSession, .. }));
+        assert!(prompt.borrow().unwrap().view.label(&cx, ids!(duration_summary)).text().contains("last room tab or screen"));
+        info.origin_room_id = None;
+        prompt.show(&mut cx, &info);
+        assert_eq!(prompt.borrow().unwrap().durations, [ApprovalDuration::Session, ApprovalDuration::Forever],
+            "a target room does not attach an account-wide app to that room's lifetime");
+        info.origin_room_id = Some(String::new());
+        prompt.show(&mut cx, &info);
+        assert!(!prompt.borrow().unwrap().durations.contains(&ApprovalDuration::RoomSession));
+    }
+
+    #[test]
+    fn grouped_room_duration_requires_the_same_origin_and_rechecks_changed_selection() {
+        let (mut cx, prompt) = prompt();
+        let mut first = ordinary_info();
+        first.can_allow_once = false;
+        let mut second = first.clone();
+        second.prompt_id = 18;
+        let group = PermissionPromptGroupInfo { group_id: 9, requests: vec![
+            PermissionPromptInfo::Ordinary(first.clone()), PermissionPromptInfo::Ordinary(second.clone()),
+        ] };
+        prompt.show_group(&mut cx, &group);
+        let index = prompt.borrow().unwrap().durations.iter().position(|duration| *duration == ApprovalDuration::RoomSession).unwrap();
+        let response = group_answer(&prompt, &mut cx, index, false);
+        assert!(response.responses.iter().all(|response| matches!(response.answer,
+            PermissionPromptAction::AllowScoped { duration: GrantDuration::RoomSession, .. })));
+
+        second.origin_room_id = Some("!other:example.org".into());
+        prompt.show_group(&mut cx, &PermissionPromptGroupInfo { group_id: 10, requests: vec![
+            PermissionPromptInfo::Ordinary(first), PermissionPromptInfo::Ordinary(second),
+        ] });
+        assert!(!prompt.borrow().unwrap().durations.contains(&ApprovalDuration::RoomSession));
+        {
+            let mut inner = prompt.borrow_mut().unwrap();
+            inner.group_selected = vec![true, false];
+            inner.configure_group_selection(&mut cx, false);
+        }
+        let index = prompt.borrow().unwrap().durations.iter().position(|duration| *duration == ApprovalDuration::RoomSession).unwrap();
+        group_answer(&prompt, &mut cx, index, false);
+        {
+            let mut inner = prompt.borrow_mut().unwrap();
+            inner.group_selected = vec![false, true];
+            inner.configure_group_selection(&mut cx, false);
+        }
+        let inner = prompt.borrow().unwrap();
+        assert_eq!(inner.durations[inner.duration], ApprovalDuration::Choose,
+            "switching the closing room requires a new duration choice");
+        assert!(inner.view.widget(&cx, ids!(allow_button)).disabled(&cx));
+    }
+
+    #[test]
+    fn room_bound_flow_and_mixed_groups_emit_room_lifetimes_only_when_lasting_is_supported() {
+        let (mut cx, prompt) = prompt();
+        let mut info = FlowPromptInfo {
+            prompt_id: 39, app_name: "Search".into(), app_icon: "🔎".into(), agent: false,
+            action: "Search another room".into(), destination: "Your Matrix server".into(), sources: vec!["Account data".into()],
+            payload: "{}".into(), allow_once: true, allow_lasting: true,
+            scope: Some(RoomScope::room("!target:example.org")), scope_targets: vec![("!target:example.org".into(), Vec::new())],
+            room_id: Some("!target:example.org".into()), origin_room_id: Some("!origin:example.org".into()),
+        };
+        prompt.show_flow(&mut cx, &info);
+        assert!(matches!(answer_for_duration(&prompt, &mut cx, ApprovalDuration::RoomSession).answer,
+            PermissionPromptAction::AllowFlowScoped { duration: GrantDuration::RoomSession, .. }));
+        info.scope = None;
+        prompt.show_flow(&mut cx, &info);
+        assert!(matches!(answer_for_duration(&prompt, &mut cx, ApprovalDuration::RoomSession).answer,
+            PermissionPromptAction::AllowFlow { duration: GrantDuration::RoomSession }));
+        prompt.show_group(&mut cx, &PermissionPromptGroupInfo { group_id: 11, requests: vec![
+            PermissionPromptInfo::Ordinary(ordinary_info()), PermissionPromptInfo::Flow(info.clone()),
+        ] });
+        let index = prompt.borrow().unwrap().durations.iter().position(|duration| *duration == ApprovalDuration::RoomSession).unwrap();
+        let response = group_answer(&prompt, &mut cx, index, false);
+        assert!(matches!(response.responses[0].answer, PermissionPromptAction::AllowScoped { duration: GrantDuration::RoomSession, .. }));
+        assert!(matches!(response.responses[1].answer, PermissionPromptAction::AllowFlow { duration: GrantDuration::RoomSession }));
+        info.allow_lasting = false;
+        prompt.show_flow(&mut cx, &info);
+        assert_eq!(prompt.borrow().unwrap().durations, [ApprovalDuration::Once], "a room anchor never broadens restricted source consent");
     }
 
     #[test]
@@ -1873,7 +2010,7 @@ mod tests {
             prompt_id: 19, app_name: "Search".into(), app_icon: "🔎".into(), agent: false, action: "Search room messages and send your search text to your Matrix server.".into(),
             destination: "Your Matrix server".into(), sources: vec!["Account data".into(), "Unknown private data".into()],
             payload: "{\n  \"query\": \"nexus \u{202e}4\"\n}".into(), allow_once: true, allow_lasting: true,
-            scope: None, scope_targets: Vec::new(), room_id: None,
+            scope: None, scope_targets: Vec::new(), room_id: None, origin_room_id: None,
         };
         for (index, duration) in [(0, None), (1, Some(GrantDuration::RobrixSession)), (2, Some(GrantDuration::Always))] {
             prompt.show_flow(&mut cx, &info);
@@ -1898,7 +2035,7 @@ mod tests {
         assert!(prompt.borrow().unwrap().view.widget(&cx, ids!(flow_payload)).visible());
         prompt.show(&mut cx, &ordinary_info());
         assert!(!prompt.borrow().unwrap().view.widget(&cx, ids!(flow_section)).visible());
-        assert_eq!(answer(&prompt, &mut cx, 1, false).prompt_id, 17);
+        assert_eq!(answer_for_duration(&prompt, &mut cx, ApprovalDuration::Session).prompt_id, 17);
     }
 
     #[test]
@@ -1908,7 +2045,7 @@ mod tests {
             prompt_id: 27, app_name: "Search".into(), app_icon: "🔎".into(), agent: false, action: "Search for nexus in this room".into(),
             destination: "Your Matrix server: https://matrix.example.org".into(), sources: vec!["Account data".into(), "Unknown private data".into()],
             payload: "{\"query\":\"nexus\"}".into(), allow_once: true, allow_lasting: true,
-            scope: None, scope_targets: Vec::new(), room_id: None,
+            scope: None, scope_targets: Vec::new(), room_id: None, origin_room_id: None,
         };
         prompt.show_flow(&mut cx, &info);
         let inner = prompt.borrow().unwrap();
@@ -1921,7 +2058,7 @@ mod tests {
         assert!(!inner.view.label(&cx, ids!(prompt_blurb)).text().contains("Unknown"));
         drop(inner);
         assert!(matches!(answer(&prompt, &mut cx, 0, false).answer, PermissionPromptAction::AllowFlowOnce));
-        assert!(matches!(answer(&prompt, &mut cx, 1, false).answer, PermissionPromptAction::AllowFlow { duration: GrantDuration::RobrixSession }));
+        assert!(matches!(answer_for_duration(&prompt, &mut cx, ApprovalDuration::Session).answer, PermissionPromptAction::AllowFlow { duration: GrantDuration::RobrixSession }));
         assert!(matches!(answer(&prompt, &mut cx, 2, false).answer, PermissionPromptAction::AllowFlow { duration: GrantDuration::Always }));
     }
 
@@ -1932,7 +2069,7 @@ mod tests {
             prompt_id: 28, app_name: "Search".into(), app_icon: "🔎".into(), agent: false, action: "Search for nexus in the selected room".into(),
             destination: "Room: Selected room".into(), sources: vec!["Data from a different account".into()],
             payload: "{\"query\":\"nexus\"}".into(), allow_once: true, allow_lasting: false,
-            scope: None, scope_targets: Vec::new(), room_id: None,
+            scope: None, scope_targets: Vec::new(), room_id: None, origin_room_id: None,
         };
         prompt.show_flow(&mut cx, &info);
         let inner = prompt.borrow().unwrap();
@@ -1954,7 +2091,7 @@ mod tests {
         prompt.show(&mut cx, &info);
         assert!(matches!(answer(&prompt, &mut cx, 99, false).answer,
             PermissionPromptAction::AllowScoped { duration: GrantDuration::RobrixSession, .. }));
-        assert_eq!(prompt.borrow().unwrap().duration, 0);
+        assert_eq!(prompt.borrow().unwrap().durations[prompt.borrow().unwrap().duration], ApprovalDuration::Session);
     }
 
     #[test]
@@ -1985,7 +2122,7 @@ mod tests {
         picker.set_scope(&mut cx, &space);
         let changed = cx.capture_actions(|cx| cx.widget_action(picker.widget_uid(), PermissionScopeEditorAction::Changed));
         prompt.borrow_mut().unwrap().handle_event(&mut cx, &Event::Actions(changed), &mut Scope::empty());
-        assert!(matches!(answer(&prompt, &mut cx, 1, false).answer,
+        assert!(matches!(answer_for_duration(&prompt, &mut cx, ApprovalDuration::Session).answer,
             PermissionPromptAction::AllowScoped { scope, duration: GrantDuration::RobrixSession, .. } if scope == space));
         prompt.update_scope_targets(&mut cx, &[("!target:example.org".into(), Vec::new())]);
         assert!(!prompt.borrow().unwrap().scope_valid);
@@ -1996,7 +2133,7 @@ mod tests {
         prompt.set_space_membership_ready(&mut cx, true);
         assert!(prompt.borrow().unwrap().scope_valid);
         assert_eq!(prompt.borrow().unwrap().scope, Some(space));
-        assert_eq!(prompt.borrow().unwrap().duration, 1);
+        assert_eq!(prompt.borrow().unwrap().durations[prompt.borrow().unwrap().duration], ApprovalDuration::Session);
         picker.set_scope(&mut cx, &RoomScope::Selection { rooms: Vec::new(), spaces: Vec::new() });
         let changed = cx.capture_actions(|cx| cx.widget_action(picker.widget_uid(), PermissionScopeEditorAction::Changed));
         prompt.borrow_mut().unwrap().handle_event(&mut cx, &Event::Actions(changed), &mut Scope::empty());
@@ -2016,12 +2153,12 @@ mod tests {
         prompt.show(&mut cx, &info);
         assert_eq!(prompt.borrow().unwrap().spatial_mode, 1);
         prompt.borrow_mut().unwrap().select_spatial_scope(&mut cx, 0);
-        assert!(matches!(answer(&prompt, &mut cx, 1, false).answer,
+        assert!(matches!(answer_for_duration(&prompt, &mut cx, ApprovalDuration::Session).answer,
             PermissionPromptAction::AllowScoped { scope, .. } if scope == RoomScope::room("!target:example.org")));
         info.room_id = None;
         prompt.show(&mut cx, &info);
         assert_eq!(prompt.borrow().unwrap().spatial_modes, [1, 2, 3]);
-        assert!(matches!(answer(&prompt, &mut cx, 1, false).answer,
+        assert!(matches!(answer_for_duration(&prompt, &mut cx, ApprovalDuration::Session).answer,
             PermissionPromptAction::AllowScoped { scope: RoomScope::AllRooms, .. }));
     }
 
@@ -2034,10 +2171,10 @@ mod tests {
             payload: "{\"query\":\"nexus\"}".into(), allow_once: true, allow_lasting: true,
             scope: Some(RoomScope::room("!target:example.org")),
             scope_targets: vec![("!target:example.org".into(), vec!["!parent:example.org".into()])],
-            room_id: Some("!target:example.org".into()),
+            room_id: Some("!target:example.org".into()), origin_room_id: None,
         };
         prompt.show_flow(&mut cx, &info);
-        assert!(matches!(answer(&prompt, &mut cx, 1, false).answer,
+        assert!(matches!(answer_for_duration(&prompt, &mut cx, ApprovalDuration::Session).answer,
             PermissionPromptAction::AllowFlowScoped { scope, duration: GrantDuration::RobrixSession } if scope == RoomScope::room("!target:example.org")));
         prompt.borrow_mut().unwrap().select_spatial_scope(&mut cx, 1);
         assert!(matches!(answer(&prompt, &mut cx, 2, false).answer,
@@ -2048,7 +2185,7 @@ mod tests {
         info.room_id = None;
         prompt.show_flow(&mut cx, &info);
         assert!(!prompt.borrow().unwrap().view.widget(&cx, ids!(spatial_section)).visible());
-        assert!(matches!(answer(&prompt, &mut cx, 1, false).answer,
+        assert!(matches!(answer_for_duration(&prompt, &mut cx, ApprovalDuration::Session).answer,
             PermissionPromptAction::AllowFlow { duration: GrantDuration::RobrixSession }));
         let mut account = ordinary_info();
         account.perm = Permission::MatrixProfile;

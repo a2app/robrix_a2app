@@ -484,7 +484,7 @@ mod navigation_tests {
                 assert!(stack.destination_view().is_none());
                 assert_mini_apps_page(&mut cx, &home);
                 assert!(!response.iter().any(|action| matches!(action.downcast_ref(),
-                    Some(crate::a2app::runtime::A2AppOp::RoomClosed(_)))),
+                    Some(crate::a2app::runtime::A2AppOp::RoomClosed { .. }))),
                     "page navigation must preserve room work, including its generation console");
 
                 let hidden = transition_action(&mut cx, view.widget_uid(), StackNavigationTransitionAction::HideEnd(stack.widget_uid()));

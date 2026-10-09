@@ -130,14 +130,20 @@ background tasks. App data and provenance are retained. Apps ask again when
 opened; background tasks must be enabled again.
 
 Request popups show the app, task and captured rooms or website. Choose **One
-time**, **Until you quit Robrix**, or **Forever** under **Approve duration:**,
-then **Approve** or **Deny**. The default is until you quit Robrix; website access
+time**, **Until this room closes**, **Until you quit Robrix**, or **Forever** under
+**Approve duration:**, then **Approve** or **Deny**. The room-close choice appears
+only for an open origin-room session; detached apps and scheduled reviews without
+that anchor omit it. The default is until you quit Robrix; website access
 covers only the displayed HTTP(S) origin. For room operations, **Approve in:**
 defaults to the requested rooms. Choose **Current room(s)**, **All rooms**,
 **Rooms in a space**, or **Selected rooms and spaces** in the same popup.
 Spaces include their nested rooms and future membership changes. Fixed requests
 must fit the selection; room collections are filtered to it. **One time** approves
 only the captured request. Account and device tasks omit room choices.
+Duration and target scope are independent: closing the originating room expires
+its room-session grant even when **Approve in:** covers another room or all rooms.
+Closing its last room tab or screen ends that session, including when the
+mini-app stays open in a separate window.
 Robrix checks room protection internally. Ongoing subscriptions need a
 session or lasting duration. Related setup requests appear together, with
 **Choose permissions individually** to approve only selected features. Pending
@@ -561,9 +567,12 @@ redirect destination requires a separate approved request.
 ### Permission scopes and room protection
 
 Consent can cover all rooms or selected rooms and spaces, for the current
-room session, until Robrix closes, or persistently. A room session ends when
-that room is closed; restarting a mini-app isolate does not end a Robrix
-session grant. Session allowances never reach disk. Allow Once authorizes
+origin-room session, until Robrix closes, or persistently. **Until this room
+closes** ends when the app's originating room closes, independently of the grant's
+target-room selection. Detached account apps have no origin-room session; an
+attached account utility can use this duration without gaining room-reading
+permission. Restarting a mini-app isolate does not end a Robrix-session grant or
+extend a room-session grant. Session allowances never reach disk. Allow Once authorizes
 only the pending request, including its asynchronous completion. Subscriptions
 and requests to enable a permission use a selected duration instead.
 Explicit action and sharing session choices also survive restarting that same
@@ -707,13 +716,14 @@ A foreground prompt can approve sharing and the sensitive action together.
 **One time** covers the complete host-owned request and is consumed immediately
 before the effect starts. Changed contents, a different target, cancellation,
 revocation or a new activation cannot reuse that one-time approval.
-**Until you quit Robrix** and **Forever** remember the app's operation and
-target for repeated requests, including different contents. All choices continue
+**Until this room closes**, **Until you quit Robrix**, and **Forever** remember
+the app's operation and target for repeated requests, including different
+contents. All choices continue
 the waiting request automatically and preserve its private source labels.
-New sources or influences require another review. Session approvals end when
-Robrix quits; permanent approvals remain until revoked. The advanced history
-review still authorizes one unchanged manual retry, and explicit room-session
-choices remain available there. Operation approvals do not create general
+New sources or influences require another review. Room-session approvals end
+when the originating room closes; Robrix-session approvals end when Robrix quits;
+permanent approvals remain until revoked. The advanced history review still
+authorizes one unchanged manual retry. Operation approvals do not create general
 source-to-recipient sharing rules. No app can endorse its own content or reset
 these labels.
 This constrains actions influenced by prompt injection; it does not classify

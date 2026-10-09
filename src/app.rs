@@ -854,6 +854,8 @@ impl AppMain for App {
         });
         makepad_widgets::set_splash_theme(makepad_widgets::SplashTheme::Light);
         makepad_widgets::widgets_mod(vm);
+        // Complete an explicitly selected Makepad style before Robrix overrides it.
+        makepad_widgets::desktop_style::apply_widgets(vm);
         makepad_code_editor::script_mod(vm);
         crate::shared::script_mod(vm);
 
