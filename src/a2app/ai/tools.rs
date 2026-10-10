@@ -77,6 +77,15 @@ pub trait AiHost: Send + Sync {
     /// URL sources use the same destination and sharing gates as [`Self::fetch_url`].
     fn draft_media(&self, request: MediaDraftRequest) -> Result<String, String>;
 
+    /// Makes actual authorized draft bytes available to the configured model.
+    fn inspect_media(&self, _request: InspectMediaRequest) -> Result<a2app_agent::tool_output::ToolOutput, String> {
+        Err("Media inspection is unavailable for this host.".into())
+    }
+
+    /// Generates image bytes through a configured, reviewed model recipient.
+    /// Returns a local draft; attachment and sending remain separate effects.
+    fn generate_image(&self, request: super::discovery::ImageGenerationRequest) -> Result<String, String>;
+
     /// Attaches a prepared draft to this room's composer for the user to send.
     fn attach_media(&self, draft_id: &str) -> Result<String, String>;
 
@@ -351,8 +360,8 @@ impl Tool for ReadRoomMessagesTool {
          room_id, the body, and whether the user has already read it \
          (unread: true means it arrived after the user's last read receipt). \
          Attachment rows include media metadata (filename, MIME type, URI \
-         and encrypted flag, without keys); use their event_id with draft_media \
-         to prepare media through the host, including encrypted attachments. \
+         and encrypted flag, without keys); use their event_id with inspect_media \
+         to see actual pixels/content, including encrypted attachments; draft_media prepares a separate local draft. \
          Use it to catch up on conversation you have not been told about — \
          when asked to summarize, focus on the rows where unread is true."
     }
@@ -397,7 +406,7 @@ impl Tool for ReadOlderMessagesTool {
          you have — to get the messages that came before it. Rows carry the \
          sender, sender_id, event_id, room_id, body and an unread flag, as \
          in read_room_messages, including attachment metadata; use the row's \
-         event_id with draft_media to prepare its bytes through the host."
+         event_id with inspect_media to see actual pixels/content, or draft_media to prepare its bytes through the host."
     }
 
     fn input_schema(&self) -> Value {
@@ -480,7 +489,7 @@ impl Tool for ReadOtherRoomMessagesTool {
          room_id, body, and an unread flag (true when the user hasn't read it \
          yet). The user is asked to allow each room the first time you read \
          from it. Attachment rows include media metadata without keys; pass \
-         their event_id and use their room_id as source_room in draft_media. Once \
+         their event_id and room_id as source_room in inspect_media to see actual contents; draft_media prepares a separate local draft. Once \
          allowed that one room stays allowed, but a different \
          room is a fresh ask. Use list_rooms to see which rooms exist."
     }
@@ -1190,7 +1199,7 @@ impl DraftMediaTool {
 impl Tool for DraftMediaTool {
     fn name(&self) -> &str { "draft_media" }
     fn description(&self) -> &str {
-        "Prepare image, audio, video or file bytes locally. Supply exactly one of url (HTTP(S)), mxc_uri (an attachment verified in this room's cached events), event_id (a room attachment, including encrypted media), or data_base64 (raw base64, at most 4 MiB), plus filename and mime_type. event_id defaults here; source_room selects another joined source room. Unknown mxc_uri requires event_id and source_room. HTTP(S) uses website and sharing approvals. Matrix downloads require matrix.media.download and no internet permission. Returns draft_id and metadata; nothing uploaded or posted. Use attach_media or post_room_media next."
+        "Prepare image, audio, video or file bytes locally. Supply exactly one of url (HTTP(S)), mxc_uri (an attachment verified in this room's cached events), event_id (a room attachment, including encrypted media), or data_base64 (raw base64, at most 4 MiB), plus filename and mime_type. event_id defaults here; source_room selects another joined source room. Unknown mxc_uri requires event_id and source_room. HTTP(S) uses website and sharing approvals. Matrix downloads require matrix.media.download and no internet permission. Returns draft_id and metadata; nothing uploaded or posted. Use inspect_media for actual contents, attach_media to stage a draft, or post_room_media to send it."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -1212,6 +1221,39 @@ impl Tool for DraftMediaTool {
     }
     fn call(&self, arguments: &Map<String, Value>) -> Result<String, String> {
         self.host.draft_media(MediaDraftRequest::from_arguments(arguments)?)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum InspectMediaRequest {
+    Draft(String),
+    Event { event_id: String, source_room: Option<String> },
+}
+
+pub struct InspectMediaTool { host: Arc<dyn AiHost> }
+impl InspectMediaTool {
+    pub fn new(host: Arc<dyn AiHost>) -> Self { Self { host } }
+}
+impl Tool for InspectMediaTool {
+    fn name(&self) -> &str { "inspect_media" }
+    fn description(&self) -> &str {
+        "Show a prepared draft's actual contents to the configured model, not just metadata. Supply a draft_id returned by draft_media, draft_file or generate_image, or event_id of an existing attachment plus optional source_room (defaults to this room, encrypted media supported). Images and supported PDF, text, audio and video inputs use native model content. Supported modalities depend on the provider/model; errors identify unsupported formats. Source downloads and model sharing stay permission-gated. Does not attach, upload or post."
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type":"object","properties":{"draft_id":{"type":"string"},"event_id":{"type":"string"},"source_room":{"type":"string"}},"oneOf":[{"required":["draft_id"]},{"required":["event_id"]}],"additionalProperties":false})
+    }
+    fn call(&self, arguments: &Map<String, Value>) -> Result<String, String> {
+        self.call_output(arguments).map(|output| output.text)
+    }
+    fn call_output(&self, arguments: &Map<String, Value>) -> Result<a2app_agent::tool_output::ToolOutput, String> {
+        reject_unknown_arguments(arguments, &["draft_id", "event_id", "source_room"])?;
+        let request = match (arguments.contains_key("draft_id"), arguments.contains_key("event_id")) {
+            (true, false) if !arguments.contains_key("source_room") => InspectMediaRequest::Draft(required_string(arguments, "draft_id")?),
+            (false, true) => InspectMediaRequest::Event { event_id: required_string(arguments, "event_id")?,
+                source_room: arguments.get("source_room").map(|_| required_string(arguments, "source_room")).transpose()? },
+            _ => return Err("inspect_media requires exactly one draft_id or event_id; source_room applies only to event_id.".into()),
+        };
+        self.host.inspect_media(request)
     }
 }
 
@@ -1476,9 +1518,13 @@ pub fn register_session_tools(server: &mut a2app_agent::mcp::McpServer, host: Ar
     // the fallback for anything the agent did not list.
     server.add_tool(RequestTaskPermissionsTool::new(host.clone()));
     server.add_tool(WebFetchTool::new(host.clone()));
+    server.add_tool(super::discovery::SearchMediaTool::new(host.clone()));
+    server.add_tool(super::discovery::GenerateImageTool::new(host.clone()));
+    server.add_tool(super::discovery::DraftFileTool::new(host.clone()));
     server.add_tool(PostRoomMessageTool::new(host.clone()));
     server.add_tool(DraftMessageTool::new(host.clone()));
     server.add_tool(DraftMediaTool::new(host.clone()));
+    server.add_tool(InspectMediaTool::new(host.clone()));
     server.add_tool(AttachMediaTool::new(host.clone()));
     server.add_tool(PostRoomMediaTool::new(host));
 }

@@ -4,6 +4,7 @@ use super::*;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use a2app_core::information_flow::{self as flow, ContextId, Label, Influences};
 use crate::a2app::ai::{media::PreparedMedia, tools::{MediaDraftRequest, MediaSource}};
+use crate::a2app::ai::tools::InspectMediaRequest;
 
 const MAX_DRAFTS: usize = 16;
 const MAX_DRAFT_BYTES: usize = 64 * 1024 * 1024;
@@ -21,8 +22,22 @@ pub(super) struct Pending {
     context: ContextId,
     epoch: u64,
     tool: &'static str,
-    answer: Sender<Result<String, String>>,
+    answer: PendingAnswer,
     alive: Arc<AtomicBool>,
+}
+
+enum PendingAnswer {
+    Text(Sender<Result<String, String>>),
+    Inspect(Sender<Result<a2app_agent::tool_output::ToolOutput, String>>),
+}
+
+impl PendingAnswer {
+    fn refuse(&self, error: String) {
+        match self {
+            Self::Text(answer) => { let _ = answer.send(Err(error)); }
+            Self::Inspect(answer) => { let _ = answer.send(Err(error)); }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -35,6 +50,7 @@ pub(super) struct MediaResult {
 enum MediaOutcome {
     Draft(Arc<PreparedMedia>),
     Posted(String),
+    Inspected { media: Arc<PreparedMedia>, detail: String },
 }
 
 fn draft(room: &OwnedRoomId, id: &str) -> Result<Arc<PreparedMedia>, String> {
@@ -62,7 +78,8 @@ pub(super) fn message_preview(state: &A2AppState, room: &OwnedRoomId, draft_id: 
 
 pub(super) fn restore_provenance(room: &OwnedRoomId, job: &SessionJob) -> Result<(), String> {
     match job {
-        SessionJob::AttachMedia { draft_id, .. } | SessionJob::PostRoomMedia { draft_id, .. } => { draft(room, draft_id)?; }
+        SessionJob::AttachMedia { draft_id, .. } | SessionJob::PostRoomMedia { draft_id, .. }
+        | SessionJob::InspectMedia { request: InspectMediaRequest::Draft(draft_id), .. } => { draft(room, draft_id)?; }
         _ => {}
     }
     Ok(())
@@ -152,17 +169,32 @@ fn authorization(room: &OwnedRoomId, target: &OwnedRoomId, capability: &str, con
 }
 
 fn pending(room: &OwnedRoomId, tool: &'static str, answer: Sender<Result<String, String>>) -> Result<(u64, ContextId, Arc<AtomicBool>), String> {
-    let context = super::super::information_flow::agent_context(room.as_str())?;
-    let epoch = flow::context_epoch(&context)?;
+    pending_answer(room, tool, PendingAnswer::Text(answer)).map(|(id, context, _, alive)| (id, context, alive))
+}
+
+fn pending_answer(room: &OwnedRoomId, tool: &'static str, answer: PendingAnswer) -> Result<(u64, ContextId, u64, Arc<AtomicBool>), String> {
+    let capture = super::super::information_flow::agent_context(room.as_str())
+        .and_then(|context| flow::context_epoch(&context).map(|epoch| (context, epoch)));
+    let (context, epoch) = match capture {
+        Ok(capture) => capture,
+        Err(error) => { answer.refuse(error.clone()); return Err(error); }
+    };
     let id = NEXT_AI_TOOL_ID.fetch_add(1, Ordering::Relaxed);
     let alive = Arc::new(AtomicBool::new(true));
-    with_a2app(|state| state.ai_media_pending.insert(id, Pending { room: room.clone(), context: context.clone(), epoch, tool, answer, alive: alive.clone() }));
-    Ok((id, context, alive))
+    let mut worker = Some(Pending { room: room.clone(), context: context.clone(), epoch, tool, answer, alive: alive.clone() });
+    if with_a2app(|state| state.ai_media_pending.insert(id, worker.take().unwrap())).is_none() {
+        let error = "Mini Apps is unavailable.".to_string();
+        worker.unwrap().answer.refuse(error.clone());
+        return Err(error);
+    }
+    Ok((id, context, epoch, alive))
 }
 
 pub(super) fn run(cx: &mut Cx, ui: &WidgetRef, room: &OwnedRoomId, job: SessionJob) {
     match job {
         SessionJob::DraftMedia { request, answer } => prepare(cx, ui, room, request, answer),
+        SessionJob::InspectMedia { request, answer } => inspect(cx, ui, room, request, answer),
+        SessionJob::GenerateImage { request, answer } => generate(room, request, answer),
         SessionJob::DraftMessage { .. } | SessionJob::AttachMedia { .. } => {
             let cap = if matches!(job, SessionJob::DraftMessage { .. }) { "host.composer.insert" } else { "host.composer.attach" };
             let Some(job) = gate(cx, ui, room, job, room, &[cap]) else { return };
@@ -196,7 +228,9 @@ pub(super) fn run(cx: &mut Cx, ui: &WidgetRef, room: &OwnedRoomId, job: SessionJ
             let prepared = draft(room, &draft_id).and_then(|media| {
                 Ok((media, authorizations))
             });
-            let (media, authorizations) = match prepared { Ok(prepared) => prepared, Err(error) => { let _ = answer.send(Err(error)); return; } };
+            let (media, mut authorizations) = match prepared { Ok(prepared) => prepared, Err(error) => { let _ = answer.send(Err(error)); return; } };
+            let payload = media.post_payload(&target);
+            for authorization in &mut authorizations { authorization.flow_payload = Some(payload.clone()); }
             let Ok((id, _, alive)) = pending(room, "post_room_media", answer) else { return };
             crate::sliding_sync::spawn_async_task(async move {
                 let result = if alive.load(Ordering::Acquire) { media.post(&target, &authorizations).await.map(MediaOutcome::Posted) }
@@ -206,6 +240,76 @@ pub(super) fn run(cx: &mut Cx, ui: &WidgetRef, room: &OwnedRoomId, job: SessionJ
         }
         _ => unreachable!(),
     }
+}
+
+fn inspect_output(media: &PreparedMedia, detail: String) -> Result<a2app_agent::tool_output::ToolOutput, String> {
+    let attachment = a2app_agent::tool_output::ModelAttachment::new(
+        media.bytes().to_vec(), media.mime_type().into(), media.filename().into())?;
+    Ok(a2app_agent::tool_output::ToolOutput { text: detail, attachments: vec![attachment] })
+}
+
+fn inspect(cx: &mut Cx, ui: &WidgetRef, room: &OwnedRoomId, request: InspectMediaRequest,
+    answer: Sender<Result<a2app_agent::tool_output::ToolOutput, String>>) {
+    let InspectMediaRequest::Event { ref event_id, ref source_room } = request else {
+        let InspectMediaRequest::Draft(draft_id) = request else { unreachable!() };
+        let result = draft(room, &draft_id).and_then(|media|
+            inspect_output(&media, serde_json::json!({"draft_id":draft_id,"media":media.metadata()}).to_string()));
+        note_ai_tool_call(room, "inspect_media", result.is_ok(), "");
+        let _ = answer.send(result);
+        return;
+    };
+    let source_room = match source_room.as_deref().map(OwnedRoomId::try_from).transpose() {
+        Ok(source) => source.unwrap_or_else(|| room.clone()),
+        Err(_) => { let _ = answer.send(Err("Invalid media source room id.".into())); return; }
+    };
+    if let Err(error) = joined_room_name(cx, &source_room) { let _ = answer.send(Err(error)); return; }
+    let event_id = event_id.clone();
+    let job = SessionJob::InspectMedia { request, answer };
+    let Some(job) = gate(cx, ui, room, job, &source_room, &["matrix.media.download"]) else { return };
+    let SessionJob::InspectMedia { answer, .. } = job else { unreachable!() };
+    let prepared = super::super::information_flow::agent_context(room.as_str()).and_then(|context| {
+        flow::add_sources(&context, [super::super::information_flow::room_source(&context, source_room.as_str())])?;
+        flow::add_influences(&context, [flow::Influence::RoomContent { account: context.account().into(), room: source_room.to_string() }])?;
+        authorization(room, &source_room, "matrix.media.download", &context)
+    });
+    let auth = match prepared { Ok(auth) => auth, Err(error) => { let _ = answer.send(Err(error)); return; } };
+    let Ok((id, _, _, _)) = pending_answer(room, "inspect_media", PendingAnswer::Inspect(answer)) else { return };
+    crate::sliding_sync::spawn_async_task(async move {
+        let result = crate::a2app::ai::media::download_event_attachment(&source_room, &event_id, auth).await
+            .and_then(|media| media.prepare()).map(|media| {
+                let detail = serde_json::json!({"event_id":event_id,"source_room":source_room,"media":media.metadata()}).to_string();
+                MediaOutcome::Inspected { media: Arc::new(media), detail }
+            });
+        Cx::post_action(MediaResult { id, result });
+    });
+}
+
+fn generate(room: &OwnedRoomId, request: super::super::ai::discovery::ImageGenerationRequest, answer: Sender<Result<String, String>>) {
+    use a2app_agent::model_transport::image_generation;
+    let resolved = match image_generation::resolve(request.provider.as_deref(), request.model.as_deref()) {
+        Ok(resolved) => resolved,
+        Err(error) => { note_ai_tool_call(room, "generate_image", false, ""); let _ = answer.send(Err(error)); return; }
+    };
+    let has_room = with_a2app(|state| state.ai_media_drafts.keys().filter(|(owner, _)| owner == room).count() < MAX_DRAFTS
+        && state.ai_media_drafts.values().map(|draft| draft.media.size()).sum::<usize>() < MAX_DRAFT_BYTES).unwrap_or(false);
+    if !has_room { let _ = answer.send(Err("Media draft storage is full. Stop this agent session to clear its drafts.".into())); return; }
+    let Ok((id, context, epoch, alive)) = pending_answer(room, "generate_image", PendingAnswer::Text(answer)) else { return };
+    crate::sliding_sync::spawn_async_task(async move {
+        let result = async {
+            flow::ensure_context_epoch(&context, epoch)?;
+            let recipient = flow::Recipient::ModelProvider(resolved.recipient.id.clone());
+            let payload = image_generation::review_payload(&resolved, &request.prompt);
+            let review = flow::prepare_effect_for_activation(&context, epoch, Some(&recipient), None, &payload)?;
+            crate::a2app::effect_review::request(review, true).await?;
+            let generated = image_generation::generate(&resolved, context, epoch, alive, &request.prompt).await?;
+            let media_request = MediaDraftRequest {
+                source: MediaSource::Base64(String::new()), filename: request.filename,
+                mime_type: generated.mime_type, caption: request.caption,
+            };
+            PreparedMedia::from_bytes(&media_request, generated.bytes).map(|media| MediaOutcome::Draft(Arc::new(media)))
+        }.await;
+        Cx::post_action(MediaResult { id, result });
+    });
 }
 
 fn prepare(cx: &mut Cx, ui: &WidgetRef, room: &OwnedRoomId, request: MediaDraftRequest, answer: Sender<Result<String, String>>) {
@@ -308,13 +412,26 @@ pub(super) fn apply_result(response: MediaResult) {
     pending.alive.store(false, Ordering::Release);
     let result = super::super::information_flow::current_context(&pending.context)
         .and_then(|_| flow::ensure_context_epoch(&pending.context, pending.epoch))
-        .and_then(|_| response.result)
-        .and_then(|result| match result {
+        .and_then(|_| response.result);
+    match pending.answer {
+        PendingAnswer::Text(answer) => {
+            let result = result.and_then(|result| match result {
             MediaOutcome::Draft(media) => save_draft(&pending.room, &pending.context, media),
             MediaOutcome::Posted(text) => Ok(text),
-        });
-    note_ai_tool_call(&pending.room, pending.tool, result.is_ok(), "");
-    let _ = pending.answer.send(result);
+            _ => Err("Invalid media worker result.".into()),
+            });
+            note_ai_tool_call(&pending.room, pending.tool, result.is_ok(), "");
+            let _ = answer.send(result);
+        }
+        PendingAnswer::Inspect(answer) => {
+            let result = result.and_then(|result| match result {
+            MediaOutcome::Inspected { media, detail } => inspect_output(&media, detail),
+            _ => Err("Invalid media inspection result.".into()),
+            });
+            note_ai_tool_call(&pending.room, pending.tool, result.is_ok(), "");
+            let _ = answer.send(result);
+        }
+    }
 }
 
 pub(super) fn cancel(state: &mut A2AppState, room: &OwnedRoomId) {
@@ -322,7 +439,7 @@ pub(super) fn cancel(state: &mut A2AppState, room: &OwnedRoomId) {
     state.ai_media_pending.retain(|_, pending| {
         if pending.room != *room { return true; }
         pending.alive.store(false, Ordering::Release);
-        let _ = pending.answer.send(Err("This agent session stopped.".into()));
+        pending.answer.refuse("This agent session stopped.".into());
         false
     });
     if state.room_action.as_ref().is_some_and(|action| action.room_id == *room
@@ -403,6 +520,52 @@ mod tests {
         assert!(draft(&fixture.rooms[1], &id).is_err(), "knowing a handle must not authorize another room's draft");
         crate::a2app::information_flow::TEST_ACCOUNT.with(|value| { value.replace(Some("another-account".into())); });
         assert!(draft(&fixture.rooms[0], &id).is_err(), "same room id under another account must not reuse media");
+    }
+
+    #[test]
+    fn inspection_returns_actual_immutable_content_without_send_or_composer_authority() {
+        let fixture = Fixture::new();
+        let media = fixture.media();
+        let id = fixture.save(0, media.clone());
+        std::fs::write(media.path(), b"replaced on disk").unwrap();
+        with_a2app(|state| {
+            state.permissions.set_matrix_write(false);
+            state.permissions.set_capability(&agent_subject(fixture.rooms[0].as_str()), "host.composer.attach", GrantState::Denied);
+            state.permissions.set_capability(&agent_subject(fixture.rooms[0].as_str()), "matrix.media.send", GrantState::Denied);
+        });
+        let (answer, response) = channel();
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        run(&mut cx, &WidgetRef::empty(), &fixture.rooms[0], SessionJob::InspectMedia {
+            request: InspectMediaRequest::Draft(id), answer,
+        });
+        let output = response.try_recv().unwrap().unwrap();
+        assert_eq!(output.attachments.len(), 1);
+        assert_eq!(output.attachments[0].bytes(), b"media");
+        assert_eq!(output.attachments[0].mime_type(), "text/plain");
+        assert_eq!(output.attachments[0].filename(), "fixture.txt");
+        assert!(with_a2app(|state| state.room_action.is_none()).unwrap());
+        let path = media.path().to_owned();
+        with_a2app(|state| cancel(state, &fixture.rooms[0]));
+        drop(media);
+        assert!(!path.exists());
+        assert_eq!(output.attachments[0].bytes(), b"media", "typed provider content owns its reviewed immutable bytes");
+    }
+
+    #[test]
+    fn inspection_workers_are_answered_on_cancellation_and_replacement() {
+        let fixture = Fixture::new();
+        let (answer, response) = channel();
+        let (_, _, _, alive) = pending_answer(&fixture.rooms[0], "inspect_media", PendingAnswer::Inspect(answer)).unwrap();
+        with_a2app(|state| cancel(state, &fixture.rooms[0]));
+        assert!(response.try_recv().unwrap().is_err());
+        assert!(!alive.load(Ordering::Acquire));
+        let (answer, response) = channel();
+        let (id, _, epoch, _) = pending_answer(&fixture.rooms[0], "inspect_media", PendingAnswer::Inspect(answer)).unwrap();
+        flow::remove_context_for_activation(&fixture.contexts[0], epoch).unwrap();
+        flow::register_context(&fixture.contexts[0]).unwrap();
+        flow::begin_agent_session(&fixture.contexts[0]).unwrap();
+        apply_result(MediaResult { id, result: Ok(MediaOutcome::Inspected { media: fixture.media(), detail: "old read".into() }) });
+        assert!(response.try_recv().unwrap().is_err());
     }
 
     #[test]

@@ -15,6 +15,7 @@ makepad-widgets = { workspace = true }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+base64 = "0.22"
 
 ## Both agent backends use the same host-owned model transport and types.
 ## Only the in-process backend links the Octos agent, CLI, and memory crates.

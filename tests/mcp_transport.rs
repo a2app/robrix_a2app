@@ -70,6 +70,17 @@ impl AiHost for RecordingHost {
         Ok(json!({"draft_id":"media-fixture","filename":request.filename,"mime_type":request.mime_type}).to_string())
     }
 
+    fn generate_image(&self, _request: robrix::a2app::ai::discovery::ImageGenerationRequest) -> Result<String, String> {
+        Err("generation not exercised by this relay test".into())
+    }
+
+    fn inspect_media(&self, request: robrix::a2app::ai::tools::InspectMediaRequest) -> Result<a2app_agent::tool_output::ToolOutput, String> {
+        self.calls.lock().unwrap().push(format!("inspect_media({request:?})"));
+        Ok(a2app_agent::tool_output::ToolOutput { text: "Actual image bytes".into(), attachments: vec![
+            a2app_agent::tool_output::ModelAttachment::new(include_bytes!("../a2app/agent/tests/fixtures/vision-colors.png").to_vec(), "image/png".into(), "fixture.png".into())?,
+        ] })
+    }
+
     fn attach_media(&self, draft_id: &str) -> Result<String, String> {
         self.calls.lock().unwrap().push(format!("attach_media({draft_id:?})"));
         Ok("attached".into())
@@ -405,9 +416,13 @@ fn a_full_mcp_session_over_the_relay_child() {
             "send_message",
             "request_task_permissions",
             "web_fetch",
+            "search_media",
+            "generate_image",
+            "draft_file",
             "post_room_message",
             "draft_message",
             "draft_media",
+            "inspect_media",
             "attach_media",
             "post_room_media",
         ]
@@ -444,6 +459,12 @@ fn a_full_mcp_session_over_the_relay_child() {
     assert_eq!(result["isError"], false);
     let draft: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(draft["draft_id"], "media-fixture");
+    let result = client.request("tools/call", json!({"name":"inspect_media","arguments":{"draft_id":draft["draft_id"]}}));
+    assert_eq!(result["isError"], false);
+    assert_eq!(result["content"][1]["type"], "image");
+    assert_eq!(result["content"][1]["mimeType"], "image/png");
+    let pixels: matrix_sdk::ruma::serde::Base64 = matrix_sdk::ruma::serde::Base64::parse(result["content"][1]["data"].as_str().unwrap()).unwrap();
+    assert_eq!(pixels.into_inner(), include_bytes!("../a2app/agent/tests/fixtures/vision-colors.png"));
     let result = client.request("tools/call", json!({"name":"attach_media","arguments":{"draft_id":draft["draft_id"]}}));
     assert_eq!(result["content"][0]["text"], "attached");
     let result = client.request("tools/call", json!({"name":"post_room_media","arguments":{"draft_id":draft["draft_id"],"room":"!target:example.org"}}));
@@ -523,6 +544,7 @@ fn a_full_mcp_session_over_the_relay_child() {
             "launch_splash_app(\"a counter app\")".to_string(),
             "send_room_message(\"hello room\")".to_string(),
             "draft_media(MediaDraftRequest { source: Url(\"https://example.org/diagram.png\"), filename: \"diagram.png\", mime_type: \"image/png\", caption: Some(\"The diagram\") })".to_string(),
+            "inspect_media(Draft(\"media-fixture\"))".to_string(),
             "attach_media(\"media-fixture\")".to_string(),
             "post_room_media(\"media-fixture\", Some(\"!target:example.org\"))".to_string(),
             "post_room_media(\"media-fixture\", None)".to_string(),

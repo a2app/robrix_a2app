@@ -4529,6 +4529,8 @@ fn ai_job_tool_name(job: &SessionJob) -> String {
         SessionJob::PostRoomMessage { .. } => String::from("post_room_message"),
         SessionJob::DraftMessage { .. } => String::from("draft_message"),
         SessionJob::DraftMedia { .. } => String::from("draft_media"),
+        SessionJob::InspectMedia { .. } => String::from("inspect_media"),
+        SessionJob::GenerateImage { .. } => String::from("generate_image"),
         SessionJob::AttachMedia { .. } => String::from("attach_media"),
         SessionJob::PostRoomMedia { .. } => String::from("post_room_media"),
         // Not a tool call: the agent's web tool is already shown by its ACP
@@ -4555,6 +4557,8 @@ fn session_job_detail(rooms: Option<&RoomsListRef>, job: &SessionJob) -> Option<
         }
         SessionJob::PostRoomMedia { room_id: Some(room), .. } => Some(format!("into “{}”", resolve_room_label(rooms, room))),
         SessionJob::DraftMedia { request, .. } => Some(request.filename.clone()),
+        SessionJob::GenerateImage { request, .. } => Some(request.filename.clone()),
+        SessionJob::InspectMedia { .. } => None,
         SessionJob::LaunchSplashApp { description, .. } => {
             let description = description.trim();
             if description.is_empty() {
@@ -4771,9 +4775,21 @@ fn prompt_already_granted(state: &A2AppState, prompt: &PermissionPrompt) -> bool
     })
 }
 
+/// Image generation names its independently configured provider in the
+/// host-captured review. Other operations keep the ordinary chat wording.
+fn model_review_destination(payload: &serde_json::Value) -> String {
+    if payload["operation"].as_str() == Some("image.generate")
+        && let Some(label) = payload["provider_label"].as_str().map(str::trim).filter(|label| !label.is_empty())
+    {
+        return format!("AI service: {label}");
+    }
+    "Your AI service".into()
+}
+
 fn flow_prompt_info(state: &A2AppState, rooms: Option<&RoomsListRef>, flow: &FlowContinuation) -> FlowPromptInfo {
     use a2app_core::information_flow::{Recipient, Source};
     let review = flow.review();
+    let payload = serde_json::from_str::<serde_json::Value>(&review.payload).unwrap_or_default();
     let manifest = review.context.app().and_then(|app| state.registry.get(app));
     let room_name = |room: &str| rooms.and_then(|rooms| room_display_name(rooms, room)).unwrap_or_else(|| room.into());
     let destination = match review.recipient.as_ref() {
@@ -4783,7 +4799,7 @@ fn flow_prompt_info(state: &A2AppState, rooms: Option<&RoomsListRef>, flow: &Flo
                 Recipient::network_origin(client.homeserver().as_str()).as_ref() == Ok(&Recipient::NetworkOrigin(origin.clone())));
             format!("{}: {origin}", if is_server { "Your Matrix server" } else { "Website" })
         }
-        Some(Recipient::ModelProvider(_)) => "Your AI service".into(),
+        Some(Recipient::ModelProvider(_)) => model_review_destination(&payload),
         Some(Recipient::Clipboard) => "System clipboard (other apps can read copied text)".into(),
         Some(Recipient::External) => "External destination".into(),
         None => "Robrix".into(),
@@ -4791,15 +4807,19 @@ fn flow_prompt_info(state: &A2AppState, rooms: Option<&RoomsListRef>, flow: &Flo
     let capability = review.action.as_ref().and_then(|action| a2app_core::capabilities::by_id(&action.kind))
         .or_else(|| serde_json::from_str::<serde_json::Value>(&review.payload).ok()
             .and_then(|payload| payload["operation"].as_str().and_then(a2app_core::capabilities::by_id)));
-    let payload = serde_json::from_str::<serde_json::Value>(&review.payload).unwrap_or_default();
     let (scope, scope_targets) = flow_prompt_scope(state, flow, capability, &payload);
-    let message_preview = capability.and_then(|capability| permission_message::from_flow_payload(capability.id, &payload,
-        matches!(review.context, a2app_core::information_flow::ContextId::Agent { .. })));
+    let image_generation = matches!(review.recipient, Some(Recipient::ModelProvider(_)))
+        && payload["operation"].as_str() == Some("image.generate");
+    let message_preview = if image_generation {
+        payload["prompt"].as_str().map(|prompt| PermissionMessagePreview { body: prompt.into(), formatted_html: None })
+    } else { capability.and_then(|capability| permission_message::from_flow_payload(capability.id, &payload,
+        matches!(review.context, a2app_core::information_flow::ContextId::Agent { .. }))) };
     let mut write_warning = None;
-    let mut action = capability.map(|capability| permission_action(capability,
-        payload.get("parameters").unwrap_or(&payload))).unwrap_or_else(|| "Send this request".into());
+    let mut action = if image_generation { "Generate an image from this prompt:".into() }
+        else { capability.map(|capability| permission_action(capability,
+            payload.get("parameters").unwrap_or(&payload))).unwrap_or_else(|| "Send this request".into()) };
     if capability.is_some_and(|capability| matches!(capability.id,
-        "matrix.room.event.read" | "matrix.room.thread.read" | "matrix.room.messages.paginate"
+        "matrix.room.event.read" | "matrix.room.thread.read" | "matrix.room.messages.paginate" | "matrix.media.download"
             | "host.nav.event" | "host.nav.thread"))
     {
         let parameters = payload.get("parameters").unwrap_or(&payload);
@@ -4821,11 +4841,12 @@ fn flow_prompt_info(state: &A2AppState, rooms: Option<&RoomsListRef>, flow: &Flo
     if capability.is_some_and(|capability| capability.id == "matrix.space.rooms.list")
         && let Some(space) = payload["parameters"]["space_id"].as_str()
     { action.push_str(&format!("\nSpace: {}", room_name(space))); }
-    if let FlowContinuation::Bridge { request, permission: Some(permission), .. } = flow {
+    if let FlowContinuation::Bridge { request, permission: Some(_), .. } = flow {
         let manifest = review.context.app().and_then(|app| state.registry.get(app));
         let args = serde_json::from_str::<serde_json::Value>(&request.args_json).unwrap_or_default();
-        if manifest.is_some_and(|manifest| services::can_enable_permission_writes(&state.permissions, manifest, *permission,
-            services::permission_context(&request.service, &args, review.context.room())))
+        if manifest.is_some_and(|manifest| a2app_core::capabilities::for_service(&request.service).is_some_and(|capability|
+            services::can_enable_writes(&state.permissions, manifest, capability,
+                services::permission_context(&request.service, &args, review.context.room()))))
         {
             let warning = "Approving also turns on room changes for mini-apps. Each app still needs its own permission.";
             if message_preview.is_some() { write_warning = Some(warning.into()); }
@@ -4837,6 +4858,8 @@ fn flow_prompt_info(state: &A2AppState, rooms: Option<&RoomsListRef>, flow: &Flo
             action = format!("Install {} “{}”", if pending.refine_of.is_some() { "the update to" } else { "the new app" }, pending.manifest.name);
         }
         ("Mini Apps".into(), "✨".into())
+    } else if image_generation && let a2app_core::information_flow::ContextId::Agent { room, .. } = &review.context {
+        (format!("AI in {}", room_name(room)), "🤖".into())
     } else {
         (manifest.map(|manifest| manifest.name.clone()).unwrap_or_else(|| "Mini-app".into()),
             manifest.map(|manifest| manifest.icon.clone()).unwrap_or_default())
@@ -4959,7 +4982,9 @@ fn ai_prompt_action(
                 SessionJob::DraftMessage { .. } => String::from("prepare a message in your composer"),
                 SessionJob::AttachMedia { .. } => String::from("attach media for you to review and send"),
                 SessionJob::PostRoomMedia { room_id, .. } => format!("post media into “{}”", resolve_room_label(rooms, room_id.as_deref().unwrap_or(_room_id.as_str()))),
-                SessionJob::DraftMedia { .. } => String::from("download media for this draft"),
+                SessionJob::DraftMedia { .. } => String::from("read the attachment used by this draft"),
+                SessionJob::InspectMedia { .. } => String::from("read this attachment"),
+                SessionJob::GenerateImage { .. } => String::from("generate an image"),
                 // A network-access job never reaches this arm (it parks as
                 // `ParkedRequest::NetworkAccess` and is handled above).
                 SessionJob::NetworkAccess { .. } | SessionJob::FetchUrl { .. } => continue,
@@ -5036,7 +5061,9 @@ fn ai_prompt_reason(
                 SessionJob::SendRoomMessage { .. } => continue,
                 SessionJob::DraftMessage { .. } | SessionJob::AttachMedia { .. } => String::from("It is preparing a draft for you to review. You still choose whether to send it."),
                 SessionJob::PostRoomMedia { .. } => String::from("It will upload and post a native media message into the selected room."),
-                SessionJob::DraftMedia { .. } => String::from("It needs to download the image or file used by this draft."),
+                SessionJob::DraftMedia { .. } => String::from("It needs to read the attachment used by this draft."),
+                SessionJob::InspectMedia { .. } => String::from("It needs the actual attachment content to complete this task."),
+                SessionJob::GenerateImage { .. } => String::from("Your configured image provider receives the prompt to generate this image."),
                 // A network-access job never reaches this arm (handled above).
                 SessionJob::NetworkAccess { .. } | SessionJob::FetchUrl { .. } => continue,
                 SessionJob::InvokeMiniAppTool { tool, .. } => format!(
@@ -5088,6 +5115,7 @@ fn parked_rooms(parked: &ParkedRequest) -> (Option<String>, Option<String>) {
                 SessionJob::PostRoomMedia { permission: "matrix.media.upload", .. } => room_id.to_string(),
                 SessionJob::PostRoomMedia { room_id: Some(target), .. } => target.clone(),
                 SessionJob::DraftMedia { request: super::ai::tools::MediaDraftRequest { source: super::ai::tools::MediaSource::MatrixEvent { room_id: Some(target), .. }, .. }, .. } => target.clone(),
+                SessionJob::InspectMedia { request: super::ai::tools::InspectMediaRequest::Event { source_room: Some(target), .. }, .. } => target.clone(),
                 SessionJob::ReadTool { kind: ReadToolKind::OtherRoom { room, .. }, .. } => room.clone(),
                 SessionJob::ReadTool { kind: ReadToolKind::SpaceInfo { space } | ReadToolKind::SpaceRooms { space }, .. } => space.clone(),
                 _ => room_id.to_string(),
@@ -5148,6 +5176,7 @@ fn parked_capability(parked: &ParkedRequest) -> Option<&'static a2app_core::capa
                 super::ai::tools::MediaSource::Url(_) => "network.http",
                 _ => "matrix.media.download",
             }),
+            SessionJob::InspectMedia { request: super::ai::tools::InspectMediaRequest::Event { .. }, .. } => a2app_core::capabilities::by_id("matrix.media.download"),
             SessionJob::ListApps { .. } => a2app_core::capabilities::by_id(LIST_APPS_CAP_ID),
             SessionJob::LaunchApp { .. } => a2app_core::capabilities::by_id(LAUNCH_APP_CAP_ID),
             SessionJob::LaunchSplashApp { .. } => a2app_core::capabilities::by_id("apps.generate"),
@@ -5221,6 +5250,7 @@ fn permission_action(capability: &a2app_core::capabilities::Capability, args: &s
         "matrix.room.threads.read" => "List conversations in this room".into(),
         "matrix.room.thread.read" => "Load replies to this conversation".into(),
         "matrix.room.event.read" => "Load this message".into(),
+        "matrix.media.download" => "Read an attachment from this message".into(),
         "matrix.room.messages.paginate" => "Load older messages in this room".into(),
         "matrix.room.receipts.read" => "Read who has read this room's messages".into(),
         "matrix.room.unread.read" => "Read this room's unread count and flags".into(),
@@ -5449,6 +5479,7 @@ fn answer_session_job(job: SessionJob, result: Result<String, String>) {
         | SessionJob::SendRoomMessage { answer, .. }
         | SessionJob::DraftMessage { answer, .. }
         | SessionJob::DraftMedia { answer, .. }
+        | SessionJob::GenerateImage { answer, .. }
         | SessionJob::AttachMedia { answer, .. }
         | SessionJob::PostRoomMedia { answer, .. }
         | SessionJob::ReadTool { answer, .. }
@@ -5460,6 +5491,9 @@ fn answer_session_job(job: SessionJob, result: Result<String, String>) {
         | SessionJob::ListMiniAppTools { answer }
         | SessionJob::RequestTaskPermissions { answer, .. } => {
             let _ = answer.send(result);
+        }
+        SessionJob::InspectMedia { answer, .. } => {
+            let _ = answer.send(result.map(|text| a2app_agent::tool_output::ToolOutput { text, attachments: Vec::new() }));
         }
     }
 }
@@ -6073,17 +6107,14 @@ fn task_prompt_info(
             checked: item.state.is_grantable(),
         })
         .collect();
-    let risk = plan
-        .items
-        .iter()
-        .any(|item| item.state.is_grantable() && item.risk >= a2app_core::capabilities::Risk::High)
-        .then(|| "This plan includes broad or high-risk access. Review the details before allowing.".to_string());
     TaskPromptInfo {
         // Only the assistant's own paragraph. Robrix's framing is the modal
         // title and the detail rows below, never a label on the agent's words.
         explanation: plan.explanation.clone(),
         items,
-        risk,
+        // Exact capabilities, room scopes and sharing destinations are shown
+        // in the item rows. A bounded room read needs no blanket warning.
+        risk: None,
     }
 }
 
@@ -9570,6 +9601,9 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
             }, .. } if source != room_id.as_str() => {
                 super::information_flow::record_directory_response(&context)?;
             }
+            SessionJob::InspectMedia { request: super::ai::tools::InspectMediaRequest::Event { source_room: Some(source), .. }, .. } if source != room_id.as_str() => {
+                super::information_flow::record_directory_response(&context)?;
+            }
             SessionJob::ReadTool { kind: ReadToolKind::OtherRoom { room, .. }, .. } => {
                 a2app_core::information_flow::add_sources(&context, [super::information_flow::room_source(&context, room)])?;
             }
@@ -9605,7 +9639,7 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
     let detail = session_job_detail(rooms.as_ref(), &job);
     record_tool_call_detail(room_id, &ai_job_tool_name(&job), detail);
     match job {
-        job @ (SessionJob::DraftMessage { .. } | SessionJob::DraftMedia { .. } | SessionJob::AttachMedia { .. } | SessionJob::PostRoomMedia { .. }) => ai_media::run(cx, ui, room_id, job),
+        job @ (SessionJob::DraftMessage { .. } | SessionJob::DraftMedia { .. } | SessionJob::InspectMedia { .. } | SessionJob::GenerateImage { .. } | SessionJob::AttachMedia { .. } | SessionJob::PostRoomMedia { .. }) => ai_media::run(cx, ui, room_id, job),
         SessionJob::SendRoomMessage { text, answer } => {
             // The call's state row finishes when its message is on its way;
             // the receipt chip rides the same `ai_reply` card below. A failed
@@ -9939,8 +9973,6 @@ fn cancel_ai_fetches(room_id: &OwnedRoomId) {
 fn run_ai_fetch(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, url: String, answer: Sender<Result<String, String>>) {
     let prepared = super::information_flow::agent_context(room_id.as_str()).and_then(|context| {
         super::information_flow::current_context(&context)?;
-        let recipient = a2app_core::information_flow::Recipient::network_origin(&url)?;
-        a2app_core::information_flow::ensure_allowed(&context, &recipient)?;
         let request = super::network::Request::parse(&serde_json::json!({ "url": url }))?;
         Ok((context, request))
     });
@@ -10822,6 +10854,99 @@ fn post_ai_reply(room_id: &OwnedRoomId, text: String, answer_id: Option<u64>) {
 #[cfg(test)]
 mod permission_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_attachment_and_message_task_previews_show_exact_scope_without_blanket_notice() {
+        use a2app_core::task_grants::{ItemOrigin, PlanAction, PlanItem};
+        for capability in ["matrix.room.messages.read", "matrix.room.event.read", "matrix.media.download"] {
+            let mut plan = TaskPlan {
+                task_id: 1, subject: "agent".into(),
+                context: a2app_core::information_flow::ContextId::Agent { account: "alice".into(), room: SOURCE.into() }, epoch: 1,
+                title: "Read one attachment or message".into(), explanation: "I will inspect this room's content.".into(),
+                items: vec![PlanItem { id: "read".into(), origin: ItemOrigin::Requested,
+                    action: PlanAction::Scoped { permission: a2app_core::capabilities::by_id(capability).unwrap().group.unwrap().as_str().into(),
+                        capability: capability.into(), scope: RoomScope::room(SOURCE) },
+                    state: ItemState::NeedsGrant, why: None, risk: a2app_core::capabilities::Risk::High }],
+                flow_dependencies: BTreeMap::new(), plan_hash: [0; 32], needs_fingerprint: [0; 32],
+            };
+            plan.seal();
+            let info = task_prompt_info(&plan, None, None, &[]);
+            assert!(info.risk.is_none());
+            assert_eq!(info.items.len(), 1);
+            assert_eq!(info.items[0].title, a2app_core::capabilities::by_id(capability).unwrap().title);
+            assert_eq!(info.items[0].detail, SOURCE);
+            assert!(info.items[0].grantable && info.items[0].checked);
+        }
+    }
+
+    #[test]
+    fn image_generation_review_names_the_provider_and_preserves_the_literal_prompt() {
+        use a2app_core::information_flow::{ContextId, EffectReview, Recipient};
+        struct Restore(Option<A2AppState>);
+        impl Drop for Restore { fn drop(&mut self) { A2APP.with(|state| { state.replace(self.0.take()); }); } }
+        let _restore = Restore(A2APP.with(|state| state.replace(None)));
+        initialize_background_test(builtin::stock("roll-call").unwrap());
+        let prompt = "**Literal prompt**, <b>not formatting</b>\n猫🦀, full image description";
+        let payload = serde_json::json!({"operation":"image.generate", "provider_label":"OpenAI / gpt-image-1.5", "prompt":prompt});
+        let review = EffectReview { id: 1,
+            context: ContextId::Agent { account: "alice".into(), room: SOURCE.into() }, epoch: 1,
+            recipient: Some(Recipient::ModelProvider("independent-image-provider".into())), action: None,
+            sources: Default::default(), denied_sources: Default::default(), influences: Default::default(),
+            payload: payload.to_string().into(), allowed: false };
+        let request = SplashHostRequest { app_tag: "roll-call".into(), heap_key: 0, req_id: 1,
+            service: "network.http".into(), args_json: "{}".into(), may_prompt: true };
+        with_a2app(|state| {
+            let flow = FlowContinuation::Bridge { request, review, allow_once: true, permission: None };
+            let info = flow_prompt_info(state, None, &flow);
+            assert_eq!(info.app_name, format!("AI in {SOURCE}"));
+            assert_eq!(info.app_icon, "🤖");
+            assert_eq!(info.destination, "AI service: OpenAI / gpt-image-1.5");
+            assert_eq!(info.action, "Generate an image from this prompt:");
+            assert!(info.write_warning.is_none());
+            let preview = info.message_preview.unwrap();
+            assert_eq!(preview.body, prompt);
+            assert!(preview.formatted_html.is_none());
+            assert!(info.scope.is_none(), "the provider review grants no room-write authority");
+        });
+        for payload in [serde_json::json!({"operation":"chat", "provider_label":"An unrelated label"}),
+            serde_json::json!({"operation":"image.generate"}),
+            serde_json::json!({"operation":"image.generate", "provider_label":"  "})]
+        {
+            assert_eq!(model_review_destination(&payload), "Your AI service");
+        }
+    }
+
+    #[test]
+    fn media_read_review_does_not_show_the_same_groups_write_switch_notice() {
+        use a2app_core::information_flow::{ContextId, EffectReview, Recipient};
+        struct Restore(Option<A2AppState>);
+        impl Drop for Restore { fn drop(&mut self) { A2APP.with(|state| { state.replace(self.0.take()); }); } }
+        let _restore = Restore(A2APP.with(|state| state.replace(None)));
+        let mut manifest = builtin::stock("room-peek").unwrap();
+        manifest.capabilities.push("matrix.media.download".into());
+        initialize_background_test(manifest.clone());
+        let request = SplashHostRequest { app_tag: a2app_core::manifest::instance_tag(&manifest.id, Some(SOURCE)),
+            heap_key: 0, req_id: 1, service: "matrix.download_media".into(),
+            args_json: serde_json::json!({"event_id":"$attachment:test"}).to_string(), may_prompt: true };
+        let review = EffectReview { id: 1,
+            context: ContextId::App { account: "alice".into(), app: manifest.id.clone(), room: Some(SOURCE.into()) }, epoch: 1,
+            recipient: Some(Recipient::network_origin("https://homeserver.test").unwrap()), action: None,
+            sources: Default::default(), denied_sources: Default::default(), influences: Default::default(),
+            payload: serde_json::json!({"operation":"matrix.media.download", "parameters":{"event_id":"$attachment:test"}}).to_string().into(), allowed: false };
+        with_a2app(|state| {
+            let context = PermissionContext { origin_room: Some(SOURCE), target_room: Some(SOURCE) };
+            assert!(services::can_enable_permission_writes(&state.permissions, &manifest, Permission::MatrixMedia, context),
+                "the same app separately declares posting authority");
+            let flow = FlowContinuation::Bridge { request, review, allow_once: true, permission: Some(Permission::MatrixMedia) };
+            let info = flow_prompt_info(state, None, &flow);
+            assert_eq!(info.action, format!("Read an attachment from this message\nIn {SOURCE}"));
+            assert!(info.message_preview.is_none());
+            assert!(info.write_warning.is_none());
+            assert!(info.allow_once);
+            assert!(!state.permissions.matrix_write());
+        });
+    }
 
     #[test]
     fn foreground_launches_allow_account_utilities_and_preserve_context_constraints() {

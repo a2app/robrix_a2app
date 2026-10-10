@@ -10,6 +10,7 @@ pub mod acp_client;
 pub mod claude_code;
 pub mod intent;
 pub mod mcp;
+pub mod tool_output;
 pub mod model_transport;
 mod host_broker;
 #[cfg(feature = "embedded")]

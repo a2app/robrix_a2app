@@ -112,6 +112,7 @@ impl Request {
             headers.insert(name, value);
         }
         headers.insert(reqwest::header::ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+        headers.entry(reqwest::header::USER_AGENT).or_insert(HeaderValue::from_static("Robrix/1.0 (https://github.com/project-robius/robrix)"));
         Ok(Self { url, method, headers, body: args.body })
     }
 }

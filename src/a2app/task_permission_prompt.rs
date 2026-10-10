@@ -103,7 +103,7 @@ pub struct TaskPromptInfo {
     /// The agent's paragraph, shown verbatim and quoted.
     pub explanation: String,
     pub items: Vec<TaskItemView>,
-    /// Robrix's own warning, shown only for high-risk or unusually broad asks.
+    /// An optional host notice for the exact action being reviewed.
     pub risk: Option<String>,
 }
 

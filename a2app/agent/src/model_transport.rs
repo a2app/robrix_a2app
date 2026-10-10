@@ -87,15 +87,19 @@ fn stored_api_key(provider: &str) -> Option<String> {
 }
 
 mod guarded;
+mod multimodal;
+mod gemini;
 mod claude_code;
+pub mod image_generation;
 
-pub(crate) fn provider(prefs: &AgentPrefs, context: a2app_core::information_flow::ContextId,
-    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<std::sync::Arc<dyn octos_llm::LlmProvider>, String>
+pub(crate) fn provider_with_outputs(prefs: &AgentPrefs, context: a2app_core::information_flow::ContextId,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>, outputs: std::sync::Arc<crate::tool_output::ToolOutputStore>)
+    -> Result<std::sync::Arc<dyn octos_llm::LlmProvider>, String>
 {
     if crate::providers::effective_provider().as_deref() == Some(crate::claude_code::ID) {
-        claude_code::provider(prefs, context, shutdown)
+        claude_code::provider(prefs, context, shutdown, outputs)
     } else {
-        guarded::provider(prefs, context, shutdown)
+        guarded::provider(prefs, context, shutdown, outputs)
     }
 }
 

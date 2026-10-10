@@ -65,13 +65,13 @@ fn claude_model(model: &str) -> bool {
     matches!(model, "sonnet" | "opus" | "haiku" | "sonnet[1m]" | "opus[1m]") || model.starts_with("claude-")
 }
 
-pub(super) fn provider(prefs: &AgentPrefs, context: ContextId, shutdown: Arc<AtomicBool>) -> Result<Arc<dyn LlmProvider>, String> {
+pub(super) fn provider(prefs: &AgentPrefs, context: ContextId, shutdown: Arc<AtomicBool>, outputs: Arc<crate::tool_output::ToolOutputStore>) -> Result<Arc<dyn LlmProvider>, String> {
     let config = resolve(prefs)?;
     let guard = Guard::new(prefs, context, shutdown, &config.recipient)?;
-    Ok(Arc::new(ClaudeProvider { config, guard }))
+    Ok(Arc::new(ClaudeProvider { config, guard, outputs }))
 }
 
-struct ClaudeProvider { config: Resolved, guard: Guard }
+struct ClaudeProvider { config: Resolved, guard: Guard, outputs: Arc<crate::tool_output::ToolOutputStore> }
 
 type VerifyAccount = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
@@ -99,7 +99,7 @@ impl Write for BoundedWriter {
 fn prompt(messages: &[Message], tools: &[ToolSpec], config: &ChatConfig) -> eyre::Result<Vec<u8>> {
     if messages.len() > 4096 { return Err(eyre::eyre!("Claude Code request contains too many conversation messages.")); }
     if messages.iter().any(|message| !message.media.is_empty()) {
-        return Err(eyre::eyre!("Media inputs need explicit source tracking and are not supported by the guarded model transport yet."));
+        return Err(eyre::eyre!("Untracked filesystem media cannot be read. Use inspect_media on an authorized attachment instead."));
     }
     if tools.len() > 128 { return Err(eyre::eyre!("Claude Code request contains too many host tools.")); }
     if matches!(config.tool_choice, ToolChoice::Required) && tools.is_empty() {
@@ -119,6 +119,24 @@ fn prompt(messages: &[Message], tools: &[ToolSpec], config: &ChatConfig) -> eyre
     Ok(writer.0)
 }
 
+fn multimodal_prompt(messages: &[Message], tools: &[ToolSpec], config: &ChatConfig,
+    outputs: &crate::tool_output::ToolOutputStore, context: Option<&ContextId>) -> eyre::Result<(Vec<u8>, bool)>
+{
+    let turns = super::multimodal::prepare(messages, outputs, context).map_err(eyre::Report::msg)?;
+    let plain: Vec<_> = turns.iter().map(|turn| turn.message.clone()).collect();
+    let input = prompt(&plain, tools, config)?;
+    if turns.iter().all(|turn| turn.attachments.is_empty()) { return Ok((input, false)); }
+    let mut content = vec![json!({"type":"text","text":String::from_utf8(input).map_err(|_| eyre::eyre!("Invalid model conversation."))?})];
+    for turn in turns {
+        content.extend(super::multimodal::parts(&turn.attachments, super::multimodal::Format::Anthropic, "Claude Code"));
+    }
+    let mut input = serde_json::to_vec(&json!({"type":"user","message":{"role":"user","content":content}}))
+        .map_err(|_| eyre::eyre!("Cannot encode model attachment inputs."))?;
+    if input.len() > 24 * 1024 * 1024 { return Err(eyre::eyre!("Claude Code media request exceeds the 24 MiB encoded limit.")); }
+    input.push(b'\n');
+    Ok((input, true))
+}
+
 fn configure(command: &mut Command, config: &Resolved, chat: &ChatConfig, directory: &Path) {
     command.current_dir(directory).args(["-p", "--output-format", "json", "--tools", "", "--disallowedTools", "mcp__*",
         "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}", "--no-session-persistence", "--disable-slash-commands",
@@ -130,6 +148,12 @@ fn configure(command: &mut Command, config: &Resolved, chat: &ChatConfig, direct
     if let Some(max) = chat.max_tokens { command.env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", max.clamp(1, 65536).to_string()); }
     #[cfg(unix)]
     { use std::os::unix::process::CommandExt; command.process_group(0); }
+}
+
+// Older supported CLI releases require matching streaming output for media
+// input. Keep the normal text request's single JSON envelope unchanged.
+fn configure_media(command: &mut Command) {
+    command.args(["--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]);
 }
 
 fn private_directory() -> Result<tempfile::TempDir, std::io::Error> {
@@ -287,10 +311,11 @@ async fn invoke(command: Command, input: Vec<u8>, config: Resolved, guard: Guard
 impl LlmProvider for ClaudeProvider {
     async fn chat(&self, messages: &[Message], tools: &[ToolSpec], chat: &ChatConfig) -> eyre::Result<ChatResponse> {
         self.guard.check().map_err(eyre::Report::msg)?;
-        let input = prompt(messages, tools, chat)?;
+        let (input, has_media) = multimodal_prompt(messages, tools, chat, &self.outputs, self.guard.audit_context.as_ref())?;
         let directory = private_directory().map_err(|_| eyre::eyre!("Cannot create a private Claude Code working directory."))?;
         let mut command = crate::claude_code::command().map_err(eyre::Report::msg)?;
         configure(&mut command, &self.config, chat, directory.path());
+        if has_media { configure_media(&mut command); }
         let bytes = invoke(command, input, self.config.clone(), self.guard.clone(), directory, TIMEOUT,
             Arc::new(crate::claude_code::verify_account)).await?;
         self.guard.check().map_err(eyre::Report::msg)?;
@@ -393,6 +418,16 @@ mod tests {
     }
 
     #[test]
+    fn media_stream_accepts_only_one_valid_structured_result() {
+        let final_result = envelope("Analyzed actual contents",json!([]));
+        let stream = format!("{}\n{}\n{}\n",json!({"type":"system","subtype":"init"}),json!({"type":"assistant","message":{"content":"untrusted interim prose"}}),final_result);
+        assert_eq!(parse(stream.as_bytes(),&[],&ChatConfig::default()).unwrap().content.as_deref(),Some("Analyzed actual contents"));
+        assert!(parse(format!("{stream}{final_result}\n").as_bytes(),&[],&ChatConfig::default()).is_err());
+        assert!(parse(b"{\"type\":\"system\"}\n{\"type\":\"assistant\"}\n",&[],&ChatConfig::default()).is_err());
+        assert!(parse(format!("{stream}malformed\n").as_bytes(),&[],&ChatConfig::default()).is_err());
+    }
+
+    #[test]
     fn local_model_filter_rejects_other_provider_picks() {
         for model in ["sonnet", "opus", "haiku", "sonnet[1m]", "claude-sonnet-4-6"] { assert!(claude_model(model)); }
         for model in ["", "k3", "deepseek-chat", "gpt-5"] { assert!(!claude_model(model)); }
@@ -437,6 +472,51 @@ mod tests {
         assert_eq!(capture["env"]["MAX_THINKING_TOKENS"], "0");
         assert_eq!(capture["files"], json!([])); assert_eq!(capture["mode"], 0o700);
         assert_eq!(capture["prompt"]["messages"][0]["content"], "private-stdin-only-fixture");
+    }
+
+    #[test]
+    fn fake_cli_consumes_typed_image_and_pdf_from_stdin_without_media_files() {
+        use a2app_core::information_flow;
+        use crate::tool_output::{ModelAttachment,ToolOutput,ToolOutputStore};
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let context = ContextId::Agent {account:"@cli-media:test".into(),room:"!cli-media:test".into()};
+        information_flow::register_context(&context).unwrap();
+        let store = ToolOutputStore::default();
+        let image = include_bytes!("../../tests/fixtures/vision-colors.png");
+        let pdf = include_bytes!("../../tests/fixtures/report.pdf");
+        let receipt = store.register(&context,information_flow::context_epoch(&context).unwrap(),ToolOutput {text:"Loaded image and document".into(),attachments:vec![
+            ModelAttachment::new(image.to_vec(),"image/png".into(),"fixture.png".into()).unwrap(),
+            ModelAttachment::new(pdf.to_vec(),"application/pdf".into(),"report.pdf".into()).unwrap(),
+        ]}).unwrap();
+        let mut assistant = message(MessageRole::Assistant,"");
+        assistant.tool_calls=Some(vec![ToolCall{id:"media-call".into(),name:"inspect_media".into(),arguments:json!({"draft_id":"fixture"}),metadata:None}]);
+        let mut result=message(MessageRole::Tool,&receipt);result.tool_call_id=Some("media-call".into());
+        let chat = ChatConfig::default();
+        let (input,has_media)=multimodal_prompt(&[message(MessageRole::User,"Inspect supplied content"),assistant,result],&[],&chat,&store,Some(&context)).unwrap();
+        assert!(has_media);
+        let root=tempfile::tempdir().unwrap();
+        let path=script(root.path(),"value=json.load(sys.stdin)\njson.dump({'args':sys.argv[1:],'files':os.listdir('.'),'prompt':value},open(os.environ['FIXTURE_CAPTURE'],'w'))\nprint(os.environ['FIXTURE_RESPONSE'])");
+        let capture=root.path().join("capture.json");
+        let config=fixture(&path);
+        let directory=private_directory().unwrap();
+        let mut command=Command::new(&path);
+        configure(&mut command,&config,&chat,directory.path());
+        configure_media(&mut command);
+        command.env("FIXTURE_CAPTURE",&capture).env("FIXTURE_RESPONSE",format!("{}\n{}",json!({"type":"system","subtype":"init"}),envelope("Analyzed contents",json!([]))));
+        let output = run(command,input,config,guard(yes(),yes(),Arc::new(AtomicBool::new(false))),Arc::new(AtomicBool::new(false)),Duration::from_secs(5),verify()).unwrap();
+        assert_eq!(parse(&output,&[],&chat).unwrap().content.as_deref(),Some("Analyzed contents"));
+        let capture:Value=serde_json::from_slice(&std::fs::read(capture).unwrap()).unwrap();
+        assert_eq!(capture["files"],json!([]),"media must never be materialized in the CLI's working directory");
+        assert!(capture["args"].as_array().unwrap().windows(2).any(|pair|pair[0]=="--input-format" && pair[1]=="stream-json"));
+        assert!(capture["args"].as_array().unwrap().windows(2).any(|pair|pair[0]=="--output-format" && pair[1]=="stream-json"));
+        assert!(capture["args"].as_array().unwrap().iter().any(|arg|arg=="--verbose"));
+        assert_eq!(capture["prompt"]["message"]["role"],"user");
+        let content=capture["prompt"]["message"]["content"].as_array().unwrap();
+        assert!(content.iter().any(|part|part["type"]=="image" && part["source"]["data"]==STANDARD.encode(image)));
+        assert!(content.iter().any(|part|part["type"]=="document" && part["source"]["data"]==STANDARD.encode(pdf)));
+        assert!(!content[0]["text"].as_str().unwrap().contains("_robrix_media_receipt"));
+        assert!(!content[0]["text"].as_str().unwrap().contains(&STANDARD.encode(image)));
+        information_flow::remove_context(&context).unwrap();
     }
 
     #[test]
@@ -554,7 +634,7 @@ mod tests {
         config.account = crate::claude_code::account_identity().expect("verified subscription account is required");
         // No recipient salt or agent/source storage is initialized. Normal
         // CLI login stays with Claude; only our private temporary cwd is used.
-        let provider = ClaudeProvider { config, guard: guard(yes(), yes(), yes()) };
+        let provider = ClaudeProvider { config, guard: guard(yes(), yes(), yes()), outputs: Arc::default() };
         let tools = [ToolSpec { name: "synthetic_host_echo".into(), description: "A mock host tool for a public transport smoke test. Propose it only; it will never be executed.".into(),
             input_schema: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}) }];
         let mut messages = vec![message(MessageRole::User, "For this public dry-run test, propose synthetic_host_echo with message exactly RO BRIX PUBLIC PROBE. Do not claim it ran.")];
@@ -578,9 +658,23 @@ mod tests {
 }
 
 fn parse(bytes: &[u8], tools: &[ToolSpec], config: &ChatConfig) -> eyre::Result<ChatResponse> {
-    // --output-format=json returns a single result envelope. Its `result`
-    // field is prose; only structured_output obeys the supplied JSON schema.
-    let envelope: Value = serde_json::from_slice(bytes).map_err(|_| eyre::eyre!("Claude Code returned an invalid model response."))?;
+    // Media calls use bounded NDJSON on older CLI versions. Only the final
+    // result envelope's structured_output obeys our schema; intermediate
+    // messages and the result's freeform prose never become host calls.
+    let envelope: Value = match serde_json::from_slice(bytes) {
+        Ok(envelope) => envelope,
+        Err(_) => {
+            let mut result = None;
+            for line in bytes.split(|byte| *byte == b'\n').filter(|line| !line.iter().all(u8::is_ascii_whitespace)) {
+                let frame: Value = serde_json::from_slice(line).map_err(|_| eyre::eyre!("Claude Code returned an invalid model stream."))?;
+                if frame["type"] == "result" {
+                    if result.is_some() { return Err(eyre::eyre!("Claude Code returned multiple model result envelopes.")); }
+                    result = Some(frame);
+                }
+            }
+            result.ok_or_else(|| eyre::eyre!("Claude Code returned no final model result."))?
+        }
+    };
     if envelope["type"] != "result" || envelope["subtype"] != "success" || envelope["is_error"] != false {
         return Err(eyre::eyre!("Claude Code did not complete a structured model response."));
     }

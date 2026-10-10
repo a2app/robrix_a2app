@@ -75,7 +75,7 @@ pub enum Status {
     Never,
 }
 
-/// How much harm a misuse could do, for the user's read of the row.
+/// Internal catalog metadata retained in sealed task plans.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Risk {
     Low,
@@ -169,18 +169,12 @@ impl Capability {
         matches!(self.status, Status::Available | Status::RefusedBySwitch)
     }
 
-    /// The compact tag line shown under a capability row; risk is only
-    /// called out when it is worth a second look.
+    /// The concrete access and scope shown under a capability row.
     pub fn tags(&self) -> String {
         let mut tags = format!("{} · {}", self.access.as_str(), self.scope.as_str());
         if self.direction == Direction::Incoming {
             tags.push_str(" · ");
             tags.push_str(self.direction.as_str());
-        }
-        if self.risk >= Risk::High {
-            tags.push_str(" · ");
-            tags.push_str(self.risk.as_str());
-            tags.push_str(" risk");
         }
         tags
     }
@@ -354,13 +348,13 @@ pub const CATALOG: &[Capability] = &[
     // ----- matrix-room-invite -----
     cap!("matrix.room.invite.send", "Invite someone", "Invite a user to the attached room as you; the user id is shown on every prompt.", Write, Outgoing, Room, Some(P::MatrixRoomInvite), RefusedBySwitch, High, ["matrix.invite"]),
     // ----- matrix-media -----
-    cap!("matrix.media.download", "Fetch an attachment", "Let an agent prepare a local, size-capped copy of an image or file from an approved room. Your room and space read rules apply, and Matrix requests go to your homeserver.", Read, Outgoing, Room, Some(P::MatrixMedia), Available, High, []),
+    cap!("matrix.media.download", "Read an attachment", "Read an image, audio clip, video, or file from an approved room using the same room and space read rules as messages. Matrix downloads use your homeserver.", Read, Outgoing, Room, Some(P::MatrixMedia), Available, High, ["matrix.download_media"]),
     cap!("matrix.media.save", "Download to disk", "Save an attachment from the attached room to Downloads with host progress UI.", Act, Outgoing, Room, Some(P::MatrixMedia), PlannedMachinery, Medium, []),
     cap!("matrix.media.share", "Share an attachment", "Hand a room attachment to the system share sheet.", Act, Outgoing, Room, Some(P::MatrixMedia), PlannedMachinery, Medium, []),
     cap!("matrix.media.avatar.read", "Avatars", "A member's or the room's avatar thumbnail.", Read, Outgoing, Room, Some(P::MatrixMedia), PlannedMachinery, Low, []),
     cap!("matrix.media.url_preview.read", "Link preview", "Title, description and image of a URL via the homeserver (the homeserver sees the URL).", Read, Outgoing, Account, Some(P::MatrixMedia), PlannedMachinery, Medium, []),
     cap!("matrix.media.upload", "Upload media", "Let an agent or mini-app upload prepared images, audio, video, or files to your homeserver when posting media. Posting also requires permission to send media to that room.", Write, Outgoing, Account, Some(P::MatrixMedia), Available, High, []),
-    cap!("matrix.media.send", "Post images and files", "Let an agent or mini-app upload and post prepared media as you in an approved room. Upload permission and your room and space write rules also apply.", Write, Outgoing, Room, Some(P::MatrixMedia), Available, High, ["matrix.send_media"]),
+    cap!("matrix.media.send", "Post media", "Upload and post an image, audio clip, video, or file as you in an approved room. Upload permission and your room and space write rules also apply.", Write, Outgoing, Room, Some(P::MatrixMedia), Available, High, ["matrix.send_media"]),
     cap!("on_upload_progress", "Upload progress hook", "Be told how an upload it started is progressing, and cancel it.", Read, Incoming, Room, Some(P::MatrixMedia), PlannedMachinery, Low, []),
     // ----- matrix-rooms-list -----
     cap!("matrix.rooms.list", "Your rooms", "Joined rooms and DMs with name, unread, mentions, tags, is_direct, is_space; no message previews; optionally limited to a space.", Read, Outgoing, MultiRoom, Some(P::MatrixRoomsList), Available, High, ["matrix.rooms_list"]),
@@ -399,7 +393,7 @@ pub const CATALOG: &[Capability] = &[
     cap!("host.nav.app", "Open another mini-app", "Open an installed app in this room's dock; target must be installed and unrestricted.", Act, Outgoing, Apps, Some(P::RobrixNavigation), Available, Low, ["nav.app"]),
     // ----- robrix-composer -----
     cap!("host.composer.insert", "Draft a message for you", "Put text into the attached room's message box; the user still presses send.", Act, Outgoing, Room, Some(P::RobrixComposer), Available, Medium, ["composer.insert"]),
-    cap!("host.composer.attach", "Attach images and files for you", "Put prepared media in an approved room's message box for you to review and send. Preparing an attachment does not upload or post it.", Act, Outgoing, Room, Some(P::RobrixComposer), Available, Medium, ["composer.attach"]),
+    cap!("host.composer.attach", "Attach media for you", "Put a prepared image, audio clip, video, or file in an approved room's message box for you to review and send. Preparing an attachment does not upload or post it.", Act, Outgoing, Room, Some(P::RobrixComposer), Available, Medium, ["composer.attach"]),
     cap!("host.composer.reply_to", "Set reply target", "Put the attached room's composer into reply mode for a message.", Act, Outgoing, Room, Some(P::RobrixComposer), Available, Low, ["composer.reply_to"]),
     // ----- robrix-ui -----
     cap!("ui.pane.request_size", "Preferred size", "Hint the size along the pane's resizable axis; the dock clamps and the user's drag always wins; rate-limited harder since it reflows the timeline.", Act, Outgoing, Instance, Some(P::RobrixUi), PlannedNewPlumbing, Low, []),
@@ -498,6 +492,26 @@ mod tests {
     }
 
     #[test]
+    fn capability_tags_describe_access_and_scope_without_generic_warnings() {
+        for capability in CATALOG {
+            let mut expected = format!("{} · {}", capability.access.as_str(), capability.scope.as_str());
+            if capability.direction == Direction::Incoming {
+                expected.push_str(" · ");
+                expected.push_str(capability.direction.as_str());
+            }
+            assert_eq!(capability.tags(), expected, "{}", capability.id);
+        }
+        let attachment = by_id("matrix.media.download").unwrap();
+        for id in ["matrix.room.messages.read", "matrix.room.event.read"] {
+            let message = by_id(id).unwrap();
+            assert_eq!(attachment.access, message.access);
+            assert_eq!(attachment.scope, message.scope);
+            assert_eq!(attachment.risk, message.risk);
+            assert_eq!(attachment.tags(), message.tags());
+        }
+    }
+
+    #[test]
     fn every_implemented_capability_has_an_explicit_flow_contract() {
         for capability in CATALOG.iter().filter(|capability| capability.is_available()) {
             assert!(capability.flow_contract().is_some(), "{} has no information-flow contract", capability.id);
@@ -534,6 +548,7 @@ mod tests {
         }
         assert!(by_id("matrix.media.upload").unwrap().wire.is_empty(), "upload is a prerequisite rather than a separate mini-app service");
         assert_eq!(for_service("matrix.send_media").unwrap().id, "matrix.media.send");
+        assert_eq!(for_service("matrix.download_media").unwrap().id, "matrix.media.download");
         for id in ["host.composer.insert", "host.composer.attach", "host.composer.reply_to"] {
             let contract = by_id(id).unwrap().flow_contract().unwrap();
             assert_eq!(contract.source, FlowSource::None);

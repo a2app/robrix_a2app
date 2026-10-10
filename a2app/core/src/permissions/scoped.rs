@@ -897,6 +897,55 @@ mod tests {
     }
 
     #[test]
+    fn matrix_attachment_reads_keep_message_read_boundaries_without_send_or_internet_access() {
+        let cap = crate::capabilities::by_id("matrix.media.download").unwrap();
+        for subject in ["app", "ai-room:!origin:s"] {
+            let manifest: MiniAppManifest = serde_json::from_value(serde_json::json!({
+                "id": subject, "name": "Test", "icon": "t", "tint": 0, "source": "",
+                "allow_net": false, "builtin": false, "permissions": ["matrix-media", "matrix-room-read"],
+                "capabilities": ["matrix.media.download", "matrix.room.event.read"],
+            })).unwrap();
+            let target = context("!origin:s", "!target:s");
+            let mut store = PermissionStore::default();
+            store.set_room_spaces("!target:s", vec!["!parent:s".into()]);
+            store.set_room_policy("!target:s", RoomAccess::Write, PolicyDecision::Deny);
+            store.set_space_policy("!parent:s", RoomAccess::Write, PolicyDecision::Deny);
+            store.set(subject, Permission::Network, GrantState::Denied);
+            for send in ["matrix.room.message.send", "matrix.rooms.message.send", "matrix.media.upload", "matrix.media.send"] {
+                store.set_capability(subject, send, GrantState::Denied);
+            }
+            let evaluate = |store: &PermissionStore, cap, target| {
+                if subject == "app" { store.effective_capability_in_context(&manifest, cap, target) }
+                else { store.effective_capability_for_in_context(subject, |_| true, |_| true, cap, target) }
+            };
+            assert!(!store.matrix_write());
+            assert_eq!(evaluate(&store, cap, target), Effective::NeedsPrompt);
+            let grant = store.grant_scoped(subject, Permission::MatrixMedia, Some(cap.id), RoomScope::room("!target:s"),
+                GrantDuration::RobrixSession, Some("!origin:s")).unwrap();
+            assert_eq!(evaluate(&store, cap, target), Effective::Granted);
+            assert_eq!(evaluate(&store, cap, context("!origin:s", "!other:s")), Effective::NeedsPrompt);
+            assert_eq!(evaluate(&store, crate::capabilities::by_id("matrix.room.event.read").unwrap(), target), Effective::NeedsPrompt,
+                "attachment approval grants only attachment access");
+            assert!(store.network_grants(subject).is_empty());
+            store.set_room_policy("!target:s", RoomAccess::Read, PolicyDecision::Deny);
+            assert_eq!(evaluate(&store, cap, target), Effective::Denied);
+            store.set_room_policy("!target:s", RoomAccess::Read, PolicyDecision::Ask);
+            store.set_space_policy("!parent:s", RoomAccess::Read, PolicyDecision::Deny);
+            assert_eq!(evaluate(&store, cap, target), Effective::Denied);
+            store.set_space_policy("!parent:s", RoomAccess::Read, PolicyDecision::Ask);
+            store.set_capability(subject, cap.id, GrantState::Denied);
+            assert_eq!(evaluate(&store, cap, target), Effective::Denied);
+            store.set_capability(subject, cap.id, GrantState::Ask);
+            store.set(subject, Permission::MatrixMedia, GrantState::Denied);
+            assert_eq!(evaluate(&store, cap, target), Effective::Denied);
+            store.set(subject, Permission::MatrixMedia, GrantState::Ask);
+            assert_eq!(evaluate(&store, cap, target), Effective::Granted);
+            store.remove_scoped_grant(grant);
+            assert_eq!(evaluate(&store, cap, target), Effective::NeedsPrompt);
+        }
+    }
+
+    #[test]
     fn composer_drafts_are_grantable_without_sending_or_reading_messages() {
         for subject in ["app", "ai-room:!origin:s"] {
             let manifest: MiniAppManifest = serde_json::from_value(serde_json::json!({

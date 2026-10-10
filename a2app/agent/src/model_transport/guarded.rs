@@ -10,10 +10,10 @@ use sha2::{Digest, Sha256};
 use super::{AgentPrefs, ModelRecipient, stored_api_key};
 
 #[derive(Clone, Copy, PartialEq)]
-enum Protocol { OpenAi, Anthropic }
+enum Protocol { OpenAi, Anthropic, Gemini }
 
-// The registry's Gemini URL speaks Google's native protocol. The guarded
-// transport uses Google's documented OpenAI-compatible API instead.
+// Explicit OpenAI-compatible Gemini configurations retain their existing API;
+// the registry default uses the native API to preserve audio/video inputs.
 const GEMINI_OPENAI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 
 /// The model configuration fields consumed by the host transport.
@@ -157,6 +157,7 @@ fn endpoint(base: &str, protocol: Protocol) -> Result<(String, bool), String> {
         Protocol::OpenAi => format!("{base_path}/chat/completions"),
         Protocol::Anthropic if base_path.ends_with("/v1") => format!("{base_path}/messages"),
         Protocol::Anthropic => format!("{base_path}/v1/messages"),
+        Protocol::Gemini => format!("{base_path}/generateContent"),
     };
     url.set_path(&path);
     Ok((url.to_string(), local))
@@ -197,6 +198,23 @@ pub(super) fn identity_salt() -> Result<Vec<u8>, String> {
     Ok(salt)
 }
 
+/// Image requests share the host's exact credential resolution. A custom base
+/// belongs only to the provider selected in that config, never another key.
+pub(super) fn image_service_config(provider: &str) -> Result<(String, String), String> {
+    let config: ModelConfig = match crate::octos_config_candidates().into_iter().find(|path| path.exists()) {
+        Some(path) => serde_json::from_str(&std::fs::read_to_string(path).map_err(|_| "Cannot read model configuration.")?)
+            .map_err(|_| "Cannot parse model configuration.")?,
+        None => ModelConfig::default(),
+    };
+    let selected = config.provider.as_deref() == Some(provider);
+    let base = if selected { config.base_url.clone() } else { None }
+        .or_else(|| octos_llm::registry::lookup(provider).and_then(|entry| entry.default_base_url).map(str::to_string))
+        .ok_or("Configure an image provider API endpoint.")?;
+    let credentials = if selected { config } else { ModelConfig { env_vars: config.env_vars, ..Default::default() } };
+    let key = credentials.api_key(provider).ok_or("Image generation needs a configured OpenAI or Gemini API key. Open Setup AI Providers to add one.")?;
+    Ok((base, key))
+}
+
 pub(super) fn resolve(prefs: &AgentPrefs) -> Result<Resolved, String> {
     let config: ModelConfig = match crate::octos_config_candidates().into_iter().find(|path| path.exists()) {
         Some(path) => serde_json::from_str(&std::fs::read_to_string(path).map_err(|_| "Cannot read model configuration.")?)
@@ -216,8 +234,11 @@ pub(super) fn resolve(prefs: &AgentPrefs) -> Result<Resolved, String> {
     let protocol = match config.api_type.as_deref() {
         Some("anthropic") => Protocol::Anthropic,
         Some("openai") => Protocol::OpenAi,
-        Some(_) => return Err("Unsupported model API protocol. Choose openai or anthropic.".into()),
+        Some("gemini") => Protocol::Gemini,
+        Some(_) => return Err("Unsupported model API protocol. Choose openai, anthropic or gemini.".into()),
         None if name == "anthropic" => Protocol::Anthropic,
+        None if name == "gemini" && config.base_url.as_deref().is_none_or(|base|
+            entry.and_then(|entry| entry.default_base_url).is_some_and(|default| base.trim_end_matches('/') == default.trim_end_matches('/'))) => Protocol::Gemini,
         None => Protocol::OpenAi,
     };
     if name == "gemini" && protocol == Protocol::Anthropic && config.base_url.is_none() {
@@ -235,12 +256,22 @@ pub(super) fn resolve(prefs: &AgentPrefs) -> Result<Resolved, String> {
     // Only the built-in Ollama default is rewritten. Arbitrary HTTP DNS names
     // do not become trusted local services because of a user-supplied label.
     let base = if name == "ollama" && config.base_url.is_none() { "http://127.0.0.1:11434/v1" } else { base };
-    let (endpoint, local) = endpoint(base, protocol)?;
     let model = crate::prefs::Backend::Octos { provider: name.into() }.model_override(prefs)
         .or_else(|| config.model.clone()).or_else(|| entry.and_then(|entry| entry.default_model()).map(str::to_string))
         .ok_or("Choose a model for the configured provider.")?;
+    let (mut endpoint, local) = endpoint(base, protocol)?;
+    if protocol == Protocol::Gemini {
+        let model_id = model.strip_prefix("models/").unwrap_or(&model);
+        if model_id.is_empty() || model_id.contains(['/', '?', '#']) || model_id.contains(char::from(92)) || model_id.chars().any(char::is_control) {
+            return Err("Invalid Gemini model identifier.".into());
+        }
+        let mut url = url::Url::parse(&endpoint).map_err(|_| "Invalid Gemini endpoint.")?;
+        let prefix = url.path().trim_end_matches("/generateContent").to_string();
+        url.set_path(&format!("{prefix}/models/{model_id}:generateContent"));
+        endpoint = url.to_string();
+    }
     let key = if entry.is_some_and(|entry| entry.requires_api_key) || config.api_key_env.is_some() { config.api_key(&selected).ok_or("Configure the API credential for this model provider.")? } else { String::new() };
-    let protocol_name = if protocol == Protocol::OpenAi { "openai" } else { "anthropic" };
+    let protocol_name = match protocol { Protocol::OpenAi => "openai", Protocol::Anthropic => "anthropic", Protocol::Gemini => "gemini" };
     let id = identity(&identity_salt()?, &[name, &endpoint, &model, protocol_name, &key]);
     let hints = config.model_hints.unwrap_or_else(|| octos_llm::openai::ModelHints::detect(&model));
     Ok(Resolved {
@@ -293,17 +324,18 @@ impl Guard {
     }
 }
 
-pub(crate) fn provider(prefs: &AgentPrefs, context: ContextId, shutdown: Arc<AtomicBool>) -> Result<Arc<dyn LlmProvider>, String> {
+pub(crate) fn provider(prefs: &AgentPrefs, context: ContextId, shutdown: Arc<AtomicBool>, outputs: Arc<crate::tool_output::ToolOutputStore>) -> Result<Arc<dyn LlmProvider>, String> {
     let config = resolve(prefs)?;
     let guard = Guard::new(prefs, context, shutdown, &config.recipient)?;
     let mut provider = GuardedProvider::new(config, guard.approve)?;
+    provider.outputs = outputs;
     provider.audit_context = guard.audit_context;
     provider.check_config = Some(guard.check_config);
     provider.on_response = Some(guard.on_response);
     Ok(Arc::new(provider))
 }
 
-struct GuardedProvider { config: Resolved, client: reqwest::Client, approve: Approval, check_config: Option<Approval>, on_response: Option<Approval>, audit_context: Option<ContextId> }
+struct GuardedProvider { config: Resolved, client: reqwest::Client, approve: Approval, check_config: Option<Approval>, on_response: Option<Approval>, audit_context: Option<ContextId>, outputs: Arc<crate::tool_output::ToolOutputStore> }
 
 impl GuardedProvider {
     fn new(config: Resolved, approve: Approval) -> Result<Self, String> {
@@ -312,7 +344,7 @@ impl GuardedProvider {
             .no_gzip().no_brotli().no_deflate().no_zstd()
             .timeout(Duration::from_secs(180)).build()
             .map_err(|_| "Cannot initialize the guarded model transport.")?;
-        Ok(Self { config, client, approve, check_config: None, on_response: None, audit_context: None })
+        Ok(Self { config, client, approve, check_config: None, on_response: None, audit_context: None, outputs: Arc::default() })
     }
 
     async fn send(&self, body: Value) -> eyre::Result<Value> {
@@ -324,6 +356,7 @@ impl GuardedProvider {
             request = match self.config.protocol {
                 Protocol::OpenAi => request.bearer_auth(&self.config.key),
                 Protocol::Anthropic => request.header("x-api-key", &self.config.key),
+                Protocol::Gemini => request.header("x-goog-api-key", &self.config.key),
             };
         }
         if self.config.protocol == Protocol::Anthropic { request = request.header("anthropic-version", "2023-06-01"); }
@@ -366,12 +399,22 @@ impl GuardedProvider {
 impl LlmProvider for GuardedProvider {
     async fn chat(&self, messages: &[Message], tools: &[ToolSpec], config: &ChatConfig) -> eyre::Result<ChatResponse> {
         (self.approve)().map_err(eyre::Report::msg)?;
-        if messages.iter().any(|message| !message.media.is_empty()) {
-            return Err(eyre::eyre!("Media inputs need explicit source tracking and are not supported by the guarded model transport yet."));
-        }
+        let turns = super::multimodal::prepare(messages, &self.outputs, self.audit_context.as_ref()).map_err(eyre::Report::msg)?;
+        let plain: Vec<Message> = turns.iter().map(|turn| turn.message.clone()).collect();
         let body = match self.config.protocol {
-            Protocol::OpenAi => openai_body(&self.config, messages, tools, config),
-            Protocol::Anthropic => anthropic_body(&self.config, messages, tools, config),
+            Protocol::OpenAi => {
+                let mut body = openai_body(&self.config, &plain, tools, config);
+                for (value, turn) in body["messages"].as_array_mut().unwrap().iter_mut().zip(&turns) {
+                    if !turn.attachments.is_empty() {
+                        let mut parts = vec![json!({"type":"text","text":turn.message.content})];
+                        parts.extend(super::multimodal::parts(&turn.attachments, super::multimodal::Format::OpenAi, &self.config.provider));
+                        value["content"] = json!(parts);
+                    }
+                }
+                body
+            }
+            Protocol::Anthropic => anthropic_multimodal_body(&self.config, &turns, tools, config),
+            Protocol::Gemini => super::gemini::body(&turns, tools, config),
         };
         let result = self.send(body).await;
         // Service failures can influence retries too. Persist the influence
@@ -381,6 +424,7 @@ impl LlmProvider for GuardedProvider {
         match self.config.protocol {
             Protocol::OpenAi => parse_openai(value, &self.config.provider),
             Protocol::Anthropic => parse_anthropic(value),
+            Protocol::Gemini => super::gemini::parse(value),
         }
     }
     fn model_id(&self) -> &str { &self.config.model }
@@ -423,10 +467,17 @@ fn openai_body(resolved: &Resolved, messages: &[Message], tools: &[ToolSpec], co
     value
 }
 
+#[cfg(test)]
 fn anthropic_body(resolved: &Resolved, messages: &[Message], tools: &[ToolSpec], config: &ChatConfig) -> Value {
+    let turns = messages.iter().cloned().map(|message| super::multimodal::Turn { message, attachments: Vec::new() }).collect::<Vec<_>>();
+    anthropic_multimodal_body(resolved, &turns, tools, config)
+}
+
+fn anthropic_multimodal_body(resolved: &Resolved, input: &[super::multimodal::Turn], tools: &[ToolSpec], config: &ChatConfig) -> Value {
     let mut system = Vec::new();
     let mut turns: Vec<Value> = Vec::new();
-    for message in messages {
+    for turn in input {
+        let message = &turn.message;
         if message.role == MessageRole::System { system.push(message.content.clone()); continue; }
         let role = if message.role == MessageRole::Assistant { "assistant" } else { "user" };
         let mut content = Vec::new();
@@ -438,6 +489,7 @@ fn anthropic_body(resolved: &Resolved, messages: &[Message], tools: &[ToolSpec],
                 content.push(json!({"type":"tool_use","id":call.id,"name":call.name,"input":call.arguments}));
             }
         }
+        content.extend(super::multimodal::parts(&turn.attachments, super::multimodal::Format::Anthropic, &resolved.provider));
         if let Some(previous) = turns.last_mut().filter(|previous| previous["role"] == role) {
             previous["content"].as_array_mut().unwrap().extend(content);
         } else { turns.push(json!({"role":role,"content":content})); }
@@ -504,7 +556,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
-    fn fixture(base: &str, protocol: Protocol) -> Resolved {
+    pub(super) fn fixture(base: &str, protocol: Protocol) -> Resolved {
         let (endpoint, local) = endpoint(base, protocol).unwrap();
         Resolved {
             recipient: ModelRecipient { id: "test-recipient".into(), label: "Test model".into(), endpoint, local },
@@ -512,14 +564,14 @@ mod tests {
             protocol, hints: octos_llm::openai::ModelHints::default(),
         }
     }
-    fn message(role: MessageRole, content: &str) -> Message {
+    pub(super) fn message(role: MessageRole, content: &str) -> Message {
         Message { role, content: content.into(), media: vec![], tool_calls: None, tool_call_id: None,
             reasoning_content: None, client_message_id: None, thread_id: None, timestamp: chrono::Utc::now() }
     }
-    fn approval(allowed: Arc<AtomicBool>) -> Approval {
+    pub(super) fn approval(allowed: Arc<AtomicBool>) -> Approval {
         Arc::new(move || if allowed.load(Ordering::SeqCst) { Ok(()) } else { Err("Private source policy denied this recipient.".into()) })
     }
-    fn request(listener: TcpListener, response: String, revoke: Option<Arc<AtomicBool>>) -> std::thread::JoinHandle<String> {
+    pub(super) fn request(listener: TcpListener, response: String, revoke: Option<Arc<AtomicBool>>) -> std::thread::JoinHandle<String> {
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -543,7 +595,7 @@ mod tests {
             String::from_utf8(bytes).unwrap()
         })
     }
-    fn ok_response() -> String {
+    pub(super) fn ok_response() -> String {
         let body = json!({"choices":[{"message":{"content":"Allowed result"},"finish_reason":"stop"}],"usage":{}}).to_string();
         format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
     }
@@ -722,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn gemini_resolution_uses_compatible_default_and_preserves_explicit_endpoints() {
+    fn gemini_resolution_uses_native_media_default_and_preserves_explicit_endpoints() {
         let _guard = crate::CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         struct Restore { config: Option<std::ffi::OsString>, provider: Option<String> }
         impl Drop for Restore {
@@ -745,8 +797,8 @@ mod tests {
         let auth_key = resolve(&prefs).unwrap();
         assert_eq!(auth_key.provider, "gemini");
         assert_eq!(auth_key.key, "AQ.synthetic-auth-key");
-        assert!(auth_key.protocol == Protocol::OpenAi);
-        assert_eq!(auth_key.recipient.endpoint, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions");
+        assert!(auth_key.protocol == Protocol::Gemini);
+        assert_eq!(auth_key.recipient.endpoint, "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent");
         assert!(!auth_key.recipient.local);
         assert_eq!(auth_key.model, "gemini-3.8-flash", "fresh Gemini setup uses a model available to new projects");
         assert!(!auth_key.recipient.id.contains(&auth_key.key));
@@ -756,11 +808,11 @@ mod tests {
         assert_eq!(legacy_key.key, "AIzaSyntheticLegacyKey");
         assert_eq!(legacy_key.recipient.endpoint, auth_key.recipient.endpoint);
         assert_ne!(legacy_key.recipient.id, auth_key.recipient.id);
-        config["provider"] = json!("google"); config["api_type"] = json!("openai"); write(&config);
+        config["provider"] = json!("google"); write(&config);
         assert_eq!(resolve(&prefs).unwrap().recipient, legacy_key.recipient, "registry aliases resolve to the same Gemini recipient");
         for base in ["https://generativelanguage.googleapis.com/v1beta", "https://generativelanguage.googleapis.com/v1beta/"] {
             config["base_url"] = json!(base); write(&config);
-            assert_eq!(resolve(&prefs).unwrap().recipient, legacy_key.recipient, "saved native default uses the compatible endpoint");
+            assert_eq!(resolve(&prefs).unwrap().recipient, legacy_key.recipient, "saved native default supports all input modalities");
         }
         config.as_object_mut().unwrap().remove("base_url");
         config["model"] = json!("gemini-2.5-flash"); write(&config);
@@ -1028,3 +1080,6 @@ mod tests {
         assert_eq!(anthropic["messages"][2]["content"][0]["content"], "private tool result");
     }
 }
+
+#[cfg(test)]
+mod multimodal_tests;

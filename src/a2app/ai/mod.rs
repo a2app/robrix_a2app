@@ -25,6 +25,8 @@
 
 pub mod tools;
 
+pub mod discovery;
+
 pub mod media;
 
 #[cfg(unix)]

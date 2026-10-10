@@ -33,6 +33,7 @@ pub(crate) struct HostBroker {
     provider: Arc<dyn LlmProvider>,
     tools: McpServer,
     check: Check,
+    output_context: Option<(ContextId, u64)>,
     stopped: Arc<AtomicBool>,
     ready: AtomicBool,
     active: AtomicBool,
@@ -54,7 +55,9 @@ impl HostBroker {
     fn new(prefs: &AgentPrefs, context: ContextId, room_agent: bool, tools: Option<McpServer>) -> Result<Arc<Self>, String> {
         let epoch = flow::context_epoch(&context)?;
         let stopped = Arc::new(AtomicBool::new(false));
-        let provider = crate::model_transport::provider(prefs, context.clone(), stopped.clone())?;
+        let tools = if room_agent { tools.ok_or("The room's host tools are unavailable.")? } else { McpServer::new() };
+        let provider = crate::model_transport::provider_with_outputs(prefs, context.clone(), stopped.clone(), tools.output_store())?;
+        let output_context = context.clone();
         let check: Check = Arc::new(move || flow::ensure_context_epoch(&context, epoch));
         #[allow(unused_mut)]
         let mut system_prompt = if room_agent {
@@ -62,13 +65,12 @@ impl HostBroker {
         } else {
             "You create Robrix mini-apps. Return the complete app in a fenced splash code block as requested. You have no filesystem or research tools.".to_string()
         };
-        let tools = if room_agent { tools.ok_or("The room's host tools are unavailable.")? } else { McpServer::new() };
         #[cfg(feature = "persistent-guide")]
         { system_prompt.push('\n'); system_prompt.push_str(crate::SPLASH_GUIDE); }
-        Self::with_provider(provider, tools, check, stopped, system_prompt)
+        Self::with_provider(provider, tools, check, stopped, system_prompt, Some((output_context, epoch)))
     }
 
-    fn with_provider(provider: Arc<dyn LlmProvider>, tools: McpServer, check: Check, stopped: Arc<AtomicBool>, system_prompt: String) -> Result<Arc<Self>, String> {
+    fn with_provider(provider: Arc<dyn LlmProvider>, tools: McpServer, check: Check, stopped: Arc<AtomicBool>, system_prompt: String, output_context: Option<(ContextId, u64)>) -> Result<Arc<Self>, String> {
         let config = HostConfig {
             version: VERSION,
             model: HostModel {
@@ -83,7 +85,7 @@ impl HostBroker {
         let (tx, mut rx) = mpsc::channel::<Request>(MAX_PENDING);
         let (generation, mut cancellation) = watch::channel(0);
         let broker = Arc::new(Self {
-            config, provider, tools, check, stopped, ready: AtomicBool::new(false), active: AtomicBool::new(false), generation,
+            config, provider, tools, check, output_context, stopped, ready: AtomicBool::new(false), active: AtomicBool::new(false), generation,
             requests: Mutex::new(Some(tx)), pending: Mutex::new(HashSet::new()), pending_bytes: AtomicUsize::new(0),
             tool_slots: Arc::new(Semaphore::new(MAX_ACTIVE)),
         });
@@ -224,7 +226,17 @@ impl HostBroker {
                     let _permit = permit;
                     broker.ensure_live()?;
                     if !broker.active.load(Ordering::Acquire) || *broker.generation.borrow() != generation { return Err("Agent request cancelled.".to_string()); }
-                    Ok(match tool.call(&arguments) {
+                    let output = tool.call_output(&arguments);
+                    broker.ensure_live()?;
+                    if !broker.active.load(Ordering::Acquire) || *broker.generation.borrow() != generation { return Err("Agent request cancelled.".to_string()); }
+                    let output = output.and_then(|output| {
+                        if output.attachments.is_empty() { Ok(output.text) }
+                        else {
+                            let (context, epoch) = broker.output_context.as_ref().ok_or("Model attachment context is unavailable.")?;
+                            broker.tools.output_store().register(context, *epoch, output)
+                        }
+                    });
+                    Ok(match output {
                         Ok(content) => ToolCallResponse { content, is_error: false },
                         Err(content) => ToolCallResponse { content, is_error: true },
                     })
@@ -310,7 +322,7 @@ mod tests {
         let epoch = Arc::new(AtomicUsize::new(1));
         let captured = epoch.clone();
         let check: Check = Arc::new(move || if captured.load(Ordering::Acquire) == 1 { Ok(()) } else { Err("Stale activation.".into()) });
-        let broker = HostBroker::with_provider(model.clone(), McpServer::new(), check, Arc::new(AtomicBool::new(false)), "Assistant".into()).unwrap();
+        let broker = HostBroker::with_provider(model.clone(), McpServer::new(), check, Arc::new(AtomicBool::new(false)), "Assistant".into(), None).unwrap();
         (broker, model, epoch)
     }
 
@@ -347,6 +359,40 @@ mod tests {
         epoch.store(2, Ordering::Release);
         assert!(request(&broker, 5, MODEL_METHOD, model_request()).is_err());
         assert_eq!(model.calls.load(Ordering::Acquire), 1);
+        broker.stop();
+    }
+
+    #[test]
+    fn acp_tool_wire_carries_opaque_receipt_resolvable_to_actual_image_bytes() {
+        struct Media;
+        impl crate::mcp::Tool for Media {
+            fn name(&self) -> &str { "inspect_media" }
+            fn description(&self) -> &str { "Fixture image" }
+            fn input_schema(&self) -> Value { json!({"type":"object"}) }
+            fn call(&self, _: &serde_json::Map<String, Value>) -> Result<String, String> { panic!("protected broker must request typed output") }
+            fn call_output(&self, _: &serde_json::Map<String, Value>) -> Result<crate::tool_output::ToolOutput, String> {
+                Ok(crate::tool_output::ToolOutput { text:"Loaded image".into(), attachments:vec![crate::tool_output::ModelAttachment::new(
+                    include_bytes!("../tests/fixtures/vision-colors.png").to_vec(),"image/png".into(),"fixture.png".into())?] })
+            }
+        }
+        let context = ContextId::Agent { account:"@broker-media:test".into(), room:"!broker-media:test".into() };
+        flow::register_context(&context).unwrap();
+        let epoch = flow::context_epoch(&context).unwrap();
+        let expected = context.clone();
+        let check: Check = Arc::new(move || flow::ensure_context_epoch(&expected,epoch));
+        let model = Arc::new(Model { calls:AtomicUsize::new(0),wait:AtomicBool::new(false),tool_loop:false,seen_tools:Mutex::new(vec![]) });
+        let tools = McpServer::new(); tools.add_tool(Media);
+        let broker = HostBroker::with_provider(model,tools,check,Arc::new(AtomicBool::new(false)),"Assistant".into(),Some((context.clone(),epoch))).unwrap();
+        negotiate(&broker); broker.begin_turn().unwrap();
+        let reply = request(&broker,1,TOOLS_CALL_METHOD,json!({"name":"inspect_media","arguments":{}})).unwrap().recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(reply["is_error"],false);
+        let receipt = reply["content"].as_str().unwrap();
+        assert!(receipt.contains("_robrix_media_receipt"));
+        assert!(!receipt.contains("base64"));
+        let output = broker.tools.output_store().resolve(&context,receipt).unwrap().unwrap();
+        assert_eq!(output.attachments[0].bytes(),include_bytes!("../tests/fixtures/vision-colors.png"));
+        flow::remove_context(&context).unwrap();
+        assert!(broker.tools.output_store().resolve(&context,receipt).is_err());
         broker.stop();
     }
 

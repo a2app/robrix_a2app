@@ -82,6 +82,10 @@ pub enum SessionJob {
     DraftMessage { text: String, answer: Sender<Result<String, String>> },
     /// `draft_media`: prepare local bytes; URL acquisition remains host-gated.
     DraftMedia { request: MediaDraftRequest, answer: Sender<Result<String, String>> },
+    /// Supplies immutable authorized draft content through typed model input.
+    InspectMedia { request: super::tools::InspectMediaRequest, answer: Sender<Result<a2app_agent::tool_output::ToolOutput, String>> },
+    /// Generates a local draft through a separately reviewed image provider.
+    GenerateImage { request: super::discovery::ImageGenerationRequest, answer: Sender<Result<String, String>> },
     /// `attach_media`: stage a session-owned draft in the attached room's composer.
     AttachMedia { draft_id: String, answer: Sender<Result<String, String>> },
     /// `post_room_media`: upload and send native media under its upload/send
@@ -243,6 +247,18 @@ impl AiHost for SessionHost {
         let (answer, result) = channel();
         self.submit(SessionJob::DraftMedia { request, answer })?;
         result.recv().map_err(|_| "this session ended before the media draft was prepared".to_string())?
+    }
+
+    fn inspect_media(&self, request: super::tools::InspectMediaRequest) -> Result<a2app_agent::tool_output::ToolOutput, String> {
+        let (answer, result) = channel();
+        self.submit(SessionJob::InspectMedia { request, answer })?;
+        result.recv().map_err(|_| "this session ended before the media was inspected".to_string())?
+    }
+
+    fn generate_image(&self, request: super::discovery::ImageGenerationRequest) -> Result<String, String> {
+        let (answer, result) = channel();
+        self.submit(SessionJob::GenerateImage { request, answer })?;
+        result.recv().map_err(|_| "this session ended before the image was generated".to_string())?
     }
 
     fn attach_media(&self, draft_id: &str) -> Result<String, String> {

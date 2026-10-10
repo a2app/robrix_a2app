@@ -59,6 +59,17 @@ impl AiHost for RecordingHost {
         Ok(json!({"draft_id":"media-fixture","filename":request.filename,"mime_type":request.mime_type}).to_string())
     }
 
+    fn generate_image(&self, _request: robrix::a2app::ai::discovery::ImageGenerationRequest) -> Result<String, String> {
+        Err("generation not exercised by this relay test".into())
+    }
+
+    fn inspect_media(&self, request: robrix::a2app::ai::tools::InspectMediaRequest) -> Result<a2app_agent::tool_output::ToolOutput, String> {
+        self.calls.lock().unwrap().push(format!("inspect_media({request:?})"));
+        Ok(a2app_agent::tool_output::ToolOutput { text: "Actual image bytes".into(), attachments: vec![
+            a2app_agent::tool_output::ModelAttachment::new(include_bytes!("../a2app/agent/tests/fixtures/vision-colors.png").to_vec(), "image/png".into(), "fixture.png".into())?,
+        ] })
+    }
+
     fn attach_media(&self, draft_id: &str) -> Result<String, String> {
         self.calls.lock().unwrap().push(format!("attach_media({draft_id:?})"));
         Ok("attached".into())
@@ -198,7 +209,7 @@ async fn an_rmcp_client_lists_and_calls_robrix_tools_over_the_relay() {
     assert!(names.iter().any(|n| n == "list_mini_app_tools"), "tools advertised: {names:?}");
     assert!(names.iter().any(|n| n == "call_mini_app_tool"), "tools advertised: {names:?}");
     assert!(names.iter().any(|n| n == "request_task_permissions"), "tools advertised: {names:?}");
-    for name in ["draft_message", "draft_media", "attach_media", "post_room_media"] {
+    for name in ["draft_message", "draft_media", "inspect_media", "search_media", "generate_image", "draft_file", "attach_media", "post_room_media"] {
         assert!(names.iter().any(|offered| offered == name), "tools advertised: {names:?}");
     }
 
@@ -210,6 +221,16 @@ async fn an_rmcp_client_lists_and_calls_robrix_tools_over_the_relay() {
         .expect("tools/call timed out")
         .expect("tools/call failed");
     assert!(!result.is_error.unwrap_or(false), "send_message must not report isError");
+
+    let mut params = CallToolRequestParams::new("inspect_media");
+    params.arguments = Some(json!({"event_id":"$photo"}).as_object().unwrap().clone());
+    let result = timeout(REPLY_TIMEOUT, service.call_tool(params)).await.unwrap().unwrap();
+    assert!(!result.is_error.unwrap_or(false));
+    let parts = serde_json::to_value(&result.content).unwrap();
+    assert_eq!(parts[1]["type"], "image");
+    assert_eq!(parts[1]["mimeType"], "image/png");
+    let pixels: matrix_sdk::ruma::serde::Base64 = matrix_sdk::ruma::serde::Base64::parse(parts[1]["data"].as_str().unwrap()).unwrap();
+    assert_eq!(pixels.into_inner(), include_bytes!("../a2app/agent/tests/fixtures/vision-colors.png"));
 
     // Octos's rmcp client must pass a structured plan through the real relay
     // and receive the host's structured permission outcome.

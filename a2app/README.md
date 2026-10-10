@@ -337,6 +337,10 @@ bodies; only the mini-app services clip.
 | `post_room_message` | Posts a notice into another joined room | `matrix.rooms.message.send` (per room) |
 | `draft_message` | Puts text in this room's composer for the user to send | `host.composer.insert` |
 | `draft_media` | Prepares local media from one HTTP(S) URL, Matrix attachment event, verified Matrix `mxc` URI or inline base64 and returns an opaque session draft id | HTTP(S): exact website and data-sharing rules; Matrix: `matrix.media.download` and authenticated media transport; local preparation: no upload |
+| `inspect_media` | Reads actual bytes from an attachment `event_id` (optional `source_room`) or a retained `draft_id`, and delivers native media content to the model | Matrix event: `matrix.media.download` with the same room/space read protections as messages; model sharing remains checked |
+| `search_media` | Finds photos, audio, videos or files on Wikimedia Commons with direct download URLs, source pages and attribution | Ordinary internet permissions and data-sharing review |
+| `generate_image` | Generates an image through a configured OpenAI or Gemini image service and returns a local draft | Review for the chosen AI service; no upload, composer or send grant implied |
+| `draft_file` | Creates a local file draft from UTF-8 text, Markdown, CSV, JSON, HTML or source code | Local preparation only; attaching and posting stay separately gated |
 | `attach_media` | Stages a prepared media draft in this room's composer for the user to review and send | `host.composer.attach` |
 | `post_room_media` | Uploads and posts a native image, audio, video or file message here or into another joined room | `matrix.media.upload`, `matrix.media.send`; another room also needs `matrix.rooms.message.send` |
 | `list_spaces` | Lists the spaces the user has joined | `matrix.spaces.list` (default on) |
@@ -371,6 +375,28 @@ Matrix attachment, which the timeline can display as media, after the upload,
 send and data-sharing checks succeed. Plan media permissions with the source
 reads, destination rooms and exact media URLs in `request_task_permissions`.
 
+Message reads include attachment metadata and event ids. To understand the
+contents, call `inspect_media` with the attachment's event id or a prepared
+draft id. The host downloads and decrypts the file and sends its actual bytes
+as native image/document/audio/video input, rather than treating base64 or
+metadata as a view of the file. Embedded workers use opaque, session-bound
+receipts that only the protected model transport resolves. Text files are
+decoded as UTF-8. Native media support depends on the configured model and
+transport: compatible OpenAI and Anthropic models accept images and PDFs;
+Gemini's native API also accepts audio and video. An unsupported file type
+produces an explicit capability error instead of a guessed description.
+Every file type can still be downloaded, drafted, attached and posted.
+
+`search_media` returns actual public results; use `draft_media` to download one,
+`inspect_media` to check its content, then attach or post it with the separate
+permissions. Image generation uses the existing provider configuration and
+host-owned credentials. It needs an OpenAI or Gemini API key with image-model
+access; it never shares credentials with the agent. The default image models
+are `gpt-image-1.5` and `gemini-2.5-flash-image`, with an optional model override.
+Generation returns actual image bytes as a local draft and never sends it to
+a room automatically. A generated illustration is not a verified photograph
+of a real object or place.
+
 Mini-apps use `host.request("composer.insert", {text}, callback)` for text
 drafts and `host.request("composer.attach", {data_base64, filename, mime_type,
 caption?, room_id?}, callback)` for media drafts, declaring the corresponding
@@ -386,11 +412,14 @@ uses `matrix.send_media` with the same bounded inline media fields, without
 `matrix.media.send`, preserves native media types and room encryption, and
 returns the sent event id only after the post succeeds. Both sending services
 require an explicit Send/Post action, independent of composer grants.
+`host.request("matrix.download_media", {event_id}, callback)` reads an
+attachment from the app's attached room under `matrix.media.download`. It
+returns real, decrypted `data_base64` with trusted media metadata; the bounded
+download uses Matrix access permissions, independently of internet access,
+uploading or sending. A later `composer.attach` or `matrix.send_media` request
+keeps its own permission and inline-size limits.
 Generated apps receive these rules in their authoring guide
 and every generation prompt.
-
-The host tools prepare existing bytes or fetch a known media URL; they do not
-provide image search or an image generation model.
 
 #### Upfront task permissions
 

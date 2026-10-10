@@ -1420,6 +1420,7 @@ mod tests {
 
     const DECLARED: &[&str] = &[
         "matrix.room.messages.read",
+        "matrix.room.event.read",
         "matrix.rooms.messages.read",
         "matrix.rooms.message.send",
         "matrix.rooms.list",
@@ -1621,6 +1622,71 @@ mod tests {
         store.set_room_policy("!source:example.org", RoomAccess::Read, PolicyDecision::Deny);
         let plan = resolve(&need, &inputs(&store, &|_| true, &lookup)).unwrap();
         assert_eq!(plan.items[0].state, ItemState::Blocked(TaskReason::BlockedByRoomPolicy));
+    }
+
+    #[test]
+    fn attached_media_and_message_reads_have_the_same_bounded_plan_and_revocation() {
+        let mut expected_flow = None;
+        for capability in ["matrix.room.messages.read", "matrix.room.event.read", "matrix.media.download"] {
+            let mut store = PermissionStore::default();
+            let subject = "ai-room:!ai:example.org";
+            store.set(subject, Permission::Network, GrantState::Denied);
+            store.set(subject, Permission::MatrixRoomSend, GrantState::Denied);
+            store.set(subject, Permission::MatrixRoomsSend, GrantState::Denied);
+            store.set_capability(subject, "matrix.media.upload", GrantState::Denied);
+            store.set_capability(subject, "matrix.media.send", GrantState::Denied);
+            let lookup = FakeLookup { allowed: Default::default() };
+            let plan = resolve(&request(vec![TaskNeed::Capability { id: "read".into(),
+                capability: capability.into(), targets: Vec::new(), why: None }]),
+                &inputs(&store, &|_| true, &lookup)).unwrap();
+            assert!(!store.matrix_write());
+            assert_eq!(plan.items[0].state, ItemState::NeedsGrant);
+            assert_eq!(plan.items[0].action.scope(), Some(&RoomScope::room("!ai:example.org")));
+            let pairs = plan.items.iter().filter_map(|item| match &item.action {
+                PlanAction::Flow { source, recipient } => Some((item_key(source), item_key(recipient))),
+                _ => None,
+            }).collect::<BTreeSet<_>>();
+            if let Some(expected) = &expected_flow { assert_eq!(&pairs, expected); }
+            else { expected_flow = Some(pairs); }
+            let flow = FakeFlow::new();
+            let applied = apply(&plan, &checked(&plan).into_iter().collect(), &mut store, &flow).unwrap();
+            let cap = crate::capabilities::by_id(capability).unwrap();
+            let effective = |store: &PermissionStore, cap, room| store.effective_capability_for_in_context(
+                subject, |_| true, |_| true, cap, PermissionContext { origin_room: Some("!ai:example.org"), target_room: Some(room) });
+            assert_eq!(effective(&store, cap, "!ai:example.org"), Effective::Granted);
+            assert_eq!(effective(&store, cap, "!other:example.org"), Effective::NeedsPrompt);
+            assert!(store.network_grants(subject).is_empty(), "Matrix attachment reads grant no Internet access");
+            assert_eq!(store.scoped_grants(subject).len(), 1);
+            for unrelated in ["matrix.media.upload", "matrix.media.send", "matrix.room.message.send"] {
+                assert_eq!(effective(&store, crate::capabilities::by_id(unrelated).unwrap(), "!ai:example.org"), Effective::Denied);
+            }
+            assert!(rollback(&applied, &mut store, &flow));
+            assert_eq!(effective(&store, cap, "!ai:example.org"), Effective::NeedsPrompt);
+            assert!(!flow.revoked.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn media_read_approval_rechecks_source_room_and_parent_space_read_denials() {
+        for deny_space in [false, true] {
+            let mut store = PermissionStore::default();
+            store.set_room_spaces("!source:example.org", vec!["!parent:example.org".into()]);
+            let lookup = FakeLookup { allowed: Default::default() };
+            let plan = resolve(&request(vec![TaskNeed::Capability { id: "fetch".into(),
+                capability: "matrix.media.download".into(), targets: vec!["!source:example.org".into()], why: None }]),
+                &inputs(&store, &|_| true, &lookup)).unwrap();
+            assert_eq!(plan.items[0].state, ItemState::NeedsGrant);
+            if deny_space { store.set_space_policy("!parent:example.org", RoomAccess::Read, PolicyDecision::Deny); }
+            else { store.set_room_policy("!source:example.org", RoomAccess::Read, PolicyDecision::Deny); }
+            let flow = FakeFlow::new();
+            let approved = checked(&plan).into_iter().collect();
+            let applied = apply(&plan, &approved, &mut store, &flow).unwrap();
+            assert_eq!(applied.item_states.get("fetch"), Some(&ItemState::Blocked(TaskReason::BlockedByRoomPolicy)));
+            assert!(store.scoped_grants(&plan.subject).is_empty());
+            let source = Source::Room { account: "alice".into(), room: "!source:example.org".into() };
+            assert!(!flow.allowed.borrow().iter().any(|(item_source, _)| *item_source == item_key(&source)),
+                "a protected attachment must not acquire sharing grants while the prompt waits");
+        }
     }
 
     #[test]

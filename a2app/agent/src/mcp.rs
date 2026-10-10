@@ -163,6 +163,12 @@ pub trait Tool: Send + Sync {
     /// start-then-poll — that constraint lives with the implementation, not
     /// the protocol.
     fn call(&self, arguments: &Map<String, Value>) -> Result<String, String>;
+
+    /// Typed image/audio/document results retain bytes through the host bridge.
+    /// Existing text-only tools preserve their original behavior.
+    fn call_output(&self, arguments: &Map<String, Value>) -> Result<crate::tool_output::ToolOutput, String> {
+        self.call(arguments).map(Into::into)
+    }
 }
 
 /// A parsed inbound request or notification, reduced from raw JSON.
@@ -198,6 +204,7 @@ pub type ToolRegistry = Arc<RwLock<Vec<Arc<dyn Tool>>>>;
 #[derive(Clone)]
 pub struct McpServer {
     tools: ToolRegistry,
+    outputs: Arc<crate::tool_output::ToolOutputStore>,
 }
 
 impl McpServer {
@@ -205,8 +212,10 @@ impl McpServer {
     /// after) the connection starts — `tools/list` reflects whatever is
     /// registered when it arrives.
     pub fn new() -> Self {
-        Self { tools: Arc::new(RwLock::new(Vec::new())) }
+        Self { tools: Arc::new(RwLock::new(Vec::new())), outputs: Arc::default() }
     }
+
+    pub(crate) fn output_store(&self) -> Arc<crate::tool_output::ToolOutputStore> { self.outputs.clone() }
 
     /// Adds one tool to the registry. Adding a host tool is this call plus the
     /// [`Tool`] implementation; nothing else in Robrix or the protocol layer
@@ -367,11 +376,9 @@ impl McpServer {
                 )));
             }
         };
-        match tool.call(&arguments) {
-            // The model reads text content; octos joins all text parts and
-            // drops non-text ones, so one text block is the whole message.
-            Ok(text) => Ok(json!({
-                "content": [{"type": "text", "text": text}],
+        match tool.call_output(&arguments).and_then(|output| { output.validate()?; Ok(output) }) {
+            Ok(output) => Ok(json!({
+                "content": output.mcp_content(),
                 "isError": false,
             })),
             // A tool failure is NOT a JSON-RPC error: isError keeps the reason
@@ -524,6 +531,41 @@ mod tests {
                 .to_string();
             (id, Err(msg))
         }
+    }
+
+    #[test]
+    fn native_mcp_tool_result_contains_actual_typed_bytes_and_valid_resource_uri() {
+        struct Media;
+        impl Tool for Media {
+            fn name(&self) -> &str { "inspect_media" }
+            fn description(&self) -> &str { "Fixture media" }
+            fn input_schema(&self) -> Value { json!({"type":"object"}) }
+            fn call(&self, _: &Map<String, Value>) -> Result<String, String> { panic!("MCP must call the typed output method") }
+            fn call_output(&self, _: &Map<String, Value>) -> Result<crate::tool_output::ToolOutput, String> {
+                use crate::tool_output::{ModelAttachment, ToolOutput};
+                Ok(ToolOutput { text:"Authorized content".into(), attachments:vec![
+                    ModelAttachment::new(include_bytes!("../tests/fixtures/vision-colors.png").to_vec(),"image/png".into(),"image.png".into())?,
+                    ModelAttachment::new(include_bytes!("../tests/fixtures/tone.wav").to_vec(),"audio/wav".into(),"tone.wav".into())?,
+                    ModelAttachment::new(include_bytes!("../tests/fixtures/report.pdf").to_vec(),"application/pdf".into(),"A report #1 ? 猫.pdf".into())?,
+                ] })
+            }
+        }
+        let server = McpServer::new(); server.add_tool(Media);
+        let replies = server.handle_frame(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"inspect_media","arguments":{}}}"#);
+        let result = reply_of(&replies[0]).1.unwrap();
+        assert_eq!(result["isError"],false);
+        let content = result["content"].as_array().unwrap();
+        assert_eq!(content[1]["type"],"image"); assert_eq!(content[2]["type"],"audio");
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        assert_eq!(STANDARD.decode(content[1]["data"].as_str().unwrap()).unwrap(),include_bytes!("../tests/fixtures/vision-colors.png"));
+        assert_eq!(STANDARD.decode(content[2]["data"].as_str().unwrap()).unwrap(),include_bytes!("../tests/fixtures/tone.wav"));
+        let resource = &content[3]["resource"];
+        assert_eq!(STANDARD.decode(resource["blob"].as_str().unwrap()).unwrap(),include_bytes!("../tests/fixtures/report.pdf"));
+        let uri = url::Url::parse(resource["uri"].as_str().unwrap()).unwrap();
+        assert_eq!(uri.scheme(),"robrix-attachment");
+        assert!(uri.query().is_none() && uri.fragment().is_none());
+        assert!(uri.path().contains("%20") && uri.path().contains("%23") && uri.path().contains("%3F"));
+        assert!(!uri.as_str().contains(' '));
     }
 
     /// The exact handshake an rmcp-based client (octos) runs:

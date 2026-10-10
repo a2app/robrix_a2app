@@ -1976,6 +1976,22 @@ mod room_context_tests {
     }
 
     #[test]
+    fn attachment_only_setup_is_grantable_without_turning_on_room_changes() {
+        let manifest = permission_manifest(&[Permission::MatrixMedia], &["matrix.media.download"]);
+        let capability = crate::capabilities::for_service("matrix.download_media").unwrap();
+        let context = PermissionContext { origin_room: Some("!origin:s"), target_room: Some("!origin:s") };
+        let mut store = PermissionStore::default();
+        assert_eq!(permission_request_status(&store, &manifest, Permission::MatrixMedia, context), Effective::NeedsPrompt);
+        assert_eq!(permission_setup_status(&store, &manifest, Permission::MatrixMedia, context), Effective::NeedsPrompt);
+        assert!(!can_enable_writes(&store, &manifest, capability, context));
+        assert!(!can_enable_permission_writes(&store, &manifest, Permission::MatrixMedia, context));
+        store.grant_scoped(&manifest.id, Permission::MatrixMedia, Some(capability.id), crate::permissions::RoomScope::room("!origin:s"),
+            crate::permissions::GrantDuration::RobrixSession, context.origin_room).unwrap();
+        assert_eq!(permission_setup_status(&store, &manifest, Permission::MatrixMedia, context), Effective::Granted);
+        assert!(!store.matrix_write());
+    }
+
+    #[test]
     fn composer_setup_never_needs_or_enables_sending() {
         for id in ["host.composer.insert", "host.composer.attach", "host.composer.reply_to"] {
             let manifest = permission_manifest(&[Permission::RobrixComposer], &[id]);
@@ -2002,9 +2018,11 @@ mod room_context_tests {
     #[test]
     fn attached_services_cannot_spoof_policy_target_with_ignored_room_argument() {
         let args = serde_json::json!({ "room_id": "!allowed:s" });
-        let context = permission_context("matrix.read_messages", &args, Some("!protected:s"));
-        assert_eq!(context.target_room, Some("!protected:s"));
-        assert_eq!(context.origin_room, Some("!protected:s"));
+        for service in ["matrix.read_messages", "matrix.event", "matrix.download_media"] {
+            let context = permission_context(service, &args, Some("!protected:s"));
+            assert_eq!(context.target_room, Some("!protected:s"));
+            assert_eq!(context.origin_room, Some("!protected:s"));
+        }
         let context = permission_context("matrix.rooms_messages", &args, Some("!origin:s"));
         assert_eq!(context.target_room, Some("!allowed:s"));
         assert_eq!(context.origin_room, Some("!origin:s"));

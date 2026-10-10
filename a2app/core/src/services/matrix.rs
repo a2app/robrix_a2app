@@ -12,6 +12,9 @@ pub enum MatrixServiceCall {
     RoomInfo,
     /// The latest `limit` text messages, oldest first (limit already 1..=30).
     ReadMessages { limit: u32 },
+    /// Read and decrypt one attachment from an event in the attached room.
+    /// The host resolves its descriptor; the app cannot select an arbitrary URI.
+    DownloadMedia { event_id: String },
     /// Send a plain text message to the attached room as the user.
     SendMessage { body: String },
     /// Upload and post inline media to the attached room as the user.
@@ -209,6 +212,17 @@ pub fn parse(service: &str, args: &serde_json::Value, has_room: bool) -> Result<
         "matrix.read_messages" => MatrixServiceCall::ReadMessages {
             limit: args["limit"].as_u64().unwrap_or(10).clamp(1, 30) as u32,
         },
+        "matrix.download_media" => {
+            let object = args.as_object().ok_or("matrix.download_media needs {event_id}")?;
+            if let Some(key) = object.keys().find(|key| key.as_str() != "event_id") {
+                return Err(format!("matrix.download_media does not accept '{key}'; attachments are read from the attached room"));
+            }
+            let event_id = id_arg(service, args, "event_id", '$')?;
+            if event_id.len() == 1 || event_id.chars().any(char::is_whitespace) || event_id.chars().any(char::is_control) {
+                return Err("matrix.download_media needs a valid {event_id}".into());
+            }
+            MatrixServiceCall::DownloadMedia { event_id }
+        },
         "matrix.room_members" => MatrixServiceCall::Members {
             limit: args["limit"].as_u64().unwrap_or(50).clamp(1, 200) as u32,
         },
@@ -378,7 +392,7 @@ pub fn cost(service: &str) -> f64 {
         // ----- room: a worker round-trip -----
         "matrix.read_messages" | "matrix.room_members" | "matrix.pinned_events"
         | "matrix.room_threads" | "matrix.search_room" | "matrix.thread_replies"
-        | "matrix.older_messages" | "matrix.event" | "matrix.read_receipts" => 5.0,
+        | "matrix.older_messages" | "matrix.event" | "matrix.read_receipts" | "matrix.download_media" => 5.0,
         // ----- rooms: fans out over every room and may hit the network -----
         "matrix.rooms_list" => 5.0,
         "matrix.search_rooms" => 8.0,
@@ -476,6 +490,27 @@ mod tests {
             parse_attached("matrix.event", serde_json::json!({"event_id": "$e"})).unwrap()
         else { panic!("expected Event") };
         assert_eq!(event_id, "$e");
+    }
+
+    #[test]
+    fn media_download_reads_one_valid_event_from_the_attached_room() {
+        let args = serde_json::json!({"event_id": " $attachment:test "});
+        let MatrixServiceCall::DownloadMedia { event_id } = parse_attached("matrix.download_media", args.clone()).unwrap()
+            else { panic!("expected an attachment read") };
+        assert_eq!(event_id, "$attachment:test");
+        assert_eq!(cost("matrix.download_media"), cost("matrix.event"));
+        assert!(matches!(parse("matrix.download_media", &args, false), Err(error) if error.contains("not attached to a room")));
+        for args in [serde_json::json!({}), serde_json::json!({"event_id": "$"}),
+            serde_json::json!({"event_id": "mxc://server/media"}), serde_json::json!({"event_id": "$two words"}),
+            serde_json::json!({"event_id": "$control\u{0}"}), serde_json::json!({"event_id": 3})]
+        {
+            assert!(parse_attached("matrix.download_media", args).is_err());
+        }
+        for key in ["room_id", "source_room", "uri", "url", "thumbnail", "filename"] {
+            let mut args = args.clone();
+            args[key] = serde_json::json!("arbitrary");
+            assert!(matches!(parse_attached("matrix.download_media", args), Err(error) if error.contains(key)));
+        }
     }
 
     #[test]

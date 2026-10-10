@@ -322,7 +322,7 @@ and scope (this room, account, device, app-local). Available today:
 | clipboard-read | `device.clipboard.read` | read · device |
 | clipboard-write | `device.clipboard.write` | write · device |
 | ipc | `ipc.send` / `ipc.post` (write), `ipc.apps.list` (read), `on_ipc_message` (Robrix→app hook) | app-local |
-| mcp-tools | `mcp.tools.register` (write), `mcp.tools.unregister` (write), `on_tool_call` (Robrix→app hook) | app-local · high risk |
+| mcp-tools | `mcp.tools.register` (write), `mcp.tools.unregister` (write), `on_tool_call` (Robrix→app hook) | app-local · tool description review |
 | open-url | `device.url.open` | write · device |
 | share | `device.share` | write · device |
 | files | `device.files.pick` (read), `device.files.save` (write) | device |
@@ -330,7 +330,7 @@ and scope (this room, account, device, app-local). Available today:
 | matrix-room-info | `matrix.room.info.read` | read · this room |
 | matrix-room-read | `matrix.room.messages.read`, `matrix.room.members.read`, `matrix.room.pins.read`, `matrix.room.threads.read`, `matrix.room.messages.search` | read · this room |
 | matrix-room-send | `matrix.room.message.send` | write · this room |
-| matrix-media | `matrix.media.upload`, `matrix.media.send` | write · homeserver / this room |
+| matrix-media | `matrix.media.download`, `matrix.media.upload`, `matrix.media.send` | read source room / upload homeserver / post this room |
 | matrix-profile | `matrix.profile.read` | read · account |
 | matrix-rooms-list | `matrix.rooms.list` | read · many rooms |
 | matrix-rooms-read | `matrix.rooms.messages.search` | read · many rooms · critical |
@@ -341,7 +341,7 @@ and scope (this room, account, device, app-local). Available today:
 | matrix-rooms-list | `on_rooms_changed`, `on_invite_received`, `on_unread_totals_changed` (Robrix→app hooks) | read · many rooms |
 | robrix-ui | `ui.pane.set_side`, `ui.pane.break_out`, `ui.pane.minimize`, `ui.pane.restore` | act · this pane |
 | robrix-preferences | `host.prefs.read`, `on_prefs_changed` (Robrix→app hook) | read · account |
-| robrix-observe | `on_active_room_changed`, `on_navigation_changed` (Robrix→app hooks) | read · many rooms · high risk |
+| robrix-observe | `on_active_room_changed`, `on_navigation_changed` (Robrix→app hooks) | read · many rooms |
 | device-info | `device.info.read` | read · device |
 
 Ungated plumbing every app has: `host.env.read` (`"env"`),
@@ -741,6 +741,14 @@ burning a permission.
   — sends a plain text message to the attached room as the user. Use this only
   for an explicit Send/Post action. A Draft action uses `composer.insert`
   with its separate composer permission; a draft grant does not authorize sending.
+- `"matrix.download_media"` (needs `matrix.media.download` in `matrix-media`):
+  `{event_id}` -> `{data_base64, filename, mime_type, size, ...}`. Downloads the
+  actual attachment from an original event in this app's attached room,
+  including authenticated encrypted media. No `room_id`, `source_room`, URL
+  or URI fields are accepted. Download permission follows room read protection
+  and grants no upload/send/Internet access. Use exact returned bytes for a
+  separate visible Attach draft or Send action with its own grant. A returned
+  caption or filename alone is not the attachment's contents.
 - `"matrix.send_media"` (needs both `matrix.media.upload` and `matrix.media.send`
   in `matrix-media`): `{data_base64, filename, mime_type, caption?}` ->
   `{room_id, event_id, media}`. Uploads and posts a native image, audio, video
