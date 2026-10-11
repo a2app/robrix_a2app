@@ -257,9 +257,7 @@ script_mod! {
             width: Fill, height: Fit
             font_size: 10.
             font_color: #3
-            body: "<p>An AI room is an ordinary room backed by a Robrix AI agent session: \
-                messages you (or anyone you invite) send drive the agent, and its replies \
-                are posted back into the room.</p>"
+            body: "<p>An AI room is a regular room with a Robrix AI agent session: you send messages to drive the agent, and it posts replies back into the room.</p>"
         }
 
         ai_room_view := View {
@@ -271,14 +269,11 @@ script_mod! {
             flow: Right
 
             ai_room_name_input := RobrixTextInput {
-                align: Align{y: 0.5}
                 margin: Inset{top: 0, left: 5, right: 5, bottom: 0},
-                padding: Inset{left: 12, right: 12, top: 11, bottom: 0}
+                padding: Inset{left: 12, right: 12, top: 0, bottom: 0}
                 width: Fill { max: 400 }
                 height: 40
                 empty_text: "Name this AI room..."
-                autocapitalize: None,
-                autocorrect: Disabled,
             }
 
             create_ai_room_button := RobrixIconButton {

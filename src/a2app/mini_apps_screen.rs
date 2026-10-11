@@ -625,23 +625,23 @@ script_mod! {
                     width: Fill, height: Fit, flow: Flow.Right{wrap: true}, spacing: 8
                     protection_button := RobrixNeutralIconButton {
                         padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                        text: "Room and space access…"
+                        text: "Room and space access"
                     }
                     agent_permissions_button := RobrixNeutralIconButton {
                         padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                        text: "AI room permissions…"
+                        text: "AI room permissions"
                     }
                     sharing_button := RobrixNeutralIconButton {
                         padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                        text: "Agent permissions…"
+                        text: "Agent permissions"
                     }
                     inspect_protection_button := RobrixNeutralIconButton {
                         padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                        text: "Check access…"
+                        text: "Check access"
                     }
                     reset_all_permissions_button := RobrixNegativeIconButton {
                         padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                        text: "Reset all permissions…"
+                        text: "Reset all permissions"
                     }
                 }
             }
@@ -857,7 +857,7 @@ script_mod! {
                 mini_app_row := mod.widgets.MiniAppRow { }
             }
 
-            SubsectionLabel { text: "Import" }
+            SubsectionLabel { text: "Import Mini-App" }
             View {
                 width: Fill, height: Fit
                 // no wrap: a wrapping Right flow can't lay out the Fill-width input
@@ -866,13 +866,17 @@ script_mod! {
                 align: Align{y: 0.5}
 
                 import_input := RobrixTextInput {
-                    width: Fill { max: 500 }, height: Fit
-                    empty_text: "Paste a .splashapp bundle or bare Splash source here…"
+                    margin: Inset{top: 0, left: 5, right: 5, bottom: 0},
+                    padding: Inset{left: 12, right: 12, top: 0, bottom: 0}
+                    width: Fill { max: 450 }
+                    height: 40
+                    empty_text: "Paste Splash source or a .splashapp bundle here…"
                 }
                 import_button := RobrixIconButton {
-                    padding: 8,
-                    draw_icon +: { svg: (ICON_IMPORT) }
-                    icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+                    padding: Inset{top: 10, bottom: 10, left: 12, right: 14}
+                    height: 40
+                    draw_icon.svg: (ICON_IMPORT)
+                    icon_walk: Walk{width: 16, height: 16}
                     text: "Install"
                 }
             }
