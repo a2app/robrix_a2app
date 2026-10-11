@@ -3,6 +3,18 @@
 [![Robrix Matrix Chat](https://img.shields.io/matrix/robius-robrix%3Amatrix.org?server_fqdn=matrix.org&style=flat&logo=matrix&label=Robrix%20Matrix%20Chat&color=B7410E)](https://matrix.to/#/#robius-robrix:matrix.org)
 [![Project Robius Matrix Chat](https://img.shields.io/matrix/robius-general%3Amatrix.org?server_fqdn=matrix.org&style=flat&logo=matrix&label=Project%20Robius%20Matrix%20Chat&color=B7410E)](https://matrix.to/#/#robius:matrix.org)
 
+## ✨ AI agents and mini-apps with images and files
+
+> [!IMPORTANT]
+> **[Build, run, and test a2app →](a2app/README.md#build-run-and-test-agents-with-images-and-files)**
+>
+> Run AI agents in Matrix rooms and create sandboxed mini-apps inside Robrix.
+> Agents can inspect supported attachments, find and generate images, and draft
+> files for review before sending. Drafting and posting have separate permissions.
+>
+> **These features require an `a2app`-enabled build.** The guide includes copyable
+> build commands, provider setup, image/file fixtures, and live agent tests.
+
 > [!TIP]
 > ▶️  [Click here to download & install Robrix](https://github.com/project-robius/robrix/releases/latest) on macOS, iOS, Android, Linux, and Windows.
 

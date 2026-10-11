@@ -10,6 +10,139 @@ Everything is gated behind the `a2app` cargo feature:
 cargo run --features a2app
 ```
 
+## Build, run, and test agents with images and files
+
+This walkthrough is for macOS and supported Linux desktops. Install the
+[desktop build dependencies](../README.md#building--running-robrix-on-desktop)
+first; Octos builds require Rust 1.88 or newer. Run the commands below from the
+repository root.
+
+### Build and launch the embedded agent
+
+Quit any running Robrix instance, then run:
+
+```sh
+env -u ROBRIX_AGENT_CMD cargo run -p robrix --release --locked --features a2app-embedded-agent
+```
+
+`cargo run` builds and launches Robrix. To build without launching it:
+
+```sh
+cargo build -p robrix --release --locked --features a2app-embedded-agent
+```
+
+The embedded feature includes `a2app` and links Octos into Robrix; no separate
+Octos executable or backend selection is needed. It uses the same host-owned
+media tools and permission checks as the confined worker, but runs in Robrix's
+process rather than a separate OS process compartment. The `env -u` above
+removes an explicit worker override for this launch.
+
+For the separate confined-worker setup, install the pinned Octos revision in
+[Agent setup (once)](#agent-setup-once), then build and run with:
+
+```sh
+cargo run -p robrix --release --locked --features a2app
+```
+
+### Configure providers and open an AI room
+
+1. Open **Mini Apps → Setup AI Providers**. Select an already configured provider,
+   or use its **+** button to add a key and choose **Save**.
+2. **Claude Code (your subscription)** works for the PNG image-inspection test.
+   Its setup uses **Check sign-in → Use Claude Code**, with no API key. Select
+   **Google Gemini** to test native HEIC, audio, and video understanding with a
+   compatible model.
+3. **Image generation needs an OpenAI or Google Gemini API key** with image-model
+   access. Add that provider's key even if you keep Claude selected for chat.
+   Generating an image uses the separately configured image service.
+4. Sign in to Matrix and open an existing AI room, or choose **Add Room →
+   Or start a new AI room**. Launching the rebuilt app loads the new media tools;
+   a new Matrix room is not required.
+5. After changing providers, restart an existing room agent: enter `/ai` and
+   toggle **Allow this room's AI to run** off and on. Durable permissions remain,
+   but session drafts, active work, and one-time grants are cleared.
+
+Use **Setup AI Providers** to select the chat provider. Models use provider
+defaults or existing overrides in the Octos configuration and saved agent
+preferences.
+
+### Test real images and files in the room
+
+Upload the linked fixtures as ordinary room attachments, then send the text
+request. Image and PDF interpretation require a compatible model; all file types
+can still be downloaded, drafted, attached, and posted within the host's size
+limits.
+
+| Test | What to upload or ask | Expected result |
+|---|---|---|
+| Image inspection | Upload [vision-colors.png](agent/tests/fixtures/vision-colors.png), then ask: “Use inspect_media to identify the four quadrant colors in reading order.” | Red, green, blue, yellow, based on actual pixels rather than the filename or dimensions. |
+| PDF inspection | Upload [report.pdf](agent/tests/fixtures/report.pdf), then ask: “Read this PDF. What number does the report contain?” | **42**. |
+| File drafting | “Create test.csv containing two sample rows and attach it to my composer for review.” | An attachment preview; no file posted. |
+| Photo search | “Find a real HZMB Golden Bus photo on Wikimedia Commons and attach it to my composer.” | A downloaded photo with its source. |
+| Image generation | “Generate a red circle beside a blue square, then attach it to my composer.” | A generated image preview using the configured image provider. |
+
+The [fixture directory](agent/tests/fixtures/) also contains a HEIC image, WAV
+audio, and MP4 video for testing the corresponding native input types. See its
+[README](agent/tests/fixtures/README.md) for the synthetic content and expected
+formats.
+
+Approve the requested attachment-read and sharing permissions for the selected
+AI service. Matrix attachment reads use Matrix permissions, independently of
+internet access. Web searches and URL downloads use ordinary internet
+permissions. If a request is blocked by a saved rule, **Agent permissions →
+Needs attention** lets you review that exact request; permission management is
+not a mandatory setup step for ordinary prompts.
+
+To verify that drafting and sending are independent, leave **Allow apps to send
+or change rooms** off while testing text or attachment drafts. Composer staging
+should still work after its own approval, without uploading or posting. Then
+enable room changes and ask the agent to post a prepared attachment into the
+room. Uploading and sending need their separate approvals. The result should be
+a native Matrix attachment in the timeline, including in encrypted rooms.
+
+### Run automated and live checks
+
+The full automated suite uses local fixtures and skips live-service tests:
+
+```sh
+cargo test --workspace --all-features --locked -- --test-threads=1
+```
+
+After configuring the chat provider, test actual pixels through the embedded
+agent's tool loop and native model transport:
+
+```sh
+cargo test -p a2app-agent --all-features --locked --lib \
+  live_configured_model_sees_synthetic_image_pixels \
+  -- --ignored --nocapture --test-threads=1
+```
+
+The test must identify red, green, blue, and yellow in quadrant order. A response
+that only describes attachment metadata does not pass.
+
+After adding an image-generation API key, test an actual image-service request:
+
+```sh
+cargo test -p a2app-agent --all-features --locked --lib \
+  live_generation_produces_an_actual_image_file \
+  -- --ignored --nocapture --test-threads=1
+```
+
+This verifies that the provider returns image bytes and prints the MIME type,
+byte count, and saved artifact path. Both live model tests contact the configured
+services and use their quota.
+
+To verify public media search and download independently of a model:
+
+```sh
+cargo test -p robrix --all-features --locked --lib \
+  live_bus_search_returns_a_downloadable_photo \
+  -- --ignored --nocapture --test-threads=1
+```
+
+This contacts Wikimedia Commons and verifies that a returned bus photograph can
+be downloaded and prepared as media. It does not post anything into Matrix.
+
 ## What you get
 
 - A **Mini Apps** button in the navigation bar (sparkle icon; can be hidden in
@@ -206,10 +339,10 @@ needs no CLI installation. Use the embedded feature on iOS and platforms
 without a supported process sandbox. Embedded mode uses the same guarded
 model/tool transport but has no separate OS process compartment.
 
-Configure an OpenAI-compatible or
-Anthropic provider through **AI Providers**, an existing Octos configuration,
+Configure an OpenAI-compatible, Anthropic, or native Gemini provider through
+**Mini Apps → Setup AI Providers**, an existing Octos configuration,
 or that provider's supported environment/auth-store credentials. Supported
-provider IDs are `openai`, `anthropic`, `deepseek`, `moonshot`,
+provider IDs are `openai`, `anthropic`, `gemini`, `deepseek`, `moonshot`,
 `moonshot-coding`, `groq`, `openrouter`, `ollama`, and `custom`; other backends
 are refused. A local Ollama endpoint can use an already installed model
 without an API key.
@@ -239,16 +372,19 @@ Linux `keychain:` references use Octos's existing `~/.octos/secrets` store,
 including credentials scoped to a profile. Credentials remain in Robrix's
 host process and are never supplied to the confined worker.
 
-Run with `cargo run --features a2app` (or `a2app-embedded-agent`), then use **Agent permissions** to allow the configured model recipient for the sources the
-agent or generator needs. A local endpoint also needs explicit source consent;
+Run with `cargo run --features a2app` (or `a2app-embedded-agent`). Ordinary
+requests prompt for the model sharing and action permissions they need;
+**Agent permissions** provides optional management of those rules and blocked
+requests. A local endpoint also needs explicit source consent;
 Robrix cannot guarantee that the service itself will not forward data.
 
 `ROBRIX_AGENT_CMD` can select a local compatible Octos executable (optionally
 followed by `acp`); Robrix still applies confinement and requires host-broker
 negotiation before sending a prompt. Shell commands, SSH workers and ordinary
 ACP adapters cannot provide this protected mode. Unset the override to use the
-embedded backend when compiled in. Select the model in AI Providers or the
-Octos configuration; the child receives no credentials or provider endpoint.
+embedded backend when compiled in. Select the provider in **Setup AI Providers**;
+explicit model overrides use the Octos configuration or saved agent preferences.
+The child receives no credentials or provider endpoint.
 The standalone ACP client remains available for legacy integrations and tests.
 
 Install a trusted worker in a location where untrusted code cannot replace
@@ -807,10 +943,12 @@ and a private credential fingerprint, so an allowance cannot silently move
 to a different service or account. A loopback endpoint still needs consent:
 the service may itself forward the data elsewhere.
 
-The initial guarded model transport supports text/tool requests to
-OpenAI-compatible and Anthropic APIs. It currently delivers the completed
-response rather than streaming tokens and refuses media inputs. Protected
-app generation runs without tools; it cannot use external research, shell or
+The guarded model transport supports text, tools, and authorized native media
+inputs through OpenAI-compatible, Anthropic, and Gemini APIs, plus the Claude
+Code subscription adapter. Attachment support depends on the configured model
+and transport; see [the media tool contracts](#tools-the-agent-can-call). It
+delivers the completed response rather than streaming tokens. Protected app
+generation runs without tools; it cannot use external research, shell or
 filesystem tools during generation.
 
 The stateless HTTP service checks source rules before DNS, immediately before
