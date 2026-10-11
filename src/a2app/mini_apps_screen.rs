@@ -379,10 +379,18 @@ script_mod! {
         }
     }
 
-    // The word at the start of a manage-card row, centered on its buttons.
+    // Fixed control slots keep the three manage-card rows on the same grid.
+    mod.widgets.MiniAppManageButton = RobrixNeutralIconButton {
+        width: 88, height: 32, margin: 0, padding: 8
+        icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
+    }
+    mod.widgets.MiniAppManageNegativeButton = RobrixNegativeIconButton {
+        width: 88, height: 32, margin: 0, padding: 8
+        icon_walk: Walk{width: 0, height: 0, margin: 0}
+    }
+    // Keep headings beside the first control row when the actions wrap.
     mod.widgets.MiniAppGroupLabel = Label {
-        width: 56, height: 30
-        padding: Inset{top: 8, bottom: 0, left: 0, right: 0}, margin: 0
+        width: Fill, height: Fit, padding: 0, margin: 0
         draw_text +: {
             text_style: theme.font_bold {font_size: 10},
             color: (MESSAGE_TEXT_COLOR)
@@ -1055,28 +1063,26 @@ script_mod! {
                     width: Fill, height: Fit
                     flow: Right
                     spacing: 8
-                    mod.widgets.MiniAppGroupLabel { text: "Source" }
+                    source_group_slot := View {
+                        width: 56, height: 32
+                        align: Align{y: 0.5}
+                        source_group_label := mod.widgets.MiniAppGroupLabel { text: "Source" }
+                    }
                     View {
                         width: Fill, height: Fit
-                        flow: Flow.Right{wrap: true}
-                        spacing: 8
-                        align: Align{y: 0.5}
-                        info_source_button := RobrixNeutralIconButton {
-                            padding: 8,
+                        flow: Flow.Right{wrap: true, row_align: RowAlign.Center}
+                        spacing: 8, wrap_spacing: 8
+                        info_source_button := mod.widgets.MiniAppManageButton {
                             draw_icon +: { svg: (ICON_VIEW_SOURCE) }
-                            icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
                             text: "View"
                         }
-                        info_edit_button := RobrixNeutralIconButton {
-                            padding: 8,
+                        info_edit_button := mod.widgets.MiniAppManageButton {
                             draw_icon +: { svg: (ICON_EDIT) }
-                            icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
                             text: "Edit"
                         }
-                        info_modify_button := RobrixNeutralIconButton {
-                            padding: 8,
+                        info_modify_button := mod.widgets.MiniAppManageButton {
+                            width: 144
                             draw_icon +: { svg: (ICON_SPARKLE) }
-                            icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
                             text: "Modify with AI"
                         }
                     }
@@ -1085,28 +1091,26 @@ script_mod! {
                     width: Fill, height: Fit
                     flow: Right
                     spacing: 8
-                    mod.widgets.MiniAppGroupLabel { text: "Share" }
+                    share_group_slot := View {
+                        width: 56, height: 32
+                        align: Align{y: 0.5}
+                        share_group_label := mod.widgets.MiniAppGroupLabel { text: "Share" }
+                    }
                     View {
                         width: Fill, height: Fit
-                        flow: Flow.Right{wrap: true}
-                        spacing: 8
-                        align: Align{y: 0.5}
-                        info_export_button := RobrixNeutralIconButton {
-                            padding: 8,
+                        flow: Flow.Right{wrap: true, row_align: RowAlign.Center}
+                        spacing: 8, wrap_spacing: 8
+                        info_export_button := mod.widgets.MiniAppManageButton {
                             draw_icon +: { svg: (ICON_COPY) }
-                            icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
                             text: "Export"
                         }
-                        info_share_button := RobrixNeutralIconButton {
-                            padding: 8,
+                        info_share_button := mod.widgets.MiniAppManageButton {
                             draw_icon +: { svg: (ICON_SHARE) }
-                            icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
                             text: "Share…"
                         }
-                        info_send_button := RobrixNeutralIconButton {
-                            padding: 8,
+                        info_send_button := mod.widgets.MiniAppManageButton {
+                            width: 144
                             draw_icon +: { svg: (ICON_SEND) }
-                            icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
                             text: "Send to room…"
                         }
                     }
@@ -1115,28 +1119,32 @@ script_mod! {
                     width: Fill, height: Fit
                     flow: Right
                     spacing: 8
-                    mod.widgets.MiniAppGroupLabel { text: "Storage" }
+                    storage_group_slot := View {
+                        width: 56, height: 32
+                        align: Align{y: 0.5}
+                        storage_group_label := mod.widgets.MiniAppGroupLabel { text: "Storage" }
+                    }
                     View {
                         width: Fill, height: Fit
-                        flow: Flow.Right{wrap: true}
-                        spacing: 8
-                        align: Align{y: 0.5}
-                        info_storage_label := Label {
-                            width: Fit, height: 30
-                            padding: Inset{top: 8, bottom: 0, left: 0, right: 0}, margin: Inset{right: 4}
-                            draw_text +: {
-                                text_style: REGULAR_TEXT {font_size: 10},
-                                color: (MESSAGE_TEXT_COLOR)
+                        flow: Flow.Right{wrap: true, row_align: RowAlign.Center}
+                        spacing: 8, wrap_spacing: 8
+                        storage_value_slot := View {
+                            width: 88, height: 32
+                            align: Align{x: 0.0, y: 0.5}
+                            info_storage_label := Label {
+                                width: Fill, height: Fit, padding: 0, margin: 0
+                                max_lines: 1, text_overflow: TextOverflow.Ellipsis
+                                draw_text +: {
+                                    text_style: REGULAR_TEXT {font_size: 10},
+                                    color: (MESSAGE_TEXT_COLOR)
+                                }
                             }
                         }
-                        info_clear_data_button := RobrixNegativeIconButton {
-                            padding: 8,
-                            icon_walk: Walk{width: 0, height: 0, margin: 0}
+                        info_clear_data_button := mod.widgets.MiniAppManageNegativeButton {
                             text: "Clear Data"
                         }
-                        info_reset_button := RobrixNegativeIconButton {
-                            visible: false,
-                            padding: 8,
+                        info_reset_button := mod.widgets.MiniAppManageNegativeButton {
+                            visible: false, width: 144
                             draw_icon +: { svg: (ICON_ROTATE_CW) }
                             icon_walk: Walk{width: 14, height: 14, margin: Inset{right: 2}}
                             text: "Reset to stock"
