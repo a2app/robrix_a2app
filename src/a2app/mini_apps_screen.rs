@@ -422,25 +422,17 @@ script_mod! {
 
     mod.widgets.MiniAppProviderMediaNote = RoundedView {
         width: Fill, height: Fit
+        visible: false
         flow: Down
-        spacing: 8
         padding: 12
         show_bg: true
         draw_bg +: { color: (COLOR_BG_PREVIEW), border_radius: 8.0 }
 
-        SubsectionLabel { width: Fill, margin: 0, text: "Images and files" }
         Label {
             width: Fill, height: Fit
             flow: Flow.Right{wrap: true}
             padding: 0
-            text: "Claude can find existing photos online or in your rooms, view supported images and files, and use Robrix tools to draft, attach, upload or post media with your permission. Existing media does not need an image-generation key."
-            draw_text +: { text_style: REGULAR_TEXT {font_size: 10}, color: (MESSAGE_TEXT_COLOR) }
-        }
-        Label {
-            width: Fill, height: Fit
-            flow: Flow.Right{wrap: true}
-            padding: 0
-            text: "Claude does not generate photos or illustrations itself. Image generation needs an OpenAI or Google Gemini API key with image-model access. You can keep Claude selected for chat."
+            text: "FYI:  most Anthropic/Claude models cannot generate images from prompts."
             draw_text +: { text_style: REGULAR_TEXT {font_size: 10}, color: (MESSAGE_TEXT_COLOR) }
         }
     }
@@ -3199,6 +3191,9 @@ impl MiniAppsScreen {
                 self.view.widget(cx, ids!(info_reset_button)).set_visible(cx, self.reset_available);
             }
             Pane::Providers => {
+                let provider = a2app_agent::providers::in_use_id();
+                self.view.widget(cx, ids!(providers_media_note)).set_visible(cx,
+                    provider.as_deref().is_some_and(|id| id == "anthropic" || id == a2app_agent::claude_code::ID));
                 let blocker = a2app_agent::blocker();
                 self.view.widget(cx, ids!(providers_blocker)).set_visible(cx, blocker.is_some());
                 if let Some(blocker) = blocker {
