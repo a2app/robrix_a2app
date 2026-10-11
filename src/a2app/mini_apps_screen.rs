@@ -420,6 +420,31 @@ script_mod! {
         text_style_normal: MESSAGE_TEXT_STYLE { font_size: 10 }
     }
 
+    mod.widgets.MiniAppProviderMediaNote = RoundedView {
+        width: Fill, height: Fit
+        flow: Down
+        spacing: 8
+        padding: 12
+        show_bg: true
+        draw_bg +: { color: (COLOR_BG_PREVIEW), border_radius: 8.0 }
+
+        SubsectionLabel { width: Fill, margin: 0, text: "Images and files" }
+        Label {
+            width: Fill, height: Fit
+            flow: Flow.Right{wrap: true}
+            padding: 0
+            text: "Claude can find existing photos online or in your rooms, view supported images and files, and use Robrix tools to draft, attach, upload or post media with your permission. Existing media does not need an image-generation key."
+            draw_text +: { text_style: REGULAR_TEXT {font_size: 10}, color: (MESSAGE_TEXT_COLOR) }
+        }
+        Label {
+            width: Fill, height: Fit
+            flow: Flow.Right{wrap: true}
+            padding: 0
+            text: "Claude does not generate photos or illustrations itself. Image generation needs an OpenAI or Google Gemini API key with image-model access. You can keep Claude selected for chat."
+            draw_text +: { text_style: REGULAR_TEXT {font_size: 10}, color: (MESSAGE_TEXT_COLOR) }
+        }
+    }
+
     // One AI provider in the providers pane.
     mod.widgets.MiniAppProviderRow = set_type_default() do #(MiniAppProviderRow::register_widget(vm)) {
         ..mod.widgets.RoundedView
@@ -532,7 +557,7 @@ script_mod! {
                 on: AnimatorState {
                     redraw: true
                     from: {all: Snap}
-                    apply: { draw_bg: {color: (COLOR_LIST_ROW_HOVER)} }
+                    apply: { draw_bg: {color: (COLOR_LIST_ITEM_BG_HOVER)} }
                 }
             }
         }
@@ -1358,6 +1383,8 @@ script_mod! {
                     color: (COLOR_FG_DANGER_RED)
                 }
             }
+
+            providers_media_note := mod.widgets.MiniAppProviderMediaNote {}
 
             key_entry_section := View {
                 visible: false,

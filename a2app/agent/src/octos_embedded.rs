@@ -27,6 +27,9 @@ use crate::mcp::McpServerConfig as RobrixMcpServerConfig;
 use crate::prefs::AgentPrefs;
 use crate::AgentTransport;
 
+#[cfg(test)]
+mod media_workflow_tests;
+
 /// Keep both generation and room turns bounded independently of Octos's
 /// ordinary interactive runtime, whose default is unlimited.
 const MAX_ITERATIONS: u32 = 12;
@@ -388,7 +391,11 @@ async fn build_protected_agent(
         .with_config(config).with_shutdown(flag).with_system_prompt(prompt.into());
     let agent = Arc::new(agent);
     #[cfg(feature = "persistent-guide")]
-    agent.append_system_prompt(crate::SPLASH_GUIDE);
+    if !room_agent {
+        // This guide instructs mini-app authoring, which conflicts with the
+        // room assistant's role and host-mediated conversation tools.
+        agent.append_system_prompt(crate::SPLASH_GUIDE);
+    }
     Ok((agent, tools))
 }
 

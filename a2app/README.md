@@ -48,8 +48,10 @@ cargo run -p robrix --release --locked --features a2app
 
 1. Open **Mini Apps → Setup AI Providers**. Select an already configured provider,
    or use its **+** button to add a key and choose **Save**.
-2. **Claude Code (your subscription)** works for the PNG image-inspection test.
-   Its setup uses **Check sign-in → Use Claude Code**, with no API key. Select
+2. **Claude Code (your subscription)** can find, draft and post existing photos,
+   and works for the PNG image-inspection test. These existing-media actions do
+   not need an image-generation API key. Its setup uses **Check sign-in → Use
+   Claude Code**, with no API key. Select
    **Google Gemini** to test native HEIC, audio, and video understanding with a
    compatible model.
 3. **Image generation needs an OpenAI or Google Gemini API key** with image-model
@@ -73,12 +75,18 @@ request. Image and PDF interpretation require a compatible model; all file types
 can still be downloaded, drafted, attached, and posted within the host's size
 limits.
 
+For Claude and Claude Code, Robrix makes a smaller inspection copy of large JPEG
+or PNG images to fit the model's image-input limits. The prepared draft and
+Matrix upload keep the original file bytes, filename and metadata. Smaller
+images reach the model unchanged.
+
 | Test | What to upload or ask | Expected result |
 |---|---|---|
 | Image inspection | Upload [vision-colors.png](agent/tests/fixtures/vision-colors.png), then ask: “Use inspect_media to identify the four quadrant colors in reading order.” | Red, green, blue, yellow, based on actual pixels rather than the filename or dimensions. |
 | PDF inspection | Upload [report.pdf](agent/tests/fixtures/report.pdf), then ask: “Read this PDF. What number does the report contain?” | **42**. |
 | File drafting | “Create test.csv containing two sample rows and attach it to my composer for review.” | An attachment preview; no file posted. |
 | Photo search | “Find a real HZMB Golden Bus photo on Wikimedia Commons and attach it to my composer.” | A downloaded photo with its source. |
+| Reuse a room photo | “Attach the photo I sent earlier in this room to my composer for review.” | The original attachment's bytes in the composer; nothing uploaded or posted until you send it. |
 | Image generation | “Generate a red circle beside a blue square, then attach it to my composer.” | A generated image preview using the configured image provider. |
 
 The [fixture directory](agent/tests/fixtures/) also contains a HEIC image, WAV
@@ -119,6 +127,24 @@ cargo test -p a2app-agent --all-features --locked --lib \
 
 The test must identify red, green, blue, and yellow in quadrant order. A response
 that only describes attachment metadata does not pass.
+
+After configuring Claude Code, verify that Claude independently finds an online
+photo or an earlier room image, inspects its pixels, stages it without sending,
+and posts the same bytes only after a second explicit request:
+
+```sh
+cargo test -p a2app-agent --all-features --locked --lib \
+  live_claude_finds_inspects_stages_then_ \
+  -- --ignored --nocapture --test-threads=1
+```
+
+These tests call Claude Code; the online-photo tests also search and download
+from Wikimedia Commons, including a full-resolution photo that needs a smaller
+inspection copy. Composer and send effects use isolated host fixtures, so these
+tests do not post into your Matrix account. The automated Robrix
+SDK tests separately verify actual encrypted room-image download and repost
+with identical bytes. Finding and providing existing photos does not need an
+OpenAI or Gemini image-generation key.
 
 After adding an image-generation API key, test an actual image-service request:
 

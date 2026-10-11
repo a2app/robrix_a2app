@@ -5,6 +5,9 @@ use octos_core::{Message, MessageRole};
 use serde_json::{Value, json};
 use crate::tool_output::{ModelAttachment, ToolOutputStore, MAX_ATTACHMENT_BYTES};
 
+#[path = "inspection_image.rs"]
+mod inspection_image;
+
 pub(super) struct Turn { pub message: Message, pub attachments: Vec<ModelAttachment> }
 
 pub(super) fn prepare(messages: &[Message], store: &ToolOutputStore, context: Option<&ContextId>) -> Result<Vec<Turn>, String> {
@@ -65,6 +68,20 @@ pub(super) fn parts(attachments: &[ModelAttachment], format: Format, provider: &
                 parts.push(json!({"inlineData":{"mimeType":mime,"data":attachment.base64()}}));
             }
             Format::Anthropic if image || pdf => {
+                if matches!(mime, "image/jpeg" | "image/png") {
+                    match inspection_image::prepare(attachment.bytes(), mime) {
+                        Ok(input) => {
+                            parts.push(text(format!("Attachment: {name} ({mime})")));
+                            if let Some((width, height)) = input.resized {
+                                parts.push(text(format!("Inspection image: {width}×{height}. The original attachment remains available for drafting and posting.")));
+                            }
+                            use base64::{Engine, engine::general_purpose::STANDARD};
+                            parts.push(json!({"type":"image", "source":{"type":"base64","media_type":mime,"data":STANDARD.encode(input.bytes)}}));
+                        }
+                        Err(error) => parts.push(text(format!("Attachment capability error: {provider} could not inspect {name} ({mime}): {error}. The original file remains available for attaching or posting; its contents were not analyzed."))),
+                    }
+                    continue;
+                }
                 parts.push(text(format!("Attachment: {name} ({mime})")));
                 parts.push(json!({"type":if image {"image"} else {"document"}, "source":{"type":"base64","media_type":mime,"data":attachment.base64()}}));
             }

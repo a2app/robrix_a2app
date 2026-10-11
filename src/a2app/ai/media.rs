@@ -1071,6 +1071,122 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn encrypted_prior_room_images_download_prepare_and_repost_without_byte_changes() {
+        use std::io::Read;
+        use a2app_core::information_flow::{self as flow, Recipient, SensitiveAction};
+        let _review_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
+        let server = MockHomeserver::new();
+        server.encrypted.store(true, std::sync::atomic::Ordering::Release);
+        let client = server.client().await;
+        let fixture = MockPermissionContext::new(&server.url);
+        let room_id = OwnedRoomId::try_from("!media:test").unwrap();
+        let room = client.get_room(&room_id).unwrap();
+        assert!(room.encryption_state().is_encrypted());
+        let samples: &[(&str, &str, &[u8])] = &[
+            ("original.png", "image/png", include_bytes!("../../../a2app/agent/tests/fixtures/vision-colors.png")),
+            ("original.jpg", "image/jpeg", include_bytes!("../../../a2app/agent/tests/fixtures/vision-colors.jpg")),
+        ];
+        for (index, (filename, mime_type, original)) in samples.iter().enumerate() {
+            let source_id = format!("prior-image-{index}");
+            let source_uri = format!("mxc://media.test/{source_id}");
+            let caption = format!("Original room photograph {index}");
+            let mut reader = std::io::Cursor::new(*original);
+            let mut encryptor = matrix_sdk_base::crypto::AttachmentEncryptor::new(&mut reader);
+            let mut original_ciphertext = Vec::new();
+            encryptor.read_to_end(&mut original_ciphertext).unwrap();
+            assert_ne!(original_ciphertext, *original);
+            let mut file = serde_json::to_value(encryptor.finish()).unwrap();
+            file["url"] = source_uri.clone().into();
+            server.media.lock().unwrap().insert(source_id.clone(), original_ciphertext);
+            let source_content: RoomMessageEventContent = serde_json::from_value(serde_json::json!({
+                "msgtype":"m.image", "body":caption, "filename":filename, "file":file,
+                "info":{"mimetype":mime_type,"size":original.len(),"w":256,"h":256},
+            })).unwrap();
+
+            // Build the prior-room fixture with the real SDK too: both its
+            // room event and attachment are encrypted, just like an upload
+            // that the agent encounters later in the room history.
+            let before_source = server.requests.lock().unwrap().len();
+            tokio::time::timeout(std::time::Duration::from_secs(15),
+                room.send(source_content).with_request_config(RequestConfig::new().retry_limit(0)))
+                .await.expect("the encrypted source event must be created").unwrap();
+            let source_event_content = {
+                let captured = server.requests.lock().unwrap();
+                let sent = captured[before_source..].iter().find(|(header, _)| header.starts_with("PUT ") && header.contains("/send/m.room.encrypted/")).unwrap();
+                serde_json::from_slice::<serde_json::Value>(&sent.1).unwrap()
+            };
+            server.events.lock().unwrap().insert(source_id.clone(), serde_json::json!({
+                "type":"m.room.encrypted", "room_id":room_id, "event_id":format!("${source_id}"),
+                "sender":"@media:test", "origin_server_ts":1, "content":source_event_content,
+            }));
+            let downloaded = download_event_attachment_with_client(&room_id, &format!("${source_id}"),
+                fixture.auth("matrix.media.download"), client.clone()).await.unwrap();
+            assert_eq!(downloaded.bytes, *original, "reading an existing encrypted image must return its original pixels");
+            assert_eq!(downloaded.filename, *filename);
+            assert_eq!(downloaded.mime_type, *mime_type);
+            assert_eq!(downloaded.caption.as_deref(), Some(caption.as_str()));
+            let media = Arc::new(downloaded.prepare().unwrap());
+            let original_digest = format!("{:x}", Sha256::digest(original));
+            assert_eq!(media.metadata(), serde_json::json!({
+                "filename":filename,"mime_type":mime_type,"caption":caption,
+                "size":original.len(),"sha256":original_digest,
+            }));
+            let payload = media.post_payload(&room_id);
+            let upload = fixture.auth("matrix.media.upload").with_payload(payload.clone());
+            let draft = fixture.auth("host.composer.attach").with_payload(payload.clone());
+            let before = server.requests.lock().unwrap().len();
+            assert!(media.post_with_client(&room_id, &[draft, upload.clone()], client.clone()).await.is_err());
+            assert_eq!(server.requests.lock().unwrap().len(), before, "draft permission must not upload or send the existing image");
+
+            let send = fixture.auth("matrix.media.send").with_payload(payload.clone());
+            let recipient = Recipient::MatrixRoom { account: fixture.context.account().into(), room: room_id.to_string() };
+            let action = SensitiveAction { kind: "matrix.media.send".into(), target: room_id.to_string() };
+            let review = flow::prepare_effect_for_activation(&fixture.context, send.flow_epoch.unwrap(), Some(&recipient), Some(&action), &payload).unwrap();
+            flow::approve_effect_once(&review).unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(15),
+                media.post_with_client(&room_id, &[send, upload], client.clone()))
+                .await.expect("reposting the existing image must finish").unwrap();
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&result).unwrap()["event_id"], "$posted");
+            let (upload_bytes, sent_content) = {
+                let captured = server.requests.lock().unwrap();
+                let calls = &captured[before..];
+                let uploaded = calls.iter().find(|(header, _)| header.starts_with("POST ") && header.contains("/media/") && header.contains("/upload")).unwrap();
+                let sent = calls.iter().find(|(header, _)| header.starts_with("PUT ") && header.contains("/send/m.room.encrypted/")).unwrap();
+                assert!(uploaded.0.to_ascii_lowercase().contains("authorization: bearer mock-media-token"));
+                assert!(sent.0.to_ascii_lowercase().contains("authorization: bearer mock-media-token"));
+                (uploaded.1.clone(), serde_json::from_slice::<serde_json::Value>(&sent.1).unwrap())
+            };
+            assert_ne!(upload_bytes, *original, "reposting to an encrypted room must upload ciphertext");
+            server.events.lock().unwrap().insert("posted".into(), serde_json::json!({
+                "type":"m.room.encrypted","room_id":room_id,"event_id":"$posted",
+                "sender":"@media:test","origin_server_ts":2,"content":sent_content,
+            }));
+            let posted_id: matrix_sdk::ruma::OwnedEventId = "$posted".try_into().unwrap();
+            let posted = room.event(&posted_id, Some(RequestConfig::new().retry_limit(0))).await.unwrap();
+            let actual: serde_json::Value = serde_json::from_str(posted.raw().json().get()).unwrap();
+            assert_eq!(actual["content"]["msgtype"], "m.image");
+            assert_eq!(actual["content"]["filename"], *filename);
+            assert_eq!(actual["content"]["body"], caption);
+            assert_eq!(actual["content"]["info"]["mimetype"], *mime_type);
+            assert_eq!(actual["content"]["info"]["size"], original.len());
+            assert_eq!(actual["content"]["info"]["w"], 256);
+            assert_eq!(actual["content"]["info"]["h"], 256);
+            assert!(actual["content"].get("url").is_none());
+            let file: matrix_sdk::ruma::events::room::EncryptedFile = serde_json::from_value(actual["content"]["file"].clone()).unwrap();
+            assert_eq!(file.url.as_str(), "mxc://media.test/uploaded");
+            let reposted_bytes = decrypt_media(upload_bytes, file.into()).unwrap();
+            assert_eq!(reposted_bytes, *original, "the posted attachment must preserve every source byte");
+            assert_eq!(format!("{:x}", Sha256::digest(&reposted_bytes)), original_digest);
+            assert_eq!(media.bytes(), *original, "sending must retain the immutable prepared source");
+        }
+        let requests = server.requests.lock().unwrap();
+        let downloads: Vec<_> = requests.iter().filter(|(header, _)| header.contains("/media/download/")).collect();
+        assert_eq!(downloads.len(), samples.len());
+        assert!(downloads.iter().all(|(header, _)| header.to_ascii_lowercase().contains("authorization: bearer mock-media-token")));
+    }
+
+    #[tokio::test]
     async fn a_revoked_capture_drops_pending_transport_before_timeout() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let alive = Arc::new(AtomicBool::new(true));

@@ -89,6 +89,14 @@ You can prepare, attach and post images, audio, video and files through the
 host's media tools. Use native attachments when the user asks to show an image;
 a Markdown image link in a text reply does not create a Matrix attachment.
 
+Finding and providing existing media works with the selected chat provider,
+including Claude and Claude Code, without an image-generation API key. For an
+existing photo, use `search_media`, `web_fetch` for a known source page, or the
+room read tools to locate its attachment. Retrieve its actual bytes and attach
+or post them through the media tools. The separate image service is needed only
+when creating a new image from a prompt; do not confuse that requirement with
+searching for, inspecting or providing an existing image.
+
 - `draft_media` takes exactly one source: a complete HTTP(S) `url`, a Matrix
   `mxc_uri`, an attachment's `event_id`, or raw `data_base64`, plus a single
   `filename`, its `mime_type`,

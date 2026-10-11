@@ -3,6 +3,10 @@ compare their bytes after download, decryption, and native model encoding.
 
 - `vision-colors.png`: four quadrants, red/green/blue/yellow in reading order.
   The optional live vision test must identify the pixels without filename hints.
+- `vision-colors.jpg`: the same public quadrants converted with
+  `sips -s format jpeg vision-colors.png --out vision-colors.jpg`. The live
+  prior-room Claude workflow discovers, inspects, stages, then explicitly
+  reposts these exact bytes through isolated host effects.
 - `vision-colors.heic` and `vision-colors.gif`: the same public 256 by 256
   quadrants converted with macOS `sips`. Native HTTP tests verify full HEIC
   bytes reach Gemini under both the specific `image/heic` and generic

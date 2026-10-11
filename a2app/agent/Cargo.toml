@@ -16,6 +16,9 @@ makepad-widgets = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 base64 = "0.22"
+## Inspection copies use the codecs already pinned by Robrix; original media
+## remains immutable for drafting and native Matrix attachment transfers.
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 
 ## Both agent backends use the same host-owned model transport and types.
 ## Only the in-process backend links the Octos agent, CLI, and memory crates.

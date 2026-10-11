@@ -1264,10 +1264,10 @@ impl AttachMediaTool {
 impl Tool for AttachMediaTool {
     fn name(&self) -> &str { "attach_media" }
     fn description(&self) -> &str {
-        "Attach a draft_media draft to this room's composer so the user can review and press Send. Requires host.composer.attach, independently of upload/send permissions and the Matrix writes switch. Pass only a draft_id returned by draft_media in this session; this tool does not upload or post it."
+        "Attach a draft_media, draft_file or generate_image draft to this room's composer so the user can review and press Send. Requires host.composer.attach, independently of upload/send permissions and the Matrix writes switch. Pass only a draft_id returned by one of those tools in this session; this tool does not upload or post it."
     }
     fn input_schema(&self) -> Value {
-        json!({"type":"object","properties":{"draft_id":{"type":"string","description":"Opaque draft_id returned by draft_media."}},"required":["draft_id"],"additionalProperties":false})
+        json!({"type":"object","properties":{"draft_id":{"type":"string","description":"Opaque draft_id returned by draft_media, draft_file or generate_image."}},"required":["draft_id"],"additionalProperties":false})
     }
     fn call(&self, arguments: &Map<String, Value>) -> Result<String, String> {
         reject_unknown_arguments(arguments, &["draft_id"])?;
@@ -1282,11 +1282,11 @@ impl PostRoomMediaTool {
 impl Tool for PostRoomMediaTool {
     fn name(&self) -> &str { "post_room_media" }
     fn description(&self) -> &str {
-        "Upload and post a prepared draft_media draft as a native Matrix image, audio, video or file message. Omit room to post here, or name another joined room from list_rooms. Request matrix.media.upload and matrix.media.send before posting; another room also requires matrix.rooms.message.send for that room. Private-data sharing and exact-action review still apply. Pass only a draft_id returned by draft_media in this session."
+        "Upload and post a prepared draft_media, draft_file or generate_image draft as a native Matrix image, audio, video or file message. Omit room to post here, or name another joined room from list_rooms. Request matrix.media.upload and matrix.media.send before posting; another room also requires matrix.rooms.message.send for that room. Private-data sharing and exact-action review still apply. Pass only a draft_id returned by one of those tools in this session."
     }
     fn input_schema(&self) -> Value {
         json!({"type":"object","properties":{
-            "draft_id":{"type":"string","description":"Opaque draft_id returned by draft_media."},
+            "draft_id":{"type":"string","description":"Opaque draft_id returned by draft_media, draft_file or generate_image."},
             "room":{"type":"string","description":"Optional joined Matrix room id. Omit to post in this room."}
         },"required":["draft_id"],"additionalProperties":false})
     }
