@@ -637,11 +637,6 @@ script_mod! {
                 }
             }
 
-            background_tasks_button := RobrixNeutralIconButton {
-                padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                text: "Background tasks"
-            }
-
             create_section := RoundedView {
                 width: Fill, height: Fit
                 flow: Down
@@ -798,6 +793,39 @@ script_mod! {
                             }
                         }
                     }
+                }
+            }
+
+            background_section := RoundedView {
+                width: Fill, height: Fit
+                flow: Down
+                spacing: 10
+                padding: 14
+                show_bg: true
+                draw_bg +: { color: (COLOR_BG_PREVIEW), border_radius: 8.0 }
+
+                View {
+                    width: Fill, height: Fit
+                    flow: Right
+                    spacing: 6
+                    align: Align{y: 0.5}
+                    Icon {
+                        icon_walk: Walk{width: 16, height: 16, margin: 0}
+                        draw_icon +: { svg: (ICON_ROTATE_CW), color: (COLOR_ROBRIX_PURPLE) }
+                    }
+                    SubsectionLabel { width: Fill, text: "Background mini-apps", margin: 0 }
+                }
+                Label {
+                    width: Fill, height: Fit
+                    flow: Flow.Right{wrap: true}
+                    padding: 0
+                    text: "Mini-apps with background support can check for updates, show reminders or respond to room messages while Robrix is open and you're signed in. Configure the mini-app's settings and permissions first, then choose where and when it runs in Background tasks."
+                    draw_text +: { text_style: REGULAR_TEXT {font_size: 10.5}, color: (MESSAGE_TEXT_COLOR) }
+                }
+                background_tasks_button := RobrixNeutralIconButton {
+                    padding: Inset{top: 9, bottom: 9, left: 12, right: 12}
+                    icon_walk: Walk{width: 0, height: 0, margin: 0}
+                    text: "Manage background tasks"
                 }
             }
 
