@@ -7,6 +7,7 @@
 //! prose. What the user checks is what is applied.
 
 use makepad_widgets::*;
+use crate::shared::collapsible_header::CollapsibleHeaderWidgetExt;
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -40,10 +41,9 @@ script_mod! {
             draw_bg +: { color: (COLOR_BG_PREVIEW), border_radius: 4.0 }
             risk_text := mod.widgets.TaskPromptBody {}
         }
-        details_toggle := RobrixNeutralIconButton {
+        details_toggle := RobrixSettingsCollapsibleHeader {
             margin: Inset{top: 10}
-            text: "Details (0 items)"
-            icon_walk: Walk{width: 0, height: 0, margin: 0}
+            title: "Details (0 items)"
         }
         details := ScrollYView {
             visible: false
@@ -130,8 +130,8 @@ impl Widget for TaskPermissionPrompt {
         self.view.handle_event(cx, event, scope);
 
         if let Event::Actions(actions) = event {
-            if self.view.button(cx, ids!(details_toggle)).clicked(actions) {
-                self.expanded = !self.expanded;
+            if let Some(expanded) = self.view.collapsible_header(cx, ids!(details_toggle)).expansion_changed(actions) {
+                self.expanded = expanded;
                 self.apply_expanded(cx);
             }
             let mut changed = false;
@@ -182,12 +182,7 @@ impl TaskPermissionPrompt {
     fn apply_expanded(&mut self, cx: &mut Cx) {
         self.view.widget(cx, ids!(details)).set_visible(cx, self.expanded);
         let grantable = self.items.iter().filter(|item| item.grantable).count();
-        let text = if self.expanded {
-            "Hide details".to_string()
-        } else {
-            format!("Details ({grantable} items)")
-        };
-        self.view.button(cx, ids!(details_toggle)).set_text(cx, &text);
+        self.view.collapsible_header(cx, ids!(details_toggle)).set_title(cx, &format!("Details ({grantable} items)"));
         self.refresh_allow(cx);
         self.view.redraw(cx);
     }
@@ -207,6 +202,7 @@ impl TaskPermissionPromptRef {
         let Some(mut inner) = self.borrow_mut() else { return };
         inner.items = info.items.clone();
         inner.expanded = false;
+        inner.view.collapsible_header(cx, ids!(details_toggle)).set_expanded(cx, false, Animate::No);
         inner.view.label(cx, ids!(agent_paragraph)).set_text(cx, &info.explanation);
         match &info.risk {
             Some(risk) => {
@@ -217,5 +213,62 @@ impl TaskPermissionPromptRef {
         }
         inner.apply_expanded(cx);
         inner.view.redraw(cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::collapsible_header::CollapsibleHeaderAction;
+
+    #[test]
+    fn task_details_disclose_without_changing_approvals_and_reset_for_the_next_plan() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let prompt = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.TaskPermissionPrompt {} });
+            WidgetRef::script_from_value(vm, value).as_task_permission_prompt()
+        });
+        let item = |id: &str, grantable, checked| TaskItemView {
+            id: id.into(), title: format!("Operation {id}"), detail: format!("Exact scope for {id}"),
+            chip: if grantable { "Will be granted".into() } else { "Blocked".into() }, grantable, checked,
+        };
+        let info = TaskPromptInfo {
+            explanation: "I need access for this task.".into(),
+            items: vec![item("selected", true, true), item("unchecked", true, false), item("blocked", false, false)],
+            risk: None,
+        };
+        prompt.show(&mut cx, &info);
+        let header = prompt.borrow().unwrap().view.collapsible_header(&cx, ids!(details_toggle));
+        assert!(header.borrow().is_some(), "task details use the shared disclosure header");
+        assert!(!prompt.borrow().unwrap().view.widget(&cx, ids!(details)).visible());
+        for expanded in [true, false, true] {
+            let change = cx.capture_actions(|cx| cx.widget_action(header.widget_uid(), CollapsibleHeaderAction::ExpansionChanged(expanded)));
+            let emitted = cx.capture_actions(|cx| prompt.borrow_mut().unwrap().handle_event(cx, &Event::Actions(change), &mut Scope::empty()));
+            let inner = prompt.borrow().unwrap();
+            assert_eq!(inner.expanded, expanded);
+            assert_eq!(inner.view.widget(&cx, ids!(details)).visible(), expanded);
+            assert_eq!(inner.items.iter().map(|item| (&item.id, item.grantable, item.checked)).collect::<Vec<_>>(),
+                info.items.iter().map(|item| (&item.id, item.grantable, item.checked)).collect::<Vec<_>>());
+            assert!(!emitted.iter().any(|action| action.downcast_ref::<TaskPermissionAction>().is_some()),
+                "disclosing details cannot approve or refuse a task");
+        }
+        let allow = prompt.borrow().unwrap().view.button(&cx, ids!(allow_button)).widget_uid();
+        let click = cx.capture_actions(|cx| cx.widget_action(allow, ButtonAction::Clicked(Default::default())));
+        let emitted = cx.capture_actions(|cx| prompt.borrow_mut().unwrap().handle_event(cx, &Event::Actions(click), &mut Scope::empty()));
+        let answer = emitted.iter().find_map(|action| action.downcast_ref::<TaskPermissionAction>());
+        assert!(matches!(answer, Some(TaskPermissionAction::Allow(ids)) if ids == &vec!["selected".to_string()]));
+
+        prompt.show(&mut cx, &TaskPromptInfo { items: vec![item("next", true, false)], ..info });
+        let inner = prompt.borrow().unwrap();
+        assert!(!inner.expanded);
+        assert!(!inner.view.widget(&cx, ids!(details)).visible());
+        assert_eq!(inner.items.len(), 1);
+        assert_eq!(inner.items[0].id, "next");
+        assert!(!inner.items[0].checked);
+        assert!(inner.view.widget(&cx, ids!(allow_button)).disabled(&cx));
     }
 }

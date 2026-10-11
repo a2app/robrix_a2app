@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 // For the `reply_body` HtmlOrPlaintext child accessor in the card's
 // populate; `HtmlOrPlaintext` and its widget are shared from `crate::shared`.
 use crate::shared::html_or_plaintext::HtmlOrPlaintextWidgetExt as _;
+use crate::shared::collapsible_header::CollapsibleHeaderWidgetExt as _;
 
 /// The state event that marks a room as an AI room. `state_key` is always
 /// `""` (one marker per room). Only the room creator's own client ever
@@ -425,27 +426,8 @@ script_mod! {
         header := View {
             width: Fill, height: Fit
             flow: Right, align: Align{y: 0.5}, spacing: 6
-            cursor: MouseCursor.Hand
-
-            turn_arrow := Label {
-                width: Fit, height: Fit
-                padding: 0, margin: 0
-                draw_text +: {
-                    text_style: SMALL_STATE_TEXT_STYLE {},
-                    color: (SMALL_STATE_TEXT_COLOR)
-                }
-                text: "▸"
-            }
             turn_spinner := mod.widgets.AiTurnSpinner {}
-            turn_title := Label {
-                width: Fill, height: Fit
-                padding: 0, margin: 0
-                flow: Flow.Right{wrap: true},
-                draw_text +: {
-                    text_style: SMALL_STATE_TEXT_STYLE {},
-                    color: (SMALL_STATE_TEXT_COLOR)
-                }
-            }
+            turn_disclosure := RobrixSettingsCollapsibleHeader { title: "Tools used" }
         }
 
         turn_body := Label {
@@ -628,14 +610,14 @@ pub struct AiTurnTimelineCard {
 
 impl Widget for AiTurnTimelineCard {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        if let Hit::FingerUp(fe) = event.hits(cx, self.view.area()) {
-            if fe.is_over && fe.is_primary_hit() && fe.was_tap() {
-                self.is_expanded = !self.is_expanded;
+        self.view.handle_event(cx, event, scope);
+        if let Event::Actions(actions) = event {
+            if let Some(expanded) = self.view.collapsible_header(cx, ids!(turn_disclosure)).expansion_changed(actions) {
+                self.is_expanded = expanded;
                 self.apply_expanded(cx);
                 self.redraw(cx);
             }
         }
-        self.view.handle_event(cx, event, scope);
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -646,7 +628,7 @@ impl Widget for AiTurnTimelineCard {
 impl AiTurnTimelineCard {
     /// Applies the current expand state to the arrow and body.
     fn apply_expanded(&mut self, cx: &mut Cx) {
-        self.view.label(cx, ids!(turn_arrow)).set_text(cx, if self.is_expanded { "▾" } else { "▸" });
+        self.view.collapsible_header(cx, ids!(turn_disclosure)).set_expanded(cx, self.is_expanded, Animate::No);
         self.view.label(cx, ids!(turn_body)).set_visible(cx, self.is_expanded && self.has_body);
     }
 }
@@ -962,7 +944,7 @@ impl AiTurnTimelineCardRef {
             .set_spinning(cx, running);
         let Some(mut inner) = self.borrow_mut() else { return };
         inner.view.set_visible(cx, true);
-        inner.view.label(cx, ids!(turn_title)).set_text(cx, &ai_turn_title(content));
+        inner.view.collapsible_header(cx, ids!(turn_disclosure)).set_title(cx, &ai_turn_title(content));
         inner.view.widget(cx, ids!(turn_spinner)).set_visible(cx, running);
         // The thinking marker leads the body while the turn runs, then the
         // tool calls follow; once the turn settles it is folded into the
@@ -1166,6 +1148,38 @@ impl AiEventTimelineCardRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_details_keep_the_selected_expansion_across_live_updates() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let card = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            crate::shared::script_mod(vm);
+            super::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.AiTurnTimelineCard {} });
+            WidgetRef::script_from_value(vm, value).as_ai_turn_timeline_card()
+        });
+        let mut content = AiTurnContent {
+            v: 1, turn: "test-turn".into(), first: Some(true), status: AiTurnStatus::Running,
+            seq: 1, thinking: true, tool_calls: Vec::new(), created_at: 0,
+        };
+        card.populate(&mut cx, Some(&content));
+        for expanded in [false, true, false] {
+            let uid = card.borrow().unwrap().view.collapsible_header(&cx, ids!(turn_disclosure)).widget_uid();
+            let actions = cx.capture_actions(|cx| cx.widget_action(uid,
+                crate::shared::collapsible_header::CollapsibleHeaderAction::ExpansionChanged(expanded)));
+            card.borrow_mut().unwrap().handle_event(&mut cx, &Event::Actions(actions), &mut Scope::empty());
+            content.seq += 1;
+            card.populate(&mut cx, Some(&content));
+            assert_eq!(card.borrow().unwrap().view.widget(&cx, ids!(turn_body)).visible(), expanded);
+            assert_eq!(card.borrow().unwrap().is_expanded, expanded);
+        }
+        content.status = AiTurnStatus::Done;
+        content.seq += 1;
+        card.populate(&mut cx, Some(&content));
+        assert!(!card.borrow().unwrap().view.widget(&cx, ids!(turn_body)).visible());
+        assert!(!card.borrow().unwrap().view.widget(&cx, ids!(turn_spinner)).visible());
+    }
 
     /// The chat never shows a raw MCP identifier: every known tool gets a
     /// phrase, and an unknown one humanizes instead of leaking its name.

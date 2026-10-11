@@ -11,6 +11,7 @@ use a2app_core::permissions::{
     RoomPolicyReason, RoomScope,
 };
 use crate::home::rooms_list::RoomsListRef;
+use crate::shared::collapsible_header::CollapsibleHeaderWidgetExt;
 use super::mini_apps_screen::AccessRuleKey;
 use super::permission_choices::*;
 use super::runtime::with_a2app;
@@ -63,13 +64,9 @@ script_mod! {
                     text: "These rules apply to every mini-app and agent. Their own permissions and data-sharing checks still apply."
                 }
                 target_details := PermissionOptionLabel {}
-                retained_toggle := RobrixNeutralIconButton {
-                    padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                    text: "Show previously accessed data"
-                }
+                retained_toggle := RobrixSettingsCollapsibleHeader { title: "Previously accessed data" }
                 retained_page := View {
                     visible: false, width: Fill, height: Fit, flow: Down, spacing: 10
-                    SubsectionLabel { text: "Previously accessed data", margin: 0 }
                     PermissionOptionLabel {
                         text: "Blocking new reads does not erase data already read or remove sharing rules. These records show possible use in saved app data, agent history and app code, even after they stop running."
                     }
@@ -109,10 +106,7 @@ script_mod! {
                         padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
                         text: "Change this permission"
                     }
-                    context_toggle := RobrixNeutralIconButton {
-                        padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                        text: "About this app check"
-                    }
+                    context_toggle := RobrixSettingsCollapsibleHeader { title: "About this app check" }
                     subject_context := View {
                         visible: false, width: Fill, height: Fit, flow: Down
                         subject_details := PermissionOptionLabel {}
@@ -221,13 +215,13 @@ impl Widget for ProtectionInspector {
             self.update_details(cx);
             return;
         }
-        if self.view.button(cx, ids!(retained_toggle)).clicked(actions) {
-            self.showing_retained = !self.showing_retained;
+        if let Some(expanded) = self.view.collapsible_header(cx, ids!(retained_toggle)).expansion_changed(actions) {
+            self.showing_retained = expanded;
             self.update_page(cx);
             return;
         }
-        if self.view.button(cx, ids!(context_toggle)).clicked(actions) {
-            self.showing_context = !self.showing_context;
+        if let Some(expanded) = self.view.collapsible_header(cx, ids!(context_toggle)).expansion_changed(actions) {
+            self.showing_context = expanded;
             self.update_page(cx);
             return;
         }
@@ -292,10 +286,8 @@ impl ProtectionInspector {
         self.view.widget(cx, ids!(retained_page)).set_visible(cx, self.showing_retained);
         self.view.widget(cx, ids!(subject_context)).set_visible(cx, self.showing_context);
         self.view.widget(cx, ids!(check_footer)).set_visible(cx, has_target && (page == 0 || has_subject));
-        self.view.button(cx, ids!(retained_toggle)).set_text(cx,
-            if self.showing_retained { "Hide previously accessed data" } else { "Show previously accessed data" });
-        self.view.button(cx, ids!(context_toggle)).set_text(cx,
-            if self.showing_context { "Hide app details" } else { "About this app check" });
+        self.view.collapsible_header(cx, ids!(retained_toggle)).set_expanded(cx, self.showing_retained, Animate::No);
+        self.view.collapsible_header(cx, ids!(context_toggle)).set_expanded(cx, self.showing_context, Animate::No);
         self.view.redraw(cx);
     }
 
@@ -729,6 +721,21 @@ mod tests {
         assert!(!editor.view.widget(&cx, ids!(target_picker)).visible());
         assert!(editor.view.widget(&cx, ids!(room_page)).visible());
         assert!(!editor.view.widget(&cx, ids!(retained_page)).visible());
+        let retained = editor.view.collapsible_header(&cx, ids!(retained_toggle));
+        assert!(retained.borrow().is_some());
+        for expanded in [true, false, true] {
+            let actions = cx.capture_actions(|cx| cx.widget_action(retained.widget_uid(),
+                crate::shared::collapsible_header::CollapsibleHeaderAction::ExpansionChanged(expanded)));
+            editor.handle_event(&mut cx, &Event::Actions(actions), &mut Scope::empty());
+            assert_eq!(editor.view.widget(&cx, ids!(retained_page)).visible(), expanded);
+        }
+        let uid = editor.view.button(&cx, ids!(change_target)).widget_uid();
+        let actions = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+        editor.handle_event(&mut cx, &Event::Actions(actions), &mut Scope::empty());
+        assert!(!editor.view.widget(&cx, ids!(retained_page)).visible());
+        let uid = editor.view.button(&cx, ids!(keep_target)).widget_uid();
+        let actions = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+        editor.handle_event(&mut cx, &Event::Actions(actions), &mut Scope::empty());
 
         editor.read_controls = vec![ProtectionInspectorAction::Rule(AccessRuleKey::Room("!target:example.org".into()))];
         editor.populate_controls(&mut cx);
@@ -750,6 +757,22 @@ mod tests {
         editor.handle_event(&mut cx, &Event::Actions(actions), &mut Scope::empty());
         assert!(!editor.view.widget(&cx, ids!(subject_picker)).visible());
         assert!(editor.view.widget(&cx, ids!(subject_check)).visible());
+        assert!(!editor.view.widget(&cx, ids!(subject_context)).visible());
+        let context = editor.view.collapsible_header(&cx, ids!(context_toggle));
+        assert!(context.borrow().is_some());
+        for expanded in [true, false, true] {
+            let actions = cx.capture_actions(|cx| cx.widget_action(context.widget_uid(),
+                crate::shared::collapsible_header::CollapsibleHeaderAction::ExpansionChanged(expanded)));
+            editor.handle_event(&mut cx, &Event::Actions(actions), &mut Scope::empty());
+            assert_eq!(editor.view.widget(&cx, ids!(subject_context)).visible(), expanded);
+        }
+        let uid = editor.view.button(&cx, ids!(change_subject)).widget_uid();
+        let actions = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+        editor.handle_event(&mut cx, &Event::Actions(actions), &mut Scope::empty());
+        assert!(!editor.view.widget(&cx, ids!(subject_context)).visible());
+        let uid = editor.view.button(&cx, ids!(keep_subject)).widget_uid();
+        let actions = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+        editor.handle_event(&mut cx, &Event::Actions(actions), &mut Scope::empty());
         assert!(!editor.view.widget(&cx, ids!(subject_context)).visible());
         let uid = editor.view.button(&cx, ids!(change_target)).widget_uid();
         let actions = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));

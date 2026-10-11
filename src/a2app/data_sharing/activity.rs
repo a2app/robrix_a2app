@@ -48,7 +48,12 @@ impl DataSharing {
         self.view.label(cx, ids!(activity_summary)).set_text(cx, if self.activities.is_empty() {
             "No activity matches this filter."
         } else { "Choose a record to see its data sources, destination and result." });
-        self.view.widget(cx, ids!(history_more)).set_visible(cx, self.activities.len() > self.history_limit);
+        self.view.widget(cx, ids!(history_more)).set_visible(cx, self.activities.len() > 20);
+        if self.activities.len() <= 20 && self.history_expanded {
+            self.history_expanded = false;
+            self.view.collapsible_header(cx, ids!(history_more)).set_expanded(cx, false, Animate::No);
+        }
+        self.view.widget(cx, ids!(history_more_section)).set_visible(cx, self.activities.len() > 20 && self.history_expanded);
         self.view.widget(cx, ids!(history_overview)).set_visible(cx, self.activity_selection.is_none());
         self.view.widget(cx, ids!(history_details)).set_visible(cx, self.activity_selection.is_some());
         let entry = self.activity_selection.and_then(|id| self.activities.iter().find(|entry| entry.id == id));

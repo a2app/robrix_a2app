@@ -68,6 +68,7 @@ script_mod! {
     mod.widgets.RobrixSettingsCollapsibleHeader = mod.widgets.CollapsibleHeader {
         height: 40, margin: 0
         title: "Details"
+        is_expanded: false
         draw_bg +: { color: (COLOR_BG_PREVIEW) }
         collapse_icon +: { draw_bg.color: (MESSAGE_TEXT_COLOR) }
         label +: {
@@ -129,7 +130,7 @@ pub struct CollapsibleHeader {
     #[deref] view: View,
     /// A standalone disclosure title; empty uses the room-category name.
     #[live] title: String,
-    #[rust(true)] is_expanded: bool,
+    #[live(true)] is_expanded: bool,
     #[rust] category: HeaderCategory,
     #[rust] num_unread_mentions: u64,
     #[rust] num_unread_messages: u64,
@@ -137,6 +138,7 @@ pub struct CollapsibleHeader {
 
 impl Widget for CollapsibleHeader {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if !self.view.visible() { return; }
         // Handle hits on this view as a whole before passing the event to the inner view.
         match event.hits(cx, self.view.area()) {
             Hit::FingerDown(..) => {
@@ -147,12 +149,18 @@ impl Widget for CollapsibleHeader {
             {
                 self.toggle_collapse(cx, scope);
             }
+            Hit::KeyDown(key) if !key.is_repeat
+                && matches!(key.key_code, KeyCode::Space | KeyCode::ReturnKey | KeyCode::NumpadEnter) =>
+            {
+                self.toggle_collapse(cx, scope);
+            }
             _ => { }
         }
         self.view.handle_event(cx, event, scope);
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        if !self.view.visible() { return DrawStep::done(); }
         // Set arrow and label state during draw to ensure child widgets are available.
         if let Some(mut arrow) = self.view.child_by_path(ids!(collapse_icon)).borrow_mut::<ExpandArrow>() {
             arrow.set_is_open_no_animate(self.is_expanded);
@@ -162,11 +170,22 @@ impl Widget for CollapsibleHeader {
         self.view.child_by_path(ids!(unread_badge))
             .as_unread_badge()
             .update_counts(false, self.num_unread_mentions, self.num_unread_messages);
-        self.view.draw_walk(cx, scope, walk)
+        let step = self.view.draw_walk(cx, scope, walk);
+        cx.add_nav_stop(self.view.area(), NavRole::TextInput, Inset::default());
+        step
     }
 }
 
 impl CollapsibleHeader {
+    fn set_expanded(&mut self, cx: &mut Cx, is_expanded: bool, animate: Animate) {
+        if self.is_expanded == is_expanded { return; }
+        self.is_expanded = is_expanded;
+        if let Some(mut arrow) = self.view.child_by_path(ids!(collapse_icon)).borrow_mut::<ExpandArrow>() {
+            arrow.set_is_open(cx, is_expanded, animate);
+        }
+        self.redraw(cx);
+    }
+
     fn toggle_collapse(&mut self, cx: &mut Cx, _scope: &mut Scope) {
         self.is_expanded = !self.is_expanded;
         if let Some(mut arrow) = self.view.child_by_path(ids!(collapse_icon)).borrow_mut::<ExpandArrow>() {
@@ -185,14 +204,20 @@ impl CollapsibleHeader {
 }
 
 impl CollapsibleHeaderRef {
+    /// Updates a standalone disclosure's title without changing its state.
+    pub fn set_title(&self, cx: &mut Cx, title: &str) {
+        if let Some(mut inner) = self.borrow_mut()
+            && inner.title != title
+        {
+            inner.title = title.to_string();
+            inner.redraw(cx);
+        }
+    }
+
     /// Sets the disclosure's state without changing its title or category.
     pub fn set_expanded(&self, cx: &mut Cx, is_expanded: bool, animate: Animate) {
         if let Some(mut inner) = self.borrow_mut() {
-            inner.is_expanded = is_expanded;
-            if let Some(mut arrow) = inner.view.child_by_path(ids!(collapse_icon)).borrow_mut::<ExpandArrow>() {
-                arrow.set_is_open(cx, is_expanded, animate);
-            }
-            inner.redraw(cx);
+            inner.set_expanded(cx, is_expanded, animate);
         }
     }
 
@@ -219,5 +244,41 @@ impl CollapsibleHeaderRef {
             inner.num_unread_mentions = num_unread_mentions;
             inner.num_unread_messages = num_unread_messages;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_disclosures_start_closed_and_silent_sync_preserves_title() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let (settings, category) = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            crate::shared::script_mod(vm);
+            let settings = script_eval!(vm, { mod.widgets.RobrixSettingsCollapsibleHeader { title: "Individual abilities" } });
+            let category = script_eval!(vm, { mod.widgets.CollapsibleHeader {} });
+            (WidgetRef::script_from_value(vm, settings).as_collapsible_header(),
+                WidgetRef::script_from_value(vm, category).as_collapsible_header())
+        });
+        assert!(!settings.borrow().unwrap().is_expanded);
+        assert!(category.borrow().unwrap().is_expanded, "room categories keep their existing default");
+        let actions = cx.capture_actions(|cx| {
+            settings.set_expanded(cx, true, Animate::No);
+            settings.set_title(cx, "Permission details");
+        });
+        assert!(actions.is_empty(), "render-state synchronization must not act like user approval");
+        assert!(settings.borrow().unwrap().is_expanded);
+        assert_eq!(settings.borrow().unwrap().title, "Permission details");
+        for expanded in [false, true, false] {
+            let actions = cx.capture_actions(|cx| settings.borrow_mut().unwrap().toggle_collapse(cx, &mut Scope::empty()));
+            assert_eq!(settings.expansion_changed(&actions), Some(expanded));
+            assert_eq!(settings.borrow().unwrap().title, "Permission details");
+        }
+        category.set_details(&mut cx, true, HeaderCategory::Favorites, 0, 0);
+        let actions = cx.capture_actions(|cx| category.borrow_mut().unwrap().toggle_collapse(cx, &mut Scope::empty()));
+        assert!(matches!(actions.find_widget_action(category.widget_uid()).cast(),
+            CollapsibleHeaderAction::Toggled { category: HeaderCategory::Favorites }));
     }
 }

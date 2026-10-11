@@ -9,6 +9,7 @@ use a2app_core::information_flow::{
 };
 use a2app_agent::model_transport::ModelRecipient;
 use crate::home::rooms_list::RoomsListRef;
+use crate::shared::collapsible_header::CollapsibleHeaderWidgetExt;
 use crate::shared::popup_list::{enqueue_popup_notification, PopupKind};
 use super::runtime::{with_a2app, A2AppOp};
 use super::permission_choices::PermissionChoicesWidgetExt;
@@ -55,7 +56,7 @@ script_mod! {
                 rule_back := TextButton { text: "Back to rules" }
                 SubsectionLabel { text: "Saved approval", margin: 0 }
                 saved_rule_details := PermissionOptionLabel {}
-                saved_identifiers_toggle := TextButton { text: "Show identifiers" }
+                saved_identifiers_toggle := RobrixSettingsCollapsibleHeader { title: "Identifiers" }
                 saved_identifiers := PermissionOptionLabel { visible: false }
                 remove_button := RobrixNegativeIconButton { text: "Remove this permission", padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0} }
                 PermissionOptionLabel { text: "Removing this approval stops affected work. Reopen the app or repeat your agent request to continue. Other approvals may still apply; Block this permission in the app's Permissions panel turns the feature off. Your saved data is kept; data already sent cannot be recalled." }
@@ -76,7 +77,7 @@ script_mod! {
                     }
                     reader_app_section := View { visible: false, width: Fill, height: Fit, flow: Down, reader_app := PermissionDropDown {} }
                     reader_preview := PermissionOptionLabel {}
-                    more_readers := TextButton { text: "More sharing options" }
+                    more_readers := RobrixSettingsCollapsibleHeader { title: "More sharing options" }
                     reader_options := View {
                         visible: false, width: Fill, height: Fit, flow: Down, spacing: 8
                         reader_kind := PermissionChoices { labels: ["Only this mini-app or agent here", "Everywhere this mini-app runs", "All mini-apps and agents"] }
@@ -118,7 +119,7 @@ script_mod! {
                         lifetime_room := PermissionDropDown {}
                     }
                     rule_preview := PermissionOptionLabel {}
-                    rule_identifiers_toggle := TextButton { text: "Show identifiers" }
+                    rule_identifiers_toggle := RobrixSettingsCollapsibleHeader { title: "Identifiers" }
                     rule_identifiers := PermissionOptionLabel { visible: false }
                     PermissionOptionLabel { text: "Allowing sharing sends private room or account data to the destination shown. If several data sources are used together, each must allow that destination." }
                 }
@@ -138,7 +139,11 @@ script_mod! {
                     SubsectionLabel { text: "Requests that need a decision", margin: 0 }
                     attention_summary := PermissionOptionLabel {}
                     attention_list := SharingList {}
-                    attention_more := TextButton { visible: false, text: "Show more requests" }
+                    attention_more := RobrixSettingsCollapsibleHeader { visible: false, title: "More requests" }
+                    attention_more_section := View {
+                        visible: false, width: Fill, height: Fit, flow: Down
+                        attention_more_list := SharingList {}
+                    }
                 }
                 attention_details := View {
                     visible: false, width: Fill, height: Fit, flow: Down, spacing: 12
@@ -147,7 +152,7 @@ script_mod! {
                         visible: false, width: Fill, height: Fit, flow: Down, spacing: 12
                         SubsectionLabel { text: "Sharing was blocked", margin: 0 }
                         decision_details := PermissionOptionLabel {}
-                        decision_identifiers_toggle := TextButton { text: "Show identifiers" }
+                        decision_identifiers_toggle := RobrixSettingsCollapsibleHeader { title: "Identifiers" }
                         decision_identifiers := PermissionOptionLabel { visible: false }
                         review_section := View {
                             width: Fill, height: Fit, flow: Down, spacing: 8
@@ -173,14 +178,18 @@ script_mod! {
                     width: Fill, height: Fit, flow: Down, spacing: 10
                     SubsectionLabel { text: "Recent protection history", margin: 0 }
                     PermissionOptionLabel { text: "Saved on this device without message contents, request bodies or credentials." }
-                    history_filter_toggle := TextButton { text: "Filter history" }
+                    history_filter_toggle := RobrixSettingsCollapsibleHeader { title: "Filter history" }
                     history_filters := View {
                         visible: false, width: Fill, height: Fit, flow: Down
                         activity_filter := PermissionChoices { labels: ["All activity", "Blocked requests", "Network and room operations", "Settings changes"] }
                     }
                     activity_summary := PermissionOptionLabel {}
                     activity_list := SharingList {}
-                    history_more := TextButton { visible: false, text: "Show more history" }
+                    history_more := RobrixSettingsCollapsibleHeader { visible: false, title: "More history" }
+                    history_more_section := View {
+                        visible: false, width: Fill, height: Fit, flow: Down
+                        history_more_list := SharingList {}
+                    }
                 }
                 history_details := View {
                     visible: false, width: Fill, height: Fit, flow: Down, spacing: 12
@@ -250,8 +259,9 @@ pub struct DataSharing {
     #[rust] decision_selection: usize,
     #[rust] action_selection: usize,
     #[rust] activity_selection: Option<u64>,
-    #[rust(20)] attention_limit: usize,
-    #[rust(20)] history_limit: usize,
+    #[rust] attention_expanded: bool,
+    #[rust] history_expanded: bool,
+    #[rust] disclosures_initialized: bool,
     #[rust] sources: Vec<(Source, String)>,
     #[rust] rooms: Vec<(String, String)>,
     #[rust] model: Option<ModelRecipient>,
@@ -281,9 +291,30 @@ impl Widget for DataSharing {
             self.update_page(cx);
             return;
         }
+        if page == 1 && !self.wizard_open && self.decision_selection == 0 && self.action_selection == 0
+            && self.view.widget(cx, ids!(attention_more)).visible()
+            && let Some(expanded) = self.view.collapsible_header(cx, ids!(attention_more)).expansion_changed(actions)
+        {
+            self.attention_expanded = expanded;
+            self.view.collapsible_header(cx, ids!(attention_more)).set_expanded(cx, expanded, Animate::No);
+            self.view.widget(cx, ids!(attention_more_section)).set_visible(cx, expanded);
+            self.view.redraw(cx);
+            return;
+        }
+        if page == 2 && !self.wizard_open && self.activity_selection.is_none()
+            && self.view.widget(cx, ids!(history_more)).visible()
+            && let Some(expanded) = self.view.collapsible_header(cx, ids!(history_more)).expansion_changed(actions)
+        {
+            self.history_expanded = expanded;
+            self.view.collapsible_header(cx, ids!(history_more)).set_expanded(cx, expanded, Animate::No);
+            self.view.widget(cx, ids!(history_more_section)).set_visible(cx, expanded);
+            self.view.redraw(cx);
+            return;
+        }
         for action in actions {
             if let Some(action) = action.downcast_ref::<SharingCardAction>()
                 && action.owner == self.widget_uid() && action.account == self.account && !self.wizard_open
+                && self.card_is_visible(&action.target)
                 && match &action.target {
                     SharingCardTarget::Rule(_) | SharingCardTarget::Authority(_) | SharingCardTarget::EffectAuthority(_) => page == 0 && matches!(self.saved_selection, SharingCardTarget::None),
                     SharingCardTarget::Decision(_) | SharingCardTarget::Action(_) => page == 1 && self.decision_selection == 0 && self.action_selection == 0,
@@ -319,18 +350,26 @@ impl Widget for DataSharing {
             self.update_page(cx);
             return;
         }
-        if self.wizard_open && self.wizard_step == 0 && self.view.button(cx, ids!(more_readers)).clicked(actions) {
-            self.reader_options_open = !self.reader_options_open;
+        if self.wizard_open && self.wizard_step == 0
+            && let Some(expanded) = self.view.collapsible_header(cx, ids!(more_readers)).expansion_changed(actions)
+        {
+            self.reader_options_open = expanded;
+            self.view.collapsible_header(cx, ids!(more_readers)).set_expanded(cx, expanded, Animate::No);
             self.update_recipient_form(cx);
         }
-        if self.wizard_open && self.wizard_step == 2 && self.view.button(cx, ids!(rule_identifiers_toggle)).clicked(actions) {
-            self.rule_identifiers_open = !self.rule_identifiers_open;
+        if self.wizard_open && self.wizard_step == 2 && self.view.widget(cx, ids!(rule_identifiers_toggle)).visible()
+            && let Some(expanded) = self.view.collapsible_header(cx, ids!(rule_identifiers_toggle)).expansion_changed(actions)
+        {
+            self.rule_identifiers_open = expanded;
+            self.view.collapsible_header(cx, ids!(rule_identifiers_toggle)).set_expanded(cx, expanded, Animate::No);
             self.update_recipient_form(cx);
         }
         if page == 0 && !self.wizard_open && !matches!(self.saved_selection, SharingCardTarget::None)
-            && self.view.button(cx, ids!(saved_identifiers_toggle)).clicked(actions)
+            && self.view.widget(cx, ids!(saved_identifiers_toggle)).visible()
+            && let Some(expanded) = self.view.collapsible_header(cx, ids!(saved_identifiers_toggle)).expansion_changed(actions)
         {
-            self.saved_identifiers_open = !self.saved_identifiers_open;
+            self.saved_identifiers_open = expanded;
+            self.view.collapsible_header(cx, ids!(saved_identifiers_toggle)).set_expanded(cx, expanded, Animate::No);
             self.update_saved_details(cx);
         }
         if page == 0 && !self.wizard_open && self.view.button(cx, ids!(rule_back)).clicked(actions) {
@@ -345,9 +384,11 @@ impl Widget for DataSharing {
             return;
         }
         if page == 1 && !self.wizard_open && self.decision_selection != 0
-            && self.view.button(cx, ids!(decision_identifiers_toggle)).clicked(actions)
+            && self.view.widget(cx, ids!(decision_identifiers_toggle)).visible()
+            && let Some(expanded) = self.view.collapsible_header(cx, ids!(decision_identifiers_toggle)).expansion_changed(actions)
         {
-            self.decision_identifiers_open = !self.decision_identifiers_open;
+            self.decision_identifiers_open = expanded;
+            self.view.collapsible_header(cx, ids!(decision_identifiers_toggle)).set_expanded(cx, expanded, Animate::No);
             self.update_diagnostic_details(cx);
         }
         if page == 2 && !self.wizard_open && self.view.button(cx, ids!(history_back)).clicked(actions) {
@@ -355,15 +396,20 @@ impl Widget for DataSharing {
             self.update_page(cx);
             return;
         }
-        if self.view.button(cx, ids!(attention_more)).clicked(actions) { self.attention_limit += 20; }
-        if self.view.button(cx, ids!(history_more)).clicked(actions) { self.history_limit += 20; }
-        if self.view.button(cx, ids!(history_filter_toggle)).clicked(actions) {
-            self.history_filters_open = !self.history_filters_open;
+        if page == 2 && !self.wizard_open && self.activity_selection.is_none()
+            && let Some(expanded) = self.view.collapsible_header(cx, ids!(history_filter_toggle)).expansion_changed(actions)
+        {
+            self.history_filters_open = expanded;
+            self.view.collapsible_header(cx, ids!(history_filter_toggle)).set_expanded(cx, expanded, Animate::No);
             self.view.widget(cx, ids!(history_filters)).set_visible(cx, self.history_filters_open);
         }
-        if self.view.permission_choices(cx, ids!(activity_filter)).changed(actions).is_some() {
+        if page == 2 && !self.wizard_open && self.activity_selection.is_none() && self.history_filters_open
+            && self.view.permission_choices(cx, ids!(activity_filter)).changed(actions).is_some()
+        {
             self.activity_selection = None;
-            self.history_limit = 20;
+            self.history_expanded = false;
+            self.view.collapsible_header(cx, ids!(history_more)).set_expanded(cx, false, Animate::No);
+            self.view.widget(cx, ids!(history_more_section)).set_visible(cx, false);
         }
         if self.view.drop_down2(cx, ids!(source_choice)).changed(actions).is_some()
             || self.view.drop_down2(cx, ids!(context_choice)).changed(actions).is_some()
@@ -406,19 +452,23 @@ impl Widget for DataSharing {
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         self.refresh_account(cx);
+        if !self.disclosures_initialized { self.sync_disclosures(cx); }
         self.refresh_diagnostics(cx);
         self.refresh_rules(cx);
         self.refresh_activity(cx);
         self.update_recipient_form(cx);
         self.update_saved_details(cx);
-        let lists = [ids!(rules_list), ids!(attention_list), ids!(activity_list)]
-            .map(|path| self.view.widget(cx, path).widget_uid());
+        let lists = [
+            (ids!(rules_list), 0, false), (ids!(attention_list), 1, false),
+            (ids!(attention_more_list), 1, true), (ids!(activity_list), 2, false),
+            (ids!(history_more_list), 2, true),
+        ].map(|(path, kind, additional)| (self.view.widget(cx, path).widget_uid(), kind, additional));
         while let Some(subview) = self.view.draw_walk(cx, scope, walk).step() {
             let uid = subview.widget_uid();
             if let Some(mut list) = subview.as_flat_list().borrow_mut()
-                && let Some(kind) = lists.iter().position(|candidate| *candidate == uid)
+                && let Some((_, kind, additional)) = lists.iter().find(|(candidate, _, _)| *candidate == uid)
             {
-                self.draw_cards(cx, &mut list, kind);
+                self.draw_cards(cx, &mut list, *kind, *additional);
             }
         }
         DrawStep::done()
@@ -426,6 +476,36 @@ impl Widget for DataSharing {
 }
 
 impl DataSharing {
+    fn card_is_visible(&self, target: &SharingCardTarget) -> bool {
+        match target {
+            SharingCardTarget::Decision(decision) => self.decisions.iter().filter(|current| !current.allowed)
+                .position(|current| current == decision).is_some_and(|index| index < 20 || self.attention_expanded),
+            SharingCardTarget::Action(decision) => self.action_decisions.iter().position(|current| current == decision)
+                .is_some_and(|index| self.attention_expanded
+                    || self.decisions.iter().filter(|current| !current.allowed).count() + index < 20),
+            SharingCardTarget::Activity(id) => self.activities.iter().position(|current| current.id == *id)
+                .is_some_and(|index| index < 20 || self.history_expanded),
+            SharingCardTarget::None => false,
+            _ => true,
+        }
+    }
+
+    fn sync_disclosures(&mut self, cx: &mut Cx) {
+        for (path, expanded) in [
+            (ids!(more_readers), self.reader_options_open),
+            (ids!(rule_identifiers_toggle), self.rule_identifiers_open),
+            (ids!(saved_identifiers_toggle), self.saved_identifiers_open),
+            (ids!(decision_identifiers_toggle), self.decision_identifiers_open),
+            (ids!(history_filter_toggle), self.history_filters_open),
+            (ids!(attention_more), self.attention_expanded),
+            (ids!(history_more), self.history_expanded),
+        ] {
+            self.view.collapsible_header(cx, path).set_expanded(cx, expanded, Animate::No);
+        }
+        self.view.widget(cx, ids!(history_filters)).set_visible(cx, self.history_filters_open);
+        self.disclosures_initialized = true;
+    }
+
     fn back(&mut self, cx: &mut Cx) -> bool {
         if self.wizard_open {
             if self.wizard_step > 0 {
@@ -456,6 +536,7 @@ impl DataSharing {
     }
 
     fn update_page(&mut self, cx: &mut Cx) {
+        self.sync_disclosures(cx);
         let page = self.view.permission_choices(cx, ids!(page_choice)).selected_item();
         let saved = !matches!(self.saved_selection, SharingCardTarget::None);
         self.view.widget(cx, ids!(tabs)).set_visible(cx, !self.wizard_open);
@@ -596,7 +677,6 @@ impl DataSharing {
         self.view.label(cx, ids!(saved_rule_details)).set_text(cx, details.as_ref().map(|(summary, _)| summary.as_str()).unwrap_or("This permission is no longer saved."));
         self.view.label(cx, ids!(saved_identifiers)).set_text(cx, details.as_ref().map(|(_, exact)| exact.as_str()).unwrap_or_default());
         self.view.widget(cx, ids!(saved_identifiers_toggle)).set_visible(cx, details.is_some());
-        self.view.button(cx, ids!(saved_identifiers_toggle)).set_text(cx, if self.saved_identifiers_open { "Hide identifiers" } else { "Show identifiers" });
         self.view.widget(cx, ids!(saved_identifiers)).set_visible(cx, details.is_some() && self.saved_identifiers_open);
         self.view.button(cx, ids!(remove_button)).set_enabled(cx, details.is_some());
     }
@@ -613,7 +693,7 @@ impl DataSharing {
         format!("{} can share\n{}\n\nWith: {destination}\nFor how long: {duration}\n\nAccount: {}", self.reader_choice_label(reader), self.source_choice_label(source), self.account)
     }
 
-    fn draw_cards(&mut self, cx: &mut Cx2d, list: &mut FlatList, kind: usize) {
+    fn draw_cards(&mut self, cx: &mut Cx2d, list: &mut FlatList, kind: usize, additional: bool) {
         let mut rows: Vec<(String, String, SharingCardTarget, &str)> = Vec::new();
         match kind {
             0 => {
@@ -631,21 +711,21 @@ impl DataSharing {
                     SharingCardTarget::EffectAuthority(grant.id), "View approval")));
             }
             1 => {
-                rows.extend(self.decisions.iter().filter(|decision| !decision.allowed).take(self.attention_limit).map(|decision| (
+                rows.extend(self.decisions.iter().filter(|decision| !decision.allowed).map(|decision| (
                     format!("Sharing with {}", self.recipient_choice_label(&decision.recipient)),
                     format!("{}\nBlocked at its last check. Review the destination and data before allowing sharing.", self.context_choice_label(&decision.context)),
                     SharingCardTarget::Decision(decision.clone()), "Review sharing")));
-                let remaining = self.attention_limit.saturating_sub(rows.len());
-                rows.extend(self.action_decisions.iter().take(remaining).map(|decision| (
+                rows.extend(self.action_decisions.iter().map(|decision| (
                     self.action_choice_label(&decision.action), format!("{}\nNeeds approval before retrying.", self.context_choice_label(&decision.context)),
                     SharingCardTarget::Action(decision.clone()), "Review action")));
             }
-            _ => rows.extend(self.activities.iter().take(self.history_limit).map(|entry| (
+            _ => rows.extend(self.activities.iter().map(|entry| (
                 format!("{} · {}", activity::activity_outcome(entry.outcome), activity::activity_kind(entry.kind)),
                 format!("{}\n{}", activity::activity_time(entry.timestamp_ms), entry.context.as_ref().map(|context| self.context_choice_label(context)).unwrap_or_else(|| "Account settings".into())),
                 SharingCardTarget::Activity(entry.id), "View details"))),
         }
-        for (index, (title, summary, target, button)) in rows.into_iter().enumerate() {
+        let (start, limit) = if additional { (20, usize::MAX) } else if kind == 0 { (0, usize::MAX) } else { (0, 20) };
+        for (index, (title, summary, target, button)) in rows.into_iter().enumerate().skip(start).take(limit) {
             if let Some(item) = list.item(cx, LiveId::from_str(&format!("sharing-{kind}-{index}")), id!(card)) {
                 if let Some(mut row) = item.borrow_mut::<SharingCard>() {
                     row.owner = self.widget_uid();
@@ -678,6 +758,9 @@ impl DataSharing {
             self.rule_identifiers_open = false;
             self.saved_identifiers_open = false;
             self.decision_identifiers_open = false;
+            self.history_filters_open = false;
+            self.attention_expanded = false;
+            self.history_expanded = false;
             self.saved_selection = SharingCardTarget::None;
             self.decision_selection = 0;
             self.action_selection = 0;
@@ -775,7 +858,6 @@ impl DataSharing {
         self.view.widget(cx, ids!(reader_app_section)).set_visible(cx, reader_kind == 1);
         self.view.widget(cx, ids!(reader_context_section)).set_visible(cx, reader_kind == 0);
         self.view.widget(cx, ids!(reader_options)).set_visible(cx, self.reader_options_open);
-        self.view.button(cx, ids!(more_readers)).set_text(cx, if self.reader_options_open { "Hide sharing options" } else { "More sharing options" });
         let room_lifetime = self.view.permission_choices(cx, ids!(sharing_lifetime)).selected_item() == 1;
         self.view.widget(cx, ids!(lifetime_room_section)).set_visible(cx, room_lifetime);
         let preview = self.selected_reader(cx).map(|reader| self.reader_label(&reader))
@@ -796,7 +878,6 @@ impl DataSharing {
         self.view.label(cx, ids!(rule_preview)).set_text(cx, &preview);
         self.view.label(cx, ids!(rule_identifiers)).set_text(cx, &identifiers);
         self.view.widget(cx, ids!(rule_identifiers_toggle)).set_visible(cx, !identifiers.is_empty());
-        self.view.button(cx, ids!(rule_identifiers_toggle)).set_text(cx, if self.rule_identifiers_open { "Hide identifiers" } else { "Show identifiers" });
         self.view.widget(cx, ids!(rule_identifiers)).set_visible(cx, !identifiers.is_empty() && self.rule_identifiers_open);
         self.view.button(cx, ids!(add_button)).set_enabled(cx, can_allow);
         self.view.widget(cx, ids!(add_button)).set_disabled(cx, !can_allow);
@@ -918,6 +999,127 @@ mod tests {
         (cx, widget)
     }
 
+    fn expand(editor: &mut DataSharing, cx: &mut Cx, path: &[LiveId], expanded: bool) -> ActionsBuf {
+        let uid = editor.view.collapsible_header(cx, path).widget_uid();
+        let event = cx.capture_actions(|cx| cx.widget_action(uid,
+            crate::shared::collapsible_header::CollapsibleHeaderAction::ExpansionChanged(expanded)));
+        cx.capture_actions(|cx| editor.handle_event(cx, &Event::Actions(event), &mut Scope::empty()))
+    }
+
+    #[test]
+    fn sharing_headers_follow_expansion_and_reset_without_granting_permissions() {
+        let account = "@alice:example.org";
+        let _account = TestAccount::set(account);
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+        editor.account = account.into();
+        for path in [ids!(more_readers), ids!(rule_identifiers_toggle), ids!(saved_identifiers_toggle),
+            ids!(decision_identifiers_toggle), ids!(history_filter_toggle), ids!(attention_more), ids!(history_more)]
+        {
+            assert!(editor.view.collapsible_header(&cx, path).borrow().is_some());
+        }
+        editor.begin_rule(&mut cx);
+        for expanded in [true, true, false] {
+            let actions = expand(&mut editor, &mut cx, ids!(more_readers), expanded);
+            assert_eq!(editor.reader_options_open, expanded, "use the header's state rather than invert it");
+            assert_eq!(editor.view.widget(&cx, ids!(reader_options)).visible(), expanded);
+            assert!(!actions.iter().any(|action| action.downcast_ref::<A2AppOp>().is_some()));
+        }
+        expand(&mut editor, &mut cx, ids!(more_readers), true);
+        editor.begin_rule(&mut cx);
+        assert!(!editor.reader_options_open);
+        assert!(!editor.view.widget(&cx, ids!(reader_options)).visible());
+        editor.wizard_open = false;
+        editor.view.permission_choices(&cx, ids!(page_choice)).set_selected_item(&mut cx, 2);
+        editor.update_page(&mut cx);
+        for expanded in [true, true, false] {
+            let actions = expand(&mut editor, &mut cx, ids!(history_filter_toggle), expanded);
+            assert_eq!(editor.history_filters_open, expanded);
+            assert_eq!(editor.view.widget(&cx, ids!(history_filters)).visible(), expanded);
+            assert!(!actions.iter().any(|action| action.downcast_ref::<A2AppOp>().is_some()));
+        }
+        editor.view.permission_choices(&cx, ids!(page_choice)).set_selected_item(&mut cx, 0);
+        expand(&mut editor, &mut cx, ids!(history_filter_toggle), true);
+        assert!(!editor.history_filters_open, "a hidden history header must not open its filters");
+        editor.history_filters_open = true;
+        editor.attention_expanded = true;
+        editor.history_expanded = true;
+        let _next_account = TestAccount::set("@sharing-next:example.org");
+        editor.configure(&mut cx);
+        assert!(!editor.history_filters_open);
+        assert!(!editor.attention_expanded);
+        assert!(!editor.history_expanded);
+        assert!(!editor.view.widget(&cx, ids!(history_filters)).visible());
+    }
+
+    #[test]
+    fn cached_record_disclosures_keep_first_twenty_and_reject_collapsed_card_actions() {
+        let account = "@alice:example.org";
+        let _account = TestAccount::set(account);
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+        editor.account = account.into();
+        let snapshot = context_fixture();
+        for index in 0..21 {
+            editor.decisions.push(FlowDecision {
+                context: snapshot.context.clone(), epoch: snapshot.epoch,
+                recipient: Recipient::NetworkOrigin(format!("https://request{index}.example")),
+                sources: snapshot.label.clone(), denied_sources: snapshot.label.clone(), allowed: false,
+            });
+            editor.activities.push(a2app_core::protection_audit::Activity {
+                id: index, timestamp_ms: index, account: account.into(), context: Some(snapshot.context.clone()),
+                recipient: None, sources: snapshot.label.clone(), blocked_sources: snapshot.label.clone(),
+                kind: a2app_core::protection_audit::ActivityKind::SharingCheck,
+                outcome: a2app_core::protection_audit::ActivityOutcome::Blocked,
+            });
+        }
+        editor.action_decisions.push(ActionDecision {
+            context: snapshot.context, epoch: snapshot.epoch, influences: snapshot.influences,
+            action: flow::SensitiveAction { kind: "matrix.message.send".into(), target: "!target:example.org".into() },
+            allowed: false, request: None,
+        });
+        let first = SharingCardTarget::Decision(editor.decisions[19].clone());
+        let extra = SharingCardTarget::Decision(editor.decisions[20].clone());
+        let action = SharingCardTarget::Action(editor.action_decisions[0].clone());
+        let activity = SharingCardTarget::Activity(20);
+        assert!(editor.card_is_visible(&first));
+        assert!(!editor.card_is_visible(&extra));
+        assert!(!editor.card_is_visible(&action));
+        assert!(!editor.card_is_visible(&activity));
+        editor.view.permission_choices(&cx, ids!(page_choice)).set_selected_item(&mut cx, 1);
+        editor.view.widget(&cx, ids!(attention_more)).set_visible(&mut cx, true);
+        for expanded in [true, true] {
+            let actions = expand(&mut editor, &mut cx, ids!(attention_more), expanded);
+            assert!(editor.attention_expanded);
+            assert!(editor.card_is_visible(&extra));
+            assert!(editor.card_is_visible(&action));
+            assert!(editor.view.widget(&cx, ids!(attention_more_section)).visible());
+            assert!(!actions.iter().any(|action| action.downcast_ref::<A2AppOp>().is_some()));
+        }
+        let uid = editor.view.collapsible_header(&cx, ids!(attention_more)).widget_uid();
+        let stale = SharingCardAction { owner: editor.widget_uid(), account: account.into(), target: extra.clone() };
+        let events = cx.capture_actions(|cx| {
+            cx.action(stale.clone());
+            cx.widget_action(uid, crate::shared::collapsible_header::CollapsibleHeaderAction::ExpansionChanged(false));
+        });
+        editor.handle_event(&mut cx, &Event::Actions(events), &mut Scope::empty());
+        assert!(!editor.attention_expanded);
+        assert_eq!(editor.decision_selection, 0, "collapse must discard a cached card action in the same batch");
+        assert!(editor.card_is_visible(&first));
+        assert!(!editor.card_is_visible(&extra));
+        let events = cx.capture_actions(|cx| cx.action(stale));
+        editor.handle_event(&mut cx, &Event::Actions(events), &mut Scope::empty());
+        assert_eq!(editor.decision_selection, 0, "an extra row cannot open while its section is hidden");
+        editor.view.permission_choices(&cx, ids!(page_choice)).set_selected_item(&mut cx, 2);
+        editor.view.widget(&cx, ids!(history_more)).set_visible(&mut cx, true);
+        expand(&mut editor, &mut cx, ids!(history_more), true);
+        assert!(editor.card_is_visible(&activity));
+        assert!(editor.view.widget(&cx, ids!(history_more_section)).visible());
+        expand(&mut editor, &mut cx, ids!(history_more), false);
+        assert!(!editor.card_is_visible(&activity));
+        assert!(!editor.view.widget(&cx, ids!(history_more_section)).visible());
+    }
+
     #[test]
     fn editor_preserves_account_and_room_identities_and_canonical_origin() {
         let (mut cx, widget) = editor();
@@ -1035,6 +1237,11 @@ mod tests {
         assert!(summary.contains("Room · Friends"));
         assert!(!summary.contains("!private:example.org"));
         assert!(!editor.view.widget(&cx, ids!(saved_identifiers)).visible());
+        for expanded in [true, true, false] {
+            let actions = expand(&mut editor, &mut cx, ids!(saved_identifiers_toggle), expanded);
+            assert_eq!(editor.view.widget(&cx, ids!(saved_identifiers)).visible(), expanded);
+            assert!(!actions.iter().any(|action| action.downcast_ref::<A2AppOp>().is_some()));
+        }
         let remove = editor.view.button(&cx, ids!(remove_button)).widget_uid();
         let clicks = cx.capture_actions(|cx| cx.widget_action(remove, ButtonAction::Clicked(Default::default())));
         let actions = cx.capture_actions(|cx| editor.handle_event(cx, &Event::Actions(clicks), &mut Scope::empty()));
@@ -1104,7 +1311,7 @@ mod tests {
         assert_eq!(preview.matches("@alice:example.org").count(), 1);
         assert!(preview.contains("https://example.org"));
         assert!(!editor.view.widget(&cx, ids!(rule_identifiers)).visible());
-        let actions = click(&mut editor, &mut cx, ids!(rule_identifiers_toggle));
+        let actions = expand(&mut editor, &mut cx, ids!(rule_identifiers_toggle), true);
         assert!(editor.view.widget(&cx, ids!(rule_identifiers)).visible());
         assert!(editor.view.label(&cx, ids!(rule_identifiers)).text().contains("!source:example.org"));
         assert!(!actions.iter().any(|action| action.downcast_ref::<A2AppOp>().is_some()));
@@ -1273,6 +1480,7 @@ mod tests {
 
     #[test]
     fn blocked_sharing_explains_unreviewable_sources_and_hides_identifiers() {
+        let _account = TestAccount::set("@alice:example.org");
         let (mut cx, widget) = editor();
         let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
         editor.account = "@alice:example.org".into();
@@ -1298,9 +1506,12 @@ mod tests {
         let details = editor.view.label(&cx, ids!(decision_identifiers)).text();
         assert!(details.contains("@alice:example.org"));
         assert!(details.contains("!source:example.org"));
-        editor.decision_identifiers_open = true;
-        editor.update_diagnostic_details(&mut cx);
-        assert!(editor.view.widget(&cx, ids!(decision_identifiers)).visible());
+        editor.view.permission_choices(&cx, ids!(page_choice)).set_selected_item(&mut cx, 1);
+        for expanded in [true, true, false] {
+            let actions = expand(&mut editor, &mut cx, ids!(decision_identifiers_toggle), expanded);
+            assert_eq!(editor.view.widget(&cx, ids!(decision_identifiers)).visible(), expanded);
+            assert!(!actions.iter().any(|action| action.downcast_ref::<A2AppOp>().is_some()));
+        }
     }
 
     #[test]

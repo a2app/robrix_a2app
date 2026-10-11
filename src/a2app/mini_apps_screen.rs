@@ -21,6 +21,7 @@ use crate::a2app::permission_choices::PermissionChoicesWidgetExt;
 use crate::a2app::permission_prompt::{PermissionScopeEditorWidgetExt, duration_label, network_scope_label};
 use crate::a2app::data_sharing::DataSharingWidgetExt;
 use crate::a2app::approval_details::{ApprovalDetailsWidgetExt, ApprovalSource, approval_sources, source_summary};
+use crate::shared::collapsible_header::CollapsibleHeaderWidgetExt;
 use crate::a2app::protection_inspector::{ProtectionInspectorAction, ProtectionInspectorWidgetExt};
 use crate::a2app::background_tasks::{BackgroundTasksAction, BackgroundTasksWidgetExt};
 use a2app_core::persistence;
@@ -1014,10 +1015,7 @@ script_mod! {
                 text: "This app declares no permissions: it can only draw its own UI and use its private storage."
             }
             mod.widgets.PermissionOptionLabel { text: "Apps ask directly when they need permission. Review your choices here; blocked rooms and spaces stay protected." }
-            ability_details := RobrixNeutralIconButton {
-                padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                text: "Show individual abilities"
-            }
+            ability_details := RobrixSettingsCollapsibleHeader { title: "Individual abilities" }
             perms_list := FlatList {
                 width: Fill, height: Fit
                 spacing: 2
@@ -1200,11 +1198,8 @@ script_mod! {
                 agent_permissions := View {
                     visible: false, width: Fill, height: Fit, flow: Down, spacing: 12
                     mod.widgets.PermissionOptionLabel { text: "Choose what you want this agent to do." }
+                    agent_details := RobrixSettingsCollapsibleHeader { title: "Individual abilities" }
                     agent_ability := PermissionChoices {}
-                    agent_details := RobrixNeutralIconButton {
-                        padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                        text: "Show individual abilities"
-                    }
                 }
                 protection_overview := View {
                     visible: false, width: Fill, height: Fit, flow: Down, spacing: 16
@@ -2345,10 +2340,10 @@ impl Widget for MiniAppsScreen {
 
         let Event::Actions(actions) = event else { return };
 
-        if self.view.button(cx, ids!(ability_details)).clicked(actions) {
-            self.show_abilities = !self.show_abilities;
-            self.view.button(cx, ids!(ability_details)).set_text(cx,
-                if self.show_abilities { "Hide individual abilities" } else { "Show individual abilities" });
+        if self.pane == Pane::Info
+            && let Some(expanded) = self.view.collapsible_header(cx, ids!(ability_details)).expansion_changed(actions)
+        {
+            self.show_abilities = expanded;
             self.view.redraw(cx);
         }
         if let Some(index) = self.view.permission_choices(cx, ids!(global_read)).changed(actions)
@@ -2443,9 +2438,9 @@ impl Widget for MiniAppsScreen {
             self.select_agent_access(cx);
         }
         if self.pane == Pane::Access && self.access_view == AccessView::AgentPermissions
-            && self.view.button(cx, ids!(agent_details)).clicked(actions)
+            && let Some(expanded) = self.view.collapsible_header(cx, ids!(agent_details)).expansion_changed(actions)
         {
-            self.agent_details = !self.agent_details;
+            self.agent_details = expanded;
             self.populate_agent_abilities(cx);
         }
         self.handle_access_editor(cx, actions);
@@ -2927,7 +2922,7 @@ impl MiniAppsScreen {
     fn show_info(&mut self, cx: &mut Cx, app_id: MiniAppId) {
         if self.info_app.as_ref() != Some(&app_id) {
             self.show_abilities = false;
-            self.view.button(cx, ids!(ability_details)).set_text(cx, "Show individual abilities");
+            self.view.collapsible_header(cx, ids!(ability_details)).set_expanded(cx, false, Animate::No);
         }
         crate::a2app::runtime::ensure_app_history(&app_id);
         self.info_app = Some(app_id);
@@ -4258,8 +4253,7 @@ impl MiniAppsScreen {
         self.view.permission_choices(cx, ids!(agent_ability)).set_labels(cx,
             self.agent_abilities.iter().map(|(_, _, label)| label.clone()).collect());
         self.view.permission_choices(cx, ids!(agent_ability)).set_selected_item(cx, usize::MAX);
-        self.view.button(cx, ids!(agent_details)).set_text(cx,
-            if self.agent_details { "Hide individual abilities" } else { "Show individual abilities" });
+        self.view.collapsible_header(cx, ids!(agent_details)).set_expanded(cx, self.agent_details, Animate::No);
     }
 
     fn select_agent_access(&mut self, cx: &mut Cx) {

@@ -17,6 +17,7 @@
 use makepad_widgets::*;
 use a2app_core::permissions::Permission;
 use super::permission_choices::*;
+use crate::shared::collapsible_header::CollapsibleHeaderWidgetExt;
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -118,10 +119,7 @@ script_mod! {
                 ModalBody {
                     text: "Choose an option to apply it now. Ask when needed keeps existing approvals. Room and space protections still take priority."
                 }
-                abilities_button := RobrixNeutralIconButton {
-                    text: "What this permission covers…"
-                    icon_walk: Walk{width: 0, height: 0, margin: 0}
-                }
+                abilities_button := RobrixSettingsCollapsibleHeader { title: "What this permission covers" }
                 abilities_section := View {
                     visible: false
                     width: Fill, height: Fit, flow: Down, spacing: 8
@@ -258,8 +256,8 @@ impl Widget for AiRoomPanel {
             }
         }
         if let Some(index) = self.selected_group {
-            if self.view.button(cx, ids!(abilities_button)).clicked(actions) {
-                self.abilities_expanded = !self.abilities_expanded;
+            if let Some(expanded) = self.view.collapsible_header(cx, ids!(abilities_button)).expansion_changed(actions) {
+                self.abilities_expanded = expanded;
                 self.update_abilities(cx);
             }
             if let Some(choice) = self.view.permission_choices(cx, ids!(editor_choice)).changed(actions)
@@ -319,9 +317,7 @@ impl AiRoomPanel {
 
     fn update_abilities(&mut self, cx: &mut Cx) {
         self.view.widget(cx, ids!(abilities_section)).set_visible(cx, self.abilities_expanded);
-        self.view.button(cx, ids!(abilities_button)).set_text(cx, if self.abilities_expanded {
-            "Hide included abilities"
-        } else { "What this permission covers…" });
+        self.view.collapsible_header(cx, ids!(abilities_button)).set_expanded(cx, self.abilities_expanded, Animate::No);
         self.view.redraw(cx);
     }
 
@@ -444,6 +440,14 @@ mod tests {
         actions.iter().filter_map(|action| action.downcast_ref::<AiRoomPanelAction>()).cloned().collect()
     }
 
+    fn expand_abilities(panel: &AiRoomPanelRef, cx: &mut Cx, expanded: bool) -> Vec<AiRoomPanelAction> {
+        let uid = panel.borrow().unwrap().view.collapsible_header(cx, ids!(abilities_button)).widget_uid();
+        let changed = cx.capture_actions(|cx| cx.widget_action(uid,
+            crate::shared::collapsible_header::CollapsibleHeaderAction::ExpansionChanged(expanded)));
+        let actions = cx.capture_actions(|cx| panel.borrow_mut().unwrap().handle_event(cx, &Event::Actions(changed), &mut Scope::empty()));
+        actions.iter().filter_map(|action| action.downcast_ref::<AiRoomPanelAction>()).cloned().collect()
+    }
+
     #[test]
     fn opening_permissions_and_ability_details_never_changes_access() {
         let (mut cx, panel) = panel();
@@ -456,8 +460,11 @@ mod tests {
         assert_eq!(panel.borrow().unwrap().view.label(&cx, ids!(editor_current)).text(), info.rows[0]);
         assert_eq!(panel.borrow().unwrap().view.permission_choices(&cx, ids!(editor_choice)).selected_item(), usize::MAX,
             "a blocked effective state must not be mistaken for a saved group denial");
-        assert!(click(&panel, &mut cx, ids!(abilities_button)).is_empty());
-        assert!(panel.borrow().unwrap().view.widget(&cx, ids!(abilities_section)).visible());
+        for expanded in [true, false, true] {
+            assert!(expand_abilities(&panel, &mut cx, expanded).is_empty());
+            assert_eq!(panel.borrow().unwrap().view.widget(&cx, ids!(abilities_section)).visible(), expanded);
+            assert_eq!(panel.borrow().unwrap().view.permission_choices(&cx, ids!(editor_choice)).selected_item(), usize::MAX);
+        }
         assert!(!panel.borrow().unwrap().view.label(&cx, ids!(ability_details)).text().is_empty());
         let actions = choose(&panel, &mut cx, 0);
         assert_eq!(actions.len(), 1);

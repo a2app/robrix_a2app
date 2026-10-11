@@ -454,19 +454,23 @@ impl Harness {
             children.into_iter().find_map(|child| find(&child, text))
         }
         let widget = find(app, text).expect("the actual stock control exists");
+        self.widget_callback(app, &widget, id!(on_click), args);
+    }
+
+    fn widget_callback(&mut self, app: &WidgetRef, widget: &WidgetRef, method: LiveId, args: &[ScriptValue]) {
         let source = app.borrow::<Splash>().unwrap().view.source.clone();
         let vm_id = self.cx.script_ref_vm_id(&source).unwrap();
         let (source, callback) = self.cx.with_script_vm_id(vm_id, |vm| {
             let source = widget.script_source();
-            let value = vm.bx.heap.value(source, id!(on_click).into(), NoTrap);
-            assert!(!value.is_nil(), "{text} has its real guest click callback");
+            let value = vm.bx.heap.value(source, method.into(), NoTrap);
+            assert!(!value.is_nil(), "the actual stock control has its guest callback");
             let callback = ScriptFnRef::script_from_value(vm, value);
             let source = vm.bx.heap.new_object_ref(source);
             (source, callback)
         });
         self.cx.widget_to_script_call(widget.widget_uid(), NIL, source, callback, args);
         self.cx.with_vm_and_async(|_| {});
-        self.assert_callback_errors(text);
+        self.assert_callback_errors("stock widget callback");
     }
 
     fn queue_matrix_reply(&mut self, capability: &str, data: serde_json::Value) {
@@ -1398,6 +1402,66 @@ fn stock_watcher_saves_without_write_permission_and_tests_only_the_selected_rule
 }
 
 #[test]
+fn stock_watcher_disclosure_toggles_choices_and_tracks_advanced_rule_edits() {
+    fn opened(host: &mut Harness, app: &WidgetRef) -> bool {
+        let arrow = app.widget(&host.cx, ids!(adv_btn.disclosure_control));
+        assert!(!arrow.is_empty(), "the real disclosure has its keyboard-capable control");
+        let source = app.borrow::<Splash>().unwrap().view.source.clone();
+        let vm_id = host.cx.script_ref_vm_id(&source).unwrap();
+        host.cx.with_script_vm_id(vm_id, |vm| {
+            let background = vm.bx.heap.value(arrow.script_source(), id!(draw_bg).into(), NoTrap);
+            let value = vm.bx.heap.value(background.as_object().unwrap(), id!(opened).into(), NoTrap);
+            match value.as_f64() {
+                Some(0.0) => false,
+                Some(1.0) => true,
+                value => panic!("unexpected actual arrow state: {value:?}"),
+            }
+        })
+    }
+    fn has_text(widget: &WidgetRef, text: &str) -> bool {
+        if widget.text() == text { return true; }
+        let mut children = Vec::new();
+        widget.children(&mut |_, child| children.push(child));
+        children.iter().any(|child| has_text(child, text))
+    }
+    let mut host = Harness::new();
+    let (app, _) = host.launch_stock_permissions("watcher", false, false);
+    host.boot();
+    let mut audit = StockAudit::default();
+    host.settle_stock(&app, "watcher", &mut audit);
+    let initial_effects = (audit.prompts.len(), audit.services.len(), audit.notifications.len());
+    let header = app.widget(&host.cx, ids!(adv_btn));
+    assert!(app.widget(&host.cx, ids!(adv_btn.disclosure_control)).borrow::<Button>().is_some(),
+        "the header keeps native keyboard and focus behavior");
+    assert!(has_text(&header, "Advanced filters"));
+    assert!(!opened(&mut host, &app));
+    assert!(host.call_index_text(&app, "open_menu", 0, "field"));
+    assert!(!has_text(&app, "   Message type"));
+    let control = app.widget(&host.cx, ids!(adv_btn.disclosure_control));
+    host.widget_callback(&app, &control, id!(on_click), &[]);
+    assert!(opened(&mut host, &app));
+    assert!(host.call_index_text(&app, "open_menu", 0, "field"));
+    assert!(has_text(&app, "   Message type"));
+    let control = app.widget(&host.cx, ids!(adv_btn.disclosure_control));
+    host.widget_callback(&app, &control, id!(on_click), &[]);
+    assert!(!opened(&mut host, &app));
+    assert!(!has_text(&app, "   Message type"), "closing the disclosure also closes the active menu");
+    assert!(host.call_index_text(&app, "open_menu", 0, "field"));
+    assert!(!has_text(&app, "   Message type"));
+    assert!(host.call_object(&app, "restore", r#"{"match":"all","filters":[{"field":"type","op":"is","value":"m.image"}],"notify":true,"reply":""}"#));
+    assert!(host.call(&app, "edit_rule", &[0_u32.into()]));
+    assert!(opened(&mut host, &app), "editing an advanced saved rule synchronizes the triangle");
+    assert!(has_text(&header, "Advanced filters"), "the title stays stable");
+    assert!(host.call(&app, "set_advanced", &[false.into()]));
+    assert!(!opened(&mut host, &app));
+    assert!(host.call(&app, "edit_rule", &[0_u32.into()]));
+    assert!(opened(&mut host, &app), "programmatic reopening does not invoke a toggling callback");
+    host.settle_stock(&app, "watcher", &mut audit);
+    assert_eq!((audit.prompts.len(), audit.services.len(), audit.notifications.len()), initial_effects,
+        "disclosure interaction cannot ask for more authority or perform external work");
+}
+
+#[test]
 fn stock_watcher_legacy_rule_defaults_ignore_nested_optional_keys() {
     let mut host = Harness::new();
     let (app, context) = host.launch_stock("watcher", false);
@@ -1430,7 +1494,7 @@ fn stock_watcher_filters_combine_any_all_and_negation_and_the_ai_adds_notify_onl
     assert!(app.widget(&host.cx, ids!(status)).text().starts_with("Rule not saved: Message needs a value."));
 
     // Message contains any of "wifi, password", doesn't contain "solved", and Alice sent it.
-    assert!(host.call(&app, "toggle_advanced", &[]));
+    assert!(host.call(&app, "set_advanced", &[true.into()]));
     assert!(host.call_index_text(&app, "open_menu", 0, "op"));
     assert!(host.call_strings(&app, "choose", &["any_of"]));
     assert!(host.call_index_text(&app, "set_value", 0, "wifi, password"));

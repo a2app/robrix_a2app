@@ -37,10 +37,7 @@ script_mod! {
         width: Fill, height: Fit, flow: Down, spacing: 8
         scope_heading := SettingsItemLabel { text: "Rooms and spaces" }
         target_summary := mod.widgets.PermissionOptionLabel {}
-        choose_targets := RobrixNeutralIconButton {
-            text: "Change rooms…"
-            icon_walk: Walk{width: 0, height: 0, margin: 0}
-        }
+        choose_targets := RobrixSettingsCollapsibleHeader { title: "Choose rooms and spaces" }
         selected_targets := View {
             visible: false
             width: Fill, height: Fit, flow: Down, spacing: 6
@@ -100,20 +97,14 @@ script_mod! {
             margin: Inset{top: 8}
             SettingsItemLabel { text: "Allowed websites" }
             network_summary := mod.widgets.PermissionOptionLabel {}
-            change_network := RobrixNeutralIconButton {
-                text: "Change websites…"
-                icon_walk: Walk{width: 0, height: 0, margin: 0}
-            }
+            change_network := RobrixSettingsCollapsibleHeader { title: "Choose websites" }
             network_settings := View {
                 visible: false
                 width: Fill, height: Fit, flow: Down, spacing: 8
                 network_choice := PermissionChoices {
                     labels: ["Only this web address", "This website", "This domain and its subdomains"]
                 }
-                more_network := RobrixNeutralIconButton {
-                    text: "More website options…"
-                    icon_walk: Walk{width: 0, height: 0, margin: 0}
-                }
+                more_network := RobrixSettingsCollapsibleHeader { title: "Advanced website options" }
                 advanced_network := View {
                     visible: false
                     width: Fill, height: Fit, flow: Down, spacing: 8
@@ -1243,9 +1234,9 @@ impl Widget for PermissionScopeEditor {
             self.all_rooms = index == 1;
             self.update_target_visibility(cx);
         }
-        if !self.popup_scope && self.view.button(cx, ids!(choose_targets)).clicked(actions) {
+        if !self.popup_scope && let Some(expanded) = self.view.collapsible_header(cx, ids!(choose_targets)).expansion_changed(actions) {
             changed = true;
-            self.targets_expanded = !self.targets_expanded;
+            self.targets_expanded = expanded;
             self.update_target_visibility(cx);
         }
         if !self.popup_scope && let Some(index) = self.view.permission_choices(cx, ids!(duration_choice)).changed(actions) {
@@ -1271,12 +1262,12 @@ impl Widget for PermissionScopeEditor {
             self.update_network_visibility(cx);
             self.update_network_summary(cx);
         }
-        if !self.popup_scope && self.view.button(cx, ids!(change_network)).clicked(actions) {
-            self.network_expanded = !self.network_expanded;
+        if !self.popup_scope && let Some(expanded) = self.view.collapsible_header(cx, ids!(change_network)).expansion_changed(actions) {
+            self.network_expanded = expanded;
             self.update_network_visibility(cx);
         }
-        if !self.popup_scope && self.view.button(cx, ids!(more_network)).clicked(actions) {
-            self.advanced_network_expanded = !self.advanced_network_expanded;
+        if !self.popup_scope && let Some(expanded) = self.view.collapsible_header(cx, ids!(more_network)).expansion_changed(actions) {
+            self.advanced_network_expanded = expanded;
             self.update_network_visibility(cx);
         }
         if !self.popup_scope && let Some(value) = self.view.text_input(cx, ids!(network_value)).changed(actions) {
@@ -1356,21 +1347,15 @@ impl PermissionScopeEditor {
         self.view.widget(cx, ids!(target_checklist)).set_visible(cx, !self.all_rooms);
         self.view.widget(cx, ids!(editor_targets)).set_visible(cx, !self.popup_scope);
         self.view.widget(cx, ids!(popup_targets_section)).set_visible(cx, self.popup_scope);
-        self.view.button(cx, ids!(choose_targets)).set_text(cx, if self.targets_expanded {
-            "Done choosing rooms"
-        } else { "Change rooms…" });
+        self.view.collapsible_header(cx, ids!(choose_targets)).set_expanded(cx, self.targets_expanded, Animate::No);
     }
 
     fn update_network_visibility(&mut self, cx: &mut Cx) {
         self.view.widget(cx, ids!(network_settings)).set_visible(cx, self.network_expanded);
         self.view.widget(cx, ids!(advanced_network)).set_visible(cx, self.advanced_network_expanded);
         self.view.widget(cx, ids!(network_value_section)).set_visible(cx, self.network_kind != 4);
-        self.view.button(cx, ids!(change_network)).set_text(cx, if self.network_expanded {
-            "Done choosing websites"
-        } else { "Change websites…" });
-        self.view.button(cx, ids!(more_network)).set_text(cx, if self.advanced_network_expanded {
-            "Hide advanced website options"
-        } else { "More website options…" });
+        self.view.collapsible_header(cx, ids!(change_network)).set_expanded(cx, self.network_expanded, Animate::No);
+        self.view.collapsible_header(cx, ids!(more_network)).set_expanded(cx, self.advanced_network_expanded, Animate::No);
         self.view.redraw(cx);
     }
 
@@ -1695,11 +1680,15 @@ mod tests {
         assert_eq!(editor.selection().unwrap().network, exact);
         assert!(!editor.borrow().unwrap().view.widget(&cx, ids!(network_settings)).visible());
         assert!(!editor.borrow().unwrap().view.widget(&cx, ids!(advanced_network)).visible());
-        for button in [ids!(change_network), ids!(more_network)] {
-            let uid = editor.borrow().unwrap().view.button(&cx, button).widget_uid();
-            let click = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
-            editor.borrow_mut().unwrap().handle_event(&mut cx, &Event::Actions(click), &mut Scope::empty());
-            assert_eq!(editor.selection().unwrap().network, exact, "opening choices never changes the destination scope");
+        for header in [ids!(change_network), ids!(more_network)] {
+            let uid = editor.borrow().unwrap().view.collapsible_header(&cx, header).widget_uid();
+            for expanded in [true, false, true] {
+                let click = cx.capture_actions(|cx| cx.widget_action(uid, crate::shared::collapsible_header::CollapsibleHeaderAction::ExpansionChanged(expanded)));
+                editor.borrow_mut().unwrap().handle_event(&mut cx, &Event::Actions(click), &mut Scope::empty());
+                assert_eq!(editor.selection().unwrap().network, exact, "opening or closing choices never changes the destination scope");
+                let body = if header == ids!(change_network) { ids!(network_settings) } else { ids!(advanced_network) };
+                assert_eq!(editor.borrow().unwrap().view.widget(&cx, body).visible(), expanded);
+            }
         }
         let common = editor.borrow().unwrap().view.permission_choices(&cx, ids!(network_choice)).widget_uid();
         let advanced = editor.borrow().unwrap().view.permission_choices(&cx, ids!(network_advanced_choice)).widget_uid();
@@ -1718,6 +1707,9 @@ mod tests {
         assert_eq!(editor.selection().unwrap().network, exact, "an invalid choice must preserve the exact destination");
         editor.configure(&mut cx, Some("!room:example.org"), None, Some(url), true, false);
         assert_eq!(editor.selection().unwrap().network, exact);
+        assert!(!editor.borrow().unwrap().network_expanded);
+        assert!(!editor.borrow().unwrap().advanced_network_expanded);
+        assert!(!editor.borrow().unwrap().view.widget(&cx, ids!(network_settings)).visible());
         assert!(!editor.borrow().unwrap().view.widget(&cx, ids!(advanced_network)).visible());
     }
 
@@ -1729,6 +1721,21 @@ mod tests {
         assert!(editor.borrow().unwrap().view.widget(&cx, ids!(scope_choice_section)).visible());
         assert!(!editor.borrow().unwrap().view.widget(&cx, ids!(selected_targets)).visible());
         assert!(editor.borrow().unwrap().view.label(&cx, ids!(target_summary)).text().contains("!room:example.org"));
+        let original = editor.selection().unwrap();
+        let header = editor.borrow().unwrap().view.collapsible_header(&cx, ids!(choose_targets));
+        assert!(header.borrow().is_some(), "room choices use the shared disclosure header");
+        for expanded in [true, false, true] {
+            let change = cx.capture_actions(|cx| cx.widget_action(header.widget_uid(), crate::shared::collapsible_header::CollapsibleHeaderAction::ExpansionChanged(expanded)));
+            editor.borrow_mut().unwrap().handle_event(&mut cx, &Event::Actions(change), &mut Scope::empty());
+            assert_eq!(editor.borrow().unwrap().view.widget(&cx, ids!(selected_targets)).visible(), expanded);
+            let selection = editor.selection().unwrap();
+            assert_eq!(selection.scope, original.scope);
+            assert_eq!(selection.duration, original.duration);
+            assert_eq!(selection.network, original.network);
+        }
+        editor.configure(&mut cx, Some("!room:example.org"), None, None, false, false);
+        assert!(!editor.borrow().unwrap().targets_expanded);
+        assert!(!editor.borrow().unwrap().view.widget(&cx, ids!(selected_targets)).visible());
 
         editor.configure(&mut cx, None, None, None, false, true);
         assert!(editor.borrow().unwrap().targets_expanded);

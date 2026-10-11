@@ -206,7 +206,12 @@ impl DataSharing {
         self.view.label(cx, ids!(attention_summary)).set_text(cx, if count == 0 {
             "Nothing needs your attention. Blocked sharing requests and actions will appear here."
         } else { "Choose a request to see why it was blocked. Reviewing a request does not approve it." });
-        self.view.widget(cx, ids!(attention_more)).set_visible(cx, count > self.attention_limit);
+        self.view.widget(cx, ids!(attention_more)).set_visible(cx, count > 20);
+        if count <= 20 && self.attention_expanded {
+            self.attention_expanded = false;
+            self.view.collapsible_header(cx, ids!(attention_more)).set_expanded(cx, false, Animate::No);
+        }
+        self.view.widget(cx, ids!(attention_more_section)).set_visible(cx, count > 20 && self.attention_expanded);
         let reviewing = self.decision_selection != 0 || self.action_selection != 0;
         self.view.widget(cx, ids!(attention_overview)).set_visible(cx, !reviewing);
         self.view.widget(cx, ids!(attention_details)).set_visible(cx, reviewing);
@@ -245,7 +250,6 @@ impl DataSharing {
         self.view.label(cx, ids!(decision_identifiers)).set_text(cx, &identifiers);
         self.view.widget(cx, ids!(decision_identifiers)).set_visible(cx, self.decision_identifiers_open && !identifiers.is_empty());
         self.view.widget(cx, ids!(decision_identifiers_toggle)).set_visible(cx, !identifiers.is_empty());
-        self.view.button(cx, ids!(decision_identifiers_toggle)).set_text(cx, if self.decision_identifiers_open { "Hide identifiers" } else { "Show identifiers" });
         let blocked = decision.map(|decision| decision.denied_sources.iter().cloned().collect::<Vec<_>>()).unwrap_or_default();
         if blocked != self.blocked_sources {
             let labels = blocked.iter().map(|source| self.source_choice_label(source)).collect();

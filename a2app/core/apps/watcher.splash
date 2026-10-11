@@ -363,7 +363,7 @@ fn show_editor(){
     ui.match_btn.set_text(draft["match"] + " ▼")
     if draft.notify { ui.notify_btn.set_text("🔔 Notify me") } else { ui.notify_btn.set_text("🔕 Silent") }
     if editing >= 0 { ui.editor_title.set_text("EDITING RULE") } else { ui.editor_title.set_text("NEW RULE") }
-    if advanced { ui.adv_btn.set_text("Hide advanced ▲") } else { ui.adv_btn.set_text("Show advanced ▼") }
+    ui.adv_btn.render()
     ui.filter_list.render()
     return nil
 }
@@ -389,8 +389,8 @@ fn toggle_notify(){
     return nil
 }
 
-fn toggle_advanced(){
-    advanced = !advanced
+fn set_advanced(expanded){
+    advanced = expanded
     menu_row = -1
     show_editor()
     return nil
@@ -783,6 +783,51 @@ fn on_tool_call(json){
     return answer(ev.call_id, true, summaries().to_json())
 }
 
+// Splash isolates use their own widget registry. This script-local header
+// matches Robrix's settings disclosures while keeping native Button keyboard
+// and focus behavior. Its outer View rerenders the arrow without clicking it.
+let SettingsDisclosureControl = Button{
+    width: Fill height: 40 margin: 0 spacing: 0
+    padding: Inset{left: 36 right: 5 top: 5 bottom: 5}
+    align: Align{x: 0.0 y: 0.5}
+    label_walk: Walk{width: Fill height: Fit}
+    label_align: Align{x: 0.0 y: 0.5}
+    icon_walk: Walk{width: 0 height: 0 margin: 0}
+    text: "Advanced filters"
+    draw_text +: {
+        color: #x333333 color_hover: #x333333 color_down: #x333333 color_focus: #x333333
+        text_style: theme.font_bold{font_size: 11}
+    }
+    draw_bg +: {
+        opened: instance(0.0)
+        pixel: fn(){
+            let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+            sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, 4.0)
+            sdf.fill(#xF0F5FF)
+            let corner_round = 2.25
+            let sz = 20.0 * 0.3 - corner_round * 0.5
+            let c = vec2(20.0, self.rect_size.y * 0.5)
+            sdf.rotate(self.opened * 0.5 * PI + 0.5 * PI, c.x, c.y)
+            sdf.move_to(c.x - sz, c.y + sz)
+            sdf.line_to(c.x, c.y - sz)
+            sdf.line_to(c.x + sz, c.y + sz)
+            sdf.close_path()
+            sdf.fill_keep(#x333333)
+            return sdf.stroke(#x333333, corner_round)
+        }
+    }
+}
+let SettingsDisclosureHeader = View{
+    width: Fill height: 40 padding: 0
+    on_render: || {
+        disclosure_control := SettingsDisclosureControl{
+            draw_bg +: {opened: if advanced {1.0} else {0.0}}
+            on_click: || set_advanced(!advanced)
+        }
+        nil
+    }
+}
+
 let _init = load()
 let _boot = start_timeout(0.05, || {
     subscribe()
@@ -865,8 +910,8 @@ View{
             View{
                 width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8 align: Align{y: 0.5}
                 Button{ text: "➕ Add filter" on_click: || add_filter() draw_text +: { color: #x1C274C } }
-                adv_btn := Button{ text: "Show advanced ▼" on_click: || toggle_advanced() draw_text +: { color: #x0f88fe } }
             }
+            adv_btn := SettingsDisclosureHeader{}
             Label{
                 text: "WHEN A MESSAGE MATCHES" padding: 0 margin: 0
                 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }

@@ -270,7 +270,7 @@ decides an operation and opens that setting directly.
 
 Open a mini-app's settings and choose a permission to see its current state and
 saved allowances. **Add an allowance…** opens room, website and duration choices;
-**Show individual abilities** exposes narrower controls. **AI room permissions**
+Expand **Individual abilities** for narrower controls. **AI room permissions**
 asks for the agent's room and then the permission to edit. Opening or cancelling
 an editor does not grant access.
 

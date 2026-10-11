@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use crate::app::ConfirmDeleteAction;
 use crate::shared::confirmation_modal::ConfirmationModalContent;
+use crate::shared::collapsible_header::CollapsibleHeaderWidgetExt;
 use a2app_core::background::{Job, JobBinding, JobContext, PauseReason, RunOutcome, Trigger, MIN_INTERVAL_SECONDS};
 use crate::home::rooms_list::RoomsListRef;
 use super::background::{self, TaskView};
@@ -191,9 +192,7 @@ script_mod! {
                     text: "Open the mini-app and use its Test button to approve the task before scheduling it. Choose Until you quit Robrix or Forever in the permission popup. Background tasks cannot show popups while running."
                 }
             }
-            show_help := RobrixNeutralIconButton {
-                padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "How background tasks work"
-            }
+            show_help := RobrixSettingsCollapsibleHeader { title: "How background tasks work" }
             task_help := View {
                 visible: false, width: Fill, height: Fit, flow: Down, spacing: 8
                 mod.widgets.PermissionOptionLabel {
@@ -386,10 +385,11 @@ impl Widget for BackgroundTasks {
             if let Some(app) = self.selected_app(cx) { cx.action(BackgroundTasksAction::AppPermissions(app.id.clone())); }
         }
         if self.view.button(cx, ids!(task_sharing)).clicked(actions) { cx.action(BackgroundTasksAction::Sharing); }
-        if self.view.button(cx, ids!(show_help)).clicked(actions) {
-            let visible = !self.view.widget(cx, ids!(task_help)).visible();
-            self.view.widget(cx, ids!(task_help)).set_visible(cx, visible);
-            self.view.button(cx, ids!(show_help)).set_text(cx, if visible { "Hide help" } else { "How background tasks work" });
+        let help = self.view.collapsible_header(cx, ids!(show_help));
+        if let Some(expanded) = help.expansion_changed(actions) {
+            self.view.widget(cx, ids!(task_help)).set_visible(cx, expanded);
+            help.set_expanded(cx, expanded, Animate::No);
+            self.view.redraw(cx);
         }
     }
 
@@ -645,6 +645,8 @@ impl BackgroundTasks {
     }
 
     fn update_form(&mut self, cx: &mut Cx) {
+        let help_expanded = self.view.widget(cx, ids!(task_help)).visible();
+        self.view.collapsible_header(cx, ids!(show_help)).set_expanded(cx, help_expanded, Animate::No);
         let schedule = self.view.permission_choices(cx, ids!(schedule_choice)).selected_item();
         self.view.widget(cx, ids!(interval_section)).set_visible(cx, schedule == 5);
         self.view.widget(cx, ids!(alarm_section)).set_visible(cx, schedule == 3);
@@ -912,6 +914,25 @@ mod tests {
             WidgetRef::script_from_value(vm, value)
         });
         (cx, widget)
+    }
+
+    #[test]
+    fn background_help_disclosure_tracks_expansion_and_survives_form_refresh() {
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<BackgroundTasks>().unwrap();
+        editor.account = super::super::information_flow::account().unwrap_or_default();
+        editor.update_form(&mut cx);
+        let header = editor.view.collapsible_header(&cx, ids!(show_help));
+        assert!(header.borrow().is_some());
+        assert!(!editor.view.widget(&cx, ids!(task_help)).visible());
+        for expanded in [true, false, true] {
+            let actions = cx.capture_actions(|cx| cx.widget_action(header.widget_uid(),
+                crate::shared::collapsible_header::CollapsibleHeaderAction::ExpansionChanged(expanded)));
+            editor.handle_event(&mut cx, &Event::Actions(actions), &mut Scope::empty());
+            assert_eq!(editor.view.widget(&cx, ids!(task_help)).visible(), expanded);
+            editor.update_form(&mut cx);
+            assert_eq!(editor.view.widget(&cx, ids!(task_help)).visible(), expanded);
+        }
     }
 
     fn binding() -> JobBinding {
