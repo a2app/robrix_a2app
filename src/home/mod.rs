@@ -26,6 +26,9 @@ pub mod search_messages;
 pub mod space_lobby;
 pub mod spaces_bar;
 pub mod navigation_tab_bar;
+pub mod nav_history;
+pub mod nav_history_buttons;
+pub mod nav_history_menu;
 pub mod welcome_screen;
 pub mod event_reaction_list;
 pub mod new_message_context_menu;
@@ -57,6 +60,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
     new_message_context_menu::script_mod(vm);
     event_source_modal::script_mod(vm);
     room_context_menu::script_mod(vm);
+    nav_history_menu::script_mod(vm);
     invite_modal::script_mod(vm);
     invite_screen::script_mod(vm);
     tombstone_footer::script_mod(vm);
@@ -70,6 +74,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
     main_desktop_ui::script_mod(vm);
     spaces_bar::script_mod(vm);
     navigation_tab_bar::script_mod(vm);
+    nav_history_buttons::script_mod(vm);
     upload_progress::script_mod(vm);
     // Keep HomeScreen last, it references many widgets registered above.
     home_screen::script_mod(vm);

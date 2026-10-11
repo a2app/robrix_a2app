@@ -602,7 +602,8 @@ script_mod! {
             scroll_bar: ListScrollBar {}
 
             auto_tail: true, // set to `true` to lock the view to the last item.
-            // only bounce at the end, not the start because that triggers back pagination.
+            // `draw_walk()` turns this on once the timeline is fully paginated;
+            // before that, reaching the top back-paginates instead of bouncing.
             bounce_at_start: false,
             bounce_at_end: true,
             // Read-receipt logic listens for scroll position changes.
@@ -1681,6 +1682,7 @@ impl Widget for RoomScreen {
             // Set the ranges of collapsed groups, such that the portallist will skip iterating over them
             // instead of drawing them only for them to be invisible anyway, a big perf win!
             list.set_skipped_ranges(tl_state.state_event_groups.collapsed_ranges());
+            list.bounce_at_start = tl_state.backwards_pagination.is_fully_paginated();
 
             // The AI-room status pill (see populate_ai_room_status above) sits
             // just below the timeline, so the first frame it appears it shrinks
@@ -7220,7 +7222,7 @@ impl Widget for Message {
             script_apply_eval!(cx, self, {
                 draw_bg +: {
                     color: #ffffd1,
-                    color_hover: #xfff9c2,
+                    color_hover: #fff9c2,
                     mentions_bar_color: #ffd54f
                 }
             });

@@ -116,8 +116,8 @@ script_mod! {
         align: Align{x: 0.5, y: 0.5}
 
         auto_tail: false,
-        bounce_at_start: false,
-        bounce_at_end: false,
+        bounce_at_start: true,
+        bounce_at_end: true,
         // Nothing here listens for scroll position changes.
         emit_scroll_actions: false,
         scroll_bar: ScrollBar {  // hide the scroll bar
@@ -796,5 +796,12 @@ impl SpacesBar {
         self.regenerate_invited_spaces(cx);
         self.view.portal_list(cx, ids!(spaces_list)).set_first_id_and_scroll(0, 0.0);
         self.redraw(cx);
+    }
+}
+
+impl SpacesBarRef {
+    /// Returns the avatar of the given space, if it's a joined top-level space in this bar.
+    pub fn get_space_avatar(&self, space_id: &OwnedRoomId) -> Option<FetchedRoomAvatar> {
+        self.borrow()?.all_joined_spaces.get(space_id).map(|space| space.space_avatar.clone())
     }
 }

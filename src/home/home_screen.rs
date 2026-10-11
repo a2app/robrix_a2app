@@ -1,9 +1,13 @@
 use makepad_widgets::*;
 use matrix_sdk::ruma::OwnedEventId;
+#[cfg(feature = "a2app")]
+use {matrix_sdk::ruma::OwnedRoomId, std::collections::HashSet};
 
 use crate::{
     app::{AppState, AppStateAction, SelectedRoom},
     home::{
+        nav_history::{GoBackAction, GoForwardAction, can_show},
+        nav_history_menu::{LongPressWatcher, NavHistoryDirection, request_nav_history_menu},
         add_room::AddRoomScreenWidgetRefExt,
         invite_screen::InviteScreenWidgetRefExt,
         navigation_tab_bar::{NavigationBarAction, SelectedTab},
@@ -13,6 +17,7 @@ use crate::{
         space_lobby::SpaceLobbyScreenWidgetRefExt,
         spaces_bar::SpacesBarAction,
     },
+    logout::logout_confirm_modal::LogoutAction,
     room::{pane_dock::{RoomPaneDockAction, SavedPaneContent}, pinned_messages_list::PinnedMessagesListAction, room_action_bar::{RoomActionBarAction, RoomActionBarWidgetRefExt}, room_pane::{self, RoomPaneKind}},
     settings::{
         app_preferences::{AppPreferencesGlobal, AppPreferencesAction, ViewModeOverride},
@@ -65,6 +70,8 @@ script_mod! {
                     align: Align{y: 0.5}
                     left_button +: {
                         width: 56, height: 40,
+                        // Long-pressing shows the nav history popup menu
+                        enable_long_press: true
                         padding: 8
                         margin: Inset{left: 3}
                         align: Align{x: 0.5, y: 0.5}
@@ -415,6 +422,7 @@ mod navigation_tests {
                         }
                         stack_templates: {
                             TestRoom := StackNavigationView {}
+                            RoomScreenStackNavigationView := StackNavigationView {}
                         }
                     }
                 }
@@ -465,9 +473,9 @@ mod navigation_tests {
                     selected_room: Some(SelectedRoom::to_joined(room.clone(), is_space)), selected_tab,
                     ..Default::default()
                 };
-                home.borrow_mut::<HomeScreen>().unwrap().mobile_screen_history.push(
+                app_state.nav_history.back.push(Some(
                     SelectedRoom::JoinedRoom { room_name_id: room.clone() },
-                );
+                ));
                 let stack = home.stack_navigation(&cx, ids!(view_stack));
                 let (view_id, view) = stack.create_view_from_template(&mut cx, id!(TestRoom)).unwrap();
                 stack.push(&mut cx, view_id);
@@ -479,7 +487,8 @@ mod navigation_tests {
                 let response = deliver(&mut cx, &home, &mut app_state, navigation);
                 assert_eq!(app_state.selected_tab, SelectedTab::MiniApps);
                 assert!(app_state.selected_room.is_none());
-                assert!(home.borrow::<HomeScreen>().unwrap().mobile_screen_history.is_empty());
+                assert!(app_state.nav_history.back.is_empty());
+                assert!(app_state.nav_history.forward.is_empty());
                 assert!(!home.borrow::<HomeScreen>().unwrap().mini_apps_navigation_pending);
                 assert!(stack.destination_view().is_none());
                 assert_mini_apps_page(&mut cx, &home);
@@ -529,6 +538,75 @@ mod navigation_tests {
         deliver(&mut cx, &home, &mut app_state, hidden);
         assert!(stack.current_view().is_none());
         assert_mini_apps_page(&mut cx, &home);
+    }
+
+    #[test]
+    fn back_expires_room_consent_only_when_no_previous_screen_keeps_the_room_open() {
+        for keeps_previous_room in [false, true] {
+            let (mut cx, home, _) = fixture(false);
+            let room = RoomNameId::empty("!back-room-session:example.org".try_into().unwrap());
+            let selected_room = SelectedRoom::JoinedRoom { room_name_id: room.clone() };
+            let mut app_state = AppState { selected_room: Some(selected_room.clone()), ..Default::default() };
+            if keeps_previous_room {
+                app_state.nav_history.back.push(Some(selected_room.clone()));
+            }
+            app_state.nav_history.back.push(None);
+            let stack = home.stack_navigation(&cx, ids!(view_stack));
+            let (view_id, view) = stack.create_view_from_template(&mut cx, id!(TestRoom)).unwrap();
+            stack.push(&mut cx, view_id);
+            let shown = transition_action(&mut cx, view.widget_uid(), StackNavigationTransitionAction::ShowDone);
+            deliver(&mut cx, &home, &mut app_state, shown);
+
+            let back = cx.capture_actions(|cx| cx.action(GoBackAction { steps: 1 }));
+            let response = deliver(&mut cx, &home, &mut app_state, back);
+            assert!(app_state.selected_room.is_none());
+            assert_eq!(app_state.nav_history.forward, vec![Some(selected_room)]);
+            let room_closed = response.iter().any(|action| matches!(action.downcast_ref(),
+                Some(crate::a2app::runtime::A2AppOp::RoomClosed { room_id, .. }) if room_id == room.room_id()));
+            assert_eq!(room_closed, !keeps_previous_room,
+                "forward history can reopen a room but must not keep its closed session alive");
+        }
+    }
+
+    #[test]
+    fn jumping_back_expires_skipped_rooms_from_a_screen_or_the_rooms_list() {
+        for from_rooms_list in [false, true] {
+            let (mut cx, home, _) = fixture(false);
+            let room_screen = |room_id: &str| SelectedRoom::JoinedRoom {
+                room_name_id: RoomNameId::empty(room_id.try_into().unwrap()),
+            };
+            let (a, b, c) = (
+                room_screen("!back-a:example.org"),
+                room_screen("!back-b:example.org"),
+                room_screen("!back-c:example.org"),
+            );
+            let current_screen = (!from_rooms_list).then(|| c.clone());
+            let mut app_state = AppState { selected_room: current_screen.clone(), ..Default::default() };
+            app_state.nav_history.back = vec![Some(a.clone()), Some(b.clone())];
+            let stack = home.stack_navigation(&cx, ids!(view_stack));
+            if !from_rooms_list {
+                let (view_id, view) = stack.create_view_from_template(&mut cx, id!(TestRoom)).unwrap();
+                stack.push(&mut cx, view_id);
+                let shown = transition_action(&mut cx, view.widget_uid(), StackNavigationTransitionAction::ShowDone);
+                deliver(&mut cx, &home, &mut app_state, shown);
+            }
+
+            let back = cx.capture_actions(|cx| cx.action(GoBackAction { steps: 2 }));
+            let response = deliver(&mut cx, &home, &mut app_state, back);
+            assert_eq!(app_state.selected_room, Some(a));
+            assert!(app_state.nav_history.back.is_empty());
+            assert_eq!(app_state.nav_history.forward, vec![current_screen, Some(b.clone())]);
+            let closed_rooms: HashSet<_> = response.iter().filter_map(|action| match action.downcast_ref() {
+                Some(crate::a2app::runtime::A2AppOp::RoomClosed { room_id, .. }) => Some(room_id.clone()),
+                _ => None,
+            }).collect();
+            let mut expected_closed = HashSet::from([b.room_id().clone()]);
+            if !from_rooms_list {
+                expected_closed.insert(c.room_id().clone());
+            }
+            assert_eq!(closed_rooms, expected_closed,
+                "rooms skipped into forward history must expire their room sessions too");
+        }
     }
 
     #[test]
@@ -644,10 +722,17 @@ pub struct MainViewIsDesktop(Option<bool>);
 #[derive(Debug)]
 pub struct MainViewVariantChangedAction;
 
-/// Returns whether the UI is currently showing the wide "desktop" layout.
+/// An action emitted after we show a screen or reload the dock,
+/// which may have take over the back gesture (cancel scope).
+///
+/// This is used to restore that modal's cancel scope, if it's still open.
+#[derive(Debug)]
+pub struct ScreenRestoredAction;
+
+/// Returns whether the UI is currently showing the wide layout, i.e., desktop view mode.
 pub fn effective_is_desktop(cx: &mut Cx) -> bool {
     cx.global::<MainViewIsDesktop>().0
-        .unwrap_or(true) // Before the first selection, default to desktop mode
+        .unwrap_or(true) // Before the first selection, default to desktop view mode
 }
 
 /// Returns the id of the page that shows the given navigation tab.
@@ -674,9 +759,9 @@ pub struct HomeScreen {
     #[rust] previous_selection: SelectedTab,
     #[rust] is_spaces_bar_shown: bool,
 
-    /// A history of previously-selected screens for mobile stack navigation.
-    /// When a view is popped off the stack, the previous `selected_room` is restored.
-    #[rust] mobile_screen_history: Vec<SelectedRoom>,
+    /// The Home or Space tab that was previously selected before the transition
+    /// to mobile view mode or before another transition (like going to AddRoom).
+    #[rust] tab_to_restore_on_mobile: Option<SelectedTab>,
 
     /// Reveal the Mini Apps page once an active mobile transition finishes.
     #[rust] mini_apps_navigation_pending: bool,
@@ -689,6 +774,11 @@ pub struct HomeScreen {
 
     /// The last effective AdaptiveView mode we observed. `Some(true)` means desktop mode.
     #[rust] last_effective_is_desktop: Option<bool>,
+
+    /// Used to handle the go-back gesture by navigating backwards through nav history.
+    #[rust] cancel_scope: Option<CancelScope>,
+
+    #[rust] backwards_nav_button_long_press: LongPressWatcher,
 }
 
 impl ScriptHook for HomeScreen {
@@ -703,8 +793,17 @@ impl ScriptHook for HomeScreen {
 
 impl Widget for HomeScreen {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        // Begin a cancel scope ASAP so that any modal that opens later can take precedence.
+        if self.cancel_scope.is_none() {
+            self.cancel_scope = Some(self.begin_cancel_scope_for(cx, CancelScopeKind::Back));
+        }
         if let Event::Actions(actions) = event {
             let app_state = scope.data.get_mut::<AppState>().unwrap();
+
+            // If a view mode change happened while drawing, we must handle it before
+            // the new MainDesktopUI handles these actions, which includes loading its dock.
+            self.sync_effective_view_mode(cx, app_state);
+
             for action in actions {
                 match action.downcast_ref() {
                     Some(NavigationBarAction::GoToHome) => {
@@ -723,7 +822,7 @@ impl Widget for HomeScreen {
                         ) {
                             continue;
                         }
-                        // On mobile, the AddRoom page is at the root view ( eneath any screens pushed onto the stack),
+                        // On mobile, the AddRoom page is at the root view (beneath any screens pushed onto the stack),
                         // so we have to pop all of them off to show it.
                         // TODO: we should probably change this to allow the AddRoom page to be pushed onto the stack
                         //       in addition to also being accessible from the root.
@@ -731,11 +830,10 @@ impl Widget for HomeScreen {
                             && stack_navigation.current_view().is_some()
                             && !stack_navigation.is_transitioning()
                         {
-                            cancel_all_dictation();
-                            for screen in app_state.selected_room.take().into_iter().chain(self.mobile_screen_history.drain(..)) {
-                                screen.drop_resources(cx);
-                            }
-                            stack_navigation.pop_to_root(cx);
+                            // As with the desktop dock, the current screen in mobile view mode stays selected
+                            // such that once AddRoom is done, we can go back to that current screen.
+                            self.tab_to_restore_on_mobile = Some(app_state.selected_tab.clone());
+                            self.pop_to_rooms_list(cx);
                         }
                         self.switch_to_tab(cx, app_state, SelectedTab::AddRoom);
                         if let Some(address) = search_for
@@ -756,7 +854,7 @@ impl Widget for HomeScreen {
                     // Only open the settings screen if it is not currently open.
                     Some(NavigationBarAction::OpenSettings) => {
                         if !matches!(app_state.selected_tab, SelectedTab::Settings) {
-                            self.cancel_dictation_if_page_changes(cx, &app_state.selected_tab, &SelectedTab::Settings);
+                            cancel_all_dictation();
                             self.previous_selection = std::mem::replace(&mut app_state.selected_tab, SelectedTab::Settings);
                             cx.action(NavigationBarAction::TabSelected(app_state.selected_tab.clone()));
                             if let Some(settings_page) = self.update_active_page_from_selection(cx, app_state) {
@@ -818,11 +916,7 @@ impl Widget for HomeScreen {
                     && !effective_is_desktop(cx)
                 {
                     self.switch_to_tab(cx, app_state, SelectedTab::Home);
-                    self.push_selected_screen_view(
-                        cx,
-                        app_state,
-                        SelectedRoom::InvitedRoom { room_name_id: space_name_id },
-                    );
+                    self.navigate_to_screen(cx, app_state, SelectedRoom::InvitedRoom { room_name_id: space_name_id });
                     continue;
                 }
 
@@ -830,17 +924,14 @@ impl Widget for HomeScreen {
                 // while mobile owns StackNavigation screen pushes here.
                 match action.as_widget_action().cast() {
                     RoomsListAction::Selected(selected_room) if !effective_is_desktop(cx) => {
-                        self.push_selected_screen_view(cx, app_state, selected_room.clone());
-                        if let SelectedRoom::RoomPane { room_name_id, kind } = &selected_room {
-                            if app_state.selected_room.as_ref() == Some(&selected_room) {
-                                // Like its desktop tab, a pane has only one popped-out screen, so an older one won't be shown again.
-                                self.mobile_screen_history.retain(|sr| sr != &selected_room);
-                            } else {
-                                // A pane that couldn't be popped out (e.g., mid-transition) is returned its timeline.
-                                let timeline_kind = room_pane::popped_out_from(room_name_id.room_id(), kind);
-                                let saved = room_pane::take_popped_out_state(room_name_id.room_id(), kind);
-                                room_pane::dock_when_shown(cx, timeline_kind, kind.clone(), saved);
-                            }
+                        let is_shown = self.navigate_to_screen(cx, app_state, selected_room.clone());
+                        // A pane that couldn't be popped out (e.g., mid-transition) is returned its timeline.
+                        if let SelectedRoom::RoomPane { room_name_id, kind } = &selected_room
+                            && !is_shown
+                        {
+                            let timeline_kind = room_pane::popped_out_from(room_name_id.room_id(), kind);
+                            let saved = room_pane::take_popped_out_state(room_name_id.room_id(), kind);
+                            room_pane::dock_when_shown(cx, timeline_kind, kind.clone(), saved);
                         }
                     }
                     // On desktop, `MainDesktopUI` handles this, so we only need to update this in mobile view mode.
@@ -902,15 +993,16 @@ impl Widget for HomeScreen {
                     && !effective_is_desktop(cx)
                     && app_state.selected_room == Some(SelectedRoom::RoomPane { room_name_id, kind })
                 {
-                    self.pop_selected_screen_view(cx, app_state);
+                    self.pop_selected_screen_view(cx, app_state, 1);
                 }
 
                 // A pinned message was clicked in a popped-out pane, or in a pane docked in another timeline,
                 // so show the timeline that contains it, and then jump to it there.
                 if !effective_is_desktop(cx)
                     && let PinnedMessagesListAction::MessageClicked { room_name_id, timeline_kind, event_id, description } = action.as_widget_action().cast()
-                    && self.show_timeline_and_jump_to_event(cx, app_state, &room_name_id, &timeline_kind, event_id, description)
+                    && self.return_pane_to_screen(cx, app_state, room_pane::timeline_screen(&room_name_id, &timeline_kind))
                 {
+                    self.jump_to_event_when_shown(cx, &timeline_kind, event_id, description);
                     // Navigating away hid the pinned messages pane, so we show it again here.
                     let saved = self.save_pane_screen_state(cx, &room_name_id, &RoomPaneKind::PinnedMessages);
                     room_pane::dock_when_shown(cx, timeline_kind, RoomPaneKind::PinnedMessages, saved);
@@ -925,7 +1017,10 @@ impl Widget for HomeScreen {
                             self.navigate_to_screen(cx, app_state, screen.clone());
                         }
                         Some(NavigateToLinkAction::Event { room_name_id, timeline_kind, event_id, description }) => {
-                            self.show_timeline_and_jump_to_event(cx, app_state, room_name_id, timeline_kind, event_id.clone(), description.clone());
+                            let timeline_screen = room_pane::timeline_screen(room_name_id, timeline_kind);
+                            if self.navigate_to_screen(cx, app_state, timeline_screen) {
+                                self.jump_to_event_when_shown(cx, timeline_kind, event_id.clone(), description.clone());
+                            }
                         }
                         None => {}
                     }
@@ -947,18 +1042,46 @@ impl Widget for HomeScreen {
                 }
 
                 // When a stack navigation pop is requested (back button pressed),
-                // reveal the previous screen from HomeScreen's mobile history.
+                // reveal the previous screen from the nav history.
                 if let StackNavigationAction::Pop = action.as_widget_action().cast() {
-                    self.pop_selected_screen_view(cx, app_state);
+                    self.pop_selected_screen_view(cx, app_state, 1);
+                }
+
+                // Going back pops the shown screen, or shows the previous screen atop the rooms list.
+                if let Some(GoBackAction { steps }) = action.downcast_ref() && !effective_is_desktop(cx) {
+                    if self.view.stack_navigation(cx, ids!(view_stack)).destination_view().is_some() {
+                        self.pop_selected_screen_view(cx, app_state, *steps);
+                    } else {
+                        self.go_back_from_rooms_list(cx, app_state, *steps, || true);
+                    }
+                }
+
+                if let Some(GoForwardAction { steps }) = action.downcast_ref() && !effective_is_desktop(cx) {
+                    let stack_navigation = self.view.stack_navigation(cx, ids!(view_stack));
+                    let current_screen = app_state.selected_room.clone().filter(|_| stack_navigation.current_view().is_some());
+                    if let Some(next_place) = app_state.nav_history.next_place(current_screen.as_ref(), *steps, can_show(cx)) {
+                        let old_screens = Self::screens_with_resources(app_state);
+                        let is_shown = match next_place {
+                            Some(next_screen) => self.push_selected_screen_view(cx, app_state, next_screen, Animate::Yes),
+                            // In mobile view mode, the rooms list *is* the root/home view.
+                            None if !stack_navigation.is_transitioning() => {
+                                app_state.selected_room = None;
+                                self.pop_to_rooms_list(cx);
+                                true
+                            }
+                            None => false,
+                        };
+                        if is_shown {
+                            app_state.nav_history.record_going_forward_from(current_screen, *steps, can_show(cx));
+                            Self::drop_resources_left_behind(cx, app_state, old_screens);
+                        }
+                    }
                 }
 
                 if let Some(
                     AppStateAction::RoomNameUpdated(new_room_name)
                     | AppStateAction::RoomLoadedSuccessfully { room_name_id: new_room_name, .. }
                 ) = action.downcast_ref() {
-                    for room in &mut self.mobile_screen_history {
-                        room.update_room_name(new_room_name);
-                    }
                     self.previous_selection.update_space_name(new_room_name);
                     let stack_navigation = self.view.stack_navigation(cx, ids!(view_stack));
                     if let Some(view_id) = stack_navigation.destination_view()
@@ -967,6 +1090,30 @@ impl Widget for HomeScreen {
                     {
                         stack_navigation.set_title(cx, view_id, &room.display_name());
                     }
+                }
+
+                if let Some(LogoutAction::ClearAppState { .. }) = action.downcast_ref() {
+                    self.tab_to_restore_on_mobile = None;
+                }
+
+            }
+
+            // Once the rooms list is shown again and stack nav finished its transition animation,
+            // we show the selected screen atop it.
+            // We do this after handling all actions, such that a screen opened as a result of one
+            // of those actions (e.g., joining or going to a room via AddRoom) is shown on the top.
+            let is_transitioning = self.view.stack_navigation(cx, ids!(view_stack)).is_transitioning();
+            if let Some(tab) = self.tab_to_restore_on_mobile
+                .take_if(|_| page_for_tab(&app_state.selected_tab) == id!(home_page) && !is_transitioning)
+            {
+                if tab == app_state.selected_tab {
+                    self.restore_selected_screen_view(cx, app_state);
+                } else if self.view.stack_navigation(cx, ids!(view_stack)).destination_view().is_none() {
+                    // Another rooms list is shown now instead of the selected screen.
+                    let old_screens = Self::screens_with_resources(app_state);
+                    let old_screen = app_state.selected_room.take();
+                    app_state.nav_history.record_navigation_from(old_screen);
+                    Self::drop_resources_left_behind(cx, app_state, old_screens);
                 }
             }
         }
@@ -982,6 +1129,31 @@ impl Widget for HomeScreen {
         if self.mini_apps_navigation_pending {
             let app_state = scope.data.get_mut::<AppState>().unwrap();
             self.finish_mini_apps_navigation(cx, app_state);
+        }
+
+        // On the mobile rooms list, the go-back gesture returns to the previous place in the nav history.
+        if self.cancel_scope.as_ref().is_some_and(|s| cx.owns_cancel(s))
+            && !effective_is_desktop(cx)
+            && (matches!(event, Event::BackPressed { .. }) || matches!(event, Event::MouseUp(e) if e.button.is_back()))
+        {
+            let app_state = scope.data.get_mut::<AppState>().unwrap();
+            self.go_back_from_rooms_list(cx, app_state, 1, || {
+                event.back_pressed() || matches!(event, Event::MouseUp(e) if e.button.is_back())
+            });
+        }
+
+        // A long click/press on the stack nav header's back button also shows the nav history popup menu.
+        let back_button_with_uid = |cx: &mut Cx, uid: WidgetUid| {
+            let stack_navigation = self.view.stack_navigation(cx, ids!(view_stack));
+            stack_navigation.dynamic_stack_view_ids().into_iter()
+                .map(|view_id| stack_navigation.view_by_id(cx, view_id).button(cx, ids!(left_button)))
+                .find(|button| button.widget_uid() == uid)
+        };
+
+        if let Some((uid, held_pointer)) = self.backwards_nav_button_long_press.handle_event(cx, event, |cx, uid| back_button_with_uid(cx, uid).is_some())
+            && let Some(back_button) = back_button_with_uid(cx, uid)
+        {
+            request_nav_history_menu(cx, NavHistoryDirection::Back, &back_button, held_pointer);
         }
     }
 
@@ -1009,9 +1181,13 @@ impl HomeScreen {
         if stack_navigation.is_transitioning() { return; }
 
         cancel_all_dictation();
-        if let Some(room) = app_state.selected_room.take() {
-            room.drop_resources(cx);
+        for screen in app_state.selected_room.take().into_iter()
+            .chain(app_state.nav_history.back.iter().flatten().cloned())
+        {
+            screen.drop_resources_unless_in_saved_dock(cx, app_state);
         }
+        app_state.nav_history.clear();
+        self.tab_to_restore_on_mobile = None;
         // Park room screens so room work can continue in the Mini Apps console.
         self.clear_mobile_navigation_state(cx);
         self.mini_apps_navigation_pending = false;
@@ -1055,14 +1231,17 @@ impl HomeScreen {
             return;
         }
 
-        // If we transitioned from mobile --> desktop view mode, the dock will reload the tabs
-        // from its previously-saved state, so we need to free the current selected room now
-        // (if it was a thread timeline), and then also clear any thread timelines in the mobile nav stack.
-        if !was_desktop && is_desktop {
-            if let Some(room) = app_state.selected_room.as_ref() {
-                room.drop_resources(cx);
+        // If we transitioned from mobile to desktop view mode, the dock will only show
+        // the current screen plus the screens in its saved dock state,
+        // so free the resources from any other screens that won't be shown anymore.
+        if is_desktop {
+            for screen in app_state.nav_history.back.iter().flatten() {
+                if app_state.selected_room.as_ref() != Some(screen) {
+                    screen.drop_resources_unless_in_saved_dock(cx, app_state);
+                }
             }
         }
+        self.tab_to_restore_on_mobile = None;
 
         // If the mentionable popup was shown, close it because the whole UI has changed/moved.
         if cx.has_global::<MentionablePopupRef>() {
@@ -1071,10 +1250,47 @@ impl HomeScreen {
 
         self.clear_mobile_navigation_state(cx);
 
-        // Switching into mobile mode lands on the rooms list, so no room should
-        // be drawn as selected until one is actually clicked.
-        if !is_desktop {
-            cx.action(AppStateAction::FocusNone);
+        // Transitioning to mobile view mode shows the current screen atop the rooms list.
+        if !is_desktop && app_state.selected_room.is_some() {
+            if page_for_tab(&app_state.selected_tab) == id!(home_page)
+                && !self.view.stack_navigation(cx, ids!(view_stack)).is_empty()
+            {
+                self.restore_selected_screen_view(cx, app_state);
+            } else {
+                // Settings or AddRoom may be hiding the rooms list that the current screen goes atop of. If not, the mobile
+                // view doesn't exist yet (e.g., a restored view mode was applied upon login), so we start on the rooms list.
+                self.tab_to_restore_on_mobile = match &app_state.selected_tab {
+                    SelectedTab::AddRoom | SelectedTab::Settings => matches!(self.previous_selection, SelectedTab::Home | SelectedTab::Space { .. })
+                        .then(|| self.previous_selection.clone()),
+                    SelectedTab::Home | SelectedTab::Space { .. } | SelectedTab::MiniApps => None,
+                };
+                if self.tab_to_restore_on_mobile.is_none() {
+                    let old_screens = Self::screens_with_resources(app_state);
+                    let old_screen = app_state.selected_room.take();
+                    app_state.nav_history.record_navigation_from(old_screen);
+                    Self::drop_resources_left_behind(cx, app_state, old_screens);
+                    // This overrides any focus that a dock loaded in this batch has yet to apply.
+                    cx.action(AppStateAction::FocusNone);
+                }
+            }
+        }
+    }
+
+    /// Shows the selected screen atop the mobile rooms list without animating it in.
+    ///
+    /// This is useful for showing the screen that was last selected in the desktop view mode
+    /// (before we switched to mobile view mode)..
+    fn restore_selected_screen_view(&mut self, cx: &mut Cx, app_state: &mut AppState) {
+        let stack_navigation = self.view.stack_navigation(cx, ids!(view_stack));
+        // If another screen was just opened atop the rooms list, don't put this one in front of it.
+        if stack_navigation.current_view().is_some() || stack_navigation.is_transitioning() {
+            return;
+        }
+        // Skip any screens for rooms that the user has left.
+        let can_show = can_show(cx);
+        app_state.selected_room.take_if(|screen| !can_show(screen));
+        if let Some(screen) = app_state.selected_room.clone() {
+            self.push_selected_screen_view(cx, app_state, screen, Animate::No);
         }
     }
 
@@ -1083,18 +1299,11 @@ impl HomeScreen {
         cx: &mut Cx,
         app_state: &mut AppState,
     ) -> Option<WidgetRef> {
-        self.view
-            .page_flip(cx, ids!(home_screen_page_flip))
-            .set_active_page(cx, page_for_tab(&app_state.selected_tab))
-    }
-
-    /// Cancels dictation if showing `new_tab` instead of `old_tab` hides the page the user is looking at.
-    fn cancel_dictation_if_page_changes(&self, cx: &mut Cx, old_tab: &SelectedTab, new_tab: &SelectedTab) {
-        // On mobile, a pushed screen stays in front of whichever page is shown.
-        let is_page_in_front = self.view.stack_navigation(cx, ids!(view_stack)).current_view().is_none();
-        if is_page_in_front && page_for_tab(old_tab) != page_for_tab(new_tab) {
-            cancel_all_dictation();
-        }
+        let page_flip = self.view.page_flip(cx, ids!(home_screen_page_flip));
+        // The home page must exist even behind AddRoom or Settings, in order for its
+        // rooms list and desktop dock to keep handling events like room updates or logout.
+        page_flip.page(cx, id!(home_page));
+        page_flip.set_active_page(cx, page_for_tab(&app_state.selected_tab))
     }
 
     fn set_mobile_stack_header_height(cx: &mut Cx, stack_view: &WidgetRef, height: f64) {
@@ -1208,13 +1417,6 @@ impl HomeScreen {
     }
 
     fn clear_mobile_navigation_state(&mut self, cx: &mut Cx) {
-        // Discarding mobile navigation frees the resources of its history screens.
-        // The caller handles the current room.
-        for room in &self.mobile_screen_history {
-            room.drop_resources(cx);
-        }
-        self.mobile_screen_history.clear();
-
         let stack_navigation = self.view.stack_navigation(cx, ids!(view_stack));
         for view_id in stack_navigation.dynamic_stack_view_ids() {
             let stack_navigation_view = stack_navigation.view_by_id(cx, view_id);
@@ -1240,49 +1442,39 @@ impl HomeScreen {
             .hide_displayed(cx);
     }
 
-    /// Pushes the given screen onto the mobile screen history and animates it in.
+    /// Pushes the given screen onto the mobile nav stack without touching the nav history,
+    /// animating it in unless `animate` is `No`. Returns whether it was pushed (not mid-transition).
     fn push_selected_screen_view(
         &mut self,
         cx: &mut Cx,
         app_state: &mut AppState,
         sr: SelectedRoom,
-    ) {
+        animate: Animate,
+    ) -> bool {
         let stack_navigation = self.view.stack_navigation(cx, ids!(view_stack));
         if stack_navigation.is_transitioning() {
-            return;
-        }
-        self.mini_apps_navigation_pending = false;
-        let has_current_mobile_screen = stack_navigation.current_view().is_some();
-        // If it has the same room ID and the same screen type (invite, joined, etc),
-        // then we actually don't need to do anything. Otherwise we need to change it
-        // to a new screen, e.g., a joined RoomScreen or a joined SpaceLobbyScreen.
-        let is_same_screen = app_state.selected_room.as_ref().is_some_and(|c|
-            c == &sr && std::mem::discriminant(c) == std::mem::discriminant(&sr)
-        );
-        if has_current_mobile_screen && is_same_screen {
-            return;
+            return false;
         }
         let Some(view_id) = self.populate_mobile_stack_view(cx, &stack_navigation, &sr) else {
-            return;
+            return false;
         };
-
-        // Save the current selected_room onto the navigation stack before replacing it.
-        if has_current_mobile_screen {
-            if let Some(prev) = app_state.selected_room.take() {
-                self.mobile_screen_history.push(prev);
-            }
-        }
+        self.mini_apps_navigation_pending = false;
         app_state.selected_room = Some(sr);
         // The pushed screen covers whatever the user was dictating into.
         cancel_all_dictation();
-        stack_navigation.push(cx, view_id);
+        match animate {
+            Animate::Yes => stack_navigation.push(cx, view_id),
+            Animate::No => stack_navigation.push_without_animation(cx, view_id),
+        }
+        cx.action(ScreenRestoredAction);
         self.view.redraw(cx);
+        true
     }
 
     /// Switches to (selects) the given navigation tab, if it isn't already the selected one.
     fn switch_to_tab(&mut self, cx: &mut Cx, app_state: &mut AppState, new_tab: SelectedTab) {
         if app_state.selected_tab == new_tab { return }
-        self.cancel_dictation_if_page_changes(cx, &app_state.selected_tab, &new_tab);
+        cancel_all_dictation();
         self.previous_selection = std::mem::replace(&mut app_state.selected_tab, new_tab);
         cx.action(NavigationBarAction::TabSelected(app_state.selected_tab.clone()));
         self.update_active_page_from_selection(cx, app_state);
@@ -1309,19 +1501,13 @@ impl HomeScreen {
             if let AcceptedInviteKind::Space { dock_space: Some(dock_space) } = &kind {
                 self.switch_to_tab(cx, app_state, SelectedTab::Space { space_name_id: dock_space.clone() });
             }
+            // The joined screen takes the invite screen's place, so going back won't show the invite.
             self.push_selected_screen_view(
                 cx,
                 app_state,
                 SelectedRoom::to_joined(room_name_id.clone(), is_space),
+                Animate::Yes,
             );
-            // The invite we replaced was pushed onto the mobile history stack,
-            // so we need to remove it to ensure that it won't show up if the user goes back.
-            if self.mobile_screen_history.last().is_some_and(is_this_invite) {
-                self.mobile_screen_history.pop();
-            }
-        }
-        for room in &mut self.mobile_screen_history {
-            room.upgrade_invite_to_joined(room_id, is_space);
         }
     }
 
@@ -1344,7 +1530,7 @@ impl HomeScreen {
             pane_screen.vacate(cx);
         }
         let timeline_kind = room_pane::popped_out_from(room_name_id.room_id(), &kind);
-        if self.navigate_to_screen(cx, app_state, room_pane::timeline_screen(&room_name_id, &timeline_kind)) {
+        if self.return_pane_to_screen(cx, app_state, room_pane::timeline_screen(&room_name_id, &timeline_kind)) {
             room_pane::dock_when_shown(cx, timeline_kind, kind, saved);
         }
     }
@@ -1358,121 +1544,232 @@ impl HomeScreen {
         )
     }
 
-    /// Shows the screen for the given selected room.
-    ///
-    /// Based on where it is, this either goes back to it if it's right beneath
-    /// the current screen (e.g., the room that a pane was popped out of),
-    /// or otherwise pushes it on the top or else by pushing it.
-    ///
-    /// A popped-out room pane that it replaces won't be shown again upon going back.
-    ///
+    /// Shows the given screen, such that going back from it returns to the current screen.
     /// Returns whether the given screen is now shown (or being transitioned to).
     fn navigate_to_screen(&mut self, cx: &mut Cx, app_state: &mut AppState, screen: SelectedRoom) -> bool {
+        let stack_navigation = self.view.stack_navigation(cx, ids!(view_stack));
         // We can't navigate during a transition, so just don't do anything,
         // and let the user just try again.
-        if self.view.stack_navigation(cx, ids!(view_stack)).is_transitioning() {
+        if stack_navigation.is_transitioning() {
             return false;
         }
 
+        // A screen with the same room ID but another type (e.g., a joined room vs. an invite) is a different screen.
         let is_screen = |sr: &SelectedRoom| {
             sr == &screen
             && std::mem::discriminant(sr) == std::mem::discriminant(&screen)
         };
-        let prev_screen = app_state.selected_room.clone();
-        if self.mobile_screen_history.last().is_some_and(is_screen) {
-            self.pop_selected_screen_view(cx, app_state);
-        } else {
-            self.push_selected_screen_view(cx, app_state, screen.clone());
-            if let Some(pane_screen @ SelectedRoom::RoomPane { .. }) = prev_screen
-                && app_state.selected_room.as_ref() != Some(&pane_screen)
-                && self.mobile_screen_history.last() == Some(&pane_screen)
-            {
-                self.mobile_screen_history.pop();
-                pane_screen.drop_resources(cx);
+        let is_shown = stack_navigation.current_view().is_some();
+        // Without a shown screen, we're on the rooms list (home) even if a room is still selected,
+        // unless that room is waiting behind AddRoom or Settings to be shown again.
+        let current_screen = app_state.selected_room.clone()
+            .filter(|_| is_shown || self.tab_to_restore_on_mobile.is_some());
+        let is_current = current_screen.as_ref().is_some_and(is_screen);
+        if is_current && is_shown {
+            return true;
+        }
+        let old_screens = Self::screens_with_resources(app_state);
+        let is_pushed = self.push_selected_screen_view(cx, app_state, screen, Animate::Yes);
+        if is_pushed {
+            self.tab_to_restore_on_mobile = None;
+            // If we just re-showed the current screen (it was hidden behind AddRoom or Settings),
+            // we don't record it in the history, or else going back from it would return to itself.
+            if !is_current {
+                app_state.nav_history.record_navigation_from(current_screen);
+                Self::drop_resources_left_behind(cx, app_state, old_screens);
             }
         }
-        app_state.selected_room.as_ref().is_some_and(is_screen)
+        is_pushed
     }
 
-    /// Shows the given timeline screen and then jumps to the given event in it.
-    ///
-    /// Returns whether that screen is now shown (or being transitioned to).
-    fn show_timeline_and_jump_to_event(
-        &mut self,
-        cx: &mut Cx,
-        app_state: &mut AppState,
-        room_name_id: &RoomNameId,
-        timeline_kind: &TimelineKind,
-        event_id: OwnedEventId,
-        description: String,
-    ) -> bool {
-        if !self.navigate_to_screen(cx, app_state, room_pane::timeline_screen(room_name_id, timeline_kind)) {
-            return false;
+    /// Returns the screens that keep their resources when in mobile view mode,
+    /// which is currently just the active screen and the one right before it in history.
+    fn screens_with_resources(app_state: &AppState) -> [Option<SelectedRoom>; 2] {
+        [app_state.selected_room.clone(), app_state.nav_history.back.last().cloned().flatten()]
+    }
+
+    /// Frees the resources of the given screens.
+    fn drop_resources_left_behind(cx: &mut Cx, app_state: &AppState, old_screens: [Option<SelectedRoom>; 2]) {
+        let screens = Self::screens_with_resources(app_state);
+        for screen in old_screens.into_iter().flatten() {
+            if !screens.iter().flatten().any(|kept_screen| kept_screen == &screen) {
+                screen.drop_resources_unless_in_saved_dock(cx, app_state);
+            }
         }
+    }
+
+    /// The room sessions kept open by the current screen or the mobile back stack.
+    #[cfg(feature = "a2app")]
+    fn room_ids_in_mobile_navigation(app_state: &AppState) -> HashSet<OwnedRoomId> {
+        app_state.selected_room.iter().chain(app_state.nav_history.back.iter().flatten())
+            .map(|screen| screen.room_id().clone())
+            .collect()
+    }
+
+    /// Expires sessions whose last mobile screen was removed by going back.
+    /// Forward history can reopen those screens, but does not keep their consent alive.
+    #[cfg(feature = "a2app")]
+    fn close_room_sessions_left_behind(cx: &mut Cx, app_state: &AppState, old_room_ids: HashSet<OwnedRoomId>) {
+        let room_ids = Self::room_ids_in_mobile_navigation(app_state);
+        for room_id in old_room_ids.difference(&room_ids) {
+            crate::a2app::runtime::on_room_closed(cx, room_id);
+        }
+    }
+
+    /// Shows the given timeline screen that the current popped-out pane (if any) goes back into.
+    /// Returns whether that screen is now shown (or being transitioned to).
+    fn return_pane_to_screen(&mut self, cx: &mut Cx, app_state: &mut AppState, screen: SelectedRoom) -> bool {
+        let Some(pane_screen @ SelectedRoom::RoomPane { .. }) = app_state.selected_room.clone() else {
+            return self.navigate_to_screen(cx, app_state, screen);
+        };
+
+        // If going back from the pane would show that screen anyway, we just go back to it.
+        let is_shown = if app_state.nav_history.previous_place(Some(&pane_screen), 1, can_show(cx)).flatten().as_ref() == Some(&screen) {
+            self.pop_selected_screen_view(cx, app_state, 1)
+        }
+        else {
+            // The pane becomes that screen, so that screen takes the pane's place in the nav history
+            // (see `replace()` below) instead of adding a new place.
+            let is_pushed = self.push_selected_screen_view(cx, app_state, screen.clone(), Animate::Yes);
+            if is_pushed {
+                app_state.nav_history.forward.clear();
+            }
+            is_pushed
+        };
+        if is_shown {
+            app_state.nav_history.replace(&pane_screen, &screen, app_state.selected_room.as_ref());
+            // A saved desktop dock would otherwise show the pane in its own tab again.
+            let pane_tab_id = pane_screen.tab_id();
+            for saved in std::iter::once(&mut app_state.saved_dock_state_home)
+                .chain(app_state.saved_dock_state_per_space.values_mut())
+            {
+                if saved.dock_items.remove(&pane_tab_id).is_none() {
+                    continue;
+                }
+                let mut tab_shown_instead = None;
+                for item in saved.dock_items.values_mut() {
+                    if let DockItem::Tabs { tabs, selected, .. } = item
+                        && let Some(pos) = tabs.iter().position(|tab_id| *tab_id == pane_tab_id)
+                    {
+                        tabs.remove(pos);
+                        if pos < *selected || *selected >= tabs.len() {
+                            *selected = selected.saturating_sub(1);
+                        }
+                        tab_shown_instead = tabs.get(*selected).copied();
+                    }
+                }
+                saved.open_rooms.remove(&pane_tab_id);
+                saved.room_order.retain(|sr| sr.tab_id() != pane_tab_id);
+                if saved.selected_room.as_ref().is_some_and(|sr| sr.tab_id() == pane_tab_id) {
+                    saved.selected_room = tab_shown_instead.and_then(|tab_id| saved.open_rooms.get(&tab_id).cloned());
+                }
+            }
+            pane_screen.drop_resources(cx);
+        }
+        is_shown
+    }
+
+    /// Jumps to the given event in the timeline screen that's shown (or being transitioned to).
+    fn jump_to_event_when_shown(&self, cx: &mut Cx, timeline_kind: &TimelineKind, event_id: OwnedEventId, description: String) {
         let stack_navigation = self.view.stack_navigation(cx, ids!(view_stack));
         if let Some(view_id) = stack_navigation.destination_view() {
             stack_navigation.view_by_id(cx, view_id)
                 .room_screen(cx, ids!(room_screen))
                 .jump_to_event_when_shown(cx, timeline_kind, event_id, description);
         }
-        true
     }
 
-    /// Pops the current mobile screen, revealing the previous screen or the room list root.
-    fn pop_selected_screen_view(&mut self, cx: &mut Cx, app_state: &mut AppState) {
+    /// Goes back N `steps` in the nav history, if there are that many.
+    ///
+    /// We check `should_go_back` only once we know that we can go back, since it may consume the go-back gesture.
+    fn go_back_from_rooms_list(
+        &mut self,
+        cx: &mut Cx,
+        app_state: &mut AppState,
+        steps: usize,
+        should_go_back: impl FnOnce() -> bool,
+    ) {
+        let stack_navigation = self.view.stack_navigation(cx, ids!(view_stack));
+        if page_for_tab(&app_state.selected_tab) == id!(home_page)
+            && stack_navigation.current_view().is_none()
+            && !stack_navigation.is_transitioning()
+            && let Some(Some(previous_screen)) = app_state.nav_history.previous_place(None, steps, can_show(cx))
+            && should_go_back()
+        {
+            let old_screens = Self::screens_with_resources(app_state);
+            #[cfg(feature = "a2app")]
+            let old_room_ids = Self::room_ids_in_mobile_navigation(app_state);
+            if self.push_selected_screen_view(cx, app_state, previous_screen, Animate::Yes) {
+                app_state.nav_history.record_going_back_from(None, steps, can_show(cx));
+                Self::drop_resources_left_behind(cx, app_state, old_screens);
+                #[cfg(feature = "a2app")]
+                Self::close_room_sessions_left_behind(cx, app_state, old_room_ids);
+            }
+        }
+    }
+
+    /// Pops every screen off the mobile nav stack, revealing the rooms list.
+    fn pop_to_rooms_list(&self, cx: &mut Cx) {
+        cancel_all_dictation();
+        self.view.stack_navigation(cx, ids!(view_stack)).pop_to_root(cx);
+    }
+
+    /// Pops the current mobile screen, revealing the screen N `steps` back in the nav history,
+    /// or the root view (rooms list) if none.
+    ///
+    /// Returns whether we actually went back, which can't happen during a transition.
+    fn pop_selected_screen_view(&mut self, cx: &mut Cx, app_state: &mut AppState, steps: usize) -> bool {
         let stack_nav = self.view.stack_navigation(cx, ids!(view_stack));
         if stack_nav.is_transitioning() {
-            return;
+            return false;
         }
         // The popped screen is what the user was dictating into.
         cancel_all_dictation();
+        let old_screens = Self::screens_with_resources(app_state);
+        #[cfg(feature = "a2app")]
+        let old_room_ids = Self::room_ids_in_mobile_navigation(app_state);
         let Some(current_screen) = app_state.selected_room.take() else {
             // If we didn't have a current screen, something's buggy,
-            // so the safest option is to clear the mobile stack and start over. nbd.
-            self.mobile_screen_history.clear();
-            return;
+            // so the safest option is to clear the nav history and start over. nbd.
+            app_state.nav_history.clear();
+            return false;
         };
         // Going back from a popped-out pane closes it, e.g., quitting its mini-app.
+        // Returning that pane to its room vacates it first, so its content stays alive.
         let current_pane_screen = matches!(current_screen, SelectedRoom::RoomPane { .. })
             .then(|| stack_nav.current_view())
             .flatten()
             .map(|view_id| stack_nav.view_by_id(cx, view_id).room_pane_screen(cx, ids!(room_pane_screen)));
-        // A popped-out pane that can't be shown again (e.g., its mini-app stopped) is skipped.
-        let revealed = loop {
-            let Some(previous) = self.mobile_screen_history.pop() else { break None };
-            if let Some(view_id) = self.populate_mobile_stack_view(cx, &stack_nav, &previous) {
-                break Some((previous, view_id));
-            }
-            if !matches!(previous, SelectedRoom::RoomPane { .. }) {
-                // Nav failed; current_screen is restored, so don't free it.
-                app_state.selected_room = Some(current_screen);
-                self.mobile_screen_history.push(previous);
-                return;
-            }
+        let Some(previous_screen) = app_state.nav_history.previous_place(Some(&current_screen), steps, can_show(cx)) else {
+            app_state.selected_room = Some(current_screen);
+            return false;
         };
-        // current_screen is gone for good — release its timeline or pane resources.
-        current_screen.drop_resources(cx);
+        let previous_view_id = match &previous_screen {
+            Some(previous) => {
+                let Some(view_id) = self.populate_mobile_stack_view(cx, &stack_nav, previous) else {
+                    // Nav failed; current_screen is restored, so don't free it.
+                    app_state.selected_room = Some(current_screen);
+                    return false;
+                };
+                Some(view_id)
+            }
+            None => None,
+        };
         if let Some(pane_screen) = current_pane_screen {
             pane_screen.close_content(cx);
         }
-        match revealed {
-            Some((previous, view_id)) => {
-                app_state.selected_room = Some(previous);
-                stack_nav.pop_to_view(cx, view_id);
-            }
-            None => {
-                app_state.selected_room = None;
-                stack_nav.pop_to_root(cx);
-            }
+        app_state.nav_history.record_going_back_from(Some(current_screen), steps, can_show(cx));
+        app_state.selected_room = previous_screen;
+        // Going forward will re-create the popped screen, so we free its resources now
+        // if it's not in use anywhere else (like in a saved dock state that we may soon restore).
+        Self::drop_resources_left_behind(cx, app_state, old_screens);
+        match previous_view_id {
+            Some(view_id) => stack_nav.pop_to_view(cx, view_id),
+            None => stack_nav.pop_to_root(cx),
         }
         #[cfg(feature = "a2app")]
-        if !app_state.selected_room.iter().chain(&self.mobile_screen_history)
-            .any(|room| room.room_id() == current_screen.room_id())
-        {
-            // Closing a thread keeps consent while its room remains in the
-            // navigation stack. View recycling and layout changes never close it.
-            crate::a2app::runtime::on_room_closed(cx, current_screen.room_id());
-        }
+        Self::close_room_sessions_left_behind(cx, app_state, old_room_ids);
         self.view.redraw(cx);
+        true
     }
 }
