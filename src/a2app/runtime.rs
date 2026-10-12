@@ -7081,6 +7081,14 @@ pub fn run_miniapp_command(cx: &mut Cx, arg: &str, room_id: &OwnedRoomId) {
 // AI Rooms
 // -----------------------------------------------------------------------
 
+/// Returns whether this room is known to carry the AI-room marker.
+///
+/// This stays true while its agent is stopped or unable to start.
+#[cfg(unix)]
+pub fn is_ai_room(room_id: &OwnedRoomId) -> bool {
+    with_a2app(|state| state.ai_rooms.contains_key(room_id)).unwrap_or(false)
+}
+
 /// Called when a `RoomScreen` first opens a room: checks (once) whether it
 /// carries the `rs.robius.robrix.ai_room` marker, so its session can be
 /// attached. Cheap to call on every room open — a room already known either

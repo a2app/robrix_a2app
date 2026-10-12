@@ -1078,6 +1078,18 @@ impl Widget for HomeScreen {
                     }
                 }
 
+                // Marker checks can complete after the room's stack header is shown.
+                #[cfg(all(feature = "a2app", unix))]
+                if let Some(crate::a2app::ai::rooms::AiRoomAction::Attached { room_id, .. }) = action.downcast_ref() {
+                    let stack_navigation = self.view.stack_navigation(cx, ids!(view_stack));
+                    if let Some(view_id) = stack_navigation.destination_view()
+                        && let Some(room) = app_state.selected_room.as_ref()
+                        && room.room_id() == room_id
+                    {
+                        stack_navigation.set_title(cx, view_id, &room.display_name());
+                    }
+                }
+
                 if let Some(
                     AppStateAction::RoomNameUpdated(new_room_name)
                     | AppStateAction::RoomLoadedSuccessfully { room_name_id: new_room_name, .. }

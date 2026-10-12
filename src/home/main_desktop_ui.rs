@@ -585,6 +585,10 @@ impl MainDesktopUI {
         dock.load_state(cx, dock_items);
         // Popped-out mini-apps take back their parked apps before any room's dock can.
         for (tab_id, room) in &self.open_rooms {
+            #[cfg(all(feature = "a2app", unix))]
+            if crate::a2app::runtime::is_ai_room(room.room_id()) {
+                dock.set_tab_title(cx, *tab_id, room.display_name());
+            }
             if matches!(room, SelectedRoom::RoomPane { kind: RoomPaneKind::MiniApp(_), .. }) {
                 Self::init_tab_widget(cx, &self.open_rooms, tab_id, &dock.item(*tab_id));
             }
@@ -978,6 +982,17 @@ impl WidgetMatchEvent for MainDesktopUI {
                     continue;
                 }
                 None => {}
+            }
+
+            // Marker checks can complete after a room's tab has been opened.
+            #[cfg(all(feature = "a2app", unix))]
+            if let Some(crate::a2app::ai::rooms::AiRoomAction::Attached { room_id, .. }) = action.downcast_ref() {
+                let dock = self.view.dock(cx, ids!(dock));
+                for (tab_id, room) in &self.open_rooms {
+                    if room.room_id() == room_id {
+                        dock.set_tab_title(cx, *tab_id, room.display_name());
+                    }
+                }
             }
 
             // Handle potential changes to room names.

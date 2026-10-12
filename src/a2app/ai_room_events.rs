@@ -292,8 +292,8 @@ script_mod! {
         height: Fit,
         flow: Down
         spacing: 4
-        padding: Inset{top: 8, bottom: 8, left: 12, right: 12}
-        margin: Inset{top: 4, bottom: 4, left: 10, right: 60}
+        padding: Inset{top: 8, bottom: 12, left: 12, right: 12}
+        margin: Inset{top: 4, bottom: 10, left: 10, right: 60}
 
         show_bg: true
         draw_bg +: {
@@ -412,7 +412,7 @@ script_mod! {
         height: Fit,
         flow: Down
         spacing: 5
-        padding: Inset{top: 6, bottom: 6, left: 10, right: 10}
+        padding: Inset{top: 3, bottom: 3, left: 10, right: 10}
         margin: Inset{top: 2, bottom: 2, left: 10, right: 60}
 
         show_bg: true
@@ -427,7 +427,22 @@ script_mod! {
             width: Fill, height: Fit
             flow: Right, align: Align{y: 0.5}, spacing: 6
             turn_spinner := mod.widgets.AiTurnSpinner {}
-            turn_disclosure := RobrixSettingsCollapsibleHeader { title: "Tools used" }
+            turn_disclosure := RobrixSettingsCollapsibleHeader {
+                title: "Tools used"
+                height: 24, padding: 0
+                show_bg: false
+                collapse_icon +: {
+                    width: 12, height: 12
+                    margin: Inset{left: 0, right: 6, top: 0, bottom: 0}
+                    draw_bg.color: (SMALL_STATE_TEXT_COLOR)
+                }
+                label +: {
+                    draw_text +: {
+                        text_style: SMALL_STATE_TEXT_STYLE {}
+                        color: (SMALL_STATE_TEXT_COLOR)
+                    }
+                }
+            }
         }
 
         turn_body := Label {
@@ -918,12 +933,12 @@ impl AiTurnTimelineCardRef {
                 return;
             }
         }
-        // Warm while working, cool once settled. The border follows the same
+        // Warm while working, muted once settled. The border follows the same
         // family so the card reads as one object in either state.
         let (bg, border) = if running {
             (vec4(1.0, 0.972, 0.902, 1.0), vec4(0.98, 0.82, 0.45, 1.0))
         } else {
-            (vec4(0.933, 0.961, 1.0, 1.0), vec4(0.78, 0.78, 0.8, 1.0))
+            (vec4(0.969, 0.976, 0.988, 1.0), vec4(0.867, 0.89, 0.922, 1.0))
         };
         // Applied on the card's own widget ref (not the inner `view`), since
         // `draw_bg` lives on the widget's script object. Must run before the

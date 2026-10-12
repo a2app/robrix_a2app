@@ -1532,14 +1532,21 @@ impl SelectedRoom {
     }
 
     /// Returns the display name to be shown for this room in the UI.
+    ///
+    /// Known AI rooms have a robot prefix; the stored room name is unchanged.
     pub fn display_name(&self) -> String {
-        match self {
+        let name = match self {
             SelectedRoom::JoinedRoom { room_name_id } => room_name_id.to_string(),
             SelectedRoom::InvitedRoom { room_name_id } => room_name_id.to_string(),
             SelectedRoom::Space { space_name_id } => format!("[Space] {space_name_id}"),
             SelectedRoom::Thread { room_name_id, .. } => format!("[Thread] {room_name_id}"),
             SelectedRoom::RoomPane { room_name_id, kind } => format!("[{}] {room_name_id}", kind.title()),
+        };
+        #[cfg(all(feature = "a2app", unix))]
+        if crate::a2app::runtime::is_ai_room(self.room_id()) && !name.starts_with('🤖') {
+            return format!("🤖 {name}");
         }
+        name
     }
 
     /// Returns the dock-tab `kind` template id used to render this room.
