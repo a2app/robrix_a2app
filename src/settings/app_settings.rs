@@ -63,6 +63,7 @@ script_mod! {
 
         View {
             width: Fill, height: Fit
+            margin: Inset{bottom: 5}
             flow: Flow.Right{wrap: true}
             align: Align{y: 0.5}
 
@@ -84,6 +85,7 @@ script_mod! {
 
         View {
             width: Fill, height: Fit
+            margin: Inset{top: 5, bottom: 6}
             flow: Flow.Right{wrap: true}
             align: Align{y: 0.5}
             spacing: 6
@@ -139,11 +141,12 @@ script_mod! {
 
 
         SubsectionLabel {
+            margin: Inset{top: 10}
             text: "Keyboard Shortcut to Send Message"
         }
 
         send_on_cmd_enter_toggle := mod.widgets.RobrixSettingsToggle {
-            margin: Inset{left: 6.5, top: 5, bottom: 10}
+            margin: Inset{left: 6.5, top: 10, bottom: 10}
             active: false,
             text: "" // we set this text dynamically based on the toggle state and target platform
         }
@@ -158,6 +161,7 @@ script_mod! {
         }
 
         SubsectionLabel {
+            margin: Inset{top: 10}
             text: "Maximum Height of Thumbnails"
         }
 
@@ -213,6 +217,7 @@ script_mod! {
         }
 
         SubsectionLabel {
+            margin: Inset{top: 10}
             text: "Read Receipts"
         }
 
@@ -231,7 +236,7 @@ script_mod! {
 
             View {
                 width: Fill, height: Fit
-                margin: Inset{top: 6}
+                margin: Inset{top: 5, bottom: 5}
                 // `row_align` (not `align.y`) is what centers items within a wrapping row.
                 flow: Flow.Right{wrap: true, row_align: RowAlign.Center}
 
@@ -251,7 +256,7 @@ script_mod! {
 
             View {
                 width: Fill, height: Fit
-                margin: Inset{top: 6}
+                margin: Inset{top: 5, bottom: 5}
                 // `row_align` (not `align.y`) is what centers items within a wrapping row.
                 flow: Flow.Right{wrap: true, row_align: RowAlign.Center}
 
@@ -272,6 +277,7 @@ script_mod! {
         }
 
         SubsectionLabel {
+            margin: Inset{top: 10}
             text: "Typing Notifications"
         }
 
