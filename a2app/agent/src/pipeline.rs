@@ -201,8 +201,7 @@ impl Generation {
             && crate::skills::guide_is_deployed();
         #[cfg(not(feature = "persistent-guide"))]
         let slim_prompts = false;
-        let update = (crate::providers::effective_provider().as_deref() == Some(crate::claude_code::ID))
-            .then(|| check_update(prefs.thinking.as_deref() != Some("off")));
+        let update = check_update(crate::providers::effective_provider().as_deref(), &prefs);
         Ok(Self {
             client,
             request,
@@ -628,9 +627,16 @@ pub fn agent_workspace_dir() -> std::path::PathBuf {
     a2app_core::data_root().join("agent_workspace")
 }
 
-/// Asks off the UI thread whether updating Claude Code would show more of a run
-/// live, waking the UI if so. Thinking that is switched off can't show anyway.
-fn check_update(is_thinking: bool) -> std::sync::mpsc::Receiver<crate::claude_code::Update> {
+/// On Claude Code, asks off the UI thread whether updating it would show more
+/// of a run live, waking the UI if so. Switched-off thinking can't show anyway.
+fn check_update(
+    provider: Option<&str>,
+    prefs: &AgentPrefs,
+) -> Option<std::sync::mpsc::Receiver<crate::claude_code::Update>> {
+    if provider != Some(crate::claude_code::ID) {
+        return None;
+    }
+    let is_thinking = prefs.thinking.as_deref() != Some("off");
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let update = crate::claude_code::preview_update()
@@ -640,7 +646,7 @@ fn check_update(is_thinking: bool) -> std::sync::mpsc::Receiver<crate::claude_co
             SignalToUI::set_ui_signal();
         }
     });
-    receiver
+    Some(receiver)
 }
 
 /// The console's suggestion to update Claude Code, naming the installed version.
@@ -1641,34 +1647,52 @@ mod tests {
         unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", config.path()); }
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let partial = "  --include-partial-messages  Include partial message chunks as they arrive";
-        for (help, version, is_thinking, notice) in [
-            ("  --output-format <format>  Output format", "1.0.30 (Claude Code)", true,
+        let with_thinking = |thinking: Option<&str>| AgentPrefs { thinking: thinking.map(str::to_string), ..Default::default() };
+        let claude_code = Some(crate::claude_code::ID);
+        let no_thinking = "Claude Code 2.1.63 shows the app as it's written, but not newer models' thinking. Run `claude update` in a terminal to see that too.";
+        for (help, version, provider, prefs, notice) in [
+            // Even with thinking off, this build can't show the reply live.
+            ("  --output-format <format>  Output format", "1.0.30 (Claude Code)", claude_code, with_thinking(Some("off")),
                 Some("Claude Code 1.0.30 can't show the model's output live. Run `claude update` in a terminal to see it as it's written.")),
-            (partial, "2.1.63 (Claude Code)", true,
-                Some("Claude Code 2.1.63 shows the app as it's written, but not newer models' thinking. Run `claude update` in a terminal to see that too.")),
+            // Unset, the CLI's own default may think.
+            (partial, "2.1.63 (Claude Code)", claude_code, with_thinking(None), Some(no_thinking)),
+            (partial, "2.1.63 (Claude Code)", claude_code, with_thinking(Some("on")), Some(no_thinking)),
             // With thinking switched off there is no thinking to miss.
-            (partial, "2.1.63 (Claude Code)", false, None),
-            (partial, "2.1.301 (Claude Code)", true, None),
+            (partial, "2.1.63 (Claude Code)", claude_code, with_thinking(Some("off")), None),
+            // A run on another provider never asks the CLI.
+            (partial, "2.1.63 (Claude Code)", Some("anthropic"), with_thinking(Some("on")), None),
+            (partial, "2.1.301 (Claude Code)", claude_code, with_thinking(Some("on")), None),
         ] {
+            let case = format!("{version} on {provider:?}, thinking {:?}", prefs.thinking);
             let directory = tempfile::tempdir().unwrap();
-            let cli = crate::claude_code::fixture_cli(directory.path(),
-                &format!("case \"$1\" in --version) printf '%s\\n' '{version}' ;; *) printf '%s\\n' '{help}' ;; esac\n"));
+            // Its help waits to be released, and it notes what it is asked.
+            let cli = crate::claude_code::fixture_cli(directory.path(), &format!("here=\"${{0%/*}}\"\ncase \"$1\" in\n\
+                --version) printf '%s ' \"$1\" >> \"$here/asked\"; printf '%s\\n' '{version}' ;;\n\
+                --help) printf '%s ' \"$1\" >> \"$here/asked\"; while [ ! -e \"$here/release\" ]; do /bin/sleep 0.02; done; printf '%s\\n' '{help}' ;;\n\
+                esac\n"));
             unsafe { std::env::set_var("CLAUDE_CODE_EXECUTABLE", &cli); }
             let mut generation = queued(&std::sync::Arc::new(std::sync::Mutex::new(vec![AcpEvent::SessionReady])));
-            generation.update = Some(check_update(is_thinking));
-            // Each pass takes the answer if it is in, and never waits for it.
+            let started = std::time::Instant::now();
+            generation.update = check_update(provider, &prefs);
+            for _ in 0..3 { generation.advance(&mut cx); }
+            // The UI never waits for the check, which can't finish yet.
+            assert!(started.elapsed() < std::time::Duration::from_secs(1), "{case}: the UI waited for the CLI");
+            assert_eq!(generation.console(), "Agent connected", "{case}");
+            std::fs::write(directory.path().join("release"), "").unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while generation.update.is_some() {
                 generation.advance(&mut cx);
-                assert!(std::time::Instant::now() < deadline, "the update check never finished");
+                assert!(std::time::Instant::now() < deadline, "{case}: the update check never finished");
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             for _ in 0..3 { generation.advance(&mut cx); }
             let console = generation.console();
             match notice {
-                Some(notice) => assert_eq!(console.lines().filter(|line| *line == notice).count(), 1, "{console}"),
-                None => assert_eq!(console, "Agent connected"),
+                Some(notice) => assert_eq!(console.lines().filter(|line| *line == notice).count(), 1, "{case}: {console}"),
+                None => assert_eq!(console, "Agent connected", "{case}"),
             }
+            let asked = std::fs::read_to_string(directory.path().join("asked")).unwrap_or_default();
+            assert_eq!(asked, if provider == claude_code { "--help --version " } else { "" }, "{case}");
         }
     }
 

@@ -1813,13 +1813,19 @@ sys.exit(int(open(path('exit')).read()) if os.path.exists(path('exit')) else 0)"
 
     #[test]
     fn a_cli_refusing_partial_messages_keeps_the_single_reply_without_streaming_options() {
-        for (case, rules) in [
-            ("unknown option", json!({"--include-partial-messages": {"stderr": "error: unknown option '--include-partial-messages'\n"}})),
-            ("its own check", json!({"--include-partial-messages": {"stderr": "Error: --include-partial-messages requires --print and --output-format=stream-json.\n"}})),
-            ("invalid format", json!({"stream-json": {"stderr": "error: option '--output-format <format>' argument 'stream-json' is invalid. Allowed choices are text, json.\n"}})),
+        let (newer, older) = ("2.1.301 (Claude Code)\n", "2.1.63 (Claude Code)\n");
+        let unknown = json!({"--include-partial-messages": {"stderr": "error: unknown option '--include-partial-messages'\n"}});
+        for (case, version, rules) in [
+            ("unknown option", newer, unknown.clone()),
+            ("its own check", newer, json!({"--include-partial-messages": {"stderr": "Error: --include-partial-messages requires --print and --output-format=stream-json.\n"}})),
+            ("invalid format", newer, json!({"stream-json": {"stderr": "error: option '--output-format <format>' argument 'stream-json' is invalid. Allowed choices are text, json.\n"}})),
+            ("an older build", older, unknown),
         ] {
-            let installed = Installed::new("2.1.301 (Claude Code)\n");
+            let installed = Installed::new(version);
             installed.refuse(rules);
+            // An older build starts out with a notice to update.
+            let update = (version == older).then_some(crate::claude_code::Update::Thinking((2, 1, 63)));
+            assert_eq!(crate::claude_code::preview_update(), update, "{case}");
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             let (shown, checks): (Shown, _) = (Arc::default(), Arc::new(std::sync::atomic::AtomicUsize::new(0)));
             let provider = installed.provider(&shown, &checks);

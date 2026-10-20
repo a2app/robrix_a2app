@@ -532,6 +532,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn preview_support_is_read_from_help_and_version_once_per_binary() {
+        // Its builds would push other tests' builds out of the shared cache.
+        let _lock = crate::CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let directory = tempfile::tempdir().unwrap();
         let asked = directory.path().join("asked");
         let cli_answering = |help: &str, version: &str| format!("printf '%s ' \"$1\" >> '{}'\ncase \"$1\" in --version) printf '%s\\n' '{version}' ;; *) printf '%s\\n' '{help}' ;; esac\n", asked.display());
