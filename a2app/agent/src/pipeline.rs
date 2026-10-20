@@ -43,10 +43,23 @@ enum StreamKind {
 impl StreamKind {
     fn heading(self) -> &'static str {
         match self {
-            Self::Thinking => "💭 thinking",
-            Self::Writing => "✍️ writing",
+            Self::Thinking => "💭 Thinking",
+            Self::Writing => "✍️ Writing",
         }
     }
+}
+
+/// Appends agent output to `out`, headed whenever its kind differs from `last`.
+fn append_output(out: &mut String, last: &mut Option<StreamKind>, kind: StreamKind, text: &str) {
+    if *last != Some(kind) {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(kind.heading());
+        out.push('\n');
+        *last = Some(kind);
+    }
+    out.push_str(text);
 }
 
 /// Where the generation pipeline currently is; drives the create UI's status.
@@ -105,9 +118,6 @@ pub struct Generation {
     /// foreign agent via ROBRIX_AGENT_CMD may ignore AGENTS.md, so the
     /// env override always inlines).
     slim_prompts: bool,
-    /// Human-readable activity trail for the drop-down panel: phase changes,
-    /// tool calls, validation errors. Capped; newest last.
-    activity: Vec<String>,
     /// The current turn's streamed reply text (the code being written),
     /// accumulated for the panel's live tail. Cleared per turn.
     stream: String,
@@ -115,8 +125,9 @@ pub struct Generation {
     /// `stream` so it can never reach the fence extractor, and so the panel can
     /// show it only while there's no real output yet.
     thought: String,
-    /// EVERYTHING the agent has emitted this run, in arrival order — thinking
-    /// and code alike, across every repair turn.
+    /// EVERYTHING this run did, in arrival order: its log lines (phase changes,
+    /// tool calls, validation errors) and the agent's thinking and code, across
+    /// every repair turn.
     ///
     /// Separate from `stream`/`thought` because those are working buffers: the
     /// fence extractor consumes `stream`, so it has to be cleared at each turn
@@ -126,11 +137,19 @@ pub struct Generation {
     /// compile, the earlier attempts — was gone before anyone could read it.
     transcript: String,
     /// What the transcript last carried, so switching between thinking and code
-    /// gets a heading instead of the two running together mid-word.
+    /// gets a heading instead of the two running together mid-word. `None`
+    /// after a log line.
     transcript_kind: Option<StreamKind>,
+    /// The current model call's output while the host streams it in, by kind.
+    /// The agent's own copy of each kind replaces it.
+    preview: Vec<(StreamKind, String)>,
     /// The plan the agent last published, so an update can be diffed against it
     /// and only the CHANGES logged (it republishes the whole list every time).
     plan: Vec<PlanStep>,
+    /// Bumped whenever agent events arrive, so the UI can tell when to redraw.
+    revision: u64,
+    /// What updating Claude Code would show live, while that is still being checked.
+    update: Option<std::sync::mpsc::Receiver<crate::claude_code::Update>>,
 }
 
 impl Generation {
@@ -182,6 +201,8 @@ impl Generation {
             && crate::skills::guide_is_deployed();
         #[cfg(not(feature = "persistent-guide"))]
         let slim_prompts = false;
+        let update = (crate::providers::effective_provider().as_deref() == Some(crate::claude_code::ID))
+            .then(|| check_update(prefs.thinking.as_deref() != Some("off")));
         Ok(Self {
             client,
             request,
@@ -189,16 +210,18 @@ impl Generation {
             scope,
             phase: GenPhase::Connecting,
             repairs: 0,
-            status: "Contacting agent…".to_string(),
+            status: "Connecting to the agent…".to_string(),
             taken_ids,
             last_event: std::time::Instant::now(),
             thought: String::new(),
             plan: Vec::new(),
             slim_prompts,
-            activity: vec!["Starting agent…".to_string()],
             stream: String::new(),
             transcript: String::new(),
             transcript_kind: None,
+            preview: Vec::new(),
+            revision: 0,
+            update,
         })
     }
 
@@ -217,15 +240,14 @@ impl Generation {
         }
     }
 
-    /// The run's full activity trail, oldest first — what the console shows.
-    pub fn activity(&self) -> &[String] {
-        &self.activity
-    }
-
-    /// Everything the agent has produced this run, oldest first — what the
-    /// console shows below the trail, and scrolls.
-    pub fn transcript(&self) -> &str {
-        &self.transcript
+    /// Everything the run did so far, oldest first, ending with any output
+    /// still streaming in. What the console shows.
+    pub fn console(&self) -> String {
+        let (mut console, mut kind) = (self.transcript.clone(), self.transcript_kind);
+        for (previewed, text) in &self.preview {
+            append_output(&mut console, &mut kind, *previewed, text);
+        }
+        console
     }
 
     /// What the create UI shows while a generation is live.
@@ -238,25 +260,63 @@ impl Generation {
         self.status.clone()
     }
 
-    /// Appends to the run's trail. Nothing is ever dropped: the console shows
-    /// the whole history and scrolls, and a pipeline lives only as long as the
-    /// generation it's driving, so the trail is bounded by the run itself.
+    /// Changes whenever the status, trail or transcript may have changed.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Adds a line to the transcript where it happened, so the console reads
+    /// in time order. Nothing is ever dropped: a pipeline lives only as long
+    /// as the generation it drives, so the transcript is bounded by the run.
     fn log(&mut self, line: impl Into<String>) {
-        self.activity.push(line.into());
+        if !self.transcript.is_empty() {
+            // A blank line sets the log apart from the agent's own output.
+            self.transcript.push_str(if self.transcript_kind.is_some() { "\n\n" } else { "\n" });
+        }
+        self.transcript.push_str(&line.into());
+        self.transcript_kind = None;
     }
 
     /// Appends agent output to the retained transcript, heading it whenever the
     /// kind changes so a stretch of reasoning doesn't run straight into code.
     fn transcribe(&mut self, kind: StreamKind, text: &str) {
-        if self.transcript_kind != Some(kind) {
-            if !self.transcript.is_empty() {
-                self.transcript.push_str("\n\n");
-            }
-            self.transcript.push_str(kind.heading());
-            self.transcript.push('\n');
-            self.transcript_kind = Some(kind);
+        // The copy replaces the preview of its kind. A reply's code follows its
+        // thinking, so copied code replaces the whole preview.
+        match kind {
+            StreamKind::Thinking => self.preview.retain(|(previewed, _)| *previewed != kind),
+            StreamKind::Writing => self.preview.clear(),
         }
-        self.transcript.push_str(text);
+        append_output(&mut self.transcript, &mut self.transcript_kind, kind, text);
+    }
+
+    /// Shows streamed output after the transcript, headed the same way, until the
+    /// agent's own copy arrives through `transcribe`.
+    fn show_preview(&mut self, kind: StreamKind, text: &str) {
+        match self.preview.last_mut() {
+            Some((previewed, shown)) if *previewed == kind => shown.push_str(text),
+            _ => self.preview.push((kind, text.to_string())),
+        }
+    }
+
+    /// Whether the app's code shows yet, copied or still streaming in.
+    fn is_writing(&self) -> bool {
+        !self.stream.is_empty() || self.preview.last().is_some_and(|(previewed, _)| *previewed == StreamKind::Writing)
+    }
+
+    /// Drops output the agent has not confirmed, as when its run ends early.
+    pub fn clear_preview(&mut self) {
+        self.preview.clear();
+    }
+
+    /// The status while the agent writes (`kind`), named for the current attempt.
+    fn writing_status(&mut self, kind: StreamKind) {
+        let GenPhase::Generating { attempt } = self.phase else { return };
+        self.status = match (kind, attempt) {
+            (StreamKind::Writing, 0) => "Writing the app…".to_string(),
+            (StreamKind::Writing, _) => format!("Fixing the app (try {attempt})…"),
+            (StreamKind::Thinking, 0) => "Thinking…".to_string(),
+            (StreamKind::Thinking, _) => format!("Thinking about the fix (try {attempt})…"),
+        };
     }
 
     /// Marks a turn boundary in the transcript. Each repair re-asks the agent
@@ -289,12 +349,28 @@ impl Generation {
         self.phase != GenPhase::Done && self.last_event.elapsed().as_secs() > STALL_SECS
     }
 
+    /// Logs what updating Claude Code would show live, once its check finishes.
+    fn show_update(&mut self) {
+        let Some(update) = &self.update else { return };
+        match update.try_recv() {
+            Ok(update) => {
+                self.log(update_notice(update));
+                self.revision += 1;
+                self.update = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.update = None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
     /// Feeds queued agent events through the state machine. Call on every UI
     /// event (cheap when idle); `cx` is needed to run the validator.
     pub fn advance(&mut self, cx: &mut Cx) -> GenOutcome {
+        self.show_update();
         let events = self.client.drain_events();
         if !events.is_empty() {
             self.last_event = std::time::Instant::now();
+            self.revision += 1;
         }
         for event in events {
             match event {
@@ -307,8 +383,9 @@ impl Generation {
                     };
                     self.client.send_prompt(&prompt);
                     self.phase = GenPhase::Generating { attempt: 0 };
-                    self.status = "Generating your app…".to_string();
-                    self.log("Agent connected — writing the app");
+                    // Until the model's output starts streaming in.
+                    self.status = "Waiting for the model…".to_string();
+                    self.log("Agent connected");
                     self.stream.clear();
                     self.thought.clear();
                     self.transcript_kind = None;
@@ -319,17 +396,19 @@ impl Generation {
                     }
                     self.stream.push_str(&text);
                     self.transcribe(StreamKind::Writing, &text);
-                    // Streaming progress. Length is a decent proxy for life.
-                    if let GenPhase::Generating { attempt } = self.phase {
-                        self.status = if attempt == 0 {
-                            "Writing the app…".to_string()
-                        } else {
-                            format!("Fixing the app (try {attempt})…")
-                        };
+                    self.writing_status(StreamKind::Writing);
+                }
+                AcpEvent::Preview { is_thought, text } => {
+                    let kind = if is_thought { StreamKind::Thinking } else { StreamKind::Writing };
+                    let was_writing = self.is_writing();
+                    self.show_preview(kind, &text);
+                    if kind == StreamKind::Writing || !was_writing {
+                        self.writing_status(kind);
                     }
                 }
                 AcpEvent::ToolCall { title, .. } => {
                     makepad_widgets::log!("app generation: agent tool call started");
+                    self.clear_preview();
                     self.status = format!("Agent: {title}…");
                     self.log(format!("🔧 {title}"));
                 }
@@ -339,23 +418,16 @@ impl Generation {
                     makepad_widgets::log!("app generation: agent tool call finished (ok: {ok})");
                 }
                 AcpEvent::Thought(text) => {
-                    // The trail gets ONE line per thinking stretch, not one per
-                    // chunk — the chunks are token-sized. The text itself goes
-                    // to the live tail, where it's replaced by the code as soon
-                    // as the agent starts writing.
+                    // The transcript's heading marks the stretch; the console log
+                    // gets one line per stretch, not one per token-sized chunk.
                     if self.thought.is_empty() {
                         makepad_widgets::log!("app generation: agent thinking…");
-                        self.log("💭 Thinking…");
                     }
                     self.thought.push_str(&text);
                     self.transcribe(StreamKind::Thinking, &text);
-                    if self.stream.is_empty() {
-                        self.status = match self.phase {
-                            GenPhase::Generating { attempt } if attempt > 0 => {
-                                format!("Thinking about the fix (try {attempt})…")
-                            }
-                            _ => "Thinking…".to_string(),
-                        };
+                    // The copied thinking can come a pass before the code it preceded.
+                    if !self.is_writing() {
+                        self.writing_status(StreamKind::Thinking);
                     }
                 }
                 AcpEvent::Plan(steps) => {
@@ -384,6 +456,7 @@ impl Generation {
                 AcpEvent::Tick => {}
                 AcpEvent::TurnDone { stop_reason, text } => {
                     makepad_widgets::log!("app generation: turn done ({stop_reason})");
+                    self.clear_preview();
                     if stop_reason == "cancelled" {
                         return GenOutcome::Failed("Cancelled".to_string());
                     }
@@ -405,6 +478,13 @@ impl Generation {
                         }
                         TurnVerdict::NeedsRepair(errors) => {
                             self.repairs += 1;
+                            // Shown even for the last attempt, so the console says why the run failed.
+                            for e in errors.iter().take(3) {
+                                self.log(format!("⚠ {}", display_error(e)));
+                            }
+                            if errors.len() > 3 {
+                                self.log(format!("…and {} more", errors.len() - 3));
+                            }
                             if self.repairs > MAX_REPAIRS {
                                 return GenOutcome::Failed(
                                     "The generated app kept failing to compile".to_string(),
@@ -417,20 +497,17 @@ impl Generation {
                                 self.repairs,
                                 MAX_REPAIRS
                             );
-                            for e in errors.iter().take(3) {
-                                self.log(format!("⚠ {e}"));
-                            }
                             let attempt = self.repairs;
-                            self.log(format!("Sending errors back (repair {attempt})"));
                             self.client.send_prompt(&build_repair_prompt(&errors));
                             self.phase = GenPhase::Generating { attempt };
                             self.status = format!("Fixing the app (try {attempt})…");
                             self.stream.clear();
                             self.thought.clear();
-                            self.transcribe_turn(&format!(
-                                "──────── repair {attempt}: {} error(s) sent back ────────",
-                                errors.len()
-                            ));
+                            let count = match errors.len() {
+                                1 => "1 error".to_string(),
+                                count => format!("{count} errors"),
+                            };
+                            self.transcribe_turn(&format!("── Repair {attempt}: {count} sent back ──"));
                         }
                         TurnVerdict::Malformed(reason) => {
                             // No fenced code at all — one retry with a nudge,
@@ -444,15 +521,12 @@ impl Generation {
                                 self.repairs
                             );
                             let attempt = self.repairs;
-                            self.log("Reply had no code block — asking again");
                             self.client.send_prompt(&build_nudge_prompt());
                             self.phase = GenPhase::Generating { attempt };
                             self.status = "Asking for the code again…".to_string();
                             self.stream.clear();
                             self.thought.clear();
-                            self.transcribe_turn(
-                                "──────── retry: reply had no code block ────────",
-                            );
+                            self.transcribe_turn("── Retry: the reply had no code block ──");
                         }
                     }
                 }
@@ -460,9 +534,11 @@ impl Generation {
                     // A failed *spawn* arrives here, not as ProcessGone — the
                     // process never existed to go away — so it needs the same
                     // "install octos" translation rather than a raw errno.
+                    self.clear_preview();
                     return GenOutcome::Failed(process_gone_reason(&msg, self.client.desc()));
                 }
                 AcpEvent::ProcessGone(msg) => {
+                    self.clear_preview();
                     return GenOutcome::Failed(process_gone_reason(&msg, self.client.desc()));
                 }
             }
@@ -498,12 +574,12 @@ impl Generation {
         }
 
         self.status = "Checking the app…".to_string();
-        self.log("Validating with the Splash parser");
+        self.log("Checking the app…");
         let errors = validate_splash(cx, &source);
         if !errors.is_empty() {
             return TurnVerdict::NeedsRepair(errors);
         }
-        self.log("Compiles clean — installing");
+        self.log("No errors found");
 
         // A refine keeps the app's identity; the header may restyle it. A
         // create mints everything fresh.
@@ -550,6 +626,36 @@ enum TurnVerdict {
 /// cwd for its sandbox), under the a2app data root.
 pub fn agent_workspace_dir() -> std::path::PathBuf {
     a2app_core::data_root().join("agent_workspace")
+}
+
+/// Asks off the UI thread whether updating Claude Code would show more of a run
+/// live, waking the UI if so. Thinking that is switched off can't show anyway.
+fn check_update(is_thinking: bool) -> std::sync::mpsc::Receiver<crate::claude_code::Update> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let update = crate::claude_code::preview_update()
+            .filter(|update| is_thinking || matches!(update, crate::claude_code::Update::Streaming(_)));
+        if let Some(update) = update {
+            let _ = sender.send(update);
+            SignalToUI::set_ui_signal();
+        }
+    });
+    receiver
+}
+
+/// The console's suggestion to update Claude Code, naming the installed version.
+fn update_notice(update: crate::claude_code::Update) -> String {
+    use crate::claude_code::Update;
+    let named = |version: Option<(u32, u32, u32)>| match version {
+        Some((major, minor, patch)) => format!("Claude Code {major}.{minor}.{patch}"),
+        None => "This version of Claude Code".to_string(),
+    };
+    match update {
+        Update::Streaming(version) => format!("{} can't show the model's output live. \
+            Run `claude update` in a terminal to see it as it's written.", named(version)),
+        Update::Thinking(version) => format!("{} shows the app as it's written, but not newer models' thinking. \
+            Run `claude update` in a terminal to see that too.", named(Some(version))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -908,6 +1014,54 @@ pub fn unique_id(name: &str, taken: &[MiniAppId]) -> MiniAppId {
 /// class that octos-one's lint+repair loop targets, but with the real parser.
 pub fn validate_splash(cx: &mut Cx, source: &str) -> Vec<String> {
     makepad_widgets::splash::validate_splash_body_with_host_io(cx, source)
+}
+
+/// A validator error as the console shows it: the app's line, the message and
+/// a few suggestions, without heap ids or the validator's own source location.
+/// The agent still gets the full error.
+fn display_error(error: &str) -> String {
+    let mut text = error.trim().to_string();
+    if let Some((line, message)) = text.strip_prefix("splash:validating:")
+        .and_then(|rest| rest.split_once(':'))
+        .and_then(|(line, rest)| Some((line, rest.split_once(':')?.1)))
+        .filter(|(line, _)| !line.is_empty() && line.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        text = format!("Line {line}: {}", message.trim_start());
+    }
+    if text.ends_with(')') && let Some(open) = text.rfind(" (") && text[open..].contains(".rs:") {
+        text.truncate(open);
+    }
+    let mut text = without_heap_ids(&text);
+    if let Some(at) = text.find(". Did you mean: ") {
+        let list = &text[at + ". Did you mean: ".len()..];
+        let list = list.find(" (+").map_or(list, |more| &list[..more]);
+        let mut names: Vec<&str> = list.splitn(2, " or ").flat_map(|part| part.split(", ")).map(str::trim).take(3).collect();
+        let last = names.pop().unwrap_or_default();
+        let names = if names.is_empty() { last.to_string() } else { format!("{} or {last}", names.join(", ")) };
+        text = format!("{}. Did you mean {names}?", &text[..at]);
+    }
+    text
+}
+
+/// Drops value previews like `(obj3848)` or `(fn325)` that only name heap slots.
+fn without_heap_ids(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('(') {
+        let inner = &rest[open + 1..];
+        let letters = inner.bytes().take_while(u8::is_ascii_lowercase).count();
+        let digits = inner[letters..].bytes().take_while(u8::is_ascii_digit).count();
+        let is_heap_id = letters > 0 && digits > 0 && inner[letters + digits..].starts_with(')');
+        out.push_str(&rest[..open]);
+        if is_heap_id {
+            rest = &inner[letters + digits + 1..];
+        } else {
+            out.push('(');
+            rest = inner;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1373,5 +1527,158 @@ mod tests {
     fn default_names_from_request() {
         assert_eq!(default_name("make me a pomodoro timer app"), "Pomodoro Timer");
         assert_eq!(default_name(""), "Generated");
+    }
+
+    struct QueuedEvents(std::sync::Arc<std::sync::Mutex<Vec<AcpEvent>>>);
+
+    impl AgentTransport for QueuedEvents {
+        fn drain_events(&mut self) -> Vec<AcpEvent> { std::mem::take(&mut *self.0.lock().unwrap()) }
+        fn send_prompt(&mut self, _text: &str) {}
+        fn cancel(&mut self) {}
+        fn desc(&self) -> &str { "queued events" }
+    }
+
+    fn queued(queue: &std::sync::Arc<std::sync::Mutex<Vec<AcpEvent>>>) -> Generation {
+        Generation {
+            client: Box::new(QueuedEvents(queue.clone())),
+            request: "a timer".into(), mode: GenMode::Create, scope: A2AppScope::Account,
+            phase: GenPhase::Connecting, repairs: 0, status: String::new(), taken_ids: Vec::new(),
+            last_event: std::time::Instant::now(), slim_prompts: false,
+            stream: String::new(), thought: String::new(), transcript: String::new(),
+            transcript_kind: None, preview: Vec::new(), plan: Vec::new(), revision: 0, update: None,
+        }
+    }
+
+    #[test]
+    fn revision_changes_only_when_agent_output_arrives() {
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(vec![AcpEvent::SessionReady, AcpEvent::Thought("Planning".into())]));
+        let mut generation = queued(&queue);
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        assert!(matches!(generation.advance(&mut cx), GenOutcome::Working));
+        let first = generation.revision();
+        assert_ne!(first, 0);
+        assert!(generation.console().contains("Planning"));
+        // An idle pass leaves the console nothing new to draw.
+        generation.advance(&mut cx);
+        assert_eq!(generation.revision(), first);
+        queue.lock().unwrap().push(AcpEvent::Chunk("```splash".into()));
+        generation.advance(&mut cx);
+        assert!(generation.revision() > first);
+        assert_eq!(generation.status_line(), "Writing the app…");
+    }
+
+    #[test]
+    fn console_reads_in_time_order_and_previews_give_way_to_the_reply() {
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(vec![
+            AcpEvent::SessionReady,
+            AcpEvent::Preview { is_thought: true, text: "Plan the ".into() },
+            AcpEvent::Preview { is_thought: true, text: "layout".into() },
+        ]));
+        let mut generation = queued(&queue);
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        generation.advance(&mut cx);
+        let thinking = "Agent connected\n\n💭 Thinking\nPlan the layout";
+        assert_eq!(generation.console(), thinking);
+        assert_eq!(generation.status_line(), "Thinking…");
+
+        // The agent's own copy of the streamed reply replaces its preview.
+        queue.lock().unwrap().push(AcpEvent::Thought("Plan the layout".into()));
+        generation.advance(&mut cx);
+        assert_eq!(generation.console(), thinking);
+
+        // A later log line lands below the output that came before it.
+        queue.lock().unwrap().extend([
+            AcpEvent::ToolCall { id: "call-1".into(), title: "Read the guide".into() },
+            AcpEvent::Preview { is_thought: false, text: "```splash\n".into() },
+        ]);
+        generation.advance(&mut cx);
+        assert_eq!(generation.status_line(), "Writing the app…");
+        assert_eq!(generation.console(), format!("{thinking}\n\n🔧 Read the guide\n\n✍️ Writing\n```splash\n"));
+        queue.lock().unwrap().push(AcpEvent::Chunk("```splash\nView{}\n```".into()));
+        generation.advance(&mut cx);
+        assert_eq!(generation.console(), format!("{thinking}\n\n🔧 Read the guide\n\n✍️ Writing\n```splash\nView{{}}\n```"));
+    }
+
+    #[test]
+    fn the_agents_copy_replaces_each_previewed_kind_and_a_failed_run_drops_the_rest() {
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(vec![
+            AcpEvent::SessionReady,
+            AcpEvent::Preview { is_thought: true, text: "Plan".into() },
+            AcpEvent::Preview { is_thought: false, text: "```splash\nView{}\n```".into() },
+        ]));
+        let mut generation = queued(&queue);
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        generation.advance(&mut cx);
+        let streamed = "Agent connected\n\n💭 Thinking\nPlan\n\n✍️ Writing\n```splash\nView{}\n```";
+        assert_eq!(generation.console(), streamed);
+        // The copied thinking alone leaves the streamed code in place, and the status on it.
+        queue.lock().unwrap().push(AcpEvent::Thought("Plan".into()));
+        generation.advance(&mut cx);
+        assert_eq!(generation.console(), streamed);
+        assert_eq!(generation.status_line(), "Writing the app…");
+        queue.lock().unwrap().push(AcpEvent::Chunk("```splash\nView{}\n```".into()));
+        generation.advance(&mut cx);
+        assert_eq!(generation.console(), streamed);
+
+        // Output the agent never confirmed leaves with a failed run.
+        queue.lock().unwrap().extend([
+            AcpEvent::Preview { is_thought: false, text: "\n// name: Half".into() },
+            AcpEvent::ProcessGone("agent process exited".into()),
+        ]);
+        assert!(matches!(generation.advance(&mut cx), GenOutcome::Failed(_)));
+        assert_eq!(generation.console(), streamed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_older_claude_code_gets_one_update_notice_and_a_current_one_none() {
+        let _lock = crate::CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore { fn drop(&mut self) { for (name, value) in &self.0 { unsafe { match value { Some(value) => std::env::set_var(name, value), None => std::env::remove_var(name) } } } } }
+        let _restore = Restore(["CLAUDE_CODE_EXECUTABLE", "CLAUDE_CONFIG_DIR"].iter().map(|name| (*name, std::env::var_os(name))).collect());
+        // The managed policy check reads no real Claude configuration.
+        let config = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", config.path()); }
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let partial = "  --include-partial-messages  Include partial message chunks as they arrive";
+        for (help, version, is_thinking, notice) in [
+            ("  --output-format <format>  Output format", "1.0.30 (Claude Code)", true,
+                Some("Claude Code 1.0.30 can't show the model's output live. Run `claude update` in a terminal to see it as it's written.")),
+            (partial, "2.1.63 (Claude Code)", true,
+                Some("Claude Code 2.1.63 shows the app as it's written, but not newer models' thinking. Run `claude update` in a terminal to see that too.")),
+            // With thinking switched off there is no thinking to miss.
+            (partial, "2.1.63 (Claude Code)", false, None),
+            (partial, "2.1.301 (Claude Code)", true, None),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let cli = crate::claude_code::fixture_cli(directory.path(),
+                &format!("case \"$1\" in --version) printf '%s\\n' '{version}' ;; *) printf '%s\\n' '{help}' ;; esac\n"));
+            unsafe { std::env::set_var("CLAUDE_CODE_EXECUTABLE", &cli); }
+            let mut generation = queued(&std::sync::Arc::new(std::sync::Mutex::new(vec![AcpEvent::SessionReady])));
+            generation.update = Some(check_update(is_thinking));
+            // Each pass takes the answer if it is in, and never waits for it.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while generation.update.is_some() {
+                generation.advance(&mut cx);
+                assert!(std::time::Instant::now() < deadline, "the update check never finished");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            for _ in 0..3 { generation.advance(&mut cx); }
+            let console = generation.console();
+            match notice {
+                Some(notice) => assert_eq!(console.lines().filter(|line| *line == notice).count(), 1, "{console}"),
+                None => assert_eq!(console, "Agent connected"),
+            }
+        }
+    }
+
+    #[test]
+    fn validator_errors_read_as_one_plain_line() {
+        let raw = "splash:validating:6:21: variable DefinitelyNotAWidget not found in scope. Did you mean: SplitterAlign(obj3848) or Sentences(obj1134), texture_video(fn325), Slider(obj12), Splash(obj9) (+626 more) (/Users/someone/makepad/platform/script/src/object_heap.rs:726)";
+        assert_eq!(display_error(raw), "Line 6: variable DefinitelyNotAWidget not found in scope. Did you mean SplitterAlign, Sentences or texture_video?");
+        assert_eq!(display_error("splash:validating:2:1: unexpected token"), "Line 2: unexpected token");
+        assert_eq!(display_error("script has no root widget (e.g. View{...}) as its final expression"),
+            "script has no root widget (e.g. View{...}) as its final expression");
+        assert_eq!(display_error("unknown property foo. Did you mean: font(obj3)"), "unknown property foo. Did you mean font?");
     }
 }

@@ -92,14 +92,33 @@ mod gemini;
 mod claude_code;
 pub mod image_generation;
 
+type ShowPreview = std::sync::Arc<dyn Fn(bool, &str) + Send + Sync>;
+
+/// Where a model call's output is shown while it streams in, as `(is_thought, text)`.
+/// Display only: the agent's own copy of the finished reply replaces it.
+#[derive(Clone, Default)]
+pub(crate) struct PreviewSink(std::sync::Arc<std::sync::Mutex<Option<ShowPreview>>>);
+
+impl PreviewSink {
+    pub(crate) fn connect(&self, show: impl Fn(bool, &str) + Send + Sync + 'static) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = Some(std::sync::Arc::new(show));
+    }
+
+    pub(crate) fn show(&self) -> Option<ShowPreview> {
+        self.0.lock().unwrap_or_else(|error| error.into_inner()).clone()
+    }
+}
+
+/// `preview` only takes effect for transports that can stream their replies.
 pub(crate) fn provider_with_outputs(prefs: &AgentPrefs, context: a2app_core::information_flow::ContextId,
-    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>, outputs: std::sync::Arc<crate::tool_output::ToolOutputStore>)
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>, outputs: std::sync::Arc<crate::tool_output::ToolOutputStore>,
+    preview: PreviewSink)
     -> Result<std::sync::Arc<dyn octos_llm::LlmProvider>, String>
 {
     if crate::providers::effective_provider().as_deref() == Some(crate::claude_code::ID) {
-        claude_code::provider(prefs, context, shutdown, outputs)
+        claude_code::provider(prefs, context, shutdown, outputs, preview)
     } else {
-        guarded::provider(prefs, context, shutdown, outputs)
+        guarded::provider(prefs, context, shutdown, outputs, preview)
     }
 }
 

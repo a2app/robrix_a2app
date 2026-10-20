@@ -414,16 +414,27 @@ pub enum ExactResume {
     },
 }
 
+/// Numbers generation runs, so the console can tell a new run from more output.
+static NEXT_CONSOLE_RUN: AtomicU64 = AtomicU64::new(1);
+
 /// The state of the AI generation console shown in the Mini Apps screen.
 #[derive(Default)]
 pub struct GenConsole {
     pub status: String,
     pub lines: Vec<String>,
+    /// Which run these lines belong to; 0 when no run has started.
+    pub run: u64,
     /// The blocked generation's compartment, opened by Review permissions.
     pub review_context: Option<a2app_core::information_flow::ContextId>,
     /// True from submit until the user starts a new prompt.
     pub active: bool,
+    /// Whether the run's app was installed.
+    pub was_installed: bool,
     pub last_render: Option<Instant>,
+    /// The generation revision these lines show.
+    pub revision: Option<u64>,
+    /// Shows an update that arrived too soon after the last one.
+    pub repaint_timer: Option<Timer>,
 }
 
 impl GenConsole {
@@ -436,7 +447,7 @@ impl GenConsole {
             flow::EFFECT_REVIEW_REQUIRED,
         ].iter().any(|message| reason.contains(message));
         self.review_context = context.filter(|_| needs_review);
-        self.status = format!("Failed: {reason}");
+        self.status = sentence(&format!("Failed: {reason}"));
         if needs_review {
             self.status.push_str(if self.review_context.is_some() {
                 " Select Review permissions to open Agent permissions → Needs attention. Review and approve the blocked request, then return here and select Retry."
@@ -479,6 +490,32 @@ mod generation_recovery_tests {
         console.failed("The agent connection closed.", console.review_context.clone());
         assert!(console.review_context.is_none());
         assert_eq!(console.status, "Failed: The agent connection closed.");
+    }
+
+    #[test]
+    fn a_throttled_console_update_is_shown_after_the_throttle_without_another_event() {
+        let start = Instant::now();
+        let soon = start + Duration::from_millis(50);
+        assert_eq!(console_repaint(2, Some(1), Some(start), soon, false), ConsoleRepaint::After(CONSOLE_REPAINT - Duration::from_millis(50)));
+        assert_eq!(console_repaint(2, Some(1), Some(start), start + CONSOLE_REPAINT, false), ConsoleRepaint::Now);
+        // Nothing new to show; the first and the final updates are never held back.
+        assert_eq!(console_repaint(2, Some(2), Some(start), start + Duration::from_secs(1), false), ConsoleRepaint::Idle);
+        assert_eq!(console_repaint(1, None, None, start, false), ConsoleRepaint::Now);
+        assert_eq!(console_repaint(2, Some(1), Some(start), soon, true), ConsoleRepaint::Now);
+    }
+
+    #[test]
+    fn console_lines_keep_indentation_and_drop_fences() {
+        assert_eq!(console_line("    width: Fill"), "\u{a0}\u{a0}\u{a0}\u{a0}width: Fill");
+        assert_eq!(console_line("\tView{"), "\u{a0}\u{a0}\u{a0}\u{a0}View{");
+        assert_eq!(console_line(""), "\u{a0}");
+        assert!(is_code_fence("```splash") && is_code_fence("```") && is_code_fence("  ````  "));
+        assert!(!is_code_fence("let x = \"```\"") && !is_code_fence("``` not a fence"));
+        // A fence still streaming in waits; a finished line of backticks stays.
+        assert_eq!(console_lines("✍️ Writing\n```splash\nView{}\n``"), ["✍️ Writing", "View{}"]);
+        assert_eq!(console_lines("View{}\n`\n```"), ["View{}", "`"]);
+        assert_eq!(sentence("Failed: The generated app kept failing to compile"), "Failed: The generated app kept failing to compile.");
+        assert_eq!(sentence("Cancelled."), "Cancelled.");
     }
 
     #[test]
@@ -782,8 +819,8 @@ pub struct A2AppState {
     generation_attribution: Option<(Option<VersionActor>, AcquisitionSource)>,
     generation_epoch: Option<u64>,
     pub console: GenConsole,
-    /// The request text of a failed generation, offered for Retry.
-    pub failed_request: Option<String>,
+    /// A failed generation's request and what it was asked to do, offered for Retry.
+    pub failed_request: Option<(String, Intent)>,
     pub agent_prefs: AgentPrefs,
     /// The room the next created app will be scoped to, if any.
     pub create_room: Option<OwnedRoomId>,
@@ -1683,6 +1720,12 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     // drives to completion (and answers the waiting tool call).
     #[cfg(unix)]
     advance_ai_sessions(cx, ui);
+    // A console update that the throttle held back is due on this timer.
+    if let Event::Timer(_) = event {
+        with_a2app(|state| if state.console.repaint_timer.is_some_and(|timer| timer.is_event(event).is_some()) {
+            state.console.repaint_timer = None;
+        });
+    }
     advance_generation(cx, ui);
     // Keep the generation stall-watchdog heartbeat alive exactly while a
     // generation runs: its own events wake this loop constantly while the
@@ -1875,7 +1918,7 @@ fn deliver_room_hooks(
         if !event.is_current() { continue; }
         let room_id = event.room_id;
         match event.kind {
-            RoomWatchKind::Message { event_id, sender, sender_name, body, msgtype, ts, is_own } => {
+            RoomWatchKind::Message { event_id, sender, sender_name, body, msgtype, ts, is_own, mentions_me, reply_to, thread_root } => {
                 messages.entry(room_id.clone()).or_default().push(serde_json::json!({
                     "room_id": room_id,
                     "event_id": event_id,
@@ -1886,6 +1929,9 @@ fn deliver_room_hooks(
                     "ts": ts,
                     "msgtype": msgtype,
                     "is_own": is_own,
+                    "mentions_me": mentions_me,
+                    "reply_to": reply_to,
+                    "thread_root": thread_root,
                 }));
             }
             RoomWatchKind::MessageChanged { event_id, edited, redacted, body } => {
@@ -2607,7 +2653,7 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 enqueue_popup_notification(error, PopupKind::Error, Some(6.0));
                 return;
             }
-            with_a2app(|state| { state.generation = None; state.pending_generated = None; });
+            with_a2app(|state| { drop_generation(cx, state); state.pending_generated = None; });
             #[cfg(unix)]
             {
                 let rooms = with_a2app(|state| state.ai_sessions.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
@@ -2736,8 +2782,7 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
         A2AppOp::StartModify { app_id, request } => start_generation(cx, ui, request, None, Some(Intent::Modify(app_id))),
         A2AppOp::CancelGeneration => {
             with_a2app(|state| {
-                // Dropping the Generation kills the agent child process.
-                state.generation = None;
+                drop_generation(cx, state);
                 state.pending_generated = None;
                 state.generation_context = None; state.generation_epoch = None;
                 state.failed_request = None;
@@ -2756,9 +2801,10 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 finish_generated_app(cx, ui, pending);
                 return;
             }
-            let retry = with_a2app(|state| state.failed_request.take().map(|request| (request, state.create_room.clone()))).flatten();
-            if let Some((request, room)) = retry {
-                start_generation(cx, ui, request, room, None);
+            let retry = with_a2app(|state| state.failed_request.take().map(|(request, intent)| (request, intent, state.create_room.clone()))).flatten();
+            // The same kind of run again: a forced new app must not turn into a rewrite.
+            if let Some((request, intent, room)) = retry {
+                start_generation(cx, ui, request, room, Some(intent));
             }
         }
         A2AppOp::NewPrompt => {
@@ -3010,14 +3056,15 @@ fn start_generation(
         }
         state.pending_generated = None;
         state.console.review_context = None;
-        state.failed_request = Some(request.clone());
         let apps: Vec<(MiniAppId, String)> = state.registry.iter()
             .map(|a| (a.id.clone(), a.name.clone()))
             .collect();
         let taken: Vec<MiniAppId> = apps.iter().map(|(id, _)| id.clone()).collect();
 
         // An explicit intent wins; otherwise classify the request text.
-        let refine_target = match intent.unwrap_or_else(|| a2app_agent::intent::classify(&request, &apps)) {
+        let intent = intent.unwrap_or_else(|| a2app_agent::intent::classify(&request, &apps));
+        state.failed_request = Some((request.clone(), intent.clone()));
+        let refine_target = match intent.clone() {
             Intent::Modify(id) => Some(id),
             Intent::Create => None,
         };
@@ -3028,10 +3075,6 @@ fn start_generation(
         };
         state.create_room = room_id.clone();
 
-        let status = match refine_target.as_ref().and_then(|id| state.registry.get(id)) {
-            Some(target) => format!("Connecting to the agent to rewrite \"{}\"…", target.name),
-            None => String::from("Connecting to the agent to create a new app…"),
-        };
         let context = (|| -> Result<_, String> {
             let context = match room_id.as_ref() {
                 Some(room) => super::information_flow::prepare_agent(room.as_str())?,
@@ -3078,17 +3121,14 @@ fn start_generation(
                     model: a2app_agent::model_transport::current_recipient(&state.agent_prefs).ok().map(|recipient| recipient.label),
                     room_id: room_id.as_ref().map(ToString::to_string),
                 }));
+                state.console = GenConsole {
+                    status: generation.status_line(), active: true, run: NEXT_CONSOLE_RUN.fetch_add(1, Ordering::Relaxed),
+                    ..GenConsole::default()
+                };
                 state.generation = Some(generation);
                 state.generation_epoch = a2app_core::information_flow::context_epoch(&context).ok();
                 state.generation_context = Some(context);
-                state.console = GenConsole {
-                    status,
-                    lines: Vec::new(),
-                    review_context: None,
-                    active: true,
-                    last_render: None,
-                };
-                state.failed_request = Some(request);
+                state.failed_request = Some((request, intent));
             }
             Err(e) => {
                 state.console.failed(&e, Some(context));
@@ -3118,22 +3158,23 @@ fn advance_generation(cx: &mut Cx, ui: &WidgetRef) {
         // waiting on this build would stay parked on an unanswered call. Fail
         // the run so it resolves (the room's AI then reports the failure).
         if generation.is_stalled() {
-            refresh_console(state, true);
+            generation.clear_preview();
+            refresh_console(cx, state, true);
             let reason = "The agent went silent; the run was stopped.".to_string();
             state.console.status = reason.clone();
             return Some(Done::Failed(reason));
         }
         match generation.advance(cx) {
             GenOutcome::Working => {
-                refresh_console(state, false);
+                refresh_console(cx, state, false);
                 None
             }
             GenOutcome::Ready { manifest, refine_of } => {
-                refresh_console(state, true);
+                refresh_console(cx, state, true);
                 Some(Done::Ready { manifest, refine_of })
             }
             GenOutcome::Failed(reason) => {
-                refresh_console(state, true);
+                refresh_console(cx, state, true);
                 let context = state.generation_context.clone().filter(|context|
                     state.generation_epoch.is_some_and(|epoch|
                         a2app_core::information_flow::ensure_context_epoch(context, epoch).is_ok())
@@ -3243,6 +3284,7 @@ fn finish_generated_app(cx: &mut Cx, ui: &WidgetRef, mut pending: PendingGenerat
             state.failed_request = None;
             state.console.status = if pending.refine_of.is_some() { format!("Updated \"{}\".", pending.manifest.name) }
                 else { format!("Created \"{}\".", pending.manifest.name) };
+            state.console.was_installed = true;
             state.registry_dirty = true;
             Ok(())
         }).unwrap_or_else(|| Err("Mini-app state is unavailable.".into()))
@@ -3252,7 +3294,7 @@ fn finish_generated_app(cx: &mut Cx, ui: &WidgetRef, mut pending: PendingGenerat
             state.generation = None;
             state.generation_context = None; state.generation_epoch = None;
             state.failed_request = None;
-            state.console.status = format!("The app was not installed: {reason}");
+            state.console.status = sentence(&format!("The app was not installed: {reason}"));
         });
         #[cfg(unix)]
         resolve_session_generation(cx, ui, None, Err(format!("The build could not be installed: {reason}")));
@@ -3272,22 +3314,89 @@ fn finish_generated_app(cx: &mut Cx, ui: &WidgetRef, mut pending: PendingGenerat
     ui.redraw(cx);
 }
 
-/// Rebuilds the console's line list from the generation's trail + transcript,
-/// throttled so a fast-streaming agent doesn't re-split per token.
-fn refresh_console(state: &mut A2AppState, force: bool) {
-    let now = Instant::now();
-    if !force
-        && state.console.last_render.is_some_and(|last| now.duration_since(last) < CONSOLE_REPAINT)
-    {
-        return;
+/// Ends `text` with a period unless it already ends a sentence.
+fn sentence(text: &str) -> String {
+    let text = text.trim_end();
+    if text.ends_with(['.', '!', '?', '…']) { text.to_string() } else { format!("{text}.") }
+}
+
+/// A Markdown code fence like "```splash". The console's headings already mark
+/// the code, and the fence's spaced-out backticks only add noise.
+fn is_code_fence(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with("```") && line.trim_start_matches('`').chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The console's lines as drawn, without code fences. An unfinished last line of one
+/// or two backticks may be a fence still streaming in, so it waits.
+fn console_lines(console: &str) -> Vec<String> {
+    let last = console.rsplit('\n').next().unwrap_or_default();
+    let console = if matches!(last.trim(), "`" | "``") { &console[..console.len() - last.len()] } else { console };
+    console.lines().filter(|line| !is_code_fence(line)).map(console_line).collect()
+}
+
+/// A console line as drawn: indentation survives as no-break spaces, and a blank
+/// line keeps its height.
+fn console_line(line: &str) -> String {
+    let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let text = &line[indent..];
+    let indent: String = line[..indent].chars().map(|c| if c == '\t' { "\u{a0}\u{a0}\u{a0}\u{a0}" } else { "\u{a0}" }).collect();
+    if text.is_empty() { String::from("\u{a0}") } else { format!("{indent}{text}") }
+}
+
+/// When the console should next show the generation's output.
+#[derive(Debug, PartialEq)]
+enum ConsoleRepaint {
+    Now,
+    After(Duration),
+    Idle,
+}
+
+/// Throttles console rebuilds so a fast-streaming agent isn't re-split per token,
+/// without ever dropping the last update: a held-back one is due `After` the throttle.
+fn console_repaint(revision: u64, shown: Option<u64>, last_render: Option<Instant>, now: Instant, force: bool) -> ConsoleRepaint {
+    if force {
+        return ConsoleRepaint::Now;
     }
+    if shown == Some(revision) {
+        return ConsoleRepaint::Idle;
+    }
+    match last_render.map(|last| CONSOLE_REPAINT.saturating_sub(now.duration_since(last))) {
+        Some(wait) if !wait.is_zero() => ConsoleRepaint::After(wait),
+        _ => ConsoleRepaint::Now,
+    }
+}
+
+/// Drops the running generation, which kills its agent. Output still streaming in never
+/// gets the agent's own copy, so the console drops it too.
+fn drop_generation(cx: &mut Cx, state: &mut A2AppState) {
+    if let Some(generation) = state.generation.as_mut() {
+        generation.clear_preview();
+        refresh_console(cx, state, true);
+    }
+    state.generation = None;
+}
+
+/// Rebuilds the console's line list from the generation's trail + transcript.
+fn refresh_console(cx: &mut Cx, state: &mut A2AppState, force: bool) {
     let Some(generation) = state.generation.as_ref() else { return };
-    state.console.status = generation.status_line();
-    let mut lines: Vec<String> = generation.activity().to_vec();
-    for line in generation.transcript().lines() {
-        lines.push(line.to_string());
+    let now = Instant::now();
+    match console_repaint(generation.revision(), state.console.revision, state.console.last_render, now, force) {
+        ConsoleRepaint::Idle => return,
+        ConsoleRepaint::After(wait) => {
+            if state.console.repaint_timer.is_none() {
+                state.console.repaint_timer = Some(cx.start_timeout(wait.as_secs_f64()));
+            }
+            return;
+        }
+        ConsoleRepaint::Now => {}
     }
-    state.console.lines = lines;
+    if let Some(timer) = state.console.repaint_timer.take() {
+        cx.stop_timer(timer);
+    }
+    state.console.status = generation.status_line();
+    state.console.lines = console_lines(&generation.console());
+    state.console.revision = Some(generation.revision());
     state.console.last_render = Some(now);
     SignalToUI::set_ui_signal();
 }
@@ -4442,11 +4551,17 @@ fn refuse_flow(cx: &mut Cx, flow: FlowContinuation, reason: &str) {
             let cancelled = with_a2app(|state| {
                 if !state.pending_generated.as_ref().is_some_and(|pending| pending.matches_review(&review))
                 { return false; }
+                // A declined update leaves the installed app as it was.
+                let unchanged = state.pending_generated.as_ref().and_then(|pending| pending.refine_of.clone())
+                    .map(|app_id| state.registry.get(&app_id).map_or(app_id.clone(), |app| app.name.clone()));
                 state.pending_generated = None;
                 state.generation = None;
                 state.generation_context = None; state.generation_epoch = None;
                 state.failed_request = None;
-                state.console.status = "The app was not installed. You can start a new request.".into();
+                state.console.status = match unchanged {
+                    Some(name) => format!("The update was not installed. \"{name}\" is unchanged."),
+                    None => "The app was not installed. You can start a new request.".into(),
+                };
                 true
             }).unwrap_or(false);
             #[cfg(unix)]
@@ -6784,7 +6899,7 @@ fn retire_flow_context(cx: &mut Cx, ui: &WidgetRef, context: &a2app_core::inform
 }
 
 fn stop_private_contexts(cx: &mut Cx, ui: &WidgetRef) {
-    with_a2app(|state| { state.generation = None; state.generation_context = None; state.generation_epoch = None; state.pending_generated = None; state.console.review_context = None; });
+    with_a2app(|state| { drop_generation(cx, state); state.generation_context = None; state.generation_epoch = None; state.pending_generated = None; state.console.review_context = None; });
     #[cfg(unix)]
     {
         let rooms = with_a2app(|state| state.ai_sessions.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
@@ -8046,8 +8161,7 @@ fn abort_ai_room_work(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
     .unwrap_or(false);
     if cancels_generation {
         with_a2app(|state| {
-            // Dropping the Generation kills its agent child process.
-            state.generation = None;
+            drop_generation(cx, state);
             state.generation_context = None; state.generation_epoch = None;
             state.console.status = String::from("Cancelled.");
         });
@@ -11087,6 +11201,7 @@ mod permission_tests {
 
     #[test]
     fn related_requests_share_a_dialog_and_stale_group_answers_cannot_grant_the_next() {
+        let _policy_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
         let previous = A2APP.with(|state| state.replace(None));
         let manifest = builtin::stock("room-peek").unwrap();
         initialize_background_test(manifest.clone());
@@ -11141,6 +11256,7 @@ mod permission_tests {
     #[test]
     fn installing_stock_retires_source_inspection_before_recovering_empty_storage() {
         use a2app_core::information_flow as flow;
+        let _policy_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
         let stock = builtin::stock("room-info").unwrap();
         let previous_account = super::super::information_flow::TEST_ACCOUNT.with(|account|
             account.replace(Some("@stock-install:test".into())));
@@ -11238,6 +11354,7 @@ mod permission_tests {
     #[test]
     fn setup_write_prompt_enables_its_room_grant_and_rechecks_new_denials() {
         use a2app_core::information_flow as flow;
+        let _policy_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
         let previous_account = super::super::information_flow::TEST_ACCOUNT.with(|account|
             account.replace(Some("@write-setup:test".into())));
         let previous_state = A2APP.with(|state| state.replace(None));
@@ -11990,6 +12107,7 @@ View{note := Label{text:"waiting"}}
     #[cfg(unix)]
     #[test]
     fn active_task_keeps_its_caller_and_dispatches_a_queued_exact_review_after_answer() {
+        let _policy_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
         let _restore = ModalTestGuard::new("task-first");
         let (task_answer, task_reply) = std::sync::mpsc::channel();
         let (exact_answer, exact_reply) = std::sync::mpsc::channel();

@@ -1,7 +1,8 @@
 # Default mini-app permission audit
 
-This records the source audit of all 20 shipped mini-apps and the deterministic
-coverage in `core/tests/splash_information_flow.rs`. The coverage exercises the
+This records the source audit of all 23 shipped mini-apps and the deterministic
+coverage in `core/tests/splash_information_flow.rs`, plus the per-app
+`core/tests/stock_*.rs` suites that share its harness. The coverage exercises the
 real Splash VM, host bridge and broker with fixture Matrix/HTTP responses. It
 does not replace a Robrix build, native permission-popup checks, a homeserver,
 or scheduled-worker/device testing. This audit uses focused deterministic
@@ -30,7 +31,7 @@ Watcher rule does not authorize or execute sending.
 | Mini-app | Permission entry and continuation | Denial/retry and later effects |
 | --- | --- | --- |
 | Public Web | Fetch requests only the fixed `https://example.com/` URL. | A denied fetch ends; Fetch can be clicked again. No room/account reads. |
-| Website Watch | Test requests the saved concrete URL, then the selected popup or room report. | Each failed step finishes Test; Test retries. A scheduled callback acknowledges success/failure and avoids duplicate match reports. |
+| Website Watch | Test report requests the saved concrete URL, then the selected popup or room report. | Each failed step finishes the test; Test report retries. A scheduled callback acknowledges success/failure and avoids duplicate match reports. |
 | Reminder | Test directly requests its saved reminder popup. | Failed Test releases its pending flag; Test retries. Hidden runs acknowledge completion and cannot prompt. |
 | Keyword Alert | Test sets up missing ongoing room-message watching, then requests its concrete test popup. | Rejected setup ends Test. Hidden unmatched/own-message batches complete without a notification request. |
 | Room Peek | Startup groups room details, recent-message reads and live room updates. | Refresh retries selected reads/hooks. Draft message and Attach file use composer grants; Send now and Send file now require independent sending grants, including media upload for files. Navigation is requested only when used. |
@@ -46,20 +47,24 @@ Watcher rule does not authorize or execute sending.
 | Room Tools | Startup groups recent/pinned messages and room flags/links/details. | Refresh retries permitted parts. Flags, pinning, copying and upgraded-room navigation retain separate concrete effects and captured contents. |
 | Spaces | Opening loads the attached space, or the joined-space list. | Refresh retries denied reads and shows their error. New space selections reject stale replies; preview, join and room navigation request only the chosen target. |
 | Inbox | Opening loads invites/unread rooms and their collection updates. | Refresh retries reads/hooks. Accept/decline captures the selected invite and finishes after its result; opening unread rooms uses the selected room. |
-| Room Stats | Startup groups message/history reads and power-level details. | Refresh retries; rejected reads finish counting with a useful fallback. The selected sender's profile opens only on tap. |
+| Room Stats | Startup groups message/history reads, power-level details and device facts, so busy hours count in local time. | Refresh retries; rejected reads finish counting with a useful fallback. The selected sender's profile opens only on tap. |
 | Account | Startup groups the own profile and device/homeserver/ignore-list reads. | Refresh retries permitted parts. User lookup, existing-DM lookup/navigation and account-management browser opening remain concrete actions. |
 | Inspector | Startup groups display settings, navigation observation and device facts. | Refresh retries selected parts. Own pane/environment reads remain available; moving/minimizing/restoring the pane is requested only on its controls. |
+| Link Library | Startup groups recent-message reads and live message updates. Scan older messages pages back only from its button. | Refresh or Ask again retries setup; a refused page stops the scan until the next tap. Open, Copy and Show in chat request only the tapped link or message; Matrix links to users, rooms and events use navigation, others open in the browser. |
+| Translator | Startup groups recent-message reads, live watching when live translation was saved on, and device facts for the default language. Each translation sends its text to the chosen service as one concrete web request. | Refresh retries setup. A refused or failed request stops queued work and pauses live translation until a tap, Translate all or Resume. Put in message box drafts the translated reply under composer grants and Copy copies it; nothing is sent. |
+| Room Gallery | Startup groups recent-message reads and live room updates (no batch when both are already allowed), then reads device facts for local dates only if they are already allowed; it never asks for them. `matrix-media` is asked for only from a tap: Show previews, Show preview or Share again. Once allowed, previews load for the visible tiles, at most two at a time, paced to leave request budget for taps. Load older pages back only from its button. | Refresh retries setup, refused live updates and refused lookups; Show previews retries paused previews. Automatic work refused by Robrix's request limit waits a few seconds and retries once; a second refusal within two minutes stops it until Refresh, Show previews or Load older. Show in chat requests navigation only when tapped. Share again stages the exact downloaded bytes with `composer.attach` and never sends. |
 
 The all-app primary-path coverage checks finite declared permissions, actual
 service completion, parked callback completion, outgoing reviews, subscription
 deduplication, and unrelated-grant idempotence in ordinary and strict modes.
 Dedicated grouped-startup coverage checks full denial, explicit Refresh,
 reapproval, revocation, and partial selections for Account, Inspector, Who's
-Here, Room Members, Pinned Messages, Room Threads, Room Peek, Room Stats and
-Room Tools. Other focused cases cover scheduled work without hidden prompts,
-Watcher configuration versus Test, exact navigation targets, stale selections,
-independent composer/send permission, write-switch enablement, captured clipboard/browser content, and malformed
-saved website URLs. Runtime tests separately cover trusted input, policy scopes,
+Here, Room Members, Pinned Messages, Room Threads, Room Peek, Room Stats, Room
+Tools, Link Library, Translator and Room Gallery. Other focused cases cover
+scheduled work without hidden prompts, Watcher configuration versus Test, exact
+navigation targets, stale selections, independent composer/send permission,
+write-switch enablement, captured clipboard/browser content, and malformed saved
+website URLs. Runtime tests separately cover trusted input, policy scopes,
 refusal clearing, persistence and the actual modal controls.
 
 Keyword Alert can require two first-time decisions: ongoing message watching

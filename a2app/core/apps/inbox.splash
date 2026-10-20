@@ -7,6 +7,31 @@
 // why-robrix-navigation: Opens a room you tap.
 // why-matrix-membership: Accepts or declines an invite when you tap a button.
 
+let PrimaryButton = Button{
+    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
+    draw_bg +: {
+        border_size: 0.0 border_radius: 4.0
+        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+}
+let NeutralButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
+        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+}
+let PositiveButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #x138808 border_color_hover: #x138808 border_color_down: #x138808 border_color_focus: #x138808
+        color: #xF0FFF0 color_hover: #xD4EED4 color_down: #xB8E0B8 color_focus: #xF0FFF0 }
+    draw_text +: { color: #x138808 color_hover: #x138808 color_down: #x138808 color_focus: #x138808 }
+}
+let NegativeButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xDC0005 border_color_hover: #xDC0005 border_color_down: #xDC0005 border_color_focus: #xDC0005
+        color: #xFFF0F0 color_hover: #xF0D4D4 color_down: #xE0B8B8 color_focus: #xFFF0F0 }
+    draw_text +: { color: #xDC0005 color_hover: #xDC0005 color_down: #xDC0005 color_focus: #xDC0005 }
+}
+
 let subscribed_events = []
 let pending_events = []
 
@@ -17,40 +42,229 @@ let unread_loaded = false
 
 let invites = []
 let unread = []
-let invite_note = "Loading…"
-let unread_note = "Loading…"
+let invite_rows = []
+let unread_rows = []
+// "loading", "ready" or "error" for each section.
+let invites_phase = "loading"
+let unread_phase = "loading"
+let invites_error = ""
+let unread_error = ""
+let sum_unread = 0
+let sum_mentions = 0
 let pick_id = ""
 let pick_name = ""
 let invite_answer_loading = false
+let is_narrow = false
+// Rows drawn at most; the caption still counts every room.
+let row_cap = 100
+
+let upper_map = {a: "A" b: "B" c: "C" d: "D" e: "E" f: "F" g: "G" h: "H" i: "I" j: "J" k: "K" l: "L" m: "M"
+    n: "N" o: "O" p: "P" q: "Q" r: "R" s: "S" t: "T" u: "U" v: "V" w: "W" x: "X" y: "Y" z: "Z"}
 
 fn plural(n, word){
     if "" + n == "1" { return word }
     return word + "s"
 }
 
-fn totals_text(u, m){
-    return "" + u + " unread · " + m + " " + plural(m, "mention")
+fn initial(name){
+    let parts = ("" + name).split("")
+    let i = 1
+    while i < parts.len() - 1 {
+        let c = parts[i]
+        if c != "#" && c != "@" && c != "!" && c != " " {
+            let up = upper_map[c]
+            if up.is_nil() { return c }
+            return up
+        }
+        i += 1
+    }
+    return "?"
+}
+
+// "room not joined" -> "Room not joined."
+fn sentence(text){
+    let t = "" + text
+    let chars = t.split("")
+    if chars.len() < 3 { return t }
+    let first = chars[1]
+    let up = upper_map[first]
+    if up == nil { up = first }
+    let out = up + t.strip_prefix(first)
+    let last = chars[chars.len() - 2]
+    if last != "." && last != "!" && last != "?" { out = out + "." }
+    return out
+}
+
+// 19240 -> "19,240"
+fn grouped(n){
+    if n < 1000 { return "" + n }
+    let k = floor(n / 1000)
+    let r = n - k * 1000
+    let pad = ""
+    if r < 100 { pad = "0" }
+    if r < 10 { pad = "00" }
+    return grouped(k) + "," + pad + r
+}
+
+fn badge_count(n){
+    if n > 99 { return "99+" }
+    return "" + n
+}
+
+// One label per part, so a narrow pane wraps between parts, never inside one.
+fn show_totals(u, m){
+    let a = "Nothing unread"
+    let b = ""
+    if m == 0 && u > 0 { a = grouped(u) + " unread" }
+    if m > 0 {
+        a = grouped(u) + " unread · "
+        b = grouped(m) + " " + plural(m, "mention")
+    }
+    set_title(a, b)
+}
+
+fn set_title(a, b){
+    ui.totals.set_text(a)
+    ui.totals_b.set_text(b)
+    ui.totals_b_wrap.set_visible(b != "")
 }
 
 fn invite_line(it){
     let who = "someone"
-    if !it.inviter_name.is_nil() { who = it.inviter_name }
-    let line = "invited by " + who
-    if it.is_space { line = "space · " + line }
-    if it.is_direct { line = "DM · " + line }
-    return line
+    if !it["inviter_name"].is_nil() { who = it["inviter_name"] }
+    if it["is_direct"] == true {
+        if who == it.name { return "Direct message" }
+        return "Direct message from " + who
+    }
+    if it["is_space"] == true { return "Space · invited by " + who }
+    return "Invited by " + who
 }
 
-fn badge(it){
-    let b = "" + it.unread
-    if it.mentions > 0 { b = b + " · " + it.mentions + " " + plural(it.mentions, "mention") }
-    return b
+// Busiest first: mentions, then unread. Two stable bucket passes stay linear, so big
+// inboxes fit the script budget; counts past 99 tie, like their 99+ badges.
+fn sort_busiest(xs){
+    let a = xs
+    for field in ["unread", "mentions"] {
+        let buckets = []
+        let k = 0
+        while k < 100 {
+            buckets.push([])
+            k += 1
+        }
+        for it in a {
+            let v = it[field]
+            if v > 99 { v = 99 }
+            if v < 0 { v = 0 }
+            buckets[v].push(it)
+        }
+        a = []
+        k = 99
+        while k >= 0 {
+            for it in buckets[k] { a.push(it) }
+            k -= 1
+        }
+    }
+    return a
 }
 
-fn outranks(a, b){
-    if a.mentions > b.mentions { return true }
-    if a.mentions < b.mentions { return false }
-    return a.unread > b.unread
+fn say(kind, text){
+    ui.status.set_text(if kind == "ok" {text} else {""})
+    ui.status_err.set_text(if kind == "err" {text} else {""})
+    ui.status_note.set_text(if kind == "note" {text} else {""})
+    ui.status_wrap.set_visible(kind == "ok")
+    ui.status_err_wrap.set_visible(kind == "err")
+    ui.status_note_wrap.set_visible(kind == "note")
+}
+
+fn build_invite_rows(){
+    invite_rows = []
+    for it in invites {
+        let bg = #xF7F9FC
+        let edge = #xF7F9FC
+        if it.room_id == pick_id {
+            bg = #xE4EEFF
+            edge = #x0f88fe
+        }
+        invite_rows.push({name: it.name initial: initial(it.name) meta: invite_line(it) bg: bg edge: edge})
+    }
+}
+
+fn build_unread_rows(){
+    unread_rows = []
+    for it in unread {
+        if unread_rows.len() >= row_cap { break }
+        let meta = ""
+        if it["is_direct"] == true { meta = "Direct message" }
+        unread_rows.push({name: it.name initial: initial(it.name) meta: meta
+            mentions: if it.mentions > 0 {"@" + badge_count(it.mentions)} else {""}
+            count: if it.unread > 0 {badge_count(it.unread)} else {""}})
+    }
+}
+
+fn show_head(){
+    if unread_phase == "ready" { show_totals(sum_unread, sum_mentions) }
+    elif unread_phase == "error" && invites_phase != "error" { set_title("Unread counts unavailable", "") }
+    else { set_title("Your inbox", "") }
+    // Section captions carry the counts; this line only says what they can't.
+    let line = ""
+    if invites_phase == "ready" && invites.len() == 0 && unread.len() > 0 { line = "No pending invites" }
+    ui.meta_line.set_text(line)
+    ui.meta_wrap.set_visible(line != "")
+    let is_loading = (invites_phase == "loading" || unread_phase == "loading") && invites.len() == 0 && unread.len() == 0
+    ui.loading_wrap.set_visible(is_loading)
+}
+
+fn show_sections(){
+    build_invite_rows()
+    build_unread_rows()
+    let has_invites = invites.len() > 0
+    ui.invite_section.set_visible(has_invites || (invites_phase == "error" && unread_phase != "error"))
+    ui.invite_list_wrap.set_visible(has_invites)
+    ui.invite_err.set_text(if invites_phase == "error" {"Couldn't load invites: " + sentence(invites_error)} else {""})
+    ui.invite_err_wrap.set_visible(invites_phase == "error")
+    ui.invite_head.set_text(if has_invites {"INVITES · " + invites.len()} else {"INVITES"})
+    let has_unread = unread.len() > 0
+    ui.unread_section.set_visible(has_unread || (unread_phase == "error" && invites_phase != "error"))
+    ui.unread_list_wrap.set_visible(has_unread)
+    ui.unread_err.set_text(if unread_phase == "error" {"Couldn't load unread rooms: " + sentence(unread_error)} else {""})
+    ui.unread_err_wrap.set_visible(unread_phase == "error")
+    ui.unread_more_wrap.set_visible(unread.len() > row_cap)
+    ui.unread_head.set_text(if has_unread {"UNREAD · " + grouped(unread.len()) + if unread.len() == 1 {" ROOM"} else {" ROOMS"}} else {"UNREAD"})
+    ui.invite_list.render()
+    ui.unread_list.render()
+    show_empty()
+    show_head()
+}
+
+fn show_empty(){
+    if invites_phase == "error" && unread_phase == "error" {
+        let is_denied = !host.has("matrix.rooms.invites.list") && !host.has("matrix.rooms.list")
+        ui.empty_wrap.set_visible(true)
+        ui.empty_btn_wrap.set_visible(!is_denied)
+        ui.ask_btn_wrap.set_visible(is_denied)
+        if is_denied {
+            ui.empty_icon.set_text("🔒")
+            ui.empty_title.set_text("Can't see your inbox")
+            ui.empty_text.set_text("Allow Inbox to see your invites and unread rooms.")
+            return nil
+        }
+        ui.empty_icon.set_text("😕")
+        ui.empty_title.set_text("Couldn't load your inbox")
+        ui.empty_text.set_text(sentence(unread_error))
+        ui.empty_btn.set_text("Try again")
+        return nil
+    }
+    if invites_phase == "ready" && unread_phase == "ready" && invites.len() == 0 && unread.len() == 0 {
+        ui.empty_wrap.set_visible(true)
+        ui.empty_btn_wrap.set_visible(false)
+        ui.ask_btn_wrap.set_visible(false)
+        ui.empty_icon.set_text("📭")
+        ui.empty_title.set_text("You're all caught up")
+        ui.empty_text.set_text("No invites and nothing unread.")
+        return nil
+    }
+    ui.empty_wrap.set_visible(false)
+    return nil
 }
 
 fn sync_pick(){
@@ -64,11 +278,19 @@ fn sync_pick(){
 
 fn pick_invite(i){
     if i >= invites.len() { return nil }
-    pick_id = invites[i].room_id
-    pick_name = invites[i].name
+    let it = invites[i]
+    pick_id = it.room_id
+    pick_name = it.name
+    ui.pick_kind.set_text(if it["is_direct"] == true {"DIRECT MESSAGE"} else {if it["is_space"] == true {"SPACE INVITE"} else {"ROOM INVITE"}})
     ui.pick_title.set_text(pick_name)
+    ui.pick_line.set_text(invite_line(it))
     ui.pick_note.set_text("")
+    ui.pick_note_wrap.set_visible(false)
+    ui.pick_err.set_text("")
+    ui.pick_err_wrap.set_visible(false)
     sync_pick()
+    build_invite_rows()
+    ui.invite_list.render()
 }
 
 fn answer_invite(accept){
@@ -78,17 +300,24 @@ fn answer_invite(accept){
     let verb = "Declined"
     if accept { verb = "Accepted" }
     invite_answer_loading = true
-    ui.pick_note.set_text("One moment…")
+    ui.pick_err_wrap.set_visible(false)
+    ui.pick_note.set_text(if accept {"Accepting…"} else {"Declining…"})
+    ui.pick_note_wrap.set_visible(true)
     host.request("matrix.invite_respond", {room_id: answered_id, accept: accept}, fn(r){
         invite_answer_loading = false
+        if pick_id == answered_id { ui.pick_note_wrap.set_visible(false) }
         if !r.is_ok {
-            if pick_id == answered_id { ui.pick_note.set_text(r.error) }
-            ui.status.set_text(r.error)
+            if pick_id == answered_id {
+                ui.pick_err.set_text(sentence(r.error))
+                ui.pick_err_wrap.set_visible(true)
+            } else {
+                say("err", "Couldn't answer the invite to " + answered_name + ": " + sentence(r.error))
+            }
             return nil
         }
-        if pick_id == answered_id { ui.pick_note.set_text("") }
-        ui.status.set_text(verb + " the invite to " + answered_name)
+        say("ok", verb + " the invite to " + answered_name)
         load_invites()
+        return nil
     })
 }
 
@@ -100,15 +329,15 @@ fn load_invites(){
         invites_loaded = r.is_ok
         if r.is_ok {
             invites = r.data.invites
-            invite_note = "No pending invites."
-            ui.invite_head.set_text("INVITES · " + invites.len())
+            invites_phase = "ready"
         } else {
             invites = []
-            invite_note = r.error
-            ui.invite_head.set_text("INVITES")
+            invites_phase = "error"
+            invites_error = r.error
         }
         sync_pick()
-        ui.invite_list.render()
+        show_sections()
+        return nil
     })
 }
 
@@ -120,10 +349,9 @@ fn load_unread(){
         unread_loaded = r.is_ok
         if !r.is_ok {
             unread = []
-            unread_note = r.error
-            ui.totals.set_text("Unread counts unavailable.")
-            ui.unread_head.set_text("UNREAD")
-            ui.unread_list.render()
+            unread_phase = "error"
+            unread_error = r.error
+            show_sections()
             return nil
         }
         let pending = []
@@ -136,21 +364,12 @@ fn load_unread(){
                 sum_m += it.mentions
             }
         }
-        unread = []
-        while pending.len() > 0 {
-            let best = 0
-            let i = 0
-            for it in pending {
-                if outranks(it, pending[best]) { best = i }
-                i += 1
-            }
-            unread.push(pending[best])
-            pending.remove(best)
-        }
-        unread_note = "Nothing unread. You're all caught up."
-        ui.totals.set_text(totals_text(sum_u, sum_m))
-        ui.unread_head.set_text("UNREAD · " + unread.len() + " " + plural(unread.len(), "room"))
-        ui.unread_list.render()
+        unread = sort_busiest(pending)
+        sum_unread = sum_u
+        sum_mentions = sum_m
+        unread_phase = "ready"
+        show_sections()
+        return nil
     })
 }
 
@@ -162,7 +381,8 @@ fn load_all(){
 fn open_room(i){
     if i >= unread.len() { return nil }
     host.request("nav.room", {room_id: unread[i].room_id}, fn(r){
-        if !r.is_ok { ui.status.set_text(r.error) }
+        if !r.is_ok { say("err", "Couldn't open that room: " + sentence(r.error)) }
+        return nil
     })
 }
 
@@ -170,7 +390,9 @@ fn on_invite_received(json){ if host.has("matrix.rooms.invites.list") { load_inv
 fn on_rooms_changed(json){ if host.has("matrix.rooms.list") { load_unread() } }
 fn on_unread_totals_changed(json){
     let t = json.parse_json()
-    ui.totals.set_text(totals_text(t.unread, t.mentions))
+    sum_unread = t.unread
+    sum_mentions = t.mentions
+    show_totals(t.unread, t.mentions)
 }
 
 fn subscribe(name){
@@ -180,7 +402,7 @@ fn subscribe(name){
     host.request("events.subscribe", {event: name}, fn(r){
         pending_events.retain(|event| event != name)
         if r.is_ok { subscribed_events.push(name) }
-        if !r.is_ok { ui.status.set_text("Live updates are off: " + r.error) }
+        if !r.is_ok { say("note", "Live updates are off: " + sentence(r.error)) }
     })
 }
 
@@ -192,10 +414,25 @@ fn watch_granted(){
 }
 
 fn watch(){
-    ui.status.set_text("")
+    say("", "")
     subscribe("on_invite_received")
     subscribe("on_rooms_changed")
     subscribe("on_unread_totals_changed")
+}
+
+fn refresh(){
+    load_all()
+    watch()
+}
+
+fn on_app_resize(w, h){
+    let narrow = w < 300
+    if narrow == is_narrow { return nil }
+    is_narrow = narrow
+    ui.refresh_btn.set_text(if narrow {"↻"} else {"Refresh"})
+    ui.invite_list.render()
+    ui.unread_list.render()
+    return nil
 }
 
 fn on_permissions_changed(caps){
@@ -212,34 +449,96 @@ let _boot = start_timeout(0.05, || {
 })
 
 View{
-    width: Fill height: Fill flow: Down align: Align{x: 0.5}
+    width: Fill height: Fill flow: Down
     col := ScrollYView{
-        width: Fill height: Fill flow: Down spacing: 10 padding: 14
+        width: Fill height: Fill flow: Down spacing: 12 padding: 14
         View{
-            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-            totals := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
-            Button{ text: "Refresh" on_click: || { load_all() watch() } draw_text +: { color: #x1C274C } }
+            width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
+            View{
+                width: Fill height: Fit flow: Down spacing: 3
+                View{
+                    width: Fill height: Fit flow: Flow.Right{wrap: true}
+                    totals := Label{ text: "Your inbox" padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
+                    totals_b_wrap := View{
+                        width: Fit height: Fit visible: false
+                        totals_b := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
+                    }
+                }
+                meta_wrap := View{
+                    width: Fill height: Fit visible: false
+                    meta_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                }
+            }
+            refresh_btn := NeutralButton{ text: "Refresh" on_click: || refresh() }
         }
-        status := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
-        invite_head := Label{ text: "INVITES" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
-        invite_list := ScrollYView{
-            width: Fill height: Fit{max: FitBound.Rel{base: Base.Full, factor: 0.35}} flow: Down spacing: 5
-            on_item_tap: |i| pick_invite(i)
-            on_render: || {
-                if invites.len() == 0 {
-                    Label{ text: invite_note width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
-                } else {
-                    for it in invites {
-                        RoundedView{
-                            width: Fill height: Fit flow: Down spacing: 2 padding: 10
-                            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
-                            Label{
-                                text: it.name width: Fill padding: 0 margin: 0
-                                draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} }
-                            }
-                            Label{
-                                text: invite_line(it) width: Fill padding: 0 margin: 0
-                                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 11} }
+        status_wrap := View{
+            width: Fill height: Fit visible: false
+            status := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x138808 text_style: theme.font_regular{font_size: 10} } }
+        }
+        status_err_wrap := View{
+            width: Fill height: Fit visible: false
+            status_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} } }
+        }
+        status_note_wrap := View{
+            width: Fill height: Fit visible: false
+            status_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+        }
+        loading_wrap := View{
+            width: Fill height: Fit flow: Right spacing: 10 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24}
+            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
+            Label{ text: "Loading your inbox…" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+        }
+        empty_wrap := View{
+            width: Fill height: Fit visible: false
+            RoundedView{
+                width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5}
+                padding: Inset{top: 20 bottom: 20 left: 16 right: 16}
+                show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                empty_icon := Label{ text: "📭" padding: 0 margin: 0 draw_text +: { text_style: theme.font_regular{font_size: 28} } }
+                empty_title := Label{ text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} } }
+                empty_text := Label{ text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                empty_btn_wrap := View{
+                    width: Fit height: Fit visible: false margin: Inset{top: 6}
+                    empty_btn := NeutralButton{ text: "Try again" on_click: || refresh() }
+                }
+                ask_btn_wrap := View{
+                    width: Fit height: Fit visible: false margin: Inset{top: 6}
+                    PrimaryButton{ text: "Ask again" on_click: || refresh() }
+                }
+            }
+        }
+        invite_section := View{
+            width: Fill height: Fit flow: Down spacing: 8 visible: false
+            invite_head := Label{ text: "INVITES" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+            invite_err_wrap := View{
+                width: Fill height: Fit visible: false
+                invite_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} } }
+            }
+            invite_list_wrap := View{
+                width: Fill height: Fit
+                invite_list := ScrollYView{
+                    width: Fill height: Fit{max: FitBound.Rel{base: Base.Full, factor: 0.4}} flow: Down spacing: 8
+                    on_item_tap: |i| pick_invite(i)
+                    on_render: || {
+                        // A render with no children keeps the old ones, so an empty list draws a spacer.
+                        if invite_rows.len() == 0 { invite_spacer := View{ width: Fill height: 1 } }
+                        for r in invite_rows {
+                            RoundedView{
+                                width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
+                                padding: Inset{top: 10 bottom: 10 left: 10 right: 12}
+                                show_bg: true draw_bg +: { color: r.bg border_size: 1.0 border_color: r.edge border_radius: 8.0 }
+                                if !is_narrow {
+                                    RoundedView{
+                                        width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
+                                        show_bg: true draw_bg +: { color: #x52b2ac border_radius: 16.0 }
+                                        Label{ text: r.initial padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
+                                    }
+                                }
+                                View{
+                                    width: Fill height: Fit flow: Down spacing: 2
+                                    Label{ text: r.name width: Fill max_lines: 1 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} } }
+                                    Label{ text: r.meta width: Fill max_lines: 1 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                                }
                             }
                         }
                     }
@@ -247,42 +546,86 @@ View{
             }
         }
         pick_wrap := View{
-            width: Fill height: Fit flow: Down visible: false
+            width: Fill height: Fit visible: false
             RoundedView{
-                width: Fill height: Fit flow: Down spacing: 6 padding: 12
-                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
-                pick_title := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 14} } }
+                width: Fill height: Fit flow: Down spacing: 8 padding: 12
+                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                View{
+                    width: Fill height: Fit flow: Down spacing: 3
+                    pick_kind := Label{ text: "ROOM INVITE" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+                    pick_title := Label{ text: "" width: Fill max_lines: 2 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
+                    pick_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                }
                 View{
                     width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
-                    Button{ text: "Accept" on_click: || answer_invite(true) draw_text +: { color: #x138808 } }
-                    Button{ text: "Decline" on_click: || answer_invite(false) draw_text +: { color: #xB91C1C } }
+                    PositiveButton{ text: "Accept" on_click: || answer_invite(true) }
+                    NegativeButton{ text: "Decline" on_click: || answer_invite(false) }
                 }
-                pick_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
+                pick_note_wrap := View{
+                    width: Fill height: Fit visible: false
+                    pick_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                }
+                pick_err_wrap := View{
+                    width: Fill height: Fit visible: false
+                    pick_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} } }
+                }
             }
         }
-        unread_head := Label{ text: "UNREAD" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
-        unread_list := ScrollYView{
-            width: Fill height: Fill{min: 80} flow: Down spacing: 5
-            on_item_tap: |i| open_room(i)
-            on_render: || {
-                if unread.len() == 0 {
-                    Label{ text: unread_note width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
-                } else {
-                    for it in unread {
-                        RoundedView{
-                            width: Fill height: Fit flow: Right spacing: 8 padding: 10 align: Align{y: 0.5}
-                            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
-                            Label{
-                                text: it.name width: Fill padding: 0 margin: 0
-                                draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} }
-                            }
-                            Label{
-                                text: badge(it) padding: 0 margin: 0
-                                draw_text +: { color: #x0f88fe text_style: theme.font_bold{font_size: 11} }
+        unread_section := View{
+            width: Fill height: Fill{min: 80} flow: Down spacing: 8 visible: false
+            unread_head := Label{ text: "UNREAD" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+            unread_err_wrap := View{
+                width: Fill height: Fit visible: false
+                unread_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} } }
+            }
+            unread_list_wrap := View{
+                width: Fill height: Fill
+                unread_list := ScrollYView{
+                    width: Fill height: Fill flow: Down spacing: 8
+                    on_item_tap: |i| open_room(i)
+                    on_render: || {
+                        if unread_rows.len() == 0 { unread_spacer := View{ width: Fill height: 1 } }
+                        for r in unread_rows {
+                            RoundedView{
+                                width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
+                                padding: Inset{top: 10 bottom: 10 left: 10 right: 12}
+                                show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                                if !is_narrow {
+                                    RoundedView{
+                                        width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
+                                        show_bg: true draw_bg +: { color: #x52b2ac border_radius: 16.0 }
+                                        Label{ text: r.initial padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
+                                    }
+                                }
+                                View{
+                                    width: Fill height: Fit flow: Down spacing: 2
+                                    Label{ text: r.name width: Fill max_lines: 1 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} } }
+                                    if r.meta != "" {
+                                        Label{ text: r.meta width: Fill max_lines: 1 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                                    }
+                                }
+                                if r.mentions != "" {
+                                    RoundedView{
+                                        width: Fit height: Fit padding: Inset{top: 2 bottom: 2 left: 7 right: 7}
+                                        show_bg: true draw_bg +: { color: #xDC0005 border_radius: 9.0 }
+                                        Label{ text: r.mentions padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 9.5} } }
+                                    }
+                                }
+                                if r.count != "" {
+                                    RoundedView{
+                                        width: Fit height: Fit padding: Inset{top: 2 bottom: 2 left: 7 right: 7}
+                                        show_bg: true draw_bg +: { color: #x8A93A8 border_radius: 9.0 }
+                                        Label{ text: r.count padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 9.5} } }
+                                    }
+                                }
                             }
                         }
                     }
                 }
+            }
+            unread_more_wrap := View{
+                width: Fill height: Fit visible: false
+                Label{ text: "Showing the 100 busiest rooms." width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
             }
         }
     }

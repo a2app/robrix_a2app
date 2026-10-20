@@ -1,0 +1,2601 @@
+// name: Link Library
+// icon: 🔗
+// tint: #2F6FDE
+// description: Every link shared in this room, searchable, with who shared it and when.
+// permissions: matrix-room-read, matrix-room-watch, open-url, clipboard-write, robrix-navigation, matrix.room.messages.read, matrix.room.messages.paginate, on_room_message, on_room_message_changed, device.url.open, device.clipboard.write, host.nav.event, host.nav.link
+// why-matrix-room-read: Reads this room's messages to collect the links people shared.
+// why-matrix-room-watch: Adds links from new messages as they arrive, and drops deleted ones.
+// why-open-url: Opens a link in your browser when you tap Open.
+// why-clipboard-write: Copies a link when you tap Copy.
+// why-robrix-navigation: Jumps to the message that shared a link, and opens Matrix links in Robrix.
+
+// Bounds keep memory, the saved file and each callback's work small.
+let max_links = 400
+let max_shares = 6
+// Shares remembered per link (details plus bare ids), so re-reading a window never counts twice.
+let max_tracked = 30
+let max_urls = 8
+let max_gaps = 8
+let row_step = 50
+// A keystroke draws this many rows at once; the follow-up render draws the rest.
+let typing_rows = 12
+let scan_pages = 4
+let page_size = 50
+let slice_budget = 300
+// An entry that queues work has already parsed its payload, so its own slice is smaller;
+// a few messages still land at once, and a burst continues on the next ticks.
+let entry_budget = 80
+// Robrix clips the message bodies it hands to apps at this many characters.
+let body_clip = 500
+let hook_names = ["on_room_message", "on_room_message_changed"]
+let save_path = "/library.json"
+let save_cap = 250000
+
+// ASCII classes and no "i" flag: Unicode classes are slow to compile within the startup budget.
+// A URL ends at whitespace, quotes, backticks, angle brackets and CJK punctuation.
+let url_char = "[^\\s<>\"`“”‘’«»、-〿！-／：-＠［-｀｛-･]"
+// No pattern has a capture group: a reused Splash regex can return stale captures.
+// A www. or matrix: link needs a non-URL character before it; http(s) links stand alone.
+let url_re = regex("(?:^|[^A-Za-z0-9_@./:=?&#%+~-])(?:[wW][wW][wW]\\.|[mM][aA][tT][rR][iI][xX]:[A-Za-z]+/)" + url_char + "+|[hH][tT][tT][pP][sS]?://" + url_char + "+")
+let lead_char_re = regex("^[^A-Za-z]")
+let scheme_re = regex("^[A-Za-z][A-Za-z0-9+.-]*://")
+let path_start_re = regex("[/?#].*$", "s")
+let query_re = regex("\\?.*$", "s")
+let matrix_prefix_re = regex("^[mM][aA][tT][rR][iI][xX]:")
+let saved_url_re = regex("^(?:https?://|matrix:)")
+let www_re = regex("^[wW][wW][wW]\\.")
+let port_re = regex(":[0-9]*$")
+let word_re = regex("[A-Za-z0-9]|[^\\s!-~]")
+let matrix_to_re = regex("^/?#/")
+let nav_id_re = regex("^[@!]")
+let clean_end_re = regex("[A-Za-z0-9/_=&+-]$")
+let trail_punct_re = regex("[.,;:!?*'…]+$")
+let close_paren_re = regex("\\)$")
+let close_square_re = regex("\\]$")
+let close_curly_re = regex("\\}$")
+let upper_re = regex("[A-Z]")
+let space_re = regex("\\s+", "g")
+// Markdown brackets, bold and inline-code marks around links read as noise in a snippet.
+let markup_re = regex("[\\[\\]`]|\\*\\*", "g")
+let last_word_re = regex("^.*\\s", "s")
+let edit_re = regex("^\\* ")
+let reply_re = regex("^> (?:\\* )?<")
+let quote_line_re = regex("^> ")
+let emoticon_re = regex("^(?:[:;=8][-'^o]?[()\\[\\]DPpOo3/\\\\|*$@]+|[()\\[\\]][-'^o]?[:;=]|\\^[_.-]?\\^|<3|[xX][dD]+)$")
+let term_split_re = regex("\\s+")
+let end_re = regex("[.!?…]$")
+let metas = ["\\", ".", "*", "+", "?", "(", ")", "[", "]", "{", "}", "|", "^", "$"]
+// Robrix's own lead-ins, which the app's wording already says.
+let error_leads = ["couldn't read messages: ", "couldn't load older messages: "]
+
+// Where the app runs: "unknown" until env answers, then "attached" or "detached".
+let room_state = "unknown"
+let room_id = ""
+let room_name = ""
+let saved_room = ""
+let is_env_pending = false
+let env_error = ""
+
+// The grouped setup, the latest-messages read and the live hooks.
+let is_setup_pending = false
+let setup_error = ""
+let is_latest_loading = false
+let is_latest_loaded = false
+let is_latest_refused = false
+let latest_token = 0
+let read_error = ""
+let window_size = 0
+let subscribed_events = []
+let pending_events = []
+let refused_events = []
+let live_error = ""
+
+// The library: links newest first, indexed by link key and by event id.
+let links = []
+let link_index = {}
+let event_keys = {}
+let dead_links = 0
+let dead_events = 0
+let moved = []
+let is_changed = false
+let site_counts = {}
+let top_sites = []
+let site_total = 0
+let people_total = 0
+let display_names = {}
+let name_order = []
+// People with a share in the library, whose names its search text may hold.
+let share_users = {}
+let hay_gen = 0
+let recent_meta = {}
+let recent_ids = []
+let dead_meta = 0
+
+// Messages are absorbed a slice per tick, so no single callback runs long.
+let jobs = []
+let is_jobs_scheduled = false
+let is_view_dirty = false
+let is_save_due = false
+let is_save_soon = false
+let is_save_pending = false
+
+// History: scan_before is the oldest message read; each gap bridges back to an earlier visit.
+let scanned = 0
+let newest_ts = 0
+let restored_ts = 0
+let scan_before = ""
+let is_at_start = false
+let gaps = []
+let is_scanning = false
+let is_scan_pending = false
+let scan_left = 0
+let scan_epoch = 0
+let scan_note = ""
+let scan_error = ""
+let scan_start_links = 0
+let scan_trimmed = 0
+
+// What the list shows.
+let query = ""
+let query_terms = []
+let site_filter = ""
+let rows = []
+let match_total = 0
+let row_limit = 50
+let chips = []
+let selected_key = ""
+let is_wide = false
+let is_narrow = false
+// Tiny panes stack Refresh and the scan button under their text.
+let is_tiny = false
+// What link_list draws: the rows, or nothing for a frame while its scroll offset resets.
+let list_rows = []
+let is_list_reset_pending = false
+let is_rerender_pending = false
+// Each ui call searches the widget tree, so view parts write only what changed.
+let view_sigs = {}
+
+// One-shot actions on the selected link; the token drops replies for an earlier selection.
+let is_open_pending = false
+let is_copy_pending = false
+let is_jump_pending = false
+let action_token = 0
+let action_note = ""
+// 0 neutral, 1 done, 2 failed.
+let action_tone = 0
+
+// ---- Small helpers
+
+fn str_of(v){
+    if v.is_string() { return v }
+    return ""
+}
+
+fn num_of(v){
+    if v.is_number() { return v }
+    return 0
+}
+
+// Reads an optional field; a missing one is nil instead of an error.
+fn field_of(obj, key){
+    if !obj.is_object() { return nil }
+    return obj[key]
+}
+
+fn plural(n, one, many){
+    if n == 1 { return "1 " + one }
+    return "" + n + " " + many
+}
+
+fn count_of(text, piece){ return text.split(piece).len() - 1 }
+
+// A host error without Robrix's lead-in, ending in a period.
+fn clean_error(error){
+    let text = str_of(error).trim()
+    for lead in error_leads { text = text.strip_prefix(lead) }
+    if text == "" { return "Something went wrong." }
+    if !end_re.test(text) { text = text + "." }
+    return text
+}
+
+// The same as a line of its own, capitalized.
+fn error_line(error){
+    let codes = clean_error(error).to_chars()
+    if codes[0] >= 97 && codes[0] <= 122 { codes[0] = codes[0] - 32 }
+    return codes.to_string()
+}
+
+// ASCII lowercase for schemes and hosts: to_chars gives char codes and to_string joins them back.
+fn lower(text){
+    if !upper_re.test(text) { return text }
+    let codes = text.to_chars()
+    let i = 0
+    while i < codes.len() {
+        let c = codes[i]
+        if c >= 65 && c <= 90 { codes[i] = c + 32 }
+        i += 1
+    }
+    return codes.to_string()
+}
+
+fn escape_regex(value){
+    let out = value
+    for c in metas {
+        if out.search(c) < 0 { continue }
+        let parts = out.split(c)
+        let joined = parts[0]
+        let i = 1
+        while i < parts.len() {
+            joined = joined + "\\" + c + parts[i]
+            i += 1
+        }
+        out = joined
+    }
+    return out
+}
+
+// The first n characters of text, dropping or copying whichever is fewer.
+// to_chars gives char codes and to_string joins them back; split("") gives one string per char.
+fn head_chars(text, codes, n){
+    if codes.len() - n < n {
+        while codes.len() > n { codes.pop() }
+        return codes.to_string()
+    }
+    let chars = text.split("")
+    let parts = []
+    let i = 1
+    while i <= n {
+        parts.push(chars[i])
+        i += 1
+    }
+    return parts.to_string()
+}
+
+// Cuts text to about n characters, at a word break when one is near.
+// len() counts bytes, so a short byte length means no cut is needed.
+fn shorten(text, n){
+    if text.len() <= n { return text }
+    let codes = text.to_chars()
+    if codes.len() <= n { return text }
+    let head = head_chars(text, codes, n - 1)
+    let cut = head.strip_suffix(head.replace(last_word_re, "")).trim()
+    if cut.to_chars().len() >= floor(n * 0.6) { return cut + "…" }
+    return head.trim() + "…"
+}
+
+fn ago(ts){
+    if !ts.is_number() || ts <= 0 { return "" }
+    let s = time_now() - ts / 1000.0
+    if s < 60.0 { return "now" }
+    if s < 3600.0 { return "" + floor(s / 60.0) + "m" }
+    if s < 86400.0 { return "" + floor(s / 3600.0) + "h" }
+    if s < 604800.0 { return "" + floor(s / 86400.0) + "d" }
+    if s < 2592000.0 { return "" + floor(s / 604800.0) + "w" }
+    if s < 31536000.0 { return "" + floor(s / 2592000.0) + "mo" }
+    return "" + floor(s / 31536000.0) + "y"
+}
+
+fn ago_phrase(ts){
+    let a = ago(ts)
+    if a == "" { return "" }
+    if a == "now" { return "just now" }
+    if a == "1d" { return "yesterday" }
+    return a + " ago"
+}
+
+// ---- Finding links in a message
+
+// Drops trailing punctuation and closing brackets the URL never opened.
+fn clean_url(raw){
+    if clean_end_re.test(raw) { return raw }
+    let u = raw
+    let guard = 0
+    while guard < 8 {
+        guard += 1
+        let before = u
+        u = u.replace(trail_punct_re, "")
+        if close_paren_re.test(u) && count_of(u, "(") < count_of(u, ")") { u = u.replace(close_paren_re, "") }
+        if close_square_re.test(u) && count_of(u, "[") < count_of(u, "]") { u = u.replace(close_square_re, "") }
+        if close_curly_re.test(u) && count_of(u, "{") < count_of(u, "}") { u = u.replace(close_curly_re, "") }
+        if u == before { break }
+    }
+    return u
+}
+
+fn path_label(rest){
+    if rest == "" || rest == "/" { return "Home page" }
+    return shorten(rest, 64)
+}
+
+// "#room:server/$event?via=x" shown as "#room:server/$event".
+fn matrix_label(id){ return shorten(id.replace(query_re, ""), 64) }
+
+// A matrix: URI. Robrix can't resolve room aliases, so those open on matrix.to instead.
+fn parse_matrix_uri(url){
+    let target = url.replace(matrix_prefix_re, "")
+    let bare = target.replace(query_re, "")
+    let parts = bare.split("/")
+    if parts.len() < 2 || parts[1] == "" { return nil }
+    let kind = lower(parts[0])
+    let sigil = ""
+    if kind == "u" { sigil = "@" }
+    if kind == "roomid" { sigil = "!" }
+    if kind == "r" { sigil = "#" }
+    if sigil == "" { return nil }
+    let id = sigil + parts[1]
+    if parts.len() >= 4 && parts[2] == "e" && parts[3] != "" { id = id + "/$" + parts[3] }
+    let label = matrix_label(id)
+    let full = "matrix:" + target
+    return {url: full key: full site: "matrix" path: label label: label open: "https://matrix.to/#/" + id + target.strip_prefix(bare) is_nav: sigil != "#"}
+}
+
+// One link as {url, key, site, path, label, open, is_nav}, or nil when the text isn't a usable link.
+// is_nav: Robrix opens it in-app (people, room ids and their messages); open is what a browser gets.
+fn parse_link(raw){
+    let url = raw
+    if url.len() < 8 || url.len() > 2000 { return nil }
+    if www_re.test(url) { url = "https://" + url }
+    if matrix_prefix_re.test(url) { return parse_matrix_uri(url) }
+    if !scheme_re.test(url) { return nil }
+    let scheme = lower(url.split("://")[0])
+    if scheme != "http" && scheme != "https" { return nil }
+    let after = url.replace(scheme_re, "")
+    let authority = after.replace(path_start_re, "")
+    let rest = after.strip_prefix(authority)
+    let host = lower(authority)
+    let base = scheme + "://" + host
+    if host.search("@") >= 0 {
+        let parts = host.split("@")
+        host = parts[parts.len() - 1]
+    }
+    if host.search(":") >= 0 { host = host.replace(port_re, "") }
+    let site = host.replace(www_re, "")
+    if !word_re.test(site) { return nil }
+    let tail = rest
+    if tail == "" { tail = "/" }
+    let full = base + rest
+    let link = {url: full key: base + tail site: site path: "" label: site open: full is_nav: false}
+    let id = rest.replace(matrix_to_re, "")
+    if site != "matrix.to" || id == rest || id == "" {
+        link.path = path_label(rest)
+        return link
+    }
+    if id.search("%") >= 0 { id = id.url_decode() }
+    link.path = matrix_label(id)
+    link.label = link.path
+    link.is_nav = nav_id_re.test(id)
+    return link
+}
+
+// Every URL in a message as {raw, link, is_cut}; raw is its text in the message.
+// A URL running into the end of a clipped body may be cut short, so it isn't collected.
+fn find_urls(body){
+    let out = []
+    if body == "" { return out }
+    let is_clipped = body.len() >= body_clip && body.to_chars().len() >= body_clip
+    for m in body.match_all(url_re) {
+        let raw = clean_url(m.value.replace(lead_char_re, ""))
+        let is_cut = is_clipped && m.index + m.value.len() == body.len()
+        out.push({raw: raw link: parse_link(raw) is_cut: is_cut})
+        if out.len() >= 40 { break }
+    }
+    return out
+}
+
+// The distinct links a message shares.
+fn links_in(urls){
+    let out = []
+    let seen = {}
+    for u in urls {
+        if u.link.is_nil() || u.is_cut || seen[u.link.key] == true { continue }
+        seen[u.link.key] = true
+        out.push(u.link)
+        if out.len() >= max_urls { break }
+    }
+    return out
+}
+
+// Whether text has words, not just punctuation and emoticons like :) or ^^.
+fn has_words(text){
+    for t in text.split(term_split_re) {
+        if t == "" || emoticon_re.test(t) { continue }
+        if word_re.test(t) { return true }
+    }
+    return false
+}
+
+// The message with each link shown as its site, or "" when it is only links.
+fn snippet_of(body, urls){
+    let bare = body
+    for u in urls { bare = bare.replace(u.raw, " ") }
+    if !has_words(bare) { return "" }
+    let text = body
+    for u in urls {
+        let label = u.raw
+        if !u.link.is_nil() { label = u.link.label }
+        // A markdown link keeps its text; <url> loses its brackets.
+        text = text.replace("](" + u.raw + ")", "]").replace("<" + u.raw + ">", label).replace(u.raw, label)
+    }
+    return shorten(text.replace(markup_re, "").replace(space_re, " ").trim(), 140)
+}
+
+// Live messages keep a reply's quoted fallback; reads strip it the way ruma does.
+fn strip_reply_fallback(body){
+    if !reply_re.test(body) || body.search("\n") < 0 { return body }
+    let lines = body.split("\n")
+    let i = 0
+    while i < lines.len() && quote_line_re.test(lines[i]) { i += 1 }
+    if i < lines.len() && lines[i] == "" { i += 1 }
+    let out = []
+    let k = i
+    while k < lines.len() {
+        if k > i { out.push("\n") }
+        out.push(lines[k])
+        k += 1
+    }
+    return out.to_string()
+}
+
+// ---- The library
+
+fn new_link(p){
+    return {key: p.key url: p.url site: p.site path: p.path label: p.label open: p.open is_nav: p.is_nav count: 0 first_ts: 0 last_ts: 0 event_id: "" shares: [] more: [] row_src: "" row_x: "" hay: "" hay_gen: -1 is_gone: false is_moved: false}
+}
+
+fn name_shown(share){
+    let known = display_names[share.u]
+    if known.is_string() { return known }
+    if share.s != "" { return share.s }
+    return share.u
+}
+
+// The newest share leads; the search text is rebuilt lazily.
+fn refresh_link(link){
+    let shares = link.shares
+    if shares.len() == 0 { return nil }
+    link.last_ts = shares[0].t
+    link.event_id = shares[0].e
+    link.hay_gen = -1
+    return nil
+}
+
+// Search text covers the URL, site, people and messages; joining an array copies once.
+fn hay_of(link){
+    if link.hay_gen == hay_gen { return link.hay }
+    let parts = [link.url, " ", link.site]
+    for s in link.shares {
+        parts.push(" ")
+        parts.push(name_shown(s))
+        parts.push(" ")
+        parts.push(s.u)
+        parts.push(" ")
+        parts.push(s.x)
+    }
+    link.hay = parts.to_string()
+    link.hay_gen = hay_gen
+    return link.hay
+}
+
+fn mark_moved(link){
+    if link.is_moved { return nil }
+    link.is_moved = true
+    moved.push(link)
+    return nil
+}
+
+fn link_event(event_id, key){
+    let keys = event_keys[event_id]
+    if !keys.is_array() {
+        event_keys[event_id] = [key]
+        return nil
+    }
+    for k in keys { if k == key { return nil } }
+    keys.push(key)
+    return nil
+}
+
+fn unlink_event(event_id, key){
+    let keys = event_keys[event_id]
+    if !keys.is_array() { return nil }
+    keys.retain(|k| k != key)
+    if keys.len() == 0 {
+        event_keys[event_id] = nil
+        dead_events += 1
+    }
+    return nil
+}
+
+fn clear_selection(){
+    selected_key = ""
+    action_token += 1
+    action_note = ""
+    action_tone = 0
+    return nil
+}
+
+fn release_link(link){
+    link.is_gone = true
+    link_index[link.key] = nil
+    dead_links += 1
+    for s in link.shares { unlink_event(s.e, link.key) }
+    for s in link.more { unlink_event(s.e, link.key) }
+    if link.key == selected_key { clear_selection() }
+    return nil
+}
+
+fn drop_link(link){
+    release_link(link)
+    mark_moved(link)
+    is_changed = true
+    return nil
+}
+
+fn is_tracked(link, event_id){
+    for s in link.shares { if s.e == event_id { return true } }
+    for s in link.more { if s.e == event_id { return true } }
+    return false
+}
+
+// Newest first; equal times keep arrival order.
+fn insert_newest_first(list, item){
+    let out = []
+    let is_placed = false
+    for x in list {
+        if !is_placed && item.t > x.t {
+            out.push(item)
+            is_placed = true
+        }
+        out.push(x)
+    }
+    if !is_placed { out.push(item) }
+    return out
+}
+
+// Older shares keep only their id, time and sender; past max_tracked they are just counted.
+fn keep_id(link, s){
+    let out = insert_newest_first(link.more, {e: s.e t: s.t u: s.u})
+    if out.len() > max_tracked - max_shares { unlink_event(out.pop().e, link.key) }
+    link.more = out
+    return nil
+}
+
+// Adds one sharing message to a link, once.
+fn add_share(p, share){
+    let link = link_index[p.key]
+    if link.is_nil() {
+        link = new_link(p)
+        link_index[p.key] = link
+        mark_moved(link)
+    }
+    if is_tracked(link, share.e) { return nil }
+    if share.u != "" { share_users[share.u] = true }
+    link.count += 1
+    if link.first_ts <= 0 || (share.t > 0 && share.t < link.first_ts) { link.first_ts = share.t }
+    link_event(share.e, link.key)
+    let out = insert_newest_first(link.shares, share)
+    if out.len() > max_shares { keep_id(link, out.pop()) }
+    link.shares = out
+    let last = link.last_ts
+    refresh_link(link)
+    if link.last_ts != last { mark_moved(link) }
+    is_changed = true
+    return nil
+}
+
+fn oldest_tracked(link){
+    let t = link.shares[link.shares.len() - 1].t
+    if link.more.len() > 0 && link.more[link.more.len() - 1].t < t { t = link.more[link.more.len() - 1].t }
+    return t
+}
+
+// Removes one message from one link; a link left without a detailed share goes away.
+fn forget_share(event_id, key){
+    let link = link_index[key]
+    if link.is_nil() { return nil }
+    let before = link.shares.len() + link.more.len()
+    link.shares.retain(|s| s.e != event_id)
+    link.more.retain(|s| s.e != event_id)
+    let removed = before - link.shares.len() - link.more.len()
+    if removed == 0 { return nil }
+    link.count -= removed
+    is_changed = true
+    if link.shares.len() == 0 || link.count <= 0 {
+        drop_link(link)
+        return nil
+    }
+    if link.count == link.shares.len() + link.more.len() { link.first_ts = oldest_tracked(link) }
+    let last = link.last_ts
+    refresh_link(link)
+    if link.last_ts != last { mark_moved(link) }
+    return nil
+}
+
+// Removes what one message contributed.
+fn forget_event(event_id){
+    let keys = event_keys[event_id]
+    if !keys.is_array() { return nil }
+    event_keys[event_id] = nil
+    dead_events += 1
+    for key in keys { forget_share(event_id, key) }
+    return nil
+}
+
+fn sort_moved(){
+    let i = 1
+    while i < moved.len() {
+        let j = i
+        while j > 0 && moved[j].last_ts > moved[j - 1].last_ts {
+            let tmp = moved[j - 1]
+            moved[j - 1] = moved[j]
+            moved[j] = tmp
+            j -= 1
+        }
+        i += 1
+    }
+    return nil
+}
+
+// Re-inserts new and re-dated links into the newest-first list in one pass.
+fn reorder(){
+    if moved.len() == 0 { return nil }
+    sort_moved()
+    let out = []
+    let j = 0
+    for l in links {
+        if l.is_moved { continue }
+        while j < moved.len() && moved[j].last_ts > l.last_ts {
+            if !moved[j].is_gone { out.push(moved[j]) }
+            j += 1
+        }
+        out.push(l)
+    }
+    while j < moved.len() {
+        if !moved[j].is_gone { out.push(moved[j]) }
+        j += 1
+    }
+    for l in moved { l.is_moved = false }
+    links = out
+    moved = []
+    return nil
+}
+
+fn trim_library(){
+    while links.len() > max_links {
+        release_link(links.pop())
+        scan_trimmed += 1
+        is_changed = true
+    }
+    return nil
+}
+
+// Site counts, the top sites and the number of people, from scratch.
+// People are counted from the shares with details, which bounds the work per link.
+fn recount(){
+    let counts = {}
+    let order = []
+    let people = {}
+    let people_n = 0
+    for l in links {
+        let n = counts[l.site]
+        if n.is_nil() {
+            counts[l.site] = 1
+            order.push(l.site)
+        } else { counts[l.site] = n + 1 }
+        for s in l.shares {
+            if s.u != "" && people[s.u] != true {
+                people[s.u] = true
+                people_n += 1
+            }
+        }
+    }
+    let top = []
+    for site in order {
+        let n = counts[site]
+        if top.len() >= 12 && n <= top[top.len() - 1].n { continue }
+        top.push({site: site n: n})
+        let k = top.len() - 1
+        while k > 0 && top[k].n > top[k - 1].n {
+            let tmp = top[k - 1]
+            top[k - 1] = top[k]
+            top[k] = tmp
+            k -= 1
+        }
+        if top.len() > 12 { top.pop() }
+    }
+    site_counts = counts
+    top_sites = top
+    site_total = order.len()
+    people_total = people_n
+    return nil
+}
+
+// Maps keep removed keys as nil, so rebuild them once enough have piled up.
+fn compact_indexes(){
+    if dead_links > 200 {
+        link_index = {}
+        for l in links { link_index[l.key] = l }
+        dead_links = 0
+    }
+    if dead_events > 400 {
+        event_keys = {}
+        for l in links {
+            for s in l.shares { link_event(s.e, l.key) }
+            for s in l.more { link_event(s.e, l.key) }
+        }
+        dead_events = 0
+    }
+    return nil
+}
+
+// ---- Names and message details for later edits
+
+fn remember_name(user, name){
+    if user == "" || name == "" { return nil }
+    let known = display_names[user]
+    if known == name { return nil }
+    if !known.is_string() {
+        name_order.push(user)
+        if name_order.len() > 300 { forget_old_names() }
+    }
+    display_names[user] = name
+    // A first name for someone with no shares yet is in no search text.
+    if known.is_string() || share_users[user] == true { hay_gen += 1 }
+    return nil
+}
+
+fn forget_old_names(){
+    let keep = {}
+    let order = []
+    let i = name_order.len() - 200
+    while i < name_order.len() {
+        let id = name_order[i]
+        keep[id] = display_names[id]
+        order.push(id)
+        i += 1
+    }
+    display_names = keep
+    name_order = order
+    return nil
+}
+
+fn remember_meta(id, name, user, ts){
+    if !recent_meta[id].is_nil() { return nil }
+    recent_meta[id] = {s: name u: user t: ts}
+    recent_ids.push(id)
+    if recent_ids.len() <= 240 { return nil }
+    recent_meta[recent_ids.remove(0)] = nil
+    dead_meta += 1
+    if dead_meta < 240 { return nil }
+    let keep = {}
+    for k in recent_ids { keep[k] = recent_meta[k] }
+    recent_meta = keep
+    dead_meta = 0
+    return nil
+}
+
+fn shown_name(user, name, short){
+    if name != "" { return name }
+    let known = display_names[user]
+    if known.is_string() { return known }
+    if short != "" { return short }
+    if user != "" { return user }
+    return "Someone"
+}
+
+fn sender_of(m){
+    let user = str_of(m["sender_id"])
+    let name = str_of(m["sender_name"])
+    if name != "" { remember_name(user, name) }
+    return {name: shown_name(user, name, str_of(m["sender"])) user: user}
+}
+
+// ---- Absorbing messages
+
+fn is_same_keys(prior, found){
+    if prior.len() != found.len() { return false }
+    for p in found {
+        let is_hit = false
+        for k in prior { if k == p.key { is_hit = true } }
+        if !is_hit { return false }
+    }
+    return true
+}
+
+// A re-read that changes nothing is skipped, so it neither reorders nor resaves the library.
+fn is_same_share(id, prior, found, snippet){
+    if !is_same_keys(prior, found) { return false }
+    let link = link_index[prior[0]]
+    if link.is_nil() { return false }
+    for s in link.shares { if s.e == id { return s.x == snippet } }
+    return true
+}
+
+// Adds one message's links; a message seen before replaces what it gave last time.
+// Returns the work it took, for slicing.
+fn absorb_message(m, kind){
+    let id = str_of(m["event_id"])
+    if id == "" { return 1 }
+    let body = str_of(m["body"])
+    // Older pages list edits as their own "* new text" messages.
+    if kind == "page" && edit_re.test(body) { return 1 }
+    if kind == "live" || kind == "edit" { body = strip_reply_fallback(body) }
+    let ts = num_of(m["ts"])
+    let who = sender_of(m)
+    if kind != "page" { remember_meta(id, who.name, who.user, ts) }
+    let urls = find_urls(body)
+    let found = links_in(urls)
+    let snippet = ""
+    if found.len() > 0 { snippet = snippet_of(body, urls) }
+    let cost = 2 + 5 * found.len() + floor(body.len() / 100)
+    let prior = event_keys[id]
+    if prior.is_array() {
+        if is_same_share(id, prior, found, snippet) { return cost }
+        forget_event(id)
+    }
+    for p in found { add_share(p, {e: id s: who.name u: who.user t: ts x: snippet}) }
+    return cost
+}
+
+// The sender and time of a message the library already tracks.
+fn tracked_meta(id){
+    let keys = event_keys[id]
+    if !keys.is_array() { return nil }
+    let link = link_index[keys[0]]
+    if link.is_nil() { return nil }
+    for s in link.shares { if s.e == id { return {s: s.s u: s.u t: s.t} } }
+    for s in link.more { if s.e == id { return {s: "" u: s.u t: s.t} } }
+    return nil
+}
+
+// An edited message keeps its sender and time; only its text changes.
+fn reabsorb(id, body){
+    let meta = tracked_meta(id)
+    if meta.is_nil() { meta = recent_meta[id] }
+    if meta.is_nil() { return nil }
+    forget_event(id)
+    absorb_message({event_id: id body: body ts: meta.t sender: meta.s sender_id: meta.u}, "edit")
+    return nil
+}
+
+// A window newer than everything read before leaves a gap that the next scan walks first.
+fn note_gap(msgs){
+    if msgs.len() == 0 { return nil }
+    let oldest_id = str_of(field_of(msgs[0], "event_id"))
+    if oldest_id == "" { return nil }
+    if newest_ts > 0 && num_of(field_of(msgs[0], "ts")) > newest_ts {
+        gaps.push({before: scan_before ts: newest_ts is_at_start: is_at_start})
+        // Past max_gaps the oldest is forgotten, so a scan may re-read messages it already counted.
+        if gaps.len() > max_gaps { gaps.remove(0) }
+        scan_before = oldest_id
+        is_at_start = false
+        return nil
+    }
+    if scan_before == "" { scan_before = oldest_id }
+    return nil
+}
+
+fn messages_job(kind, msgs){
+    return {kind: kind items: msgs next: msgs.len() - 1 stop: -1 step: -1 has_more: false is_bridged: false epoch: scan_epoch}
+}
+
+// One unit of a job; returns its rough cost.
+fn step_job(job){
+    if job.kind == "restore" { return restore_step(job) }
+    if job.kind == "edit" {
+        if job.is_redacted { forget_event(job.id) } else { reabsorb(job.id, job.body) }
+        return 4
+    }
+    let m = job.items[job.next]
+    if !m.is_object() { return 1 }
+    let ts = num_of(m["ts"])
+    if job.kind == "page" {
+        if gaps.len() > 0 && ts <= gaps[gaps.len() - 1].ts {
+            job.is_bridged = true
+            return 1
+        }
+        scanned += 1
+        return absorb_message(m, "page")
+    }
+    // Live messages before this visit's first read don't vouch for the history before them.
+    if (job.kind == "window" || is_latest_loaded) && ts > newest_ts { newest_ts = ts }
+    // Counted once: newer than the saved library and not yet seen this session.
+    if ts > restored_ts && recent_meta[str_of(m["event_id"])].is_nil() { scanned += 1 }
+    return absorb_message(m, job.kind)
+}
+
+fn end_page(job){
+    let msgs = job.items
+    if msgs.len() > 0 {
+        let first_id = str_of(field_of(msgs[0], "event_id"))
+        if first_id != "" { scan_before = first_id }
+    }
+    // Bridged messages older than the earlier visit's cursor were skipped unread,
+    // so the scan resumes from that cursor even when this page was the last.
+    if job.is_bridged && gaps.len() > 0 {
+        let g = gaps.pop()
+        if g.before != "" { scan_before = g.before }
+        is_at_start = g.is_at_start
+    } elif !job.has_more {
+        is_at_start = true
+        gaps = []
+    }
+    if job.epoch != scan_epoch { return nil }
+    scan_left -= 1
+    // An empty page with more history behind it has nothing readable to page past.
+    after_page(msgs.len() == 0 && job.has_more)
+    return nil
+}
+
+fn end_job(job){
+    if job.kind == "window" {
+        window_size = job.items.len()
+        is_save_due = true
+        return nil
+    }
+    if job.kind == "page" {
+        end_page(job)
+        is_save_due = true
+        return nil
+    }
+    if job.kind != "restore" { is_save_soon = true }
+    return nil
+}
+
+// The list must be in order before a job's end looks at it.
+fn close_job(job){
+    reorder()
+    trim_library()
+    end_job(job)
+    return nil
+}
+
+fn schedule_jobs(){
+    if is_jobs_scheduled { return nil }
+    is_jobs_scheduled = start_timeout(0.01, || run_jobs()) != nil
+    return nil
+}
+
+// Counts, the list and the saved file catch up once the queue is empty.
+fn finish_jobs(){
+    if is_view_dirty {
+        is_view_dirty = false
+        recount()
+        compact_indexes()
+        refresh_view()
+    } else { show_frame() }
+    if is_save_due {
+        is_save_due = false
+        is_save_soon = false
+        save()
+    } elif is_save_soon {
+        is_save_soon = false
+        schedule_save()
+    }
+    return nil
+}
+
+fn run_jobs(){ return run_slice(slice_budget) }
+
+fn run_slice(budget){
+    is_jobs_scheduled = false
+    is_changed = false
+    let used = 0
+    while used < budget && jobs.len() > 0 {
+        let job = jobs[0]
+        if job.next == job.stop {
+            jobs.remove(0)
+            close_job(job)
+        } else {
+            used += step_job(job)
+            job.next += job.step
+        }
+    }
+    while jobs.len() > 0 && jobs[0].next == jobs[0].stop { close_job(jobs.remove(0)) }
+    reorder()
+    trim_library()
+    if is_changed { is_view_dirty = true }
+    // A heavy slice leaves the recount and redraw to their own tick.
+    if jobs.len() > 0 || used + 30 + links.len() / 2 > budget {
+        schedule_jobs()
+        if is_jobs_scheduled { return nil }
+    }
+    finish_jobs()
+    return nil
+}
+
+fn queue_job(job){
+    jobs.push(job)
+    if !is_jobs_scheduled { run_slice(entry_budget) }
+    return nil
+}
+
+// ---- Saving
+
+// Only the newest links that fit save_cap are saved: parsing takes a few ms per 100 KB.
+// Snippet bytes are counted; ids and names get a generous flat size.
+fn save(){
+    if room_state != "attached" { return nil }
+    let out = []
+    let size = 0
+    for l in links {
+        size += 90 + l.url.len() + 90 * l.more.len()
+        for s in l.shares { size += 110 + s.x.len() }
+        if size > save_cap { break }
+        out.push({url: l.url count: l.count first_ts: l.first_ts shares: l.shares more: l.more})
+    }
+    let names = []
+    for id in name_order {
+        let n = display_names[id]
+        if n.is_string() { names.push([id, n]) }
+    }
+    let data = {v: 2 room_id: room_id links: out before: scan_before is_at_start: is_at_start scanned: scanned newest_ts: newest_ts gaps: gaps names: names}
+    fs.write(save_path, data.to_json())
+    return nil
+}
+
+fn schedule_save(){
+    if is_save_pending { return nil }
+    is_save_pending = start_timeout(2.0, || {
+        is_save_pending = false
+        save()
+    }) != nil
+    if !is_save_pending { save() }
+    return nil
+}
+
+// Read at boot, not at top level, where a large file would eat the startup budget.
+// Nothing saves before then: saving waits for env to attach the room.
+fn read_saved(){
+    if !fs.exists(save_path) { return nil }
+    let text = fs.read(save_path)
+    // Larger than this app writes: an older file would take too long to parse.
+    if !text.is_string() || text.len() > save_cap + 50000 { return nil }
+    let parsed = text.parse_json()
+    if parsed.is_object() { return parsed }
+    return nil
+}
+
+fn is_share(s){
+    if !s.is_object() { return false }
+    let e = s["e"]
+    return e.is_string() && e != "" && s["s"].is_string() && s["u"].is_string() && s["x"].is_string() && s["t"].is_number()
+}
+
+fn is_id_share(s){
+    if !s.is_object() { return false }
+    let e = s["e"]
+    return e.is_string() && e != "" && s["u"].is_string() && s["t"].is_number()
+}
+
+// A saved link is parsed again from its URL; malformed or out-of-order shares are skipped.
+fn restore_link(raw){
+    if !raw.is_object() { return nil }
+    let url = raw["url"]
+    let raw_shares = raw["shares"]
+    if !url.is_string() || !raw_shares.is_array() || !saved_url_re.test(url) { return nil }
+    let p = parse_link(url)
+    if p.is_nil() { return nil }
+    let link = new_link(p)
+    let seen = {}
+    let prev = -1
+    for s in raw_shares {
+        if link.shares.len() >= max_shares { break }
+        if !is_share(s) || seen[s.e] == true || (prev >= 0 && s.t > prev) { continue }
+        prev = s.t
+        seen[s.e] = true
+        let x = s.x
+        if x.len() > 420 { x = shorten(x, 140) }
+        link.shares.push({e: s.e s: s.s u: s.u t: s.t x: x})
+    }
+    if link.shares.len() == 0 { return nil }
+    let raw_more = raw["more"]
+    if raw_more.is_array() {
+        for s in raw_more {
+            if link.more.len() >= max_tracked - max_shares { break }
+            if !is_id_share(s) || seen[s.e] == true || s.t > prev { continue }
+            prev = s.t
+            seen[s.e] = true
+            link.more.push({e: s.e t: s.t u: s.u})
+        }
+    }
+    let tracked = link.shares.len() + link.more.len()
+    link.count = num_of(raw["count"])
+    if link.count < tracked { link.count = tracked }
+    let oldest = oldest_tracked(link)
+    link.first_ts = num_of(raw["first_ts"])
+    if link.first_ts <= 0 || link.first_ts > oldest { link.first_ts = oldest }
+    refresh_link(link)
+    return link
+}
+
+// One saved link per step; anything malformed, repeated or out of order is skipped.
+fn restore_step(job){
+    if links.len() >= max_links {
+        job.next = job.stop - job.step
+        return 1
+    }
+    let link = restore_link(job.items[job.next])
+    if link.is_nil() { return 2 }
+    if !link_index[link.key].is_nil() { return 2 }
+    if job.prev_ts >= 0 && link.last_ts > job.prev_ts { return 2 }
+    job.prev_ts = link.last_ts
+    links.push(link)
+    link_index[link.key] = link
+    for s in link.shares {
+        link_event(s.e, link.key)
+        share_users[s.u] = true
+    }
+    for s in link.more {
+        link_event(s.e, link.key)
+        share_users[s.u] = true
+    }
+    // Ready for the first search after reopening.
+    hay_of(link)
+    is_changed = true
+    return 4 + link.shares.len() + floor(link.more.len() / 2) + floor(link.url.len() / 100)
+}
+
+fn restore_names(names){
+    if !names.is_array() { return nil }
+    for pair in names {
+        if !pair.is_array() { continue }
+        if pair.len() != 2 || name_order.len() >= 300 { continue }
+        let id = str_of(pair[0])
+        let name = str_of(pair[1])
+        if id == "" || name == "" { continue }
+        if !display_names[id].is_string() { name_order.push(id) }
+        display_names[id] = name
+    }
+    return nil
+}
+
+fn restore_gaps(raw){
+    if !raw.is_array() { return nil }
+    for g in raw {
+        if gaps.len() >= max_gaps { break }
+        if !g.is_object() || !g["ts"].is_number() || !g["before"].is_string() { continue }
+        if g["ts"] <= 0 { continue }
+        gaps.push({before: g["before"] ts: g["ts"] is_at_start: g["is_at_start"] == true})
+    }
+    return nil
+}
+
+// Starts rebuilding the saved library, a slice at a time.
+fn start_restore(data){
+    if !data.is_object() { return nil }
+    if data["v"] != 2 { return nil }
+    saved_room = str_of(data["room_id"])
+    restore_names(data["names"])
+    scan_before = str_of(data["before"])
+    is_at_start = data["is_at_start"] == true
+    // Splash's max() rounds through f32, which would corrupt a millisecond timestamp.
+    scanned = num_of(data["scanned"])
+    if scanned < 0 { scanned = 0 }
+    newest_ts = num_of(data["newest_ts"])
+    if newest_ts < 0 { newest_ts = 0 }
+    // A skewed clock can date a message in the future, which would hide the next gap.
+    if newest_ts > time_now() * 1000.0 { newest_ts = time_now() * 1000.0 }
+    restored_ts = newest_ts
+    restore_gaps(data["gaps"])
+    let raw_links = data["links"]
+    if !raw_links.is_array() || raw_links.len() == 0 { return nil }
+    // The parse used this tick, so the links are rebuilt from the next one.
+    jobs.push({kind: "restore" items: raw_links next: 0 stop: raw_links.len() step: 1 prev_ts: -1})
+    schedule_jobs()
+    if !is_jobs_scheduled { run_jobs() }
+    return nil
+}
+
+fn reset_library(){
+    jobs.retain(|j| j.kind != "restore")
+    links = []
+    link_index = {}
+    event_keys = {}
+    share_users = {}
+    dead_links = 0
+    dead_events = 0
+    scanned = 0
+    newest_ts = 0
+    restored_ts = 0
+    scan_before = ""
+    is_at_start = false
+    gaps = []
+    clear_selection()
+    recount()
+    return nil
+}
+
+// ---- Building the view
+
+// Widget handles, bound once: a lookup right after a list redraw re-walks the whole widget tree.
+let views = nil
+
+fn bind_ui(){
+    if views != nil { return nil }
+    views = {
+        ask_btn: ui.ask_btn ask_wrap: ui.ask_wrap ask_btn_wrap: ui.ask_btn_wrap retry_btn: ui.retry_btn retry_wrap: ui.retry_wrap body: ui.body chip_list: ui.chip_list chip_wrap: ui.chip_wrap
+        clear_wrap: ui.clear_wrap d_head: ui.d_head d_note: ui.d_note d_note_err: ui.d_note_err
+        d_note_err_wrap: ui.d_note_err_wrap d_note_n: ui.d_note_n d_note_ok: ui.d_note_ok
+        d_note_ok_wrap: ui.d_note_ok_wrap d_note_wrap: ui.d_note_wrap d_open: ui.d_open d_people: ui.d_people
+        d_site: ui.d_site d_snippet: ui.d_snippet d_url: ui.d_url detail_wrap: ui.detail_wrap
+        empty_icon: ui.empty_icon empty_text: ui.empty_text empty_title: ui.empty_title empty_wrap: ui.empty_wrap
+        head_wrap: ui.head_wrap link_list: ui.link_list list_head: ui.list_head list_head_wrap: ui.list_head_wrap
+        more_btn: ui.more_btn more_wrap: ui.more_wrap reset_wrap: ui.reset_wrap room_line: ui.room_line
+        s_card_wrap: ui.s_card_wrap s_empty_wrap: ui.s_empty_wrap s_head: ui.s_head s_note: ui.s_note
+        s_note_err: ui.s_note_err s_note_err_wrap: ui.s_note_err_wrap s_note_n: ui.s_note_n s_note_ok: ui.s_note_ok
+        s_note_ok_wrap: ui.s_note_ok_wrap s_note_wrap: ui.s_note_wrap s_open: ui.s_open s_people: ui.s_people
+        s_site: ui.s_site s_snippet: ui.s_snippet s_url: ui.s_url scan_btn: ui.scan_btn
+        scan_btn_wrap: ui.scan_btn_wrap scan_err: ui.scan_err scan_err_wrap: ui.scan_err_wrap scan_line: ui.scan_line
+        scan_note_label: ui.scan_note_label scan_note_wrap: ui.scan_note_wrap scan_wrap: ui.scan_wrap
+        search: ui.search search_wrap: ui.search_wrap side_wrap: ui.side_wrap status: ui.status
+        loading_wrap: ui.loading_wrap loading_line: ui.loading_line empty_card: ui.empty_card
+        refresh_wide: ui.refresh_wide refresh_narrow: ui.refresh_narrow scan_row: ui.scan_row
+        scan_top_wrap: ui.scan_top_wrap scan_line_top: ui.scan_line_top scan_line_wrap: ui.scan_line_wrap
+        status_err: ui.status_err status_err_wrap: ui.status_err_wrap status_n: ui.status_n
+        status_wrap: ui.status_wrap stop_wrap: ui.stop_wrap summary: ui.summary title_wrap: ui.title_wrap
+    }
+    return nil
+}
+
+
+fn selected_link(){
+    if selected_key == "" { return nil }
+    return link_index[selected_key]
+}
+
+fn is_link_match(link){
+    if site_filter != "" && link.site != site_filter { return false }
+    if query_terms.len() == 0 { return true }
+    let hay = hay_of(link)
+    for t in query_terms { if !t.test(hay) { return false } }
+    return true
+}
+
+// With a search, a link speaks through the newest share that matches it.
+fn shown_share(l){
+    if query_terms.len() == 0 || l.shares.len() < 2 { return l.shares[0] }
+    // Terms that match the link itself match every share's text, so the newest share speaks.
+    let base = l.url + " " + l.site
+    let is_base_hit = true
+    for t in query_terms {
+        if !t.test(base) {
+            is_base_hit = false
+            break
+        }
+    }
+    if is_base_hit { return l.shares[0] }
+    for s in l.shares {
+        let text = l.url + " " + l.site + " " + name_shown(s) + " " + s.u + " " + s.x
+        let is_hit = true
+        for t in query_terms {
+            if !t.test(text) {
+                is_hit = false
+                break
+            }
+        }
+        if is_hit { return s }
+    }
+    return l.shares[0]
+}
+
+// About 90 Latin characters; CJK characters are twice as wide and three bytes long.
+fn row_cut(text){
+    let bytes = text.len()
+    if bytes <= 90 { return 90 }
+    let chars = text.to_chars().len()
+    return max(40, floor(180 * chars / (chars + bytes)))
+}
+
+fn row_of(l){
+    let s = shown_share(l)
+    let meta = name_shown(s)
+    let when = ago_phrase(s.t)
+    if when != "" { meta = meta + " · " + when }
+    if l.count > 1 { meta = meta + " · shared " + l.count + "×" }
+    // Rows show a shorter cut of the message than the detail card, cached per message text.
+    if l.row_src != s.x || l.row_x == "" {
+        l.row_src = s.x
+        l.row_x = "Just the link"
+        if s.x != "" { l.row_x = "“" + shorten(s.x, row_cut(s.x)) + "”" }
+    }
+    let site = shorten(l.site, 40)
+    if l.is_nav { site = site + " · opens in Robrix" }
+    let bg = #xF7F9FC
+    let edge = #xF7F9FC
+    if l.key == selected_key {
+        bg = #xE4EEFF
+        edge = #x0f88fe
+    }
+    return {key: l.key site: site path: l.path snippet: l.row_x meta: meta bg: bg edge: edge}
+}
+
+fn build_rows(){
+    rows = []
+    match_total = 0
+    let is_selected_seen = false
+    for l in links {
+        if !is_link_match(l) { continue }
+        match_total += 1
+        if l.key == selected_key { is_selected_seen = true }
+        if rows.len() < row_limit { rows.push(row_of(l)) }
+    }
+    if selected_key != "" && !is_selected_seen { clear_selection() }
+    return nil
+}
+
+// Pills: white with a gray edge, or accent-filled when chosen.
+fn chip_of(label, site, n){
+    let bg = #xFFFFFF
+    let edge = #xC8C8C8
+    let fg = #x1C274C
+    let fg2 = #x66708F
+    if site == site_filter {
+        bg = #x0f88fe
+        edge = #x0f88fe
+        fg = #xFFFFFF
+        fg2 = #xD6E8FF
+    }
+    return {label: label site: site n: "" + n bg: bg edge: edge fg: fg fg2: fg2}
+}
+
+// Chips only for sites with several links, so they stay one or two rows.
+fn build_chips(){
+    chips = []
+    let cap = 5
+    if is_narrow { cap = 3 }
+    if is_wide { cap = 10 }
+    chips.push(chip_of("All", "", links.len()))
+    let is_current_shown = site_filter == ""
+    for t in top_sites {
+        if chips.len() > cap || t.n < 2 { break }
+        chips.push(chip_of(shorten(t.site, 24), t.site, t.n))
+        if t.site == site_filter { is_current_shown = true }
+    }
+    if !is_current_shown { chips.push(chip_of(shorten(site_filter, 24), site_filter, num_of(site_counts[site_filter]))) }
+    return nil
+}
+
+fn room_text(){
+    if room_state == "detached" { return "Not attached to a room" }
+    if room_name != "" { return "Links people share in " + room_name }
+    return "Links people share in this room"
+}
+
+fn is_unchanged(part, sig){
+    if view_sigs[part] == sig { return true }
+    view_sigs[part] = sig
+    return false
+}
+
+fn show_summary(){
+    bind_ui()
+    let line = ""
+    if links.len() > 0 {
+        line = plural(links.len(), "link", "links") + " · " + plural(site_total, "site", "sites")
+        if !is_narrow { line = line + " · " + plural(people_total, "person", "people") }
+    }
+    if !is_unchanged("summary", line) { views.summary.set_text(line) }
+    return nil
+}
+
+fn is_subscribed(name){
+    for e in subscribed_events { if e == name { return true } }
+    return false
+}
+
+// The status line's tone: 0 neutral, 2 error; set by the text functions below.
+let status_tone = 0
+
+fn live_text(){
+    let is_new = is_subscribed("on_room_message")
+    let is_edits = is_subscribed("on_room_message_changed")
+    if is_new && is_edits { return "Watching for new links." }
+    if refused_events.len() > 0 {
+        status_tone = 2
+        return "Live updates are off: " + clean_error(live_error)
+    }
+    if pending_events.len() > 0 { return "Turning on live updates…" }
+    if is_new { return "Watching for new links; edits and deletions aren't followed." }
+    if is_edits { return "Following edits and deletions; tap Refresh for new links." }
+    return "Live updates are off. Tap Refresh to check for new links."
+}
+
+fn read_text(){
+    if is_setup_pending { return "Waiting for permission to read this room…" }
+    if setup_error != "" {
+        status_tone = 2
+        return "Couldn't set up: " + clean_error(setup_error)
+    }
+    if is_latest_loading { return "Reading the latest messages…" }
+    if !host.has("matrix.room.messages.read") {
+        if is_subscribed("on_room_message") { return "Reading this room is off, so only new links are added. Tap Refresh to ask again." }
+        return "Reading this room is off; showing saved links. Tap Refresh to ask again."
+    }
+    if read_error != "" {
+        status_tone = 2
+        return "Couldn't read the latest messages: " + clean_error(read_error)
+    }
+    return ""
+}
+
+// The status line shows only beside saved links; the empty card speaks for an empty library.
+// Each tone has its own label; the neutral one always holds the text.
+fn show_status(){
+    bind_ui()
+    let line = ""
+    status_tone = 0
+    if room_state == "unknown" {
+        line = "Starting…"
+        if env_error != "" {
+            line = "Couldn't check where this app is open: " + clean_error(env_error)
+            status_tone = 2
+        }
+    }
+    if room_state == "attached" {
+        line = read_text()
+        if line == "" { line = live_text() }
+    }
+    if is_unchanged("status", line + "|" + status_tone) { return nil }
+    views.status.set_text(line)
+    if status_tone == 2 { views.status_err.set_text(line) }
+    views.status_wrap.set_visible(line != "")
+    views.status_n.set_visible(status_tone == 0)
+    views.status_err_wrap.set_visible(status_tone == 2)
+    return nil
+}
+
+fn list_head_text(){
+    if query_terms.len() == 0 && site_filter == "" { return "Newest first" }
+    if query_terms.len() == 0 { return plural(match_total, "link", "links") + " on " + site_filter }
+    let line = plural(match_total, "match", "matches")
+    if site_filter != "" { line = line + " on " + site_filter }
+    return line
+}
+
+fn no_match_text(){
+    let what = "links"
+    if site_filter != "" { what = "links on " + site_filter }
+    if query != "" { return "No " + what + " match “" + query + "”." }
+    return "There are no " + what + " right now."
+}
+
+fn live_hint(){
+    if is_subscribed("on_room_message") { return " New links show up here as people share them." }
+    if refused_events.len() > 0 && live_error != "" { return " Live updates are off: " + clean_error(live_error) }
+    return " Tap Refresh to check for new ones."
+}
+
+// Hidden while there are rows; its texts catch up when it shows again.
+// While nothing is known yet, a spinner line stands in for the card.
+fn show_empty(){
+    bind_ui()
+    if rows.len() > 0 { return nil }
+    let icon = "🔗"
+    let title = "No links yet"
+    let text = "None of the latest " + plural(window_size, "message", "messages") + " has a link."
+    if window_size == 1 { text = "The latest message has no link." }
+    if window_size == 0 { text = "Robrix has no recent messages here." }
+    text = text + live_hint()
+    let ask_text = ""
+    if !is_subscribed("on_room_message") { ask_text = "Refresh" }
+    let is_reset = false
+    let loading = ""
+    if links.len() > 0 && room_state != "detached" {
+        icon = "🔍"
+        title = "No matches"
+        text = no_match_text()
+        ask_text = ""
+        is_reset = true
+    } elif room_state == "unknown" {
+        loading = "Opening your library…"
+        if env_error != "" {
+            loading = ""
+            icon = "😕"
+            title = "Couldn't start"
+            text = error_line(env_error)
+            ask_text = "Try again"
+        }
+    } elif room_state == "detached" {
+        icon = "🧭"
+        title = "No room attached"
+        text = "Open Link Library from a room to see the links people share."
+        ask_text = ""
+    } elif is_setup_pending || is_latest_loading || jobs.len() > 0 {
+        loading = "Collecting links…"
+    } elif setup_error != "" {
+        icon = "😕"
+        title = "Couldn't ask for permission"
+        text = error_line(setup_error)
+        ask_text = "Try again"
+    } elif !host.has("matrix.room.messages.read") {
+        icon = "🔒"
+        title = "Can't read this room"
+        text = "Allow Link Library to read this room's messages to collect the links people share. It only reads; it never posts."
+        ask_text = "Ask again"
+    } elif read_error != "" {
+        icon = "😕"
+        title = "Couldn't read this room"
+        text = error_line(read_error)
+        ask_text = "Try again"
+    } elif is_at_start {
+        title = "No links in this room"
+        text = "Scanned " + plural(scanned, "message", "messages") + " back to the start; nobody has shared a link yet." + live_hint()
+    }
+    if is_unchanged("empty", loading + "|" + icon + "|" + title + "|" + text + "|" + ask_text + "|" + is_reset) { return nil }
+    views.loading_wrap.set_visible(loading != "")
+    views.loading_line.set_text(loading)
+    views.empty_card.set_visible(loading == "")
+    if loading != "" { return nil }
+    views.empty_icon.set_text(icon)
+    views.empty_title.set_text(title)
+    views.empty_text.set_text(text)
+    if ask_text != "Ask again" && ask_text != "" { views.retry_btn.set_text(ask_text) }
+    views.ask_wrap.set_visible(ask_text != "")
+    views.ask_btn_wrap.set_visible(ask_text == "Ask again")
+    views.retry_wrap.set_visible(ask_text != "Ask again")
+    views.reset_wrap.set_visible(is_reset)
+    return nil
+}
+
+fn add_person(people, user){
+    if user == "" || people[user] == true { return 0 }
+    people[user] = true
+    return 1
+}
+
+fn people_in(l){
+    let people = {}
+    let n = 0
+    for s in l.shares {
+        let who = s.u
+        if who == "" { who = s.s }
+        n += add_person(people, who)
+    }
+    for s in l.more { n += add_person(people, s.u) }
+    return n
+}
+
+fn people_head(l){
+    if l.count == 1 { return "SHARED ONCE" }
+    let n = people_in(l)
+    if n <= 1 { return "SHARED " + l.count + " TIMES" }
+    let more = ""
+    if l.count > l.shares.len() + l.more.len() { more = "+" }
+    return "SHARED " + l.count + " TIMES BY " + n + more + " PEOPLE"
+}
+
+// The avatar letter: the name's first character, capitalized, skipping a leading "@".
+fn initial_of(name){
+    let text = name.strip_prefix("@")
+    let codes = text.to_chars()
+    if codes.len() == 0 { return "?" }
+    let first = head_chars(text, codes, 1).to_chars()
+    if first[0] >= 97 && first[0] <= 122 { first[0] = first[0] - 32 }
+    return first.to_string()
+}
+
+// What the detail card's sharer list draws: newest first, then a line for earlier shares.
+let sharers = []
+let sharers_more = ""
+
+fn sharers_of(l, cap){
+    let rows = []
+    let sig = ""
+    for s in l.shares {
+        if rows.len() >= cap { break }
+        let name = name_shown(s)
+        let when = ago_phrase(s.t)
+        // A time on its own starts with a capital, as in the other apps.
+        if when == "just now" { when = "Just now" } elif when == "yesterday" { when = "Yesterday" }
+        rows.push({name: name initial: initial_of(name) when: when})
+        sig = sig + name + "·" + when + "\n"
+    }
+    let more = ""
+    let rest = l.count - rows.len()
+    if rest > 0 {
+        more = "and " + plural(rest, "earlier share", "earlier shares")
+        let first = ago_phrase(l.first_ts)
+        if first != "" { more = more + ", the first " + first }
+    }
+    return {rows: rows more: more sig: sig + more}
+}
+
+// Each copy of the list redraws only when its people or the pane tier change.
+fn show_people(list, part, people){
+    if is_unchanged(part, people.sig + "|" + is_tiny) { return nil }
+    sharers = people.rows
+    sharers_more = people.more
+    list.render()
+    return nil
+}
+
+// The detail card exists twice: above the list, and beside it in wide panes.
+// Only the copy on screen is written.
+fn show_detail(){
+    bind_ui()
+    let l = selected_link()
+    let is_open = !l.is_nil()
+    if !is_unchanged("detail", "" + is_open + is_wide) {
+        views.detail_wrap.set_visible(is_open && !is_wide)
+        views.s_card_wrap.set_visible(is_open)
+        views.s_empty_wrap.set_visible(!is_open)
+    }
+    if !is_open { return nil }
+    let s = shown_share(l)
+    let open_text = "Open"
+    if l.is_nav { open_text = "Open in Robrix" }
+    let snippet = "Just the link"
+    if s.x != "" { snippet = "“" + s.x + "”" }
+    let cap = 3
+    if is_wide { cap = 6 }
+    let head = people_head(l)
+    let people = sharers_of(l, cap)
+    let title = shorten(l.site, 40)
+    let url = shorten(l.url, 100)
+    let sig = title + "|" + url + "|" + snippet + "|" + head + "|" + people.sig + "|" + is_tiny + "|" + open_text + "|" + action_note + "|" + action_tone
+    if is_wide {
+        if is_unchanged("side_card", sig) { return nil }
+        views.s_site.set_text(title)
+        views.s_url.set_text(url)
+        views.s_snippet.set_text(snippet)
+        views.s_head.set_text(head)
+        show_people(views.s_people, "s_people", people)
+        views.s_open.set_text(open_text)
+        views.s_note.set_text(action_note)
+        if action_tone == 1 { views.s_note_ok.set_text(action_note) }
+        if action_tone == 2 { views.s_note_err.set_text(action_note) }
+        views.s_note_wrap.set_visible(action_note != "")
+        views.s_note_n.set_visible(action_tone == 0)
+        views.s_note_ok_wrap.set_visible(action_tone == 1)
+        views.s_note_err_wrap.set_visible(action_tone == 2)
+        return nil
+    }
+    if is_unchanged("card", sig) { return nil }
+    views.d_site.set_text(title)
+    views.d_url.set_text(url)
+    views.d_snippet.set_text(snippet)
+    views.d_head.set_text(head)
+    show_people(views.d_people, "d_people", people)
+    views.d_open.set_text(open_text)
+    views.d_note.set_text(action_note)
+    if action_tone == 1 { views.d_note_ok.set_text(action_note) }
+    if action_tone == 2 { views.d_note_err.set_text(action_note) }
+    views.d_note_wrap.set_visible(action_note != "")
+    views.d_note_n.set_visible(action_tone == 0)
+    views.d_note_ok_wrap.set_visible(action_tone == 1)
+    views.d_note_err_wrap.set_visible(action_tone == 2)
+    return nil
+}
+
+// Hidden until there is something to scan from, and while an open link needs the room,
+// unless a scan is running and needs its Stop button.
+fn show_scan(){
+    bind_ui()
+    let is_allowed = host.has("matrix.room.messages.paginate")
+    let is_shown = room_state == "attached" && (is_latest_loaded || links.len() > 0) && (is_allowed || host.has("matrix.room.messages.read")) && (selected_key == "" || is_wide || is_scanning)
+    if !is_shown {
+        if !is_unchanged("scan", "hidden") { views.scan_wrap.set_visible(false) }
+        return nil
+    }
+    // Narrow panes leave the link count to the summary above.
+    let counts = plural(scanned, "message", "messages")
+    if !is_narrow { counts = counts + " · " + plural(links.len(), "link", "links") }
+    let line = "Scanned " + counts
+    if is_scanning { line = "Scanning… " + counts }
+    if is_at_start { line = "Reached the start of the room · " + counts }
+    if is_at_start && is_narrow { line = "Reached the start of the room" }
+    // Reading can be allowed while older history alone is blocked.
+    if !is_allowed { line = "Scanning older messages is turned off for Link Library in Mini Apps settings." }
+    let label = "Scan older messages"
+    if is_narrow { label = "Scan older" }
+    if is_unchanged("scan", line + "|" + label + "|" + is_allowed + "|" + is_scanning + "|" + is_at_start + "|" + is_tiny + "|" + scan_note + "|" + scan_error) { return nil }
+    let is_btn = is_allowed && !is_scanning && !is_at_start
+    let is_stop = is_allowed && is_scanning
+    views.scan_wrap.set_visible(true)
+    views.scan_line.set_text(line)
+    views.scan_line_top.set_text(line)
+    views.scan_top_wrap.set_visible(is_tiny)
+    views.scan_line_wrap.set_visible(!is_tiny)
+    views.scan_btn.set_text(label)
+    views.scan_btn_wrap.set_visible(is_btn)
+    views.stop_wrap.set_visible(is_stop)
+    views.scan_row.set_visible(!is_tiny || is_btn || is_stop)
+    views.scan_note_label.set_text(scan_note)
+    views.scan_note_wrap.set_visible(scan_note != "")
+    views.scan_err.set_text(scan_error)
+    views.scan_err_wrap.set_visible(scan_error != "")
+    return nil
+}
+
+fn show_frame(){
+    bind_ui()
+    let has_links = links.len() > 0 && room_state != "detached"
+    let has_rows = rows.len() > 0
+    // In stacked layouts an open link takes the chips' and the scan card's room;
+    // tiny panes leave filtering to the search unless a site is picked.
+    let is_chips = has_links && chips.len() > 1 && (selected_key == "" || is_wide) && (!is_tiny || site_filter != "")
+    let more = match_total - rows.len()
+    let room_line = room_text()
+    let head = list_head_text()
+    if !is_unchanged("frame", room_line + "|" + has_links + "|" + has_rows + "|" + is_chips + "|" + is_wide + "|" + is_tiny + "|" + head + "|" + more) {
+        views.room_line.set_text(room_line)
+        views.head_wrap.set_visible(has_links)
+        views.refresh_wide.set_visible(!is_tiny)
+        views.refresh_narrow.set_visible(has_links && is_tiny)
+        views.search_wrap.set_visible(has_links)
+        views.chip_wrap.set_visible(is_chips)
+        views.list_head.set_text(head)
+        views.list_head_wrap.set_visible(has_rows)
+        views.body.set_visible(has_rows)
+        views.side_wrap.set_visible(is_wide && has_rows)
+        views.empty_wrap.set_visible(!has_rows)
+        views.more_btn.set_text("Show " + min(row_step, more) + " more")
+        views.more_wrap.set_visible(more > 0)
+    }
+    show_summary()
+    show_status()
+    show_empty()
+    show_detail()
+    show_scan()
+    return nil
+}
+
+// A pending reset draws the latest rows when it fires.
+fn render_list(){
+    bind_ui()
+    if is_list_reset_pending { return nil }
+    list_rows = rows
+    views.link_list.render()
+    return nil
+}
+
+// Drawing rows is a keystroke's costliest step, so it draws only those in view.
+fn render_list_top(){
+    bind_ui()
+    if is_list_reset_pending { return nil }
+    if rows.len() <= typing_rows {
+        render_list()
+        return nil
+    }
+    let head = []
+    for r in rows {
+        if head.len() >= typing_rows { break }
+        head.push(r)
+    }
+    list_rows = head
+    views.link_list.render()
+    return nil
+}
+
+// Splash can't scroll a list, so a new filter draws it empty for a frame:
+// the scroll bar settles at the top before the matches arrive.
+fn render_list_from_top(){
+    bind_ui()
+    if is_list_reset_pending { return nil }
+    is_list_reset_pending = start_timeout(0.03, || {
+        is_list_reset_pending = false
+        render_list()
+    }) != nil
+    if !is_list_reset_pending {
+        render_list()
+        return nil
+    }
+    list_rows = []
+    views.link_list.render()
+    return nil
+}
+
+// A list that shrinks below its scroll offset draws blank once; a second render redraws it in range.
+fn render_again_soon(){
+    if is_rerender_pending { return nil }
+    is_rerender_pending = start_timeout(0.05, || {
+        is_rerender_pending = false
+        render_list()
+    }) != nil
+    return nil
+}
+
+fn apply_filter(){
+    build_rows()
+    show_frame()
+    render_list()
+    return nil
+}
+
+// A new site or search starts its list at the top.
+fn apply_new_filter(){
+    build_rows()
+    show_frame()
+    render_list_from_top()
+    return nil
+}
+
+fn refresh_view(){
+    bind_ui()
+    build_rows()
+    build_chips()
+    show_frame()
+    render_list()
+    views.chip_list.render()
+    return nil
+}
+
+// ---- Search, sites and selection
+
+fn compile_terms(q){
+    let out = []
+    if q == "" { return out }
+    for part in q.split(term_split_re) {
+        if part == "" { continue }
+        out.push(regex(escape_regex(part), "i"))
+        if out.len() >= 6 { break }
+    }
+    return out
+}
+
+fn set_query(text){
+    bind_ui()
+    let raw = str_of(text)
+    views.clear_wrap.set_visible(raw != "")
+    let q = raw.trim()
+    if q == query { return nil }
+    let is_new_search = query == "" || q == ""
+    query = q
+    query_terms = compile_terms(q)
+    row_limit = row_step
+    if is_new_search {
+        apply_new_filter()
+        return nil
+    }
+    // Each further keystroke keeps the list where it is, so typing doesn't flicker.
+    build_rows()
+    show_frame()
+    render_again_soon()
+    // Without a follow-up render on its way, every row draws now.
+    if is_rerender_pending { render_list_top() } else { render_list() }
+    return nil
+}
+
+fn clear_query(){
+    bind_ui()
+    views.search.set_text("")
+    views.clear_wrap.set_visible(false)
+    query = ""
+    query_terms = []
+    row_limit = row_step
+    apply_new_filter()
+    return nil
+}
+
+fn clear_filters(){
+    bind_ui()
+    site_filter = ""
+    build_chips()
+    views.chip_list.render()
+    clear_query()
+    return nil
+}
+
+fn pick_chip(i){
+    bind_ui()
+    if i >= chips.len() { return nil }
+    let site = chips[i].site
+    if site == site_filter && site != "" { site = "" }
+    site_filter = site
+    row_limit = row_step
+    build_chips()
+    views.chip_list.render()
+    apply_new_filter()
+    return nil
+}
+
+fn show_more(){
+    row_limit += row_step
+    apply_filter()
+    return nil
+}
+
+fn select_row(i){
+    if i >= list_rows.len() { return nil }
+    let key = list_rows[i].key
+    if key == selected_key {
+        clear_selection()
+    } else {
+        selected_key = key
+        action_token += 1
+        action_note = ""
+        action_tone = 0
+    }
+    apply_filter()
+    return nil
+}
+
+fn close_detail(){
+    clear_selection()
+    apply_filter()
+    return nil
+}
+
+// ---- Actions on the selected link, each one request from a tap
+
+fn note_action(text, tone){
+    action_note = text
+    action_tone = tone
+    show_detail()
+    return nil
+}
+
+// A reply for an earlier selection says nothing about the current one.
+fn action_reply(r, token, done){
+    if token != action_token { return nil }
+    if r.is_ok {
+        note_action("✅ " + done, 1)
+        return nil
+    }
+    note_action("❗ " + error_line(r.error), 2)
+    return nil
+}
+
+// Robrix opens links to people, room ids and their messages; aliases and the web open in a browser.
+fn open_link(){
+    let l = selected_link()
+    if l.is_nil() { return nil }
+    if is_open_pending {
+        note_action("Still opening the last link…", 0)
+        return nil
+    }
+    is_open_pending = true
+    let token = action_token
+    note_action("Opening…", 0)
+    if l.is_nav {
+        host.request("nav.link", {url: l.url}, fn(r){
+            is_open_pending = false
+            return action_reply(r, token, "Opened in Robrix.")
+        })
+        return nil
+    }
+    host.request("url.open", {url: l.open}, fn(r){
+        is_open_pending = false
+        return action_reply(r, token, "Opened in your browser.")
+    })
+    return nil
+}
+
+fn copy_link(){
+    let l = selected_link()
+    if l.is_nil() { return nil }
+    if is_copy_pending {
+        note_action("Still copying the last link…", 0)
+        return nil
+    }
+    is_copy_pending = true
+    let token = action_token
+    note_action("Copying…", 0)
+    host.request("clipboard.write", {text: l.url}, fn(r){
+        is_copy_pending = false
+        return action_reply(r, token, "Copied the link.")
+    })
+    return nil
+}
+
+// Jumps to the message the row shows: the newest share, or the one a search matched.
+fn show_in_chat(){
+    let l = selected_link()
+    if l.is_nil() { return nil }
+    if is_jump_pending {
+        note_action("Still finding the last message…", 0)
+        return nil
+    }
+    is_jump_pending = true
+    let token = action_token
+    note_action("Finding the message…", 0)
+    host.request("nav.event", {event_id: shown_share(l).e}, fn(r){
+        is_jump_pending = false
+        return action_reply(r, token, "Showing the message in the chat.")
+    })
+    return nil
+}
+
+// ---- Scanning older messages
+
+fn found_note(){
+    let n = links.len() - scan_start_links
+    if n <= 0 { return "No new links in those messages." }
+    return "Found " + plural(n, "new link", "new links") + "."
+}
+
+fn finish_scan(note){
+    is_scanning = false
+    scan_left = 0
+    scan_note = note
+    scan_error = ""
+    return nil
+}
+
+// Each page costs part of the request budget, so pages go a second apart.
+fn after_page(is_stuck){
+    if scan_trimmed > 0 {
+        finish_scan("The library keeps the newest " + max_links + " links, so older ones aren't kept.")
+        return nil
+    }
+    if is_at_start {
+        finish_scan(found_note())
+        return nil
+    }
+    if is_stuck {
+        finish_scan("No readable messages further back; older ones may be encrypted. " + found_note())
+        return nil
+    }
+    if !is_scanning {
+        scan_note = "Stopped. " + found_note()
+        return nil
+    }
+    if scan_left <= 0 {
+        finish_scan(found_note() + " Tap Scan older to keep going.")
+        return nil
+    }
+    if start_timeout(1.0, || request_page()).is_nil() {
+        finish_scan("Couldn't continue scanning. Tap Scan older to try again.")
+    }
+    return nil
+}
+
+fn request_page(){
+    if !is_scanning || is_scan_pending { return nil }
+    is_scan_pending = true
+    let epoch = scan_epoch
+    let before = scan_before
+    let args = {limit: page_size}
+    if before != "" { args = {before: before limit: page_size} }
+    host.request("matrix.older_messages", args, fn(r){
+        is_scan_pending = false
+        if epoch != scan_epoch { return nil }
+        if !r.is_ok {
+            is_scanning = false
+            scan_left = 0
+            scan_note = ""
+            scan_error = "Couldn't scan older messages: " + clean_error(r.error)
+            show_scan()
+            return nil
+        }
+        if before != scan_before {
+            if is_scanning { request_page() }
+            return nil
+        }
+        let msgs = field_of(r.data, "messages")
+        if !msgs.is_array() { msgs = [] }
+        let job = messages_job("page", msgs)
+        job.has_more = field_of(r.data, "has_more") == true
+        queue_job(job)
+        return nil
+    })
+    return nil
+}
+
+fn scan_older(){
+    if room_state != "attached" { return nil }
+    if is_at_start {
+        scan_note = "You've reached the start of the room."
+        show_scan()
+        return nil
+    }
+    if is_scanning { return nil }
+    if !host.has("matrix.room.messages.paginate") {
+        scan_note = "Scanning older messages is turned off for Link Library in Mini Apps settings."
+        show_scan()
+        return nil
+    }
+    is_scanning = true
+    scan_left = scan_pages
+    scan_start_links = links.len()
+    scan_trimmed = 0
+    scan_note = ""
+    scan_error = ""
+    request_page()
+    show_scan()
+    return nil
+}
+
+fn stop_scan(){
+    if !is_scanning { return nil }
+    is_scanning = false
+    scan_left = 0
+    scan_note = "Stopping after this page…"
+    if !is_scan_pending { scan_note = "Stopped. " + found_note() }
+    show_scan()
+    return nil
+}
+
+// ---- Permissions, reading and live updates
+
+fn load_latest(){
+    if is_latest_loading { return nil }
+    is_latest_loading = true
+    is_latest_refused = false
+    read_error = ""
+    latest_token += 1
+    let token = latest_token
+    host.request("matrix.read_messages", {limit: 30}, fn(r){
+        if token != latest_token { return nil }
+        is_latest_loading = false
+        if !r.is_ok {
+            read_error = r.error
+            is_latest_refused = true
+            refresh_view()
+            return nil
+        }
+        is_latest_loaded = true
+        let msgs = field_of(r.data, "messages")
+        if !msgs.is_array() { msgs = [] }
+        note_gap(msgs)
+        queue_job(messages_job("window", msgs))
+        return nil
+    })
+    return nil
+}
+
+fn subscribe(name){
+    for e in subscribed_events { if e == name { return nil } }
+    for e in pending_events { if e == name { return nil } }
+    for e in refused_events { if e == name { return nil } }
+    pending_events.push(name)
+    host.request("events.subscribe", {event: name}, fn(r){
+        pending_events.retain(|e| e != name)
+        if r.is_ok && host.has(name) {
+            subscribed_events.push(name)
+        } elif !r.is_ok {
+            refused_events.push(name)
+            live_error = r.error
+        }
+        show_frame()
+        return nil
+    })
+    return nil
+}
+
+// Keeps allowed hooks, forgets revoked ones, and never re-asks for a refused one on its own.
+fn watch_granted(is_retry){
+    subscribed_events.retain(|e| host.has(e))
+    if is_retry { refused_events = [] } else { refused_events.retain(|e| host.has(e)) }
+    for name in hook_names {
+        if host.has(name) { subscribe(name) }
+    }
+    return nil
+}
+
+fn setup(is_retry){
+    if room_state != "attached" || is_setup_pending { return nil }
+    is_setup_pending = true
+    setup_error = ""
+    host.request("permissions.request", {perms: ["matrix-room-read", "matrix-room-watch"], retry: is_retry}, fn(r){
+        is_setup_pending = false
+        if !r.is_ok {
+            setup_error = r.error
+            refresh_view()
+            return nil
+        }
+        // A group answers false when any one of its abilities is blocked, so go by each exact ability.
+        if host.has("matrix.room.messages.read") { load_latest() }
+        watch_granted(is_retry)
+        refresh_view()
+        return nil
+    })
+    refresh_view()
+    return nil
+}
+
+fn check_env(){
+    if is_env_pending { return nil }
+    is_env_pending = true
+    env_error = ""
+    host.request("env", nil, fn(r){
+        is_env_pending = false
+        if !r.is_ok {
+            env_error = r.error
+            refresh_view()
+            return nil
+        }
+        if field_of(r.data, "room_attached") != true {
+            room_state = "detached"
+            refresh_view()
+            return nil
+        }
+        room_state = "attached"
+        room_id = str_of(field_of(r.data, "room_id"))
+        room_name = str_of(field_of(r.data, "room_name"))
+        if room_id != "" && saved_room != "" && saved_room != room_id { reset_library() }
+        refresh_view()
+        setup(false)
+        return nil
+    })
+    return nil
+}
+
+fn refresh(){
+    if room_state == "unknown" {
+        check_env()
+        return nil
+    }
+    if room_state == "attached" { setup(true) }
+    return nil
+}
+
+// The setup reply handles grants that arrive while it is pending.
+fn on_permissions_changed(caps){
+    if room_state != "attached" || is_setup_pending { return nil }
+    if !host.has("matrix.room.messages.read") {
+        latest_token += 1
+        is_latest_loading = false
+        is_latest_loaded = false
+        is_latest_refused = false
+    } elif !is_latest_loaded && !is_latest_loading && !is_latest_refused { load_latest() }
+    if !host.has("matrix.room.messages.paginate") && is_scanning {
+        scan_epoch += 1
+        is_scan_pending = false
+        finish_scan("Scanning stopped: reading older messages isn't allowed anymore.")
+    }
+    watch_granted(false)
+    refresh_view()
+    return nil
+}
+
+fn on_room_message(json){
+    if room_state != "attached" { return nil }
+    let batch = json.parse_json()
+    if !batch.is_array() || batch.len() == 0 { return nil }
+    queue_job(messages_job("live", batch))
+    return nil
+}
+
+fn on_room_message_changed(json){
+    if room_state != "attached" { return nil }
+    let p = json.parse_json()
+    if !p.is_object() { return nil }
+    let id = str_of(p["event_id"])
+    if id == "" { return nil }
+    let body = str_of(p["body"])
+    queue_job({kind: "edit" items: [] next: 0 stop: 1 step: 1 id: id body: body is_redacted: p["redacted"] == true || body == ""})
+    return nil
+}
+
+fn on_app_resize(w, h){
+    bind_ui()
+    views.title_wrap.set_visible(h >= 520)
+    let wide = w >= 880
+    let narrow = w < 360
+    let tiny = w < 300
+    if wide == is_wide && narrow == is_narrow && tiny == is_tiny { return nil }
+    is_wide = wide
+    is_narrow = narrow
+    is_tiny = tiny
+    refresh_view()
+    return nil
+}
+
+fn boot(){
+    start_restore(read_saved())
+    // A restore refreshes the view when it finishes.
+    if jobs.len() == 0 { refresh_view() }
+    check_env()
+    return nil
+}
+
+let _boot = start_timeout(0.05, || boot())
+
+// ---- Look: Robrix's kit and the shared text styles
+
+let PrimaryButton = Button{
+    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
+    draw_bg +: {
+        border_size: 0.0 border_radius: 4.0
+        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+}
+let NeutralButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
+        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+}
+let Field = TextInput{
+    width: Fill height: Fit padding: 10
+    draw_bg +: {
+        border_radius: 4.0 border_size: 1.0
+        color: #xFFFFFF color_hover: #xFFFFFF color_focus: #xFFFFFF color_down: #xFFFFFF color_empty: #xFFFFFF
+        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_focus: #x106fcc border_color_down: #x106fcc border_color_empty: #xC8C8C8
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #x333333 color_hover: #x333333 color_focus: #x333333 color_down: #x333333 color_empty: #xBBBBBB color_empty_hover: #x999999 color_empty_focus: #x999999 text_style: theme.font_regular{font_size: 11} }
+}
+let Meta = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+let OkText = Meta{ draw_text +: { color: #x138808 } }
+let ErrText = Meta{ draw_text +: { color: #xDC0005 } }
+let Caption = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+let Body = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
+let CardTitle = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
+let LinkText = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 10} } }
+let Card = RoundedView{
+    width: Fill height: Fit flow: Down spacing: 8 padding: 12
+    show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+}
+let EmptyCard = RoundedView{
+    width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5} padding: Inset{top: 20 bottom: 20 left: 16 right: 16}
+    show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+}
+let EmptyIcon = Label{ padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 28} } }
+let EmptyTitle = Label{ width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} } }
+let EmptyText = Label{ width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+let Slot = View{ width: Fill height: Fit }
+let ButtonRow = View{ width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8 }
+// A sharer: Robrix's fallback avatar, the name, and when they shared it.
+let PersonRow = View{ width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5} }
+let Avatar = RoundedView{
+    width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
+    show_bg: true draw_bg +: { color: #x52b2ac border_radius: 16.0 }
+}
+let AvatarLetter = Label{ padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
+let PersonName = Label{ width: Fill padding: 0 margin: 0 max_lines: 1 text_overflow: TextOverflow.Ellipsis draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} } }
+// A one-glyph button such as ×, as tall as the others.
+let IconButton = NeutralButton{ padding: Inset{left: 9 right: 9 top: 4 bottom: 5} draw_text +: { text_style: theme.font_regular{font_size: 15} } }
+
+View{
+    width: Fill height: Fill flow: Down
+    col := ScrollYView{
+        width: Fill height: Fill flow: Down spacing: 12 padding: 14
+        // The pane header names the app; this row sums up the library.
+        head_wrap := View{
+            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5} visible: false
+            View{
+                width: Fill height: Fit flow: Down spacing: 2
+                summary := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
+                title_wrap := Slot{
+                    room_line := Meta{ text: "Links people share in this room" max_lines: 1 text_overflow: TextOverflow.Ellipsis }
+                }
+                status_wrap := View{
+                    width: Fill height: Fit flow: Down visible: false
+                    status_n := Slot{
+                        status := Meta{ text: "" }
+                    }
+                    status_err_wrap := Slot{
+                        visible: false
+                        status_err := ErrText{ text: "" }
+                    }
+                }
+            }
+            refresh_wide := View{
+                width: Fit height: Fit
+                NeutralButton{ text: "Refresh" on_click: || refresh() }
+            }
+        }
+        refresh_narrow := View{
+            width: Fill height: Fit visible: false
+            NeutralButton{ text: "Refresh" on_click: || refresh() }
+        }
+        search_wrap := View{
+            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5} visible: false
+            search := Field{
+                empty_text: "Search links"
+                on_change: |t| set_query(t)
+                on_return: |t| set_query(t)
+            }
+            clear_wrap := View{
+                width: Fit height: Fit visible: false
+                IconButton{ text: "×" on_click: || clear_query() }
+            }
+        }
+        chip_wrap := View{
+            width: Fill height: Fit flow: Down visible: false
+            chip_list := View{
+                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
+                on_item_tap: |i| pick_chip(i)
+                on_render: || {
+                    for c in chips {
+                        RoundedView{
+                            width: Fit height: Fit flow: Right spacing: 4 align: Align{y: 0.5}
+                            padding: Inset{top: 5, bottom: 5, left: 10, right: 10}
+                            show_bg: true draw_bg +: { color: c.bg border_size: 1.0 border_color: c.edge border_radius: 12.0 }
+                            Label{ text: c.label padding: 0 margin: 0 draw_text +: { color: c.fg text_style: theme.font_regular{font_size: 10} } }
+                            Label{ text: c.n padding: 0 margin: 0 draw_text +: { color: c.fg2 text_style: theme.font_regular{font_size: 10} } }
+                        }
+                    }
+                }
+            }
+        }
+        detail_wrap := View{
+            width: Fill height: Fit visible: false
+            Card{
+                View{
+                    width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                    d_site := CardTitle{ text: "" }
+                    IconButton{ text: "×" on_click: || close_detail() }
+                }
+                d_url := LinkText{ text: "" }
+                ButtonRow{
+                    d_open := PrimaryButton{ text: "Open" on_click: || open_link() }
+                    NeutralButton{ text: "Copy" on_click: || copy_link() }
+                    NeutralButton{ text: "Show in chat" on_click: || show_in_chat() }
+                }
+                d_note_wrap := View{
+                    width: Fill height: Fit flow: Down visible: false
+                    d_note_n := Slot{
+                        d_note := Meta{ text: "" }
+                    }
+                    d_note_ok_wrap := Slot{
+                        visible: false
+                        d_note_ok := OkText{ text: "" }
+                    }
+                    d_note_err_wrap := Slot{
+                        visible: false
+                        d_note_err := ErrText{ text: "" }
+                    }
+                }
+                d_snippet := Body{ text: "" }
+                d_head := Caption{ text: "" }
+                d_people := View{
+                    width: Fill height: Fit flow: Down spacing: 8
+                    on_render: || {
+                        for p in sharers {
+                            PersonRow{
+                                Avatar{ visible: !is_tiny AvatarLetter{ text: p.initial } }
+                                PersonName{ text: p.name }
+                                Label{ text: p.when padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                            }
+                        }
+                        if sharers_more != "" { Meta{ text: sharers_more } }
+                    }
+                }
+            }
+        }
+        empty_wrap := View{
+            width: Fill height: Fit flow: Down visible: false
+            loading_wrap := View{
+                width: Fill height: Fit flow: Right spacing: 10 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24} visible: false
+                LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
+                loading_line := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+            }
+            empty_card := EmptyCard{
+                empty_icon := EmptyIcon{ text: "🔗" }
+                empty_title := EmptyTitle{ text: "" }
+                empty_text := EmptyText{ text: "" }
+                ask_wrap := View{
+                    width: Fit height: Fit visible: false margin: Inset{top: 6}
+                    ask_btn_wrap := View{
+                        width: Fit height: Fit
+                        ask_btn := PrimaryButton{ text: "Ask again" on_click: || refresh() }
+                    }
+                    retry_wrap := View{
+                        width: Fit height: Fit visible: false
+                        retry_btn := NeutralButton{ text: "Try again" on_click: || refresh() }
+                    }
+                }
+                reset_wrap := View{
+                    width: Fit height: Fit visible: false margin: Inset{top: 6}
+                    NeutralButton{ text: "Clear filters" on_click: || clear_filters() }
+                }
+            }
+        }
+        list_head_wrap := View{
+            width: Fill height: Fit visible: false
+            list_head := Meta{ text: "Newest first" }
+        }
+        body := View{
+            width: Fill height: Fill{min: 80} flow: Right spacing: 12 visible: false
+            View{
+                width: Fill height: Fill flow: Down spacing: 8
+                link_list := ScrollYView{
+                    width: Fill height: Fill{min: 80} flow: Down spacing: 8
+                    on_item_tap: |i| select_row(i)
+                    on_render: || {
+                        // A render with no children keeps the old ones, so an empty list draws a named spacer.
+                        if list_rows.len() == 0 { list_spacer := View{ width: Fill height: 1 } }
+                        for row in list_rows {
+                            RoundedView{
+                                width: Fill height: Fit flow: Down spacing: 3
+                                padding: Inset{top: 10, bottom: 10, left: 12, right: 12}
+                                show_bg: true draw_bg +: { color: row.bg border_color: row.edge border_size: 1.0 border_radius: 8.0 }
+                                Label{ text: row.site width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} } }
+                                Label{ text: row.path width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 10} } }
+                                Label{ text: row.snippet width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
+                                Label{ text: row.meta width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                            }
+                        }
+                    }
+                }
+                more_wrap := View{
+                    width: Fill height: Fit visible: false align: Align{x: 0.5}
+                    more_btn := NeutralButton{ text: "Show more" on_click: || show_more() }
+                }
+            }
+            side_wrap := ScrollYView{
+                width: 360 height: Fill flow: Down spacing: 8 visible: false
+                s_empty_wrap := Slot{
+                    EmptyCard{
+                        EmptyIcon{ text: "🔗" }
+                        EmptyTitle{ text: "Pick a link" }
+                        EmptyText{ text: "See who shared it and when, then open it, copy it or find it in the chat." }
+                    }
+                }
+                s_card_wrap := Slot{
+                    visible: false
+                    Card{
+                        View{
+                            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                            s_site := CardTitle{ text: "" }
+                            IconButton{ text: "×" on_click: || close_detail() }
+                        }
+                        s_url := LinkText{ text: "" }
+                        ButtonRow{
+                            s_open := PrimaryButton{ text: "Open" on_click: || open_link() }
+                            NeutralButton{ text: "Copy" on_click: || copy_link() }
+                            NeutralButton{ text: "Show in chat" on_click: || show_in_chat() }
+                        }
+                        s_note_wrap := View{
+                            width: Fill height: Fit flow: Down visible: false
+                            s_note_n := Slot{
+                                s_note := Meta{ text: "" }
+                            }
+                            s_note_ok_wrap := Slot{
+                                visible: false
+                                s_note_ok := OkText{ text: "" }
+                            }
+                            s_note_err_wrap := Slot{
+                                visible: false
+                                s_note_err := ErrText{ text: "" }
+                            }
+                        }
+                        s_snippet := Body{ text: "" }
+                        s_head := Caption{ text: "" }
+                        s_people := View{
+                            width: Fill height: Fit flow: Down spacing: 8
+                            on_render: || {
+                                for p in sharers {
+                                    PersonRow{
+                                        Avatar{ visible: !is_tiny AvatarLetter{ text: p.initial } }
+                                        PersonName{ text: p.name }
+                                        Label{ text: p.when padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                                    }
+                                }
+                                if sharers_more != "" { Meta{ text: sharers_more } }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        scan_wrap := View{
+            width: Fill height: Fit visible: false
+            RoundedView{
+                width: Fill height: Fit flow: Down spacing: 4
+                padding: Inset{top: 8, bottom: 8, left: 12, right: 8}
+                show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                scan_top_wrap := Slot{
+                    visible: false
+                    scan_line_top := Meta{ text: "" }
+                }
+                scan_row := View{
+                    width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                    scan_line_wrap := Slot{
+                        scan_line := Meta{ text: "" }
+                    }
+                    scan_btn_wrap := View{
+                        width: Fit height: Fit
+                        scan_btn := NeutralButton{ text: "Scan older messages" on_click: || scan_older() }
+                    }
+                    stop_wrap := View{
+                        width: Fit height: Fit visible: false
+                        NeutralButton{ text: "Stop" on_click: || stop_scan() }
+                    }
+                }
+                scan_note_wrap := Slot{
+                    visible: false
+                    scan_note_label := Meta{ text: "" }
+                }
+                scan_err_wrap := Slot{
+                    visible: false
+                    scan_err := ErrText{ text: "" }
+                }
+            }
+        }
+    }
+}

@@ -11,6 +11,7 @@
 
 let watch_pending = false
 let watch_ready = false
+let watch_tried = false
 let watch_generation = 0
 let test_pending = false
 let pending_test = nil
@@ -23,6 +24,7 @@ let rules = []
 let hits = []
 let watch_line = "Starting…"
 let metas = ["\\", ".", "*", "+", "?", "(", ")", "[", "]", "{", "}", "|", "^", "$"]
+let upper = {a: "A" b: "B" c: "C" d: "D" e: "E" f: "F" g: "G" h: "H" i: "I" j: "J" k: "K" l: "L" m: "M" n: "N" o: "O" p: "P" q: "Q" r: "R" s: "S" t: "T" u: "U" v: "V" w: "W" x: "X" y: "Y" z: "Z"}
 
 // A rule matches `all` or `any` of its filters; each filter is a field, an
 // operator and a value. Advanced fields and operators stay hidden until asked for.
@@ -35,25 +37,54 @@ let fields = [
 let ops = [
     {field: "text", id: "contains", label: "contains", advanced: false},
     {field: "text", id: "not_contains", label: "doesn't contain", advanced: false},
+    {field: "text", id: "mentions_me", label: "mentions me", advanced: false},
+    {field: "text", id: "mentions", label: "mentions", advanced: true},
     {field: "text", id: "any_of", label: "contains any of", advanced: true},
+    {field: "text", id: "none_of", label: "contains none of", advanced: true},
+    {field: "text", id: "word", label: "has the word", advanced: true},
     {field: "text", id: "starts_with", label: "starts with", advanced: true},
+    {field: "text", id: "ends_with", label: "ends with", advanced: true},
     {field: "text", id: "is", label: "is exactly", advanced: true},
+    {field: "text", id: "pattern", label: "matches pattern", advanced: true},
+    {field: "text", id: "is_reply", label: "is a reply", advanced: true},
+    {field: "text", id: "not_reply", label: "isn't a reply", advanced: true},
+    {field: "text", id: "in_thread", label: "is in a thread", advanced: true},
+    {field: "text", id: "not_thread", label: "isn't in a thread", advanced: true},
     {field: "sender", id: "is", label: "is", advanced: false},
     {field: "sender", id: "is_not", label: "is not", advanced: false},
+    {field: "sender", id: "any_of", label: "is any of", advanced: true},
+    {field: "sender", id: "none_of", label: "is none of", advanced: true},
     {field: "sender", id: "contains", label: "contains", advanced: true},
     {field: "type", id: "is", label: "is", advanced: true},
     {field: "type", id: "is_not", label: "is not", advanced: true},
     {field: "link", id: "has", label: "has a link", advanced: true},
-    {field: "link", id: "lacks", label: "has no link", advanced: true}
+    {field: "link", id: "lacks", label: "has no link", advanced: true},
+    {field: "link", id: "to", label: "goes to", advanced: true}
 ]
+// `media` is any attachment: an image, video, audio clip or file.
 let types = [
     {id: "m.text", label: "text"},
     {id: "m.notice", label: "bot notice"},
     {id: "m.emote", label: "emote (/me)"},
+    {id: "media", label: "any attachment"},
     {id: "m.image", label: "image"},
-    {id: "m.file", label: "file"},
     {id: "m.video", label: "video"},
-    {id: "m.audio", label: "audio"}
+    {id: "m.audio", label: "audio"},
+    {id: "m.file", label: "file"},
+    {id: "m.location", label: "location"}
+]
+// Quick-add buttons in the Advanced filters panel.
+let presets = [
+    {field: "text", op: "mentions_me", value: ""},
+    {field: "text", op: "any_of", value: ""},
+    {field: "text", op: "word", value: ""},
+    {field: "text", op: "mentions", value: ""},
+    {field: "sender", op: "any_of", value: ""},
+    {field: "text", op: "is_reply", value: ""},
+    {field: "text", op: "in_thread", value: ""},
+    {field: "type", op: "is", value: "media"},
+    {field: "link", op: "has", value: ""},
+    {field: "text", op: "pattern", value: ""}
 ]
 
 // The rule being written or edited.
@@ -63,13 +94,65 @@ let editing = -1
 let advanced = false
 let menu_row = -1
 let menu_kind = ""
+let match_menu_open = false
+let editor_open = false
+// Each filter render names its inputs afresh, since a reused input keeps a stale look.
+let field_gen = 0
+
+// What the page shows.
+let status_text = "Starting…"
+let status_kind = "busy"
+let is_wide = false
+let is_stacked = false
+let is_compact = false
+let how_open = false
+let ago_sig = ""
+// The rule whose card is asking "Remove rule?", or -1.
+let confirm_remove = -1
+// Whether the match lists last showed the "Not watching" card.
+let shown_unwatched = false
+let no_room = false
 
 // Whether this room's AI may add rules, through Watcher's one tool.
 let ai_rules = false
 let ai_line = ""
+let ai_kind = "info"
 let tool_pending = false
 let tool_ready = false
-let tool_description = "Add a rule to Watcher in this room. Watcher then notifies the user whenever a new message here matches. Each filter is {field, op, value}. Fields and ops: text (the message): contains, not_contains, any_of (value is a comma-separated list), starts_with, is; sender: is, is_not, contains (value is a display name or @user:server); type: is, is_not (value m.text, m.notice, m.emote, m.image, m.file, m.video or m.audio); link: has, lacks (value is ignored). Returns the room's rules after adding."
+let tool_description = "Add a rule to Watcher in this room. Watcher then notifies the user whenever a new message here matches. Each filter is {field, op, value}. Fields and ops: text (the message): contains, not_contains, any_of, none_of (value is a comma-separated list), word (a whole word or phrase), mentions (a name or @user), starts_with, ends_with, is, pattern (* matches any text), and mentions_me, is_reply, not_reply, in_thread, not_thread (value is ignored); sender: is, is_not, any_of, none_of (comma-separated), contains (value is a display name or @user:server); type: is, is_not (value m.text, m.notice, m.emote, m.image, m.file, m.video, m.audio, m.location, or media for any attachment); link: has, lacks (value is ignored), to (value is a site such as github.com). Returns the room's rules after adding."
+
+// Host errors read as sentences: a capital first letter and a final period.
+fn sentence(text){
+    let chars = text.split("")
+    if chars.len() < 3 { return text }
+    let up = upper[chars[1]]
+    if up == nil { up = chars[1] }
+    let out = up + text.strip_prefix(chars[1])
+    let last = chars[chars.len() - 2]
+    if last != "." && last != "!" && last != "?" { out = out + "." }
+    return out
+}
+
+fn is_denial(error){ return error.search("denied") >= 0 || error.search("not approved") >= 0 || error.search("needs approval") >= 0 }
+
+// Says why watching stopped and what to do next.
+fn watch_error(error){
+    if error.search("not attached") >= 0 { return "Not watching: no room attached." }
+    if error.search("App Info") >= 0 { return "Not watching: room watching is off for this app. Turn it on in App Info, then tap Refresh." }
+    if is_denial(error) { return "Not watching: watching this room wasn't allowed. Tap Refresh to ask again." }
+    return "Not watching: " + sentence(error)
+}
+
+// The avatar letter: the name's first character, skipping a leading "@".
+fn initial(name){
+    let chars = name.split("")
+    if chars.len() < 3 { return "?" }
+    let c = chars[1]
+    if c == "@" && chars.len() > 3 { c = chars[2] }
+    let up = upper[c]
+    if up != nil { c = up }
+    return c
+}
 
 fn text_of(v){
     if v.is_string() { return v }
@@ -112,6 +195,32 @@ fn literal(value){
     return out
 }
 
+// A pattern's `*` matches any text; everything else matches literally.
+fn glob(value){
+    let out = ""
+    let first = true
+    for part in value.split("*") {
+        if !first { out = out + "[\\s\\S]*" }
+        out = out + literal(part)
+        first = false
+    }
+    return out
+}
+
+fn wild_free(value){
+    let out = ""
+    for part in text_of(value).split("*") { out = out + part }
+    return out.trim()
+}
+
+// "https://www.github.com/x" and "github.com" both mean the site github.com.
+fn site(value){
+    let s = text_of(value).trim().strip_prefix("https://").strip_prefix("http://").strip_prefix("www.")
+    if s == "" { return "" }
+    let parts = s.split("/")
+    return parts[0]
+}
+
 fn field_of(id){
     for f in fields { if f.id == id { return f } }
     return nil
@@ -150,13 +259,21 @@ fn type_label(id){
     return t.label
 }
 
-fn needs_text(f){ return f.field == "text" || f.field == "sender" }
+// Mentions, replies and threads are facts about the message, so they take no value.
+fn is_flag(f){ return f.field == "text" && (f.op == "mentions_me" || f.op == "is_reply" || f.op == "not_reply" || f.op == "in_thread" || f.op == "not_thread") }
+fn needs_text(f){ return (f.field == "text" && !is_flag(f)) || f.field == "sender" || (f.field == "link" && f.op == "to") }
 fn needs_choice(f){ return f.field == "type" }
+fn is_list(f){ return f.op == "any_of" || f.op == "none_of" }
 
 fn value_hint(f){
-    if f.op == "any_of" { return "Words, separated by commas" }
+    if f.field == "link" { return "A site, like github.com" }
+    if f.op == "pattern" { return "Use * for any text, like deploy * prod" }
+    if f.field == "sender" && is_list(f) { return "Names or @user:server, comma-separated" }
     if f.field == "sender" { return "Name or @user:server" }
-    return "Enter value"
+    if is_list(f) { return "Words, separated by commas" }
+    if f.op == "mentions" { return "A name or @user" }
+    if f.op == "word" { return "A word or phrase" }
+    return "Text to look for"
 }
 
 fn any_words(value){
@@ -195,7 +312,11 @@ fn filter_problem(f){
     if !needs_text(f) { return "" }
     if text_of(f.value).trim() == "" { return field_label(f.field) + " needs a value." }
     if f.value.len() > 200 { return "Keep each value within 200 characters." }
-    if f.op == "any_of" && any_words(f.value).len() == 0 { return "List words, separated by commas." }
+    if is_list(f) && any_words(f.value).len() == 0 && f.field == "sender" { return "List names, separated by commas." }
+    if is_list(f) && any_words(f.value).len() == 0 { return "List words, separated by commas." }
+    if f.op == "pattern" && wild_free(f.value) == "" { return "Add some text around the * in the pattern." }
+    if f.op == "mentions" && f.value.trim().strip_prefix("@").trim() == "" { return "Enter a name to look for." }
+    if f.field == "link" && (site(f.value) == "" || site(f.value).split(" ").len() > 1) { return "Enter a site, like github.com." }
     return ""
 }
 
@@ -211,20 +332,29 @@ fn problem(spec){
     return ""
 }
 
-// Prepares a filter's pattern once, so matching a message stays cheap.
+// Prepares a filter's pattern once, so matching a message stays cheap. Patterns
+// use only non-capturing groups.
 fn compile(f){
     let value = text_of(f.value).trim()
+    if f.field == "link" && f.op == "to" { value = site(value) }
+    if !needs_text(f) && !needs_choice(f) { value = "" }
     let pat = literal(value)
-    if f.op == "any_of" {
+    if is_list(f) {
         pat = ""
         for w in any_words(value) {
             if pat != "" { pat = pat + "|" }
             pat = pat + literal(w)
         }
+        if f.field == "sender" { pat = "^(?:" + pat + ")$" }
     }
     if f.field == "text" && f.op == "starts_with" { pat = "^\\s*" + literal(value) }
+    if f.field == "text" && f.op == "ends_with" { pat = literal(value) + "\\s*$" }
     if f.field == "text" && f.op == "is" { pat = "^\\s*" + literal(value) + "\\s*$" }
-    if f.field == "sender" && f.op != "contains" { pat = "^" + literal(value) + "$" }
+    if f.field == "text" && f.op == "word" { pat = "(?:^|\\W)" + literal(value) + "(?:\\W|$)" }
+    if f.field == "text" && f.op == "mentions" { pat = "(?:^|\\W)@?" + literal(value.strip_prefix("@").trim()) + "(?:\\W|$)" }
+    if f.field == "text" && f.op == "pattern" { pat = glob(value) }
+    if f.field == "sender" && (f.op == "is" || f.op == "is_not") { pat = "^" + literal(value) + "$" }
+    if f.field == "link" && f.op == "to" { pat = "https?://(?:[^\\s/?#]*\\.)?" + literal(value) + "(?:[/?#:]|\\s|$)" }
     return {field: f.field, op: f.op, value: value, pat: pat}
 }
 
@@ -236,21 +366,29 @@ fn make_rule(spec, notify, reply, by_ai){
 
 fn filter_matches(f, m){
     if f.field == "link" {
+        if f.op == "to" { return regex(f.pat, "i").test(m.body) }
         let has = regex("https?://", "i").test(m.body)
         if f.op == "has" { return has }
         return !has
     }
     if f.field == "type" {
-        if f.op == "is" { return m.msgtype == f.value }
-        return m.msgtype != f.value
+        let hit = m.msgtype == f.value
+        if f.value == "media" { hit = m.msgtype == "m.image" || m.msgtype == "m.video" || m.msgtype == "m.audio" || m.msgtype == "m.file" }
+        if f.op == "is" { return hit }
+        return !hit
     }
     if f.field == "sender" {
         let hit = regex(f.pat, "i").test(m.sender_name) || regex(f.pat, "i").test(m.sender_id)
-        if f.op == "is_not" { return !hit }
+        if f.op == "is_not" || f.op == "none_of" { return !hit }
         return hit
     }
+    if f.op == "mentions_me" { return m.mentions_me }
+    if f.op == "is_reply" { return m.reply_to != "" }
+    if f.op == "not_reply" { return m.reply_to == "" }
+    if f.op == "in_thread" { return m.thread_root != "" }
+    if f.op == "not_thread" { return m.thread_root == "" }
     let found = regex(f.pat, "i").test(m.body)
-    if f.op == "not_contains" { return !found }
+    if f.op == "not_contains" || f.op == "none_of" { return !found }
     return found
 }
 
@@ -302,13 +440,51 @@ fn load(){
     return nil
 }
 
+// ---- The header: summary, status and Refresh
+
+fn plural(n, one, many){
+    if n == 1 { return "1 " + one }
+    return "" + n + " " + many
+}
+
+// Status lines are green when all is well, red on a problem, else gray.
+fn set_status(text, kind){
+    status_text = text
+    status_kind = kind
+    ui.status_box.render()
+    return nil
+}
+
+fn has_replies(){
+    for r in rules { if r.reply != "" { return true } }
+    return false
+}
+
+fn show_header(){
+    let line = plural(rules.len(), "rule", "rules")
+    if hits.len() > 0 { line = line + " · " + plural(hits.len(), "match", "matches") }
+    ui.summary.set_text(line)
+    ui.summary_wrap.set_visible(rules.len() > 0)
+    ui.refresh_wrap.set_visible(watch_tried && !watch_ready && !watch_pending)
+    return nil
+}
+
 fn show_status(){
     let line = watch_line
-    if !host.has("matrix.room.message.send") {
-        line = line + " Automatic sending is off until this app may send to the room. Draft reply remains separate."
+    let kind = "ok"
+    if !watch_ready { kind = "err" }
+    if !watch_tried { kind = "busy" }
+    if watch_ready && !host.has("matrix.room.message.send") && has_replies() {
+        line = line + " Auto-replies need permission to send; test a reply to allow it."
+        if kind == "ok" { kind = "info" }
     }
-    if actions_paused { line = line + " Automatic actions are paused. Test a rule to resume them." }
-    ui.status.set_text(line)
+    if actions_paused {
+        line = line + " Automatic actions are paused. Test a rule to resume them."
+        kind = "err"
+    }
+    set_status(line, kind)
+    show_header()
+    if shown_unwatched != (watch_tried && !watch_ready) { render_hits() }
     return nil
 }
 
@@ -319,17 +495,17 @@ fn subscribe(){
     host.request("events.subscribe", {event: "on_room_message"}, fn(r){
         if generation != watch_generation { return nil }
         watch_pending = false
+        watch_tried = true
         watch_ready = r.is_ok
-        if r.is_ok {
-            watch_line = "Watching this room."
-        } else {
-            watch_line = "Not watching: " + r.error
-        }
+        if r.is_ok { watch_line = "Watching this room." } else { watch_line = watch_error(r.error) }
+        no_room = !r.is_ok && r.error.search("not attached") >= 0
         if pending_test.is_object() {
             let test = pending_test
             pending_test = nil
             if r.is_ok { run_rule_test(test) }
-            else { finish_test("Test stopped: " + r.error) }
+            else { finish_test(watch_error(r.error), "err") }
+            show_header()
+            render_hits()
         } else { show_status() }
     })
     return nil
@@ -348,37 +524,128 @@ fn on_permissions_changed(caps){
         action_pending = false
         watch_pending = false
         watch_ready = false
+        watch_tried = true
         watch_line = "Not watching: permission is off."
         if pending_test.is_object() {
             pending_test = nil
-            finish_test("Room watching was not allowed. Test the rule again when you want to allow it.")
+            finish_test("Room watching was not allowed. Test the rule again when you want to allow it.", "err")
         } else if !test_pending { show_status() }
+        show_header()
+        render_hits()
     }
+    return nil
+}
+
+// ---- Layout
+
+// Editing hides the list; wide panes put recent matches in a second column.
+fn show_layout(){
+    let has_rules = rules.len() > 0
+    ui.editor_wrap.set_visible(editor_open)
+    ui.empty_wrap.set_visible(!editor_open && !has_rules)
+    ui.rules_wrap.set_visible(!editor_open && has_rules)
+    ui.matches_main.set_visible(!is_wide && !editor_open && has_rules)
+    ui.side_col.set_visible(is_wide && has_rules)
+    ui.extras_wrap.set_visible(!editor_open)
+    // Wide panes put + New rule in the header, so both columns' captions line up.
+    ui.new_head.set_visible(is_wide && has_rules && !editor_open)
+    ui.new_row.set_visible(!is_wide)
+    return nil
+}
+
+fn on_app_resize(w, h){
+    let wide = w >= 720
+    let stacked = (!wide && w < 400) || (wide && w < 780)
+    let compact = w < 300
+    if wide == is_wide && stacked == is_stacked && compact == is_compact { return nil }
+    is_wide = wide
+    is_stacked = stacked
+    is_compact = compact
+    show_layout()
+    render_filters()
+    ui.adv_btn.render()
+    ui.rule_list.render()
+    render_hits()
+    return nil
+}
+
+fn toggle_how(){
+    how_open = !how_open
+    ui.how_wrap.set_visible(how_open)
+    if how_open { ui.how_btn.set_text("How it works ▲") } else { ui.how_btn.set_text("How it works ▼") }
     return nil
 }
 
 // ---- The rule editor
 
-fn show_editor(){
-    ui.match_btn.set_text(draft["match"] + " ▼")
-    if draft.notify { ui.notify_btn.set_text("🔔 Notify me") } else { ui.notify_btn.set_text("🔕 Silent") }
-    if editing >= 0 { ui.editor_title.set_text("EDITING RULE") } else { ui.editor_title.set_text("NEW RULE") }
-    ui.adv_btn.render()
+fn render_filters(){
+    field_gen = field_gen + 1
+    if draft.filters.len() < 2 { match_menu_open = false }
+    ui.match_wrap.set_visible(draft.filters.len() > 1)
+    ui.match_menu.render()
     ui.filter_list.render()
     return nil
 }
 
-fn clear_editor(){
+fn show_editor(){
+    ui.match_btn.set_text(draft["match"])
+    if editing >= 0 {
+        ui.editor_title.set_text("EDIT RULE")
+        ui.save_btn.set_text("Save changes")
+    } else {
+        ui.editor_title.set_text("NEW RULE")
+        ui.save_btn.set_text("Save rule")
+    }
+    ui.adv_panel.set_visible(advanced)
+    ui.notify_chips.render()
+    ui.adv_btn.render()
+    render_filters()
+    return nil
+}
+
+fn reset_draft(){
     draft = {"match": "all", notify: true, filters: [{field: "text", op: "contains", value: ""}]}
     editing = -1
     menu_row = -1
+    match_menu_open = false
     ui.reply_input.set_text("")
+    return nil
+}
+
+fn new_rule(){
+    confirm_remove = -1
+    reset_draft()
+    editor_open = true
     show_editor()
+    show_layout()
+    return nil
+}
+
+// Closing skips redrawing the hidden editor; opening it always redraws.
+fn clear_editor(){
+    reset_draft()
+    editor_open = false
+    show_layout()
     return nil
 }
 
 fn toggle_match(){
     if draft["match"] == "all" { draft["match"] = "any" } else { draft["match"] = "all" }
+    match_menu_open = false
+    show_editor()
+    return nil
+}
+
+fn open_match_menu(){
+    match_menu_open = !match_menu_open
+    menu_row = -1
+    render_filters()
+    return nil
+}
+
+fn choose_match(value){
+    draft["match"] = value
+    match_menu_open = false
     show_editor()
     return nil
 }
@@ -386,6 +653,12 @@ fn toggle_match(){
 fn toggle_notify(){
     draft.notify = !draft.notify
     show_editor()
+    return nil
+}
+
+fn set_notify(on){
+    draft.notify = on
+    ui.notify_chips.render()
     return nil
 }
 
@@ -398,12 +671,34 @@ fn set_advanced(expanded){
 
 fn add_filter(){
     if draft.filters.len() >= 8 {
-        ui.status.set_text("Use at most 8 filters.")
+        set_status("Use at most 8 filters.", "err")
         return nil
     }
     draft.filters.push({field: "text", op: "contains", value: ""})
     menu_row = -1
-    ui.filter_list.render()
+    render_filters()
+    return nil
+}
+
+fn is_blank(f){ return f.field == "text" && f.op == "contains" && text_of(f.value).trim() == "" }
+
+// An Advanced filters shortcut fills the lone empty filter, or adds a new one.
+fn add_preset(k){
+    if k >= presets.len() { return nil }
+    let p = presets[k]
+    let f = {field: p.field, op: p.op, value: p.value}
+    menu_row = -1
+    if draft.filters.len() == 1 && is_blank(draft.filters[0]) {
+        draft.filters = [f]
+        render_filters()
+        return nil
+    }
+    if draft.filters.len() >= 8 {
+        set_status("Use at most 8 filters.", "err")
+        return nil
+    }
+    draft.filters.push(f)
+    render_filters()
     return nil
 }
 
@@ -418,7 +713,7 @@ fn copy_filter(i){
     }
     draft.filters = out
     menu_row = -1
-    ui.filter_list.render()
+    render_filters()
     return nil
 }
 
@@ -427,7 +722,7 @@ fn remove_filter(i){
     draft.filters.remove(i)
     if draft.filters.len() == 0 { draft.filters.push({field: "text", op: "contains", value: ""}) }
     menu_row = -1
-    ui.filter_list.render()
+    render_filters()
     return nil
 }
 
@@ -441,24 +736,32 @@ fn open_menu(i, kind){
         menu_row = i
         menu_kind = kind
     }
-    ui.filter_list.render()
+    match_menu_open = false
+    render_filters()
     return nil
 }
 
+// A menu lists the basic choices, every choice in Advanced mode, and always the current one.
 fn menu_options(){
     let out = []
     if menu_row < 0 || menu_row >= draft.filters.len() { return out }
     let f = draft.filters[menu_row]
     if menu_kind == "field" {
-        for o in fields { if advanced || !o.advanced { out.push(o) } }
+        for o in fields { if advanced || !o.advanced || o.id == f.field { out.push(o) } }
         return out
     }
     if menu_kind == "op" {
-        for o in ops { if o.field == f.field && (advanced || !o.advanced) { out.push(o) } }
+        for o in ops { if o.field == f.field && (advanced || !o.advanced || o.id == f.op) { out.push(o) } }
         return out
     }
     for t in types { out.push(t) }
     return out
+}
+
+fn menu_current(f){
+    if menu_kind == "field" { return f.field }
+    if menu_kind == "op" { return f.op }
+    return f.value
 }
 
 fn choose(id){
@@ -473,19 +776,19 @@ fn choose(id){
         if id == "type" { draft.filters[i].value = "m.notice" }
     }
     menu_row = -1
-    ui.filter_list.render()
+    render_filters()
     return nil
 }
 
 fn save_rule(){
     let why = problem(draft)
     if why != "" {
-        ui.status.set_text("Rule not saved: " + why)
+        set_status("Rule not saved: " + why, "err")
         return nil
     }
     let reply = ui.reply_input.text().trim()
     if reply.len() > 4096 {
-        ui.status.set_text("Keep the reply within 4096 characters.")
+        set_status("Keep the reply within 4096 characters.", "err")
         return nil
     }
     let rule = make_rule(draft, draft.notify, reply, false)
@@ -499,6 +802,7 @@ fn save_rule(){
         rules = out
     } else { rules.push(rule) }
     save()
+    confirm_remove = -1
     clear_editor()
     ui.rule_list.render()
     show_status()
@@ -509,21 +813,23 @@ fn draft_reply(text){
     if reply_draft_pending { return nil }
     let reply = text.trim()
     if reply == "" || reply.len() > 4096 {
-        ui.status.set_text("Enter a reply between 1 and 4096 characters to draft.")
+        set_status("Enter a reply between 1 and 4096 characters to draft.", "err")
         return nil
     }
     reply_draft_pending = true
-    ui.status.set_text("Preparing a reply draft…")
+    set_status("Preparing a reply draft…", "busy")
     host.request("composer.insert", {text: reply}, fn(r){
         reply_draft_pending = false
-        if r.is_ok { ui.status.set_text("Reply drafted. Review and send it in Robrix. Automatic sending is unchanged.") }
-        else { ui.status.set_text(r.error) }
+        if r.is_ok { set_status("Reply drafted. Review and send it in Robrix.", "ok") }
+        elif is_denial(r.error) { set_status("Drafts aren't allowed yet. Tap Draft reply to allow them.", "err") }
+        else { set_status(sentence(r.error), "err") }
     })
     return nil
 }
 
 fn edit_rule(i){
     if i >= rules.len() { return nil }
+    confirm_remove = -1
     let r = rules[i]
     let filters = []
     for f in r.filters {
@@ -533,24 +839,26 @@ fn edit_rule(i){
     draft = {"match": r["match"], notify: r.notify, filters: filters}
     editing = i
     menu_row = -1
+    match_menu_open = false
+    editor_open = true
     ui.reply_input.set_text(r.reply)
-    ui.status.set_text("Editing a rule. Save it to replace the old one.")
     show_editor()
+    show_layout()
     return nil
 }
 
 // ---- Testing and running rules
 
-fn finish_test(text){
+fn finish_test(text, kind){
     test_pending = false
     pending_test = nil
-    ui.status.set_text(text)
+    set_status(text, kind)
     return nil
 }
 
 fn complete_test(text){
     actions_paused = false
-    finish_test(text)
+    finish_test(text, "ok")
     run_next_action()
     return nil
 }
@@ -561,10 +869,11 @@ fn run_rule_test(test){
     if test.reply != "" { remaining += 1 }
     let failure = ""
     let done = fn(r, label){
-        if !r.is_ok && failure == "" { failure = label + " failed: " + r.error }
+        if !r.is_ok && failure == "" && is_denial(r.error) { failure = label + " wasn't allowed. Test the rule to ask again." }
+        if !r.is_ok && failure == "" { failure = label + " failed: " + sentence(r.error) }
         remaining -= 1
         if remaining > 0 { return nil }
-        if failure != "" { finish_test(failure) }
+        if failure != "" { finish_test(failure, "err") }
         elif test.reply != "" { complete_test("Test reply posted to this room.") }
         else { complete_test("Test notification shown.") }
         return nil
@@ -593,17 +902,17 @@ fn start_rule_test(test){
 fn test_rule(rule){
     if test_pending { return nil }
     if !rule.notify && rule.reply == "" {
-        ui.status.set_text("This rule has no notification or reply to test.")
+        set_status("This rule has no notification or reply to test.", "err")
         return nil
     }
     let test = {title: describe(rule), notify: rule.notify, reply: rule.reply}
     test_pending = true
-    ui.status.set_text("Testing “" + test.title + "”…")
+    set_status("Testing “" + test.title + "”…", "busy")
     if host.has("on_room_message") { start_rule_test(test) return nil }
     host.request("permissions.request", {perms: ["matrix-room-watch"], retry: true}, fn(r){
-        if !r.is_ok { finish_test("Test stopped: " + r.error) return nil }
+        if !r.is_ok { finish_test("Test stopped: " + sentence(r.error), "err") return nil }
         if r.data.permissions["matrix-room-watch"] != true || !host.has("on_room_message") {
-            finish_test("Room watching was not allowed. Test again when you want to enable the rule.")
+            finish_test("Room watching was not allowed. Test again when you want to enable the rule.", "err")
             return nil
         }
         start_rule_test(test)
@@ -611,22 +920,50 @@ fn test_rule(rule){
     return nil
 }
 
+// Remove asks once, inline: the card's actions become a red confirm and Keep.
+fn ask_remove(i){
+    confirm_remove = i
+    ui.rule_list.render()
+    return nil
+}
+
 fn remove_rule(i){
+    confirm_remove = -1
     if i >= rules.len() { return nil }
     rules.remove(i)
     if editing == i { clear_editor() }
     elif editing > i { editing = editing - 1 }
     save()
     ui.rule_list.render()
+    show_layout()
+    show_header()
     return nil
 }
 
-fn rule_line(rule){
-    let line = "notify off"
-    if rule.notify { line = "notify on" }
-    if rule.reply.len() > 0 { line = line + "  ·  reply: " + rule.reply }
-    if rule.by_ai { line = line + "  ·  added by this room's AI" }
-    return line
+// What a rule does, as short parts that wrap cleanly in narrow panes.
+fn meta_parts(rule){
+    let out = ["🔕 No notification"]
+    if rule.notify { out = ["🔔 Notifies you"] }
+    if rule.reply != "" { out.push("↩ Replies automatically") }
+    if !rule.notify && rule.reply == "" { out.push("Only listed under matches") }
+    if rule.by_ai { out.push("🤖 Added by the room's AI") }
+    return out
+}
+
+// One line per filter, the later ones led by "and" or "or".
+fn filter_lines(rule){
+    let out = []
+    let joiner = "and"
+    if rule["match"] == "any" { joiner = "or" }
+    for f in rule.filters {
+        let lead = ""
+        if out.len() > 0 { lead = joiner }
+        let text = describe_filter(f)
+        let whole = text
+        if lead != "" { whole = lead + " " + text }
+        out.push({lead: lead, text: text, whole: whole})
+    }
+    return out
 }
 
 // Pace automatic requests and stop a denied burst after its first failure.
@@ -641,7 +978,10 @@ fn run_next_action(){
         if !r.is_ok {
             actions_paused = true
             action_queue = []
-            ui.status.set_text("Automatic actions paused: " + r.error + " Test a rule to try again.")
+            let why = sentence(r.error) + " Test a rule to try again."
+            if is_denial(r.error) { why = "popups aren't allowed yet. Test a rule to allow them." }
+            if is_denial(r.error) && action.service == "matrix.send_message" { why = "auto-replies aren't allowed yet. Test a reply to allow them." }
+            set_status("Automatic actions paused: " + why, "err")
         }
         start_timeout(1.0, || {
             if generation != action_generation { return nil }
@@ -655,12 +995,25 @@ fn run_next_action(){
 fn queue_action(service, args){
     if actions_paused { return nil }
     if action_queue.len() >= 32 {
-        ui.status.set_text("Watcher is busy. Some automatic replies or notifications were skipped.")
+        set_status("Watcher is busy. Some automatic replies or notifications were skipped.", "err")
         return nil
     }
     action_queue.push({service: service, args: args})
     run_next_action()
     return nil
+}
+
+fn short_rule(rule){
+    let line = describe_filter(rule.filters[0])
+    if rule.filters.len() > 1 { line = line + " (+" + (rule.filters.len() - 1) + " more)" }
+    return line
+}
+
+// Names the filter that caught a message: for `any` rules, the one that matched.
+fn match_label(rule, msg){
+    if rule["match"] != "any" { return short_rule(rule) }
+    for f in rule.filters { if filter_matches(f, msg) { return describe_filter(f) } }
+    return short_rule(rule)
 }
 
 // Own messages never match, so a rule can't loop on its own replies.
@@ -671,11 +1024,20 @@ fn check(m){
         sender_id: text_of(get(m, "sender_id", ""))
         sender_name: text_of(get(m, "sender_name", ""))
         msgtype: text_of(get(m, "msgtype", ""))
+        mentions_me: get(m, "mentions_me", false) == true
+        reply_to: text_of(get(m, "reply_to", ""))
+        thread_root: text_of(get(m, "thread_root", ""))
     }
-    let line = msg.sender_name + ": " + msg.body
+    let who = msg.sender_name
+    if who == "" { who = text_of(get(m, "sender", "")) }
+    if who == "" { who = msg.sender_id }
+    let line = who + ": " + msg.body
+    let at = time_now()
+    let ts = get(m, "ts", 0)
+    if ts.is_number() && ts / 1000 < at && ts / 1000 > at - 604800 { at = ts / 1000 }
     for rule in rules {
         if rule_matches(rule, msg) {
-            hits.push(line)
+            hits.push({who: who, body: msg.body, rule: match_label(rule, msg), at: at})
             if rule.notify {
                 queue_action("notify.post", {title: "Watcher: " + describe(rule), body: line})
             }
@@ -691,25 +1053,79 @@ fn check(m){
 fn on_room_message(json){
     let batch = json.parse_json()
     for m in batch { check(m) }
+    render_hits()
+    show_header()
+}
+
+// ---- Recent matches
+
+fn ago(at){
+    let s = time_now() - at
+    if s < 60 { return "Just now" }
+    if s < 3600 { return "" + floor(s / 60) + "m ago" }
+    if s < 86400 { return "" + floor(s / 3600) + "h ago" }
+    if s < 172800 { return "Yesterday" }
+    if s < 604800 { return "" + floor(s / 86400) + "d ago" }
+    if s < 2592000 { return "" + floor(s / 604800) + "w ago" }
+    if s < 31536000 { return "" + floor(s / 2592000) + "mo ago" }
+    return "" + floor(s / 31536000) + "y ago"
+}
+
+fn newest_first(){
+    let out = []
+    let k = hits.len() - 1
+    while k >= 0 {
+        let h = hits[k]
+        out.push({who: h.who, body: h.body, rule: h.rule, when: ago(h.at), first: out.len() == 0})
+        k = k - 1
+    }
+    return out
+}
+
+fn render_hits(){
+    shown_unwatched = watch_tried && !watch_ready
+    let sig = ""
+    for h in hits { sig = sig + ago(h.at) + "|" }
+    ago_sig = sig
     ui.hit_list.render()
+    ui.hit_list_side.render()
+    return nil
+}
+
+// Keeps "5m ago" current without touching the host.
+fn tick(){
+    if hits.len() == 0 { return nil }
+    let sig = ""
+    for h in hits { sig = sig + ago(h.at) + "|" }
+    if sig == ago_sig { return nil }
+    render_hits()
+    return nil
 }
 
 // ---- Letting this room's AI add rules
 
+fn set_ai(text, kind){
+    ai_line = text
+    ai_kind = kind
+    ui.ai_status_box.render()
+    return nil
+}
+
 fn show_ai(){
     if !ai_rules {
-        ui.ai_button.set_text("Let this room's AI add rules")
-        ui.ai_status.set_text("Off. When on, the AI in this room can add rules for you. You review its tool first, and you still approve what rules do.")
+        ui.ai_button.set_text("Turn on")
+        set_ai("Off. You review its tool first, and the rules it adds only notify you.", "info")
         return nil
     }
-    ui.ai_button.set_text("Stop the AI adding rules")
-    ui.ai_status.set_text(ai_line)
+    ui.ai_button.set_text("Turn off")
+    ui.ai_status_box.render()
     return nil
 }
 
 fn register_tool(){
     if !ai_rules || tool_pending || tool_ready { return nil }
     tool_pending = true
+    set_ai("Offering Watcher's tool to this room's AI…", "busy")
     host.request("mcp.tools.register", {
         name: "add_rule",
         description: tool_description,
@@ -724,8 +1140,9 @@ fn register_tool(){
             return nil
         }
         tool_ready = r.is_ok
-        if r.is_ok { ai_line = "On. The AI in this room can add rules here." }
-        else { ai_line = "The AI can't add rules here yet: " + r.error }
+        if r.is_ok { set_ai("On. The AI in this room can add rules here.", "ok") }
+        elif is_denial(r.error) { set_ai("The AI can't add rules yet: its tool wasn't allowed. Turn this off and on to ask again.", "err") }
+        else { set_ai("The AI can't add rules yet. " + sentence(r.error), "err") }
         show_ai()
         return nil
     })
@@ -737,7 +1154,7 @@ fn toggle_ai(){
     let saved = {on: ai_rules}
     fs.write("/ai.json", saved.to_json())
     if ai_rules {
-        ai_line = "Offering Watcher's tool to this room's AI…"
+        set_ai("Offering Watcher's tool to this room's AI…", "busy")
         register_tool()
         show_ai()
         return nil
@@ -752,7 +1169,7 @@ fn toggle_ai(){
 
 fn answer(call_id, is_ok, result){
     host.request("mcp.tools.result", {call_id: call_id, "ok": is_ok, result: result}, fn(r){
-        if !r.is_ok { ui.status.set_text("Couldn't answer the AI: " + r.error) }
+        if !r.is_ok { set_status("Couldn't answer the AI: " + sentence(r.error), "err") }
         return nil
     })
     return nil
@@ -779,50 +1196,270 @@ fn on_tool_call(json){
     rules.push(rule)
     save()
     ui.rule_list.render()
-    ui.status.set_text("This room's AI added a rule: " + describe(rule))
+    show_layout()
+    show_header()
+    set_status("This room's AI added a rule: " + describe(rule), "ok")
     return answer(ev.call_id, true, summaries().to_json())
 }
 
-// Splash isolates use their own widget registry. This script-local header
-// matches Robrix's settings disclosures while keeping native Button keyboard
-// and focus behavior. Its outer View rerenders the arrow without clicking it.
+// ---- Look: Robrix's buttons, inputs, dropdowns, chips and menus
+
+let PrimaryButton = Button{
+    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
+    draw_bg +: {
+        border_size: 0.0 border_radius: 4.0
+        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+}
+let NeutralButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
+        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+}
+let GhostButton = PrimaryButton{
+    padding: Inset{left: 6 right: 6 top: 4 bottom: 4}
+    margin: Inset{left: -6}
+    draw_bg +: { border_size: 0.0 color: #xFFFFFF00 color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF00 }
+    draw_text +: { color: #x66708F color_hover: #x1C274C color_down: #x1C274C color_focus: #x66708F }
+}
+let NegativeButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xDC0005 border_color_hover: #xDC0005 border_color_down: #xDC0005 border_color_focus: #xDC0005
+        color: #xFFF0F0 color_hover: #xF0D4D4 color_down: #xE0B8B8 color_focus: #xFFF0F0 }
+    draw_text +: { color: #xDC0005 color_hover: #xDC0005 color_down: #xDC0005 color_focus: #xDC0005 }
+}
+let Field = TextInput{
+    width: Fill height: Fit padding: 10
+    draw_bg +: {
+        border_radius: 4.0 border_size: 1.0
+        color: #xFFFFFF color_hover: #xFFFFFF color_focus: #xFFFFFF color_down: #xFFFFFF color_empty: #xFFFFFF
+        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_focus: #x106fcc border_color_down: #x106fcc border_color_empty: #xC8C8C8
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #x333333 color_hover: #x333333 color_focus: #x333333 color_down: #x333333 color_empty: #xBBBBBB color_empty_hover: #x999999 color_empty_focus: #x999999 text_style: theme.font_regular{font_size: 11} }
+}
+// A select: white box, gray border (blue while hovered or open), ▼ at the right.
+let Dropdown = PrimaryButton{
+    width: Fill margin: 0
+    padding: Inset{left: 10 right: 30 top: 9 bottom: 9}
+    align: Align{x: 0.0 y: 0.5}
+    draw_bg +: {
+        open: instance(0.0)
+        border_size: 1.0
+        color: #xFFFFFF color_hover: #xFFFFFF color_down: #xF7F9FC color_focus: #xFFFFFF
+        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_down: #x106fcc border_color_focus: #xC8C8C8
+        pixel: fn(){
+            let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+            sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, 4.0)
+            sdf.fill_keep(mix(self.color, self.color_down, self.down))
+            sdf.stroke(mix(self.border_color, self.border_color_hover, max(self.hover, self.open)), 1.0)
+            let ax = self.rect_size.x - 16.0
+            let ay = self.rect_size.y * 0.5
+            sdf.rotate(self.open * PI, ax, ay)
+            sdf.move_to(ax - 4.0, ay - 2.0)
+            sdf.line_to(ax + 4.0, ay - 2.0)
+            sdf.line_to(ax, ay + 2.5)
+            sdf.close_path()
+            sdf.fill(#x1C274C)
+            return sdf.result
+        }
+    }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C text_style: theme.font_regular{font_size: 11} }
+}
+// A dropdown's menu card and its rows; `selected` checks the current choice.
+let MenuCard = RoundedView{
+    width: Fill height: Fit flow: Down spacing: 0 padding: 4
+    show_bg: true draw_bg +: { color: #xFFFFFF border_radius: 6.0 border_size: 1.0 border_color: #xC8C8C8 }
+}
+let MenuItem = PrimaryButton{
+    width: Fill margin: 0
+    padding: Inset{left: 30 right: 10 top: 7 bottom: 7}
+    align: Align{x: 0.0 y: 0.5}
+    draw_bg +: {
+        selected: instance(0.0)
+        color: #xFFFFFF color_hover: #xE4EEFF color_down: #xD3E3FF color_focus: #xFFFFFF
+        pixel: fn(){
+            let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+            sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, 4.0)
+            sdf.fill(mix(mix(self.color, self.color_hover, max(self.hover, self.selected)), self.color_down, self.down))
+            let cy = self.rect_size.y * 0.5
+            sdf.move_to(10.0, cy + 0.5)
+            sdf.line_to(13.5, cy + 4.0)
+            sdf.line_to(20.0, cy - 3.5)
+            sdf.stroke(mix(vec4(0.0, 0.0, 0.0, 0.0), #x0f88fe, self.selected), 1.6)
+            return sdf.result
+        }
+    }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C text_style: theme.font_regular{font_size: 11} }
+}
+// A pill; `selected` fills it with the accent color.
+let Chip = PrimaryButton{
+    margin: Inset{top: 2 bottom: 2}
+    padding: Inset{left: 10 right: 10 top: 5 bottom: 5}
+    draw_bg +: {
+        selected: instance(0.0)
+        border_size: 1.0
+        color: #xFFFFFF color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF
+        border_color: #xC8C8C8 border_color_hover: #xC8C8C8 border_color_down: #xC8C8C8 border_color_focus: #xC8C8C8
+        pixel: fn(){
+            let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+            sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, min(12.0, self.rect_size.y * 0.5 - 0.5))
+            let rest = mix(mix(self.color, self.color_hover, self.hover), self.color_down, self.down)
+            sdf.fill_keep(mix(rest, #x0f88fe, self.selected))
+            sdf.stroke(mix(self.border_color, #x0f88fe, self.selected), 1.0)
+            return sdf.result
+        }
+    }
+    draw_text +: {
+        selected: instance(0.0)
+        color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C
+        get_color: fn(){ return mix(self.color, #xFFFFFF, self.selected) }
+    }
+}
+// Small icon buttons for a filter row: duplicate and remove.
+let IconButton = PrimaryButton{
+    width: 32 height: 32 margin: 0 padding: 0
+    text: ""
+    draw_bg +: { color: #xFFFFFF color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF }
+}
+let CopyIcon = IconButton{
+    draw_bg +: {
+        pixel: fn(){
+            let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+            let bg = mix(mix(self.color, self.color_hover, self.hover), self.color_down, self.down)
+            sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, 4.0)
+            sdf.fill(bg)
+            let c = self.rect_size * 0.5
+            sdf.box(c.x - 6.0, c.y - 6.5, 9.0, 10.0, 1.5)
+            sdf.stroke(#x66708F, 1.2)
+            sdf.box(c.x - 3.0, c.y - 3.5, 9.0, 10.0, 1.5)
+            sdf.fill_keep(bg)
+            sdf.stroke(#x66708F, 1.2)
+            return sdf.result
+        }
+    }
+}
+let RemoveIcon = IconButton{
+    draw_bg +: {
+        color_hover: #xFFF0F0 color_down: #xF0D4D4
+        pixel: fn(){
+            let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+            sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, 4.0)
+            sdf.fill(mix(mix(self.color, self.color_hover, self.hover), self.color_down, self.down))
+            let c = self.rect_size * 0.5
+            sdf.move_to(c.x - 4.0, c.y - 4.0)
+            sdf.line_to(c.x + 4.0, c.y + 4.0)
+            sdf.move_to(c.x + 4.0, c.y - 4.0)
+            sdf.line_to(c.x - 4.0, c.y + 4.0)
+            sdf.stroke(mix(#x66708F, #xDC0005, self.hover), 1.4)
+            return sdf.result
+        }
+    }
+}
+let Caption = Label{ padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+let Meta = Label{ padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+let Body = Label{ padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
+let Dot = Label{ text: "•" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+let EmptyCard = RoundedView{
+    width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5}
+    padding: Inset{left: 16 right: 16 top: 20 bottom: 20}
+    show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+}
+let EmptyEmoji = Label{ padding: 0 margin: 0 draw_text +: { text_style: theme.font_regular{font_size: 28} } }
+let EmptyTitle = Label{ width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} } }
+let EmptyText = Label{ width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+
+// Robrix's settings disclosure: a bar whose triangle turns when it opens. A
+// native Button keeps keyboard focus; the outer View rerenders the triangle.
 let SettingsDisclosureControl = Button{
-    width: Fill height: 40 margin: 0 spacing: 0
-    padding: Inset{left: 36 right: 5 top: 5 bottom: 5}
+    width: Fill height: 36 margin: 0 spacing: 0
+    padding: Inset{left: 32 right: 10 top: 5 bottom: 5}
     align: Align{x: 0.0 y: 0.5}
     label_walk: Walk{width: Fill height: Fit}
     label_align: Align{x: 0.0 y: 0.5}
     icon_walk: Walk{width: 0 height: 0 margin: 0}
     text: "Advanced filters"
     draw_text +: {
-        color: #x333333 color_hover: #x333333 color_down: #x333333 color_focus: #x333333
-        text_style: theme.font_bold{font_size: 11}
+        color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C
+        text_style: theme.font_bold{font_size: 10.5}
     }
     draw_bg +: {
         opened: instance(0.0)
         pixel: fn(){
             let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-            sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, 4.0)
-            sdf.fill(#xF0F5FF)
-            let corner_round = 2.25
-            let sz = 20.0 * 0.3 - corner_round * 0.5
-            let c = vec2(20.0, self.rect_size.y * 0.5)
+            sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, 6.0)
+            sdf.fill_keep(mix(#xFFFFFF, #xF7F9FC, self.hover))
+            sdf.stroke(#xE0E0E0, 1.0)
+            let sz = 3.5
+            let c = vec2(17.0, self.rect_size.y * 0.5)
             sdf.rotate(self.opened * 0.5 * PI + 0.5 * PI, c.x, c.y)
             sdf.move_to(c.x - sz, c.y + sz)
             sdf.line_to(c.x, c.y - sz)
             sdf.line_to(c.x + sz, c.y + sz)
             sdf.close_path()
-            sdf.fill_keep(#x333333)
-            return sdf.stroke(#x333333, corner_round)
+            sdf.fill_keep(#x1C274C)
+            return sdf.stroke(#x1C274C, 1.5)
         }
     }
 }
 let SettingsDisclosureHeader = View{
-    width: Fill height: 40 padding: 0
+    width: Fill height: Fit padding: 0
     on_render: || {
         disclosure_control := SettingsDisclosureControl{
+            text: if is_compact {"Advanced"} else {"Advanced filters"}
             draw_bg +: {opened: if advanced {1.0} else {0.0}}
             on_click: || set_advanced(!advanced)
+        }
+        nil
+    }
+}
+
+// Recent matches, newest first. Wide panes show a second copy in their side column.
+let HitList = View{
+    width: Fill height: Fit flow: Down
+    on_render: || {
+        let rows = newest_first()
+        if rows.len() > 0 {
+            RoundedView{
+                width: Fill height: Fit flow: Down padding: Inset{left: 12 right: 12 top: 2 bottom: 2}
+                show_bg: true draw_bg +: { color: #xFFFFFF border_radius: 8.0 border_size: 1.0 border_color: #xE0E0E0 }
+                for h in rows {
+                    if !h.first { SolidView{ width: Fill height: 1 draw_bg +: { color: #x00000018 } } }
+                    View{
+                        width: Fill height: Fit flow: Right spacing: 10 padding: Inset{top: 10 bottom: 10}
+                        RoundedView{
+                            visible: !is_compact width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
+                            show_bg: true draw_bg +: { color: #x52b2ac border_radius: 16.0 }
+                            Label{ text: initial(h.who) padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
+                        }
+                        View{
+                            width: Fill height: Fit flow: Down spacing: 3
+                            View{
+                                width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                Label{ text: h.who width: Fill max_lines: 1 text_overflow: TextOverflow.Ellipsis padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} } }
+                                Meta{ text: h.when }
+                            }
+                            Body{ text: h.body width: Fill max_lines: 3 text_overflow: TextOverflow.Ellipsis }
+                            Meta{ text: "Rule: " + h.rule width: Fill max_lines: 1 text_overflow: TextOverflow.Ellipsis }
+                        }
+                    }
+                }
+            }
+        }
+        if rows.len() == 0 && watch_tried && !watch_ready {
+            EmptyCard{
+                EmptyEmoji{ text: if no_room { "🧭" } else { "🔒" } }
+                EmptyTitle{ text: if no_room { "No room attached" } else { "Not watching" } }
+                EmptyText{ text: if no_room { "Open Watcher from a room to watch its messages." } else { "Rules can't match new messages until watching is on." } }
+            }
+        }
+        if rows.len() == 0 && !(watch_tried && !watch_ready) {
+            EmptyCard{
+                EmptyEmoji{ text: "📭" }
+                EmptyTitle{ text: "No matches yet" }
+                EmptyText{ text: "New messages that match a rule show up here." }
+            }
         }
         nil
     }
@@ -833,175 +1470,364 @@ let _boot = start_timeout(0.05, || {
     subscribe()
     show_editor()
     ui.rule_list.render()
+    ui.status_box.render()
+    render_hits()
     show_ai()
+    show_layout()
+    show_header()
     register_tool()
 })
+let _tick = start_interval(30, || tick())
 
 View{
-    width: Fill height: Fill flow: Down align: Align{x: 0.5}
-    col := ScrollYView{
-        width: Fill height: Fill flow: Down spacing: 10 padding: 14
-        status := Label{
-            text: "Starting…" width: Fill padding: 0 margin: 0
-            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
-        }
-        Button{ text: "Refresh" on_click: || subscribe() draw_text +: { color: #x1C274C } }
-        RoundedView{
-            width: Fill height: Fit flow: Down spacing: 8 padding: 10
-            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
-            editor_title := Label{
-                text: "NEW RULE" padding: 0 margin: 0
-                draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+    width: Fill height: Fill flow: Down
+    head := View{
+        width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5} padding: Inset{left: 14 right: 14 top: 14 bottom: 12}
+        View{
+            width: Fill height: Fit flow: Down spacing: 4
+            summary_wrap := View{
+                width: Fill height: Fit visible: false
+                summary := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
             }
-            View{
-                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 6 align: Align{y: 0.5}
-                Label{
-                    text: "Match" padding: 0 margin: 0
-                    draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
-                }
-                match_btn := Button{ text: "all ▼" on_click: || toggle_match() draw_text +: { color: #x1C274C } }
-                Label{
-                    text: "of these filters:" padding: 0 margin: 0
-                    draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
-                }
-            }
-            filter_list := View{
-                width: Fill height: Fit flow: Down spacing: 6
+            status_box := View{
+                width: Fill height: Fit
                 on_render: || {
-                    let i = 0
-                    for f in draft.filters {
-                        let index = i
-                        i = i + 1
-                        let field_text = field_label(f.field) + " ▼"
-                        let op_text = op_label(f.field, f.op) + " ▼"
-                        let choice_text = type_label(f.value) + " ▼"
-                        let value_text = text_of(f.value)
-                        let hint = value_hint(f)
-                        let show_text = needs_text(f)
-                        let show_choice = needs_choice(f)
-                        let menu_open = menu_row == index
-                        RoundedView{
-                            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 6 padding: 6 align: Align{y: 0.5}
-                            show_bg: true draw_bg +: { color: #xFFFFFF border_radius: 8.0 }
-                            Button{ text: field_text on_click: || open_menu(index, "field") draw_text +: { color: #x1C274C } }
-                            Button{ text: op_text on_click: || open_menu(index, "op") draw_text +: { color: #x1C274C } }
-                            View{
-                                visible: show_text width: Fill height: Fit
-                                TextInput{ width: Fill text: value_text empty_text: hint on_change: |t| set_value(index, t) on_return: |t| save_rule() }
-                            }
-                            View{
-                                visible: show_choice width: Fit height: Fit
-                                Button{ text: choice_text on_click: || open_menu(index, "value") draw_text +: { color: #x1C274C } }
-                            }
-                            Button{ text: "📋" on_click: || copy_filter(index) draw_text +: { color: #x1C274C } }
-                            Button{ text: "×" on_click: || remove_filter(index) draw_text +: { color: #xB91C1C } }
-                        }
-                        if menu_open {
-                            for o in menu_options() {
-                                let id = o.id
-                                let label = "   " + o.label
-                                Button{ text: label on_click: || choose(id) draw_text +: { color: #x0f88fe } }
-                            }
+                    if status_kind == "ok" { status := Meta{ text: status_text width: Fill draw_text +: { color: #x138808 } } }
+                    if status_kind == "err" { status := Meta{ text: status_text width: Fill draw_text +: { color: #xDC0005 } } }
+                    if status_kind == "info" { status := Meta{ text: status_text width: Fill } }
+                    if status_kind == "busy" {
+                        View{
+                            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
+                            status := Meta{ text: status_text width: Fill }
                         }
                     }
                     nil
                 }
             }
-            View{
-                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8 align: Align{y: 0.5}
-                Button{ text: "➕ Add filter" on_click: || add_filter() draw_text +: { color: #x1C274C } }
-            }
-            adv_btn := SettingsDisclosureHeader{}
-            Label{
-                text: "WHEN A MESSAGE MATCHES" padding: 0 margin: 0
-                draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
-            }
-            reply_input := TextInput{ width: Fill empty_text: "Auto-reply text (optional)" }
-            View{
-                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8 align: Align{y: 0.5}
-                notify_btn := Button{ text: "🔔 Notify me" on_click: || toggle_notify() draw_text +: { color: #x1C274C } }
-                Button{ text: "Save rule" on_click: || save_rule() draw_text +: { color: #x1C274C } }
-                Button{ text: "Draft reply" on_click: || draft_reply(ui.reply_input.text()) draw_text +: { color: #x1C274C } }
-                Button{ text: "Clear" on_click: || clear_editor() draw_text +: { color: #x66708F } }
-            }
         }
-        Label{
-            text: "Rules" padding: 0 margin: 0
-            draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+        refresh_wrap := View{
+            width: Fit height: Fit visible: false
+            NeutralButton{ text: "Refresh" on_click: || subscribe() }
         }
-        rule_list := View{
-            width: Fill height: Fit flow: Down spacing: 5
-            on_render: || {
-                if rules.len() == 0 {
-                    Label{
-                        text: "No rules yet. Build one above." width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+        new_head := View{
+            width: Fit height: Fit visible: false
+            PrimaryButton{ text: "+ New rule" on_click: || new_rule() }
+        }
+    }
+    SolidView{ width: Fill height: 1 draw_bg +: { color: #x00000018 } }
+    col := ScrollYView{
+        width: Fill height: Fill flow: Down spacing: 12 padding: 14
+        View{
+            width: Fill height: Fit flow: Right spacing: 16
+            main_col := View{
+                width: Fill height: Fit flow: Down spacing: 12
+                empty_wrap := View{
+                    width: Fill height: Fit visible: false
+                    EmptyCard{
+                        EmptyEmoji{ text: "👁" }
+                        EmptyTitle{ text: "No rules yet" }
+                        EmptyText{ text: "Get a notification, or send an auto-reply, when a new message here matches your filters." }
+                        View{ width: Fit height: Fit margin: Inset{top: 6}
+                            PrimaryButton{ text: "+ New rule" on_click: || new_rule() }
+                        }
                     }
-                } else {
-                    let i = 0
-                    for rule in rules {
-                        let index = i
-                        i = i + 1
-                        let title = describe(rule)
-                        let line = rule_line(rule)
-                        RoundedView{
-                            width: Fill height: Fit flow: Down spacing: 2 padding: 8
-                            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
-                            Label{
-                                text: title width: Fill padding: 0 margin: 0
-                                draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} }
+                }
+                editor_wrap := View{
+                    width: Fill height: Fit visible: false
+                    RoundedView{
+                        width: Fill height: Fit flow: Down spacing: 12 padding: 12
+                        show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                        editor_title := Caption{ text: "NEW RULE" }
+                        match_wrap := View{
+                            width: Fill height: Fit flow: Down spacing: 4 visible: false
+                            View{
+                                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8 align: Align{y: 0.5}
+                                Body{ text: "Match" width: 44 margin: Inset{top: 4} }
+                                match_btn := Dropdown{ width: Fit text: "all" on_click: || open_match_menu() }
+                                Body{ text: "of these filters" margin: Inset{top: 4} }
                             }
-                            Label{
-                                text: line width: Fill padding: 0 margin: 0
-                                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 11} }
+                            match_menu := View{
+                                width: Fill height: Fit flow: Right spacing: 8
+                                on_render: || {
+                                    if match_menu_open {
+                                        View{ width: 44 height: 1 }
+                                        MenuCard{
+                                            width: 250
+                                            MenuItem{ text: "all: every filter must match" draw_bg +: {selected: if draft["match"] == "all" {1.0} else {0.0}} on_click: || choose_match("all") }
+                                            MenuItem{ text: "any: at least one must match" draw_bg +: {selected: if draft["match"] == "any" {1.0} else {0.0}} on_click: || choose_match("any") }
+                                        }
+                                    }
+                                    nil
+                                }
                             }
+                        }
+                        filter_list := View{
+                            width: Fill height: Fit flow: Down spacing: 8
+                            on_render: || {
+                                let even = field_gen % 2 == 0
+                                let i = 0
+                                for f in draft.filters {
+                                    let index = i
+                                    i = i + 1
+                                    let field_text = field_label(f.field)
+                                    let op_text = op_label(f.field, f.op)
+                                    let choice_text = type_label(f.value)
+                                    let value_text = text_of(f.value)
+                                    let hint = value_hint(f)
+                                    let show_text = needs_text(f)
+                                    let show_choice = needs_choice(f)
+                                    let open_field = menu_row == index && menu_kind == "field"
+                                    let open_op = menu_row == index && menu_kind == "op"
+                                    let open_value = menu_row == index && menu_kind == "value"
+                                    let opts = []
+                                    let current = ""
+                                    if menu_row == index {
+                                        opts = menu_options()
+                                        current = menu_current(f)
+                                    }
+                                    RoundedView{
+                                        width: Fill height: Fit flow: Down spacing: 8 padding: 8
+                                        show_bg: true draw_bg +: { color: #xFFFFFF border_radius: 8.0 border_size: 1.0 border_color: #xE0E0E0 }
+                                        if is_stacked {
+                                            Dropdown{ text: field_text draw_bg +: {open: if open_field {1.0} else {0.0}} on_click: || open_menu(index, "field") }
+                                            if open_field {
+                                                MenuCard{
+                                                    for o in opts {
+                                                        let id = o.id
+                                                        MenuItem{ text: o.label draw_bg +: {selected: if id == current {1.0} else {0.0}} on_click: || choose(id) }
+                                                    }
+                                                }
+                                            }
+                                            Dropdown{ text: op_text draw_bg +: {open: if open_op {1.0} else {0.0}} on_click: || open_menu(index, "op") }
+                                            if open_op {
+                                                MenuCard{
+                                                    for o in opts {
+                                                        let id = o.id
+                                                        MenuItem{ text: o.label draw_bg +: {selected: if id == current {1.0} else {0.0}} on_click: || choose(id) }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if !is_stacked {
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 8
+                                                Dropdown{ text: field_text draw_bg +: {open: if open_field {1.0} else {0.0}} on_click: || open_menu(index, "field") }
+                                                Dropdown{ text: op_text draw_bg +: {open: if open_op {1.0} else {0.0}} on_click: || open_menu(index, "op") }
+                                            }
+                                            if open_field || open_op {
+                                                View{
+                                                    width: Fill height: Fit flow: Right spacing: 8
+                                                    if open_op { View{ width: Fill height: 1 } }
+                                                    MenuCard{
+                                                        for o in opts {
+                                                            let id = o.id
+                                                            MenuItem{ text: o.label draw_bg +: {selected: if id == current {1.0} else {0.0}} on_click: || choose(id) }
+                                                        }
+                                                    }
+                                                    if open_field { View{ width: Fill height: 1 } }
+                                                }
+                                            }
+                                        }
+                                        View{
+                                            width: Fill height: Fit flow: Right spacing: 4 align: Align{y: 0.5}
+                                            if show_text && even { va := Field{ text: value_text empty_text: hint draw_text +: { max_lines: 1 text_overflow: TextOverflow.Ellipsis } on_change: |t| set_value(index, t) on_return: |t| save_rule() } }
+                                            if show_text && !even { vb := Field{ text: value_text empty_text: hint draw_text +: { max_lines: 1 text_overflow: TextOverflow.Ellipsis } on_change: |t| set_value(index, t) on_return: |t| save_rule() } }
+                                            if show_choice { Dropdown{ text: choice_text draw_bg +: {open: if open_value {1.0} else {0.0}} on_click: || open_menu(index, "value") } }
+                                            if !show_text && !show_choice { Meta{ text: "Nothing to fill in" width: Fill } }
+                                            if !is_compact {
+                                                CopyIcon{ on_click: || copy_filter(index) }
+                                                RemoveIcon{ on_click: || remove_filter(index) }
+                                            }
+                                        }
+                                        if open_value {
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 4
+                                                MenuCard{
+                                                    for o in opts {
+                                                        let id = o.id
+                                                        MenuItem{ text: o.label draw_bg +: {selected: if id == current {1.0} else {0.0}} on_click: || choose(id) }
+                                                    }
+                                                }
+                                                if !is_compact { View{ width: 68 height: 1 } }
+                                            }
+                                        }
+                                        if is_compact {
+                                            View{
+                                                width: Fill height: Fit flow: Right spacing: 4 align: Align{x: 1.0}
+                                                CopyIcon{ on_click: || copy_filter(index) }
+                                                RemoveIcon{ on_click: || remove_filter(index) }
+                                            }
+                                        }
+                                    }
+                                }
+                                nil
+                            }
+                        }
+                        View{
+                            width: Fill height: Fit flow: Right spacing: 8
+                            NeutralButton{ text: "+ Add filter" on_click: || add_filter() }
+                        }
+                        adv_btn := SettingsDisclosureHeader{}
+                        adv_panel := View{
+                            width: Fill height: Fit flow: Down spacing: 8 visible: false padding: Inset{left: 2 right: 2}
+                            Meta{ text: "Every field and operator is now in the menus. Quick add:" width: Fill }
                             View{
                                 width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
-                                Button{text: "Edit" on_click: || edit_rule(index)}
-                                Button{text: "Draft reply" on_click: || draft_reply(rule.reply)}
-                                Button{text: if rule.reply != "" { "Test and send reply" } else { "Test notification" } on_click: || test_rule(rule)}
-                                Button{text: "Remove rule" on_click: || remove_rule(index)}
+                                Chip{ text: "+ Mentions me" on_click: || add_preset(0) }
+                                Chip{ text: "+ Any of these words" on_click: || add_preset(1) }
+                                Chip{ text: "+ Whole word" on_click: || add_preset(2) }
+                                Chip{ text: "+ Mentions a name" on_click: || add_preset(3) }
+                                Chip{ text: "+ Sender list" on_click: || add_preset(4) }
+                                Chip{ text: "+ Reply" on_click: || add_preset(5) }
+                                Chip{ text: "+ Thread" on_click: || add_preset(6) }
+                                Chip{ text: "+ Attachment" on_click: || add_preset(7) }
+                                Chip{ text: "+ Link" on_click: || add_preset(8) }
+                                Chip{ text: "+ Pattern" on_click: || add_preset(9) }
                             }
                         }
-                    }
-                    nil
-                }
-            }
-        }
-        RoundedView{
-            width: Fill height: Fit flow: Down spacing: 6 padding: 10
-            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
-            ai_status := Label{
-                text: "" width: Fill padding: 0 margin: 0
-                draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} }
-            }
-            ai_button := Button{ text: "Let this room's AI add rules" on_click: || toggle_ai() draw_text +: { color: #x1C274C } }
-        }
-        Label{
-            text: "Draft reply prepares local text for review and needs no sending permission. Test and send reply posts the saved reply and shows any notification. Separate sending permission allows saved auto-replies on future matches. Saving a rule only saves it."
-            width: Fill padding: 0 margin: 0
-            draw_text +: {color: #x66708F text_style: theme.font_regular{font_size: 11}}
-        }
-        Label{
-            text: "Recent matches" padding: 0 margin: 0
-            draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
-        }
-        hit_list := View{
-            width: Fill height: Fit flow: Down spacing: 4
-            on_render: || {
-                if hits.len() == 0 {
-                    Label{
-                        text: "Nothing has matched yet." width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
-                    }
-                } else {
-                    for line in hits {
-                        Label{
-                            text: line width: Fill padding: 0 margin: 0
-                            draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                        SolidView{ width: Fill height: 1 draw_bg +: { color: #x00000018 } }
+                        Caption{ text: "WHEN A MESSAGE MATCHES" width: Fill }
+                        notify_chips := View{
+                            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
+                            on_render: || {
+                                Chip{ text: "🔔 Notify me" draw_bg +: {selected: if draft.notify {1.0} else {0.0}} draw_text +: {selected: if draft.notify {1.0} else {0.0}} on_click: || set_notify(true) }
+                                Chip{ text: "🔕 Silent" draw_bg +: {selected: if draft.notify {0.0} else {1.0}} draw_text +: {selected: if draft.notify {0.0} else {1.0}} on_click: || set_notify(false) }
+                                nil
+                            }
+                        }
+                        reply_input := Field{ empty_text: "Auto-reply text (optional)" draw_text +: { max_lines: 1 text_overflow: TextOverflow.Ellipsis } }
+                        View{
+                            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8 align: Align{y: 0.5}
+                            save_btn := PrimaryButton{ text: "Save rule" on_click: || save_rule() }
+                            NeutralButton{ text: "Cancel" on_click: || clear_editor() }
+                            NeutralButton{ text: "Draft reply" on_click: || draft_reply(ui.reply_input.text()) }
                         }
                     }
                 }
+                rules_wrap := View{
+                    width: Fill height: Fit flow: Down spacing: 8 visible: false
+                    View{
+                        width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                        Caption{ text: "RULES" width: Fill }
+                        new_row := View{
+                            width: Fit height: Fit
+                            PrimaryButton{ text: "+ New rule" on_click: || new_rule() }
+                        }
+                    }
+                    rule_list := View{
+                        width: Fill height: Fit flow: Down spacing: 8
+                        on_render: || {
+                            let i = 0
+                            for rule in rules {
+                                let index = i
+                                i = i + 1
+                                let lines = filter_lines(rule)
+                                let parts = meta_parts(rule)
+                                let has_reply = rule.reply != ""
+                                let quote = "“" + rule.reply + "”"
+                                let can_test = rule.notify || has_reply
+                                let confirming = confirm_remove == index
+                                let test_text = "Test notification"
+                                if has_reply { test_text = "Test and send reply" }
+                                if is_compact { test_text = "Test" }
+                                RoundedView{
+                                    width: Fill height: Fit flow: Down spacing: 8 padding: 12
+                                    show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                                    View{
+                                        width: Fill height: Fit flow: Down spacing: 4
+                                        for l in lines {
+                                            if is_compact { Label{ text: l.whole width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} } } }
+                                            if !is_compact {
+                                                View{
+                                                    width: Fill height: Fit flow: Right spacing: 4
+                                                    if l.lead != "" { Meta{ text: l.lead draw_text +: { text_style: theme.font_regular{font_size: 11} } } }
+                                                    Label{ text: l.text width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} } }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if is_compact {
+                                        View{
+                                            width: Fill height: Fit flow: Down spacing: 2
+                                            for part in parts { Meta{ text: part width: Fill } }
+                                        }
+                                    }
+                                    if !is_compact {
+                                        View{
+                                            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 12
+                                            for part in parts { Meta{ text: part } }
+                                        }
+                                    }
+                                    if has_reply { Body{ text: quote width: Fill max_lines: 2 text_overflow: TextOverflow.Ellipsis } }
+                                    View{
+                                        width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
+                                        if !confirming {
+                                            edit_btn := NeutralButton{ text: "Edit" on_click: || edit_rule(index) }
+                                            if can_test { test_btn := NeutralButton{ text: test_text on_click: || test_rule(rule) } }
+                                            if has_reply { draft_btn := NeutralButton{ text: "Draft reply" on_click: || draft_reply(rule.reply) } }
+                                            remove_btn := NeutralButton{ text: "Remove" on_click: || ask_remove(index) }
+                                        }
+                                        if confirming {
+                                            confirm_btn := NegativeButton{ text: "Remove rule?" on_click: || remove_rule(index) }
+                                            keep_btn := NeutralButton{ text: "Keep" on_click: || ask_remove(-1) }
+                                        }
+                                    }
+                                }
+                            }
+                            nil
+                        }
+                    }
+                }
+                matches_main := View{
+                    width: Fill height: Fit flow: Down spacing: 8 visible: false
+                    Caption{ text: "RECENT MATCHES" }
+                    hit_list := HitList{}
+                }
+                extras_wrap := View{
+                    width: Fill height: Fit flow: Down spacing: 12
+                    RoundedView{
+                        width: Fill height: Fit flow: Down spacing: 8 padding: 12
+                        show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                        Label{ text: "🤖 Let the room's AI add rules" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} } }
+                        ai_status_box := View{
+                            width: Fill height: Fit
+                            on_render: || {
+                                if ai_kind == "ok" { Meta{ text: ai_line width: Fill draw_text +: { color: #x138808 } } }
+                                if ai_kind == "err" { Meta{ text: ai_line width: Fill draw_text +: { color: #xDC0005 } } }
+                                if ai_kind == "info" { Meta{ text: ai_line width: Fill } }
+                                if ai_kind == "busy" {
+                                    View{
+                                        width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                        LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
+                                        Meta{ text: ai_line width: Fill }
+                                    }
+                                }
+                                nil
+                            }
+                        }
+                        View{
+                            width: Fit height: Fit margin: Inset{top: 4}
+                            ai_button := NeutralButton{ text: "Turn on" on_click: || toggle_ai() }
+                        }
+                    }
+                    View{
+                        width: Fill height: Fit flow: Down spacing: 8
+                        how_btn := GhostButton{ text: "How it works ▼" on_click: || toggle_how() }
+                        how_wrap := View{
+                            width: Fill{max: 480} height: Fit flow: Down spacing: 6 visible: false
+                            View{ width: Fill height: Fit spacing: 6 Dot{} Meta{ text: "Rules check each new message in this room. Your own messages never match." width: Fill } }
+                            View{ width: Fill height: Fit spacing: 6 Dot{} Meta{ text: "Draft reply puts the reply in your message box. Nothing is sent until you send it." width: Fill } }
+                            View{ width: Fill height: Fit spacing: 6 Dot{} Meta{ text: "Test shows the notification and posts the reply here once. Later auto-replies need permission to send." width: Fill } }
+                            View{ width: Fill height: Fit spacing: 6 Dot{} Meta{ text: "Rules added by the room's AI only notify you." width: Fill } }
+                        }
+                    }
+                }
+            }
+            side_col := View{
+                width: Fill height: Fit flow: Down spacing: 8 visible: false
+                Caption{ text: "RECENT MATCHES" }
+                hit_list_side := HitList{}
             }
         }
     }

@@ -13,6 +13,7 @@
 
 pub mod limits;
 pub mod matrix;
+pub mod media_preview;
 
 pub use matrix::{MatrixServiceCall, SearchScope};
 

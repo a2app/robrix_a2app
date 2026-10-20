@@ -13,12 +13,46 @@ let config = {url: "https://example.com/", keyword: "Example Domain", post: fals
 let matched = false
 let draft_post = false
 let busy = false
+let test_edited = false
 let initialized = false
-let status = "Ready. Configure and run this app from Background tasks."
+let how_open = false
+// The status line's text and tone (0 neutral, 1 success, 2 error); drawn once the pane exists.
+let status = ""
+let tone = 0
+let upper = {a: "A" b: "B" c: "C" d: "D" e: "E" f: "F" g: "G" h: "H" i: "I" j: "J" k: "K" l: "L" m: "M" n: "N" o: "O" p: "P" q: "Q" r: "R" s: "S" t: "T" u: "U" v: "V" w: "W" x: "X" y: "Y" z: "Z"}
 
-fn show_status(text){
+fn paint_status(){
+    ui.status.set_text(status)
+    ui.status_ok.set_text(status)
+    ui.status_err.set_text(status)
+    ui.status_wrap.set_visible(status != "" && tone == 0)
+    ui.busy_wrap.set_visible(busy)
+    ui.status_ok_wrap.set_visible(status != "" && tone == 1)
+    ui.status_err_wrap.set_visible(status != "" && tone == 2)
+}
+
+// Host errors read as sentences: a capital first letter and a final period.
+fn sentence(text){
+    let chars = text.split("")
+    if chars.len() < 3 { return text }
+    let up = upper[chars[1]]
+    if up == nil { up = chars[1] }
+    let out = up + text.strip_prefix(chars[1])
+    let last = chars[chars.len() - 2]
+    if last != "." && last != "!" && last != "?" { out = out + "." }
+    return out
+}
+
+// A refused or missing grant gets `denied_text`, which says how to allow it.
+fn error_text(error, denied_text){
+    if error.search("denied") >= 0 || error.search("not approved") >= 0 || error.search("needs approval") >= 0 { return denied_text }
+    return sentence(error)
+}
+
+fn show_status(text, next_tone){
     status = text
-    if initialized { ui.status.set_text(text) }
+    tone = next_tone
+    if initialized { paint_status() }
 }
 
 fn load(){
@@ -38,128 +72,258 @@ fn load(){
     }
 }
 
+// Shows the selected report chip; each chip has a selected and an unselected variant.
+fn show_post(){
+    ui.popup_on.set_visible(!draft_post)
+    ui.popup_off.set_visible(draft_post)
+    ui.room_on.set_visible(draft_post)
+    ui.room_off.set_visible(!draft_post)
+}
+
 fn toggle_post(){
-    if busy { return nil }
+    if busy { show_status("Wait for the current check to finish.", 0) return nil }
     draft_post = !draft_post
-    ui.post_button.set_text(if draft_post { "Report: room message" } else { "Report: Robrix popup" })
+    if initialized { show_post() }
+}
+
+fn set_post(on){
+    if on != draft_post { toggle_post() }
 }
 
 fn save(){
-    if busy { show_status("Wait for the current check to finish before changing it.") return nil }
+    if busy { show_status("Wait for the current check to finish before changing it.", 0) return nil }
     let url = ui.url_input.text().trim()
     let keyword = ui.keyword_input.text().trim()
-    if url == "" || keyword == "" || url.len() > 2048 || keyword.len() > 200 {
-        show_status("Enter an HTTP(S) URL up to 2048 characters and a keyword up to 200 characters.")
+    if url == "" || keyword == "" {
+        show_status("Enter both a page address and a keyword.", 2)
+        return nil
+    }
+    if url.len() > 2048 || keyword.len() > 200 {
+        show_status("Use an address up to 2048 characters and a keyword up to 200.", 2)
         return nil
     }
     config = {url: url, keyword: keyword, post: draft_post}
     fs.write("/website_watch.json", config.to_json())
     matched = false
     fs.write("/website_match.json", "false")
-    show_status("Saved. In Mini Apps > Background tasks, add this app in this same room and choose every 12 hours.")
+    show_status("Saved. Turn it on in Mini Apps > Background tasks.", 1)
 }
 
-fn finish(run, success, text){
+fn finish(run, success, text, next_tone){
     busy = false
-    show_status(text)
+    show_status(text, next_tone)
     if run > 0 { host.request("background.complete", {run_id: run, success: success}) }
 }
 
 fn check_website(run){
     if busy {
-        show_status("A website check is already running.")
+        show_status("A check is already running.", 0)
         if run > 0 { host.request("background.complete", {run_id: run, success: false}) }
         return nil
     }
     busy = true
-    show_status("Checking the saved website…")
+    let tested_saved = run == 0 && test_edited
+    show_status("Checking the page…", 0)
     host.request("network.http", {url: config.url, method: "GET"}, fn(r){
-        if !r.is_ok { finish(run, false, r.error) return nil }
+        if !r.is_ok { finish(run, false, error_text(r.error, "Internet access isn't allowed yet. Tap Test report to allow it."), 2) return nil }
         if r.data.status < 200 || r.data.status >= 300 {
-            finish(run, false, "The website returned HTTP " + r.data.status)
+            finish(run, false, "The page returned HTTP " + r.data.status + ". Try again later.", 2)
             return nil
         }
         if r.data.body.len() > 65536 {
-            finish(run, false, "The response exceeds this example's 64 KiB text limit. Use a smaller page or feed.")
+            finish(run, false, "That page is over 64 KB. Watch a smaller page or feed.", 2)
             return nil
         }
         let found = r.data.body.split(config.keyword).len() > 1
         if !found && run > 0 {
             matched = false
             fs.write("/website_match.json", "false")
-            finish(run, true, "Keyword is absent. The next new match will be reported.")
+            finish(run, true, "Keyword is absent. The next new match will be reported.", 0)
             return nil
         }
-        if matched && run > 0 { finish(run, true, "Keyword is still present; already reported.") return nil }
+        if matched && run > 0 { finish(run, true, "Keyword is still present; already reported.", 0) return nil }
         let message = "Website Watch found '" + config.keyword + "' at " + config.url
         if run == 0 { message = "Website Watch test for '" + config.keyword + "' at " + config.url }
+        // A test always reports; its status also says whether the keyword is on the page now.
+        let lead = ""
+        let done_tone = 1
+        if run == 0 && found { lead = "Keyword found. " }
+        if run == 0 && !found { lead = "Keyword not on the page now. " done_tone = 0 }
         if config.post {
             host.request("matrix.send_message", {body: message}, fn(out){
-                if !out.is_ok { finish(run, false, out.error) return nil }
+                if !out.is_ok { finish(run, false, error_text(out.error, "Room messages aren't allowed yet. Tap Test report to allow them."), 2) return nil }
                 if run > 0 {
                     matched = true
                     fs.write("/website_match.json", "true")
                 }
                 let text = "Match posted to this room."
-                if run == 0 { text = "Test report posted to this room." }
-                finish(run, true, text)
+                let text_tone = done_tone
+                if run == 0 { text = lead + "Test report posted to this room." }
+                if tested_saved { text = "Tested your saved settings. Tap Save to use your edits." text_tone = 0 }
+                finish(run, true, text, text_tone)
             })
         } else {
             host.request("notify.post", {body: message}, fn(out){
-                if !out.is_ok { finish(run, false, out.error) return nil }
+                if !out.is_ok { finish(run, false, error_text(out.error, "Popups aren't allowed yet. Tap Test report to allow them."), 2) return nil }
                 if run > 0 {
                     matched = true
                     fs.write("/website_match.json", "true")
                 }
                 let text = "Match reported in a Robrix popup."
-                if run == 0 { text = "Test report shown in a Robrix popup." }
-                finish(run, true, text)
+                let text_tone = done_tone
+                if run == 0 { text = lead + "Test report shown in a Robrix popup." }
+                if tested_saved { text = "Tested your saved settings. Tap Save to use your edits." text_tone = 0 }
+                finish(run, true, text, text_tone)
             })
         }
     })
 }
 
-fn test_website(){ check_website(0) }
+// Tests always use the saved settings; the status says so when the form differs.
+fn test_website(){
+    test_edited = false
+    if initialized {
+        let url_edited = ui.url_input.text().trim() != config.url
+        let keyword_edited = ui.keyword_input.text().trim() != config.keyword
+        test_edited = url_edited || keyword_edited || draft_post != config.post
+    }
+    check_website(0)
+}
 
 fn draft_report(){
     if busy { return nil }
     busy = true
-    show_status("Preparing a draft…")
+    show_status("Preparing a draft…", 0)
     let text = "Website Watch test for '" + config.keyword + "' at " + config.url
     host.request("composer.insert", {text: text}, fn(r){
         busy = false
-        if r.is_ok { show_status("Test report drafted. Review and send it in Robrix. The website was not checked.") }
-        else { show_status(r.error) }
+        if !r.is_ok { show_status(error_text(r.error, "Drafts aren't allowed yet. Tap Draft report to allow them."), 2) return nil }
+        show_status("Test report drafted. Review and send it in Robrix. The website was not checked.", 1)
+        return nil
     })
 }
 
 fn on_background(json){ check_website(json.parse_json().run_id) }
 
+fn toggle_how(){
+    how_open = !how_open
+    ui.how_body.set_visible(how_open)
+    ui.how_button.set_text(if how_open { "How it works ▲" } else { "How it works ▼" })
+}
+
 fn on_app_resize(width, height){
-    if initialized { return nil }
-    initialized = true
-    ui.status.set_text(status)
-    ui.url_input.set_text(config.url)
-    ui.keyword_input.set_text(config.keyword)
-    draft_post = config.post
-    ui.post_button.set_text(if draft_post { "Report: room message" } else { "Report: Robrix popup" })
+    if !initialized {
+        initialized = true
+        ui.url_input.set_text(config.url)
+        ui.keyword_input.set_text(config.keyword)
+        draft_post = config.post
+        show_post()
+        paint_status()
+    }
+    return nil
 }
 
 let _load = load()
 
+let PrimaryButton = Button{
+    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
+    draw_bg +: {
+        border_size: 0.0 border_radius: 4.0
+        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+}
+let NeutralButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
+        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+}
+let GhostButton = PrimaryButton{
+    padding: Inset{left: 6 right: 6 top: 4 bottom: 4}
+    margin: Inset{left: -6}
+    draw_bg +: { border_size: 0.0 color: #xFFFFFF00 color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF00 }
+    draw_text +: { color: #x66708F color_hover: #x1C274C color_down: #x1C274C color_focus: #x66708F }
+}
+let Field = TextInput{
+    width: Fill height: Fit padding: 10
+    draw_bg +: {
+        border_radius: 4.0 border_size: 1.0
+        color: #xFFFFFF color_hover: #xFFFFFF color_focus: #xFFFFFF color_down: #xFFFFFF color_empty: #xFFFFFF
+        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_focus: #x106fcc border_color_down: #x106fcc border_color_empty: #xC8C8C8
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #x333333 color_hover: #x333333 color_focus: #x333333 color_down: #x333333 color_empty: #xBBBBBB color_empty_hover: #x999999 color_empty_focus: #x999999 text_style: theme.font_regular{font_size: 11} }
+}
+// Chips: selected is accent-filled, unselected is white with a gray border.
+let ChipOn = PrimaryButton{padding: Inset{left: 10 right: 10 top: 5 bottom: 5} draw_bg +: {border_radius: 12.0}}
+let ChipOff = NeutralButton{
+    padding: Inset{left: 10 right: 10 top: 5 bottom: 5}
+    draw_bg +: { border_radius: 12.0 border_color: #xC8C8C8 border_color_hover: #xC8C8C8 border_color_down: #xC8C8C8 border_color_focus: #xC8C8C8
+        color: #xFFFFFF color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF }
+}
+let Caption = Label{padding: 0 margin: 0 draw_text +: {color: #x66708F text_style: theme.font_bold{font_size: 9.5}}}
+let Hint = Label{width: Fill padding: 0 margin: 0 draw_text +: {color: #x66708F text_style: theme.font_regular{font_size: 10}}}
+let Dot = Label{text: "•" padding: 0 margin: 0 draw_text +: {color: #x66708F text_style: theme.font_regular{font_size: 10}}}
+let Divider = SolidView{width: Fill{max: 480} height: 1 draw_bg +: {color: #x00000018}}
+
 View{
     width: Fill height: Fill flow: Down
     ScrollYView{
-        width: Fill height: Fill flow: Down spacing: 12 padding: 16
-        Label{text: "Website Watch" width: Fill draw_text +: {color: #x1C274C text_style: theme.font_bold{font_size: 20}}}
-        Label{text: "Configure this room's watcher here, then enable it in Mini Apps > Background tasks. Try an interval of 12 hours. Matching is literal and case-sensitive; it reports only when a keyword changes from absent to present." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 12}}}
-        url_input := TextInput{width: Fill empty_text: "https://example.com/"}
-        keyword_input := TextInput{width: Fill empty_text: "Keyword or phrase"}
-        post_button := Button{text: "Report: Robrix popup" on_click: || toggle_post()}
-        Button{text: "Save configuration" on_click: || save()}
-        Button{text: "Test saved website and report" on_click: || test_website()}
-        Button{text: "Draft test report" on_click: || draft_report()}
-        status := Label{text: "Default: example.com, keyword Example Domain, popup. Save settings, then test the saved website and report before scheduling checks." width: Fill draw_text +: {color: #x2A7F92 text_style: theme.font_regular{font_size: 12}}}
-        Label{text: "Draft test report prepares local text for your review and needs no sending permission. Test saved website and report checks the website and sends one report even if the keyword is absent or already reported. Room-message reports need separate sending permission. Until this room closes expires when the open room closes; use Until you quit Robrix or Forever for scheduled checks after closing. Automated runs cannot renew permissions or open dialogs. Robrix must be running." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
+        width: Fill height: Fill flow: Down spacing: 12 padding: 14
+        Hint{text: "Checks a web page for your keyword and tells you when it appears."}
+        View{
+            width: Fill{max: 480} height: Fit flow: Down spacing: 6
+            Caption{text: "PAGE ADDRESS"}
+            url_input := Field{empty_text: "https://example.com/"}
+        }
+        View{
+            width: Fill{max: 480} height: Fit flow: Down spacing: 6
+            Caption{text: "KEYWORD"}
+            keyword_input := Field{empty_text: "A word or phrase on the page"}
+            Hint{text: "Case-sensitive."}
+        }
+        View{
+            width: Fill height: Fit flow: Down spacing: 6
+            Caption{text: "REPORT AS"}
+            View{
+                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
+                popup_on := View{width: Fit height: Fit ChipOn{text: "Popup" on_click: || set_post(false)}}
+                popup_off := View{visible: false width: Fit height: Fit ChipOff{text: "Popup" on_click: || set_post(false)}}
+                room_on := View{visible: false width: Fit height: Fit ChipOn{text: "Room message" on_click: || set_post(true)}}
+                room_off := View{width: Fit height: Fit ChipOff{text: "Room message" on_click: || set_post(true)}}
+            }
+        }
+        View{
+            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
+            PrimaryButton{text: "Save" on_click: || save()}
+            NeutralButton{text: "Test report" on_click: || test_website()}
+            NeutralButton{text: "Draft report" on_click: || draft_report()}
+        }
+        status_wrap := View{
+            visible: false width: Fill{max: 480} height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+            busy_wrap := View{
+                visible: false width: Fit height: Fit
+                LoadingSpinner{width: 18 height: 18 draw_bg +: {color: #x0f88fe}}
+            }
+            status := Hint{text: ""}
+        }
+        status_ok_wrap := View{
+            visible: false width: Fill{max: 480} height: Fit
+            status_ok := Hint{text: "" draw_text +: {color: #x138808}}
+        }
+        status_err_wrap := View{
+            visible: false width: Fill{max: 480} height: Fit
+            status_err := Hint{text: "" draw_text +: {color: #xDC0005}}
+        }
+        Divider{}
+        how_button := GhostButton{text: "How it works ▼" on_click: || toggle_how()}
+        how_body := View{
+            visible: false width: Fill{max: 480} height: Fit flow: Down spacing: 6
+            View{width: Fill height: Fit spacing: 6 Dot{} Hint{text: "Tap Test report and allow access “Until you quit Robrix” or “Forever”."}}
+            View{width: Fill height: Fit spacing: 6 Dot{} Hint{text: "Then turn it on in Mini Apps > Background tasks. Every 12 hours works well."}}
+            View{width: Fill height: Fit spacing: 6 Dot{} Hint{text: "You hear once when the keyword appears, then again only if it leaves and returns."}}
+            View{width: Fill height: Fit spacing: 6 Dot{} Hint{text: "Test report always reports, match or not. Draft report only drafts one, without checking."}}
+        }
     }
 }

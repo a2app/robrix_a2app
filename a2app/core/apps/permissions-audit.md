@@ -1,6 +1,6 @@
 # Built-in drafting and sending audit
 
-All 20 current built-ins were checked against their executable host requests,
+All 23 current built-ins were checked against their executable host requests,
 permission headers, narrowed capabilities, and catalog permission explanations.
 Declarations request permission; they do not grant it. Existing customized copies
 keep their changes and receive the normal built-in update offer.
@@ -19,7 +19,7 @@ composer grants never authorize the upload or post.
 | Built-in | Disposition |
 | --- | --- |
 | Public Web | Fetches and displays the fixed public example page. No composer or sending permission added. |
-| Website Watch | Added **Draft test report** for local review. Test reports and scheduled room-message reports retain separate sending permission. Drafting does not check the website or enable scheduled sending. |
+| Website Watch | Added **Draft report** for local review. Test reports and scheduled room-message reports retain separate sending permission. Drafting does not check the website or enable scheduled sending. |
 | Reminder | Saves reminder text and shows local notification popups. It does not compose room messages; no composer or sending permission added. |
 | Keyword Alert | Reads matching message previews and shows notification popups. No room posting or drafts; no composer or sending permission added. |
 | Room Peek | Added **Draft message** and **Attach file**, with **Send now** for text and **Send file now** for explicit immediate media posting. Enter prepares a draft. Each file control opens its own native picker; canceled or refused operations do not fall back to posting or staging. Attachments open Robrix's preview with the typed caption under composer grants. Direct file sending separately requires upload and media-send grants. Files are limited to 1 MiB. |
@@ -38,6 +38,9 @@ composer grants never authorize the upload or post.
 | Room Stats | Reads message statistics and permission information. No composition or sending permission added. |
 | Account | Displays account/profile information and opens existing DMs or account management. No composition or message-sending permission added. |
 | Inspector | Displays host/device diagnostics and controls its pane. No composition or sending permission added. |
+| Link Library | Collects links shared in room messages. **Open**, **Copy** and **Show in chat** act only on a tap; Matrix links to users, rooms and events open in Robrix. No composition or sending permission added. |
+| Translator | **Put in message box** drafts exactly the translated reply with `composer.insert`; Robrix shows an exact-action review because the text came from a website. **Copy** copies it. Drafting only; no `matrix-room-send`. A refused or canceled draft keeps the typed reply and never falls back to sending. |
+| Room Gallery | **Share again** downloads the whole attachment, then opens Robrix's attachment preview with exactly those bytes, filename and type (`composer.attach` only). No `matrix-room-send` or media upload. Files over 3 MB (4 MiB once encoded) get an explanation instead, and a refused download or draft never falls back to sending. |
 
 The catalog tests enforce the exact set of composing built-ins, matching header
 and catalog explanations, narrowed capabilities, and draft usability with sending
@@ -45,7 +48,7 @@ denied and room writes off. The real Splash parser checks every built-in source.
 
 ## Grant duration and expiry audit
 
-All 20 built-ins use the host's selected duration; none chooses or stores a grant
+All 23 built-ins use the host's selected duration; none chooses or stores a grant
 duration in Splash. A concrete one-shot request can use **One time**. Permission
 setup and ongoing subscriptions need **Until this room closes**, **Until you quit
 Robrix**, or **Forever**. **Until this room closes** is available only with an
@@ -88,9 +91,12 @@ saved configuration and accepted drafts do not themselves grant new host access.
 | Room Tools | Attached room; grouped reads, followed by one-shot flag, pin, clipboard and navigation actions. | Read flags reset individually. Refresh retries permitted parts; each management control makes a fresh captured request. |
 | Spaces | Attached space browser, or joined-space list when detached; reads, preview/join/navigation are separate requests. | Revocation resets affected list/detail flags. Refresh retries; selection tokens reject stale replies. Detachment removes room-close duration even when selected targets are rooms. |
 | Inbox | Room collection app, attached or detached; reads invites/unreads and subscribes to three collection hooks. | Permission changes clear read readiness and prune unavailable hooks; Refresh retries reads/hooks. Invite replies finish independently. Detached collection access has no origin-room lifetime. |
-| Room Stats | Attached room; grouped message/history and power-level reads, no live stream. | Missing read capability resets count/details readiness; refused pages finish counting. Refresh retries, and each page remains permission checked. |
+| Room Stats | Attached room; grouped message/history, power-level and device-facts reads, no live stream. | Missing read capability resets count/details readiness; refused pages finish counting. Without device facts, or after they are revoked, hours count in UTC and say so. Refresh retries, and each page remains permission checked. |
 | Account | Account utility; optional room/space attachment. Grouped profile/account reads, concrete user/DM/browser actions. | Read flags reset per capability and only newly allowed unfinished reads resume. Refresh retries selected setup. Detached account access has no room-close duration. |
 | Inspector | Account/device utility; optional room/space attachment. Grouped facts/preferences plus navigation/preference hooks. | Missing capabilities reset their read flags and prune hooks; Refresh restores selected work. Its own environment/pane reads do not grant protected device facts. Detached diagnostics omit room-close duration. |
+| Link Library | Attached room; grouped read/watch setup, two live hooks, older-history pages only from Scan, one-shot Open/Copy/Show in chat. | Revocation resets read readiness and prunes hooks; a scan stops when older history is revoked. Refresh/Ask again retries setup; scanning resumes only from its button. Saved links stay visible but grant nothing. |
+| Translator | Attached room; one startup batch (read, plus watch when live translation was saved on, plus device facts). Taps, Translate all and live translation send one paced `network.http` request at a time; Put in message box and Copy are one-shot. | Revocation resets read readiness and pauses watching, which resubscribes on regrant without a prompt. A refused, blocked or quota failure stops the queue and pauses live translation; rows say whether to tap again or allow Internet access in Mini Apps settings, and Resume re-sends during its tap so Robrix can ask again. Refresh retries setup. A saved LibreTranslate key is cleared when the server host changes; cached translations grant nothing. |
+| Room Gallery | Attached room; grouped read/watch setup, then one device-facts read only if already allowed. Two live hooks with one event lookup per new attachment, plus up to six re-checks of saved items a reply left out; both wait while the pane is hidden. Older pages only from Load older. Previews load for visible tiles, at most two at a time and paced to the request budget; Show in chat and Share again are one-shot. | Revocation resets read readiness and prunes hooks, which resubscribe on regrant without a prompt; revoked media stops previews and a regrant resumes them the same way. A refused preview, a homeserver-sharing refusal or a second rate-limit refusal within two minutes pauses previews until Show previews; a refused hook or live lookup waits for Refresh. A saved item is removed only once Robrix confirms it is gone. Refresh retries setup. Saved items and cached previews grant nothing. |
 
 The three background-app instructions now distinguish foreground room-close
 approval from approval needed for jobs after closure. No new retry loop or

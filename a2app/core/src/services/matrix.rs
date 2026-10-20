@@ -14,7 +14,8 @@ pub enum MatrixServiceCall {
     ReadMessages { limit: u32 },
     /// Read and decrypt one attachment from an event in the attached room.
     /// The host resolves its descriptor; the app cannot select an arbitrary URI.
-    DownloadMedia { event_id: String },
+    /// `preview` is `Some(longest edge)` exactly for `matrix.media_preview`.
+    DownloadMedia { event_id: String, preview: Option<u32> },
     /// Send a plain text message to the attached room as the user.
     SendMessage { body: String },
     /// Upload and post inline media to the attached room as the user.
@@ -169,6 +170,29 @@ fn required_bool(service: &str, args: &serde_json::Value, key: &str) -> Result<b
     args[key].as_bool().ok_or_else(|| format!("{service} needs {{{key}: bool}}"))
 }
 
+/// A preview's longest edge: a whole number of pixels in range, 256 when absent.
+fn preview_edge(size: Option<&serde_json::Value>) -> Result<u32, String> {
+    use super::media_preview::{DEFAULT_EDGE, MAX_EDGE, MIN_EDGE};
+    let Some(size) = size else { return Ok(DEFAULT_EDGE) };
+    // Script numbers are doubles, so 256.0 is the whole number 256.
+    size.as_f64().filter(|edge| edge.fract() == 0.0 && (f64::from(MIN_EDGE)..=f64::from(MAX_EDGE)).contains(edge))
+        .map(|edge| edge as u32)
+        .ok_or_else(|| format!("matrix.media_preview {{size}} must be a whole number of pixels from {MIN_EDGE} to {MAX_EDGE}"))
+}
+
+/// The one event an attachment read names: only `allowed` keys, and a valid `event_id`.
+fn attachment_event(service: &str, args: &serde_json::Value, allowed: &[&str]) -> Result<String, String> {
+    let object = args.as_object().ok_or_else(|| format!("{service} needs {{event_id}}"))?;
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(format!("{service} does not accept '{key}'; it reads {{{}}} from the attached room", allowed.join(", ")));
+    }
+    let event_id = id_arg(service, args, "event_id", '$')?;
+    if event_id.len() == 1 || event_id.chars().any(char::is_whitespace) || event_id.chars().any(char::is_control) {
+        return Err(format!("{service} needs a valid {{event_id}}"));
+    }
+    Ok(event_id)
+}
+
 /// A message body: `required_str` plus the cap every text send shares.
 fn text_body(service: &str, args: &serde_json::Value) -> Result<String, String> {
     let body = required_str(service, args, "body")?;
@@ -212,16 +236,12 @@ pub fn parse(service: &str, args: &serde_json::Value, has_room: bool) -> Result<
         "matrix.read_messages" => MatrixServiceCall::ReadMessages {
             limit: args["limit"].as_u64().unwrap_or(10).clamp(1, 30) as u32,
         },
-        "matrix.download_media" => {
-            let object = args.as_object().ok_or("matrix.download_media needs {event_id}")?;
-            if let Some(key) = object.keys().find(|key| key.as_str() != "event_id") {
-                return Err(format!("matrix.download_media does not accept '{key}'; attachments are read from the attached room"));
-            }
-            let event_id = id_arg(service, args, "event_id", '$')?;
-            if event_id.len() == 1 || event_id.chars().any(char::is_whitespace) || event_id.chars().any(char::is_control) {
-                return Err("matrix.download_media needs a valid {event_id}".into());
-            }
-            MatrixServiceCall::DownloadMedia { event_id }
+        "matrix.download_media" => MatrixServiceCall::DownloadMedia {
+            event_id: attachment_event(service, args, &["event_id"])?, preview: None,
+        },
+        "matrix.media_preview" => MatrixServiceCall::DownloadMedia {
+            event_id: attachment_event(service, args, &["event_id", "size"])?,
+            preview: Some(preview_edge(args.get("size"))?),
         },
         "matrix.room_members" => MatrixServiceCall::Members {
             limit: args["limit"].as_u64().unwrap_or(50).clamp(1, 200) as u32,
@@ -393,6 +413,8 @@ pub fn cost(service: &str) -> f64 {
         "matrix.read_messages" | "matrix.room_members" | "matrix.pinned_events"
         | "matrix.room_threads" | "matrix.search_room" | "matrix.thread_replies"
         | "matrix.older_messages" | "matrix.event" | "matrix.read_receipts" | "matrix.download_media" => 5.0,
+        // A bounded small re-encode: capped source bytes and decode memory.
+        "matrix.media_preview" => 2.0,
         // ----- rooms: fans out over every room and may hit the network -----
         "matrix.rooms_list" => 5.0,
         "matrix.search_rooms" => 8.0,
@@ -436,6 +458,7 @@ mod tests {
         for service in [
             "matrix.thread_replies", "matrix.older_messages", "matrix.event", "matrix.read_receipts",
             "matrix.unread", "matrix.power_levels", "matrix.permalink", "matrix.successor",
+            "matrix.download_media", "matrix.media_preview",
         ] {
             let err = parse(service, &serde_json::json!({}), false).err();
             assert_eq!(err.as_deref(), Some("this mini-app is not attached to a room"), "{service}");
@@ -495,22 +518,57 @@ mod tests {
     #[test]
     fn media_download_reads_one_valid_event_from_the_attached_room() {
         let args = serde_json::json!({"event_id": " $attachment:test "});
-        let MatrixServiceCall::DownloadMedia { event_id } = parse_attached("matrix.download_media", args.clone()).unwrap()
+        let MatrixServiceCall::DownloadMedia { event_id, preview } = parse_attached("matrix.download_media", args.clone()).unwrap()
             else { panic!("expected an attachment read") };
         assert_eq!(event_id, "$attachment:test");
+        assert_eq!(preview, None, "a download is always the whole file");
         assert_eq!(cost("matrix.download_media"), cost("matrix.event"));
         assert!(matches!(parse("matrix.download_media", &args, false), Err(error) if error.contains("not attached to a room")));
         for args in [serde_json::json!({}), serde_json::json!({"event_id": "$"}),
             serde_json::json!({"event_id": "mxc://server/media"}), serde_json::json!({"event_id": "$two words"}),
-            serde_json::json!({"event_id": "$control\u{0}"}), serde_json::json!({"event_id": 3})]
+            serde_json::json!({"event_id": "$control\u{0}"}), serde_json::json!({"event_id": 3}), serde_json::json!("$a:test")]
         {
             assert!(parse_attached("matrix.download_media", args).is_err());
         }
-        for key in ["room_id", "source_room", "uri", "url", "thumbnail", "filename"] {
+        // The preview keys are unknown here, so a whole file is never fetched at the preview price.
+        for key in ["room_id", "source_room", "uri", "url", "thumbnail", "filename", "preview", "size"] {
             let mut args = args.clone();
-            args[key] = serde_json::json!("arbitrary");
-            assert!(matches!(parse_attached("matrix.download_media", args), Err(error) if error.contains(key)));
+            args[key] = serde_json::json!(true);
+            assert!(matches!(parse_attached("matrix.download_media", args), Err(error) if error.contains(&format!("'{key}'"))), "{key}");
         }
+    }
+
+    #[test]
+    fn media_preview_takes_a_whole_pixel_edge_and_keeps_the_download_strictness() {
+        let preview = |args: serde_json::Value| match parse_attached("matrix.media_preview", args) {
+            Ok(MatrixServiceCall::DownloadMedia { event_id, preview }) => { assert_eq!(event_id, "$a:test"); Ok(preview) }
+            Ok(_) => panic!("expected an attachment read"),
+            Err(error) => Err(error),
+        };
+        assert_eq!(preview(serde_json::json!({"event_id": " $a:test "})), Ok(Some(256)), "a preview is never the whole file");
+        for (size, edge) in [(serde_json::json!(64), 64), (serde_json::json!(300), 300), (serde_json::json!(1024), 1024),
+            (serde_json::json!(256.0), 256)]
+        {
+            assert_eq!(preview(serde_json::json!({"event_id": "$a:test", "size": size})), Ok(Some(edge)));
+        }
+        for size in [serde_json::json!(63), serde_json::json!(1025), serde_json::json!(0), serde_json::json!(-256),
+            serde_json::json!(256.5), serde_json::json!(1e300), serde_json::json!("256"), serde_json::json!(null), serde_json::json!(true)]
+        {
+            let error = preview(serde_json::json!({"event_id": "$a:test", "size": size})).unwrap_err();
+            assert!(error.starts_with("matrix.media_preview {size}") && error.contains("64 to 1024"), "{size}: {error}");
+        }
+        for key in ["preview", "room_id", "source_room", "uri", "url", "thumbnail", "filename", "width", "mime_type"] {
+            let args = serde_json::json!({"event_id": "$a:test", "size": 128, key: true});
+            assert!(matches!(preview(args), Err(error) if error.starts_with("matrix.media_preview") && error.contains(&format!("'{key}'"))), "{key}");
+        }
+        for args in [serde_json::json!({"size": 128}), serde_json::json!({"event_id": "$"}), serde_json::json!({"event_id": "$two words"}),
+            serde_json::json!({"event_id": "mxc://server/media"}), serde_json::json!(null)]
+        {
+            assert!(preview(args).is_err());
+        }
+        assert!(matches!(parse("matrix.media_preview", &serde_json::json!({"event_id": "$a:test"}), false),
+            Err(error) if error.contains("not attached to a room")));
+        assert!(cost("matrix.media_preview") < cost("matrix.download_media"), "a bounded preview is cheaper than a whole file");
     }
 
     #[test]

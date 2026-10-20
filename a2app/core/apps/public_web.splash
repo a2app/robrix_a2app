@@ -6,49 +6,169 @@
 // why-network: Fetches https://example.com/ when you press the button.
 
 let busy = false
+let upper = {a: "A" b: "B" c: "C" d: "D" e: "E" f: "F" g: "G" h: "H" i: "I" j: "J" k: "K" l: "L" m: "M" n: "N" o: "O" p: "P" q: "Q" r: "R" s: "S" t: "T" u: "U" v: "V" w: "W" x: "X" y: "Y" z: "Z"}
+
+fn size_text(n){
+    if n < 1024 { return "" + n + " bytes" }
+    return "" + floor(n / 102.4) / 10 + " KB"
+}
+
+// The page's <title>, or "" when it has none.
+fn title_of(body){
+    let parts = body.split("<title>")
+    if parts.len() < 2 { return "" }
+    let title = parts[1].split("</title>")[0].trim()
+    if title.len() > 120 { return "" }
+    return title
+}
+
+// Host errors read as sentences: a capital first letter and a final period.
+fn sentence(text){
+    let chars = text.split("")
+    if chars.len() < 3 { return text }
+    let first = chars[1]
+    let up = upper[first]
+    if up == nil { up = first }
+    let out = up + text.strip_prefix(first)
+    let last = chars[chars.len() - 2]
+    if last != "." && last != "!" && last != "?" { out = out + "." }
+    return out
+}
+
+fn is_denial(error){ return error.search("denied") >= 0 || error.search("not approved") >= 0 }
+
+// Shows the start or error card in place of the fetched page; `button` is fetch, ask or retry.
+fn show_card(icon, title, line, button){
+    ui.card_icon.set_text(icon)
+    ui.card_title.set_text(title)
+    ui.status.set_text(line)
+    ui.fetch_wrap.set_visible(button == "fetch")
+    ui.ask_wrap.set_visible(button == "ask")
+    ui.retry_wrap.set_visible(button == "retry")
+    ui.loading_wrap.set_visible(false)
+    ui.card.set_visible(true)
+    ui.page.set_visible(false)
+}
 
 fn fetch_example(){
     if busy { return nil }
     busy = true
-    ui.status.set_text("Requesting https://example.com/…")
+    ui.card.set_visible(false)
+    ui.page.set_visible(false)
+    ui.loading_wrap.set_visible(true)
     ui.result.set_text("")
     host.request("network.http", {url: "https://example.com/"}, fn(r){
         busy = false
         if !r.is_ok {
-            ui.status.set_text(r.error)
+            if is_denial(r.error) { show_card("🔒", "Can't fetch the page", "Allow Public Web to fetch example.com.", "ask") }
+            else { show_card("😕", "Couldn't fetch the page", sentence(r.error), "retry") }
             return nil
         }
-        ui.status.set_text("https://example.com/ · HTTP " + r.data.status)
-        if r.data.body.len() > 4096 {
+        let body = r.data.body
+        let title = title_of(body)
+        let meta = size_text(body.len())
+        if title == "" { title = "example.com" } else { meta = "example.com · " + meta }
+        ui.page_title.set_text(title)
+        ui.page_meta.set_text(meta)
+        let failed = r.data.status < 200 || r.data.status >= 300
+        ui.http_note.set_text("The site answered with an error (HTTP " + r.data.status + "). Its reply is below.")
+        ui.http_wrap.set_visible(failed)
+        let too_big = body.len() > 4096
+        ui.big_note.set_visible(too_big)
+        ui.code.set_visible(!too_big)
+        ui.loading_wrap.set_visible(false)
+        ui.page.set_visible(true)
+        if too_big {
             ui.result.set_text("The response is larger than this preview's 4096-character limit.")
             return nil
         }
-        ui.result.set_text(r.data.body)
+        ui.result.set_text(body)
     })
 }
 
+// Narrow panes put Fetch again under the page title and shorten the fetch button.
+fn on_app_resize(width, height){
+    ui.again_side.set_visible(width >= 400)
+    ui.again_below.set_visible(width < 400)
+    ui.fetch_btn.set_text(if width < 240 { "Fetch" } else { "Fetch example.com" })
+    ui.fetching.set_text(if width < 260 { "Fetching…" } else { "Fetching example.com…" })
+    return nil
+}
+
+let PrimaryButton = Button{
+    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
+    draw_bg +: {
+        border_size: 0.0 border_radius: 4.0
+        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+}
+let NeutralButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
+        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+}
+let Hint = Label{width: Fill padding: 0 margin: 0 draw_text +: {color: #x66708F text_style: theme.font_regular{font_size: 10}}}
+
 View{
-    width: Fill height: Fill flow: Down align: Align{x: 0.5}
+    width: Fill height: Fill flow: Down
     ScrollYView{
-        width: Fill height: Fill flow: Down spacing: 12 padding: 16
-        Label{
-            text: "Public Web" width: Fill
-            draw_text +: {color: #x1C274C text_style: theme.font_bold{font_size: 22}}
+        width: Fill height: Fill flow: Down spacing: 12 padding: 14
+        Hint{text: "Fetches a public page. Your rooms and account stay private."}
+        loading_wrap := View{
+            visible: false width: Fill height: Fit flow: Right spacing: 10 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24}
+            LoadingSpinner{width: 18 height: 18 draw_bg +: {color: #x0f88fe}}
+            fetching := Label{text: "Fetching example.com…" padding: 0 margin: 0 draw_text +: {color: #x66708F text_style: theme.font_regular{font_size: 10.5}}}
         }
-        Label{
-            text: "Press Fetch to request a fixed example page. This app does not read your rooms or account data."
-            width: Fill
-            draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 12}}
+        card := RoundedView{
+            width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5}
+            padding: Inset{left: 16 right: 16 top: 20 bottom: 20}
+            show_bg: true draw_bg +: {color: #xF7F9FC border_radius: 8.0}
+            card_icon := Label{text: "🌐" padding: 0 margin: 0 draw_text +: {text_style: theme.font_regular{font_size: 28}}}
+            card_title := Label{text: "Nothing fetched yet" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: {color: #x1C274C text_style: theme.font_bold{font_size: 12.5}}}
+            status := Label{
+                text: "Fetch example.com to see it here." width: Fill align: Align{x: 0.5} padding: 0 margin: 0
+                draw_text +: {color: #x66708F text_style: theme.font_regular{font_size: 10.5}}
+            }
+            fetch_wrap := View{
+                width: Fit height: Fit margin: Inset{top: 6}
+                fetch_btn := PrimaryButton{text: "Fetch example.com" on_click: || fetch_example()}
+            }
+            ask_wrap := View{
+                visible: false width: Fit height: Fit margin: Inset{top: 6}
+                PrimaryButton{text: "Ask again" on_click: || fetch_example()}
+            }
+            retry_wrap := View{
+                visible: false width: Fit height: Fit margin: Inset{top: 6}
+                NeutralButton{text: "Try again" on_click: || fetch_example()}
+            }
         }
-        Button{text: "Fetch example.com" on_click: || fetch_example()}
-        status := Label{
-            text: "Internet permission is required. No request is made until you press Fetch."
-            width: Fill
-            draw_text +: {color: #x2A7F92 text_style: theme.font_regular{font_size: 12}}
-        }
-        result := Label{
-            text: "" width: Fill
-            draw_text +: {color: #x333333 text_style: theme.font_regular{font_size: 11}}
+        page := View{
+            visible: false width: Fill height: Fit flow: Down spacing: 12
+            View{
+                width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                View{
+                    width: Fill height: Fit flow: Down spacing: 4
+                    page_title := Label{text: "" width: Fill padding: 0 margin: 0 draw_text +: {color: #x1C274C text_style: theme.font_bold{font_size: 13}}}
+                    page_meta := Hint{text: ""}
+                }
+                again_side := View{width: Fit height: Fit NeutralButton{text: "Fetch again" on_click: || fetch_example()}}
+            }
+            again_below := View{visible: false width: Fit height: Fit NeutralButton{text: "Fetch again" on_click: || fetch_example()}}
+            http_wrap := View{
+                visible: false width: Fill height: Fit
+                http_note := Hint{text: "" draw_text +: {color: #xDC0005}}
+            }
+            big_note := View{
+                visible: false width: Fill height: Fit
+                Hint{text: "This page is over 4,096 characters, too long to show here."}
+            }
+            code := RoundedView{
+                width: Fill height: Fit padding: 12
+                show_bg: true draw_bg +: {color: #xF7F9FC border_radius: 8.0}
+                result := Label{text: "" width: Fill padding: 0 margin: 0 draw_text +: {color: #x333333 text_style: theme.font_code{font_size: 9.5}}}
+            }
         }
     }
 }

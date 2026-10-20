@@ -9,6 +9,39 @@
 // why-clipboard-write: Copies a room or message link when you tap.
 // why-robrix-navigation: Opens the upgraded room when you tap.
 
+let PrimaryButton = Button{
+    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
+    draw_bg +: {
+        border_size: 0.0 border_radius: 4.0
+        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+}
+let NeutralButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
+        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+}
+// Chips: both variants are declared and the matching one is shown.
+let ChipOff = Button{
+    padding: Inset{left: 10 right: 10 top: 5 bottom: 5}
+    draw_bg +: {
+        border_size: 1.0 border_radius: 12.0
+        color: #xFFFFFF color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF
+        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_down: #x0f88fe border_color_focus: #xC8C8C8
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C text_style: theme.font_regular{font_size: 10} }
+}
+let ChipOn = ChipOff{
+    draw_bg +: {
+        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        border_color: #x0f88fe border_color_hover: #x106fcc border_color_down: #x0C5DAA border_color_focus: #x0f88fe
+    }
+    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF }
+}
+
 // Flags stay unknown until matrix.unread answers or a change succeeds.
 let unread_loading = false
 let unread_loaded = false
@@ -20,28 +53,214 @@ let successor_loading = false
 let successor_loaded = false
 
 let flags = [
-    {service: "matrix.favorite", on: nil, pending: false, revision: 0, on_text: "Unfavorite", off_text: "Favorite", done_on: "Added to favorites.", done_off: "Removed from favorites."},
-    {service: "matrix.low_priority", on: nil, pending: false, revision: 0, on_text: "Normal priority", off_text: "Low priority", done_on: "Marked low priority.", done_off: "Back to normal priority."},
-    {service: "matrix.mark_unread", on: nil, pending: false, revision: 0, on_text: "Clear unread", off_text: "Mark unread", done_on: "Marked unread.", done_off: "Unread flag cleared."}
+    {service: "matrix.favorite", on: nil, pending: false, revision: 0, label: "Favorite", done_on: "Added to favorites.", done_off: "Removed from favorites."},
+    {service: "matrix.low_priority", on: nil, pending: false, revision: 0, label: "Low priority", done_on: "Marked low priority.", done_off: "Back to normal priority."},
+    {service: "matrix.mark_unread", on: nil, pending: false, revision: 0, label: "Unread", done_on: "Marked unread.", done_off: "Unread flag cleared."}
 ]
+// Newest first, as shown.
 let messages = []
+let rows = []
 let pins = []
 let pending_pins = []
 let pins_revision = 0
 let successor = ""
-let empty_note = "Loading…"
+let successor_name = ""
+let unread_count = 0
+let mention_count = 0
+// What the message area shows without rows: loading, ready, denied or error.
+let list_state = "loading"
+let list_error = ""
+let is_no_room = false
 let setup_pending = false
+let status_kind = ""
+let has_summary = false
+let is_tiny = false
+let is_narrow = false
 
-fn flag_text(f){
-    if f.on.is_nil() { return f.off_text + "…" }
-    if f.on { return f.on_text }
-    return f.off_text
+let upper = {a: "A" b: "B" c: "C" d: "D" e: "E" f: "F" g: "G" h: "H" i: "I" j: "J" k: "K" l: "L" m: "M" n: "N" o: "O" p: "P" q: "Q" r: "R" s: "S" t: "T" u: "U" v: "V" w: "W" x: "X" y: "Y" z: "Z"}
+
+// "room not joined" -> "Room not joined."
+fn sentence(text){
+    let t = "" + text
+    let chars = t.split("")
+    if chars.len() < 3 { return t }
+    let first = chars[1]
+    let up = upper[first]
+    if up == nil { up = first }
+    let out = up + t.strip_prefix(first)
+    let last = chars[chars.len() - 2]
+    if last != "." && last != "!" && last != "?" { out = out + "." }
+    return out
+}
+
+// The avatar letter: the name's first character, skipping a leading "@".
+fn initial(name){
+    let chars = ("" + name).split("")
+    if chars.len() < 3 { return "?" }
+    let c = chars[1]
+    if c == "@" && chars.len() > 3 { c = chars[2] }
+    let up = upper[c]
+    if up != nil { c = up }
+    return c
+}
+
+fn plural(n, word){
+    if "" + n == "1" { return word }
+    return word + "s"
+}
+
+fn ago(ts){
+    if !ts.is_number() || ts <= 0 { return "" }
+    let s = time_now() - ts / 1000.0
+    if s < 60.0 { return "Just now" }
+    if s < 3600.0 { return "" + floor(s / 60.0) + "m ago" }
+    if s < 86400.0 { return "" + floor(s / 3600.0) + "h ago" }
+    if s < 172800.0 { return "Yesterday" }
+    if s < 604800.0 { return "" + floor(s / 86400.0) + "d ago" }
+    if s < 2592000.0 { return "" + floor(s / 604800.0) + "w ago" }
+    if s < 31536000.0 { return "" + floor(s / 2592000.0) + "mo ago" }
+    return "" + floor(s / 31536000.0) + "y ago"
+}
+
+fn is_no_room_error(err){ return ("" + err).search("not attached to a room") >= 0 }
+
+// One status line: note (gray), ok (green) or err (red); `status` always holds the text.
+fn say(kind, text){
+    status_kind = kind
+    ui.status.set_text(text)
+    ui.status_ok.set_text(text)
+    ui.status_err.set_text(text)
+    ui.note_wrap.set_visible(kind == "note")
+    ui.ok_wrap.set_visible(kind == "ok")
+    ui.err_wrap.set_visible(kind == "err")
+    show_head()
+    return nil
+}
+
+// The header waits for a summary or a status, so Refresh never sits alone.
+fn show_head(){
+    ui.head.set_visible(!is_no_room && (has_summary || status_kind != ""))
+    return nil
+}
+
+fn show_summary(){
+    let parts = []
+    if unread_loaded {
+        if unread_count > 0 { parts.push("" + unread_count + " unread") } else { parts.push("All read") }
+        if mention_count > 0 { parts.push("" + mention_count + " " + plural(mention_count, "mention")) }
+    }
+    if pins_loaded {
+        if pins.len() > 0 { parts.push("" + pins.len() + " pinned") } else { parts.push("No pins") }
+    }
+    // One label per part, so a narrow pane wraps between parts, never inside one.
+    let texts = ["", "", ""]
+    let i = 0
+    while i < parts.len() {
+        texts[i] = parts[i]
+        if i + 1 < parts.len() { texts[i] = parts[i] + " · " }
+        i += 1
+    }
+    ui.sum_a.set_text(texts[0])
+    ui.sum_b.set_text(texts[1])
+    ui.sum_c.set_text(texts[2])
+    ui.sum_b_wrap.set_visible(parts.len() > 1)
+    ui.sum_c_wrap.set_visible(parts.len() > 2)
+    has_summary = parts.len() > 0
+    ui.summary_wrap.set_visible(has_summary && !is_no_room)
+    show_head()
+    return nil
+}
+
+fn chip_text(f){
+    if f.on.is_nil() { return f.label + "…" }
+    return f.label
 }
 
 fn show_flags(){
-    ui.fav_btn.set_text(flag_text(flags[0]))
-    ui.low_btn.set_text(flag_text(flags[1]))
-    ui.unread_btn.set_text(flag_text(flags[2]))
+    ui.fav_on.set_visible(flags[0].on == true)
+    ui.fav_off.set_visible(flags[0].on != true)
+    ui.fav_off_btn.set_text(chip_text(flags[0]))
+    ui.low_on.set_visible(flags[1].on == true)
+    ui.low_off.set_visible(flags[1].on != true)
+    ui.low_off_btn.set_text(chip_text(flags[1]))
+    ui.unread_on.set_visible(flags[2].on == true)
+    ui.unread_off.set_visible(flags[2].on != true)
+    ui.unread_off_btn.set_text(chip_text(flags[2]))
+    return nil
+}
+
+fn show_list_state(){
+    let has_rows = rows.len() > 0
+    let is_loading = !has_rows && !is_no_room && list_state == "loading"
+    show_head()
+    ui.tools_wrap.set_visible(!is_no_room)
+    ui.list_head.set_visible(!is_no_room)
+    ui.list_wrap.set_visible(has_rows && !is_no_room)
+    ui.loading_wrap.set_visible(is_loading)
+    ui.empty_wrap.set_visible((!has_rows || is_no_room) && !is_loading)
+    let icon = "📭"
+    let title = "No messages yet"
+    let body = "Messages you can pin show up here."
+    let action = ""
+    if is_no_room {
+        icon = "🧭"
+        title = "No room attached"
+        body = "Open Room Tools from a room to manage it."
+    } elif list_state == "denied" {
+        icon = "🔒"
+        title = "Can't read this room"
+        body = "Allow Room Tools to read this room to pin its messages."
+        action = "Ask again"
+    } elif list_state == "error" {
+        icon = "😕"
+        title = "Couldn't load messages"
+        body = sentence(list_error)
+        action = "Try again"
+    }
+    ui.empty_icon.set_text(icon)
+    ui.empty_title.set_text(title)
+    ui.empty_body.set_text(body)
+    ui.empty_btn.set_text(action)
+    ui.empty_btn_wrap.set_visible(action == "Try again")
+    ui.ask_btn_wrap.set_visible(action == "Ask again")
+    return nil
+}
+
+// Optional fields use [] so a missing key reads as nil instead of failing.
+fn name_of(m){
+    let n = m["sender_name"]
+    if n.is_string() && n != "" { return n }
+    return "" + m.sender
+}
+
+fn body_of(m){
+    let text = "" + m.body
+    let kind = m["msgtype"]
+    if kind == "m.image" { return "🖼 " + text }
+    if kind == "m.video" { return "🎬 " + text }
+    if kind == "m.audio" { return "🎵 " + text }
+    if kind == "m.file" { return "📎 " + text }
+    return text
+}
+
+fn build_rows(){
+    rows = []
+    for m in messages {
+        let bg = #xF7F9FC
+        let edge = #xF7F9FC
+        let pin = ""
+        if is_pinned(m.event_id) {
+            bg = #xE4EEFF
+            edge = #x0f88fe
+            pin = "📌 Pinned"
+            if is_narrow { pin = "📌" }
+        }
+        let who = name_of(m)
+        rows.push({who: who initial: initial(who) when: ago(m["ts"]) body: body_of(m) pin: pin bg: bg edge: edge})
+    }
+    show_list_state()
+    ui.msg_list.render()
+    return nil
 }
 
 fn toggle(i){
@@ -53,7 +272,7 @@ fn toggle(i){
     host.request(flags[i].service, {on: want}, fn(r){
         flags[i].pending = false
         if !r.is_ok {
-            ui.status.set_text(r.error)
+            say("err", "Couldn't change " + flags[i].label + ": " + sentence(r.error))
             return nil
         }
         flags[i].on = want
@@ -68,8 +287,9 @@ fn toggle(i){
         }
         let note = flags[i].done_off
         if want { note = flags[i].done_on }
-        ui.status.set_text(note)
+        say("ok", note)
         show_flags()
+        return nil
     })
 }
 
@@ -83,13 +303,20 @@ fn load_unread(){
         unread_loading = false
         unread_loaded = r.is_ok
         if r.is_ok {
-            if !flags[0].pending && flags[0].revision == favorite_revision { flags[0].on = r.data.favorite }
-            if !flags[1].pending && flags[1].revision == priority_revision { flags[1].on = r.data.low_priority }
-            if !flags[2].pending && flags[2].revision == unread_revision { flags[2].on = r.data.marked_unread }
+            if !flags[0].pending && flags[0].revision == favorite_revision { flags[0].on = r.data["favorite"] }
+            if !flags[1].pending && flags[1].revision == priority_revision { flags[1].on = r.data["low_priority"] }
+            if !flags[2].pending && flags[2].revision == unread_revision { flags[2].on = r.data["marked_unread"] }
+            if r.data["unread"].is_number() { unread_count = r.data["unread"] }
+            if r.data["mentions"].is_number() { mention_count = r.data["mentions"] }
+        } elif is_no_room_error(r.error) {
+            is_no_room = true
         } else {
-            ui.status.set_text(r.error)
+            say("err", sentence(r.error))
         }
         show_flags()
+        show_summary()
+        show_list_state()
+        return nil
     })
 }
 
@@ -98,11 +325,6 @@ fn is_pinned(event_id){
         if p == event_id { return true }
     }
     return false
-}
-
-fn pin_line(m){
-    if is_pinned(m.event_id) { return "📌 pinned  ·  " + m.sender }
-    return "○ " + m.sender
 }
 
 fn load_pins(){
@@ -118,28 +340,49 @@ fn load_pins(){
             for p in r.data.pinned { pins.push(p.event_id) }
             // A branch ending in a loop needs an explicit result.
             nil
+        } elif is_no_room_error(r.error) {
+            is_no_room = true
         } else {
-            ui.status.set_text(r.error)
+            say("err", sentence(r.error))
         }
-        ui.msg_list.render()
+        build_rows()
+        show_summary()
+        return nil
     })
+}
+
+fn newest_first(list){
+    let out = []
+    let i = list.len() - 1
+    while i >= 0 {
+        out.push(list[i])
+        i -= 1
+    }
+    return out
 }
 
 fn load_messages(){
     if messages_loading { return nil }
     messages_loading = true
+    if messages.len() == 0 {
+        list_state = "loading"
+        show_list_state()
+    }
     host.request("matrix.read_messages", {limit: 15}, fn(r){
         messages_loading = false
         messages_loaded = r.is_ok
         if r.is_ok {
-            messages = r.data.messages
-            empty_note = "No messages in this room yet."
+            messages = newest_first(r.data.messages)
+            list_state = "ready"
         } else {
             messages = []
-            empty_note = r.error
-            ui.status.set_text(r.error)
+            list_state = "error"
+            list_error = r.error
+            if is_no_room_error(r.error) { is_no_room = true }
         }
-        ui.msg_list.render()
+        build_rows()
+        show_summary()
+        return nil
     })
 }
 
@@ -152,44 +395,51 @@ fn toggle_pin(i){
     host.request("matrix.pin", {event_id: id, pinned: want}, fn(r){
         pending_pins.retain(|pending| pending != id)
         if !r.is_ok {
-            ui.status.set_text(r.error)
+            say("err", "Couldn't change the pin: " + sentence(r.error))
             return nil
         }
         pins_revision += 1
         if want {
             if !is_pinned(id) { pins.push(id) }
-            ui.status.set_text("Pinned.")
+            say("ok", "Pinned.")
         } else {
             pins.retain(|p| p != id)
-            ui.status.set_text("Unpinned.")
+            say("ok", "Unpinned.")
         }
-        ui.msg_list.render()
+        build_rows()
+        show_summary()
+        return nil
     })
 }
 
-fn copy_link(event_id){
+// `done` names what was copied, like Robrix's own "Link copied to clipboard."
+fn copy_link(event_id, done){
     let args = nil
     if event_id != "" { args = {event_id: event_id} }
     host.request("matrix.permalink", args, fn(r){
         if !r.is_ok {
-            ui.status.set_text(r.error)
+            say("err", "Couldn't make a link: " + sentence(r.error))
             return nil
         }
         let url = r.data.url
         host.request("clipboard.write", {text: url}, fn(c){
-            let note = "Copied " + url
-            if !c.is_ok { note = c.error }
-            ui.status.set_text(note)
+            if !c.is_ok {
+                say("err", "Couldn't copy the link: " + sentence(c.error))
+                return nil
+            }
+            say("ok", done)
+            return nil
         })
+        return nil
     })
 }
 
 fn copy_latest(){
     if messages.len() == 0 {
-        ui.status.set_text("No messages to link to yet.")
+        say("note", "No messages to link to yet.")
         return nil
     }
-    copy_link(messages[messages.len() - 1].event_id)
+    copy_link(messages[0].event_id, "Latest message link copied.")
 }
 
 fn load_successor(){
@@ -199,16 +449,25 @@ fn load_successor(){
         successor_loading = false
         successor_loaded = r.is_ok
         successor = ""
-        if r.is_ok && r.data.upgraded { successor = r.data.room_id }
-        if !r.is_ok { ui.status.set_text(r.error) }
+        successor_name = ""
+        if r.is_ok && r.data["upgraded"] == true {
+            successor = r.data["room_id"]
+            if r.data["name"].is_string() { successor_name = r.data["name"] }
+        }
+        if !r.is_ok && !is_no_room_error(r.error) { say("err", sentence(r.error)) }
         if successor.is_nil() { successor = "" }
+        let line = "The conversation continues in a new room."
+        if successor_name != "" { line = "The conversation continues in " + successor_name + "." }
+        ui.successor_line.set_text(line)
         ui.upgraded_wrap.set_visible(successor != "")
+        return nil
     })
 }
 
 fn open_successor(){
     host.request("nav.room", {room_id: successor}, fn(r){
-        if !r.is_ok { ui.status.set_text(r.error) }
+        if !r.is_ok { say("err", "Couldn't open the new room: " + sentence(r.error)) }
+        return nil
     })
 }
 
@@ -217,6 +476,21 @@ fn load_all(){
     load_pins()
     load_messages()
     load_successor()
+}
+
+fn on_app_resize(w, h){
+    let latest = "Copy latest message link"
+    if w < 340 { latest = "Copy latest link" }
+    ui.copy_latest_btn.set_text(latest)
+    ui.hint_wrap.set_visible(w >= 300)
+    ui.head_refresh.set_visible(w >= 260)
+    ui.tiny_refresh.set_visible(w < 260)
+    if is_tiny != (w < 260) || is_narrow != (w < 400) {
+        is_tiny = w < 260
+        is_narrow = w < 400
+        build_rows()
+    }
+    return nil
 }
 
 fn on_permissions_changed(caps){
@@ -236,74 +510,151 @@ fn setup(retry){
     setup_pending = true
     host.request("permissions.request", {perms: ["matrix-room-read", "matrix-room-info"], retry: retry}, fn(r){
         setup_pending = false
-        if !r.is_ok { ui.status.set_text(r.error) return nil }
+        if !r.is_ok { say("err", sentence(r.error)) return nil }
         let denied = false
         if r.data.permissions["matrix-room-info"] == true && host.has("matrix.room.unread.read") { load_unread() } else { denied = true }
         if r.data.permissions["matrix-room-read"] == true && host.has("matrix.room.pins.read") { load_pins() } else { denied = true }
         if r.data.permissions["matrix-room-read"] == true && host.has("matrix.room.messages.read") { load_messages() }
-        else { denied = true messages = [] empty_note = "Permission denied. Click Refresh to ask again." ui.msg_list.render() }
+        else { denied = true messages = [] list_state = "denied" build_rows() }
         if r.data.permissions["matrix-room-info"] == true && host.has("matrix.room.successor.read") { load_successor() } else { denied = true }
-        if denied { ui.status.set_text("Some room details were not allowed. Click Refresh to ask again.") }
+        if denied { say("note", "Some room details weren't allowed. Tap Refresh to ask again.") }
+        return nil
     })
 }
 
 let _boot = start_timeout(0.05, || setup(false))
 
 View{
-    width: Fill height: Fill flow: Down align: Align{x: 0.5}
+    width: Fill height: Fill flow: Down
     col := ScrollYView{
-        width: Fill height: Fill flow: Down spacing: 10 padding: 14
-        status := Label{
-            text: "Each button changes this room only when you tap it." width: Fill padding: 0 margin: 0
-            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
-        }
-        Button{ text: "Refresh" on_click: || setup(true) draw_text +: { color: #x1C274C } }
-        upgraded_wrap := View{
-            width: Fill height: Fit flow: Down spacing: 4 visible: false
-            Label{
-                text: "This room was upgraded." width: Fill padding: 0 margin: 0
-                draw_text +: { color: #xB91C1C text_style: theme.font_bold{font_size: 10} }
-            }
-            Button{
-                text: "Open the upgraded room" width: Fill
-                on_click: || open_successor()
-                draw_text +: { color: #xB91C1C }
-            }
-        }
-        View{
-            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 6
-            fav_btn := Button{ text: "Favorite…" on_click: || toggle(0) draw_text +: { color: #x1C274C } }
-            low_btn := Button{ text: "Low priority…" on_click: || toggle(1) draw_text +: { color: #x1C274C } }
-            unread_btn := Button{ text: "Mark unread…" on_click: || toggle(2) draw_text +: { color: #x1C274C } }
-            Button{ text: "Copy room link" on_click: || copy_link("") draw_text +: { color: #x1C274C } }
-            Button{ text: "Copy link to latest message" on_click: || copy_latest() draw_text +: { color: #x1C274C } }
-        }
-        Label{
-            text: "RECENT MESSAGES · tap one to pin or unpin it" width: Fill padding: 0 margin: 0
-            draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
-        }
-        msg_list := ScrollYView{
-            width: Fill height: Fill{min: 80} flow: Down spacing: 5
-            on_item_tap: |i| toggle_pin(i)
-            on_render: || {
-                if messages.len() == 0 {
-                    Label{
-                        text: empty_note width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+        width: Fill height: Fill flow: Down spacing: 12 padding: 14
+        head := View{
+            width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5} visible: false
+            View{
+                width: Fill height: Fit flow: Down spacing: 3
+                summary_wrap := View{
+                    width: Fill height: Fit flow: Flow.Right{wrap: true} visible: false
+                    sum_a := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
+                    sum_b_wrap := View{
+                        width: Fit height: Fit
+                        sum_b := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
                     }
-                } else {
-                    for m in messages {
+                    sum_c_wrap := View{
+                        width: Fit height: Fit
+                        sum_c := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
+                    }
+                }
+                note_wrap := View{
+                    width: Fill height: Fit visible: false
+                    status := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                }
+                ok_wrap := View{
+                    width: Fill height: Fit visible: false
+                    status_ok := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x138808 text_style: theme.font_regular{font_size: 10} } }
+                }
+                err_wrap := View{
+                    width: Fill height: Fit visible: false
+                    status_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} } }
+                }
+            }
+            head_refresh := View{
+                width: Fit height: Fit
+                NeutralButton{ text: "Refresh" on_click: || setup(true) }
+            }
+        }
+        upgraded_wrap := View{
+            width: Fill height: Fit visible: false
+            RoundedView{
+                width: Fill height: Fit flow: Down spacing: 4 padding: 12
+                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                Label{ text: "This room was upgraded" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} } }
+                successor_line := Label{ text: "The conversation continues in a new room." width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                View{
+                    width: Fill height: Fit margin: Inset{top: 6}
+                    PrimaryButton{ text: "Open the new room" on_click: || open_successor() }
+                }
+            }
+        }
+        tools_wrap := View{
+            width: Fill height: Fit flow: Down spacing: 8
+            View{
+                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
+                fav_off := View{ width: Fit height: Fit fav_off_btn := ChipOff{ text: "Favorite…" on_click: || toggle(0) } }
+                fav_on := View{ width: Fit height: Fit visible: false ChipOn{ text: "Favorite" on_click: || toggle(0) } }
+                low_off := View{ width: Fit height: Fit low_off_btn := ChipOff{ text: "Low priority…" on_click: || toggle(1) } }
+                low_on := View{ width: Fit height: Fit visible: false ChipOn{ text: "Low priority" on_click: || toggle(1) } }
+                unread_off := View{ width: Fit height: Fit unread_off_btn := ChipOff{ text: "Unread…" on_click: || toggle(2) } }
+                unread_on := View{ width: Fit height: Fit visible: false ChipOn{ text: "Unread" on_click: || toggle(2) } }
+            }
+            View{
+                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
+                NeutralButton{ text: "Copy room link" on_click: || copy_link("", "Room link copied.") }
+                copy_latest_btn := NeutralButton{ text: "Copy latest message link" on_click: || copy_latest() }
+                // Very narrow panes move Refresh here, out of the summary's way.
+                tiny_refresh := View{
+                    width: Fit height: Fit visible: false
+                    NeutralButton{ text: "Refresh" on_click: || setup(true) }
+                }
+            }
+        }
+        list_head := View{
+            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+            Label{ text: "RECENT MESSAGES" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+            hint_wrap := View{
+                width: Fit height: Fit
+                Label{ text: "Tap one to pin it" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+            }
+        }
+        loading_wrap := View{
+            width: Fill height: Fit flow: Right spacing: 10 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24}
+            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
+            Label{ text: "Loading messages…" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+        }
+        empty_wrap := View{
+            width: Fill height: Fit visible: false
+            RoundedView{
+                width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5}
+                padding: Inset{left: 16 right: 16 top: 20 bottom: 20}
+                show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                empty_icon := Label{ text: "📭" padding: 0 margin: 0 draw_text +: { text_style: theme.font_regular{font_size: 28} } }
+                empty_title := Label{ text: "No messages yet" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} } }
+                empty_body := Label{ text: "Messages you can pin show up here." width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                empty_btn_wrap := View{
+                    width: Fit height: Fit visible: false margin: Inset{top: 6}
+                    empty_btn := NeutralButton{ text: "Try again" on_click: || setup(true) }
+                }
+                ask_btn_wrap := View{
+                    width: Fit height: Fit visible: false margin: Inset{top: 6}
+                    PrimaryButton{ text: "Ask again" on_click: || setup(true) }
+                }
+            }
+        }
+        // render() re-applies the list's own declaration, so its visibility lives on this wrapper.
+        list_wrap := View{
+            width: Fill height: Fill{min: 80} visible: false
+            msg_list := ScrollYView{
+                width: Fill height: Fill flow: Down spacing: 8
+                on_item_tap: |i| toggle_pin(i)
+                on_render: || {
+                    for r in rows {
                         RoundedView{
-                            width: Fill height: Fit flow: Down spacing: 2 padding: 10
-                            show_bg: true
-                            draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
-                            Label{
-                                text: pin_line(m) width: Fill padding: 0 margin: 0
-                                draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+                            width: Fill height: Fit flow: Right spacing: 10
+                            padding: Inset{left: 12 right: 12 top: 10 bottom: 10}
+                            show_bg: true draw_bg +: { color: r.bg border_size: 1.0 border_color: r.edge border_radius: 8.0 }
+                            RoundedView{
+                                visible: !is_tiny width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
+                                show_bg: true draw_bg +: { color: #x52b2ac border_radius: 16.0 }
+                                Label{ text: r.initial padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
                             }
-                            Label{
-                                text: m.body width: Fill padding: 0 margin: 0
-                                draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                            View{
+                                width: Fill height: Fit flow: Down spacing: 4
+                                View{
+                                    width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                    Label{ text: r.who width: Fill padding: 0 margin: 0 max_lines: 1 text_overflow: TextOverflow.Ellipsis draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} } }
+                                    Label{ text: r.pin padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_bold{font_size: 10} } }
+                                    Label{ text: r.when padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                                }
+                                Label{ text: r.body width: Fill padding: 0 margin: 0 max_lines: 3 text_overflow: TextOverflow.Ellipsis draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
                             }
                         }
                     }

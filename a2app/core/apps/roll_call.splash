@@ -6,90 +6,221 @@
 // why-robrix-composer: Puts your roll in the message box for you to review and send.
 // why-matrix-room-send: Posts your roll into this room only when you press Post to room.
 
+let PrimaryButton = Button{
+    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
+    draw_bg +: {
+        border_size: 0.0 border_radius: 4.0
+        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+}
+let NeutralButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
+        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+}
+
 let die_a = 1
 let die_b = 1
 let posting = false
 let drafting = false
 
+// Pip cells (0-8, row by row) for faces 1-6.
+let pip_sets = [[4], [2, 6], [2, 4, 6], [0, 2, 6, 8], [0, 2, 4, 6, 8], [0, 2, 3, 5, 6, 8]]
+let faces = []
+let die_size = 80
+let side_pad = 28
+
 fn result_text(){ return "🎲 Rolled " + die_a + " + " + die_b + " = " + (die_a + die_b) }
 
+// A face as three rows of three cells, true where a pip sits.
+fn face_rows(n){
+    let on = pip_sets[n - 1]
+    let rows = []
+    for r in [0, 1, 2] {
+        let row = []
+        for c in [0, 1, 2] {
+            let hit = false
+            for p in on { if p == r * 3 + c { hit = true } }
+            row.push(hit)
+        }
+        rows.push(row)
+    }
+    return rows
+}
+
+fn show_dice(){
+    faces = [face_rows(die_a), face_rows(die_b)]
+    ui.faces.render()
+    ui.total.set_text("" + (die_a + die_b))
+    ui.dice.set_text("" + die_a + " + " + die_b)
+}
+
+let lower_az = "abcdefghijklmnopqrstuvwxyz"
+let upper_az = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+// Host errors can start in lowercase; show them as sentences, and say how to get a room.
+fn failure_text(error){
+    if error.search("not attached") >= 0 { return "Open Roll Call from a room to draft or post your roll." }
+    let chars = error.split("")
+    if chars.len() < 3 { return error }
+    let out = error
+    let i = lower_az.search(chars[1])
+    if chars[1].len() == 1 && i >= 0 { out = upper_az.split("")[i + 1] + error.strip_prefix(chars[1]) }
+    let last = chars[chars.len() - 2]
+    if last != "." && last != "!" && last != "?" { out = out + "." }
+    return out
+}
+
+fn note_kind(error){ return if error.search("not attached") >= 0 {"info"} else {"err"} }
+
+fn set_note(kind, text){
+    ui.note.set_text(text)
+    ui.note_ok.set_text(text)
+    ui.note_err.set_text(text)
+    ui.note_wrap.set_visible(kind == "info" && text != "")
+    ui.note_ok_wrap.set_visible(kind == "ok")
+    ui.note_err_wrap.set_visible(kind == "err")
+}
+
+// random() is a 64-bit generator; time-based floor() math runs in 32-bit floats.
 fn roll(){
-    let t = floor(time_now() * 997.0)
-    die_a = t % 6 + 1
-    let u = floor(time_now() * 7919.0)
-    die_b = u % 6 + 1
-    ui.dice.set_text("" + die_a + "  ●  " + die_b)
-    let total = die_a + die_b
-    ui.total.set_text("total " + total)
-    ui.note.set_text("")
+    die_a = min(floor(random() * 6) + 1, 6)
+    die_b = min(floor(random() * 6) + 1, 6)
+    show_dice()
+    set_note("info", "")
 }
 
 fn post(){
     if posting || drafting { return nil }
     let msg = result_text()
     posting = true
-    ui.note.set_text("Posting…")
+    set_note("info", "Posting…")
     host.request("matrix.send_message", {body: msg}, fn(r){
         posting = false
         if r.is_ok {
-            ui.note.set_text("Posted to the room!")
+            set_note("ok", "Posted to the room!")
             return nil
         }
-        ui.note.set_text(r.error)
+        set_note(note_kind(r.error), failure_text(r.error))
     })
 }
 
 fn draft_result(){
     if posting || drafting { return nil }
     drafting = true
-    ui.note.set_text("Preparing a draft…")
+    set_note("info", "Preparing a draft…")
     host.request("composer.insert", {text: result_text()}, fn(r){
         drafting = false
-        if r.is_ok { ui.note.set_text("Draft ready. Review and send it in Robrix.") }
-        else { ui.note.set_text(r.error) }
+        if r.is_ok {
+            set_note("ok", "Draft ready. Review and send it in Robrix.")
+            return nil
+        }
+        set_note(note_kind(r.error), failure_text(r.error))
     })
 }
 
+// Dice shrink to fit the pane (w includes the host's 8pt padding); wider panes pad the tray.
+fn on_app_resize(w, h){
+    let size = 80
+    if w < 240 || h < 380 { size = 60 }
+    elif w >= 560 && h >= 520 { size = 104 }
+    size = max(min(size, floor((w - 92) / 2)), 36)
+    let pad = 0
+    if w >= 300 { pad = floor(size * 0.35) }
+    if size == die_size && pad == side_pad { return nil }
+    die_size = size
+    side_pad = pad
+    ui.faces.render()
+    return nil
+}
+
+let _boot = start_timeout(0.05, || show_dice())
+
 View{
-    width: Fill height: Fill flow: Down align: Align{x: 0.5}
+    width: Fill height: Fill flow: Down
     col := ScrollYView{
-        width: Fill height: Fill flow: Down spacing: 10 padding: 14
+        width: Fill height: Fill flow: Down spacing: 14 padding: 14 align: Align{x: 0.5 y: 0.4}
         RoundedView{
-            width: Fill height: Fit align: Align{x: 0.5, y: 0.5} padding: 16 flow: Down spacing: 6
+            width: Fit height: Fit flow: Down spacing: 14 align: Align{x: 0.5}
+            padding: Inset{top: 22 bottom: 18 left: 16 right: 16}
             show_bg: true
-            draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
-            dice := Label{
-                text: "1  ●  1" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
-                draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 44} }
+            draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+            faces := View{
+                width: Fit height: Fit flow: Right
+                on_render: || {
+                    View{ width: side_pad height: 1 }
+                    let k = 0
+                    for f in faces {
+                        if k > 0 { View{ width: 16 height: 1 } }
+                        k += 1
+                        RoundedView{
+                            width: die_size height: die_size flow: Down padding: floor(die_size * 0.13)
+                            show_bg: true
+                            draw_bg +: { color: #xFFFFFF border_radius: floor(die_size * 0.14) border_size: 1.0 border_color: #xC8C8C8 }
+                            for row in f {
+                                View{
+                                    width: Fill height: Fill flow: Right
+                                    for on in row {
+                                        // Every cell keeps its pip: a re-render can't clear an emptied View.
+                                        View{
+                                            width: Fill height: Fill align: Align{x: 0.5 y: 0.5}
+                                            RoundedView{
+                                                width: floor(die_size * 0.15) height: floor(die_size * 0.15) visible: on show_bg: true
+                                                draw_bg +: { color: #x1C274C border_radius: floor(die_size * 0.075) }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    View{ width: side_pad height: 1 }
+                }
             }
-            total := Label{
-                text: "total 2" padding: 0 margin: 0
-                draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 14} }
+            View{
+                width: Fit height: Fit flow: Down spacing: 2 align: Align{x: 0.5}
+                total := Label{
+                    text: "2" padding: 0 margin: 0
+                    draw_text +: { color: #x0f88fe text_style: theme.font_bold{font_size: 26} }
+                }
+                dice := Label{
+                    text: "1 + 1" padding: 0 margin: 0
+                    draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                }
             }
         }
         View{
-            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 10 align: Align{x: 0.5}
-            Button{
-                text: "Roll" on_click: || roll()
-                draw_text +: { color: #x1C274C }
+            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8 align: Align{x: 0.5}
+            PrimaryButton{ text: "Roll" on_click: || roll() }
+            NeutralButton{ text: "Draft result" on_click: || draft_result() }
+            NeutralButton{ text: "Post to room" on_click: || post() }
+        }
+        note_wrap := View{
+            width: Fill height: Fit align: Align{x: 0.5} visible: false
+            note := Label{
+                text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
+                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
             }
-            Button{
-                text: "Draft result" on_click: || draft_result()
-                draw_text +: { color: #x1C274C }
+        }
+        note_ok_wrap := View{
+            width: Fill height: Fit align: Align{x: 0.5} visible: false
+            note_ok := Label{
+                text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
+                draw_text +: { color: #x138808 text_style: theme.font_regular{font_size: 10} }
             }
-            Button{
-                text: "Post to room" on_click: || post()
-                draw_text +: { color: #x1C274C }
+        }
+        note_err_wrap := View{
+            width: Fill height: Fit align: Align{x: 0.5} visible: false
+            note_err := Label{
+                text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
+                draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} }
             }
         }
         Label{
-            text: "Draft result prepares text for review. Post to room sends it immediately and needs separate permission."
-            width: Fill padding: 0 margin: 0
-            draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 11} }
-        }
-        note := Label{
-            text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
-            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
+            text: "Draft lets you review first. Post sends now." width: Fill align: Align{x: 0.5} padding: 0 margin: 0
+            draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
         }
     }
 }

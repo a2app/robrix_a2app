@@ -87,8 +87,9 @@ script_mod! {
                 flow: Flow.Right{wrap: true}
                 spacing: 6
                 align: Align{y: 0.5}
+                // Fits its text, so the NEW badge sits beside the name instead of on its own line.
                 row_name := Label {
-                    width: Fill{min: 80}, height: Fit
+                    width: Fit{max: FitBound.Rel{base: Base.Line, factor: 1.0}}, height: Fit
                     flow: Flow.Right{wrap: true}
                     padding: 0, margin: 0
                     draw_text +: {
@@ -580,6 +581,23 @@ script_mod! {
         LineH {}
     }
 
+    // Turns in steps: a long run redraws the screen a dozen times a second, not every frame.
+    mod.widgets.MiniAppStepSpinner = #(StepSpinner::register_widget(vm)) {
+        width: 16, height: 16
+        draw_bg +: {
+            color: uniform(COLOR_ACTIVE_PRIMARY)
+            rotation: instance(0.0)
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                let radius = min(self.rect_size.x, self.rect_size.y) * 0.5 - 1.5
+                let center = self.rect_size * 0.5
+                let start = self.rotation * 2.0 * PI
+                sdf.arc_round_caps(center.x, center.y, radius, start, start + 2.0 * PI * 0.72, 2.0)
+                return sdf.fill(self.color)
+            }
+        }
+    }
+
     mod.widgets.MiniAppsScreen = #(MiniAppsScreen::register_widget(vm)) {
         width: Fill, height: Fill
         flow: Overlay
@@ -694,50 +712,111 @@ script_mod! {
                     text_input +: {
                         // Enter inserts a newline; the Generate button submits.
                         is_multiline: true
-                        empty_text: "Describe a new mini-app or changes to one…"
+                        empty_text: "Describe a new app or a change…"
                         draw_text +: { text_style: REGULAR_TEXT {font_size: 11.5} }
                     }
                 }
 
+                // Stop takes Generate's place while a run is going. One fixed width for
+                // both keeps the next button still.
                 View {
                     width: Fill, height: Fit
                     flow: Flow.Right{wrap: true}
                     spacing: 8
                     align: Align{y: 0.5}
 
-                    generate_button := RobrixPositiveIconButton {
-                        padding: Inset{top: 9, bottom: 9, left: 14, right: 16},
+                    generate_button := RobrixIconButton {
+                        width: 128, height: 36
+                        margin: 0
+                        padding: Inset{left: 12, right: 12},
+                        align: Align{x: 0.5, y: 0.5}
+                        spacing: 8
                         draw_icon +: { svg: (ICON_SPARKLE) }
-                        icon_walk: Walk{width: 16, height: 16, margin: Inset{right: 2}}
+                        icon_walk: Walk{width: 16, height: 16, margin: 0}
                         text: "Generate"
                     }
+                    stop_button := RobrixNegativeIconButton {
+                        visible: false,
+                        width: 128, height: 36
+                        margin: 0
+                        padding: Inset{left: 12, right: 12},
+                        align: Align{x: 0.5, y: 0.5}
+                        icon_walk: Walk{width: 0, height: 0, margin: 0}
+                        text: "Stop"
+                    }
                     providers_button := RobrixNeutralIconButton {
-                        padding: Inset{top: 9, bottom: 9, left: 12, right: 12},
+                        height: 36
+                        margin: 0
+                        padding: Inset{left: 14, right: 14},
                         icon_walk: Walk{width: 0, height: 0, margin: 0}
                         text: "Setup AI Providers"
                     }
                 }
 
-                // Says which installed app the text will rewrite, before
-                // Generate is pressed, with a way to force a new app.
-                intent_hint := View {
+                // Says which installed app the prompt will modify, with a way to create a new app instead.
+                intent_hint := RoundedView {
                     visible: false,
                     width: Fill, height: Fit
-                    flow: Flow.Right{wrap: true}
+                    flow: Right
                     spacing: 8
                     align: Align{y: 0.5}
-                    intent_label := Label {
+                    padding: Inset{top: 4, bottom: 4, left: 12, right: 4}
+                    show_bg: true
+                    draw_bg +: {
+                        // A tinted strip, so it doesn't read as another text field.
+                        color: #xDFE9FB
+                        border_size: 0.0
+                        border_radius: 6.0
+                    }
+                    intent_modify_icon := View {
                         width: Fit, height: Fit
-                        padding: 0, margin: 0
-                        draw_text +: {
-                            text_style: theme.font_bold {font_size: 10},
-                            color: (COLOR_ACTIVE_PRIMARY)
+                        Icon {
+                            icon_walk: Walk{width: 14, height: 14, margin: 0}
+                            draw_icon +: { svg: (ICON_EDIT), color: (COLOR_ACTIVE_PRIMARY) }
                         }
                     }
-                    intent_switch_button := RobrixNeutralIconButton {
-                        padding: 6,
-                        icon_walk: Walk{width: 0, height: 0, margin: 0}
-                        text: "Create a new app instead"
+                    intent_create_icon := View {
+                        visible: false,
+                        width: Fit, height: Fit
+                        Icon {
+                            icon_walk: Walk{width: 14, height: 14, margin: 0}
+                            draw_icon +: { svg: (ICON_ADD), color: (COLOR_FG_ACCEPT_GREEN) }
+                        }
+                    }
+                    // A narrow card stacks the switch under the message (see `stack_intent_hint`).
+                    intent_body := View {
+                        width: Fill, height: Fit
+                        flow: Right
+                        spacing: 8
+                        align: Align{y: 0.5}
+                        // The stacked switch's hover tint reaches left past the message's edge.
+                        clip_x: false
+                        intent_label := Label {
+                            width: Fill, height: Fit
+                            flow: Flow.Right{wrap: true}
+                            padding: 0, margin: 0
+                            draw_text +: {
+                                text_style: REGULAR_TEXT {font_size: 10.5},
+                                color: (COLOR_TEXT)
+                            }
+                        }
+                        intent_switch_button := RobrixIconButton {
+                            height: 28
+                            margin: 0
+                            padding: Inset{left: 10, right: 10},
+                            icon_walk: Walk{width: 0, height: 0, margin: 0}
+                            draw_bg +: {
+                                color: (COLOR_TRANSPARENT)
+                                color_hover: #x0F88FE1A
+                                color_down: #x0F88FE33
+                            }
+                            draw_text +: {
+                                color: (COLOR_ACTIVE_PRIMARY)
+                                color_hover: (COLOR_ACTIVE_PRIMARY_DARKER)
+                                color_down: (COLOR_ACTIVE_PRIMARY_DARKER)
+                            }
+                            text: "Create a new app instead"
+                        }
                     }
                 }
 
@@ -745,12 +824,46 @@ script_mod! {
                     visible: false,
                     width: Fill, height: Fit
                     flow: Down
-                    spacing: 6
+                    spacing: 10
 
+                    // The icon sits beside the status's first line, even when it wraps.
                     View {
                         width: Fill, height: Fit
-                        flow: Down
+                        flow: Right
                         spacing: 8
+                        align: Align{y: 0.0}
+                        console_spinner := View {
+                            width: Fit, height: Fit
+                            margin: Inset{top: 1}
+                            mod.widgets.MiniAppStepSpinner {}
+                        }
+                        console_done_icon := View {
+                            visible: false,
+                            width: Fit, height: Fit
+                            margin: Inset{top: 1}
+                            Icon {
+                                icon_walk: Walk{width: 16, height: 16, margin: 0}
+                                draw_icon +: { svg: (ICON_CHECKMARK), color: (COLOR_FG_ACCEPT_GREEN) }
+                            }
+                        }
+                        console_failed_icon := View {
+                            visible: false,
+                            width: Fit, height: Fit
+                            margin: Inset{top: 1}
+                            Icon {
+                                icon_walk: Walk{width: 16, height: 16, margin: 0}
+                                draw_icon +: { svg: (ICON_WARNING), color: (COLOR_FG_DANGER_RED) }
+                            }
+                        }
+                        console_info_icon := View {
+                            visible: false,
+                            width: Fit, height: Fit
+                            margin: Inset{top: 1}
+                            Icon {
+                                icon_walk: Walk{width: 16, height: 16, margin: 0}
+                                draw_icon +: { svg: (ICON_INFO), color: (SMALL_STATE_TEXT_COLOR) }
+                            }
+                        }
                         console_status := Label {
                             width: Fill, height: Fit
                             flow: Flow.Right{wrap: true}
@@ -760,45 +873,73 @@ script_mod! {
                                 color: (COLOR_TEXT)
                             }
                         }
-                        View {
-                            width: Fill, height: Fit, flow: Flow.Right{wrap: true}, spacing: 8
-                            stop_button := RobrixNegativeIconButton {
-                                padding: 8,
-                                icon_walk: Walk{width: 0, height: 0, margin: 0}
-                                text: "Stop"
-                            }
-                            retry_button := RobrixIconButton {
-                                visible: false,
-                                padding: 8,
-                                icon_walk: Walk{width: 0, height: 0, margin: 0}
-                                text: "Retry"
-                            }
-                            review_permissions_button := RobrixNeutralIconButton {
-                                visible: false,
-                                padding: 8, icon_walk: Walk{width: 0, height: 0, margin: 0}
-                                text: "Review permissions"
-                            }
-                            new_prompt_button := RobrixNeutralIconButton {
-                                visible: false,
-                                padding: 8,
-                                icon_walk: Walk{width: 0, height: 0, margin: 0}
-                                text: "New prompt"
-                            }
+                    }
+
+                    // Secondary to the primary button above, which already runs the prompt.
+                    console_actions := View {
+                        visible: false,
+                        width: Fill, height: Fit
+                        flow: Flow.Right{wrap: true}
+                        spacing: 8
+                        retry_button := RobrixNeutralIconButton {
+                            visible: false,
+                            height: 36
+                            margin: 0
+                            padding: Inset{left: 14, right: 14},
+                            icon_walk: Walk{width: 0, height: 0, margin: 0}
+                            text: "Retry"
+                        }
+                        review_permissions_button := RobrixNeutralIconButton {
+                            visible: false,
+                            height: 36
+                            margin: 0
+                            padding: Inset{left: 14, right: 14},
+                            icon_walk: Walk{width: 0, height: 0, margin: 0}
+                            text: "Review permissions"
+                        }
+                        new_prompt_button := RobrixNeutralIconButton {
+                            visible: false,
+                            height: 36
+                            margin: 0
+                            padding: Inset{left: 14, right: 14},
+                            icon_walk: Walk{width: 0, height: 0, margin: 0}
+                            text: "New prompt"
                         }
                     }
 
-                    console_list := PortalList {
-                        width: Fill, height: 240
-                        flow: Down
-                        auto_tail: true
+                    // The run's output. Its height follows the output up to a cap, then it scrolls.
+                    console_output := RoundedView {
+                        width: Fill, height: Fit
+                        // The insets live on the list, so a scroll anywhere inside the border is the console's.
+                        padding: 1
+                        show_bg: true
+                        draw_bg +: {
+                            color: (COLOR_PRIMARY)
+                            border_color: (COLOR_DIVIDER)
+                            border_size: 1.0
+                            border_radius: 6.0
+                        }
+                        console_list := PortalList {
+                            // One line plus CONSOLE_PADDING_Y until the screen sizes it.
+                            width: Fill, height: 34
+                            padding: Inset{top: 7, bottom: 7, left: 11, right: 3}
+                            // Keeps the handle 11 pt from the box's ends and 7 pt from its right edge.
+                            scroll_bar +: { bar_size: 13, bar_side_margin: 10 }
+                            flow: Down
+                            auto_tail: true
 
-                        ConsoleLine := Label {
-                            width: Fill, height: Fit
-                            padding: Inset{top: 1, bottom: 1}
-                            margin: 0
-                            draw_text +: {
-                                text_style: MESSAGE_TEXT_STYLE {font_size: 9.5},
-                                color: (MESSAGE_TEXT_COLOR)
+                            // No vertical padding: the line's drawn area is then its whole height.
+                            ConsoleLine := Label {
+                                width: Fill, height: Fit
+                                flow: Flow.Right{wrap: true}
+                                padding: Inset{right: 8}
+                                margin: 0
+                                draw_text +: {
+                                    // Not monospace: the code font has no emoji or CJK fallback.
+                                    // Unit spacing keeps a wrapped line's rows as far apart as separate lines.
+                                    text_style: MESSAGE_TEXT_STYLE {font_size: 9.5, line_spacing: 1.0},
+                                    color: (MESSAGE_TEXT_COLOR)
+                                }
                             }
                         }
                     }
@@ -1738,11 +1879,17 @@ pub(super) enum MiniAppRowAction {
 pub struct MiniAppRow {
     #[deref] view: View,
     #[rust] app_id: MiniAppId,
+    /// The tint the tile was last given; the screen redraws often while a generation runs.
+    #[rust] tile_tint: Option<u32>,
 }
 
 impl Widget for MiniAppRow {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
+        // A reapply puts the tile's DSL color back.
+        if matches!(event, Event::ScriptReapply | Event::LiveEdit) {
+            self.tile_tint = None;
+        }
         if let Event::Actions(actions) = event {
             if self.view.button(cx, ids!(row_open_button)).clicked(actions) {
                 cx.widget_action(self.widget_uid(), MiniAppRowAction::OpenApp(self.app_id.clone()));
@@ -1781,6 +1928,10 @@ impl MiniAppRow {
         self.view.button(cx, ids!(row_open_button)).set_text(cx, row.open_label);
         // The tile is the app's tint at a pastel strength.
         let tint = row.tint;
+        if self.tile_tint == Some(tint) {
+            return;
+        }
+        self.tile_tint = Some(tint);
         let channel = |shift: u32| ((tint >> shift) & 0xff) as f32 / 255.0;
         let tile = vec4(channel(16), channel(8), channel(0), 0.16);
         let mut row_tile = self.view.view(cx, ids!(row_tile));
@@ -2221,6 +2372,141 @@ fn room_label(cx: &mut Cx, room_id: &str) -> String {
         .unwrap_or_else(|| room_id.to_string())
 }
 
+/// What the create card says about a prompt that may name an installed app.
+#[derive(Debug, PartialEq)]
+struct IntentCopy {
+    button: &'static str,
+    /// The hint under the buttons and the label of its switch, when the prompt names an app.
+    hint: Option<(String, String)>,
+}
+
+/// The switch labels stay short: the message already names the app.
+fn intent_copy(target: Option<&str>, is_create_forced: bool) -> IntentCopy {
+    match (target, is_create_forced) {
+        (None, _) => IntentCopy { button: "Generate", hint: None },
+        (Some(name), false) => IntentCopy {
+            button: "Modify app",
+            hint: Some((format!("Modifies \"{name}\". The current version is kept."), String::from("Create a new app instead"))),
+        },
+        (Some(name), true) => IntentCopy {
+            button: "Generate",
+            hint: Some((format!("Creates a new app. \"{name}\" stays as it is."), String::from("Modify it instead"))),
+        },
+    }
+}
+
+/// What the hint says while a run modifies `name`; there is nothing to switch then.
+fn running_hint(name: &str) -> String {
+    format!("Modifying \"{name}\". The current version is kept.")
+}
+
+/// What the primary button asks the runtime to do. The card's own reading of the
+/// prompt is final, so a runtime reclassification can never turn Generate into a rewrite.
+fn generate_op(target: Option<&(MiniAppId, String)>, is_create_forced: bool, request: String) -> A2AppOp {
+    match (target, is_create_forced) {
+        (Some((app_id, _)), false) => A2AppOp::StartModify { app_id: app_id.clone(), request },
+        _ => A2AppOp::StartCreate { request, room_id: None },
+    }
+}
+
+/// How long Stop ignores clicks after it takes Generate's place, so a double-click
+/// on Generate doesn't cancel the run it just started.
+const STOP_ARMING: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// The card width below which the intent hint stacks its switch under the message.
+const INTENT_STACK_WIDTH: f64 = 640.0;
+
+/// A console line's height before any line was measured.
+const CONSOLE_LINE_HEIGHT: f64 = 20.0;
+/// The console scrolls once its output is taller than this.
+const CONSOLE_MAX_HEIGHT: f64 = 260.0;
+/// The console list's top plus bottom padding, which its height has to include.
+const CONSOLE_PADDING_Y: f64 = 14.0;
+
+/// Sizes the console to its output from what the last draw measured.
+#[derive(Debug, Default)]
+struct ConsoleSize {
+    /// A line count and the output's height for that many lines, measured or estimated.
+    output: (usize, f64),
+    /// The tallest height this run's output didn't fit in, so it is never picked again.
+    overflowed_at: f64,
+}
+
+impl ConsoleSize {
+    fn restart(&mut self) {
+        *self = Self::default();
+    }
+
+    /// New lines get the average height, and a point of slack keeps rounding
+    /// from scrolling the first line out.
+    fn height(&self, lines: usize) -> f64 {
+        let height = match self.output {
+            (known, height) if known > 0 => height.ceil() + 1.0 + lines.saturating_sub(known) as f64 * height / known as f64,
+            _ => lines as f64 * CONSOLE_LINE_HEIGHT,
+        };
+        let height = if height <= self.overflowed_at { self.overflowed_at + CONSOLE_LINE_HEIGHT } else { height };
+        height.clamp(CONSOLE_LINE_HEIGHT, CONSOLE_MAX_HEIGHT)
+    }
+
+    /// Records a draw at `current` height that showed `drawn` of `lines`, `drawn_height` tall.
+    fn measured(&mut self, lines: usize, drawn: usize, drawn_height: f64, current: f64) {
+        if drawn == 0 {
+            return;
+        }
+        let hidden = lines.saturating_sub(drawn) as f64 * drawn_height / drawn as f64;
+        self.output = (lines, drawn_height + hidden);
+        if drawn < lines {
+            self.overflowed_at = self.overflowed_at.max(current);
+        }
+    }
+}
+
+/// Changes whenever an app is installed, renamed or removed.
+fn apps_signature(registry: &a2app_core::manifest::AppRegistry) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for app in registry.iter() {
+        app.id.hash(&mut hasher);
+        app.name.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// How many times a second the console's spinner turns a step.
+const SPINNER_STEPS_PER_SEC: f64 = 12.0;
+
+/// The generation console's spinner. It only redraws when it turns a step, and
+/// stops asking for frames once it is no longer drawn.
+#[derive(Script, ScriptHook, Widget)]
+pub struct StepSpinner {
+    #[uid] uid: WidgetUid,
+    #[source] source: ScriptObjectRef,
+    #[redraw] #[live] draw_bg: DrawQuad,
+    #[walk] walk: Walk,
+    #[rust] next_frame: NextFrame,
+    #[rust] step: u64,
+}
+
+impl Widget for StepSpinner {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
+        let Some(frame) = self.next_frame.is_event(event) else { return };
+        let step = (frame.time * SPINNER_STEPS_PER_SEC) as u64;
+        if step == self.step {
+            self.next_frame = cx.new_next_frame();
+        } else {
+            self.step = step;
+            self.draw_bg.redraw(cx);
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.next_frame = cx.new_next_frame();
+        self.draw_bg.set_dyn_instance(cx, id!(rotation), &[(self.step % 12) as f32 / 12.0]);
+        self.draw_bg.draw_walk(cx, walk);
+        DrawStep::done()
+    }
+}
+
 // -----------------------------------------------------------------------
 // The screen itself
 // -----------------------------------------------------------------------
@@ -2281,6 +2567,23 @@ pub struct MiniAppsScreen {
     /// whether the user overrode that to create a new app anyway.
     #[rust] modify_target: Option<(MiniAppId, String)>,
     #[rust] force_create: bool,
+    /// The console's line count and last line length when last drawn, to follow new output.
+    #[rust] console_shown: (usize, usize),
+    #[rust] console_size: ConsoleSize,
+    #[rust] console_height: f64,
+    /// The run whose output the console shows, and whether its list should jump to the newest line.
+    #[rust] console_run: u64,
+    #[rust] is_console_tail_pending: bool,
+    #[rust] is_intent_stacked: bool,
+    /// When Stop took Generate's place, while a run is going.
+    #[rust] run_shown_at: Option<std::time::Instant>,
+    /// Which of the card's buttons were last shown (running, failed, active), to clear stale hover.
+    #[rust] card_buttons: (bool, bool, bool),
+    /// The installed apps the prompt was last read against.
+    #[rust] apps_seen: u64,
+    /// After the next draw: scroll the create card into view, and focus its prompt.
+    #[rust] is_card_reveal_pending: bool,
+    #[rust] is_prompt_focus_pending: bool,
     #[rust] access_editor: Option<AccessEditor>,
     #[rust] access_view: AccessView,
     #[rust] managing_agents: bool,
@@ -2338,6 +2641,12 @@ impl Widget for MiniAppsScreen {
         if let Event::Signal = event
             && (self.pane == Pane::Providers || with_a2app(|state| state.console.active).unwrap_or(false))
         {
+            self.view.redraw(cx);
+        }
+        // A reapply puts back the DSL's console height and hint layout; the next draw redoes both.
+        if matches!(event, Event::ScriptReapply | Event::LiveEdit) {
+            self.console_height = -1.0;
+            self.is_intent_stacked = false;
             self.view.redraw(cx);
         }
 
@@ -2607,7 +2916,7 @@ impl Widget for MiniAppsScreen {
         }
         if self.view.button(cx, ids!(intent_switch_button)).clicked(actions) {
             self.force_create = !self.force_create;
-            self.show_intent_hint(cx);
+            self.view.redraw(cx);
         }
         if self.view.button(cx, ids!(generate_button)).clicked(actions) {
             let request = self.view.text_input(cx, ids!(prompt_input.text_input)).text();
@@ -2615,19 +2924,17 @@ impl Widget for MiniAppsScreen {
             if request.is_empty() {
                 enqueue_popup_notification("Describe the app you want first.", PopupKind::Warning, Some(3.0));
             } else {
-                let op = match (&self.modify_target, self.force_create) {
-                    (Some((app_id, _)), false) => A2AppOp::StartModify { app_id: app_id.clone(), request },
-                    (Some(_), true) => A2AppOp::StartCreate { request, room_id: None },
-                    (None, _) => A2AppOp::StartGeneration { request, room_id: None },
-                };
-                cx.action(op);
+                // Exactly what the button and hint say; they follow the prompt and the installed apps.
+                cx.action(generate_op(self.modify_target.as_ref(), self.force_create, request));
                 self.view.redraw(cx);
             }
         }
         if self.view.button(cx, ids!(providers_button)).clicked(actions) {
             self.set_pane(cx, Pane::Providers);
         }
-        if self.view.button(cx, ids!(stop_button)).clicked(actions) {
+        if self.view.button(cx, ids!(stop_button)).clicked(actions)
+            && self.run_shown_at.is_none_or(|shown| shown.elapsed() >= STOP_ARMING)
+        {
             cx.action(A2AppOp::CancelGeneration);
         }
         if self.view.button(cx, ids!(retry_button)).clicked(actions) {
@@ -2641,6 +2948,7 @@ impl Widget for MiniAppsScreen {
         if self.view.button(cx, ids!(new_prompt_button)).clicked(actions) {
             self.view.speech_text_input(cx, ids!(prompt_input)).set_text(cx, "");
             self.reclassify(cx, "");
+            self.is_prompt_focus_pending = true;
             cx.action(A2AppOp::NewPrompt);
         }
         if self.view.button(cx, ids!(import_button)).clicked(actions) {
@@ -2705,13 +3013,7 @@ impl Widget for MiniAppsScreen {
                 cx.action(A2AppOp::ResetToStock(app_id.clone()));
             }
             if self.view.button(cx, ids!(info_modify_button)).clicked(actions) {
-                // Prefill the composer with a modify hint and go back to it.
-                let name = with_a2app(|state| {
-                    state.registry.get(&app_id).map(|a| a.name.clone())
-                }).flatten().unwrap_or_else(|| app_id.clone());
-                self.view.speech_text_input(cx, ids!(prompt_input))
-                    .set_text(cx, &format!("Change the {name} app: "));
-                self.set_pane(cx, Pane::List);
+                self.prefill_modify(cx, &app_id);
             }
             if self.view.button(cx, ids!(info_force_stop_button)).clicked(actions) {
                 cx.action(A2AppOp::ForceStop(app_id.clone()));
@@ -2837,13 +3139,27 @@ impl Widget for MiniAppsScreen {
             self.key_focus_pending = false;
             self.view.password_text_input(cx, ids!(key_input)).set_key_focus(cx);
         }
+        if self.pane == Pane::List {
+            // The card's width is only known once it is drawn; restack and draw again if it changed.
+            if self.stack_intent_hint(cx) {
+                cx.redraw_area_in_draw(self.view.area());
+            }
+            if std::mem::take(&mut self.is_card_reveal_pending) {
+                let card = self.view.widget(cx, ids!(create_section)).area();
+                let list = self.view.view(cx, ids!(list_pane)).area();
+                cx.send_trigger(list, Trigger { id: live_id!(scroll_focus_nav), from: card });
+            }
+            if std::mem::take(&mut self.is_prompt_focus_pending) {
+                self.focus_prompt(cx);
+            }
+        }
         DrawStep::done()
     }
 }
 
 impl MiniAppsScreen {
-    /// Re-reads what the create bar's text would do, the same way the
-    /// runtime will when Generate is pressed.
+    /// Reads what the create bar's text would do with the apps installed now.
+    /// Generate then does exactly that.
     fn reclassify(&mut self, cx: &mut Cx, text: &str) {
         let apps: Vec<(MiniAppId, String)> = with_a2app(|state| {
             state.registry.iter().map(|a| (a.id.clone(), a.name.clone())).collect()
@@ -2858,24 +3174,80 @@ impl MiniAppsScreen {
             self.force_create = false;
         }
         self.modify_target = target;
-        self.show_intent_hint(cx);
+        self.view.redraw(cx);
     }
 
-    fn show_intent_hint(&mut self, cx: &mut Cx) {
-        let Some((_, name)) = &self.modify_target else {
-            self.view.widget(cx, ids!(intent_hint)).set_visible(cx, false);
-            self.view.redraw(cx);
-            return;
+    /// Labels the primary button for what the prompt will do. While a run is going,
+    /// the hint names the app it modifies (`running_target`), with nothing to switch.
+    fn show_intent(&mut self, cx: &mut Cx, is_running: bool, running_target: Option<&str>) {
+        let copy = intent_copy(self.modify_target.as_ref().map(|(_, name)| name.as_str()), self.force_create);
+        self.view.button(cx, ids!(generate_button)).set_text(cx, copy.button);
+        let hint = match is_running {
+            true => running_target.map(|name| (running_hint(name), None, false)),
+            false => copy.hint.map(|(hint, switch)| (hint, Some(switch), self.force_create)),
         };
-        let (label, switch) = if self.force_create {
-            (format!("Creates a new app; \"{name}\" stays as it is"), format!("Rewrite \"{name}\" instead"))
+        self.view.widget(cx, ids!(intent_hint)).set_visible(cx, hint.is_some());
+        let Some((hint, switch, is_create)) = hint else { return };
+        self.view.label(cx, ids!(intent_label)).set_text(cx, &hint);
+        self.view.widget(cx, ids!(intent_switch_button)).set_visible(cx, switch.is_some());
+        if let Some(switch) = switch {
+            self.view.button(cx, ids!(intent_switch_button)).set_text(cx, &switch);
+        }
+        self.view.widget(cx, ids!(intent_modify_icon)).set_visible(cx, !is_create);
+        self.view.widget(cx, ids!(intent_create_icon)).set_visible(cx, is_create);
+    }
+
+    /// Prefills the prompt to modify `app_id`, then brings the card into view with the caret at the end.
+    fn prefill_modify(&mut self, cx: &mut Cx, app_id: &MiniAppId) {
+        let name = with_a2app(|state| state.registry.get(app_id).map(|a| a.name.clone())).flatten()
+            .unwrap_or_else(|| app_id.clone());
+        let text = format!("Change the {name} app: ");
+        // Setting the text emits no change, so read it here.
+        self.view.speech_text_input(cx, ids!(prompt_input)).set_text(cx, &text);
+        self.reclassify(cx, &text);
+        self.set_pane(cx, Pane::List);
+        self.is_card_reveal_pending = true;
+        self.is_prompt_focus_pending = true;
+    }
+
+    /// Gives the prompt key focus with the caret after its text.
+    fn focus_prompt(&mut self, cx: &mut Cx) {
+        let input = self.view.text_input(cx, ids!(prompt_input.text_input));
+        let end = input.text().len();
+        input.set_cursor(cx, makepad_widgets::text::selection::Cursor { index: end, prefer_next_row: false }, false);
+        input.take_key_focus(cx);
+    }
+
+    /// On a narrow card, puts the hint's switch under its message instead of squeezing both into one row.
+    /// Called after a draw, with the card's new width; returns whether the layout changed.
+    fn stack_intent_hint(&mut self, cx: &mut Cx) -> bool {
+        let width = self.view.widget(cx, ids!(create_section)).area().rect(cx).size.x;
+        let is_stacked = width > 0.0 && width < INTENT_STACK_WIDTH;
+        if width == 0.0 || is_stacked == self.is_intent_stacked {
+            return false;
+        }
+        self.is_intent_stacked = is_stacked;
+        let mut hint = self.view.widget(cx, ids!(intent_hint));
+        let mut body = self.view.widget(cx, ids!(intent_body));
+        let mut switch = self.view.widget(cx, ids!(intent_switch_button));
+        if is_stacked {
+            script_apply_eval!(cx, hint, {
+                align: mod.prelude.widgets.Align{y: 0.0}
+                padding: mod.prelude.widgets.Inset{top: 10, bottom: 10, left: 12, right: 4}
+            });
+            script_apply_eval!(cx, body, { flow: mod.prelude.widgets.Down, spacing: 2 });
+            // Lines the link's text up with the message; its hover tint uses the insets,
+            // and the hint keeps even insets while a run hides the link.
+            script_apply_eval!(cx, switch, { margin: mod.prelude.widgets.Inset{left: -10, bottom: -6} });
         } else {
-            (format!("Rewrites \"{name}\" (the current version is kept)"), String::from("Create a new app instead"))
-        };
-        self.view.label(cx, ids!(intent_label)).set_text(cx, &label);
-        self.view.button(cx, ids!(intent_switch_button)).set_text(cx, &switch);
-        self.view.widget(cx, ids!(intent_hint)).set_visible(cx, true);
-        self.view.redraw(cx);
+            script_apply_eval!(cx, hint, {
+                align: mod.prelude.widgets.Align{y: 0.5}
+                padding: mod.prelude.widgets.Inset{top: 4, bottom: 4, left: 12, right: 4}
+            });
+            script_apply_eval!(cx, body, { flow: mod.prelude.widgets.Right, spacing: 8 });
+            script_apply_eval!(cx, switch, { margin: mod.prelude.widgets.Inset{left: 0, bottom: 0} });
+        }
+        true
     }
 
     fn set_pane(&mut self, cx: &mut Cx, pane: Pane) {
@@ -3147,22 +3519,65 @@ impl MiniAppsScreen {
         }
         match self.pane {
             Pane::List => {
-                let (any_apps, console) = with_a2app(|state| {
-                    (
-                        state.registry.iter().next().is_some(),
-                        (state.console.active, state.console.status.clone(),
-                         state.generation.is_some(), state.failed_request.is_some(), state.console.review_context.is_some()),
-                    )
-                }).unwrap_or((false, (false, String::new(), false, false, false)));
-                self.view.widget(cx, ids!(no_apps_label)).set_visible(cx, !any_apps);
-                let (active, status, running, can_retry, can_review) = console;
-                self.view.widget(cx, ids!(console_section)).set_visible(cx, active);
-                if active {
+                let (are_apps_installed, is_active, status, lines, is_running, is_retryable, is_reviewable, was_installed) = with_a2app(|state| (
+                    state.registry.iter().next().is_some(), state.console.active, state.console.status.clone(),
+                    state.console.lines.len(), state.generation.is_some(), state.failed_request.is_some(),
+                    state.console.review_context.is_some(), state.console.was_installed,
+                )).unwrap_or_default();
+                let (run, running_target, apps) = with_a2app(|state| (
+                    state.console.run,
+                    state.generation.as_ref().and_then(|generation| generation.refine_target())
+                        .map(|id| state.registry.get(id).map_or_else(|| id.clone(), |app| app.name.clone())),
+                    apps_signature(&state.registry),
+                )).unwrap_or_default();
+                // Installs, renames and uninstalls change what the prompt refers to.
+                if apps != self.apps_seen {
+                    self.apps_seen = apps;
+                    let text = self.view.text_input(cx, ids!(prompt_input.text_input)).text();
+                    self.reclassify(cx, &text);
+                }
+                self.view.widget(cx, ids!(no_apps_label)).set_visible(cx, !are_apps_installed);
+                self.show_intent(cx, is_running, running_target.as_deref());
+                let is_failed = is_active && !is_running && is_retryable;
+                let buttons = (is_running, is_failed, is_active);
+                if buttons != self.card_buttons {
+                    // A button hidden under the pointer would come back showing its hover.
+                    self.card_buttons = buttons;
+                    for button in [ids!(generate_button), ids!(stop_button), ids!(retry_button), ids!(review_permissions_button), ids!(new_prompt_button)] {
+                        self.view.button(cx, button).reset_hover(cx);
+                    }
+                }
+                match (is_running, self.run_shown_at) {
+                    (true, None) => self.run_shown_at = Some(std::time::Instant::now()),
+                    (false, Some(_)) => self.run_shown_at = None,
+                    _ => {}
+                }
+                self.view.widget(cx, ids!(generate_button)).set_visible(cx, !is_running);
+                self.view.widget(cx, ids!(stop_button)).set_visible(cx, is_running);
+                self.view.widget(cx, ids!(console_section)).set_visible(cx, is_active);
+                if is_active {
                     self.view.label(cx, ids!(console_status)).set_text(cx, &status);
-                    self.view.widget(cx, ids!(stop_button)).set_visible(cx, running);
-                    self.view.widget(cx, ids!(retry_button)).set_visible(cx, !running && can_retry);
-                    self.view.widget(cx, ids!(review_permissions_button)).set_visible(cx, !running && can_review);
-                    self.view.widget(cx, ids!(new_prompt_button)).set_visible(cx, !running);
+                    self.view.widget(cx, ids!(console_spinner)).set_visible(cx, is_running);
+                    self.view.widget(cx, ids!(console_done_icon)).set_visible(cx, !is_running && was_installed);
+                    self.view.widget(cx, ids!(console_failed_icon)).set_visible(cx, is_failed);
+                    self.view.widget(cx, ids!(console_info_icon)).set_visible(cx, !is_running && !was_installed && !is_failed);
+                    self.view.widget(cx, ids!(console_actions)).set_visible(cx, !is_running);
+                    self.view.widget(cx, ids!(retry_button)).set_visible(cx, is_failed);
+                    self.view.widget(cx, ids!(review_permissions_button)).set_visible(cx, !is_running && is_reviewable);
+                    self.view.widget(cx, ids!(new_prompt_button)).set_visible(cx, !is_running);
+                    self.view.widget(cx, ids!(console_output)).set_visible(cx, lines > 0);
+                    // A new run starts small and shows its output from the newest line.
+                    if run != self.console_run {
+                        self.console_run = run;
+                        self.console_size.restart();
+                        self.is_console_tail_pending = true;
+                    }
+                    let height = self.console_size.height(lines);
+                    if (height - self.console_height).abs() > 0.5 {
+                        self.console_height = height;
+                        let mut list = self.view.widget(cx, ids!(console_list));
+                        script_apply_eval!(cx, list, { height: #(height + CONSOLE_PADDING_Y) });
+                    }
                 }
             }
             Pane::Info => {
@@ -3450,13 +3865,33 @@ impl MiniAppsScreen {
     }
 
     fn draw_console_list(&mut self, cx: &mut Cx2d, list: &mut PortalList) {
-        let count = with_a2app(|state| state.console.lines.len()).unwrap_or(0);
+        let shown = with_a2app(|state| (state.console.lines.len(), state.console.lines.last().map_or(0, String::len)))
+            .unwrap_or_default();
+        let count = shown.0;
+        // A new run's output replaces the last one's, so show it from its end again,
+        // even if the old output was scrolled past where the new one ends.
+        if std::mem::take(&mut self.is_console_tail_pending) || list.first_id() >= count.max(1) {
+            list.set_first_id_and_scroll(count.saturating_sub(1), 0.0);
+            list.set_tail_range(true);
+        }
+        // The list scrolls to its new end on the frame after its output grows, so ask for that frame.
+        if shown != self.console_shown {
+            self.console_shown = shown;
+            cx.redraw_area_in_draw(list.area());
+        }
         list.set_item_range(cx, 0, count);
+        let mut drawn = Vec::new();
         while let Some(item_id) = list.next_visible_item(cx) {
             let Some(line) = with_a2app(|state| state.console.lines.get(item_id).cloned()).flatten() else { continue };
             let item = list.item(cx, item_id, id!(ConsoleLine));
             item.set_text(cx, &line);
             item.draw_all(cx, &mut Scope::empty());
+            drawn.push(item_id);
+        }
+        let height = drawn.iter().filter_map(|&item_id| list.drawn_slot(item_id)).map(|slot| slot.size).sum();
+        self.console_size.measured(count, drawn.len(), height, self.console_height);
+        if (self.console_size.height(count) - self.console_height).abs() > 0.5 {
+            cx.redraw_area_in_draw(list.area());
         }
     }
 
@@ -4879,5 +5314,126 @@ mod access_tests {
         assert!(ops.iter().any(|op| matches!(op, A2AppOp::SetRoomPolicy { access: RoomAccess::Write, decision: PolicyDecision::Deny, .. })));
         assert!(ops.iter().any(|op| matches!(op, A2AppOp::SetSpacePolicy { access: RoomAccess::Write, decision: PolicyDecision::Deny, .. })));
         assert!(!ops.iter().any(|op| matches!(op, A2AppOp::SetGlobalPolicy { .. } | A2AppOp::SetPolicyMode { .. })));
+    }
+}
+
+#[cfg(test)]
+mod create_card_tests {
+    use super::*;
+
+    #[test]
+    fn a_prompt_naming_an_app_offers_modify_or_a_new_app() {
+        assert_eq!(intent_copy(None, false), IntentCopy { button: "Generate", hint: None });
+        let modify = intent_copy(Some("Calculator"), false);
+        assert_eq!(modify.button, "Modify app");
+        assert_eq!(modify.hint, Some((
+            String::from("Modifies \"Calculator\". The current version is kept."),
+            String::from("Create a new app instead"),
+        )));
+        // The switch stays short however long the app's name is; the message names it.
+        let create = intent_copy(Some("Neighborhood Weekend Farmers Market Planner Pro"), true);
+        assert_eq!(create.button, "Generate");
+        assert_eq!(create.hint, Some((
+            String::from("Creates a new app. \"Neighborhood Weekend Farmers Market Planner Pro\" stays as it is."),
+            String::from("Modify it instead"),
+        )));
+    }
+
+    #[test]
+    fn generate_does_what_its_label_says() {
+        let target = (String::from("reminder"), String::from("Reminder"));
+        let is_modify = |op: A2AppOp| matches!(op, A2AppOp::StartModify { app_id, .. } if app_id == "reminder");
+        let is_create = |op: A2AppOp| matches!(op, A2AppOp::StartCreate { room_id: None, .. });
+        assert!(is_modify(generate_op(Some(&target), false, "make the reminder app blue".into())));
+        assert!(is_create(generate_op(Some(&target), true, "make the reminder app blue".into())));
+        // Never left for the runtime to reclassify, which could still pick a rewrite.
+        assert!(is_create(generate_op(None, false, "make the reminder app blue".into())));
+    }
+
+    #[test]
+    fn console_grows_with_its_output_up_to_a_cap() {
+        // A fresh console starts one line tall, not at the cap.
+        assert_eq!(ConsoleSize::default().height(1), CONSOLE_LINE_HEIGHT);
+        let mut size = ConsoleSize::default();
+        // Before anything was measured, each line gets the default height.
+        assert_eq!(size.height(2), 2.0 * CONSOLE_LINE_HEIGHT);
+        // Measured lines keep their height and new lines get the average.
+        size.measured(2, 2, 37.5, 40.0);
+        assert_eq!(size.height(2), 39.0);
+        assert_eq!(size.height(3), 39.0 + 18.75);
+        assert_eq!(size.height(500), CONSOLE_MAX_HEIGHT);
+        // The new line was taller than average, so only two of three fit: grow to the estimate.
+        size.measured(3, 2, 39.75, 57.75);
+        assert_eq!(size.height(3), 61.0);
+        size.measured(3, 3, 58.5, 61.0);
+        assert_eq!(size.height(3), 60.0);
+        // Never back down to a height the output already overflowed.
+        size.measured(3, 3, 56.0, 60.0);
+        assert_eq!(size.height(3), 57.75 + CONSOLE_LINE_HEIGHT);
+        // Long output scrolls at the cap, and a new run starts small again.
+        size.measured(40, 12, 240.0, CONSOLE_MAX_HEIGHT);
+        assert_eq!(size.height(40), CONSOLE_MAX_HEIGHT);
+        size.restart();
+        assert_eq!(size.height(1), CONSOLE_LINE_HEIGHT);
+    }
+
+    fn screen(cx: &mut Cx) -> WidgetRef {
+        super::super::runtime::initialize_background_test(a2app_core::builtin::stock("reminder").unwrap());
+        cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm);
+            crate::a2app::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
+            WidgetRef::script_from_value(vm, value)
+        })
+    }
+
+    #[test]
+    fn rewrite_prompt_turns_generate_into_modify_until_a_new_app_is_chosen() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = screen(&mut cx);
+        let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
+
+        screen.reclassify(&mut cx, "make the reminder app blue");
+        screen.show_intent(&mut cx, false, None);
+        assert_eq!(screen.view.widget(&cx, ids!(generate_button)).text(), "Modify app");
+        assert_eq!(screen.view.widget(&cx, ids!(intent_label)).text(), "Modifies \"Reminder\". The current version is kept.");
+        assert!(screen.view.widget(&cx, ids!(intent_hint)).visible());
+
+        let switch = screen.view.button(&cx, ids!(intent_switch_button)).widget_uid();
+        let clicks = cx.capture_actions(|cx| cx.widget_action(switch, ButtonAction::Clicked(Default::default())));
+        screen.handle_event(&mut cx, &Event::Actions(clicks), &mut Scope::empty());
+        screen.show_intent(&mut cx, false, None);
+        assert_eq!(screen.view.widget(&cx, ids!(generate_button)).text(), "Generate");
+        assert_eq!(screen.view.widget(&cx, ids!(intent_switch_button)).text(), "Modify it instead");
+        assert!(screen.view.widget(&cx, ids!(intent_create_icon)).visible());
+
+        // While a run modifies an app, the hint names it, with nothing to switch.
+        screen.show_intent(&mut cx, true, Some("Reminder"));
+        assert!(screen.view.widget(&cx, ids!(intent_hint)).visible());
+        assert_eq!(screen.view.widget(&cx, ids!(intent_label)).text(), "Modifying \"Reminder\". The current version is kept.");
+        assert!(!screen.view.widget(&cx, ids!(intent_switch_button)).visible());
+        // A run that creates an app has nothing to say there.
+        screen.show_intent(&mut cx, true, None);
+        assert!(!screen.view.widget(&cx, ids!(intent_hint)).visible());
+
+        screen.reclassify(&mut cx, "a pomodoro timer");
+        screen.show_intent(&mut cx, false, None);
+        assert_eq!(screen.view.widget(&cx, ids!(generate_button)).text(), "Generate");
+        assert!(!screen.view.widget(&cx, ids!(intent_hint)).visible());
+    }
+
+    #[test]
+    fn modify_with_ai_prefills_a_prompt_that_reads_as_modify() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = screen(&mut cx);
+        let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
+        screen.prefill_modify(&mut cx, &String::from("reminder"));
+        screen.show_intent(&mut cx, false, None);
+        assert_eq!(screen.view.text_input(&cx, ids!(prompt_input.text_input)).text(), "Change the Reminder app: ");
+        assert_eq!(screen.view.widget(&cx, ids!(generate_button)).text(), "Modify app");
+        assert!(screen.view.widget(&cx, ids!(intent_hint)).visible());
+        assert!(screen.is_card_reveal_pending && screen.is_prompt_focus_pending);
     }
 }

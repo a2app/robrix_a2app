@@ -5,10 +5,145 @@
 // permissions: matrix-room-info, matrix.room.info.read
 // why-matrix-room-info: Shows this room's name, topic, and settings.
 
+let PrimaryButton = Button{
+    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
+    draw_bg +: {
+        border_size: 0.0 border_radius: 4.0
+        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+}
+let NeutralButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
+        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+}
+
 let info_loading = false
 let info_loaded = false
 
 let loaded = false
+let details = []
+let is_narrow = false
+let is_tiny = false
+
+fn join_text(rule){
+    if rule == "public" { return "Anyone" }
+    if rule == "invite" { return "Invite only" }
+    if rule == "knock" { return "Ask to join" }
+    if rule == "restricted" { return "Space members" }
+    if rule == "knock_restricted" { return "Space members or ask to join" }
+    if rule == "private" { return "Private" }
+    if !rule.is_string() || rule == "" || rule == "unknown" { return "Unknown" }
+    return rule
+}
+
+fn history_text(rule){
+    if rule == "world_readable" { return "Anyone" }
+    if rule == "shared" { return "Members (all history)" }
+    if rule == "invited" { return "Members (since invited)" }
+    if rule == "joined" { return "Members (since joining)" }
+    if !rule.is_string() || rule == "" { return "Unknown" }
+    return rule
+}
+
+// 1284 -> "1,284"
+fn count_text(n){
+    if !n.is_number() { return "Unknown" }
+    if n < 1000 { return "" + n }
+    let rest = n % 1000
+    let pad = "" + rest
+    if rest < 10 { pad = "00" + pad } elif rest < 100 { pad = "0" + pad }
+    return count_text(floor(n / 1000)) + "," + pad
+}
+
+let lower_az = "abcdefghijklmnopqrstuvwxyz"
+let upper_az = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+let error_prefix = regex("^[Cc]ouldn't [^:]*: ")
+
+// "couldn't load room info: the server timed out" -> "The server timed out."
+fn sentence(text){
+    let t = text.replace(error_prefix, "")
+    let chars = t.split("")
+    if chars.len() < 3 { return t }
+    let i = lower_az.search(chars[1])
+    if chars[1].len() == 1 && i >= 0 { t = upper_az.split("")[i + 1] + t.strip_prefix(chars[1]) }
+    let last = chars[chars.len() - 2]
+    if last != "." && last != "!" && last != "?" { t = t + "." }
+    return t
+}
+
+fn is_denial(error){
+    return error.search("denied") >= 0 || error.search("not approved") >= 0 || error.search("blocked") >= 0
+}
+
+fn set_status(text, is_error){
+    ui.note.set_text(text)
+    ui.note_err.set_text(text)
+    ui.note_wrap.set_visible(text != "" && !is_error)
+    ui.note_err_wrap.set_visible(text != "" && is_error)
+}
+
+fn show_state(state){
+    ui.loading_wrap.set_visible(state == "loading")
+    ui.info_wrap.set_visible(state == "info")
+    ui.empty_wrap.set_visible(state == "empty")
+}
+
+fn show_info(d){
+    ui.room_name.set_text(d.room_name)
+    let alias = d["alias"]
+    let has_alias = alias.is_string() && alias != ""
+    ui.alias_wrap.set_visible(has_alias)
+    if has_alias { ui.room_alias.set_text(alias) }
+    let topic = d.topic
+    if !topic.is_string() { topic = "" }
+    ui.room_topic.set_text(topic)
+    ui.topic_wrap.set_visible(topic != "")
+    ui.no_topic_wrap.set_visible(topic == "")
+    let enc = "Off"
+    if d.encrypted { enc = "🔒 On" }
+    details = [
+        {label: "Members" value: count_text(d.member_count) top: false},
+        {label: "Encryption" value: enc top: true},
+        {label: "Who can join" value: join_text(d.join_rule) top: true},
+        {label: "History visible to" value: history_text(d.history_visibility) top: true}
+    ]
+    ui.details.render()
+    set_status("", false)
+    show_state("info")
+}
+
+// A failed refresh keeps what was shown; a failed first load explains itself.
+fn show_failure(error){
+    if loaded {
+        set_status("Couldn't refresh. " + sentence(error), true)
+        return nil
+    }
+    let no_room = error.search("not attached") >= 0
+    let denied = !no_room && is_denial(error)
+    let icon = "😕"
+    let title = "Couldn't load room details"
+    let detail = sentence(error)
+    if denied {
+        icon = "🔒"
+        title = "Can't see room details"
+        // A block names where to change it; other refusals get the usual line.
+        if error.search("App Info") < 0 { detail = "Allow Room Info to read this room's details." }
+    }
+    if no_room {
+        icon = "🧭"
+        title = "No room attached"
+        detail = "Open Room Info from a room to see its details."
+    }
+    ui.empty_icon.set_text(icon)
+    ui.empty_title.set_text(title)
+    ui.empty_detail.set_text(detail)
+    ui.empty_btn_wrap.set_visible(!no_room && !denied)
+    ui.ask_btn_wrap.set_visible(!no_room && denied)
+    show_state("empty")
+}
 
 fn load(){
     if info_loading { return nil }
@@ -18,25 +153,26 @@ fn load(){
         info_loaded = r.is_ok
         if r.is_ok {
             loaded = true
-            ui.room_name.set_text(r.data.room_name)
-            let topic = r.data.topic
-            if topic == "" { topic = "(no topic set)" }
-            ui.room_topic.set_text(topic)
-            ui.row_members.set_text("Members:  " + r.data.member_count)
-            let enc = "No"
-            if r.data.encrypted { enc = "Yes" }
-            ui.row_encrypted.set_text("Encrypted:  " + enc)
-            ui.row_join.set_text("Join rule:  " + r.data.join_rule)
-            ui.row_history.set_text("History:  " + r.data.history_visibility)
-            let alias = r.data.alias
-            ui.address_wrap.set_visible(!alias.is_nil())
-            if !alias.is_nil() { ui.row_alias.set_text(alias) }
-            ui.note.set_text("")
+            show_info(r.data)
             return nil
         }
-        if !loaded { ui.room_name.set_text("Not available") }
-        ui.note.set_text(r.error)
+        show_failure(r.error)
     })
+}
+
+// Narrow panes stack each detail; tiny ones give the room name the full width.
+fn on_app_resize(w, h){
+    let tiny = w < 300
+    if tiny != is_tiny {
+        is_tiny = tiny
+        ui.refresh_wide.set_visible(!tiny)
+        ui.refresh_narrow.set_visible(tiny)
+    }
+    let narrow = w < 360
+    if narrow == is_narrow { return nil }
+    is_narrow = narrow
+    if loaded { ui.details.render() }
+    return nil
 }
 
 fn on_permissions_changed(caps){
@@ -47,63 +183,129 @@ fn on_permissions_changed(caps){
 let _boot = start_timeout(0.05, || load())
 
 View{
-    width: Fill height: Fill flow: Down align: Align{x: 0.5}
+    width: Fill height: Fill flow: Down
     col := ScrollYView{
-        width: Fill height: Fill flow: Down spacing: 10 padding: 14
-        room_name := Label{
-            text: "Loading…" padding: 0 margin: 0
-            width: Fill
-            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }
-        }
-        room_topic := Label{
-            text: "" padding: 0 margin: 0
-            width: Fill
-            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
-        }
-        RoundedView{
-            width: Fill height: Fit flow: Down spacing: 8 padding: 14
-            show_bg: true
-            draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
-            row_members := Label{
-                text: "Members:  …" width: Fill padding: 0 margin: 0
-                draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
-            }
-            row_encrypted := Label{
-                text: "Encrypted:  …" width: Fill padding: 0 margin: 0
-                draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
-            }
-            row_join := Label{
-                text: "Join rule:  …" width: Fill padding: 0 margin: 0
-                draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
-            }
-            row_history := Label{
-                text: "History:  …" width: Fill padding: 0 margin: 0
-                draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
-            }
-        }
-        address_wrap := View{
-            width: Fill height: Fit flow: Down spacing: 2 visible: false
+        width: Fill height: Fill flow: Down spacing: 12 padding: 14
+        loading_wrap := View{
+            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 10 wrap_spacing: 8 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24}
+            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
             Label{
-                text: "ADDRESS" padding: 0 margin: 0
-                draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
-            }
-            row_alias := Label{
-                text: "" padding: 0 margin: 0
-                width: Fill
-                draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 11} }
+                text: "Loading room details…" padding: 0 margin: 0
+                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} }
             }
         }
-        View{
-            width: Fill height: Fit flow: Right align: Align{x: 0.5}
-            Button{
-                text: "Refresh" on_click: || load()
-                draw_text +: { color: #x1C274C }
+        info_wrap := View{
+            width: Fill height: Fit flow: Down spacing: 12 visible: false
+            View{
+                width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                View{
+                    width: Fill height: Fit flow: Down spacing: 3
+                    room_name := Label{
+                        text: "" width: Fill padding: 0 margin: 0
+                        draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} }
+                    }
+                    alias_wrap := View{
+                        width: Fill height: Fit visible: false
+                        room_alias := Label{
+                            text: "" width: Fill padding: 0 margin: 0
+                            draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                        }
+                    }
+                }
+                refresh_wide := View{
+                    width: Fit height: Fit
+                    NeutralButton{ text: "Refresh" on_click: || load() }
+                }
+            }
+            topic_wrap := View{
+                width: Fill height: Fit visible: false
+                room_topic := Label{
+                    text: "" width: Fill padding: 0 margin: 0
+                    draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} }
+                }
+            }
+            no_topic_wrap := View{
+                width: Fill height: Fit visible: false
+                Label{
+                    text: "No topic set." width: Fill padding: 0 margin: 0
+                    draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                }
+            }
+            RoundedView{
+                width: Fill height: Fit padding: Inset{left: 12 right: 12 top: 2 bottom: 2}
+                show_bg: true
+                draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                details := View{
+                    width: Fill height: Fit flow: Down
+                    on_render: || {
+                        for d in details {
+                            if d.top {
+                                RoundedView{ width: Fill height: 1 show_bg: true draw_bg +: { color: #xDCE4F2 border_radius: 0.0 } }
+                            }
+                            if is_narrow {
+                                View{
+                                    width: Fill height: Fit flow: Down spacing: 3 padding: Inset{top: 9 bottom: 9}
+                                    Label{ text: d.label width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                                    Label{ text: d.value width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 11} } }
+                                }
+                            } else {
+                                View{
+                                    width: Fill height: Fit flow: Right spacing: 8 padding: Inset{top: 10 bottom: 10}
+                                    Label{ text: d.label width: 128 padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 11} } }
+                                    Label{ text: d.value width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 11} } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            note_wrap := View{
+                width: Fill height: Fit visible: false
+                note := Label{
+                    text: "" width: Fill padding: 0 margin: 0
+                    draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                }
+            }
+            note_err_wrap := View{
+                width: Fill height: Fit visible: false
+                note_err := Label{
+                    text: "" width: Fill padding: 0 margin: 0
+                    draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} }
+                }
+            }
+            refresh_narrow := View{
+                width: Fill height: Fit visible: false
+                NeutralButton{ text: "Refresh" on_click: || load() }
             }
         }
-        note := Label{
-            text: "" padding: 0 margin: 0
-            width: Fill
-            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
+        empty_wrap := View{
+            width: Fill height: Fit visible: false
+            RoundedView{
+                width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5}
+                padding: Inset{top: 20 bottom: 20 left: 16 right: 16}
+                show_bg: true
+                draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                empty_icon := Label{
+                    text: "😕" padding: 0 margin: 0
+                    draw_text +: { text_style: theme.font_regular{font_size: 28} }
+                }
+                empty_title := Label{
+                    text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
+                    draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} }
+                }
+                empty_detail := Label{
+                    text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
+                    draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} }
+                }
+                empty_btn_wrap := View{
+                    width: Fit height: Fit margin: Inset{top: 6}
+                    empty_btn := NeutralButton{ text: "Try again" on_click: || load() }
+                }
+                ask_btn_wrap := View{
+                    width: Fit height: Fit margin: Inset{top: 6} visible: false
+                    PrimaryButton{ text: "Ask again" on_click: || load() }
+                }
+            }
         }
     }
 }

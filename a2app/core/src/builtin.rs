@@ -316,10 +316,13 @@ fn permissions_for(id: &str) -> Vec<String> {
         "room-tools" => &["matrix-room-read", "matrix-room-info", "matrix-room-manage", "clipboard-write", "robrix-navigation"],
         "spaces" => &["matrix-spaces", "matrix-rooms-list", "robrix-navigation", "matrix-membership"],
         "inbox" => &["matrix-rooms-list", "robrix-navigation", "matrix-membership"],
-        "room-stats" => &["matrix-room-read", "matrix-room-info", "robrix-navigation"],
+        "room-stats" => &["matrix-room-read", "matrix-room-info", "robrix-navigation", "device-info"],
         "account" => &["matrix-profile", "matrix-account-read", "matrix-users", "open-url", "robrix-navigation"],
         "inspector" => &["robrix-ui", "robrix-preferences", "robrix-observe", "device-info"],
         "room-pins" => &["matrix-room-read", "robrix-navigation", "matrix-room-info"],
+        "link-library" => &["matrix-room-read", "matrix-room-watch", "open-url", "clipboard-write", "robrix-navigation"],
+        "translator" => &["matrix-room-read", "matrix-room-watch", "network", "robrix-composer", "clipboard-write", "device-info"],
+        "room-gallery" => &["matrix-room-read", "matrix-room-watch", "matrix-media", "robrix-navigation", "robrix-composer", "device-info"],
         _ => &[],
     };
     p.iter().map(|x| x.to_string()).collect()
@@ -420,6 +423,7 @@ fn reasons_for(id: &str) -> std::collections::BTreeMap<String, String> {
             ("matrix-room-read", "Reads this room's messages to count who posts and when."),
             ("matrix-room-info", "Shows your power level and what it lets you do here."),
             ("robrix-navigation", "Opens the profile of a sender you tap."),
+            ("device-info", "Counts busy hours and weekdays in your own time zone."),
         ],
         "account" => &[
             ("matrix-profile", "Shows your display name and user id."),
@@ -433,6 +437,29 @@ fn reasons_for(id: &str) -> std::collections::BTreeMap<String, String> {
             ("robrix-preferences", "Shows Robrix's display settings and follows changes to them."),
             ("robrix-observe", "Logs which room and screen you switch to, so you can see what an app would see."),
             ("device-info", "Shows what this device reports about itself."),
+        ],
+        "link-library" => &[
+            ("matrix-room-read", "Reads this room's messages to collect the links people shared."),
+            ("matrix-room-watch", "Adds links from new messages as they arrive, and drops deleted ones."),
+            ("open-url", "Opens a link in your browser when you tap Open."),
+            ("clipboard-write", "Copies a link when you tap Copy."),
+            ("robrix-navigation", "Jumps to the message that shared a link, and opens Matrix links in Robrix."),
+        ],
+        "translator" => &[
+            ("matrix-room-read", "Shows this room's recent messages so you can translate them."),
+            ("matrix-room-watch", "Translates new messages as they arrive, when you turn that on."),
+            ("network", "Sends the messages and text you translate to your translation service (MyMemory unless you choose another)."),
+            ("robrix-composer", "Puts your translated reply in the message box for you to review and send."),
+            ("clipboard-write", "Copies a translation when you tap Copy."),
+            ("device-info", "Uses your device's language and time zone for the default translation language and message dates."),
+        ],
+        "room-gallery" => &[
+            ("matrix-room-read", "Finds the photos, videos, audio and files shared in this room."),
+            ("matrix-room-watch", "Adds new attachments as they arrive, and drops deleted ones."),
+            ("matrix-media", "Downloads previews of the photos and videos you see here, and the whole file only when you choose Share again."),
+            ("robrix-navigation", "Shows an attachment's message in the chat when you tap Show in chat."),
+            ("robrix-composer", "Puts an attachment in the message box for you to review and send, when you tap Share again."),
+            ("device-info", "Shows when each attachment was shared in your own time zone and clock format."),
         ],
         _ => &[],
     };
@@ -467,6 +494,9 @@ pub fn builtin_apps() -> Vec<MiniAppManifest> {
         app("room-stats", "Room Stats", "📊", 0x2A9D8F, app_source!("room_stats.splash")),
         app("account", "Account", "🪪", 0x386FA4, app_source!("account.splash")),
         app("inspector", "Inspector", "🛠", 0x546E7A, app_source!("inspector.splash")),
+        app("link-library", "Link Library", "🔗", 0x2F6FDE, app_source!("link_library.splash")),
+        app("translator", "Translator", "🌍", 0x2B8A3E, app_source!("translator.splash")),
+        app("room-gallery", "Room Gallery", "🖼", 0xC2255C, app_source!("room_gallery.splash")),
     ]
 }
 
@@ -717,7 +747,7 @@ mod tests {
     #[test]
     fn catalog_matches_the_splash_headers() {
         let apps = builtin_apps();
-        assert_eq!(apps.len(), 20);
+        assert_eq!(apps.len(), 23);
         for m in &apps {
             assert!(m.builtin);
             assert!(m.widget.is_none());
@@ -742,12 +772,15 @@ mod tests {
     fn composing_builtins_keep_drafting_separate_from_sending() {
         use crate::permissions::{Effective, GrantState, Permission, PermissionContext, PermissionStore};
         let composers = ["website-watch", "room-peek", "roll-call", "simple-watcher", "watcher"];
+        // These only prepare drafts; they never post.
+        let drafters = ["translator", "room-gallery"];
         let context = PermissionContext { origin_room: Some("!room:test"), target_room: Some("!room:test") };
         for manifest in builtin_apps() {
             let composes = composers.contains(&manifest.id.as_str());
-            assert_eq!(manifest.declares(Permission::RobrixComposer), composes, "{}", manifest.id);
+            let drafts = composes || drafters.contains(&manifest.id.as_str());
+            assert_eq!(manifest.declares(Permission::RobrixComposer), drafts, "{}", manifest.id);
             assert_eq!(manifest.declares(Permission::MatrixRoomSend), composes, "{}", manifest.id);
-            if !composes { continue; }
+            if !drafts { continue; }
             let mut permissions = PermissionStore::default();
             permissions.set(&manifest.id, Permission::MatrixRoomSend, GrantState::Denied);
             permissions.set(&manifest.id, Permission::MatrixMedia, GrantState::Denied);
@@ -757,19 +790,22 @@ mod tests {
                 assert_eq!(cap.flow_contract().unwrap().output, crate::capabilities::FlowOutput::Local);
             }
             assert_eq!(permissions.effective_capability_in_context(&manifest,
-                crate::capabilities::by_id("matrix.room.message.send").unwrap(), context), Effective::Denied);
+                crate::capabilities::by_id("matrix.room.message.send").unwrap(), context),
+                if composes { Effective::Denied } else { Effective::Undeclared });
             assert!(!permissions.matrix_write());
             // Built-ins declare only the composer operations used by their
             // foreground controls; automatic watcher/background actions send
             // under the separately declared send capability.
-            assert!(manifest.declares_capability(crate::capabilities::by_id("host.composer.insert").unwrap()));
-            assert_eq!(manifest.declares_capability(crate::capabilities::by_id("host.composer.attach").unwrap()), manifest.id == "room-peek");
+            let attaches = matches!(manifest.id.as_str(), "room-peek" | "room-gallery");
+            assert_eq!(manifest.declares_capability(crate::capabilities::by_id("host.composer.insert").unwrap()), manifest.id != "room-gallery");
+            assert_eq!(manifest.declares_capability(crate::capabilities::by_id("host.composer.attach").unwrap()), attaches);
             assert!(!manifest.declares_capability(crate::capabilities::by_id("host.composer.reply_to").unwrap()));
-            assert_eq!(manifest.declares(Permission::MatrixMedia), manifest.id == "room-peek");
+            assert_eq!(manifest.declares(Permission::MatrixMedia), attaches);
             for id in ["matrix.media.send", "matrix.media.upload"] {
                 assert_eq!(manifest.declares_capability(crate::capabilities::by_id(id).unwrap()), manifest.id == "room-peek");
             }
-            assert!(!manifest.declares_capability(crate::capabilities::by_id("matrix.media.download").unwrap()));
+            // The gallery reads attachments to preview or re-draft them; it never uploads.
+            assert_eq!(manifest.declares_capability(crate::capabilities::by_id("matrix.media.download").unwrap()), manifest.id == "room-gallery");
         }
     }
 
@@ -785,6 +821,9 @@ mod tests {
         assert_eq!(runs_in("account"), RunsIn::Account);
         assert_eq!(runs_in("inspector"), RunsIn::Account);
         assert_eq!(runs_in("public-web"), RunsIn::Account);
+        for id in ["link-library", "translator", "room-gallery"] {
+            assert_eq!(runs_in(id), RunsIn::Room, "{id}");
+        }
     }
 
     #[test]

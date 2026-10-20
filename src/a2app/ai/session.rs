@@ -750,11 +750,8 @@ impl AiSession {
                         // think keeps it set (only periodic diagnostics below).
                         self.turn_thought_logged = true;
                         updates.push(SessionUpdate::Thinking);
-                        log!(
-                            "AI session {}: agent is thinking… {}",
-                            self.room_id,
-                            clip(&text, 160)
-                        );
+                        // Unlike the reply, reasoning never reaches the room, so it stays out of the log.
+                        log!("AI session {}: agent is thinking…", self.room_id);
                     } else if self.turn_thought_chars.is_multiple_of(4096) {
                         log!(
                             "AI session {}: agent still thinking ({} chars so far)",
@@ -788,7 +785,8 @@ impl AiSession {
                 AcpEvent::Plan(steps) => {
                     log!("AI session {}: agent plan updated ({} steps)", self.room_id, steps.len());
                 }
-                AcpEvent::Tick => {}
+                // Room agents don't stream previews; the agent's own reply still arrives.
+                AcpEvent::Tick | AcpEvent::Preview { .. } => {}
             }
         }
         updates

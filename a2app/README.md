@@ -249,9 +249,13 @@ be downloaded and prepared as media. It does not post anything into Matrix.
   rules once you allow it), **Who's Here** (typing and read positions), **Room
   Tools** (favorite, low priority, unread, pins, links), **Room Stats** (who
   posts when), **Spaces** (explore and join), **Inbox** (invites and unread
-  rooms), **Account** (you, this device, look up a user), and **Inspector**
-  (what Robrix tells an app about its pane, settings and device). Background
-  examples add **Website Watch**, **Reminder**, and **Keyword Alert**.
+  rooms), **Account** (you, this device, look up a user), **Inspector**
+  (what Robrix tells an app about its pane, settings and device), **Link
+  Library** (every link shared in the room, searchable), **Translator**
+  (messages and your reply, through MyMemory or your own LibreTranslate
+  server), and **Room Gallery** (the room's photos, videos, audio and files,
+  with previews). Background examples add **Website Watch**, **Reminder**, and
+  **Keyword Alert**.
 - **Background tasks**: explicitly enable an interval, one-time alarm, or live
   room-message condition. Tasks retain their original room/space and saved app
   state across launches, while all permissions and IFC checks remain active.
@@ -579,7 +583,21 @@ attachment from the app's attached room under `matrix.media.download`. It
 returns real, decrypted `data_base64` with trusted media metadata; the bounded
 download uses Matrix access permissions, independently of internet access,
 uploading or sending. A later `composer.attach` or `matrix.send_media` request
-keeps its own permission and inline-size limits.
+keeps its own permission and inline-size limits. It always returns the whole
+file, for an explicit action such as Share or Save.
+`host.request("matrix.media_preview", {event_id, size?}, callback)` returns a
+small re-encoded JPEG or PNG of a photo or video instead, under the same
+`matrix.media.download` permission, room checks and homeserver review:
+`{room_id, event_id, data_base64, mime_type, width, height, original_width?,
+original_height?, filename, size}`. The request's `size` is the longest edge
+(64 to 1024 pixels, default 256); the reply's is the preview's byte count. It
+uses the event's own thumbnail or video poster (at most 2 MiB), otherwise a
+photo's original (at most 8 MiB), and a source that is too large ends the
+preview rather than falling back. A decode starts only if its worst case,
+counting each decoder's own buffers from the picture's header, fits 160 MiB;
+two run at once on desktop and one on phones. A preview costs 2 request tokens
+where a download costs 5. Audio, files and videos without a poster have no
+preview.
 Generated apps receive these rules in their authoring guide
 and every generation prompt.
 
@@ -972,8 +990,29 @@ the service may itself forward the data elsewhere.
 The guarded model transport supports text, tools, and authorized native media
 inputs through OpenAI-compatible, Anthropic, and Gemini APIs, plus the Claude
 Code subscription adapter. Attachment support depends on the configured model
-and transport; see [the media tool contracts](#tools-the-agent-can-call). It
-delivers the completed response rather than streaming tokens. Protected app
+and transport; see [the media tool contracts](#tools-the-agent-can-call). Room
+agents receive completed responses. App generation streams the reply and shows
+it live in the generation console, for display only: the model's influence is
+recorded before the first piece, approval is checked again before each piece,
+and the agent still receives only the completed response, rebuilt from the
+stream within the same 16 MiB limit. The agent's copy then replaces the live
+text, and a run that fails, is cancelled or loses its permission drops it.
+Live text never shows a gap: a slow UI shows it late but whole, and past its
+byte budget it waits for the agent's copy. Reasoning streams too wherever the
+completed reply keeps it: `reasoning_content` (DeepSeek, Kimi), `reasoning`
+(Groq, OpenRouter, Ollama), Anthropic thinking blocks and Gemini thought parts;
+`<think>` spans in reply text show as thinking, as the agent sorts them. Only
+the streamed request asks models that think anyway for readable summaries
+(Claude 5 thinking with `display: summarized`, Gemini 2.5 and later
+`includeThoughts`). Gemini streams from `:streamGenerateContent?alt=sse` on the
+approved endpoint, and a service that refuses a streamed request gets the
+original request unstreamed. Claude Code streams its thinking and the reply's
+text from the CLI's partial messages (`--include-partial-messages`) while the
+structured result is written. It asks the service to send that result's text
+as it is written (`CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING`) and, on CLI
+2.1.246 or later, for readable thinking (`--thinking-display summarized`). The
+CLI's final result stays the reply and keeps that reply's own thinking, and a
+CLI without partial messages keeps its single JSON reply. Protected app
 generation runs without tools; it cannot use external research, shell or
 filesystem tools during generation.
 

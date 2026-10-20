@@ -38,7 +38,8 @@ pub enum A2AppMatrixRequest {
     RefreshPolicySpaces,
     RoomInfo { room_id: OwnedRoomId, reply: Reply },
     ReadMessages { room_id: OwnedRoomId, limit: u32, reply: Reply },
-    DownloadMedia { room_id: OwnedRoomId, event_id: OwnedEventId, reply: Reply },
+    /// `preview` is `matrix.media_preview`'s longest edge; `None` reads the whole file.
+    DownloadMedia { room_id: OwnedRoomId, event_id: OwnedEventId, preview: Option<u32>, reply: Reply },
     SendMessage { room_id: OwnedRoomId, body: String, reply: Reply },
     SendMedia { room_id: OwnedRoomId, media: Arc<super::ai::media::PreparedMedia>, upload_authorization: Option<MatrixAuthorization>, reply: Reply },
     Profile { reply: Reply },
@@ -304,8 +305,8 @@ pub fn request_for(
             A2AppMatrixRequest::RoomInfo { room_id, reply },
         (MatrixServiceCall::ReadMessages { limit }, Some(room_id)) =>
             A2AppMatrixRequest::ReadMessages { room_id, limit, reply },
-        (MatrixServiceCall::DownloadMedia { event_id }, Some(room_id)) => A2AppMatrixRequest::DownloadMedia {
-            room_id, event_id: event_id.try_into().map_err(|_| "Invalid Matrix media event ID.")?, reply,
+        (MatrixServiceCall::DownloadMedia { event_id, preview }, Some(room_id)) => A2AppMatrixRequest::DownloadMedia {
+            room_id, event_id: event_id.try_into().map_err(|_| "Invalid Matrix media event ID.")?, preview, reply,
         },
         (MatrixServiceCall::SendMessage { body }, Some(room_id)) =>
             A2AppMatrixRequest::SendMessage { room_id, body, reply },
@@ -487,11 +488,15 @@ async fn run_matrix_request(request: A2AppMatrixRequest, authorization: Option<M
         A2AppMatrixRequest::RoomInfo { room_id, reply } => (reply, room::info(room_id).await),
         A2AppMatrixRequest::ReadMessages { room_id, limit, reply } =>
             (reply, room::read_messages(room_id, limit, false).await),
-        A2AppMatrixRequest::DownloadMedia { room_id, event_id, reply } => {
+        A2AppMatrixRequest::DownloadMedia { room_id, event_id, preview, reply } => {
             let result = async {
                 let auth = authorization.clone().ok_or("Missing attachment read permission.")?;
-                super::ai::media::download_event_attachment(&room_id, event_id.as_str(), auth).await?
-                    .wire_result(&room_id, event_id.as_str())
+                match preview {
+                    Some(max_edge) => Ok(super::ai::media::download_event_preview(&room_id, event_id.as_str(), max_edge, auth).await?
+                        .wire_result(&room_id, event_id.as_str())),
+                    None => super::ai::media::download_event_attachment(&room_id, event_id.as_str(), auth).await?
+                        .wire_result(&room_id, event_id.as_str()),
+                }
             }.await;
             (reply, result)
         }
@@ -568,8 +573,10 @@ async fn run_matrix_request(request: A2AppMatrixRequest, authorization: Option<M
                         "sender_id": msg.sender,
                         "event_id": msg.event_id,
                         "body": body,
+                        "ts": u64::from(msg.origin_server_ts.0),
                     }));
                 }
+                room::add_sender_names(&room, &mut out).await;
                 Ok(serde_json::json!({ "pinned": out }).to_string())
             }.await;
             (reply, result)
@@ -595,8 +602,10 @@ async fn run_matrix_request(request: A2AppMatrixRequest, authorization: Option<M
                         "sender_id": msg.sender,
                         "event_id": msg.event_id,
                         "body": body,
+                        "ts": u64::from(msg.origin_server_ts.0),
                     }));
                 }
+                room::add_sender_names(&room, &mut out).await;
                 Ok(serde_json::json!({ "threads": out }).to_string())
             }.await;
             (reply, result)
@@ -722,7 +731,11 @@ async fn run_matrix_request(request: A2AppMatrixRequest, authorization: Option<M
                 }
                 hits.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts));
                 hits.truncate(limit as usize);
-                let results: Vec<serde_json::Value> = hits.into_iter().map(|(_, v)| v).collect();
+                let mut results: Vec<serde_json::Value> = hits.into_iter().map(|(_, v)| v).collect();
+                for row in results.iter_mut() {
+                    let hit_room = row["room_id"].as_str().and_then(|id| OwnedRoomId::try_from(id).ok()).and_then(|id| client.get_room(&id));
+                    if let Some(hit_room) = hit_room { room::add_sender_names(&hit_room, std::slice::from_mut(row)).await; }
+                }
                 Ok(serde_json::json!({
                     "results": results,
                     "searched_rooms": targets.len(),
@@ -888,17 +901,24 @@ mod media_request_tests {
     fn media_download_dispatch_is_read_scoped_to_the_attached_room() {
         let reply = Reply { heap_key: 1, req_id: 2 };
         let room: OwnedRoomId = "!media:test".try_into().unwrap();
-        let call = || MatrixServiceCall::DownloadMedia { event_id: "$original".into() };
-        assert!(request_for(call(), None, reply).unwrap_err().contains("not attached"));
-        let request = request_for(call(), Some(room.clone()), reply).unwrap();
-        let A2AppMatrixRequest::DownloadMedia { room_id, event_id, .. } = &request else { panic!("wrong worker request") };
-        assert_eq!(room_id, &room);
-        assert_eq!(event_id.as_str(), "$original");
-        let (target, access, actual_reply) = request.room_target().unwrap();
-        assert_eq!(target, room.as_str());
-        assert_eq!(access, RoomAccess::Read);
-        assert_eq!(actual_reply.unwrap().req_id, reply.req_id);
-        assert!(request.media_post_payload().is_none());
-        assert!(!request.reads_rooms(), "binary data must not pass through room-list JSON filtering");
+        for (service, args, preview) in [
+            ("matrix.download_media", serde_json::json!({"event_id": "$original"}), None),
+            ("matrix.media_preview", serde_json::json!({"event_id": "$original", "size": 128}), Some(128)),
+        ] {
+            assert_eq!(a2app_core::capabilities::for_service(service).unwrap().id, "matrix.media.download", "{service}");
+            let call = || a2app_core::services::matrix::parse(service, &args, true).unwrap();
+            assert!(request_for(call(), None, reply).unwrap_err().contains("not attached"));
+            let request = request_for(call(), Some(room.clone()), reply).unwrap();
+            let A2AppMatrixRequest::DownloadMedia { room_id, event_id, preview: actual, .. } = &request else { panic!("wrong worker request") };
+            assert_eq!(room_id, &room);
+            assert_eq!(event_id.as_str(), "$original");
+            assert_eq!(*actual, preview, "{service}");
+            let (target, access, actual_reply) = request.room_target().unwrap();
+            assert_eq!(target, room.as_str());
+            assert_eq!(access, RoomAccess::Read);
+            assert_eq!(actual_reply.unwrap().req_id, reply.req_id);
+            assert!(request.media_post_payload().is_none());
+            assert!(!request.reads_rooms(), "binary data must not pass through room-list JSON filtering");
+        }
     }
 }

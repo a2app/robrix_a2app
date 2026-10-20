@@ -257,6 +257,103 @@ fn probe_executable(path: &Path, timeout: Duration) -> (Status, Option<String>) 
     status_from_json(success, &value)
 }
 
+/// Identifies an installed build, so a changed binary is never taken for an approved one.
+pub(crate) fn executable_stamp(path: &Path) -> Result<String, String> {
+    let metadata = std::fs::metadata(path).map_err(|_| "Claude Code installation changed. Restart the agent.")?;
+    if !metadata.is_file() { return Err("Claude Code executable is unavailable.".into()); }
+    let modified = metadata.modified().ok().and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map(|time| time.as_nanos()).unwrap_or_default();
+    #[cfg(unix)]
+    let stamp = { use std::os::unix::fs::MetadataExt; format!("{}:{}:{}:{}:{}", metadata.dev(), metadata.ino(), metadata.len(), modified, metadata.mode()) };
+    #[cfg(not(unix))]
+    let stamp = format!("{}:{}", metadata.len(), modified);
+    Ok(stamp)
+}
+
+/// What a CLI build offers a live preview.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PreviewSupport {
+    /// Its help lists partial messages. Without them a call keeps the single JSON reply.
+    pub are_partial_messages: bool,
+    /// It takes the SDK's `--thinking-display`, which its help hides.
+    pub is_thinking_display: bool,
+    /// What updating it would add, when its help or version shows it is too old.
+    pub update: Option<Update>,
+}
+
+/// What a newer CLI would show live, with the installed version.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Update {
+    /// It can't stream the model's output.
+    Streaming(Option<(u32, u32, u32)>),
+    /// It streams, but not newer models' thinking.
+    Thinking((u32, u32, u32)),
+}
+
+/// The oldest build known to take `--thinking-display`.
+const THINKING_DISPLAY_VERSION: (u32, u32, u32) = (2, 1, 246);
+
+/// What recent builds offer, by path and stamp.
+static CHECKED: Mutex<Vec<(PathBuf, String, PreviewSupport)>> = Mutex::new(Vec::new());
+
+fn checked(path: &Path, stamp: &str) -> Option<PreviewSupport> {
+    CHECKED.lock().unwrap_or_else(|error| error.into_inner()).iter()
+        .find(|(checked, checked_stamp, _)| checked == path && checked_stamp == stamp).map(|(.., support)| *support)
+}
+
+fn remember(path: &Path, stamp: &str, support: PreviewSupport) {
+    let mut checked = CHECKED.lock().unwrap_or_else(|error| error.into_inner());
+    checked.retain(|(checked, checked_stamp, _)| checked != path || checked_stamp != stamp);
+    if checked.len() >= 8 { checked.remove(0); }
+    checked.push((path.to_path_buf(), stamp.to_string(), support));
+}
+
+/// What this CLI build offers a live preview, read once per installed binary.
+/// No clear answer from its help keeps the single JSON reply.
+pub fn preview_support(path: &Path, stamp: &str) -> PreviewSupport {
+    // One probe at a time, so a generation's notice and its first call share it.
+    static PROBING: Mutex<()> = Mutex::new(());
+    if let Some(support) = checked(path, stamp) { return support; }
+    let _probing = PROBING.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(support) = checked(path, stamp) { return support; }
+    let Some(are_partial_messages) = are_partial_messages_listed(path, Duration::from_secs(4)) else { return PreviewSupport::default(); };
+    let version = version(path, Duration::from_secs(4));
+    let is_thinking_display = are_partial_messages && version.is_some_and(|version| version >= THINKING_DISPLAY_VERSION);
+    let update = if !are_partial_messages { Some(Update::Streaming(version)) }
+        else { version.filter(|_| !is_thinking_display).map(Update::Thinking) };
+    let support = PreviewSupport { are_partial_messages, is_thinking_display, update };
+    remember(path, stamp, support);
+    support
+}
+
+/// Keeps what is left after this build refused part of a live preview, so later calls skip it.
+pub(crate) fn preview_refused(path: &Path, stamp: &str, support: PreviewSupport) {
+    remember(path, stamp, support);
+}
+
+/// What updating the installed CLI would show live, read off the UI thread.
+pub(crate) fn preview_update() -> Option<Update> {
+    check_managed_policy().ok()?;
+    let path = executable()?;
+    preview_support(&path, &executable_stamp(&path).ok()?).update
+}
+
+/// The build's version, from `--version` output like "2.1.63 (Claude Code)".
+fn version(path: &Path, timeout: Duration) -> Option<(u32, u32, u32)> {
+    let mut command = subscription_command(path);
+    command.arg("--version");
+    let (_, output) = bounded_output(command, timeout).filter(|(success, _)| *success)?;
+    let mut numbers = std::str::from_utf8(&output).ok()?.split_whitespace().next()?.split(['.', '-']).map(|number| number.parse().ok());
+    Some((numbers.next()??, numbers.next()??, numbers.next()??))
+}
+
+fn are_partial_messages_listed(path: &Path, timeout: Duration) -> Option<bool> {
+    const OPTION: &[u8] = b"--include-partial-messages";
+    let mut command = subscription_command(path);
+    command.arg("--help");
+    let (success, help) = bounded_output(command, timeout)?;
+    Some(success && help.windows(OPTION.len()).any(|window| window == OPTION))
+}
+
 fn bounded_output(mut command: Command, timeout: Duration) -> Option<(bool, Vec<u8>)> {
     use std::io::{Read, Seek, SeekFrom};
     // Anonymous output avoids pipe deadlocks and has a strict size limit.
@@ -339,6 +436,32 @@ pub(crate) fn test_status(status: Status) -> TestStatusGuard {
     TestStatusGuard(previous)
 }
 
+/// A fixture `claude` in `directory` that runs the shell `body`, kept beside it in `fixture.sh`.
+/// All fixtures link to one launcher: a malware scanner can hold up each new executable's first run for seconds.
+#[cfg(all(test, unix))]
+pub(crate) fn fixture_cli(directory: &Path, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    static LAUNCHER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    unsafe extern "C" { fn atexit(callback: extern "C" fn()) -> i32; }
+    extern "C" fn remove_launcher() {
+        if let Some(directory) = LAUNCHER.get().and_then(|launcher| launcher.parent()) { let _ = std::fs::remove_dir_all(directory); }
+    }
+    let launcher = LAUNCHER.get_or_init(|| {
+        let launcher = tempfile::Builder::new().prefix("robrix-fixture-cli-").tempdir().unwrap().keep().join("claude");
+        std::fs::write(&launcher, "#!/bin/sh\n. \"${0%/*}/fixture.sh\"\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Its first run happens here, outside any test's timing.
+        std::fs::write(launcher.with_file_name("fixture.sh"), "exit 0\n").unwrap();
+        assert!(Command::new(&launcher).status().unwrap().success());
+        unsafe { atexit(remove_launcher); }
+        launcher
+    });
+    std::fs::write(directory.join("fixture.sh"), body).unwrap();
+    let path = directory.join("claude");
+    std::fs::hard_link(launcher, &path).unwrap();
+    path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,24 +517,62 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn fake_cli_probe_is_bounded_and_parses_auth_metadata() {
-        use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
-        let executable = directory.path().join("claude");
-        std::fs::write(&executable, "#!/bin/sh\nprintf '%s' '{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"email\":\"fixture@example.org\"}'\n").unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = fixture_cli(directory.path(), "printf '%s' '{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"email\":\"fixture@example.org\"}'\n");
+        let rewrite = |body: &str| std::fs::write(directory.path().join("fixture.sh"), body).unwrap();
         assert_eq!(probe_executable(&executable, Duration::from_secs(1)).0, Status::Ready);
-        std::fs::write(&executable, "#!/bin/sh\nexec /bin/sleep 10\n").unwrap();
+        rewrite("exec /bin/sleep 10\n");
         let start = Instant::now();
         assert_eq!(probe_executable(&executable, Duration::from_millis(100)), (Status::Unavailable, None));
         assert!(start.elapsed() < Duration::from_secs(2));
-        std::fs::write(&executable, "#!/bin/sh\nprintf '%s' 'invalid json'\n").unwrap();
+        rewrite("printf '%s' 'invalid json'\n");
         assert_eq!(probe_executable(&executable, Duration::from_secs(1)), (Status::Unavailable, None));
     }
 
     #[cfg(unix)]
     #[test]
+    fn preview_support_is_read_from_help_and_version_once_per_binary() {
+        let directory = tempfile::tempdir().unwrap();
+        let asked = directory.path().join("asked");
+        let cli_answering = |help: &str, version: &str| format!("printf '%s ' \"$1\" >> '{}'\ncase \"$1\" in --version) printf '%s\\n' '{version}' ;; *) printf '%s\\n' '{help}' ;; esac\n", asked.display());
+        let partial = "  --include-partial-messages  Include partial message chunks as they arrive";
+        let cli = fixture_cli(directory.path(), &cli_answering(partial, "2.1.301 (Claude Code)"));
+        let rewrite = |body: &str| std::fs::write(directory.path().join("fixture.sh"), body).unwrap();
+        let both = PreviewSupport { are_partial_messages: true, is_thinking_display: true, update: None };
+        assert_eq!(preview_support(&cli, "first-build"), both);
+        assert_eq!(preview_support(&cli, "first-build"), both);
+        assert_eq!(std::fs::read_to_string(&asked).unwrap(), "--help --version ");
+        // A changed build is asked again. The hidden display option came after partial messages,
+        // so an older build is worth updating, but one whose version is unclear is not.
+        let only_partial = |update| PreviewSupport { are_partial_messages: true, is_thinking_display: false, update };
+        for (stamp, version, expected) in [("second-build", "2.1.63 (Claude Code)", only_partial(Some(Update::Thinking((2, 1, 63))))),
+            ("third-build", "2.1.246 (Claude Code)", both), ("fourth-build", "3.0.0-beta.1 (Claude Code)", both),
+            ("fifth-build", "unknown", only_partial(None))] {
+            rewrite(&cli_answering(partial, version));
+            assert_eq!(preview_support(&cli, stamp), expected, "{version}");
+        }
+        // One without partial messages keeps the single reply, and its version names what to update.
+        let older = |update| PreviewSupport { update: Some(Update::Streaming(update)), ..Default::default() };
+        for (stamp, version, expected) in [("sixth-build", "1.0.30 (Claude Code)", older(Some((1, 0, 30)))), ("seventh-build", "unknown", older(None))] {
+            std::fs::write(&asked, "").unwrap();
+            rewrite(&cli_answering("  --output-format <format>  Output format", version));
+            assert_eq!(preview_support(&cli, stamp), expected, "{version}");
+            assert_eq!(std::fs::read_to_string(&asked).unwrap(), "--help --version ");
+        }
+        // What a build refused stays refused, without asking it again.
+        preview_refused(&cli, "first-build", PreviewSupport { is_thinking_display: false, ..both });
+        assert_eq!(preview_support(&cli, "first-build"), only_partial(None));
+        assert_eq!(std::fs::read_to_string(&asked).unwrap(), "--help --version ");
+        // A help that never finishes is no answer.
+        rewrite("exec /bin/sleep 10\n");
+        let started = Instant::now();
+        assert_eq!(are_partial_messages_listed(&cli, Duration::from_millis(100)), None);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn discovery_refresh_is_nonblocking_and_account_changes_require_new_approval() {
-        use std::os::unix::fs::PermissionsExt;
         let _guard = crate::CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _status = test_status(Status::Checking);
         struct Restore(Option<std::ffi::OsString>);
@@ -425,12 +586,9 @@ mod tests {
         }
         let _restore = Restore(std::env::var_os("CLAUDE_CODE_EXECUTABLE"));
         let directory = tempfile::tempdir().unwrap();
-        let cli = directory.path().join("claude");
-        let write_status = |value: serde_json::Value| {
-            std::fs::write(&cli, format!("#!/bin/sh\nprintf '%s' '{}'\n", value)).unwrap();
-            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
-        };
-        write_status(json!({"loggedIn":true,"authMethod":"claude.ai","email":"first@example.org"}));
+        let status_body = |value: serde_json::Value| format!("printf '%s' '{value}'\n");
+        let cli = fixture_cli(directory.path(), &status_body(json!({"loggedIn":true,"authMethod":"claude.ai","email":"first@example.org"})));
+        let write_status = |value: serde_json::Value| std::fs::write(directory.path().join("fixture.sh"), status_body(value)).unwrap();
         unsafe { std::env::set_var("CLAUDE_CODE_EXECUTABLE", &cli); }
         let wait_for = |expected| {
             let started = Instant::now();

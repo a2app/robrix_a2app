@@ -1,0 +1,2685 @@
+// name: Room Gallery
+// icon: 🖼
+// tint: #C2255C
+// description: Every photo, video, voice message and file shared in this room, at a glance.
+// permissions: matrix-room-read, matrix-room-watch, matrix-media, robrix-navigation, robrix-composer, device-info, matrix.room.messages.read, matrix.room.messages.paginate, matrix.room.event.read, on_room_message, on_room_message_changed, matrix.media.download, host.nav.event, host.composer.attach, device.info.read
+// why-matrix-room-read: Finds the photos, videos, audio and files shared in this room.
+// why-matrix-room-watch: Adds new attachments as they arrive, and drops deleted ones.
+// why-matrix-media: Downloads previews of the photos and videos you see here, and the whole file only when you choose Share again.
+// why-robrix-navigation: Shows an attachment's message in the chat when you tap Show in chat.
+// why-robrix-composer: Puts an attachment in the message box for you to review and send, when you tap Share again.
+// why-device-info: Shows when each attachment was shared in your own time zone and clock format.
+
+// Bounds keep memory, storage and each callback's work small.
+let page_size = 24
+let max_items = 500
+let read_limit = 30
+let older_pages = 3
+let older_limit = 50
+let max_lookups = 20
+let max_checks = 6
+let max_removed = 50
+let restore_step = 100
+let max_thumbs = 72
+let max_thumb_chars = 160000
+let max_large = 4
+let max_large_chars = 400000
+let max_in_flight = 2
+let tile_edge = 256
+let detail_edge = 768
+let max_share_bytes = 3145728
+let max_share_chars = 4194304
+let gallery_path = "/gallery.json"
+let thumbs_path = "/thumbs.json"
+let hooks = ["on_room_message", "on_room_message_changed"]
+let media_types = ["m.image", "m.video", "m.audio", "m.file"]
+let kinds = ["photo", "video", "audio", "voice", "file"]
+let month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+let day_names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+
+// Robrix's request budget for this app: 30 tokens, refilled at 6 a second. Running dry
+// refuses requests for 3 s and then restarts at 10. Prices: env, a hook or device info 1,
+// a preview 2, setup, a read, lookup, page or download 5, Show in chat or the composer 8.
+let bucket = 30
+let refill_rate = 6
+let after_cooldown = 10
+let hold_secs = 4
+// Automatic requests keep 9 tokens for taps, and their own 24-token allowance refills at
+// 5 a second: a short burst, then a pace the budget outgrows.
+let reserve = 9
+let auto_rate = 5
+let auto_cap = 24
+
+let voice_re = regex("voice", "i")
+let no_preview_re = regex("^No picture preview")
+let gone_media_re = regex("not an available media message", "i")
+let refusal_re = regex("not approved|cancelled|blocked|needs approval|review the permission|restricted|did not declare|not available in this", "i")
+let limit_re = regex("too many requests", "i")
+let gone_re = regex("isn't a message", "i")
+let end_re = regex("[.!?…]$")
+let twelve_hour_re = regex("^(?:[a-z]{2,3}[_-](?:US|CA|AU|NZ|IN|PH|PK|BD|EG|SA|MX|CO|MY|KR|TW)(?:[._@]|$)|(?:en|C|POSIX)(?:[.@]|$))")
+let french_canada_re = regex("^fr[_-]CA")
+let long_name_re = regex("^.{121}", "s")
+let name_head_re = regex("^.{120}", "s")
+let long_caption_re = regex("^.{301}", "s")
+let caption_head_re = regex("^.{300}", "s")
+let file_types = [
+    {re: regex("\\.pdf$", "i") icon: "📕" label: "PDF" title: "PDF"},
+    {re: regex("\\.(?:zip|rar|7z|tar|gz|tgz|bz2|xz)$", "i") icon: "📦" label: "Archive" title: "ARCHIVE"},
+    {re: regex("\\.(?:docx?|odt|rtf|pages)$", "i") icon: "📝" label: "Document" title: "DOCUMENT"},
+    {re: regex("\\.(?:txt|md|log)$", "i") icon: "📝" label: "Text" title: "TEXT"},
+    {re: regex("\\.(?:xlsx?|csv|ods|numbers)$", "i") icon: "📊" label: "Spreadsheet" title: "SPREADSHEET"},
+    {re: regex("\\.(?:pptx?|odp|key)$", "i") icon: "📊" label: "Slides" title: "SLIDES"},
+    {re: regex("\\.(?:png|jpe?g|gif|webp|heic|svg|bmp|tiff?)$", "i") icon: "🖼️" label: "Image file" title: "IMAGE FILE"},
+    {re: regex("\\.(?:mp4|mov|mkv|webm|avi)$", "i") icon: "🎬" label: "Video file" title: "VIDEO FILE"},
+    {re: regex("\\.(?:mp3|ogg|oga|opus|wav|m4a|flac|aac)$", "i") icon: "🎵" label: "Audio file" title: "AUDIO FILE"}
+]
+
+// Where the app runs, and its grouped setup.
+let room_state = "unknown"
+let room_name = ""
+let env_error = ""
+let is_env_pending = false
+let is_setup_pending = false
+let setup_error = ""
+let is_foreground = true
+let is_compact = false
+let is_short = false
+let is_wide = false
+// Tiny panes put Refresh under the summary, which keeps the full width.
+let is_tiny = false
+// The "How it works" note under the grid.
+let is_how_open = false
+let notice = ""
+
+// The latest-messages read: idle, pending, done, blocked (not allowed) or failed.
+let read_state = "idle"
+let read_error = ""
+let read_token = 0
+
+// Dates: the device's minutes from UTC (nil until device.info answers) and its clock.
+let utc_offset = nil
+let is_24h = false
+let device_state = "idle"
+
+// Live updates: hooks, new attachments waiting for their details, and saved ones to re-check.
+let subscribed = []
+let pending_hooks = []
+let refused_hooks = []
+let live_error = ""
+let lookup_queue = []
+let check_queue = []
+let is_lookup_pending = false
+let looking_up_id = ""
+let is_lookup_blocked = false
+let is_check_blocked = false
+let removed_ids = []
+let removed_set = {}
+
+// The gallery, newest first. `known` maps event ids to items.
+let items = []
+let known = {}
+let dead_keys = 0
+let n_photo = 0
+let n_video = 0
+let n_audio = 0
+let n_voice = 0
+let n_file = 0
+let total_bytes = 0
+
+// History scanned so far, and a gap left by messages that arrived while the app was closed.
+let before = ""
+let newest_ts = 0
+let scanned = 0
+let is_at_start = false
+let is_capped = false
+let is_history_stuck = false
+let gap = nil
+
+// Saved items come back a slice per callback, newest first, so a long list
+// never strains one callback's instruction budget.
+let saved_rows = []
+let restore_index = 0
+let is_restore_waiting = false
+let is_save_due = false
+
+// Loading older history: a few pages per tap, paced between pages.
+let is_paging = false
+let is_page_pending = false
+let pages_left = 0
+let paging_token = 0
+let run_found = 0
+let run_scanned = 0
+let older_note = ""
+
+// What the grid shows: the active filter and page over a fixed pool of tiles.
+let active_filter = "all"
+let shown = []
+let page = 0
+let is_flip_pending = false
+
+// Widget calls are the costly part of a render, so handles are bound once
+// and a call is made only when its value changes.
+let views = nil
+let last_text = {}
+let last_shown = {}
+let tiles = []
+let tile_state = []
+
+// Previews: thumbnails kept in the jail, a few large ones in memory, at most two in flight.
+let thumb_ids = []
+let thumb_of = {}
+let next_thumb = 0
+let large_cache = []
+let in_flight = []
+let is_media_proven = false
+let media_refusal = ""
+let media_error = ""
+
+// The budget model. `clock` is wall time in seconds, never behind a timer that has fired.
+let clock = 0
+let tokens = 30
+let auto_tokens = 24
+let tokens_at = 0
+let hold_until = 0
+let is_after_cooldown = false
+let limit_hits = []
+let waiting = []
+let is_send_waiting = false
+let send_due = 0
+let is_pace_waiting = false
+let pace_due = 0
+
+// The detail panel for one attachment.
+let detail_id = ""
+let detail_token = 0
+let has_large = false
+let is_nav_pending = false
+let is_share_pending = false
+
+// ---- Small helpers
+
+fn text_of(v){
+    if v.is_string() { return v }
+    return ""
+}
+
+fn num_of(v){
+    if v.is_number() { return v }
+    return 0
+}
+
+// A missing key reads as nil, but only on an object.
+fn field(obj, key){
+    if !obj.is_object() { return nil }
+    return obj[key]
+}
+
+fn join(parts, sep){
+    let out = ""
+    for part in parts {
+        if part == "" { continue }
+        if out != "" { out = out + sep }
+        out = out + part
+    }
+    return out
+}
+
+fn plural(n, one, many){
+    if n == 1 { return "1 " + one }
+    return "" + n + " " + many
+}
+
+fn clip(text, long_re, head_re){
+    if !long_re.test(text) { return text }
+    let head = text.match_str(head_re)
+    if !head.is_object() { return text }
+    return head.value + "…"
+}
+
+fn contains(list, value){
+    for entry in list {
+        if entry == value { return true }
+    }
+    return false
+}
+
+fn pad2(n){
+    if n < 10 { return "0" + n }
+    return "" + n
+}
+
+// Whole-number division, exact where floor() would round through 32 bits.
+fn idiv(a, b){ return (a - a % b) / b }
+
+fn with_period(text){
+    if text == "" || end_re.test(text) { return text }
+    return text + "."
+}
+
+// Host errors, as a sentence; the request limit's own words are made plain.
+fn friendly(error){
+    if limit_re.test(error) { return "Robrix asked the gallery to slow down." }
+    return with_period(error)
+}
+
+fn scaled(x){
+    if x >= 10 { return "" + floor(x + 0.5) }
+    return "" + floor(x * 10 + 0.5) / 10
+}
+
+fn size_text(n){
+    if n <= 0 { return "" }
+    if n < 1024 { return "" + n + " B" }
+    if n < 1048576 { return scaled(n / 1024) + " KB" }
+    if n < 1073741824 { return scaled(n / 1048576) + " MB" }
+    return scaled(n / 1073741824) + " GB"
+}
+
+fn dur_text(ms){
+    if ms <= 0 { return "" }
+    let total = floor(ms / 1000 + 0.5)
+    let hours = floor(total / 3600)
+    let minutes = floor((total - hours * 3600) / 60)
+    let seconds = total - hours * 3600 - minutes * 60
+    if hours > 0 { return "" + hours + ":" + pad2(minutes) + ":" + pad2(seconds) }
+    return "" + minutes + ":" + pad2(seconds)
+}
+
+// ---- Dates
+
+// Civil date from days since 1970 (Howard Hinnant's algorithm).
+fn civil(days){
+    let z = days + 719468
+    let era = idiv(z, 146097)
+    let doe = z - era * 146097
+    let yoe = idiv(doe - idiv(doe, 1460) + idiv(doe, 36524) - idiv(doe, 146096), 365)
+    let doy = doe - (365 * yoe + idiv(yoe, 4) - idiv(yoe, 100))
+    let mp = idiv(5 * doy + 2, 153)
+    let month = mp + 3
+    if mp >= 10 { month = mp - 9 }
+    let year = yoe + era * 400
+    if month <= 2 { year += 1 }
+    return {y: year m: month d: doy - idiv(153 * mp + 2, 5) + 1}
+}
+
+// Robrix's timeline clock (9:46am), or a 24-hour one where the locale uses it.
+fn clock_text(ms){
+    let hour = idiv(ms, 3600000)
+    let minute = pad2(idiv(ms % 3600000, 60000))
+    if is_24h { return pad2(hour) + ":" + minute }
+    let suffix = "am"
+    if hour >= 12 { suffix = "pm" }
+    let h = hour % 12
+    if h == 0 { h = 12 }
+    return "" + h + ":" + minute + suffix
+}
+
+// Without the device's time zone only the date shows, never a UTC clock time.
+fn utc_date(ts, now){
+    let c = civil(idiv(ts, 86400000))
+    let label = month_names[c.m - 1] + " " + c.d
+    if c.y != civil(idiv(now, 86400000)).y { label = label + ", " + c.y }
+    return label
+}
+
+// When it was shared, finishing "Shared by alice": relative while recent, then a local
+// date. Without the device's time zone, anything older than a week shows just its date.
+fn when_text(ts){
+    if ts <= 0 { return "" }
+    let now = time_now() * 1000
+    now = now - now % 1
+    let age = now - ts
+    if age > -300000 && age < 60000 { return "just now" }
+    if age >= 60000 && age < 3600000 { return plural(idiv(age, 60000), "min", "mins") + " ago" }
+    if utc_offset == nil {
+        if age > 0 && age < 86400000 { return plural(idiv(age, 3600000), "hour", "hours") + " ago" }
+        if age > 0 && age < 604800000 { return plural(idiv(age, 86400000), "day", "days") + " ago" }
+        return "on " + utc_date(ts, now)
+    }
+    let shift = utc_offset * 60000
+    let local = ts + shift
+    let day = idiv(local, 86400000)
+    let today = idiv(now + shift, 86400000)
+    let at = " at " + clock_text(local % 86400000)
+    if day == today { return "today" + at }
+    if day == today - 1 { return "yesterday" + at }
+    if day < today && day > today - 7 { return "on " + day_names[(day + 4) % 7] + at }
+    let c = civil(day)
+    if c.y == civil(today).y { return "on " + month_names[c.m - 1] + " " + c.d + at }
+    return "on " + month_names[c.m - 1] + " " + c.d + ", " + c.y
+}
+
+fn uses_24h(locale){
+    if !locale.is_string() || locale == "" { return false }
+    if french_canada_re.test(locale) { return true }
+    return !twelve_hour_re.test(locale)
+}
+
+// ---- Attachments
+
+fn kind_of(msgtype, words){
+    if msgtype == "m.image" { return "photo" }
+    if msgtype == "m.video" { return "video" }
+    if msgtype == "m.file" { return "file" }
+    if msgtype != "m.audio" { return "" }
+    if voice_re.test(words) { return "voice" }
+    return "audio"
+}
+
+fn group_of(kind){
+    if kind == "voice" { return "audio" }
+    return kind
+}
+
+fn is_visual(it){ return it.kind == "photo" || it.kind == "video" }
+
+fn file_type(it){
+    for t in file_types {
+        if t.re.test(it.name) { return t }
+    }
+    return nil
+}
+
+fn icon_of(it){
+    if it.kind == "photo" { return "🖼️" }
+    if it.kind == "video" { return "🎬" }
+    if it.kind == "audio" { return "🎵" }
+    if it.kind == "voice" { return "🎤" }
+    let t = file_type(it)
+    if t != nil { return t.icon }
+    return "📄"
+}
+
+fn kind_title(it){
+    if it.kind == "photo" { return "PHOTO" }
+    if it.kind == "video" { return "VIDEO" }
+    if it.kind == "audio" { return "AUDIO" }
+    if it.kind == "voice" { return "VOICE MESSAGE" }
+    let t = file_type(it)
+    if t != nil { return t.title }
+    return "FILE"
+}
+
+fn default_name(kind){
+    if kind == "photo" { return "Photo" }
+    if kind == "video" { return "Video" }
+    if kind == "voice" { return "Voice message" }
+    if kind == "audio" { return "Audio" }
+    return "File"
+}
+
+// A message row with media becomes an item; anything else is nil. Every source names
+// the sender by room display name, or by user name where an older host sent none.
+fn item_of(m){
+    if !m.is_object() { return nil }
+    let id = text_of(m["event_id"])
+    let media = m["media"]
+    if id == "" || !media.is_object() { return nil }
+    let body = text_of(m["body"]).trim()
+    let name = text_of(media["filename"]).trim()
+    if name == "" { name = body }
+    let kind = kind_of(text_of(m["msgtype"]), name + " " + body)
+    if kind == "" { return nil }
+    if name == "" { name = default_name(kind) }
+    let caption = ""
+    if body != "" && body != name { caption = clip(body, long_caption_re, caption_head_re) }
+    let sender = text_of(m["sender_name"])
+    if sender == "" { sender = text_of(m["sender"]) }
+    return {
+        id: id kind: kind name: clip(name, long_name_re, name_head_re) mime: text_of(media["mime_type"])
+        size: num_of(media["size"]) w: num_of(media["width"]) h: num_of(media["height"])
+        dur: num_of(media["duration_ms"]) sender: sender ts: num_of(m["ts"]) caption: caption
+        has_no_preview: false is_preview_failed: false is_large_failed: false tries: 0
+    }
+}
+
+fn was_removed(id){ return removed_set[id] == true }
+
+// Merges candidates into the newest-first list in one pass; returns how many were new.
+fn add_items(fresh){
+    let added = []
+    for it in fresh {
+        if !it.is_object() || known[it.id] != nil || was_removed(it.id) { continue }
+        known[it.id] = it
+        added.push(it)
+        let j = added.len() - 1
+        while j > 0 && added[j].ts > added[j - 1].ts {
+            let newer = added[j]
+            added[j] = added[j - 1]
+            added[j - 1] = newer
+            j -= 1
+        }
+    }
+    let m = added.len()
+    let n = items.len()
+    if m == 0 { return 0 }
+    if n == 0 || added[0].ts <= items[n - 1].ts {
+        for it in added { items.push(it) }
+        return m
+    }
+    let merged = []
+    let a = 0
+    let b = 0
+    while a < n && b < m {
+        if items[a].ts >= added[b].ts {
+            merged.push(items[a])
+            a += 1
+        } else {
+            merged.push(added[b])
+            b += 1
+        }
+    }
+    while a < n {
+        merged.push(items[a])
+        a += 1
+    }
+    while b < m {
+        merged.push(added[b])
+        b += 1
+    }
+    items = merged
+    return m
+}
+
+// Rows arrive oldest first, so candidates are gathered newest first.
+fn items_of(messages){
+    let out = []
+    if !messages.is_array() { return out }
+    let i = messages.len() - 1
+    while i >= 0 {
+        out.push(item_of(messages[i]))
+        i -= 1
+    }
+    return out
+}
+
+// Saved attachments inside a reply's time span that the reply left out may have
+// been deleted while the gallery was closed. A few are looked up before anything is
+// removed, because Robrix's cache can have gaps.
+fn queue_checks(messages){
+    if is_check_blocked || !messages.is_array() { return nil }
+    let lo = 0
+    let hi = 0
+    let returned = {}
+    for m in messages {
+        let id = text_of(field(m, "event_id"))
+        if id != "" { returned[id] = true }
+        let ts = num_of(field(m, "ts"))
+        if ts > 0 && (lo == 0 || ts < lo) { lo = ts }
+        if ts > hi { hi = ts }
+    }
+    if lo == 0 { return nil }
+    for it in items {
+        if it.ts < lo || check_queue.len() >= max_checks { break }
+        if it.ts > hi || returned[it.id] == true || contains(check_queue, it.id) { continue }
+        check_queue.push(it.id)
+    }
+    return nil
+}
+
+fn is_restoring(){ return restore_index < saved_rows.len() }
+
+// Trimming waits for older saved items that have yet to come back.
+fn trim_items(){
+    if is_restoring() { return nil }
+    while items.len() > max_items {
+        let oldest = items.pop()
+        known[oldest.id] = nil
+        dead_keys += 1
+        forget_thumb(oldest.id)
+        is_capped = true
+    }
+    return nil
+}
+
+// Clearing a key leaves it in the map, so both maps are rebuilt now and then.
+fn compact_maps(){
+    if dead_keys < 200 { return nil }
+    dead_keys = 0
+    known = {}
+    for it in items { known[it.id] = it }
+    thumb_of = {}
+    let slot = 0
+    while slot < thumb_ids.len() {
+        if thumb_ids[slot] != "" { thumb_of[thumb_ids[slot]] = slot }
+        slot += 1
+    }
+    return nil
+}
+
+fn recount(){
+    n_photo = 0
+    n_video = 0
+    n_audio = 0
+    n_voice = 0
+    n_file = 0
+    total_bytes = 0
+    for it in items {
+        if it.kind == "photo" { n_photo += 1 }
+        elif it.kind == "video" { n_video += 1 }
+        elif it.kind == "audio" { n_audio += 1 }
+        elif it.kind == "voice" { n_voice += 1 }
+        else { n_file += 1 }
+        total_bytes += it.size
+    }
+    return nil
+}
+
+fn page_count(){ return max(1, floor((shown.len() + page_size - 1) / page_size)) }
+
+fn refilter(){
+    shown = []
+    for it in items {
+        if active_filter == "all" || group_of(it.kind) == active_filter { shown.push(it) }
+    }
+    if page >= page_count() { page = page_count() - 1 }
+    return nil
+}
+
+fn items_changed(){
+    trim_items()
+    compact_maps()
+    recount()
+    refilter()
+    save_gallery()
+    return nil
+}
+
+fn remember_removed(id){
+    removed_ids.push(id)
+    removed_set[id] = true
+    if removed_ids.len() <= max_removed { return nil }
+    removed_ids.remove(0)
+    removed_set = {}
+    for old in removed_ids { removed_set[old] = true }
+    return nil
+}
+
+// An item still waiting to be restored also loses its cached preview.
+fn remove_item(id){
+    remember_removed(id)
+    lookup_queue.retain(|q| q != id)
+    check_queue.retain(|q| q != id)
+    large_cache.retain(|e| e.id != id)
+    forget_thumb(id)
+    if known[id] == nil { return nil }
+    known[id] = nil
+    dead_keys += 1
+    items.retain(|it| it.id != id)
+    items_changed()
+    if detail_id == id {
+        close_detail()
+        notice = "That attachment was deleted from the room."
+    }
+    render_all()
+    pump()
+    return nil
+}
+
+// ---- Saving
+
+fn save_gallery(){
+    if is_restoring() {
+        is_save_due = true
+        return nil
+    }
+    let data = {v: 1 items: items before: before newest_ts: newest_ts scanned: scanned is_at_start: is_at_start is_capped: is_capped gap: gap}
+    let text = data.to_json()
+    if text.len() < 1000000 { fs.write(gallery_path, text) }
+    return nil
+}
+
+fn clean_item(s){
+    if !s.is_object() { return nil }
+    let id = text_of(s["id"])
+    let kind = text_of(s["kind"])
+    if id == "" || !contains(kinds, kind) { return nil }
+    let name = clip(text_of(s["name"]), long_name_re, name_head_re)
+    if name == "" { name = default_name(kind) }
+    let caption = text_of(s["caption"])
+    if caption == name { caption = "" }
+    return {
+        id: id kind: kind name: name mime: text_of(s["mime"]) size: num_of(s["size"]) w: num_of(s["w"]) h: num_of(s["h"])
+        dur: num_of(s["dur"]) sender: text_of(s["sender"]) ts: num_of(s["ts"])
+        caption: clip(caption, long_caption_re, caption_head_re)
+        has_no_preview: s["has_no_preview"] == true is_preview_failed: false is_large_failed: false tries: 0
+    }
+}
+
+fn restore_thumbs(){
+    thumb_ids = []
+    let i = 0
+    while i < max_thumbs {
+        thumb_ids.push("")
+        i += 1
+    }
+    if !fs.exists(thumbs_path) { return nil }
+    let data = fs.read(thumbs_path).parse_json()
+    let ids = field(data, "ids")
+    if !ids.is_array() { return nil }
+    let j = 0
+    while j < max_thumbs && j < ids.len() {
+        let id = text_of(ids[j])
+        thumb_ids[j] = id
+        if id != "" { thumb_of[id] = j }
+        j += 1
+    }
+    let next = num_of(field(data, "next"))
+    if next >= 0 && next < max_thumbs { next_thumb = floor(next) }
+    return nil
+}
+
+// Reads the saved state at eval time; its items come back in slices from boot.
+fn load_saved(){
+    restore_thumbs()
+    if !fs.exists(gallery_path) { return nil }
+    let data = fs.read(gallery_path).parse_json()
+    if field(data, "v") != 1 { return nil }
+    if data["items"].is_array() { saved_rows = data["items"] }
+    before = text_of(data["before"])
+    newest_ts = num_of(data["newest_ts"])
+    scanned = num_of(data["scanned"])
+    is_at_start = data["is_at_start"] == true
+    is_capped = data["is_capped"] == true
+    let saved_gap = data["gap"]
+    if text_of(field(saved_gap, "before")) != "" {
+        gap = {before: saved_gap["before"] until_ts: num_of(saved_gap["until_ts"])}
+    }
+    return nil
+}
+
+fn restore_slice(){
+    let end = min(saved_rows.len(), restore_index + restore_step)
+    let slice = []
+    while restore_index < end {
+        slice.push(clean_item(saved_rows[restore_index]))
+        restore_index += 1
+    }
+    add_items(slice)
+    if !is_restoring() {
+        saved_rows = []
+        restore_index = 0
+    }
+    trim_items()
+    recount()
+    refilter()
+    if !is_restoring() && is_save_due {
+        is_save_due = false
+        save_gallery()
+    }
+    return nil
+}
+
+fn schedule_restore(){
+    if !is_restoring() || is_restore_waiting { return nil }
+    is_restore_waiting = start_timeout(0.02, || {
+        is_restore_waiting = false
+        restore_slice()
+        render_all()
+        schedule_restore()
+    }) != nil
+    return nil
+}
+
+// ---- Thumbnails, one jail file per slot in a bounded ring
+
+fn thumb_path(slot){ return "/thumbs/" + slot + ".txt" }
+
+fn save_thumbs(){
+    let data = {ids: thumb_ids next: next_thumb}
+    fs.write(thumbs_path, data.to_json())
+    return nil
+}
+
+fn read_thumb(id){
+    let slot = thumb_of[id]
+    if slot == nil { return "" }
+    if fs.exists(thumb_path(slot)) { return fs.read(thumb_path(slot)) }
+    thumb_of[id] = nil
+    thumb_ids[slot] = ""
+    return ""
+}
+
+fn store_thumb(id, b64){
+    if b64.len() == 0 || b64.len() > max_thumb_chars { return false }
+    let slot = thumb_of[id]
+    if slot == nil {
+        slot = next_thumb
+        next_thumb = (next_thumb + 1) % max_thumbs
+        let previous = thumb_ids[slot]
+        if previous != "" {
+            thumb_of[previous] = nil
+            dead_keys += 1
+        }
+    }
+    fs.write(thumb_path(slot), b64)
+    thumb_ids[slot] = id
+    thumb_of[id] = slot
+    save_thumbs()
+    return true
+}
+
+fn forget_thumb(id){
+    let slot = thumb_of[id]
+    if slot == nil { return nil }
+    thumb_of[id] = nil
+    dead_keys += 1
+    thumb_ids[slot] = ""
+    if fs.exists(thumb_path(slot)) { fs.remove(thumb_path(slot)) }
+    save_thumbs()
+    return nil
+}
+
+// The last few large previews stay in memory, so reopening one asks for nothing.
+fn remember_large(id, b64){
+    if b64.len() > max_large_chars { return nil }
+    large_cache.retain(|e| e.id != id)
+    large_cache.push({id: id b64: b64})
+    if large_cache.len() > max_large { large_cache.remove(0) }
+    return nil
+}
+
+fn cached_large(id){
+    for e in large_cache {
+        if e.id == id { return e.b64 }
+    }
+    return ""
+}
+
+// ---- Rendering
+
+fn bind_ui(){
+    if views != nil { return nil }
+    views = {
+        head_wrap: ui.head_wrap title_wrap: ui.title_wrap room_line: ui.room_line
+        no_room_wrap: ui.no_room_wrap no_room_icon: ui.no_room_icon no_room_title: ui.no_room_title no_room_line: ui.no_room_line
+        env_retry_wrap: ui.env_retry_wrap stats_wrap: ui.stats_wrap stats_line: ui.stats_line filter_wrap: ui.filter_wrap
+        f_all: ui.f_all f_photo: ui.f_photo f_video: ui.f_video f_audio: ui.f_audio f_file: ui.f_file
+        f_all_on: ui.f_all_on f_photo_on: ui.f_photo_on f_video_on: ui.f_video_on f_audio_on: ui.f_audio_on f_file_on: ui.f_file_on
+        f_all_on_wrap: ui.f_all_on_wrap f_photo_on_wrap: ui.f_photo_on_wrap f_video_on_wrap: ui.f_video_on_wrap
+        f_audio_on_wrap: ui.f_audio_on_wrap f_file_on_wrap: ui.f_file_on_wrap
+        f_all_off_wrap: ui.f_all_off_wrap f_photo_off_wrap: ui.f_photo_off_wrap f_video_off_wrap: ui.f_video_off_wrap
+        f_audio_off_wrap: ui.f_audio_off_wrap f_file_off_wrap: ui.f_file_off_wrap
+        f_photo_wrap: ui.f_photo_wrap f_video_wrap: ui.f_video_wrap f_audio_wrap: ui.f_audio_wrap f_file_wrap: ui.f_file_wrap
+        status_wrap: ui.status_wrap status: ui.status status_n: ui.status_n status_err: ui.status_err status_err_wrap: ui.status_err_wrap
+        preview_wrap: ui.preview_wrap preview_note: ui.preview_note
+        pager_wrap: ui.pager_wrap page_line: ui.page_line prev_wrap: ui.prev_wrap prev_btn: ui.prev_btn
+        next_wrap: ui.next_wrap next_btn: ui.next_btn grid_scroll: ui.grid_scroll empty_wrap: ui.empty_wrap
+        empty_icon: ui.empty_icon empty_title: ui.empty_title empty_line: ui.empty_line empty_ask: ui.empty_ask
+        empty_ask_wrap: ui.empty_ask_wrap empty_retry_wrap: ui.empty_retry_wrap empty_allow_wrap: ui.empty_allow_wrap grid: ui.grid older_wrap: ui.older_wrap older_btn_wrap: ui.older_btn_wrap
+        stop_wrap: ui.stop_wrap older_line: ui.older_line older_line_n: ui.older_line_n older_line_err: ui.older_line_err
+        older_line_err_wrap: ui.older_line_err_wrap hint_wrap: ui.hint_wrap detail_wrap: ui.detail_wrap
+        d_file_box: ui.d_file_box d_file_icon: ui.d_file_icon d_file_label: ui.d_file_label d_pic_box: ui.d_pic_box
+        d_icon_wrap: ui.d_icon_wrap d_icon: ui.d_icon d_icon_label: ui.d_icon_label d_img_wrap: ui.d_img_wrap d_img: ui.d_img
+        d_name: ui.d_name d_kind: ui.d_kind d_info_wrap: ui.d_info_wrap d_info: ui.d_info d_who: ui.d_who d_when: ui.d_when
+        d_caption_wrap: ui.d_caption_wrap d_caption: ui.d_caption d_preview_wrap: ui.d_preview_wrap
+        d_note_wrap: ui.d_note_wrap d_note: ui.d_note d_note_n: ui.d_note_n d_note_ok: ui.d_note_ok d_note_ok_wrap: ui.d_note_ok_wrap
+        d_note_err: ui.d_note_err d_note_err_wrap: ui.d_note_err_wrap
+        loading_wrap: ui.loading_wrap loading_line: ui.loading_line empty_card: ui.empty_card
+        refresh_wide: ui.refresh_wide refresh_narrow: ui.refresh_narrow how_btn: ui.how_btn how_body: ui.how_body
+    }
+    tiles = [ui.t0, ui.t1, ui.t2, ui.t3, ui.t4, ui.t5, ui.t6, ui.t7, ui.t8, ui.t9, ui.t10, ui.t11,
+        ui.t12, ui.t13, ui.t14, ui.t15, ui.t16, ui.t17, ui.t18, ui.t19, ui.t20, ui.t21, ui.t22, ui.t23]
+    // Each tile starts as the template declares it: hidden, an icon, no picture.
+    for t in tiles {
+        tile_state.push({id: "" image: "" icon: "🖼️" name: "" meta: "" badge: "▶️" is_pic: false is_badge: false is_shown: false})
+    }
+    return nil
+}
+
+fn put_text(name, text){
+    if last_text[name] == text { return nil }
+    last_text[name] = text
+    views[name].set_text(text)
+    return nil
+}
+
+fn put_shown(name, is_on){
+    if last_shown[name] == is_on { return nil }
+    last_shown[name] = is_on
+    views[name].set_visible(is_on)
+    return nil
+}
+
+fn tile_meta(it){
+    if it.kind == "file" {
+        let t = file_type(it)
+        let label = "File"
+        if t != nil { label = t.label }
+        return join([label, size_text(it.size)], " · ")
+    }
+    if is_visual(it) && previews_on() && !it.has_no_preview && !it.is_preview_failed { return "Loading preview…" }
+    let meta = join([dur_text(it.dur), size_text(it.size)], " · ")
+    if meta == "" { return default_name(it.kind) }
+    return meta
+}
+
+fn badge_text(it){
+    let dur = dur_text(it.dur)
+    if dur == "" { return "▶️" }
+    return "▶️ " + dur
+}
+
+fn load_tile_picture(k, it){
+    if !is_visual(it) { return false }
+    let b64 = read_thumb(it.id)
+    if b64 == "" { return false }
+    let bytes = b64.decode_base64()
+    if bytes == nil {
+        forget_thumb(it.id)
+        return false
+    }
+    tiles[k].img.load_image_from_data_async(bytes)
+    tile_state[k].image = it.id
+    return true
+}
+
+fn is_tile_showing(id){
+    for s in tile_state {
+        if s.id == id && s.image == id { return true }
+    }
+    return false
+}
+
+// The name always matches the tile; the icon and size line sit under a
+// picture, so they are only refreshed while they show.
+fn show_tile(k, it){
+    let t = tiles[k]
+    let s = tile_state[k]
+    s.id = it.id
+    if s.name != it.name {
+        s.name = it.name
+        t.name.set_text(it.name)
+    }
+    let is_pic = s.image == it.id || load_tile_picture(k, it)
+    if !is_pic {
+        let icon = icon_of(it)
+        if s.icon != icon {
+            s.icon = icon
+            t.ph_icon.set_text(icon)
+        }
+        let meta = tile_meta(it)
+        if s.meta != meta {
+            s.meta = meta
+            t.meta.set_text(meta)
+        }
+    }
+    let is_badge = is_pic && it.kind == "video"
+    if is_badge && s.badge != badge_text(it) {
+        s.badge = badge_text(it)
+        t.badge.set_text(s.badge)
+    }
+    if s.is_pic != is_pic {
+        s.is_pic = is_pic
+        t.img_wrap.set_visible(is_pic)
+    }
+    if s.is_badge != is_badge {
+        s.is_badge = is_badge
+        t.badge_wrap.set_visible(is_badge)
+    }
+    if !s.is_shown {
+        s.is_shown = true
+        t.set_visible(true)
+    }
+    return nil
+}
+
+fn hide_tile(k){
+    let s = tile_state[k]
+    s.id = ""
+    if !s.is_shown { return nil }
+    s.is_shown = false
+    tiles[k].set_visible(false)
+    return nil
+}
+
+// Whether a photo or video on this page still shows an icon instead of its picture.
+fn page_lacks_pictures(){
+    for s in tile_state {
+        if !s.is_shown || s.is_pic { continue }
+        let it = known[s.id]
+        if it != nil && is_visual(it) && !it.has_no_preview { return true }
+    }
+    return false
+}
+
+fn page_range(){
+    if shown.len() == 0 { return "" }
+    let first = page * page_size + 1
+    let last = min(shown.len(), (page + 1) * page_size)
+    return "" + first + "–" + last + " of " + shown.len()
+}
+
+fn filter_noun(){
+    if active_filter == "photo" { return "photos" }
+    if active_filter == "video" { return "videos" }
+    if active_filter == "audio" { return "audio or voice messages" }
+    if active_filter == "file" { return "files" }
+    return "attachments"
+}
+
+// A group allowed with one of its abilities blocked can't be fixed by asking again.
+fn is_read_switched_off(){ return host.has("matrix-room-read") }
+
+// The first letter of a host error, capitalized for a line of its own.
+fn capitalized(text){
+    if text == "" { return text }
+    let codes = text.to_chars()
+    if codes[0] < 97 || codes[0] > 122 { return text }
+    codes[0] = codes[0] - 32
+    return codes.to_string()
+}
+
+fn empty_card(icon, title, line, ask){ return {icon: icon title: title line: line ask: ask} }
+
+// The empty grid's card; its button retries or asks again when that can help.
+fn empty_state(){
+    if room_state == "unknown" || is_setup_pending || read_state == "pending" {
+        return empty_card("⏳", "Looking through this room…", "", "")
+    }
+    if items.len() > 0 && !can_load_older() { return empty_card("🔍", "No " + filter_noun() + " here", "Try another filter.", "") }
+    if items.len() > 0 { return empty_card("🔍", "No " + filter_noun() + " here yet", "Try another filter, or tap Load older.", "") }
+    if setup_error != "" { return empty_card("😕", "Couldn't ask for permission", capitalized(setup_error), "Try again") }
+    if read_state == "blocked" && is_read_switched_off() {
+        return empty_card("🔒", "Reading this room is off", "Turn it back on for Room Gallery in Mini Apps settings.", "")
+    }
+    if read_state == "blocked" { return empty_card("🔒", "Can't read this room", "Allow Room Gallery to read what's shared in this room.", "Ask again") }
+    if read_state == "failed" { return empty_card("😕", "Couldn't read this room", capitalized(read_error), "Try again") }
+    if is_at_start { return empty_card("🖼️", "Nothing shared yet", "Nobody has shared a photo, video or file in this room.", "") }
+    return empty_card("🖼️", "Nothing shared lately", "No photos, videos or files in the latest messages. Tap Load older to look further back.", "")
+}
+
+fn render_grid(){
+    bind_ui()
+    let start = page * page_size
+    let k = 0
+    while k < page_size {
+        if start + k < shown.len() { show_tile(k, shown[start + k]) } else { hide_tile(k) }
+        k += 1
+    }
+    let is_empty = shown.len() == 0
+    if is_empty {
+        let card = empty_state()
+        let is_loading = card.icon == "⏳"
+        put_text("empty_title", card.title)
+        put_text("loading_line", card.title)
+        put_shown("loading_wrap", is_loading)
+        put_shown("empty_card", !is_loading)
+        put_text("empty_icon", card.icon)
+        put_text("empty_line", card.line)
+        let is_ask = card.ask == "Ask again"
+        if card.ask != "" && !is_ask { put_text("empty_ask", card.ask) }
+        put_shown("empty_ask_wrap", card.ask != "")
+        put_shown("empty_retry_wrap", !is_ask)
+        put_shown("empty_allow_wrap", is_ask)
+    }
+    put_shown("grid", !is_empty && !is_flip_pending)
+    put_text("page_line", page_range())
+    put_shown("prev_wrap", page > 0)
+    put_shown("next_wrap", page + 1 < page_count())
+    return nil
+}
+
+// Hiding the grid for a frame lets its scroll position return to the top.
+fn flip_grid(){
+    if is_flip_pending { return nil }
+    is_flip_pending = start_timeout(0.05, || {
+        is_flip_pending = false
+        put_shown("grid", shown.len() > 0)
+    }) != nil
+    return nil
+}
+
+fn filter_label(title, emoji, n){
+    if is_compact && emoji != "" { return emoji + " " + n }
+    return title + " " + n
+}
+
+// Each chip has a plain and a filled copy; the filled one marks the active filter.
+// A kind's chip shows once it has something, or while it is the active filter.
+fn put_chip(key, title, emoji, n){
+    let label = filter_label(title, emoji, n)
+    let is_on = active_filter == key
+    put_text("f_" + key, label)
+    put_text("f_" + key + "_on", label)
+    put_shown("f_" + key + "_on_wrap", is_on)
+    put_shown("f_" + key + "_off_wrap", !is_on)
+    if key != "all" { put_shown("f_" + key + "_wrap", n > 0 || is_on) }
+    return nil
+}
+
+// The chips below count each kind, so only a wide pane, where it fits on one line, repeats the breakdown here.
+fn stats_text(){
+    if items.len() == 0 { return "No attachments found yet" }
+    if !is_wide { return join([plural(items.len(), "attachment", "attachments"), size_text(total_bytes)], " · ") }
+    let parts = []
+    if n_photo > 0 { parts.push(plural(n_photo, "photo", "photos")) }
+    if n_video > 0 { parts.push(plural(n_video, "video", "videos")) }
+    // Voice messages count as audio, as in the Audio filter.
+    if n_audio + n_voice > 0 { parts.push(plural(n_audio + n_voice, "audio clip", "audio clips")) }
+    if n_file > 0 { parts.push(plural(n_file, "file", "files")) }
+    parts.push(size_text(total_bytes))
+    return join(parts, " · ")
+}
+
+fn live_suffix(){
+    if live_error == "" { return "" }
+    if live_error == "off" { return " Live updates are off." }
+    return " " + live_error
+}
+
+fn status_text(){
+    if room_state == "unknown" { return "Starting…" }
+    if notice != "" { return notice }
+    if setup_error != "" { return "Couldn't set up the gallery: " + setup_error + " Tap Refresh to try again." }
+    if read_state == "blocked" && is_read_switched_off() { return "Reading this room's messages is turned off for Room Gallery in Mini Apps settings." }
+    if read_state == "blocked" { return "Reading this room isn't allowed. Tap Refresh to ask again." }
+    if read_state == "failed" { return "Couldn't read this room: " + read_error + " Tap Refresh to try again." }
+    if is_setup_pending || read_state == "pending" {
+        if items.len() > 0 { return "Checking for new attachments…" }
+        return "Looking through recent messages…"
+    }
+    if items.len() == 0 { return "Nothing shared in the latest messages yet." + live_suffix() }
+    return "Tap a tile for details." + live_suffix()
+}
+
+// Failures, including live updates that couldn't start, read red.
+fn put_status(line){
+    let is_err = line.search("Couldn't") >= 0 || line.search("Live updates are off:") >= 0
+    put_text("status", line)
+    if is_err { put_text("status_err", line) }
+    put_shown("status_n", !is_err)
+    put_shown("status_err_wrap", is_err)
+    return nil
+}
+
+fn previews_on(){ return media_refusal == "" && host.has("matrix.media.download") }
+
+fn media_note(){
+    if media_refusal == "limit" { return "Previews are paused so Robrix's request limit can recover." }
+    if media_refusal == "sharing" { return "Previews were blocked: " + media_error }
+    if media_refusal == "permission" { return "Previews weren't allowed, so photos and videos show as icons." }
+    if media_refusal != "" { return media_error }
+    if !host.has("matrix.media.download") { return "Photos and videos show as icons until you allow previews from your homeserver." }
+    return ""
+}
+
+fn older_text(){
+    if is_paging { return "Looking further back… " + run_scanned + " messages checked, " + plural(run_found, "attachment", "attachments") + " found." }
+    if older_note != "" { return older_note }
+    if is_capped { return "Showing the newest " + max_items + " attachments." }
+    if is_history_stuck { return "Robrix couldn't load anything older than this. It may not be readable on this device." }
+    if gap != nil { return "Load older first fills in what was shared while the gallery was closed." }
+    if is_at_start { return "That's everything, back to the start of this room." }
+    if scanned == 1 { return "Checked the latest message." }
+    if scanned > 0 { return "Checked the latest " + plural(scanned, "message", "messages") + "." }
+    return ""
+}
+
+fn can_load_older(){ return !is_paging && !is_page_pending && !is_capped && !is_history_stuck && (!is_at_start || gap != nil) && read_state == "done" }
+
+// Failures read red; the neutral label always holds the text.
+fn render_older(){
+    let line = older_text()
+    let is_err = line.strip_prefix("Couldn't ") != line
+    put_text("older_line", line)
+    if is_err { put_text("older_line_err", line) }
+    put_shown("older_line_n", !is_err && line != "")
+    put_shown("older_line_err_wrap", is_err)
+    put_shown("older_btn_wrap", can_load_older())
+    put_shown("stop_wrap", is_paging)
+    return nil
+}
+
+fn render_sections(){
+    let is_room = room_state != "detached"
+    let is_browse = is_room && detail_id == ""
+    // Counts, filters and the previews hint need something shared; until then the empty card
+    // speaks for the room, and the status line shows only news the card doesn't give.
+    let are_items_found = items.len() > 0
+    let is_news_shown = notice != "" || (live_error != "" && read_state == "done")
+    put_shown("head_wrap", is_browse)
+    put_shown("no_room_wrap", !is_room)
+    put_shown("filter_wrap", is_browse && are_items_found)
+    put_shown("status_wrap", is_browse && (are_items_found || is_news_shown))
+    put_shown("preview_wrap", is_browse && media_note() != "" && page_lacks_pictures())
+    put_shown("pager_wrap", is_browse && page_count() > 1)
+    put_shown("empty_wrap", is_browse && shown.len() == 0)
+    put_shown("grid_scroll", is_browse && shown.len() > 0)
+    put_shown("older_wrap", is_browse && room_state == "attached")
+    put_shown("stats_wrap", is_browse && are_items_found)
+    put_shown("hint_wrap", is_browse && are_items_found && !is_compact && !is_short)
+    put_shown("detail_wrap", is_room && detail_id != "")
+    put_shown("refresh_wide", !is_tiny)
+    put_shown("refresh_narrow", is_browse && is_tiny)
+    return nil
+}
+
+fn render_all(){
+    bind_ui()
+    if room_state == "detached" {
+        let icon = "🧭"
+        let title = "No room attached"
+        let line = "Open Room Gallery from a room to see what people shared."
+        if env_error != "" {
+            icon = "😕"
+            title = "Couldn't check which room this is"
+            line = capitalized(friendly(env_error))
+        }
+        put_text("room_line", "Not attached to a room")
+        put_text("no_room_icon", icon)
+        put_text("no_room_title", title)
+        put_text("no_room_line", line)
+        put_shown("env_retry_wrap", env_error != "")
+        render_sections()
+        return nil
+    }
+    let where = "Everything shared in this room"
+    if room_name != "" { where = "Everything shared in " + room_name }
+    put_text("room_line", where)
+    put_text("stats_line", stats_text())
+    put_chip("all", "All", "", items.len())
+    put_chip("photo", "Photos", "🖼️", n_photo)
+    put_chip("video", "Videos", "🎬", n_video)
+    put_chip("audio", "Audio", "🎵", n_audio + n_voice)
+    put_chip("file", "Files", "📄", n_file)
+    put_status(status_text())
+    put_text("preview_note", media_note())
+    render_grid()
+    render_older()
+    render_sections()
+    if detail_id != "" { render_detail_media() }
+    return nil
+}
+
+// ---- Browsing
+
+// A preview that failed on its own gets one more try when its page is shown again.
+fn retry_once(){
+    let i = page * page_size
+    let end = min(shown.len(), i + page_size)
+    while i < end {
+        let it = shown[i]
+        if it.is_preview_failed && it.tries < 2 { it.is_preview_failed = false }
+        i += 1
+    }
+    return nil
+}
+
+fn set_filter(key){
+    if active_filter == key { return nil }
+    active_filter = key
+    notice = ""
+    page = 0
+    refilter()
+    retry_once()
+    flip_grid()
+    render_all()
+    pump()
+    return nil
+}
+
+fn go_page(delta){
+    let next = page + delta
+    if next < 0 || next >= page_count() { return nil }
+    notice = ""
+    page = next
+    retry_once()
+    flip_grid()
+    render_all()
+    pump()
+    return nil
+}
+
+fn on_app_resize(width, height){
+    bind_ui()
+    put_shown("title_wrap", height >= 520)
+    let compact = width < 360
+    let short = height < 420
+    let wide = width >= 600
+    let tiny = width < 300
+    if compact == is_compact && short == is_short && wide == is_wide && tiny == is_tiny { return nil }
+    is_compact = compact
+    is_short = short
+    is_wide = wide
+    is_tiny = tiny
+    if compact {
+        put_text("prev_btn", "‹")
+        put_text("next_btn", "›")
+    } else {
+        put_text("prev_btn", "‹ Previous")
+        put_text("next_btn", "Next ›")
+    }
+    if room_state != "unknown" { render_all() }
+    return nil
+}
+
+fn toggle_how(){
+    bind_ui()
+    is_how_open = !is_how_open
+    if is_how_open { put_text("how_btn", "How it works ▲") } else { put_text("how_btn", "How it works ▼") }
+    put_shown("how_body", is_how_open)
+    return nil
+}
+
+fn on_focus_changed(json){
+    is_foreground = field(json.parse_json(), "foreground") != false
+    pump()
+    return nil
+}
+
+// ---- The request budget
+
+fn clock_at_least(t){
+    if t > clock { clock = t }
+    return nil
+}
+
+// Credits the refill since the last look; right after a cooldown Robrix grants a fixed amount.
+fn refill(){
+    clock_at_least(time_now())
+    if tokens_at > 0 && clock > tokens_at {
+        let dt = clock - tokens_at
+        auto_tokens += dt * auto_rate
+        if auto_tokens > auto_cap { auto_tokens = auto_cap }
+        if !is_after_cooldown {
+            tokens += dt * refill_rate
+            if tokens > bucket { tokens = bucket }
+        }
+    }
+    tokens_at = clock
+    return nil
+}
+
+fn spend(cost, is_auto){
+    refill()
+    if is_after_cooldown {
+        is_after_cooldown = false
+        tokens = after_cooldown
+    }
+    tokens -= cost
+    if is_auto { auto_tokens -= cost }
+    return nil
+}
+
+// Robrix refused a request for going over budget: everything waits out its cooldown.
+fn note_limit(){
+    refill()
+    if clock < hold_until { return nil }
+    hold_until = clock + hold_secs
+    is_after_cooldown = true
+    tokens = after_cooldown
+    auto_tokens = 0
+    limit_hits.retain(|t| clock - t < 120)
+    limit_hits.push(clock)
+    return nil
+}
+
+// Refusals within Robrix's two-minute strike window; a second one stops automatic retries.
+fn recent_limits(){
+    refill()
+    limit_hits.retain(|t| clock - t < 120)
+    return limit_hits.len()
+}
+
+// A request refused for going over budget is sent once more, after the hold.
+fn should_retry(error){
+    if !limit_re.test(error) { return false }
+    note_limit()
+    return recent_limits() < 2
+}
+
+// Seconds until a tap's request fits the budget (0 or less means now).
+fn tap_wait(cost){
+    refill()
+    let wait = hold_until - clock
+    let need = cost + 1 - tokens
+    if need > 0 && need / refill_rate > wait { wait = need / refill_rate }
+    return wait
+}
+
+// The same for an automatic request, which also keeps the reserve and its own allowance.
+// After a cooldown the budget stays at 10 until the next request, which goes without the reserve.
+fn auto_wait(cost){
+    let wait = tap_wait(cost + reserve - 1)
+    if is_after_cooldown { wait = tap_wait(cost) }
+    let need = cost - auto_tokens
+    if need > 0 && need / auto_rate > wait { wait = need / auto_rate }
+    return wait
+}
+
+// Sends a request now if the budget allows, else after the ones already waiting.
+// Requests for the open detail are dropped when it closes. True when sent now.
+fn send(service, args, cost, cb, is_detail){
+    if waiting.len() == 0 && tap_wait(cost) <= 0 {
+        spend(cost, false)
+        host.request(service, args, cb)
+        return true
+    }
+    waiting.push({service: service args: args cost: cost cb: cb is_detail: is_detail})
+    drain_later()
+    return false
+}
+
+fn drain_later(){
+    if is_send_waiting || waiting.len() == 0 { return nil }
+    let wait = tap_wait(waiting[0].cost) + 0.01
+    if wait < 0.02 { wait = 0.02 }
+    send_due = clock + wait
+    is_send_waiting = start_timeout(wait, || {
+        is_send_waiting = false
+        clock_at_least(send_due)
+        drain()
+    }) != nil
+    return nil
+}
+
+fn drain(){
+    while waiting.len() > 0 && tap_wait(waiting[0].cost) <= 0 {
+        let q = waiting[0]
+        waiting.remove(0)
+        spend(q.cost, false)
+        host.request(q.service, q.args, q.cb)
+    }
+    drain_later()
+    pump()
+    return nil
+}
+
+// ---- Pacing: automatic requests, most urgent first
+
+fn next_job(){
+    if is_paging && !is_page_pending && pages_left > 0 { return {kind: "page" cost: 5 it: nil} }
+    if is_foreground && !is_lookup_pending && host.has("matrix.room.event.read") {
+        if lookup_queue.len() > 0 { return {kind: "lookup" cost: 5 it: nil} }
+        if check_queue.len() > 0 { return {kind: "check" cost: 5 it: nil} }
+    }
+    if in_flight.len() >= preview_slots() || !previews_on() { return nil }
+    let large = detail_needing_large()
+    if large != nil { return {kind: "large" cost: 2 it: large} }
+    let next = next_tile_preview()
+    if next != nil { return {kind: "tile" cost: 2 it: next} }
+    return nil
+}
+
+fn run_job(job){
+    spend(job.cost, true)
+    if job.kind == "page" { request_page(false) }
+    elif job.kind == "lookup" { start_lookup() }
+    elif job.kind == "check" { start_check() }
+    elif job.kind == "large" { start_preview(job.it, detail_edge, false) }
+    else { start_preview(job.it, tile_edge, false) }
+    return nil
+}
+
+// Starts what is due while the budget allows, else waits until it does. Taps waiting
+// for the budget go first.
+fn pump(){
+    schedule_restore()
+    if is_pace_waiting || room_state != "attached" || waiting.len() > 0 { return nil }
+    let n = 0
+    while n < 4 {
+        let job = next_job()
+        if job == nil { return nil }
+        let wait = auto_wait(job.cost)
+        if wait > 0 {
+            arm_pace(wait)
+            return nil
+        }
+        run_job(job)
+        n += 1
+    }
+    return nil
+}
+
+fn arm_pace(wait){
+    pace_due = clock + wait + 0.01
+    is_pace_waiting = start_timeout(wait + 0.01, || {
+        is_pace_waiting = false
+        clock_at_least(pace_due)
+        pump()
+    }) != nil
+    return nil
+}
+
+// ---- Setup and reading
+
+fn check_env(){
+    if is_env_pending { return nil }
+    is_env_pending = true
+    send("env", nil, 1, fn(r){
+        is_env_pending = false
+        if !r.is_ok {
+            if should_retry(r.error) {
+                check_env()
+                return nil
+            }
+            room_state = "detached"
+            env_error = r.error
+            render_all()
+            return nil
+        }
+        if r.data["room_attached"] != true {
+            room_state = "detached"
+            render_all()
+            return nil
+        }
+        room_state = "attached"
+        room_name = text_of(r.data["room_name"])
+        render_all()
+        setup(false)
+        return nil
+    }, false)
+    return nil
+}
+
+fn setup(is_retry){
+    if is_setup_pending || room_state != "attached" { return nil }
+    setup_error = ""
+    if host.has("matrix.room.messages.read") && host.has("on_room_message") && host.has("on_room_message_changed") {
+        // Everything is allowed already, so a setup batch would ask nothing.
+        live_error = ""
+        read_latest()
+        sync_watch(is_retry)
+        render_all()
+        pump()
+        return nil
+    }
+    is_setup_pending = true
+    render_all()
+    send("permissions.request", {perms: ["matrix-room-read", "matrix-room-watch"], retry: is_retry}, 5, fn(r){
+        is_setup_pending = false
+        if !r.is_ok {
+            if should_retry(r.error) {
+                setup(is_retry)
+                return nil
+            }
+            setup_error = friendly(r.error)
+            render_all()
+            return nil
+        }
+        let perms = field(r.data, "permissions")
+        if field(perms, "matrix-room-read") == true && host.has("matrix.room.messages.read") {
+            read_latest()
+        } else {
+            read_token += 1
+            read_state = "blocked"
+        }
+        if field(perms, "matrix-room-watch") == true {
+            live_error = ""
+            sync_watch(is_retry)
+        } else { live_error = "off" }
+        render_all()
+        pump()
+        return nil
+    }, false)
+    return nil
+}
+
+fn read_latest(){
+    read_token += 1
+    let token = read_token
+    read_state = "pending"
+    read_error = ""
+    send("matrix.read_messages", {limit: read_limit}, 5, fn(r){
+        if token != read_token { return nil }
+        if !r.is_ok {
+            if should_retry(r.error) {
+                read_latest()
+                return nil
+            }
+            read_error = friendly(r.error.strip_prefix("couldn't read messages: "))
+            read_state = "failed"
+            if !host.has("matrix.room.messages.read") { read_state = "blocked" }
+            render_all()
+            return nil
+        }
+        read_state = "done"
+        merge_latest(field(r.data, "messages"))
+        read_device()
+        render_all()
+        pump()
+        return nil
+    }, false)
+    return nil
+}
+
+// Rows arrive oldest first; a window that doesn't reach the last visit leaves a gap.
+fn merge_latest(messages){
+    if !messages.is_array() || messages.len() == 0 {
+        items_changed()
+        return nil
+    }
+    add_items(items_of(messages))
+    queue_checks(messages)
+    let first_id = text_of(field(messages[0], "event_id"))
+    let first_ts = num_of(field(messages[0], "ts"))
+    let last_ts = num_of(field(messages[messages.len() - 1], "ts"))
+    if scanned == 0 {
+        before = first_id
+        scanned = messages.len()
+    } else {
+        for m in messages {
+            if num_of(field(m, "ts")) > newest_ts { scanned += 1 }
+        }
+        if newest_ts > 0 && first_ts > newest_ts {
+            let until = newest_ts
+            if gap != nil { until = gap.until_ts }
+            gap = {before: first_id until_ts: until}
+        }
+    }
+    if last_ts > newest_ts { newest_ts = last_ts }
+    items_changed()
+    return nil
+}
+
+// Local dates need the device's time zone; it is read once, after the room answers.
+fn read_device(){
+    if device_state != "idle" || !host.has("device.info.read") { return nil }
+    device_state = "pending"
+    send("device.info", nil, 1, fn(r){
+        if !r.is_ok {
+            device_state = "failed"
+            return nil
+        }
+        device_state = "done"
+        let offset = field(r.data, "utc_offset_minutes")
+        if offset.is_number() && offset > -1000 && offset < 1000 { utc_offset = offset }
+        is_24h = uses_24h(field(r.data, "locale"))
+        let it = known[detail_id]
+        if detail_id != "" && it != nil { fill_detail(it) }
+        return nil
+    }, false)
+    return nil
+}
+
+fn refresh(){
+    if room_state == "detached" {
+        env_error = ""
+        check_env()
+        return nil
+    }
+    older_note = ""
+    notice = ""
+    is_lookup_blocked = false
+    is_check_blocked = false
+    is_history_stuck = false
+    if device_state == "failed" { device_state = "idle" }
+    forget_failures()
+    setup(true)
+    return nil
+}
+
+// ---- Older history
+
+fn load_older(){
+    if room_state != "attached" || is_paging || is_page_pending { return nil }
+    if !host.has("matrix.room.messages.paginate") {
+        if is_read_switched_off() { older_note = "Loading older messages is turned off for Room Gallery in Mini Apps settings." }
+        else { older_note = "Loading older messages isn't allowed. Tap Refresh to ask again." }
+        render_older()
+        return nil
+    }
+    if !can_load_older() { return nil }
+    is_paging = true
+    pages_left = older_pages
+    paging_token += 1
+    run_found = 0
+    run_scanned = 0
+    older_note = ""
+    request_page(true)
+    render_older()
+    return nil
+}
+
+fn stop_older(){
+    if !is_paging { return nil }
+    is_paging = false
+    pages_left = 0
+    paging_token += 1
+    older_note = "Stopped after " + plural(run_scanned, "message", "messages") + "."
+    render_older()
+    return nil
+}
+
+// The tap's own page waits for the budget like any tap; later pages come from the pump.
+fn request_page(is_tap){
+    let token = paging_token
+    let is_gap = gap != nil
+    let cursor = before
+    if is_gap { cursor = gap.before }
+    let args = {limit: older_limit}
+    if cursor != "" { args = {before: cursor limit: older_limit} }
+    is_page_pending = true
+    pages_left -= 1
+    let cb = fn(r){
+        is_page_pending = false
+        if !r.is_ok {
+            if limit_re.test(r.error) {
+                note_limit()
+                if token == paging_token && is_paging && recent_limits() < 2 {
+                    pages_left += 1
+                    render_all()
+                    pump()
+                    return nil
+                }
+            }
+            if token == paging_token { is_paging = false }
+            older_note = "Couldn't load older messages: " + friendly(r.error.strip_prefix("couldn't load older messages: "))
+            render_all()
+            return nil
+        }
+        merge_page(field(r.data, "messages"), field(r.data, "has_more") == true, is_gap)
+        if token != paging_token || !is_paging {
+            render_all()
+            return nil
+        }
+        if pages_left <= 0 || is_capped || (is_at_start && gap == nil) { is_paging = false }
+        render_all()
+        pump()
+        return nil
+    }
+    if is_tap { send("matrix.older_messages", args, 5, cb, false) }
+    else { host.request("matrix.older_messages", args, cb) }
+    return nil
+}
+
+fn merge_page(messages, has_more, is_gap){
+    let list = messages
+    if !list.is_array() { list = [] }
+    run_found += add_items(items_of(list))
+    run_scanned += list.len()
+    scanned += list.len()
+    queue_checks(list)
+    let first_id = ""
+    let first_ts = 0
+    if list.len() > 0 {
+        first_id = text_of(field(list[0], "event_id"))
+        first_ts = num_of(field(list[0], "ts"))
+    }
+    if is_gap {
+        if !has_more { is_at_start = true }
+        if gap != nil && (!has_more || first_id == "" || first_ts <= gap.until_ts) { gap = nil }
+        elif gap != nil { gap.before = first_id }
+    } elif first_id != "" {
+        before = first_id
+        if !has_more { is_at_start = true }
+    } elif !has_more {
+        is_at_start = true
+    } else {
+        // An empty page that claims more history would repeat forever from this cursor.
+        is_paging = false
+        is_history_stuck = true
+    }
+    items_changed()
+    return nil
+}
+
+// ---- Live updates
+
+fn sync_watch(is_retry){
+    if is_retry { refused_hooks = [] }
+    subscribed.retain(|event| host.has(event))
+    for event in hooks {
+        if host.has(event) && !contains(refused_hooks, event) { subscribe(event) }
+    }
+    return nil
+}
+
+// A refused hook waits for Refresh; only hooks dropped by a revocation come back on their own.
+fn subscribe(event){
+    if contains(subscribed, event) || contains(pending_hooks, event) { return nil }
+    pending_hooks.push(event)
+    send("events.subscribe", {event: event}, 1, fn(r){
+        pending_hooks.retain(|e| e != event)
+        if r.is_ok {
+            subscribed.push(event)
+            if subscribed.len() == hooks.len() { live_error = "" }
+        } else {
+            if limit_re.test(r.error) { note_limit() }
+            refused_hooks.push(event)
+            live_error = "Live updates are off: " + friendly(r.error) + " Tap Refresh to turn them on."
+        }
+        render_all()
+        return nil
+    }, false)
+    return nil
+}
+
+fn on_room_message(json){
+    let batch = json.parse_json()
+    if !batch.is_array() { return nil }
+    for m in batch { queue_lookup(m) }
+    pump()
+    return nil
+}
+
+fn queue_lookup(m){
+    if is_lookup_blocked || !contains(media_types, text_of(field(m, "msgtype"))) { return nil }
+    let id = text_of(m["event_id"])
+    if id == "" || id == looking_up_id || known[id] != nil || was_removed(id) || contains(lookup_queue, id) { return nil }
+    if lookup_queue.len() >= max_lookups {
+        live_error = "Too many new attachments at once. Tap Refresh to catch up."
+        return nil
+    }
+    lookup_queue.push(id)
+    return nil
+}
+
+fn block_lookups(error){
+    is_lookup_blocked = true
+    lookup_queue = []
+    check_queue = []
+    live_error = "Couldn't add new attachments: " + friendly(error) + " Tap Refresh to catch up."
+    return nil
+}
+
+// The hook has no media details, so each new attachment is looked up once.
+fn start_lookup(){
+    let id = lookup_queue[0]
+    lookup_queue.remove(0)
+    is_lookup_pending = true
+    looking_up_id = id
+    host.request("matrix.event", {event_id: id}, fn(r){
+        is_lookup_pending = false
+        looking_up_id = ""
+        lookup_done(id, r)
+        render_all()
+        pump()
+        return nil
+    })
+    return nil
+}
+
+fn lookup_done(id, r){
+    if r.is_ok {
+        if add_items([item_of(r.data)]) > 0 { items_changed() }
+        return nil
+    }
+    if gone_re.test(r.error) { return nil }
+    if limit_re.test(r.error) {
+        note_limit()
+        if recent_limits() < 2 {
+            lookup_queue.push(id)
+            return nil
+        }
+    }
+    // A refusal stops live lookups until Refresh, so it can't prompt again per message.
+    block_lookups(r.error)
+    return nil
+}
+
+// A saved attachment the room no longer lists: removed only once Robrix confirms it is gone.
+fn start_check(){
+    let id = check_queue[0]
+    check_queue.remove(0)
+    is_lookup_pending = true
+    looking_up_id = id
+    host.request("matrix.event", {event_id: id}, fn(r){
+        is_lookup_pending = false
+        looking_up_id = ""
+        check_done(id, r)
+        render_all()
+        pump()
+        return nil
+    })
+    return nil
+}
+
+fn check_done(id, r){
+    if (r.is_ok && item_of(r.data) == nil) || (!r.is_ok && gone_re.test(r.error)) {
+        remove_item(id)
+        return nil
+    }
+    if r.is_ok { return nil }
+    if limit_re.test(r.error) {
+        note_limit()
+        if recent_limits() < 2 {
+            check_queue.push(id)
+            return nil
+        }
+    }
+    // A refusal or failure ends the checks until Refresh; nothing is removed on doubt.
+    check_queue = []
+    is_check_blocked = true
+    return nil
+}
+
+fn on_room_message_changed(json){
+    let p = json.parse_json()
+    let id = text_of(field(p, "event_id"))
+    if id == "" { return nil }
+    let body = text_of(p["body"])
+    if p["redacted"] == true || body == "" {
+        remove_item(id)
+        return nil
+    }
+    let it = known[id]
+    if it == nil && is_restoring() {
+        // An edit can beat its item's restore.
+        for row in saved_rows {
+            if field(row, "id") == id { row.caption = body }
+        }
+        return nil
+    }
+    if it == nil { return nil }
+    it.caption = ""
+    if body != it.name { it.caption = clip(body, long_caption_re, caption_head_re) }
+    save_gallery()
+    if detail_id == id { fill_detail(it) }
+    return nil
+}
+
+// ---- Permission changes
+
+fn sync_read(){
+    if !host.has("matrix.room.messages.read") {
+        if read_state == "done" || read_state == "pending" {
+            read_token += 1
+            read_state = "blocked"
+        }
+        return nil
+    }
+    if read_state == "blocked" { read_latest() }
+    return nil
+}
+
+fn on_permissions_changed(caps){
+    if is_setup_pending || room_state != "attached" { return nil }
+    sync_read()
+    if is_paging && !host.has("matrix.room.messages.paginate") {
+        stop_older()
+        older_note = "Loading older messages isn't allowed any more."
+    }
+    sync_watch(false)
+    if media_refusal == "permission" && host.has("matrix.media.download") { media_refusal = "" }
+    if read_state == "done" { read_device() }
+    render_all()
+    pump()
+    return nil
+}
+
+// ---- Previews
+
+// One preview at a time until one gets through, so a first review shows a single request.
+fn preview_slots(){
+    if is_media_proven { return max_in_flight }
+    return 1
+}
+
+fn is_in_flight(id, edge){
+    for f in in_flight {
+        if f.id == id && f.edge == edge { return true }
+    }
+    return false
+}
+
+fn needs_preview(it){
+    if !is_visual(it) || it.has_no_preview || it.is_preview_failed || thumb_of[it.id] != nil || is_tile_showing(it.id) { return false }
+    return !is_in_flight(it.id, tile_edge)
+}
+
+fn next_tile_preview(){
+    if detail_id != "" || !is_foreground { return nil }
+    let i = page * page_size
+    let end = min(shown.len(), i + page_size)
+    while i < end {
+        if needs_preview(shown[i]) { return shown[i] }
+        i += 1
+    }
+    return nil
+}
+
+fn detail_needing_large(){
+    if detail_id == "" || has_large { return nil }
+    let it = known[detail_id]
+    if it == nil || !is_visual(it) || it.has_no_preview || it.is_large_failed || is_in_flight(it.id, detail_edge) { return nil }
+    return it
+}
+
+// A tap's preview waits for the budget like any tap; the pump's go out at once.
+fn start_preview(it, edge, is_tap){
+    let id = it.id
+    in_flight.push({id: id edge: edge})
+    let cb = fn(r){
+        in_flight.retain(|f| f.id != id || f.edge != edge)
+        if r.is_ok { preview_landed(id, edge, r.data) } else { preview_failed(id, edge, r.error) }
+        render_all()
+        pump()
+        return nil
+    }
+    if is_tap { send("matrix.media_preview", {event_id: id size: edge}, 2, cb, false) }
+    else { host.request("matrix.media_preview", {event_id: id size: edge}, cb) }
+    return nil
+}
+
+// A preview belongs to its event, so it stays valid whatever is open now.
+fn preview_landed(id, edge, data){
+    is_media_proven = true
+    let it = known[id]
+    if it == nil { return nil }
+    let b64 = text_of(field(data, "data_base64"))
+    let bytes = nil
+    if b64 != "" { bytes = b64.decode_base64() }
+    if bytes == nil {
+        if edge == tile_edge { it.is_preview_failed = true } else { it.is_large_failed = true }
+        return nil
+    }
+    if edge == tile_edge {
+        if !store_thumb(id, b64) { it.is_preview_failed = true }
+        let k = 0
+        while k < tiles.len() {
+            if tile_state[k].id == id {
+                tiles[k].img.load_image_from_data_async(bytes)
+                tile_state[k].image = id
+            }
+            k += 1
+        }
+    }
+    if edge == detail_edge { remember_large(id, b64) }
+    if detail_id != id || has_large { return nil }
+    if edge == detail_edge { has_large = true }
+    show_detail_picture(bytes)
+    render_detail_media()
+    return nil
+}
+
+// Refusals pause previews; anything else is the item's own trouble.
+fn preview_failed(id, edge, error){
+    if gone_media_re.test(error) {
+        is_media_proven = true
+        remove_item(id)
+        return nil
+    }
+    preview_refused(id, edge, error)
+    if detail_id == id { render_detail_media() }
+    return nil
+}
+
+fn preview_refused(id, edge, error){
+    let it = known[id]
+    if no_preview_re.test(error) {
+        is_media_proven = true
+        if it != nil {
+            it.has_no_preview = true
+            save_gallery()
+        }
+        return nil
+    }
+    if limit_re.test(error) {
+        note_limit()
+        if recent_limits() >= 2 { media_refusal = "limit" }
+        return nil
+    }
+    if !host.has("matrix.media.download") {
+        media_refusal = "permission"
+        media_error = friendly(error)
+        return nil
+    }
+    if refusal_re.test(error) {
+        media_refusal = "sharing"
+        media_error = friendly(error)
+        return nil
+    }
+    is_media_proven = true
+    if it == nil { return nil }
+    it.tries += 1
+    if edge == tile_edge { it.is_preview_failed = true }
+    if edge == detail_edge { it.is_large_failed = true }
+    return nil
+}
+
+// Refresh and Show previews clear every failure; a page visit retries one only once.
+fn forget_failures(){
+    for it in items {
+        it.is_preview_failed = false
+        it.is_large_failed = false
+        it.tries = 0
+    }
+    return nil
+}
+
+fn show_previews(){
+    media_refusal = ""
+    media_error = ""
+    forget_failures()
+    notice = ""
+    let next = next_tile_preview()
+    if next == nil {
+        notice = "Everything on this page that can have a preview has one."
+    } elif !host.has("matrix.media.download") && in_flight.len() == 0 {
+        // The first preview asks for the media permission, so it goes alone.
+        start_preview(next, tile_edge, true)
+    }
+    render_all()
+    pump()
+    return nil
+}
+
+// ---- The detail panel
+
+fn open_tile(k){
+    let index = page * page_size + k
+    if index >= shown.len() { return nil }
+    open_item(shown[index])
+    return nil
+}
+
+fn info_line(it){
+    let parts = []
+    if it.w > 0 && it.h > 0 { parts.push("" + it.w + " × " + it.h + " pixels") }
+    if it.dur > 0 { parts.push("Length " + dur_text(it.dur)) }
+    if it.mime != "" && (it.kind != "file" || file_type(it) == nil) { parts.push(it.mime) }
+    return join(parts, " · ")
+}
+
+fn who_line(it){
+    if it.sender == "" { return "Shared by someone" }
+    return "Shared by " + it.sender
+}
+
+fn fill_detail(it){
+    put_text("d_name", it.name)
+    put_text("d_kind", join([kind_title(it), size_text(it.size)], " · "))
+    let info = info_line(it)
+    put_text("d_info", info)
+    put_shown("d_info_wrap", info != "")
+    put_text("d_who", who_line(it))
+    put_text("d_when", when_text(it.ts))
+    put_text("d_caption", it.caption)
+    put_shown("d_caption_wrap", it.caption != "")
+    return nil
+}
+
+// Tones: 0 progress, 1 done, 2 failed; the neutral label always holds the text.
+fn set_note(text, tone){
+    put_text("d_note", text)
+    if tone == 1 { put_text("d_note_ok", text) }
+    if tone == 2 { put_text("d_note_err", text) }
+    put_shown("d_note_wrap", text != "")
+    put_shown("d_note_n", tone == 0)
+    put_shown("d_note_ok_wrap", tone == 1)
+    put_shown("d_note_err_wrap", tone == 2)
+    return nil
+}
+
+fn show_detail_picture(bytes){
+    views.d_img.load_image_from_data_async(bytes)
+    put_shown("d_img_wrap", true)
+    put_shown("d_icon_wrap", false)
+    return nil
+}
+
+fn render_detail_media(){
+    let it = known[detail_id]
+    if it == nil { return nil }
+    let is_loading = is_in_flight(it.id, detail_edge) || is_in_flight(it.id, tile_edge)
+    put_shown("d_preview_wrap", is_visual(it) && !has_large && !it.has_no_preview && !is_loading && (!previews_on() || it.is_large_failed))
+    let label = kind_title(it)
+    if it.has_no_preview { label = label + " · NO PREVIEW" }
+    elif is_loading { label = label + " · LOADING PREVIEW…" }
+    put_text("d_icon_label", label)
+    return nil
+}
+
+fn open_item(it){
+    notice = ""
+    detail_id = it.id
+    detail_token += 1
+    has_large = false
+    is_nav_pending = false
+    is_share_pending = false
+    bind_ui()
+    fill_detail(it)
+    put_shown("d_pic_box", is_visual(it))
+    put_shown("d_file_box", !is_visual(it))
+    put_text("d_file_icon", icon_of(it))
+    put_text("d_file_label", kind_title(it))
+    put_text("d_icon", icon_of(it))
+    set_note("", 0)
+    put_shown("d_img_wrap", false)
+    put_shown("d_icon_wrap", true)
+    let large = ""
+    if is_visual(it) { large = cached_large(it.id) }
+    let bytes = nil
+    if large != "" { bytes = large.decode_base64() }
+    has_large = bytes != nil
+    let b64 = ""
+    if bytes == nil && is_visual(it) { b64 = read_thumb(it.id) }
+    if b64 != "" { bytes = b64.decode_base64() }
+    if bytes != nil { show_detail_picture(bytes) }
+    if previews_on() && detail_needing_large() != nil && in_flight.len() < preview_slots() {
+        start_preview(it, detail_edge, true)
+    }
+    render_detail_media()
+    render_sections()
+    return nil
+}
+
+fn close_detail(){
+    detail_id = ""
+    detail_token += 1
+    has_large = false
+    is_nav_pending = false
+    is_share_pending = false
+    waiting.retain(|q| !q.is_detail)
+    return nil
+}
+
+fn back_to_grid(){
+    close_detail()
+    retry_once()
+    render_all()
+    pump()
+    return nil
+}
+
+fn show_detail_preview(){
+    let it = known[detail_id]
+    if it == nil || is_in_flight(it.id, detail_edge) { return nil }
+    if in_flight.len() >= preview_slots() {
+        set_note("Still loading other previews. Try again in a moment.", 0)
+        return nil
+    }
+    media_refusal = ""
+    media_error = ""
+    it.is_large_failed = false
+    start_preview(it, detail_edge, true)
+    render_detail_media()
+    return nil
+}
+
+fn show_in_chat(){
+    if detail_id == "" || is_nav_pending { return nil }
+    let token = detail_token
+    is_nav_pending = true
+    set_note("Opening it in the chat…", 0)
+    let is_now = send("nav.event", {event_id: detail_id}, 8, fn(r){
+        if token != detail_token { return nil }
+        is_nav_pending = false
+        if r.is_ok { set_note("Shown in the chat.", 1) } else { set_note(capitalized(friendly(r.error)), 2) }
+        return nil
+    }, true)
+    if !is_now { set_note("One moment…", 0) }
+    return nil
+}
+
+fn too_big_text(size){
+    let what = "This file is larger than the 3 MB Share again can attach."
+    if size > 0 { what = "This file is " + size_text(size) + ", larger than the 3 MB Share again can attach." }
+    return what + " Use Show in chat to find it in the conversation instead."
+}
+
+// Downloads the whole file, then hands it to Robrix's attachment preview.
+fn share_again(){
+    let it = known[detail_id]
+    if it == nil || is_share_pending { return nil }
+    if it.size > max_share_bytes {
+        set_note(too_big_text(it.size), 2)
+        return nil
+    }
+    let token = detail_token
+    let id = it.id
+    is_share_pending = true
+    set_note("Downloading " + it.name + "…", 0)
+    let is_now = send("matrix.download_media", {event_id: id}, 5, fn(r){
+        if token != detail_token { return nil }
+        if !r.is_ok {
+            is_share_pending = false
+            if gone_media_re.test(r.error) {
+                remove_item(id)
+                return nil
+            }
+            if limit_re.test(r.error) { note_limit() }
+            set_note("Couldn't download it: " + friendly(r.error), 2)
+            return nil
+        }
+        let data = text_of(field(r.data, "data_base64"))
+        if data.len() > max_share_chars {
+            is_share_pending = false
+            set_note(too_big_text(0), 2)
+            return nil
+        }
+        if data == "" {
+            is_share_pending = false
+            set_note("Couldn't download it: the file came back empty.", 2)
+            return nil
+        }
+        let filename = text_of(r.data["filename"])
+        if filename == "" { filename = it.name }
+        let mime = text_of(r.data["mime_type"])
+        if mime == "" { mime = it.mime }
+        if mime == "" { mime = "application/octet-stream" }
+        set_note("Putting it in the message box…", 0)
+        let is_attached_now = send("composer.attach", {data_base64: data filename: filename mime_type: mime}, 8, fn(out){
+            if token != detail_token { return nil }
+            is_share_pending = false
+            if out.is_ok {
+                set_note("Ready in the message box. Review it there and press Send.", 1)
+                return nil
+            }
+            if limit_re.test(out.error) { note_limit() }
+            set_note(capitalized(friendly(out.error)), 2)
+            return nil
+        }, true)
+        if !is_attached_now { set_note("One moment…", 0) }
+        return nil
+    }, true)
+    if !is_now { set_note("One moment…", 0) }
+    return nil
+}
+
+let _init = load_saved()
+let _boot = start_timeout(0.05, || {
+    restore_slice()
+    render_all()
+    check_env()
+    schedule_restore()
+})
+
+// One grid cell, addressed through the handles in `tiles`. The picture layer
+// is opaque, so showing it is the only change a tile needs to switch modes.
+let Tile = RoundedView{
+    width: Fill height: Fill flow: Overlay visible: false
+    show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+    View{
+        width: Fill height: Fill flow: Down align: Align{x: 0.5 y: 0.5} padding: Inset{left: 6 right: 6 top: 4 bottom: 34}
+        ph_icon := Label{
+            text: "🖼️" padding: 0 margin: 0
+            draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 26} }
+        }
+    }
+    View{
+        width: Fill height: Fill flow: Down align: Align{y: 1.0} spacing: 1 padding: Inset{left: 8 right: 8 top: 0 bottom: 7}
+        name := Label{
+            text: "" width: Fill padding: 0 margin: 0 max_lines: 1 text_overflow: TextOverflow.Ellipsis
+            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 10} }
+        }
+        meta := Label{
+            text: "" width: Fill padding: 0 margin: 0 max_lines: 1 text_overflow: TextOverflow.Ellipsis
+            draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 9} }
+        }
+    }
+    img_wrap := RoundedView{
+        width: Fill height: Fill visible: false
+        show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+        img := Image{
+            width: Fill height: Fill fit: ImageFit.CropToFill
+            draw_bg +: {
+                pixel: fn(){
+                    let color = mix(self.get_color(), #xE3E9F5, self.async_load)
+                    let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                    sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, 8.0)
+                    sdf.fill(vec4(color.xyz, color.w * self.opacity))
+                    return sdf.result
+                }
+            }
+        }
+    }
+    badge_wrap := View{
+        width: Fill height: Fill align: Align{x: 0.0 y: 1.0} padding: 6 visible: false
+        RoundedView{
+            width: Fit height: Fit padding: Inset{left: 6 right: 6 top: 2 bottom: 3}
+            show_bg: true draw_bg +: { color: #x1C274CCC border_radius: 7.0 }
+            badge := Label{
+                text: "▶️" padding: 0 margin: 0
+                draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 9} }
+            }
+        }
+    }
+}
+
+// ---- Look: Robrix's kit and the shared text styles
+
+let PrimaryButton = Button{
+    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
+    draw_bg +: {
+        border_size: 0.0 border_radius: 4.0
+        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+}
+let NeutralButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
+        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+}
+let GhostButton = PrimaryButton{
+    padding: Inset{left: 6 right: 6 top: 4 bottom: 4}
+    margin: Inset{left: -6}
+    draw_bg +: { border_size: 0.0 color: #xFFFFFF00 color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF00 }
+    draw_text +: { color: #x66708F color_hover: #x1C274C color_down: #x1C274C color_focus: #x66708F }
+}
+// Filter chips: a white pill with a gray edge, or the accent-filled pill of the active filter.
+let Chip = PrimaryButton{
+    padding: Inset{left: 10 right: 10 top: 5 bottom: 5}
+    draw_bg +: { border_size: 1.0 border_radius: 12.0
+        border_color: #xC8C8C8 border_color_hover: #xC8C8C8 border_color_down: #xC8C8C8 border_color_focus: #xC8C8C8
+        color: #xFFFFFF color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+}
+let ChipOn = Chip{
+    draw_bg +: { border_color: #x0f88fe border_color_hover: #x106fcc border_color_down: #x0C5DAA border_color_focus: #x0f88fe
+        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe }
+    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF }
+}
+let Meta = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+let OkText = Meta{ draw_text +: { color: #x138808 } }
+let ErrText = Meta{ draw_text +: { color: #xDC0005 } }
+let Caption = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+let Body = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
+let Slot = View{ width: Fill height: Fit }
+let Fits = View{ width: Fit height: Fit }
+let ButtonRow = View{ width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8 align: Align{y: 0.5} }
+let Card = RoundedView{
+    width: Fill height: Fit show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+}
+let EmptyCard = RoundedView{
+    width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5} padding: Inset{top: 20 bottom: 20 left: 16 right: 16}
+    show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+}
+let EmptyIcon = Label{ padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 28} } }
+let EmptyTitle = Label{ width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} } }
+let EmptyText = Label{ width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+
+View{
+    width: Fill height: Fill flow: Down
+    col := ScrollYView{
+        width: Fill height: Fill flow: Down spacing: 12 padding: 14
+        // The pane header names the app; this row sums up what was shared.
+        head_wrap := View{
+            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+            View{
+                width: Fill height: Fit flow: Down spacing: 2
+                stats_wrap := Slot{
+                    visible: false
+                    stats_line := Label{
+                        text: "" width: Fill padding: 0 margin: 0
+                        draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} }
+                    }
+                }
+                title_wrap := Slot{
+                    room_line := Meta{ text: "" max_lines: 1 text_overflow: TextOverflow.Ellipsis }
+                }
+            }
+            refresh_wide := Fits{
+                NeutralButton{ text: "Refresh" on_click: || refresh() }
+            }
+        }
+        refresh_narrow := Slot{
+            visible: false
+            NeutralButton{ text: "Refresh" on_click: || refresh() }
+        }
+        no_room_wrap := Slot{
+            visible: false
+            EmptyCard{
+                no_room_icon := EmptyIcon{ text: "🧭" }
+                no_room_title := EmptyTitle{ text: "" }
+                no_room_line := EmptyText{ text: "" }
+                env_retry_wrap := View{
+                    width: Fit height: Fit visible: false margin: Inset{top: 6}
+                    NeutralButton{ text: "Try again" on_click: || refresh() }
+                }
+            }
+        }
+        filter_wrap := View{
+            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8 align: Align{y: 0.5} visible: false
+            Fits{
+                f_all_on_wrap := Fits{
+                    f_all_on := ChipOn{ text: "All 0" on_click: || set_filter("all") }
+                }
+                f_all_off_wrap := Fits{
+                    visible: false
+                    f_all := Chip{ text: "All 0" on_click: || set_filter("all") }
+                }
+            }
+            f_photo_wrap := Fits{
+                visible: false
+                f_photo_on_wrap := Fits{
+                    visible: false
+                    f_photo_on := ChipOn{ text: "Photos 0" on_click: || set_filter("photo") }
+                }
+                f_photo_off_wrap := Fits{
+                    f_photo := Chip{ text: "Photos 0" on_click: || set_filter("photo") }
+                }
+            }
+            f_video_wrap := Fits{
+                visible: false
+                f_video_on_wrap := Fits{
+                    visible: false
+                    f_video_on := ChipOn{ text: "Videos 0" on_click: || set_filter("video") }
+                }
+                f_video_off_wrap := Fits{
+                    f_video := Chip{ text: "Videos 0" on_click: || set_filter("video") }
+                }
+            }
+            f_audio_wrap := Fits{
+                visible: false
+                f_audio_on_wrap := Fits{
+                    visible: false
+                    f_audio_on := ChipOn{ text: "Audio 0" on_click: || set_filter("audio") }
+                }
+                f_audio_off_wrap := Fits{
+                    f_audio := Chip{ text: "Audio 0" on_click: || set_filter("audio") }
+                }
+            }
+            f_file_wrap := Fits{
+                visible: false
+                f_file_on_wrap := Fits{
+                    visible: false
+                    f_file_on := ChipOn{ text: "Files 0" on_click: || set_filter("file") }
+                }
+                f_file_off_wrap := Fits{
+                    f_file := Chip{ text: "Files 0" on_click: || set_filter("file") }
+                }
+            }
+        }
+        status_wrap := View{
+            width: Fill height: Fit flow: Down visible: false
+            status_n := Slot{
+                status := Meta{ text: "Starting…" }
+            }
+            status_err_wrap := Slot{
+                visible: false
+                status_err := ErrText{ text: "" }
+            }
+        }
+        preview_wrap := RoundedView{
+            width: Fill height: Fit flow: Down spacing: 8 padding: 12 visible: false
+            show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+            preview_note := Body{ text: "" }
+            Fits{
+                NeutralButton{ text: "Show previews" on_click: || show_previews() }
+            }
+        }
+        pager_wrap := View{
+            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5} visible: false
+            page_line := Meta{ text: "" }
+            prev_wrap := Fits{
+                prev_btn := NeutralButton{ text: "‹ Previous" on_click: || go_page(-1) }
+            }
+            next_wrap := Fits{
+                next_btn := NeutralButton{ text: "Next ›" on_click: || go_page(1) }
+            }
+        }
+        empty_wrap := View{
+            width: Fill height: Fit flow: Down visible: false
+            loading_wrap := View{
+                width: Fill height: Fit flow: Right spacing: 10 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24} visible: false
+                LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
+                loading_line := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+            }
+            empty_card := EmptyCard{
+                empty_icon := EmptyIcon{ text: "🖼️" }
+                empty_title := EmptyTitle{ text: "" }
+                empty_line := EmptyText{ text: "" }
+                empty_ask_wrap := View{
+                    width: Fit height: Fit visible: false margin: Inset{top: 6}
+                    empty_retry_wrap := View{
+                        width: Fit height: Fit
+                        empty_ask := NeutralButton{ text: "Try again" on_click: || refresh() }
+                    }
+                    empty_allow_wrap := View{
+                        width: Fit height: Fit visible: false
+                        PrimaryButton{ text: "Ask again" on_click: || refresh() }
+                    }
+                }
+            }
+        }
+        grid_scroll := ScrollYView{
+            width: Fill height: Fill{min: 120} flow: Down spacing: 8 visible: false
+            grid := Grid{
+                width: Fill height: Fit visible: false
+                columns: ["repeat(auto-fill, minmax(132px, 1fr))"]
+                implicit_row_size: 124 column_gap: 8 row_gap: 8
+                t0 := Tile{on_item_tap: |i| open_tile(0)}
+                t1 := Tile{on_item_tap: |i| open_tile(1)}
+                t2 := Tile{on_item_tap: |i| open_tile(2)}
+                t3 := Tile{on_item_tap: |i| open_tile(3)}
+                t4 := Tile{on_item_tap: |i| open_tile(4)}
+                t5 := Tile{on_item_tap: |i| open_tile(5)}
+                t6 := Tile{on_item_tap: |i| open_tile(6)}
+                t7 := Tile{on_item_tap: |i| open_tile(7)}
+                t8 := Tile{on_item_tap: |i| open_tile(8)}
+                t9 := Tile{on_item_tap: |i| open_tile(9)}
+                t10 := Tile{on_item_tap: |i| open_tile(10)}
+                t11 := Tile{on_item_tap: |i| open_tile(11)}
+                t12 := Tile{on_item_tap: |i| open_tile(12)}
+                t13 := Tile{on_item_tap: |i| open_tile(13)}
+                t14 := Tile{on_item_tap: |i| open_tile(14)}
+                t15 := Tile{on_item_tap: |i| open_tile(15)}
+                t16 := Tile{on_item_tap: |i| open_tile(16)}
+                t17 := Tile{on_item_tap: |i| open_tile(17)}
+                t18 := Tile{on_item_tap: |i| open_tile(18)}
+                t19 := Tile{on_item_tap: |i| open_tile(19)}
+                t20 := Tile{on_item_tap: |i| open_tile(20)}
+                t21 := Tile{on_item_tap: |i| open_tile(21)}
+                t22 := Tile{on_item_tap: |i| open_tile(22)}
+                t23 := Tile{on_item_tap: |i| open_tile(23)}
+            }
+        }
+        older_wrap := View{
+            width: Fill height: Fit flow: Down spacing: 6
+            ButtonRow{
+                older_btn_wrap := Fits{
+                    visible: false
+                    NeutralButton{ text: "Load older" on_click: || load_older() }
+                }
+                stop_wrap := Fits{
+                    visible: false
+                    NeutralButton{ text: "Stop" on_click: || stop_older() }
+                }
+            }
+            older_line_n := Slot{
+                older_line := Meta{ text: "" }
+            }
+            older_line_err_wrap := Slot{
+                visible: false
+                older_line_err := ErrText{ text: "" }
+            }
+        }
+        hint_wrap := View{
+            width: Fill height: Fit flow: Down spacing: 4
+            Fits{
+                how_btn := GhostButton{ text: "How it works ▼" on_click: || toggle_how() }
+            }
+            how_body := Slot{
+                visible: false
+                Meta{ text: "Previews and Share again download through your homeserver. Nothing is posted until you press Send in Robrix." }
+            }
+        }
+        detail_wrap := View{
+            width: Fill height: Fit flow: Down spacing: 12 visible: false
+            Fits{
+                NeutralButton{ text: "‹ Back to gallery" on_click: || back_to_grid() }
+            }
+            d_file_box := Card{
+                height: 150 flow: Down align: Align{x: 0.5 y: 0.5} spacing: 8 visible: false
+                d_file_icon := Label{
+                    text: "📄" padding: 0 margin: 0
+                    draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 40} }
+                }
+                d_file_label := Label{
+                    text: "" padding: 0 margin: 0
+                    draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} }
+                }
+            }
+            // Sized by its picture, at most half the pane, so short panes keep the actions in view.
+            d_pic_box := Card{
+                flow: Overlay padding: 10
+                d_icon_wrap := View{
+                    width: Fill height: 160 flow: Down align: Align{x: 0.5 y: 0.5} spacing: 8
+                    d_icon := Label{
+                        text: "📄" padding: 0 margin: 0
+                        draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 46} }
+                    }
+                    d_icon_label := Label{
+                        text: "" padding: 0 margin: 0
+                        draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} }
+                    }
+                }
+                d_img_wrap := View{
+                    width: Fill height: Fit align: Align{x: 0.5} visible: false
+                    d_img := Image{
+                        width: Fill height: Fit{max: FitBound.Rel{base: Base.Full, factor: 0.5}} fit: ImageFit.Smallest
+                        draw_bg +: {
+                            pixel: fn(){
+                                let color = mix(self.get_color(), #xE3E9F5, self.async_load)
+                                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                                sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, 6.0)
+                                sdf.fill(vec4(color.xyz, color.w * self.opacity))
+                                return sdf.result
+                            }
+                        }
+                    }
+                }
+            }
+            View{
+                width: Fill height: Fit flow: Down spacing: 4
+                d_name := Label{
+                    text: "" width: Fill padding: 0 margin: 0
+                    draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} }
+                }
+                d_kind := Caption{ text: "" }
+                d_info_wrap := Slot{
+                    d_info := Body{ text: "" }
+                }
+                // The date moves to its own line when it doesn't fit, rather than breaking inside a time.
+                View{
+                    width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 4
+                    d_who := Body{ text: "" width: Fit{max: FitBound.Rel{base: Base.Full, factor: 1.0}} max_lines: 6 }
+                    d_when := Body{ text: "" width: Fit{max: FitBound.Rel{base: Base.Full, factor: 1.0}} max_lines: 2 }
+                }
+            }
+            d_caption_wrap := Card{
+                padding: 12 visible: false
+                d_caption := Body{ text: "" }
+            }
+            ButtonRow{
+                PrimaryButton{ text: "Show in chat" on_click: || show_in_chat() }
+                NeutralButton{ text: "Share again" on_click: || share_again() }
+                d_preview_wrap := Fits{
+                    visible: false
+                    NeutralButton{ text: "Show preview" on_click: || show_detail_preview() }
+                }
+            }
+            d_note_wrap := View{
+                width: Fill height: Fit flow: Down visible: false
+                d_note_n := Slot{
+                    d_note := Meta{ text: "" }
+                }
+                d_note_ok_wrap := Slot{
+                    visible: false
+                    d_note_ok := OkText{ text: "" }
+                }
+                d_note_err_wrap := Slot{
+                    visible: false
+                    d_note_err := ErrText{ text: "" }
+                }
+            }
+            Meta{ text: "Share again puts the file in the message box. Nothing is sent until you press Send." }
+        }
+    }
+}

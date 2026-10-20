@@ -224,7 +224,7 @@ async fn run_workflow(name:&str,prompt:&str,web:bool,original:bool) {
     let fixture=Fixture::new(name);
     let shutdown=Arc::new(Shutdown::default());
     let generation=shutdown.begin_prompt();
-    let (previous,host)=build_protected_agent(&prefs,&shutdown,true,fixture.context.clone(),Some(fixture.registry())).await.unwrap();
+    let (previous,host)=build_protected_agent(&prefs,&shutdown,true,fixture.context.clone(),Some(fixture.registry()),Default::default()).await.unwrap();
     let system=previous.system_prompt_snapshot();
     assert!(system.contains(crate::ROOM_AGENT_GUIDE),"Actual room agent must receive the room role and media guide.");
     assert!(!system.contains(crate::SPLASH_GUIDE),"Mini-app generation instructions must not replace the room agent's role.");

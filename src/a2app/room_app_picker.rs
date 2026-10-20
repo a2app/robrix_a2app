@@ -54,7 +54,10 @@ script_mod! {
         apps_list := PortalList {
             width: Fill, height: Fill
             flow: Down
-            margin: Inset{top: 10, bottom: 12}
+            // Reaches into the modal's right padding, so the scroll bar sits beside the rows, not over them.
+            margin: Inset{top: 10, right: -16, bottom: 12}
+            padding: Inset{right: 16}
+            scroll_bar: ListScrollBar {}
 
             app_row := mod.widgets.MiniAppRow {
                 margin: Inset{bottom: 4}

@@ -2,9 +2,9 @@
 
 use std::{io::Write, path::{Path, PathBuf}, sync::Arc};
 
-use a2app_core::permissions::RoomAccess;
+use a2app_core::{permissions::RoomAccess, services::media_preview::{self, PreviewError, PreviewImage}};
 use makepad_widgets::image_cache::image_size_by_data;
-use matrix_sdk::{config::RequestConfig, ruma::{OwnedRoomId, serde::Base64, events::room::{MediaSource as MatrixMediaSource, message::{
+use matrix_sdk::{config::RequestConfig, ruma::{OwnedRoomId, serde::{Base64, base64::Standard}, events::room::{MediaSource as MatrixMediaSource, message::{
     AudioMessageEventContent, FileMessageEventContent, ImageMessageEventContent,
     MessageType, RoomMessageEventContent, VideoMessageEventContent,
 }}}};
@@ -371,14 +371,36 @@ pub async fn download_mxc(uri: &str, authorization: MatrixAuthorization) -> Resu
         policy::ensure_room_access(source_room.as_str(), RoomAccess::Read)?;
         let descriptor = resolve_cached_media_uri(uri, &source_room, &events)
             .ok_or("Use draft_media with event_id and source_room to identify the authorized attachment.")?;
-        download_descriptor(descriptor, authorization, client).await
+        download_descriptor(descriptor, WHOLE_FILE_BYTES, authorization, client).await
+            .map_err(|error| error.into_message(WHOLE_FILE_TOO_LARGE))
     }).await
+}
+
+const WHOLE_FILE_BYTES: usize = crate::a2app::network::MAX_MEDIA_RESPONSE_BODY;
+const WHOLE_FILE_TOO_LARGE: &str = "The Matrix media exceeds the 16 MiB download limit.";
+
+/// Why a download stopped. An exceeded byte cap stays distinct, so a preview never falls back after it.
+#[derive(Debug)]
+enum DownloadError { TooLarge, Failed(String) }
+
+impl From<String> for DownloadError {
+    fn from(error: String) -> Self { Self::Failed(error) }
+}
+
+impl From<&str> for DownloadError {
+    fn from(error: &str) -> Self { Self::Failed(error.into()) }
+}
+
+impl DownloadError {
+    fn into_message(self, too_large: &str) -> String {
+        match self { Self::TooLarge => too_large.into(), Self::Failed(error) => error }
+    }
 }
 
 /// Download plaintext MXC media through the logged-in account's own
 /// authenticated homeserver endpoint. A dedicated client prevents redirects
 /// from forwarding the access token and bounds allocation while streaming.
-async fn raw_download_mxc(uri: &str, authorization: MatrixAuthorization, client: matrix_sdk::Client) -> Result<Vec<u8>, String> {
+async fn raw_download_mxc(uri: &str, limit: usize, authorization: MatrixAuthorization, client: matrix_sdk::Client) -> Result<Vec<u8>, DownloadError> {
     policy::with_authorization(authorization.clone(), async {
         authorization.check_current_permission()?;
         let mxc: &matrix_sdk::ruma::MxcUri = uri.into();
@@ -405,18 +427,15 @@ async fn raw_download_mxc(uri: &str, authorization: MatrixAuthorization, client:
             .map_err(|_| "The Matrix media download failed.".to_string())?;
         authorization.check_current_permission()?;
         if response.status().is_redirection() { return Err("The homeserver redirected the media download; redirects are not followed.".into()); }
-        if !response.status().is_success() { return Err(format!("The homeserver refused the media download (HTTP {}).", response.status().as_u16())); }
-        let limit = crate::a2app::network::MAX_MEDIA_RESPONSE_BODY;
-        if response.content_length().is_some_and(|length| length > limit as u64) {
-            return Err("The Matrix media exceeds the 16 MiB download limit.".into());
-        }
+        if !response.status().is_success() { return Err(format!("The homeserver refused the media download (HTTP {}).", response.status().as_u16()).into()); }
+        if response.content_length().is_some_and(|length| length > limit as u64) { return Err(DownloadError::TooLarge); }
         let mut bytes = Vec::new();
         loop {
             authorization.check_current_permission()?;
             let chunk = await_checked(&check, response.chunk()).await.map_err(|error| format!("Reading Matrix media failed: {error}"))?;
             authorization.check_current_permission()?;
             let Some(chunk) = chunk else { break };
-            if chunk.len() > limit - bytes.len() { return Err("The Matrix media exceeds the 16 MiB download limit.".into()); }
+            if chunk.len() > limit - bytes.len() { return Err(DownloadError::TooLarge); }
             bytes.extend_from_slice(&chunk);
         }
         Ok(bytes)
@@ -452,9 +471,8 @@ impl DownloadedMedia {
 
     pub fn wire_result(self, source_room: &OwnedRoomId, event_id: &str) -> Result<String, String> {
         let media = self.prepare()?;
-        let data: Base64 = Base64::new(media.bytes().to_vec());
         Ok(serde_json::json!({"room_id":source_room,"event_id":event_id,
-            "data_base64":data.encode(),
+            "data_base64":padded_base64(media.bytes()),
             "filename":media.filename(),"mime_type":media.mime_type(),"size":media.size(),
             "caption":media.caption(),"sha256":media.sha256}).to_string())
     }
@@ -475,35 +493,195 @@ async fn download_event_attachment_with_client(
     authorization: MatrixAuthorization,
     client: matrix_sdk::Client,
 ) -> Result<DownloadedMedia, String> {
-    use matrix_sdk::ruma::OwnedEventId;
     policy::with_authorization(authorization.clone(), async {
-        validate_download_authorization(source_room, &authorization)?;
-        authorization.check_current_permission()?;
-        policy::ensure_room_access(source_room.as_str(), RoomAccess::Read)?;
-        let event_id = OwnedEventId::try_from(event_id).map_err(|_| "The media event ID is invalid.")?;
-        let room = client.get_room(source_room).ok_or("The media source room was not found.")?;
-        if room.state() != matrix_sdk::RoomState::Joined { return Err("The media source room is not joined.".into()); }
-        let payload = serde_json::json!({"operation":"matrix.media.download","room_id":source_room,"event_id":event_id});
-        policy::ensure_server_output_with_payload(client.homeserver().as_str(), &payload).await?;
-        authorization.check_current_permission()?;
-        policy::ensure_room_access(source_room.as_str(), RoomAccess::Read)?;
-        let check = || { validate_download_authorization(source_room, &authorization)?; policy::ensure_room_access(source_room.as_str(), RoomAccess::Read) };
-        let event = await_checked(&check, policy::audit_server_operation(client.homeserver().as_str(),
-            room.event(&event_id, Some(RequestConfig::new().retry_limit(0))))).await
-            .map_err(|error| format!("Could not fetch the media event: {error}"))?;
-        authorization.check_current_permission()?;
-        policy::ensure_room_access(source_room.as_str(), RoomAccess::Read)?;
-        let (actual_event_id, source, size) = media_source_from_event(&event, source_room)
-            .ok_or("The selected event is not an available media message in the source room.")?;
-        if actual_event_id != event_id { return Err("The homeserver returned a different media event.".into()); }
+        let (event, source, size) = fetch_media_event(source_room, event_id, &authorization, &client).await?;
         let (filename, mime_type, caption) = media_metadata_from_event(&event)
             .ok_or("The selected event has no valid attachment metadata.")?;
-        let bytes = download_descriptor((source, size), authorization, client).await?;
+        let bytes = download_descriptor((source, size), WHOLE_FILE_BYTES, authorization, client).await
+            .map_err(|error| error.into_message(WHOLE_FILE_TOO_LARGE))?;
         let mime_type = if mime_type.is_empty() || mime_type == "application/octet-stream" {
             inferred_media_mime(&filename, &bytes)
         } else { mime_type };
         Ok(DownloadedMedia { bytes, filename, mime_type, caption })
     }).await
+}
+
+/// Every attachment read, whole or preview, fetches its event this way:
+/// download permission, room read rules and homeserver sharing, rechecked after each await.
+async fn fetch_media_event(
+    source_room: &OwnedRoomId,
+    event_id: &str,
+    authorization: &MatrixAuthorization,
+    client: &matrix_sdk::Client,
+) -> Result<(matrix_sdk::deserialized_responses::TimelineEvent, MatrixMediaSource, Option<matrix_sdk::ruma::UInt>), String> {
+    use matrix_sdk::ruma::OwnedEventId;
+    validate_download_authorization(source_room, authorization)?;
+    authorization.check_current_permission()?;
+    policy::ensure_room_access(source_room.as_str(), RoomAccess::Read)?;
+    let event_id = OwnedEventId::try_from(event_id).map_err(|_| "The media event ID is invalid.")?;
+    let room = client.get_room(source_room).ok_or("The media source room was not found.")?;
+    if room.state() != matrix_sdk::RoomState::Joined { return Err("The media source room is not joined.".into()); }
+    let payload = serde_json::json!({"operation":"matrix.media.download","room_id":source_room,"event_id":event_id});
+    policy::ensure_server_output_with_payload(client.homeserver().as_str(), &payload).await?;
+    authorization.check_current_permission()?;
+    policy::ensure_room_access(source_room.as_str(), RoomAccess::Read)?;
+    let check = || { validate_download_authorization(source_room, authorization)?; policy::ensure_room_access(source_room.as_str(), RoomAccess::Read) };
+    let event = await_checked(&check, policy::audit_server_operation(client.homeserver().as_str(),
+        room.event(&event_id, Some(RequestConfig::new().retry_limit(0))))).await
+        .map_err(|error| format!("Could not fetch the media event: {error}"))?;
+    authorization.check_current_permission()?;
+    policy::ensure_room_access(source_room.as_str(), RoomAccess::Read)?;
+    let (actual_event_id, source, size) = media_source_from_event(&event, source_room)
+        .ok_or("The selected event is not an available media message in the source room.")?;
+    if actual_event_id != event_id { return Err("The homeserver returned a different media event.".into()); }
+    Ok((event, source, size))
+}
+
+const NO_PREVIEW: &str = "No picture preview for this attachment.";
+/// A preview fetches a small thumbnail, else a photo's original, never a large file.
+const PREVIEW_THUMBNAIL_BYTES: usize = 2 * 1024 * 1024;
+const PREVIEW_ORIGINAL_BYTES: usize = 8 * 1024 * 1024;
+/// One decode at a time on phones, where its up to 160 MiB weighs most.
+const PREVIEW_DECODE_SLOTS: usize = if cfg!(any(target_os = "ios", target_os = "android")) { 1 } else { 2 };
+
+/// Decodes run off the async worker, a few at a time, so a burst of
+/// previews cannot stall other requests or stack large decode buffers.
+static PREVIEW_DECODES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(PREVIEW_DECODE_SLOTS);
+
+/// A small re-encoded picture of an attachment; never its bytes or keys.
+pub struct MediaPreview {
+    image: PreviewImage,
+    filename: String,
+    original_size: Option<(u64, u64)>,
+}
+
+impl MediaPreview {
+    pub fn wire_result(&self, source_room: &OwnedRoomId, event_id: &str) -> String {
+        let mut result = serde_json::json!({"room_id":source_room,"event_id":event_id,
+            "data_base64":padded_base64(&self.image.bytes),"mime_type":self.image.mime_type,
+            "width":self.image.width,"height":self.image.height,
+            "filename":self.filename,"size":self.image.bytes.len()});
+        if let Some((width, height)) = self.original_size {
+            result["original_width"] = width.into();
+            result["original_height"] = height.into();
+        }
+        result.to_string()
+    }
+}
+
+/// A preview under exactly the download's checks. Prefers the event's own
+/// thumbnail (an image's, or a video's poster); only an image falls back to its original.
+pub async fn download_event_preview(
+    source_room: &OwnedRoomId,
+    event_id: &str,
+    max_edge: u32,
+    authorization: MatrixAuthorization,
+) -> Result<MediaPreview, String> {
+    let client = crate::sliding_sync::get_client().ok_or("Not logged in.")?;
+    download_event_preview_with_client(source_room, event_id, max_edge, authorization, client).await
+}
+
+async fn download_event_preview_with_client(
+    source_room: &OwnedRoomId,
+    event_id: &str,
+    max_edge: u32,
+    authorization: MatrixAuthorization,
+    client: matrix_sdk::Client,
+) -> Result<MediaPreview, String> {
+    policy::with_authorization(authorization.clone(), async {
+        let (event, _, _) = fetch_media_event(source_room, event_id, &authorization, &client).await?;
+        let (filename, _, _) = media_metadata_from_event(&event)
+            .ok_or("The selected event has no valid attachment metadata.")?;
+        let sources = preview_sources(&event).ok_or(NO_PREVIEW)?;
+        let too_large = PreviewError::TooLarge.to_string();
+        let mut failure = NO_PREVIEW.to_string();
+        if let Some(thumbnail) = sources.thumbnail {
+            // A thumbnail too large to fetch or decode ends the preview, so one never costs two large downloads.
+            match download_descriptor(thumbnail, PREVIEW_THUMBNAIL_BYTES, authorization.clone(), client.clone()).await {
+                Ok(bytes) => match render_preview(bytes, max_edge, source_room, &authorization).await? {
+                    Ok(image) => return Ok(MediaPreview { image, filename, original_size: sources.original_size }),
+                    Err(PreviewError::TooLarge) => return Err(too_large),
+                    Err(error) => failure = error.to_string(),
+                },
+                Err(DownloadError::TooLarge) => return Err(too_large),
+                Err(DownloadError::Failed(error)) => failure = error,
+            }
+        }
+        // Only an image's original may replace a missing or unreadable thumbnail;
+        // its download repeats every check, so a revoked grant still stops it.
+        if let Some(original) = sources.original {
+            let bytes = download_descriptor(original, PREVIEW_ORIGINAL_BYTES, authorization.clone(), client).await
+                .map_err(|error| error.into_message(&too_large))?;
+            let image = render_preview(bytes, max_edge, source_room, &authorization).await?.map_err(|error| error.to_string())?;
+            let original_size = Some((u64::from(image.source_width), u64::from(image.source_height)));
+            return Ok(MediaPreview { image, filename, original_size });
+        }
+        Err(failure)
+    }).await
+}
+
+/// The outer error is a revoked or failed request; the inner one is a picture
+/// that has no preview, of which only an unreadable one may give way to an original.
+async fn render_preview(bytes: Vec<u8>, max_edge: u32, source_room: &OwnedRoomId, authorization: &MatrixAuthorization)
+    -> Result<Result<PreviewImage, PreviewError>, String>
+{
+    let check = || { validate_download_authorization(source_room, authorization)?; policy::ensure_room_access(source_room.as_str(), RoomAccess::Read) };
+    await_checked(&check, async {
+        let slot = PREVIEW_DECODES.acquire().await.map_err(|_| "Picture previews are unavailable.")?;
+        tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            media_preview::render(&bytes, max_edge)
+        }).await.map_err(|_| "The picture preview could not be prepared.")
+    }).await
+}
+
+/// An image's or video's thumbnail, then an image's original, skipping
+/// any whose declared type cannot be decoded. Audio, files and posterless videos have none.
+struct PreviewSources {
+    thumbnail: Option<(MatrixMediaSource, Option<matrix_sdk::ruma::UInt>)>,
+    original: Option<(MatrixMediaSource, Option<matrix_sdk::ruma::UInt>)>,
+    original_size: Option<(u64, u64)>,
+}
+
+fn preview_sources(event: &matrix_sdk::deserialized_responses::TimelineEvent) -> Option<PreviewSources> {
+    use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent};
+    let AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(message))) = event.raw().deserialize().ok()?
+    else { return None; };
+    let (thumbnail, thumbnail_info, original, width, height) = match message.content.msgtype {
+        MessageType::Image(content) => {
+            let info = content.info.map(|info| *info).unwrap_or_default();
+            let original = media_preview::may_decode(info.mimetype.as_deref()).then_some((content.source, info.size));
+            (info.thumbnail_source, info.thumbnail_info, original, info.width, info.height)
+        }
+        MessageType::Video(content) => {
+            let info = content.info.map(|info| *info).unwrap_or_default();
+            (info.thumbnail_source, info.thumbnail_info, None, info.width, info.height)
+        }
+        _ => return None,
+    };
+    let thumbnail_info = thumbnail_info.map(|info| *info).unwrap_or_default();
+    let thumbnail = thumbnail.filter(|_| media_preview::may_decode(thumbnail_info.mimetype.as_deref()))
+        .map(|source| (source, thumbnail_info.size));
+    // An original that is the thumbnail itself would only fail the same way.
+    let original = original.filter(|(source, _)| thumbnail.as_ref().is_none_or(|(thumbnail, _)| media_uri(thumbnail) != media_uri(source)));
+    if thumbnail.is_none() && original.is_none() { return None; }
+    let original_size = width.zip(height).map(|(width, height)| (u64::from(width), u64::from(height)))
+        .filter(|(width, height)| *width > 0 && *height > 0);
+    Some(PreviewSources { thumbnail, original, original_size })
+}
+
+fn media_uri(source: &MatrixMediaSource) -> &matrix_sdk::ruma::MxcUri {
+    match source {
+        MatrixMediaSource::Plain(uri) => uri,
+        MatrixMediaSource::Encrypted(file) => &file.url,
+    }
+}
+
+/// Standard padded base64, the form `composer.attach` and `matrix.send_media` accept.
+fn padded_base64(bytes: &[u8]) -> String {
+    let mut encoded = Base64::<Standard, &[u8]>::new(bytes).encode();
+    while !encoded.len().is_multiple_of(4) { encoded.push('='); }
+    encoded
 }
 
 fn inferred_media_mime(filename: &str, bytes: &[u8]) -> String {
@@ -580,32 +758,24 @@ fn resolve_cached_media_uri(
 ) -> Option<(MatrixMediaSource, Option<matrix_sdk::ruma::UInt>)> {
     events.iter().rev().find_map(|event| {
         let (_, source, size) = media_source_from_event(event, source_room)?;
-        let original_uri = match &source {
-            MatrixMediaSource::Plain(uri) => uri,
-            MatrixMediaSource::Encrypted(file) => &file.url,
-        };
-        (original_uri.as_str() == uri).then_some((source, size))
+        (media_uri(&source).as_str() == uri).then_some((source, size))
     })
 }
 
+/// Refuses a declared size over `limit` before any request, and a streamed one while reading.
 async fn download_descriptor(
     descriptor: (MatrixMediaSource, Option<matrix_sdk::ruma::UInt>),
+    limit: usize,
     authorization: MatrixAuthorization,
     client: matrix_sdk::Client,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, DownloadError> {
     let (source, size) = descriptor;
-    if size.is_some_and(|size| u64::from(size) > crate::a2app::network::MAX_MEDIA_RESPONSE_BODY as u64) {
-        return Err("The Matrix media exceeds the 16 MiB download limit.".into());
-    }
-    let uri = match &source {
-        MatrixMediaSource::Plain(uri) => uri,
-        MatrixMediaSource::Encrypted(file) => &file.url,
-    };
-    let bytes = raw_download_mxc(uri.as_str(), authorization.clone(), client).await?;
+    if size.is_some_and(|size| u64::from(size) > limit as u64) { return Err(DownloadError::TooLarge); }
+    let bytes = raw_download_mxc(media_uri(&source).as_str(), limit, authorization.clone(), client).await?;
     authorization.check_current_permission()?;
     match source {
         MatrixMediaSource::Plain(_) => Ok(bytes),
-        MatrixMediaSource::Encrypted(file) => decrypt_media(bytes, (*file).into()),
+        MatrixMediaSource::Encrypted(file) => Ok(decrypt_media(bytes, (*file).into())?),
     }
 }
 
@@ -710,6 +880,9 @@ mod tests {
         }
     }
 
+    /// Each request's header and body, as the mock homeserver received it.
+    type CapturedRequests = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
     /// An actual SDK client talks to this isolated homeserver. Its event,
     /// authenticated media-download, config, upload, and native-send routes
     /// retain the exact requests for assertions; no real account is used.
@@ -717,7 +890,7 @@ mod tests {
         url: String,
         events: Arc<std::sync::Mutex<std::collections::BTreeMap<String, serde_json::Value>>>,
         media: Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>>,
-        requests: Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>,
+        requests: CapturedRequests,
         encrypted: Arc<std::sync::atomic::AtomicBool>,
         stop: Arc<std::sync::atomic::AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
@@ -1326,6 +1499,234 @@ mod tests {
         assert_eq!(decrypt_media(encrypted.clone(), copy).unwrap(), b"private attachment");
         encrypted[0] ^= 1;
         assert!(decrypt_media(encrypted, encryption).unwrap_err().contains("hash"));
+    }
+
+    fn encrypted_file(bytes: &[u8], uri: &str) -> (Vec<u8>, serde_json::Value) {
+        use std::io::Read;
+        let mut reader = std::io::Cursor::new(bytes);
+        let mut encryptor = matrix_sdk_base::crypto::AttachmentEncryptor::new(&mut reader);
+        let mut ciphertext = Vec::new();
+        encryptor.read_to_end(&mut ciphertext).unwrap();
+        let mut file = serde_json::to_value(encryptor.finish()).unwrap();
+        file["url"] = uri.into();
+        (ciphertext, file)
+    }
+
+    #[test]
+    fn preview_sources_prefer_thumbnails_and_fall_back_to_originals_only_for_images() {
+        fn sources(content: serde_json::Value) -> Option<PreviewSources> {
+            let value = serde_json::json!({"type":"m.room.message","room_id":"!media:test","event_id":"$media",
+                "sender":"@media:test","origin_server_ts":1,"content":content});
+            preview_sources(&matrix_sdk::deserialized_responses::TimelineEvent::from_plaintext(
+                matrix_sdk::ruma::serde::Raw::from_json_string(value.to_string()).unwrap()))
+        }
+        let uri = |source: &Option<(MatrixMediaSource, Option<matrix_sdk::ruma::UInt>)>| source.as_ref().map(|(source, _)| media_uri(source).to_string());
+        let plain = sources(serde_json::json!({"msgtype":"m.image","body":"a.jpg","url":"mxc://t/original",
+            "info":{"mimetype":"image/jpeg","w":4000,"h":3000,"thumbnail_url":"mxc://t/thumb","thumbnail_info":{"mimetype":"image/jpeg","size":900}}})).unwrap();
+        assert_eq!(uri(&plain.thumbnail).as_deref(), Some("mxc://t/thumb"));
+        assert_eq!(plain.thumbnail.as_ref().unwrap().1, Some(900u32.into()));
+        assert_eq!(uri(&plain.original).as_deref(), Some("mxc://t/original"));
+        assert_eq!(plain.original_size, Some((4000, 3000)));
+
+        let (_, thumbnail_file) = encrypted_file(b"thumbnail", "mxc://t/secret-thumb");
+        let (_, file) = encrypted_file(b"original", "mxc://t/secret-original");
+        let encrypted = sources(serde_json::json!({"msgtype":"m.image","body":"a.png","file":file,
+            "info":{"mimetype":"image/png","thumbnail_file":thumbnail_file}})).unwrap();
+        assert!(matches!(&encrypted.thumbnail, Some((MatrixMediaSource::Encrypted(file), _)) if file.url.as_str() == "mxc://t/secret-thumb"),
+            "an encrypted thumbnail keeps the decryption info the original download uses");
+        assert!(matches!(&encrypted.original, Some((MatrixMediaSource::Encrypted(_), _))));
+        assert_eq!(encrypted.original_size, None);
+
+        let unthumbnailed = sources(serde_json::json!({"msgtype":"m.image","body":"a.gif","url":"mxc://t/original"})).unwrap();
+        assert!(unthumbnailed.thumbnail.is_none() && unthumbnailed.original.is_some());
+        let same = sources(serde_json::json!({"msgtype":"m.image","body":"a.png","url":"mxc://t/same","info":{"thumbnail_url":"mxc://t/same"}})).unwrap();
+        assert!(same.thumbnail.is_some() && same.original.is_none(), "the same media is never fetched twice");
+        let heic_with_jpeg_thumbnail = sources(serde_json::json!({"msgtype":"m.image","body":"a.heic","url":"mxc://t/original",
+            "info":{"mimetype":"image/heic","thumbnail_url":"mxc://t/thumb","thumbnail_info":{"mimetype":"image/jpeg"}}})).unwrap();
+        assert!(heic_with_jpeg_thumbnail.thumbnail.is_some() && heic_with_jpeg_thumbnail.original.is_none());
+        let avif_thumbnail = sources(serde_json::json!({"msgtype":"m.image","body":"a.jpg","url":"mxc://t/original",
+            "info":{"mimetype":"image/jpeg","thumbnail_url":"mxc://t/thumb","thumbnail_info":{"mimetype":"image/avif"}}})).unwrap();
+        assert!(avif_thumbnail.thumbnail.is_none() && avif_thumbnail.original.is_some());
+
+        let video = sources(serde_json::json!({"msgtype":"m.video","body":"clip.mp4","url":"mxc://t/video",
+            "info":{"mimetype":"video/mp4","w":1920,"h":1080,"thumbnail_url":"mxc://t/poster"}})).unwrap();
+        assert_eq!(uri(&video.thumbnail).as_deref(), Some("mxc://t/poster"));
+        assert!(video.original.is_none(), "a video's own bytes are never decoded as a picture");
+        assert_eq!(video.original_size, Some((1920, 1080)));
+
+        for content in [
+            serde_json::json!({"msgtype":"m.video","body":"clip.mp4","url":"mxc://t/video","info":{"mimetype":"video/mp4"}}),
+            serde_json::json!({"msgtype":"m.image","body":"a.heic","url":"mxc://t/original","info":{"mimetype":"image/heic"}}),
+            serde_json::json!({"msgtype":"m.audio","body":"tone.wav","url":"mxc://t/audio"}),
+            serde_json::json!({"msgtype":"m.file","body":"report.pdf","url":"mxc://t/file","info":{"thumbnail_url":"mxc://t/thumb"}}),
+            serde_json::json!({"msgtype":"m.text","body":"mxc://t/original"}),
+        ] { assert!(sources(content.clone()).is_none(), "{content}"); }
+    }
+
+    #[test]
+    fn wire_base64_is_padded_for_composer_and_send_media() {
+        for (bytes, expected) in [(&b""[..], ""), (b"m", "bQ=="), (b"me", "bWU="), (b"med", "bWVk"), (b"media", "bWVkaWE=")] {
+            assert_eq!(padded_base64(bytes), expected);
+        }
+    }
+
+    /// Boxed, so one long test never holds many large debug-build futures on its stack.
+    async fn preview_wire(room: &OwnedRoomId, event_id: &str, max_edge: u32, authorization: MatrixAuthorization,
+        client: matrix_sdk::Client) -> Result<serde_json::Value, String>
+    {
+        let preview = Box::pin(download_event_preview_with_client(room, event_id, max_edge, authorization, client)).await?;
+        Ok(serde_json::from_str(&preview.wire_result(room, event_id)).unwrap())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn sdk_previews_decrypt_thumbnails_and_fall_back_to_image_originals_only() {
+        let _review_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
+        let server = MockHomeserver::new();
+        let client = server.client().await;
+        let fixture = MockPermissionContext::new(&server.url);
+        let room = OwnedRoomId::try_from("!media:test").unwrap();
+        let icon = include_bytes!("../../../resources/icon_32.png");
+        let photo = include_bytes!("../../../a2app/agent/tests/fixtures/vision-colors.jpg");
+        let gif = include_bytes!("../../../a2app/agent/tests/fixtures/vision-colors.gif");
+        let png = include_bytes!("../../../a2app/agent/tests/fixtures/vision-colors.png");
+        let add_media = |id: &str, bytes: Vec<u8>| { server.media.lock().unwrap().insert(id.into(), bytes); };
+        let add_event = |id: &str, content: serde_json::Value| {
+            server.events.lock().unwrap().insert(id.into(), serde_json::json!({"type":"m.room.message","room_id":room,
+                "event_id":format!("${id}"),"sender":"@media:test","origin_server_ts":1,"content":content}));
+        };
+        let downloads = || server.requests.lock().unwrap().iter().filter(|(header, _)| header.contains("/media/download/"))
+            .map(|(header, _)| header.lines().next().unwrap_or_default().to_string()).collect::<Vec<_>>();
+        let decode = |wire: &serde_json::Value| {
+            let data = wire["data_base64"].as_str().unwrap();
+            assert!(data.len().is_multiple_of(4), "previews use padded base64");
+            let bytes = Base64::<Standard>::parse(data).unwrap().into_inner();
+            assert_eq!(wire["size"], bytes.len());
+            assert_eq!(wire["mime_type"], image_mime_from_bytes(&bytes).unwrap());
+            assert!(matches!(wire["mime_type"].as_str(), Some("image/jpeg" | "image/png")));
+            bytes
+        };
+
+        // An encrypted photo with an encrypted thumbnail: only the thumbnail is fetched and decrypted.
+        let (thumbnail_ciphertext, thumbnail_file) = encrypted_file(icon, "mxc://media.test/pv-thumb-a");
+        let (photo_ciphertext, photo_file) = encrypted_file(photo, "mxc://media.test/pv-photo-a");
+        add_media("pv-thumb-a", thumbnail_ciphertext);
+        add_media("pv-photo-a", photo_ciphertext);
+        add_event("preview-a", serde_json::json!({"msgtype":"m.image","body":"Holiday photo","filename":"holiday.jpg","file":photo_file,
+            "info":{"mimetype":"image/jpeg","size":photo.len(),"w":4032,"h":3024,"thumbnail_file":thumbnail_file,
+                "thumbnail_info":{"mimetype":"image/png","size":icon.len(),"w":32,"h":32}}}));
+        let before = downloads().len();
+        let wire = preview_wire(&room, "$preview-a", 64, fixture.auth("matrix.media.download"), client.clone()).await.unwrap();
+        let text = wire.to_string();
+        let keys: std::collections::BTreeSet<&str> = wire.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["data_base64", "event_id", "filename", "height", "mime_type", "original_height",
+            "original_width", "room_id", "size", "width"].into());
+        assert_eq!((&wire["room_id"], &wire["event_id"], &wire["filename"]), (&"!media:test".into(), &"$preview-a".into(), &"holiday.jpg".into()));
+        assert_eq!((&wire["width"], &wire["height"]), (&32.into(), &32.into()), "a small thumbnail is never enlarged");
+        assert_eq!((&wire["original_width"], &wire["original_height"]), (&4032.into(), &3024.into()));
+        decode(&wire);
+        for secret in [&thumbnail_file, &photo_file] {
+            for field in [&secret["key"]["k"], &secret["iv"], &secret["hashes"]["sha256"], &secret["url"]] {
+                assert!(!text.contains(field.as_str().unwrap()), "previews never carry decryption material or media URIs");
+            }
+        }
+        let fetched = downloads()[before..].to_vec();
+        assert_eq!(fetched.len(), 1);
+        assert!(fetched[0].contains("pv-thumb-a"));
+
+        // An image without a thumbnail decodes its original; decoded dimensions win over declared ones.
+        add_media("pv-gif-b", gif.to_vec());
+        add_event("preview-b", serde_json::json!({"msgtype":"m.image","body":"colors.gif","url":"mxc://media.test/pv-gif-b",
+            "info":{"mimetype":"image/gif","w":999,"h":999}}));
+        let wire = preview_wire(&room, "$preview-b", 64, fixture.auth("matrix.media.download"), client.clone()).await.unwrap();
+        assert_eq!((&wire["width"], &wire["height"], &wire["mime_type"]), (&64.into(), &64.into(), &"image/jpeg".into()));
+        assert_eq!((&wire["original_width"], &wire["original_height"]), (&256.into(), &256.into()));
+        decode(&wire);
+
+        // An undecodable thumbnail falls back to the image's original.
+        add_media("pv-thumb-c", b"not a picture".to_vec());
+        add_media("pv-png-c", png.to_vec());
+        add_event("preview-c", serde_json::json!({"msgtype":"m.image","body":"colors.png","url":"mxc://media.test/pv-png-c",
+            "info":{"mimetype":"image/png","thumbnail_url":"mxc://media.test/pv-thumb-c"}}));
+        let before = downloads().len();
+        let wire = preview_wire(&room, "$preview-c", 128, fixture.auth("matrix.media.download"), client.clone()).await.unwrap();
+        assert_eq!((&wire["width"], &wire["height"]), (&128.into(), &128.into()));
+        let fetched = downloads()[before..].to_vec();
+        assert!(fetched.len() == 2 && fetched[0].contains("pv-thumb-c") && fetched[1].contains("pv-png-c"));
+        // So does a thumbnail the homeserver no longer has; a video's missing poster stays an error.
+        add_event("preview-j", serde_json::json!({"msgtype":"m.image","body":"colors.png","url":"mxc://media.test/pv-png-c",
+            "info":{"thumbnail_url":"mxc://media.test/pv-missing-j"}}));
+        let wire = preview_wire(&room, "$preview-j", 64, fixture.auth("matrix.media.download"), client.clone()).await.unwrap();
+        assert_eq!((&wire["width"], &wire["original_width"]), (&64.into(), &256.into()));
+        add_event("preview-k", serde_json::json!({"msgtype":"m.video","body":"clip.mp4","url":"mxc://media.test/pv-video-d",
+            "info":{"thumbnail_url":"mxc://media.test/pv-missing-k"}}));
+        let error = preview_wire(&room, "$preview-k", 64, fixture.auth("matrix.media.download"), client.clone()).await.unwrap_err();
+        assert!(error.contains("HTTP 404"), "{error}");
+
+        // A video previews its poster and never downloads the video itself.
+        add_media("pv-video-d", include_bytes!("../../../a2app/agent/tests/fixtures/blue.mp4").to_vec());
+        add_media("pv-poster-d", png.to_vec());
+        add_event("preview-d", serde_json::json!({"msgtype":"m.video","body":"clip.mp4","url":"mxc://media.test/pv-video-d",
+            "info":{"mimetype":"video/mp4","w":32,"h":32,"thumbnail_url":"mxc://media.test/pv-poster-d"}}));
+        let before = downloads().len();
+        let wire = preview_wire(&room, "$preview-d", 64, fixture.auth("matrix.media.download"), client.clone()).await.unwrap();
+        assert_eq!((&wire["width"], &wire["original_width"], &wire["filename"]), (&64.into(), &32.into(), &"clip.mp4".into()));
+        assert_eq!(downloads()[before..].iter().filter(|line| line.contains("pv-video-d")).count(), 0);
+
+        // Posterless videos, audio, files and undecodable originals fail clearly without a media download.
+        add_media("pv-poster-e", b"not a poster".to_vec());
+        for (id, content) in [
+            ("preview-e", serde_json::json!({"msgtype":"m.video","body":"clip.mp4","url":"mxc://media.test/pv-video-d","info":{"mimetype":"video/mp4"}})),
+            ("preview-f", serde_json::json!({"msgtype":"m.audio","body":"tone.wav","url":"mxc://media.test/pv-video-d"})),
+            ("preview-g", serde_json::json!({"msgtype":"m.file","body":"report.pdf","url":"mxc://media.test/pv-png-c",
+                "info":{"thumbnail_url":"mxc://media.test/pv-png-c"}})),
+            ("preview-h", serde_json::json!({"msgtype":"m.image","body":"photo.heic","url":"mxc://media.test/pv-png-c","info":{"mimetype":"image/heic"}})),
+        ] {
+            add_event(id, content);
+            let before = downloads().len();
+            let error = preview_wire(&room, &format!("${id}"), 64, fixture.auth("matrix.media.download"), client.clone()).await.unwrap_err();
+            assert_eq!(error, NO_PREVIEW, "{id}");
+            assert_eq!(downloads().len(), before, "{id} must not download media");
+        }
+        add_event("preview-i", serde_json::json!({"msgtype":"m.video","body":"clip.mp4","url":"mxc://media.test/pv-video-d",
+            "info":{"thumbnail_url":"mxc://media.test/pv-poster-e"}}));
+        let error = preview_wire(&room, "$preview-i", 64, fixture.auth("matrix.media.download"), client.clone()).await.unwrap_err();
+        assert_eq!(error, PreviewError::Unsupported.to_string(), "a bad poster never falls back to the video");
+
+        // A thumbnail over its byte cap ends the preview: the original is not downloaded as well.
+        add_media("pv-big-thumb-l", vec![0; PREVIEW_THUMBNAIL_BYTES + 1]);
+        add_event("preview-l", serde_json::json!({"msgtype":"m.image","body":"colors.png","url":"mxc://media.test/pv-png-c",
+            "info":{"mimetype":"image/png","thumbnail_url":"mxc://media.test/pv-big-thumb-l"}}));
+        let before = downloads().len();
+        let error = preview_wire(&room, "$preview-l", 64, fixture.auth("matrix.media.download"), client.clone()).await.unwrap_err();
+        assert_eq!(error, PreviewError::TooLarge.to_string());
+        let fetched = downloads()[before..].to_vec();
+        assert!(fetched.len() == 1 && fetched[0].contains("pv-big-thumb-l"), "{fetched:?}");
+        // Declared sizes over the preview caps are refused before any download.
+        for (id, content) in [
+            ("preview-m", serde_json::json!({"msgtype":"m.image","body":"colors.png","url":"mxc://media.test/pv-png-c",
+                "info":{"mimetype":"image/png","thumbnail_url":"mxc://media.test/pv-thumb-a","thumbnail_info":{"size":PREVIEW_THUMBNAIL_BYTES + 1}}})),
+            ("preview-n", serde_json::json!({"msgtype":"m.image","body":"colors.png","url":"mxc://media.test/pv-png-c",
+                "info":{"mimetype":"image/png","size":PREVIEW_ORIGINAL_BYTES + 1}})),
+        ] {
+            add_event(id, content);
+            let before = downloads().len();
+            let error = preview_wire(&room, &format!("${id}"), 64, fixture.auth("matrix.media.download"), client.clone()).await.unwrap_err();
+            assert_eq!(error, PreviewError::TooLarge.to_string(), "{id}");
+            assert_eq!(downloads().len(), before, "{id} must not download media");
+        }
+
+        // The preview keeps the download's authorization: no other capability fetches anything.
+        let before = server.requests.lock().unwrap().len();
+        let error = preview_wire(&room, "$preview-a", 64, fixture.auth("matrix.media.upload"), client.clone()).await.unwrap_err();
+        assert!(error.contains("permission does not match"), "{error}");
+        assert_eq!(server.requests.lock().unwrap().len(), before);
+
+        // Whole downloads use the same padded base64 as previews.
+        let download = Box::pin(download_event_attachment_with_client(&room, "$preview-c", fixture.auth("matrix.media.download"), client.clone()));
+        let wire: serde_json::Value = serde_json::from_str(&download.await.unwrap().wire_result(&room, "$preview-c").unwrap()).unwrap();
+        assert!(!png.len().is_multiple_of(3) && wire["data_base64"].as_str().unwrap().ends_with('='));
+        assert_eq!(wire["data_base64"], padded_base64(png));
     }
 
     #[test]

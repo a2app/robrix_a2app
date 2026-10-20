@@ -14,7 +14,7 @@
 use a2app_core::manifest::MiniAppId;
 
 /// What a typed request turned out to mean.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Intent {
     /// Generate a brand-new app.
     Create,

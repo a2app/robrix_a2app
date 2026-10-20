@@ -12,6 +12,37 @@
 // why-robrix-navigation: Jumps to a message you tap.
 // why-matrix-room-watch: Shows new messages, typing, edits and reactions as they arrive.
 
+let PrimaryButton = Button{
+    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
+    draw_bg +: {
+        border_size: 0.0 border_radius: 4.0
+        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+}
+let NeutralButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
+        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+}
+let GhostButton = PrimaryButton{
+    padding: Inset{left: 6 right: 6 top: 4 bottom: 4}
+    margin: Inset{left: -6}
+    draw_bg +: { border_size: 0.0 color: #xFFFFFF00 color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF00 }
+    draw_text +: { color: #x66708F color_hover: #x1C274C color_down: #x1C274C color_focus: #x66708F }
+}
+let Field = TextInput{
+    width: Fill height: Fit padding: 10
+    draw_bg +: {
+        border_radius: 4.0 border_size: 1.0
+        color: #xFFFFFF color_hover: #xFFFFFF color_focus: #xFFFFFF color_down: #xFFFFFF color_empty: #xFFFFFF
+        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_focus: #x106fcc border_color_down: #x106fcc border_color_empty: #xC8C8C8
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #x333333 color_hover: #x333333 color_focus: #x333333 color_down: #x333333 color_empty: #xBBBBBB color_empty_hover: #x999999 color_empty_focus: #x999999 text_style: theme.font_regular{font_size: 11} }
+}
+
 let subscribed_events = []
 let pending_events = []
 
@@ -28,18 +59,97 @@ let setup_pending = false
 
 let room_name = ""
 let room_line = "Loading…"
+let room_line_is_error = false
 let live_note = ""
-let empty_line = "Loading…"
+// What the list area shows without rows: loading, ready (nothing yet), denied or error.
+let list_state = "loading"
+let list_error = ""
 let messages = []
 let messages_during_read = []
 let rx_queue = []
 let rx_busy = false
 
+// Display rows, newest first.
+let rows = []
+let show_avatars = true
+let is_compact = false
+let is_tiny = false
+let is_no_room = false
+let how_open = false
+let is_foreground = true
+
+let lower_az = "abcdefghijklmnopqrstuvwxyz"
+let upper_az = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+let error_prefix = regex("^[Cc]ouldn't [^:]*: ")
+
+// "couldn't read messages: the server timed out" -> "The server timed out."
+fn sentence(text){
+    let t = text.replace(error_prefix, "")
+    let chars = t.split("")
+    if chars.len() < 3 { return t }
+    let i = lower_az.search(chars[1])
+    if chars[1].len() == 1 && i >= 0 { t = upper_az.split("")[i + 1] + t.strip_prefix(chars[1]) }
+    let last = chars[chars.len() - 2]
+    if last != "." && last != "!" && last != "?" { t = t + "." }
+    return t
+}
+
+fn note_no_room(error){
+    if error.search("not attached") >= 0 { is_no_room = true }
+}
+
+// 1284 -> "1,284"
+fn count_text(n){
+    if n < 1000 { return "" + n }
+    let rest = n % 1000
+    let pad = "" + rest
+    if rest < 10 { pad = "00" + pad } elif rest < 100 { pad = "0" + pad }
+    return count_text(floor(n / 1000)) + "," + pad
+}
+
+fn member_text(n){
+    if !n.is_number() { return "" }
+    if n == 1 { return "1 member" }
+    return count_text(n) + " members"
+}
+
+fn set_note(kind, text){
+    ui.send_note.set_text(text)
+    ui.send_ok.set_text(text)
+    ui.send_err.set_text(text)
+    ui.send_note_wrap.set_visible(kind == "info" && text != "")
+    ui.send_ok_wrap.set_visible(kind == "ok")
+    ui.send_err_wrap.set_visible(kind == "err")
+}
+
 fn show_room(){
     ui.room_title.set_text(room_name)
+    ui.title_wrap.set_visible(room_name != "")
     let line = room_line
-    if live_note != "" { line = line + " · " + live_note }
+    if live_note != "" {
+        if line != "" { line = line + " · " }
+        line = line + live_note
+    }
     ui.room_line.set_text(line)
+    ui.room_err.set_text(line)
+    ui.room_line_wrap.set_visible(!room_line_is_error && line != "")
+    ui.room_err_wrap.set_visible(room_line_is_error)
+    show_frame()
+}
+
+// Without a room only the explanation shows; narrow panes put Refresh under the title.
+fn show_frame(){
+    ui.head_row.set_visible(!is_no_room)
+    ui.compose_wrap.set_visible(!is_no_room)
+    ui.no_room_wrap.set_visible(is_no_room)
+    if is_no_room {
+        ui.list_wrap.set_visible(false)
+        ui.list_loading.set_visible(false)
+        ui.list_empty.set_visible(false)
+    }
+    ui.refresh_wide.set_visible(!is_tiny)
+    ui.refresh_narrow.set_visible(is_tiny && !is_no_room)
 }
 
 fn load_room(){
@@ -50,9 +160,12 @@ fn load_room(){
         room_loaded = r.is_ok
         if r.is_ok {
             room_name = r.data.room_name
-            room_line = "" + r.data.member_count + " members"
+            room_line = member_text(r.data.member_count)
+            room_line_is_error = false
         } else {
-            room_line = r.error
+            note_no_room(r.error)
+            room_line = "Couldn't load room details. " + sentence(r.error)
+            room_line_is_error = true
         }
         show_room()
     })
@@ -65,6 +178,107 @@ fn index_of(list, id){
         i += 1
     }
     return -1
+}
+
+// "Just now", "5m ago", "3h ago", "Yesterday", "2d ago", "3w ago", ...
+fn ago(ts){
+    if !ts.is_number() || ts <= 0 { return "" }
+    let s = time_now() - ts / 1000.0
+    if s < 60.0 { return "Just now" }
+    if s < 3600.0 { return "" + floor(s / 60.0) + "m ago" }
+    if s < 86400.0 { return "" + floor(s / 3600.0) + "h ago" }
+    if s < 172800.0 { return "Yesterday" }
+    if s < 604800.0 { return "" + floor(s / 86400.0) + "d ago" }
+    if s < 2592000.0 { return "" + floor(s / 604800.0) + "w ago" }
+    if s < 31536000.0 { return "" + floor(s / 2592000.0) + "mo ago" }
+    return "" + floor(s / 31536000.0) + "y ago"
+}
+
+// The room display name the host sends; older hosts send only the localpart.
+fn display_name(m){
+    let name = m["sender_name"]
+    if name.is_string() && name != "" { return name }
+    name = m["sender"]
+    if name.is_string() && name != "" { return name }
+    return "Someone"
+}
+
+fn initial_of(name){
+    let chars = name.split("")
+    if chars.len() < 3 { return "?" }
+    let c = chars[1]
+    if c == "@" && chars.len() > 3 { c = chars[2] }
+    if c.len() != 1 { return c }
+    let i = lower_az.search(c)
+    if i < 0 { return c }
+    return upper_az.split("")[i + 1]
+}
+
+fn body_text(m){
+    let kind = m["msgtype"]
+    if kind == "m.image" { return "🖼 " + m.body }
+    if kind == "m.video" { return "🎬 " + m.body }
+    if kind == "m.audio" { return "🎵 " + m.body }
+    if kind == "m.file" { return "📎 " + m.body }
+    if kind == "m.emote" { return "* " + m.body }
+    return m.body
+}
+
+fn build_rows(){
+    let out = []
+    let i = messages.len() - 1
+    while i >= 0 {
+        let m = messages[i]
+        let name = display_name(m)
+        let deleted = m["redacted"] == true
+        let body = body_text(m)
+        let body_color = #x333333
+        if deleted {
+            body = "Message deleted"
+            body_color = #x66708F
+        }
+        let pills = []
+        for r in m.reactions {
+            pills.push({text: r.key + " " + r.count mine: r.mine == true})
+        }
+        out.push({name: name initial: initial_of(name) when: ago(m["ts"]) body: body body_color: body_color pills: pills})
+        i -= 1
+    }
+    rows = out
+}
+
+// Rows render only when there are some: an emptied list can't clear its old children.
+fn render_list(){
+    build_rows()
+    let has_rows = rows.len() > 0 && !is_no_room
+    if has_rows { ui.msg_list.render() }
+    ui.list_wrap.set_visible(has_rows)
+    ui.list_loading.set_visible(!has_rows && list_state == "loading" && !is_no_room)
+    ui.list_empty.set_visible(!has_rows && list_state != "loading" && !is_no_room)
+    ui.no_room_wrap.set_visible(is_no_room)
+    if has_rows || list_state == "loading" { return nil }
+    let icon = "📭"
+    let title = "No messages yet"
+    let detail = "New messages show up here."
+    let action = ""
+    if list_state == "denied" {
+        icon = "🔒"
+        title = "Can't read this room"
+        detail = "Allow Room Peek to read this room's latest messages."
+        action = "Ask again"
+    }
+    if list_state == "error" {
+        icon = "😕"
+        title = "Couldn't load messages"
+        detail = list_error
+        action = "Try again"
+    }
+    ui.empty_icon.set_text(icon)
+    ui.empty_title.set_text(title)
+    ui.empty_detail.set_text(detail)
+    ui.empty_btn_wrap.set_visible(action == "Try again")
+    ui.ask_btn_wrap.set_visible(action == "Ask again")
+    return nil
 }
 
 // One matrix.event a second: each costs 5 of a 30 token budget refilling 6 a second.
@@ -80,7 +294,7 @@ fn fetch_reactions(){
         let i = index_of(messages, id)
         if r.is_ok && i >= 0 {
             messages[i].reactions = r.data.reactions
-            ui.msg_list.render()
+            render_list()
         }
         rx_busy = rx_queue.len() > 0 && start_timeout(1.0, || fetch_reactions()) != nil
     })
@@ -100,7 +314,7 @@ fn load_messages(){
         messages = []
         rx_queue = []
         if r.is_ok {
-            empty_line = "No messages yet."
+            list_state = "ready"
             for m in r.data.messages {
                 let live_index = index_of(live, m.event_id)
                 if live_index >= 0 {
@@ -119,7 +333,9 @@ fn load_messages(){
             // A branch ending in a loop needs an explicit result.
             nil
         } else {
-            empty_line = r.error
+            note_no_room(r.error)
+            list_state = "error"
+            list_error = sentence(r.error)
         }
         for m in live {
             if index_of(messages, m.event_id) < 0 { messages.push(m) }
@@ -140,7 +356,8 @@ fn load_messages(){
         for id in pending {
             if index_of(messages, id) >= 0 { rx_queue.push(id) }
         }
-        ui.msg_list.render()
+        render_list()
+        show_frame()
         if messages_reload_pending {
             messages_reload_pending = false
             let _reload = start_timeout(1.0, || load_messages())
@@ -151,20 +368,13 @@ fn load_messages(){
     })
 }
 
-fn reactions_line(m){
-    let line = ""
-    for r in m.reactions {
-        if line != "" { line = line + " · " }
-        line = line + r.key + " " + r.count
-        if r.mine { line = line + " (you)" }
-    }
-    return line
-}
-
+// Rows show newest first, so tap i is the i-th newest message.
 fn jump_to_message(i){
     if i >= messages.len() { return nil }
-    host.request("nav.event", {event_id: messages[i].event_id}, fn(r){
-        if !r.is_ok { ui.send_note.set_text(r.error) }
+    let m = messages[messages.len() - 1 - i]
+    host.request("nav.event", {event_id: m.event_id}, fn(r){
+        if !r.is_ok { set_note("err", "Couldn't jump to that message. " + sentence(r.error)) }
+        return nil
     })
 }
 
@@ -172,17 +382,17 @@ fn draft_msg(){
     if sending || drafting || attaching { return nil }
     let text = ui.msg_input.text()
     if text.trim() == "" {
-        ui.send_note.set_text("Type a message first.")
+        set_note("info", "Type a message first.")
         return nil
     }
     drafting = true
-    ui.send_note.set_text("Preparing a draft…")
+    set_note("info", "Preparing a draft…")
     host.request("composer.insert", {text: text}, fn(r){
         drafting = false
         if r.is_ok {
-            ui.send_note.set_text("Draft ready. Review and send it in Robrix.")
+            set_note("ok", "Draft ready. Review and send it in Robrix.")
             if ui.msg_input.text() == text { ui.msg_input.set_text("") }
-        } else { ui.send_note.set_text(r.error) }
+        } else { set_note("err", sentence(r.error)) }
     })
 }
 
@@ -198,20 +408,20 @@ fn attach_file(){
     if sending || drafting || attaching { return nil }
     attaching = true
     let caption = ui.msg_input.text()
-    ui.send_note.set_text("Choose an image or file to draft…")
+    set_note("info", "Choose an image or file to draft…")
     host.request("files.pick", nil, fn(r){
-        if !r.is_ok { attaching = false ui.send_note.set_text(r.error) return nil }
+        if !r.is_ok { attaching = false set_note("err", sentence(r.error)) return nil }
         if optional_field(r.data, "cancelled") == true {
             attaching = false
-            ui.send_note.set_text("No attachment selected.")
+            set_note("info", "No attachment selected.")
             return nil
         }
         host.request("composer.attach", {data_base64: r.data.data_base64, filename: r.data.name, mime_type: r.data.mime_type, caption: caption}, fn(out){
             attaching = false
             if out.is_ok {
-                ui.send_note.set_text("Attachment ready. Review and send it in Robrix.")
+                set_note("ok", "Attachment ready. Review and send it in Robrix.")
                 if ui.msg_input.text() == caption { ui.msg_input.set_text("") }
-            } else { ui.send_note.set_text(out.error) }
+            } else { set_note("err", sentence(out.error)) }
         })
     })
 }
@@ -221,20 +431,20 @@ fn send_msg(){
     let draft = ui.msg_input.text()
     let body = draft.trim()
     if body == "" {
-        ui.send_note.set_text("Type a message first.")
+        set_note("info", "Type a message first.")
         return nil
     }
     sending = true
-    ui.send_note.set_text("Sending…")
+    set_note("info", "Sending…")
     host.request("matrix.send_message", {body: body}, fn(r){
         sending = false
         if r.is_ok {
-            ui.send_note.set_text("Sent!")
+            set_note("ok", "Sent!")
             if ui.msg_input.text() == draft { ui.msg_input.set_text("") }
             if messages_loading { messages_reload_pending = true } else { load_messages() }
             return nil
         }
-        ui.send_note.set_text(r.error)
+        set_note("err", sentence(r.error))
     })
 }
 
@@ -242,24 +452,24 @@ fn send_file_now(){
     if sending || drafting || attaching { return nil }
     sending = true
     let caption = ui.msg_input.text()
-    ui.send_note.set_text("Choose an image or file to send now…")
+    set_note("info", "Choose an image or file to send now…")
     host.request("files.pick", nil, fn(r){
-        if !r.is_ok { sending = false ui.send_note.set_text(r.error) return nil }
+        if !r.is_ok { sending = false set_note("err", sentence(r.error)) return nil }
         if optional_field(r.data, "cancelled") == true {
             sending = false
-            ui.send_note.set_text("No file sent.")
+            set_note("info", "No file sent.")
             return nil
         }
-        ui.send_note.set_text("Sending selected file…")
+        set_note("info", "Sending selected file…")
         host.request("matrix.send_media", {data_base64: r.data.data_base64, filename: r.data.name, mime_type: r.data.mime_type, caption: caption}, fn(out){
             sending = false
             if out.is_ok {
-                ui.send_note.set_text("File sent!")
+                set_note("ok", "File sent!")
                 if ui.msg_input.text() == caption { ui.msg_input.set_text("") }
                 if messages_loading { messages_reload_pending = true } else { load_messages() }
                 return nil
             }
-            ui.send_note.set_text(out.error)
+            set_note("err", sentence(out.error))
         })
     })
 }
@@ -276,7 +486,7 @@ fn on_room_message(json){
         }
     }
     while messages.len() > 15 { messages.remove(0) }
-    ui.msg_list.render()
+    render_list()
 }
 
 fn on_room_typing(json){
@@ -308,7 +518,7 @@ fn on_room_reaction(json){
     }
     if !found && p.added { rx.push({key: p.key count: 1 mine: p.is_own}) }
     rx.retain(|x| x.count > 0)
-    ui.msg_list.render()
+    render_list()
 }
 
 fn on_room_message_changed(json){
@@ -316,9 +526,12 @@ fn on_room_message_changed(json){
     let i = index_of(messages, p.event_id)
     if i < 0 { return nil }
     let body = p.body
-    if p.redacted { body = "(deleted)" }
+    if p.redacted {
+        body = "(deleted)"
+        messages[i].redacted = true
+    }
     messages[i].body = body
-    ui.msg_list.render()
+    render_list()
 }
 
 fn on_room_members_changed(json){
@@ -348,7 +561,7 @@ fn subscribe(name){
             }
         }
         if r.is_ok || live_note != "" { return nil }
-        live_note = "live updates off: " + r.error
+        live_note = "Live updates off"
         show_room()
     })
 }
@@ -372,9 +585,45 @@ fn watch(){
     subscribe("on_room_message_changed")
 }
 
-fn on_app_resize(w, h){
-    ui.title_wrap.set_visible(h >= 520)
+fn toggle_how(){
+    how_open = !how_open
+    ui.how_wrap.set_visible(how_open)
+    ui.how_btn.set_text(if how_open {"How it works ▲"} else {"How it works ▼"})
 }
+
+// Narrow panes move Refresh under the title; very narrow ones shorten labels and drop avatars.
+fn on_app_resize(w, h){
+    let tiny = w < 300
+    if tiny != is_tiny {
+        is_tiny = tiny
+        show_frame()
+    }
+    let compact = w < 280
+    if compact != is_compact {
+        is_compact = compact
+        ui.draft_btn.set_text(if compact {"Draft"} else {"Draft message"})
+        ui.attach_btn.set_text(if compact {"Attach"} else {"Attach file"})
+        ui.send_btn.set_text(if compact {"Send"} else {"Send now"})
+        ui.send_file_btn.set_text(if compact {"Send file"} else {"Send file now"})
+    }
+    let avatars = w >= 280
+    if avatars == show_avatars { return nil }
+    show_avatars = avatars
+    if rows.len() > 0 { render_list() }
+    return nil
+}
+
+// Relative times ("5m ago") are refreshed once a minute while the pane is visible.
+fn on_focus_changed(json){
+    is_foreground = json.parse_json()["foreground"] != false
+    return nil
+}
+fn refresh_times(){
+    if !is_foreground || rows.len() == 0 { return nil }
+    render_list()
+    return nil
+}
+let _clock = start_interval(60.0, || refresh_times())
 
 fn on_permissions_changed(caps){
     if setup_pending { return nil }
@@ -390,14 +639,27 @@ fn setup(retry){
     setup_pending = true
     host.request("permissions.request", {perms: ["matrix-room-info", "matrix-room-read", "matrix-room-watch"], retry: retry}, fn(r){
         setup_pending = false
-        if !r.is_ok { room_line = r.error show_room() return nil }
+        if !r.is_ok {
+            note_no_room(r.error)
+            room_line = sentence(r.error)
+            room_line_is_error = true
+            show_room()
+            list_state = "error"
+            list_error = sentence(r.error)
+            render_list()
+            return nil
+        }
         if r.data.permissions["matrix-room-info"] == true && host.has("matrix.room.info.read") { load_room() }
-        else { room_line = "Permission denied. Click Refresh to ask again." show_room() }
+        else {
+            room_line = "Room details are off."
+            room_line_is_error = false
+            show_room()
+        }
         if r.data.permissions["matrix-room-read"] == true && host.has("matrix.room.messages.read") { load_messages() }
         else {
             messages = []
-            empty_line = "Permission denied. Click Refresh to ask again."
-            ui.msg_list.render()
+            list_state = "denied"
+            render_list()
         }
         if r.data.permissions["matrix-room-watch"] == true { watch_granted() }
     })
@@ -406,81 +668,215 @@ fn setup(retry){
 let _boot = start_timeout(0.05, || setup(false))
 
 View{
-    width: Fill height: Fill flow: Down align: Align{x: 0.5}
+    width: Fill height: Fill flow: Down
     col := ScrollYView{
-        width: Fill height: Fill flow: Down spacing: 10 padding: 14
-        title_wrap := View{
-            width: Fill height: Fit
-            room_title := Label{
-                text: "" width: Fill padding: 0 margin: 0
-                draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }
+        width: Fill height: Fill flow: Down spacing: 12 padding: 14
+        head_row := View{
+            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+            View{
+                width: Fill height: Fit flow: Down spacing: 3
+                title_wrap := View{
+                    width: Fill height: Fit visible: false
+                    room_title := Label{
+                        text: "" width: Fill padding: 0 margin: 0
+                        draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} }
+                    }
+                }
+                room_line_wrap := View{
+                    width: Fill height: Fit
+                    room_line := Label{
+                        text: "Loading…" width: Fill padding: 0 margin: 0
+                        draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                    }
+                }
+                room_err_wrap := View{
+                    width: Fill height: Fit visible: false
+                    room_err := Label{
+                        text: "" width: Fill padding: 0 margin: 0
+                        draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} }
+                    }
+                }
+            }
+            refresh_wide := View{
+                width: Fit height: Fit
+                NeutralButton{ text: "Refresh" on_click: || setup(true) }
             }
         }
-        room_line := Label{
-            text: "Loading…" width: Fill padding: 0 margin: 0
-            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
+        refresh_narrow := View{
+            width: Fill height: Fit visible: false
+            NeutralButton{ text: "Refresh" on_click: || setup(true) }
         }
-        Button{ text: "Refresh" on_click: || setup(true) draw_text +: { color: #x1C274C } }
-        msg_list := ScrollYView{
-            width: Fill height: Fill{min: 80} flow: Down spacing: 6
-            on_item_tap: |i| jump_to_message(i)
-            on_render: || {
-                if messages.len() == 0 {
-                    Label{
-                        text: empty_line
-                        width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
-                    }
-                } else {
-                    for m in messages {
+        no_room_wrap := View{
+            width: Fill height: Fit visible: false
+            RoundedView{
+                width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5}
+                padding: Inset{top: 20 bottom: 20 left: 16 right: 16}
+                show_bg: true
+                draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                Label{ text: "🧭" padding: 0 margin: 0 draw_text +: { text_style: theme.font_regular{font_size: 28} } }
+                Label{
+                    text: "No room attached" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
+                    draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} }
+                }
+                Label{
+                    text: "Open Room Peek from a room to see its messages." width: Fill align: Align{x: 0.5} padding: 0 margin: 0
+                    draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} }
+                }
+            }
+        }
+        typing_wrap := View{
+            width: Fill height: Fit visible: false
+            typing := Label{
+                text: "" width: Fill padding: 0 margin: 0
+                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+            }
+        }
+        // render() reapplies its view's declaration, so visibility lives on this wrapper.
+        list_wrap := View{
+            width: Fill height: Fill{min: 80} visible: false
+            msg_list := ScrollYView{
+                width: Fill height: Fill flow: Down spacing: 8
+                on_item_tap: |i| jump_to_message(i)
+                on_render: || {
+                    for row in rows {
                         RoundedView{
-                            width: Fill height: Fit flow: Down spacing: 2 padding: 10
+                            width: Fill height: Fit flow: Right spacing: 10 padding: 10
                             show_bg: true
-                            draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
-                            Label{
-                                text: m.sender width: Fill padding: 0 margin: 0
-                                draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
-                            }
-                            Label{
-                                text: m.body width: Fill padding: 0 margin: 0
-                                draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                            draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                            View{
+                                width: 32 height: 32 visible: show_avatars
+                                RoundedView{
+                                    width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
+                                    show_bg: true
+                                    draw_bg +: { color: #x52B2AC border_radius: 16.0 }
+                                    Label{ text: row.initial padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
+                                }
                             }
                             View{
-                                width: Fill height: Fit visible: m.reactions.len() > 0
-                                Label{ text: reactions_line(m) width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 11} } }
+                                width: Fill height: Fit flow: Down spacing: 3
+                                View{
+                                    width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                    Label{ text: row.name width: Fill max_lines: 1 text_overflow: TextOverflow.Ellipsis padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} } }
+                                    Label{ text: row.when padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                                }
+                                Label{ text: row.body width: Fill padding: 0 margin: 0 draw_text +: { color: row.body_color text_style: theme.font_regular{font_size: 11} } }
+                                if row.pills.len() > 0 {
+                                    View{
+                                        width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 4 margin: Inset{top: 3}
+                                        for p in row.pills {
+                                            if p.mine {
+                                                RoundedView{
+                                                    width: Fit height: Fit padding: Inset{left: 7 right: 7 top: 3 bottom: 3}
+                                                    show_bg: true
+                                                    draw_bg +: { color: #xE3F7ED border_radius: 4.0 border_size: 1.0 border_color: #x009978 }
+                                                    Label{ text: p.text padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 9.5} } }
+                                                }
+                                            } else {
+                                                RoundedView{
+                                                    width: Fit height: Fit padding: Inset{left: 7 right: 7 top: 3 bottom: 3}
+                                                    show_bg: true
+                                                    draw_bg +: { color: #xFFFFFF border_radius: 4.0 border_size: 1.0 border_color: #xB6BABF }
+                                                    Label{ text: p.text padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 9.5} } }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        typing_wrap := View{
-            width: Fill height: Fit visible: false
-            typing := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 11} } }
+        list_loading := View{
+            width: Fill height: Fill{min: 80}
+            View{
+                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 10 wrap_spacing: 8 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24}
+                LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
+                Label{
+                    text: "Loading messages…" padding: 0 margin: 0
+                    draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} }
+                }
+            }
         }
-        View{
-            width: Fill height: Fit flow: Down spacing: 8
-            msg_input := TextInput{
-                width: Fill empty_text: "Message or attachment caption…"
-                on_return: |t| draft_msg()
+        list_empty := View{
+            width: Fill height: Fill{min: 120} visible: false
+            RoundedView{
+                width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5}
+                padding: Inset{top: 20 bottom: 20 left: 16 right: 16}
+                show_bg: true
+                draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                empty_icon := Label{
+                    text: "📭" padding: 0 margin: 0
+                    draw_text +: { text_style: theme.font_regular{font_size: 28} }
+                }
+                empty_title := Label{
+                    text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
+                    draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} }
+                }
+                empty_detail := Label{
+                    text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
+                    draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} }
+                }
+                empty_btn_wrap := View{
+                    width: Fit height: Fit margin: Inset{top: 6} visible: false
+                    empty_btn := NeutralButton{ text: "Try again" on_click: || setup(true) }
+                }
+                ask_btn_wrap := View{
+                    width: Fit height: Fit margin: Inset{top: 6} visible: false
+                    PrimaryButton{ text: "Ask again" on_click: || setup(true) }
+                }
+            }
+        }
+        compose_wrap := View{
+            width: Fill height: Fit flow: Down spacing: 12
+            RoundedView{
+                width: Fill height: 1 show_bg: true
+                draw_bg +: { color: #xE6E9EF border_radius: 0.0 }
             }
             View{
-                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
-                Button{ text: "Draft message" on_click: || draft_msg() draw_text +: { color: #x1C274C } }
-                Button{ text: "Attach file" on_click: || attach_file() draw_text +: { color: #x1C274C } }
-                Button{ text: "Send now" on_click: || send_msg() draw_text +: { color: #x1C274C } }
-                Button{ text: "Send file now" on_click: || send_file_now() draw_text +: { color: #x1C274C } }
+                width: Fill height: Fit flow: Down spacing: 8
+                msg_input := Field{
+                    empty_text: "Message or caption"
+                    on_return: |t| draft_msg()
+                }
+                View{
+                    width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
+                    draft_btn := PrimaryButton{ text: "Draft message" on_click: || draft_msg() }
+                    attach_btn := NeutralButton{ text: "Attach file" on_click: || attach_file() }
+                    send_btn := NeutralButton{ text: "Send now" on_click: || send_msg() }
+                    send_file_btn := NeutralButton{ text: "Send file now" on_click: || send_file_now() }
+                }
+                send_note_wrap := View{
+                    width: Fill height: Fit visible: false
+                    send_note := Label{
+                        text: "" width: Fill padding: 0 margin: 0
+                        draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                    }
+                }
+                send_ok_wrap := View{
+                    width: Fill height: Fit visible: false
+                    send_ok := Label{
+                        text: "" width: Fill padding: 0 margin: 0
+                        draw_text +: { color: #x138808 text_style: theme.font_regular{font_size: 10} }
+                    }
+                }
+                send_err_wrap := View{
+                    width: Fill height: Fit visible: false
+                    send_err := Label{
+                        text: "" width: Fill padding: 0 margin: 0
+                        draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} }
+                    }
+                }
+                how_btn := GhostButton{ text: "How it works ▼" on_click: || toggle_how() }
+                how_wrap := View{
+                    width: Fill height: Fit flow: Down spacing: 4 visible: false
+                    Label{ text: "Draft message and Attach file put text or a file in Robrix's message box. You review and send it." width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                    Label{ text: "Send now and Send file now post right away and need permission to send." width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                    Label{ text: "Picked files can be up to 1 MiB." width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                    Label{ text: "Tap a message to jump to it in the room." width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                }
             }
-        }
-        Label{
-            text: "Draft message and Attach file prepare local content for review without sending permission. Send now posts text; Send file now uploads and posts the selected file. Both need separate sending permission. Picked files are limited to 1 MiB."
-            width: Fill padding: 0 margin: 0
-            draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 11} }
-        }
-        send_note := Label{
-            text: "" padding: 0 margin: 0
-            width: Fill
-            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
         }
     }
 }

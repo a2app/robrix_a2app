@@ -19,6 +19,11 @@
 //! - contains `"hopeless"` → streams an invalid script EVERY turn, so the
 //!   repair budget runs out and the generation fails (the case Retry
 //!   exists for).
+//! - contains `"trickle"` → streams thinking, then the valid app line by line
+//!   over a few seconds, like a real streaming provider.
+//! - contains `"hosted"` → asks the host broker for the model's reply, as
+//!   `octos acp --host-managed` does, and relays it. Robrix then streams it from
+//!   its configured model service.
 //! - anything else → streams a valid pomodoro-ish app, split across two
 //!   chunks mid-fence to exercise accumulation.
 //!
@@ -41,15 +46,16 @@ fn user_request(prompt: &str) -> &str {
     prompt
 }
 
+// Explicit indentation: a `\` line continuation would strip it.
 const GOOD_APP: &str = "// name: Pomodoro\n// icon: 🍅\n// tint: #E84D3D\n\
 let secs = 1500\n\
 fn show(){ ui.time.set_text(\"\" + secs) }\n\
 View{\n\
-    width: Fill height: Fit flow: Down spacing: 12 padding: 16\n\
-    align: Align{x: 0.5}\n\
-    glass.H1{text: \"Pomodoro\"}\n\
-    time := Label{text: \"1500\"}\n\
-    glass.GlassButton{text: \"Tick\" width: 90 height: 44 on_click: || { secs -= 1 show() }}\n\
+\u{20}   width: Fill height: Fit flow: Down spacing: 12 padding: 16\n\
+\u{20}   align: Align{x: 0.5}\n\
+\u{20}   glass.H1{text: \"Pomodoro\"}\n\
+\u{20}   time := Label{text: \"1500\"}\n\
+\u{20}   glass.GlassButton{text: \"Tick\" width: 90 height: 44 on_click: || { secs -= 1 show() }}\n\
 }";
 
 const BROKEN_APP: &str = "// name: Pomodoro\n// icon: 🍅\n// tint: #E84D3D\n\
@@ -63,12 +69,12 @@ const REFINED_APP: &str = "// name: Pomodoro Pro\n// icon: 🍅\n// tint: #E84D3
 let secs = 1500\n\
 fn show(){ ui.time.set_text(\"\" + secs) }\n\
 View{\n\
-    width: Fill height: Fit flow: Down spacing: 12 padding: 16\n\
-    align: Align{x: 0.5}\n\
-    glass.H1{text: \"Pomodoro Pro\"}\n\
-    time := Label{text: \"1500\"}\n\
-    glass.GlassButton{text: \"Tick\" width: 90 height: 44 on_click: || { secs -= 1 show() }}\n\
-    glass.GlassButton{text: \"Reset\" width: 90 height: 44 on_click: || { secs = 1500 show() }}\n\
+\u{20}   width: Fill height: Fit flow: Down spacing: 12 padding: 16\n\
+\u{20}   align: Align{x: 0.5}\n\
+\u{20}   glass.H1{text: \"Pomodoro Pro\"}\n\
+\u{20}   time := Label{text: \"1500\"}\n\
+\u{20}   glass.GlassButton{text: \"Tick\" width: 90 height: 44 on_click: || { secs -= 1 show() }}\n\
+\u{20}   glass.GlassButton{text: \"Reset\" width: 90 height: 44 on_click: || { secs = 1500 show() }}\n\
 }";
 
 fn send(out: &mut impl Write, v: Value) {
@@ -79,6 +85,14 @@ fn send(out: &mut impl Write, v: Value) {
 }
 
 fn chunk(out: &mut impl Write, session_id: &str, text: &str) {
+    update(out, session_id, "agent_message_chunk", text);
+}
+
+fn thought(out: &mut impl Write, session_id: &str, text: &str) {
+    update(out, session_id, "agent_thought_chunk", text);
+}
+
+fn update(out: &mut impl Write, session_id: &str, kind: &str, text: &str) {
     send(
         out,
         json!({
@@ -87,7 +101,7 @@ fn chunk(out: &mut impl Write, session_id: &str, text: &str) {
             "params": {
                 "sessionId": session_id,
                 "update": {
-                    "sessionUpdate": "agent_message_chunk",
+                    "sessionUpdate": kind,
                     "content": {"type": "text", "text": text},
                 },
             },
@@ -95,7 +109,47 @@ fn chunk(out: &mut impl Write, session_id: &str, text: &str) {
     );
 }
 
+/// The capability the protected host broker requires, once confinement held.
+/// Robrix runs `ROBRIX_AGENT_CMD` as `<cmd> acp --host-managed` for every generation.
+fn host_managed_capability() -> Option<Value> {
+    if !std::env::args().any(|arg| arg == "--host-managed") {
+        return None;
+    }
+    let sandbox = octos_sandbox::confine_host_managed().ok()?;
+    Some(json!({"octos.hostManaged": {
+        "version": octos_llm::host::VERSION, "confined": true, "sandbox": sandbox.platform,
+    }}))
+}
+
+/// Asks the host broker for one model reply to `prompt`, as a confined octos
+/// worker does, and returns its `(reasoning, content)`.
+fn host_model_reply(
+    lines: &mut impl Iterator<Item = String>,
+    out: &mut impl Write,
+    prompt: &str,
+) -> Result<(String, String), String> {
+    let request = octos_llm::host::ModelRequest {
+        messages: vec![octos_core::Message::user(prompt)],
+        tools: Vec::new(),
+        config: octos_llm::ChatConfig::default(),
+    };
+    send(out, json!({"jsonrpc": "2.0", "id": "host-model-1", "method": octos_llm::host::MODEL_METHOD, "params": request}));
+    for line in lines {
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+        if msg.get("id") != Some(&json!("host-model-1")) {
+            continue;
+        }
+        if let Some(error) = msg.get("error") {
+            return Err(error["message"].as_str().unwrap_or("host model request failed").to_string());
+        }
+        let text = |key: &str| msg["result"][key].as_str().unwrap_or_default().to_string();
+        return Ok((text("reasoning_content"), text("content")));
+    }
+    Err("the host closed the connection".into())
+}
+
 fn main() {
+    let host_managed = host_managed_capability();
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let session_id = "fake-session-1";
@@ -106,7 +160,8 @@ fn main() {
     let mut refine_session = false;
     let mut hopeless_session = false;
 
-    for line in stdin.lock().lines().map_while(Result::ok) {
+    let mut lines = stdin.lock().lines().map_while(Result::ok);
+    while let Some(line) = lines.next() {
         if line.trim().is_empty() {
             continue;
         }
@@ -116,13 +171,19 @@ fn main() {
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
         match method {
-            "initialize" => send(
-                &mut stdout,
-                json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "result": {"protocolVersion": 1, "agentCapabilities": {}},
-                }),
-            ),
+            "initialize" => {
+                let mut capabilities = json!({});
+                if let Some(meta) = &host_managed {
+                    capabilities["_meta"] = meta.clone();
+                }
+                send(
+                    &mut stdout,
+                    json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {"protocolVersion": 1, "agentCapabilities": capabilities},
+                    }),
+                );
+            }
             "session/new" => send(
                 &mut stdout,
                 json!({
@@ -138,6 +199,23 @@ fn main() {
                 // Scenario keywords come from the user's words only; `text`
                 // stays available for structural checks on the whole prompt.
                 let ask = user_request(text);
+                if ask.contains("hosted") {
+                    let (reply, stop) = match host_model_reply(&mut lines, &mut stdout, text) {
+                        Ok((reasoning, content)) => {
+                            if !reasoning.is_empty() {
+                                thought(&mut stdout, session_id, &reasoning);
+                            }
+                            chunk(&mut stdout, session_id, &content);
+                            (json!({"stopReason": "end_turn"}), None)
+                        }
+                        Err(error) => (Value::Null, Some(error)),
+                    };
+                    match stop {
+                        None => send(&mut stdout, json!({"jsonrpc": "2.0", "id": id, "result": reply})),
+                        Some(error) => send(&mut stdout, json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": error}})),
+                    }
+                    continue;
+                }
                 if ask.contains("refuse") {
                     send(
                         &mut stdout,
@@ -175,20 +253,7 @@ fn main() {
                         }),
                     );
                     for part in ["Let me think about ", "the timer layout."] {
-                        send(
-                            &mut stdout,
-                            json!({
-                                "jsonrpc": "2.0",
-                                "method": "session/update",
-                                "params": {
-                                    "sessionId": session_id,
-                                    "update": {
-                                        "sessionUpdate": "agent_thought_chunk",
-                                        "content": {"type": "text", "text": part},
-                                    },
-                                },
-                            }),
-                        );
+                        thought(&mut stdout, session_id, part);
                     }
                     for i in 1 ..= 20 {
                         send(
@@ -259,13 +324,26 @@ fn main() {
                     GOOD_APP
                 };
                 let reply = format!("```splash\n{source}\n```");
-                // Split mid-reply so the client has to accumulate chunks.
-                let mid = reply.len() / 2;
-                let mid = (mid..reply.len())
-                    .find(|&i| reply.is_char_boundary(i))
-                    .unwrap_or(reply.len());
-                chunk(&mut stdout, session_id, &reply[..mid]);
-                chunk(&mut stdout, session_id, &reply[mid..]);
+                if ask.contains("trickle") {
+                    // Thinking, then the reply line by line, paced like a real stream.
+                    let pause = std::time::Duration::from_millis(150);
+                    for part in ["Planning a timer ", "with one button ", "and a big label."] {
+                        thought(&mut stdout, session_id, part);
+                        std::thread::sleep(pause);
+                    }
+                    for line in reply.split_inclusive('\n') {
+                        chunk(&mut stdout, session_id, line);
+                        std::thread::sleep(pause);
+                    }
+                } else {
+                    // Split mid-reply so the client has to accumulate chunks.
+                    let mid = reply.len() / 2;
+                    let mid = (mid..reply.len())
+                        .find(|&i| reply.is_char_boundary(i))
+                        .unwrap_or(reply.len());
+                    chunk(&mut stdout, session_id, &reply[..mid]);
+                    chunk(&mut stdout, session_id, &reply[mid..]);
+                }
                 send(
                     &mut stdout,
                     json!({

@@ -243,6 +243,12 @@ fn agent_thread(
         }
     };
 
+    // App generation shows its model output while it streams; the replay replaces it.
+    let preview = crate::model_transport::PreviewSink::default();
+    if !host_managed {
+        let evt_tx = evt_tx.clone();
+        preview.connect(move |is_thought, text| send(&evt_tx, AcpEvent::Preview { is_thought, text: text.to_string() }));
+    }
     let (mut agent, host_tools) = match rt.block_on(build_agent(
         &workspace,
         &prefs,
@@ -250,6 +256,7 @@ fn agent_thread(
         host_managed,
         model_context,
         host_tools,
+        preview,
     )) {
         Ok(agent) => agent,
         Err(e) => {
@@ -329,9 +336,10 @@ async fn build_agent(
     host_managed: bool,
     model_context: Option<a2app_core::information_flow::ContextId>,
     host_tools: Option<crate::mcp::McpServer>,
+    preview: crate::model_transport::PreviewSink,
 ) -> Result<(Arc<octos_agent::Agent>, Option<HostTools>), String> {
     if let Some(context) = model_context {
-        return build_protected_agent(prefs, shutdown, host_managed, context, host_tools).await;
+        return build_protected_agent(prefs, shutdown, host_managed, context, host_tools, preview).await;
     }
     let cwd = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     let command = AcpCommand {
@@ -360,12 +368,13 @@ async fn build_protected_agent(
     room_agent: bool,
     context: a2app_core::information_flow::ContextId,
     host_tools: Option<crate::mcp::McpServer>,
+    preview: crate::model_transport::PreviewSink,
 ) -> Result<(Arc<octos_agent::Agent>, Option<HostTools>), String> {
     let epoch = a2app_core::information_flow::context_epoch(&context)?;
     let flag = Arc::new(AtomicBool::new(false));
     shutdown.adopt(flag.clone());
     let registry = if room_agent { host_tools.ok_or("The room's host tools are unavailable.")? } else { crate::mcp::McpServer::new() };
-    let provider = crate::model_transport::provider_with_outputs(prefs, context.clone(), flag.clone(), registry.output_store())?;
+    let provider = crate::model_transport::provider_with_outputs(prefs, context.clone(), flag.clone(), registry.output_store(), preview)?;
     let output_context = context.clone();
     let tools = if room_agent {
         Some(HostTools {
@@ -529,6 +538,8 @@ impl octos_agent::ProgressReporter for Reporter {
     fn report(&self, event: octos_agent::ProgressEvent) {
         use octos_agent::ProgressEvent as E;
         if self.shutdown.check(self.generation).is_err() { return; }
+        // Each model call opens with an empty Response, which is no output; the ACP client drops it too.
+        if matches!(&event, E::Response { content, .. } if content.is_empty()) { return; }
         match event {
             E::StreamChunk { text, iteration } => {
                 self.streamed_iteration.store(u64::from(iteration) + 1, Ordering::Release);
@@ -956,5 +967,17 @@ pub(crate) mod tests {
         reporter.report(octos_agent::ProgressEvent::StreamChunk { text: "stale".into(), iteration: 3 });
         let chunks: Vec<_> = receiver.try_iter().filter_map(|event| if let AcpEvent::Chunk(text) = event { Some(text) } else { None }).collect();
         assert_eq!(chunks, ["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn a_model_call_opens_without_an_empty_chunk() {
+        // An empty chunk would head the console with a writing section before any thinking.
+        let shutdown = Arc::new(Shutdown::default());
+        let generation = shutdown.begin_prompt();
+        let (events, receiver) = std::sync::mpsc::channel();
+        run_turn(&fixture_agent(&shutdown, false), &shutdown, &events, &mut Vec::new(), "first", generation).await;
+        let events: Vec<_> = receiver.try_iter().collect();
+        assert!(!events.iter().any(|event| matches!(event, AcpEvent::Chunk(text) if text.is_empty())), "{events:?}");
+        assert!(events.iter().any(|event| matches!(event, AcpEvent::Chunk(text) if text == "partial answer")), "{events:?}");
     }
 }

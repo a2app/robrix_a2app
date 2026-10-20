@@ -43,10 +43,6 @@ View{
     width: Fill height: Fill flow: Down
     ScrollYView{
         width: Fill height: Fill flow: Down spacing: 14 padding: 16 align: Align{x: 0.5}
-        Label{
-            text: "Counter" padding: 0 margin: 0
-            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 20} }
-        }
         RoundedView{ width: Fill height: Fit align: Align{x: 0.5, y: 0.5} padding: 26
             show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
             display := Label{
@@ -74,6 +70,8 @@ View{
   list uses `height: Fill{min: 80}` to consume the remaining height. The minimum
   keeps a usable list viewport in short panes; it is not a height limit.
 - Color literals: `#ffffff`, `#x1C274C` (with alpha: `#xffffff55`).
+- A plain `View{show_bg: true}` paints nothing. For a filled background or a
+  1px divider use `SolidView` (square) or `RoundedView`.
 
 ## The app runs at ANY size (split screen, resizable windows)
 
@@ -124,6 +122,18 @@ debug:
   children read best; value-driven layout (`let cell_h = 42.0  if compact {
   cell_h = 32.0 }`) keeps a single emission path.
 - A widget as the closure's FINAL statement is committed as the last child.
+- KNOWN BUG: an `if` whose `else` holds a `for` loop (`if xs.len() == 0 {
+  Label{...} } else { for x in xs {...} }`, or `else for`) drops the `if`
+  branch's widget, so the empty state never shows. Emit the rows first, then
+  a separate `if xs.len() == 0 { Label{...} }`.
+- `render()` re-applies the list's own declaration, so `visible: false` on a
+  view that has `on_render` hides it again on every render. Toggle a plain
+  wrapper View instead.
+- A container in a row that emits no children keeps its previous children.
+  Emit the same structure every time (hide parts with `visible:`), or wrap it
+  in `if xs.len() > 0 { ... }`.
+- Never set `cursor:` on rows emitted by `on_render`: it swallows the tap, so
+  `on_item_tap` never fires.
 - Do NOT start a statement line with a bare identifier right after a line
   ending in `}` — it can glue onto the previous statement. Read results via
   `let out = r` on a fresh line.
@@ -140,31 +150,97 @@ debug:
 - Shorthands from the glass kit: `glass.H1{text}`, `glass.H2{text}`,
   `glass.Body{text}`, `glass.Caption{text}` (small uppercase label),
   `glass.OptionLabel{text}`.
-- Emoji work in any text. Symbol characters mostly DON'T: the app fonts have
-  no ✕ ✗ ➜ ↻ or arrow glyphs (they render as empty boxes). For icons use
-  emoji (🗑 ➕ ▶️), plain words, or these known-good characters: × ○ ● − ▼ ▲
-  (use ▼ to mark a dropdown)
+- Emoji work in any text. Some symbol characters DON'T: the app fonts have
+  no ✕ ✗ ➜ glyphs (they render as empty boxes). For icons use emoji
+  (🗑 ➕ ▶️), plain words, or these known-good characters: × ○ ● − ▼ ▲ ‹ › ← → ↻
+  (use ▼ to mark a dropdown). ⚠️ and 💬 render as gray outlines; prefer
+  colored emoji such as 😕 🔒 📭 🔍.
 
 ## Robrix look (USE THIS by default)
 
 Apps are hosted inside Robrix panes with a WHITE background and should look
-Robrix-native: light theme, navy text, blue accents. The palette (matches
-Robrix's own style constants):
+like Robrix itself: navy text, blue accents, flat buttons with 4px corners.
+The pane header already shows the app's icon and name, so do not repeat
+them as a title; open with content or a short bold summary line.
 
-- Titles / primary text: `#x1C274C` (bold)
-- Body text: `#x333333`
-- Captions / secondary labels: `#x66708F` (bold, font_size 10)
-- Accent (values, links, highlights): `#x0f88fe`
-- Card background: `RoundedView{ show_bg: true draw_bg +: { color: #xF0F5FF
-  border_radius: 12.0 } }` (8.0 radius for small list rows)
-- Success green `#x138808`, danger red `#xB91C1C`, sparingly
-- Buttons: `Button{text: "..." on_click: || ... draw_text +: { color:
-  #x1C274C }}` — the default button text is too light for the white theme,
-  so always set the navy text color
+- Text: titles `#x1C274C` (bold), body `#x333333`, secondary and meta
+  `#x66708F`. Accent `#x0f88fe` for the main button, selected chips, links
+  and values that matter.
+- Status lines are never blue (blue reads as a link): neutral `#x66708F`,
+  success `#x138808`, error `#xDC0005`.
+- Fonts: summary or card title `theme.font_bold{font_size: 13}`, body
+  `theme.font_regular{font_size: 11}`, meta `theme.font_regular{font_size:
+  10}`, section caption `theme.font_bold{font_size: 9.5}` `#x66708F` in
+  UPPERCASE.
+- Cards: `RoundedView{ show_bg: true padding: 12 draw_bg +: { color:
+  #xF0F5FF border_radius: 8.0 } }`. Spacing 4 / 8 / 12 / 16; the content
+  column uses `padding: 14 spacing: 12`.
 
-Recipe for a typical app: bold `#x1C274C` title, `#x66708F` caption under
-it, one or more `#xF0F5FF` cards holding `#x333333` body text with
-`#x0f88fe` for the values that matter, plain Buttons at the bottom.
+Makepad's default `Button` and gray `TextInput` look foreign in Robrix.
+Start the script with these and use them for every button and input (the
+examples in this guide use bare widgets only for brevity):
+
+```splash
+let PrimaryButton = Button{
+    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
+    draw_bg +: {
+        border_size: 0.0 border_radius: 4.0
+        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+}
+let NeutralButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
+        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+}
+let NegativeButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xDC0005 border_color_hover: #xDC0005 border_color_down: #xDC0005 border_color_focus: #xDC0005
+        color: #xFFF0F0 color_hover: #xF0D4D4 color_down: #xE0B8B8 color_focus: #xFFF0F0 }
+    draw_text +: { color: #xDC0005 color_hover: #xDC0005 color_down: #xDC0005 color_focus: #xDC0005 }
+}
+let Field = TextInput{
+    width: Fill height: Fit padding: 10
+    draw_bg +: {
+        border_radius: 4.0 border_size: 1.0
+        color: #xFFFFFF color_hover: #xFFFFFF color_focus: #xFFFFFF color_down: #xFFFFFF color_empty: #xFFFFFF
+        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_focus: #x106fcc border_color_down: #x106fcc border_color_empty: #xC8C8C8
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #x333333 color_hover: #x333333 color_focus: #x333333 color_down: #x333333 color_empty: #xBBBBBB color_empty_hover: #x999999 color_empty_focus: #x999999 text_style: theme.font_regular{font_size: 11} }
+}
+```
+
+- One `PrimaryButton` for the screen's main action, `NeutralButton` for the
+  rest (Refresh, Cancel, Copy), `NegativeButton` only for destructive ones
+  (Delete, Clear). Use them like `Button`: `NeutralButton{text: "Refresh"
+  on_click: || refresh()}`, and `Field{empty_text: "Search" on_return: |t| go(t)}`.
+- Chips (filters, choices): pill buttons with `border_radius: 12.0` and
+  padding 10 / 5; unselected white with a 1px `#xC8C8C8` border and navy
+  text, selected `#x0f88fe` with white text.
+- Empty, denied and error states: a centered `#xF7F9FC` card (radius 8,
+  padding 16) with an emoji, one bold navy line, one short `#x66708F` line,
+  and at most one button (Try again, Ask again). Never leave a blank pane.
+- People and rooms in lists get Robrix's fallback avatar, a 32px circle with
+  the name's first letter: `RoundedView{ width: 32 height: 32 align:
+  Align{x: 0.5 y: 0.5} show_bg: true draw_bg +: { color: #x52b2ac
+  border_radius: 16.0 } Label{ text: "P" padding: 0 margin: 0 draw_text +: {
+  color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } } }`.
+- Loading: `LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }`
+  beside a short gray line such as "Loading members…".
+- Keep copy short. Put rarely needed details behind a collapsed
+  "How it works ▼" toggle (this quiet text button, flipping to ▲) over a
+  hidden View. Show times as "5m ago" or local times, never raw UTC strings.
+
+```splash
+let GhostButton = PrimaryButton{
+    padding: Inset{left: 6 right: 6 top: 4 bottom: 4}
+    margin: Inset{left: -6}
+    draw_bg +: { border_size: 0.0 color: #xFFFFFF00 color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF00 }
+    draw_text +: { color: #x66708F color_hover: #x1C274C color_down: #x1C274C color_focus: #x66708F }
+}
+```
 
 ## Glass kit (liquid-glass styled widgets)
 
@@ -186,6 +262,8 @@ Buttons take `width`/`height` numbers, `text`, and `on_click: || {...}`.
 ## Handlers
 
 - `on_click: || { ... }` on buttons; `on_return: |text| add(text)` on inputs.
+- After Return a single-line input gives up key focus. Add
+  `keep_focus_on_submit: true` to inputs people submit repeatedly (a chat line).
 - Handlers are closures; they may call your `fn`s and mutate module state.
 - A widget defined with `label := ...` inside a template can be addressed
   from a handler through `ui.<outer>.<inner>` paths only if each level is
@@ -196,7 +274,7 @@ Buttons take `width`/`height` numbers, `text`, and `on_click: || {...}`.
 - `start_interval(secs, || {...})` repeats; `start_timeout(secs, || {...})`
   fires once. Assign to a discard: `let _tick = start_interval(0.1, || ...)`.
 - `time_now()` returns seconds (float). Math helpers: `floor(x)`, `abs(x)`,
-  `min(a,b)`, `max(a,b)`.
+  `min(a,b)`, `max(a,b)` (32-bit floats: never on millisecond timestamps).
 
 ## Dynamic lists
 
@@ -207,12 +285,10 @@ let laps = []
 lap_list := ScrollYView{
     width: Fill height: Fill{min: 80} flow: Down spacing: 6
     on_render: || {
-        if laps.len() == 0 { glass.Body{text: "Nothing yet." width: Fill} }
-        else {
-            for lap in laps {
-                glass.ListRow{ width: Fill glass.Body{text: lap width: Fill} }
-            }
+        for lap in laps {
+            glass.ListRow{ width: Fill glass.Body{text: lap width: Fill} }
         }
+        if laps.len() == 0 { glass.Body{text: "Nothing yet." width: Fill} }
     }
 }
 ```
@@ -237,6 +313,33 @@ fn open_lap(i){
 `i` is the index of the direct child that was tapped, so emit exactly one
 row per array item (an empty-state label is fine: guard `i >= arr.len()`).
 Buttons inside a row keep their own `on_click` and don't trigger the tap.
+
+## Pictures
+
+The sandbox has no ambient loading: an `Image` cannot fetch a URL, an
+`mxc://` URI or a file path, so never set its `src`. It shows only bytes a
+host reply returned, such as `matrix.media_preview`'s `data_base64`: decode
+them, then load them into a named Image.
+
+```splash
+pic_wrap := View{ width: Fill height: Fit align: Align{x: 0.5} visible: false
+    pic := Image{ width: Fill height: 180 fit: ImageFit.Smallest }
+}
+fn show_picture(r){
+    if !r.is_ok { ui.note.set_text(r.error) return nil }
+    let bytes = r.data.data_base64.decode_base64()
+    if bytes == nil { ui.note.set_text("That picture couldn't be read.") return nil }
+    ui.pic.load_image_from_data_async(bytes)
+    ui.pic_wrap.set_visible(true)
+    return nil
+}
+```
+
+Give the Image a definite box (`width: Fill` and a fixed height, or `Fill`
+inside a sized parent). `ImageFit.Smallest` shows the whole picture inside the
+box; `ImageFit.CropToFill` fills it and crops the edges, which suits grid
+tiles. Keep the wrapper hidden, with an icon or caption in its place, until
+the bytes arrive, and load each picture once rather than on every render.
 
 ## Saving data (persistence)
 
@@ -277,10 +380,21 @@ let _boot = start_timeout(0.05, || refresh())
 
 - Arrays: `[a, b]`, `.push(x)`, `.len()`, `.clear()`, `.retain(|x| cond)`,
   index `items[i]`, iterate `for item in items { ... }`.
+- Reading a field an object doesn't have (`m.msgtype` when the reply omits
+  it) is a script error, not `nil`. Read optional fields as `m["msgtype"]`,
+  which gives `nil` when absent.
 - Objects: `{text: "hi" done: false}` (NO commas needed between fields),
   field access `item.done`, field assignment `items[i].done = true` (the
   merge form `items[i] += {done: true}` only works with a literal index).
-- Strings: concatenation with `+`, `.trim()`. Convert: `"" + number`.
+- Strings: concatenation with `+`, `.trim()`, `.strip_prefix(p)` (the text
+  unchanged when it doesn't start with `p`). Convert: `"" + number`.
+- Bytes: `b64.decode_base64()` turns standard base64 text (padding optional,
+  whitespace ignored) into a byte array. Anything else gives `nil`, including
+  URL-safe `-`/`_` and a `data:...;base64,` prefix (keep only the text after
+  its comma), so check `bytes == nil`.
+  `""` gives an empty array. `bytes.to_base64()` turns a byte array from
+  `decode_base64()` or `"text".to_bytes()` into padded standard base64; any
+  other array is a script error.
 - `if`/`else`, `return`, `let`, `+=`, `-=`, `!`, `==`, `<`, `>` as usual.
 
 ## Host services and permissions
@@ -511,7 +625,7 @@ Test button for the user to ask again.
 
 ```splash
 fn on_room_message(json){
-    let batch = json.parse_json()      // [{room_id, event_id, sender, sender_id, sender_name, body, ts, msgtype, is_own}]
+    let batch = json.parse_json()      // [{room_id, event_id, sender, sender_id, sender_name, body, ts, msgtype, is_own, mentions_me, reply_to, thread_root}]
     for m in batch { messages.push(m) }
     ui.msg_list.render()
 }
@@ -544,7 +658,10 @@ Each hook gets one JSON string argument:
 - `on_room_message`: every new message since you subscribed, batched
   into one call per burst and never replayed from history; `sender` is
   the short name and `sender_id` the full id, like `matrix.read_messages`.
-  Edits do not show up here (see the next hook).
+  `mentions_me` is true when Robrix highlights it as mentioning the user (their
+  name, @room, their keywords); `reply_to` is the event it replies to and
+  `thread_root` its thread's root, each null when absent. Edits do not show
+  up here (see the next hook).
 - `on_room_message_changed`: one call per edit or redaction of a message;
   `event_id` is the message that changed, `body` its new text (up to 500
   chars) or `""` when redacted.
@@ -719,6 +836,31 @@ Landmines in callback-heavy code (each cost a debug cycle):
 - The result field is `r.is_ok`, never `r.ok`: `ok` is a keyword and `r.ok`
   is not a field access. The same word is a keyword as an OBJECT KEY too:
   write `{"ok": true}` (quoted), never `ok: true`.
+- Every entry into your script (startup, a handler, a hook, a host callback,
+  a timer) must finish within about 64 ms and 200,000 instructions, or it
+  stops with "script time budget exceeded" or "script instruction limit
+  exceeded". Split big work (a large saved file, a reply with many messages)
+  into slices of a few dozen items, each continued by
+  `start_timeout(0.02, || next_slice())`, and only update widgets whose text
+  changed.
+- `floor`, `abs`, `min` and `max` compute in 32-bit floats: `max(0, ts)` on a
+  millisecond timestamp is off by up to a minute. Compare timestamps directly;
+  whole days are `(ts - ts % 86400000) / 86400000`.
+- `parse_json()` garbles a string containing the escape `\/`, `\b` or `\f`
+  (and the fields after it), and drops surrogate pairs such as `\ud83d\ude00`
+  (emoji). Web APIs written in PHP or Python send them, so rewrite those
+  escapes before parsing (a surrogate pair as one `\u{1f600}`), leaving `\\`
+  pairs intact. Note `.replace(a, b)` with a string replaces only the first
+  match.
+- `regex(...)`: use no capture groups. Reusing a regex that has groups can
+  return the previous text's captures or silently stop the callback; use
+  `(?:...)`, `split`, `strip_prefix` or `search` instead.
+- In `on_render`, `if xs.len() == 0 { Label{...} } else { for ... }` never
+  shows the Label (see the `on_render` notes).
+- When the LAST branch of an `if`/`elif`/`else` chain ends with a call or an
+  assignment, a branch that ends with a `let` or a `for`/`while` loop makes
+  the next statement log "pop_stack_value on empty stack" whenever it runs.
+  End the branches alike, e.g. finish the last one with `let _r = finish()`.
 
 ## Matrix services (Robrix)
 
@@ -734,9 +876,10 @@ burning a permission.
   `{room_id, room_name, topic, member_count, encrypted, join_rule,
   history_visibility, alias}` for the attached room.
 - `"matrix.read_messages"` (needs `matrix-room-read`): `{limit: N}` (max 30)
-  -> `{messages: [{sender, sender_id, event_id, body}]}`, the latest text
-  messages, oldest first. `sender` is the short name, `sender_id` the full
-  `@user:server`, `event_id` what the `nav.*` / `composer.*` services take.
+  -> `{messages: [{sender, sender_id, sender_name, event_id, body, ts}]}`, the
+  latest text messages, oldest first. `sender` is the short name, `sender_id`
+  the full `@user:server`, `sender_name` the display name to show, `ts` unix
+  millis, `event_id` what the `nav.*` / `composer.*` services take.
 - `"matrix.send_message"` (needs `matrix-room-send`): `{body: "text"}` -> `{}`
   — sends a plain text message to the attached room as the user. Use this only
   for an explicit Send/Post action. A Draft action uses `composer.insert`
@@ -748,7 +891,25 @@ burning a permission.
   or URI fields are accepted. Download permission follows room read protection
   and grants no upload/send/Internet access. Use exact returned bytes for a
   separate visible Attach draft or Send action with its own grant. A returned
-  caption or filename alone is not the attachment's contents.
+  caption or filename alone is not the attachment's contents. It always
+  returns the whole file, so call it only for an explicit action such as
+  Share or Save; show pictures with `matrix.media_preview`.
+- `"matrix.media_preview"` (needs `matrix.media.download` in `matrix-media`):
+  `{event_id, size?}` -> `{room_id, event_id, data_base64, mime_type, width,
+  height, original_width, original_height, filename, size}`; no other keys
+  are accepted. A small JPEG (PNG when transparency matters) of a photo or
+  video attachment, never enlarged, made from the event's own thumbnail or
+  video poster, else from a photo's original. The request's `size` is the
+  longest edge in pixels, a whole number from 64 to 1024 (default 256). In the
+  reply, `width`, `height`, `mime_type` and `size` (bytes) describe the
+  preview; `filename` and `original_width` / `original_height` (absent when
+  unknown) describe the attachment. Audio, files, videos without a poster,
+  and pictures too large or in an unsupported format fail with an error
+  starting "No picture preview for this attachment"; show an icon for those.
+  It has a download's permission and checks but costs less of the request
+  budget than a whole download. Still ask for a few previews at a time, for
+  the tiles in view, keep each result instead of fetching it again, and never
+  retry a refusal or "too many requests" in a loop. Show it as in "Pictures".
 - `"matrix.send_media"` (needs both `matrix.media.upload` and `matrix.media.send`
   in `matrix-media`): `{data_base64, filename, mime_type, caption?}` ->
   `{room_id, event_id, media}`. Uploads and posts a native image, audio, video
@@ -765,12 +926,13 @@ burning a permission.
 - `"matrix.room_members"` (needs `matrix-room-read`): `{limit: N}` (max 200)
   -> `{count, members: [{name, user_id, power}]}` — who is in the room.
 - `"matrix.pinned_events"` (needs `matrix-room-read`): `{}` ->
-  `{pinned: [{sender, sender_id, event_id, body}]}`, the room's pinned messages.
+  `{pinned: [{sender, sender_id, sender_name, event_id, body, ts}]}`, the
+  room's pinned messages.
 - `"matrix.rooms_list"` (needs `matrix-rooms-list`, works without a room): `{}` ->
   `{rooms: [{room_id, name, is_direct, is_space, member_count, is_encrypted, unread, mentions}]}`.
 - `"matrix.search_room"` (needs `matrix-room-read`, attached room):
   `{query, limit: N, server: bool}` ->
-  `{results: [{room_id, room_name, event_id, sender, sender_id, body, ts, source}],
+  `{results: [{room_id, room_name, event_id, sender, sender_id, sender_name, body, ts, source}],
   searched_rooms, server_used}`, newest first. Matches the text case-insensitively
   against what Robrix holds locally (encrypted rooms included); `server: true`
   also asks the homeserver, which only sees unencrypted rooms and may be slow.
@@ -779,15 +941,15 @@ burning a permission.
   room): the same with `room_ids: [...]` to pick rooms, else every joined room.
   Pass a result's `room_id` along with `event_id` to `nav.event` to jump there.
 - `"matrix.room_threads"` (needs `matrix-room-read`): `{limit: N}` (max 50)
-  -> `{threads: [{sender, sender_id, event_id, body}]}`, thread root
-  messages, newest first; `event_id` is the thread root.
+  -> `{threads: [{sender, sender_id, sender_name, event_id, body, ts}]}`,
+  thread root messages, newest first; `event_id` is the thread root.
 
 <!-- room -->
 - `"matrix.thread_replies"` (needs `matrix-room-read`): `{event_id, limit: N}`
   (max 100) -> `{root, replies: [message]}`, the latest replies in that thread,
   oldest first; `root` is the thread's first message (null if it isn't one). A
-  message is `{sender, sender_id, event_id, body, ts, msgtype}`, `ts` in unix
-  millis. Served from what Robrix has cached; a thread it hasn't seen is
+  message is `{sender, sender_id, sender_name, event_id, body, ts, msgtype}`,
+  `ts` in unix millis. Served from what Robrix has cached; a thread it hasn't seen is
   fetched from the homeserver.
 - `"matrix.older_messages"` (needs `matrix-room-read`): `{before: event_id?,
   limit: N}` (max 50) -> `{messages: [message], has_more}`, one page of text
@@ -1135,15 +1297,19 @@ idempotency where the destination supports it.
 2. Exactly one root `View{` or `ScrollYView{` as the last expression. Prefer a
    full-pane View containing a full-pane ScrollYView content column.
 3. Never use: `use`, `import`, `Root`, `Window`, `live_design`, `sys.`,
-   `fetch`, `Image{`, `<` JSX `>`, CSS, or HTML. Network only through
+   `fetch`, `<` JSX `>`, CSS, or HTML. Network only through
    `host.request("network.http", ...)` as above; ambient `mod.net` is disabled.
+   An `Image{` shows only bytes a host reply returned, decoded with
+   `decode_base64()` and loaded with `load_image_from_data_async` (see
+   "Pictures"); never give it a `src`, URL or URI.
 4. Every interactive element updates the UI through `ui.<name>.set_*` /
    `.render()` calls — never assume a mutation redraws by itself.
-5. Keep it small: under ~150 lines. Polished and readable at ANY host size:
-   fill the available pane in both dimensions, give primary lists the remaining
-   height, and make overflowing controls scroll in short panes. Never impose
-   fixed result-list heights or cap the entire content column's width. Use
-   `fn on_app_resize` + pre-declared tiers when fixed sizes must change.
+5. Keep it small: under ~150 lines, not counting the Robrix look kit.
+   Polished and readable at ANY host size: fill the available pane in both
+   dimensions, give primary lists the remaining height, and make overflowing
+   controls scroll in short panes. Never impose fixed result-list heights or
+   cap the entire content column's width. Use `fn on_app_resize` +
+   pre-declared tiers when fixed sizes must change.
 6. Declare every capability you use in the header (`// permissions:`), ask
    for the least you need, and give each one a `// why-<perm>:` reason.
 7. The app MUST work with every permission denied or revoked mid-run: real

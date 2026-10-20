@@ -209,6 +209,7 @@ View{status := Label{text:"waiting"} hits := Label{text:"none"}}
 
     #[test]
     fn flow_room_duration_uses_origin_and_expires_without_broadening_target_scope() {
+        let _policy_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
         let mut fixture = Fixture::new("flow-room-duration");
         let context = fixture.context(0);
         let epoch = flow::context_epoch(&context).unwrap();
@@ -259,6 +260,7 @@ View{status := Label{text:"waiting"} hits := Label{text:"none"}}
 
     #[test]
     fn close_rejects_same_pass_ordinary_approval_and_drops_stale_callbacks() {
+        let _policy_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
         let mut fixture = Fixture::new("stale-room-answer");
         let prompt = fixture.prompt(0);
         let id = prompt.id;
@@ -281,6 +283,7 @@ View{status := Label{text:"waiting"} hits := Label{text:"none"}}
 
     #[test]
     fn closing_one_room_preserves_other_instance_grants_and_hook_delivery() {
+        let _policy_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
         let mut fixture = Fixture::new("independent-room-hooks");
         let heaps = [fixture.heap(0), fixture.heap(1)];
         let surviving_host = fixture.host(1);
@@ -320,6 +323,7 @@ View{status := Label{text:"waiting"} hits := Label{text:"none"}}
 
     #[test]
     fn deferred_close_is_account_bound_and_releases_markers_after_sign_out() {
+        let _policy_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
         let mut fixture = Fixture::new("account-bound-close");
         let room: OwnedRoomId = ORIGIN.try_into().unwrap();
         let captured_account = begin(&mut fixture.cx, &room).unwrap();
@@ -344,6 +348,7 @@ View{status := Label{text:"waiting"} hits := Label{text:"none"}}
 
     #[test]
     fn late_matrix_errors_and_successes_cannot_enter_a_reopened_callback() {
+        let _policy_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
         let mut fixture = Fixture::new("late-matrix-close-result");
         let prompt = fixture.prompt(0);
         let ParkedRequest::Bridge(Some(request)) = &prompt.parked[0] else { panic!("expected native request") };
@@ -386,6 +391,7 @@ View{status := Label{text:"waiting"} hits := Label{text:"none"}}
 
     #[test]
     fn native_composer_completion_rejects_retired_or_reused_callback_identity() {
+        let _policy_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
         let mut fixture = Fixture::new("stale-composer-completion");
         let prompt = fixture.prompt(0);
         let ParkedRequest::Bridge(Some(request)) = &prompt.parked[0] else { panic!("expected native request") };
@@ -417,6 +423,7 @@ View{status := Label{text:"waiting"} hits := Label{text:"none"}}
 
     #[test]
     fn closing_one_origin_requeues_unrelated_group_member_with_a_new_identity() {
+        let _policy_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
         let mut fixture = Fixture::new("room-group-survivor");
         let affected = fixture.prompt(0);
         let survivor = fixture.prompt(1);

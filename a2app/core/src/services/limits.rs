@@ -347,6 +347,15 @@ mod tests {
         );
     }
 
+    /// The limiter prices by service name, so a preview never pays, or gets, a whole download's price.
+    #[test]
+    fn attachment_previews_are_priced_below_whole_downloads() {
+        assert_eq!((cost_of("matrix.media_preview"), cost_of("matrix.download_media")), (2.0, 5.0));
+        let mut limiter = AbuseLimiter::default();
+        assert!((0..15).all(|_| matches!(limiter.check("gallery", "matrix.media_preview", true), Verdict::Allow)),
+            "a full bucket covers fifteen previews");
+    }
+
     /// Cheap, ordinary traffic is never punished.
     #[test]
     fn ordinary_use_is_not_rate_limited() {

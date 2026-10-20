@@ -10,6 +10,7 @@
 
 let watch_pending = false
 let watch_ready = false
+let watch_tried = false
 let watch_generation = 0
 let test_pending = false
 let reply_draft_pending = false
@@ -23,6 +24,21 @@ let rules = []
 let hits = []
 let watch_line = "Starting…"
 let metas = ["\\", ".", "*", "+", "?", "(", ")", "[", "]", "{", "}", "|", "^", "$"]
+let upper = {a: "A" b: "B" c: "C" d: "D" e: "E" f: "F" g: "G" h: "H" i: "I" j: "J" k: "K" l: "L" m: "M" n: "N" o: "O" p: "P" q: "Q" r: "R" s: "S" t: "T" u: "U" v: "V" w: "W" x: "X" y: "Y" z: "Z"}
+
+// What the page shows.
+let new_notify = true
+let status_text = "Starting…"
+let status_kind = "busy"
+let is_wide = false
+let is_compact = false
+let how_open = false
+let ago_sig = ""
+// The rule whose card is asking "Remove rule?", or -1.
+let confirm_remove = -1
+// Whether the match lists last showed the "Not watching" card.
+let shown_unwatched = false
+let no_room = false
 
 fn save(){ fs.write("/rules.json", rules.to_json()) }
 
@@ -61,13 +77,94 @@ fn keyword_pattern(keyword){
     return out
 }
 
+// Reading a missing field is an error, so optional fields go through here.
+fn get(obj, key, fallback){
+    if !obj.is_object() { return fallback }
+    for field value in obj {
+        if field.to_string() == key { return value }
+    }
+    return fallback
+}
+
+// Host errors read as sentences: a capital first letter and a final period.
+fn sentence(text){
+    let chars = text.split("")
+    if chars.len() < 3 { return text }
+    let up = upper[chars[1]]
+    if up == nil { up = chars[1] }
+    let out = up + text.strip_prefix(chars[1])
+    let last = chars[chars.len() - 2]
+    if last != "." && last != "!" && last != "?" { out = out + "." }
+    return out
+}
+
+fn is_denial(error){ return error.search("denied") >= 0 || error.search("not approved") >= 0 || error.search("needs approval") >= 0 }
+
+// Says why watching stopped and what to do next.
+fn watch_error(error){
+    if error.search("not attached") >= 0 { return "Not watching: no room attached." }
+    if error.search("App Info") >= 0 { return "Not watching: room watching is off for this app. Turn it on in App Info, then tap Refresh." }
+    if is_denial(error) { return "Not watching: watching this room wasn't allowed. Tap Refresh to ask again." }
+    return "Not watching: " + sentence(error)
+}
+
+// The avatar letter: the name's first character, skipping a leading "@".
+fn initial(name){
+    let chars = name.split("")
+    if chars.len() < 3 { return "?" }
+    let c = chars[1]
+    if c == "@" && chars.len() > 3 { c = chars[2] }
+    let up = upper[c]
+    if up != nil { c = up }
+    return c
+}
+
+// ---- The header: summary, status and Refresh
+
+fn plural(n, one, many){
+    if n == 1 { return "1 " + one }
+    return "" + n + " " + many
+}
+
+// Status lines are green when all is well, red on a problem, else gray.
+fn set_status(text, kind){
+    status_text = text
+    status_kind = kind
+    ui.status_box.render()
+    return nil
+}
+
+fn has_replies(){
+    for r in rules { if r.reply != "" { return true } }
+    return false
+}
+
+fn show_header(){
+    let line = plural(rules.len(), "rule", "rules")
+    if hits.len() > 0 { line = line + " · " + plural(hits.len(), "match", "matches") }
+    ui.summary.set_text(line)
+    ui.summary_wrap.set_visible(rules.len() > 0)
+    ui.refresh_wrap.set_visible(watch_tried && !watch_ready && !watch_pending)
+    return nil
+}
+
 fn show_status(){
     let line = watch_line
-    if !host.has("matrix.room.message.send") {
-        line = line + " Automatic sending is off until this app may send to the room. Draft reply remains separate."
+    let kind = "ok"
+    if !watch_ready { kind = "err" }
+    if !watch_tried { kind = "busy" }
+    if watch_ready && !host.has("matrix.room.message.send") && has_replies() {
+        line = line + " Auto-replies need permission to send; test a reply to allow it."
+        if kind == "ok" { kind = "info" }
     }
-    if actions_paused { line = line + " Automatic actions are paused. Test a rule to resume them." }
-    ui.status.set_text(line)
+    if actions_paused {
+        line = line + " Automatic actions are paused. Test a rule to resume them."
+        kind = "err"
+    }
+    set_status(line, kind)
+    show_header()
+    if shown_unwatched != (watch_tried && !watch_ready) { render_hits() }
+    return nil
 }
 
 fn subscribe(){
@@ -77,17 +174,17 @@ fn subscribe(){
     host.request("events.subscribe", {event: "on_room_message"}, fn(r){
         if generation != watch_generation { return nil }
         watch_pending = false
+        watch_tried = true
         watch_ready = r.is_ok
-        if r.is_ok {
-            watch_line = "Watching this room."
-        } else {
-            watch_line = "Not watching: " + r.error
-        }
+        if r.is_ok { watch_line = "Watching this room." } else { watch_line = watch_error(r.error) }
+        no_room = !r.is_ok && r.error.search("not attached") >= 0
         if pending_test.is_object() {
             let test = pending_test
             pending_test = nil
             if r.is_ok { run_rule_test(test) }
-            else { finish_test("Test stopped: " + r.error) }
+            else { finish_test(watch_error(r.error), "err") }
+            show_header()
+            render_hits()
         } else { show_status() }
     })
 }
@@ -103,35 +200,77 @@ fn on_permissions_changed(caps){
         action_pending = false
         watch_pending = false
         watch_ready = false
+        watch_tried = true
         watch_line = "Not watching: permission is off."
         if pending_test.is_object() {
             pending_test = nil
-            finish_test("Room watching was not allowed. Test the rule again when you want to allow it.")
+            finish_test("Room watching was not allowed. Test the rule again when you want to allow it.", "err")
         } else if !test_pending { show_status() }
+        show_header()
+        render_hits()
     }
+}
+
+// ---- Layout
+
+// Wide panes put recent matches in a second column.
+fn show_layout(){
+    let has_rules = rules.len() > 0
+    ui.matches_main.set_visible(!is_wide && has_rules)
+    ui.side_col.set_visible(is_wide && has_rules)
+    return nil
+}
+
+fn on_app_resize(w, h){
+    let wide = w >= 720
+    let compact = w < 300
+    if wide == is_wide && compact == is_compact { return nil }
+    is_wide = wide
+    is_compact = compact
+    show_layout()
+    ui.rule_list.render()
+    render_hits()
+    return nil
+}
+
+fn toggle_how(){
+    how_open = !how_open
+    ui.how_wrap.set_visible(how_open)
+    if how_open { ui.how_btn.set_text("How it works ▲") } else { ui.how_btn.set_text("How it works ▼") }
+    return nil
+}
+
+// ---- Rules
+
+fn set_notify(on){
+    new_notify = on
+    ui.notify_chips.render()
+    return nil
 }
 
 fn add_rule(){
     let keyword = ui.keyword_input.text().trim()
     if keyword == "" || keyword.len() > 100 {
-        ui.status.set_text("Enter a keyword between 1 and 100 characters.")
+        set_status("Enter a keyword between 1 and 100 characters.", "err")
         return nil
     }
     let reply = ui.reply_input.text().trim()
     if reply.len() > 4096 {
-        ui.status.set_text("Keep the reply within 4096 characters.")
+        set_status("Keep the reply within 4096 characters.", "err")
         return nil
     }
     rules.push({
         keyword: keyword
         pattern: keyword_pattern(keyword)
-        notify: !ui.silent_toggle.checked()
+        notify: new_notify
         reply: reply
     })
     save()
+    confirm_remove = -1
     ui.keyword_input.set_text("")
     ui.reply_input.set_text("")
     ui.rule_list.render()
+    show_layout()
     show_status()
 }
 
@@ -139,27 +278,28 @@ fn draft_reply(text){
     if reply_draft_pending { return nil }
     let reply = text.trim()
     if reply == "" || reply.len() > 4096 {
-        ui.status.set_text("Enter a reply between 1 and 4096 characters to draft.")
+        set_status("Enter a reply between 1 and 4096 characters to draft.", "err")
         return nil
     }
     reply_draft_pending = true
-    ui.status.set_text("Preparing a reply draft…")
+    set_status("Preparing a reply draft…", "busy")
     host.request("composer.insert", {text: reply}, fn(r){
         reply_draft_pending = false
-        if r.is_ok { ui.status.set_text("Reply drafted. Review and send it in Robrix. Automatic sending is unchanged.") }
-        else { ui.status.set_text(r.error) }
+        if r.is_ok { set_status("Reply drafted. Review and send it in Robrix.", "ok") }
+        elif is_denial(r.error) { set_status("Drafts aren't allowed yet. Tap Draft reply to allow them.", "err") }
+        else { set_status(sentence(r.error), "err") }
     })
 }
 
-fn finish_test(text){
+fn finish_test(text, kind){
     test_pending = false
     pending_test = nil
-    ui.status.set_text(text)
+    set_status(text, kind)
 }
 
 fn complete_test(text){
     actions_paused = false
-    finish_test(text)
+    finish_test(text, "ok")
     run_next_action()
 }
 
@@ -169,10 +309,11 @@ fn run_rule_test(test){
     if test.reply != "" { remaining += 1 }
     let failure = ""
     let done = fn(r, label){
-        if !r.is_ok && failure == "" { failure = label + " failed: " + r.error }
+        if !r.is_ok && failure == "" && is_denial(r.error) { failure = label + " wasn't allowed. Test the rule to ask again." }
+        if !r.is_ok && failure == "" { failure = label + " failed: " + sentence(r.error) }
         remaining -= 1
         if remaining > 0 { return nil }
-        if failure != "" { finish_test(failure) }
+        if failure != "" { finish_test(failure, "err") }
         elif test.reply != "" { complete_test("Test reply posted to this room.") }
         else { complete_test("Test notification shown.") }
         return nil
@@ -199,35 +340,47 @@ fn start_rule_test(test){
 fn test_rule(rule){
     if test_pending { return nil }
     if !rule.notify && rule.reply == "" {
-        ui.status.set_text("This rule has no notification or reply to test.")
+        set_status("This rule has no notification or reply to test.", "err")
         return nil
     }
     let test = {keyword: rule.keyword, notify: rule.notify, reply: rule.reply}
     test_pending = true
-    ui.status.set_text("Testing '" + test.keyword + "'…")
+    set_status("Testing “" + test.keyword + "”…", "busy")
     if host.has("on_room_message") { start_rule_test(test) return nil }
     host.request("permissions.request", {perms: ["matrix-room-watch"], retry: true}, fn(r){
-        if !r.is_ok { finish_test("Test stopped: " + r.error) return nil }
+        if !r.is_ok { finish_test("Test stopped: " + sentence(r.error), "err") return nil }
         if r.data.permissions["matrix-room-watch"] != true || !host.has("on_room_message") {
-            finish_test("Room watching was not allowed. Test again when you want to enable the rule.")
+            finish_test("Room watching was not allowed. Test again when you want to enable the rule.", "err")
             return nil
         }
         start_rule_test(test)
     })
 }
 
+// Remove asks once, inline: the card's actions become a red confirm and Keep.
+fn ask_remove(i){
+    confirm_remove = i
+    ui.rule_list.render()
+    return nil
+}
+
 fn remove_rule(i){
+    confirm_remove = -1
     if i >= rules.len() { return nil }
     rules.remove(i)
     save()
     ui.rule_list.render()
+    show_layout()
+    show_header()
 }
 
-fn rule_line(rule){
-    let line = "notify off"
-    if rule.notify { line = "notify on" }
-    if rule.reply.len() > 0 { line = line + "  ·  reply: " + rule.reply }
-    return line
+// What a rule does, as short parts that wrap cleanly in narrow panes.
+fn meta_parts(rule){
+    let out = ["🔕 No notification"]
+    if rule.notify { out = ["🔔 Notifies you"] }
+    if rule.reply.len() > 0 { out.push("↩ Replies automatically") }
+    if !rule.notify && rule.reply == "" { out.push("Only listed under matches") }
+    return out
 }
 
 // Pace automatic requests and stop a denied burst after its first failure.
@@ -242,7 +395,10 @@ fn run_next_action(){
         if !r.is_ok {
             actions_paused = true
             action_queue = []
-            ui.status.set_text("Automatic actions paused: " + r.error + " Test a rule to try again.")
+            let why = sentence(r.error) + " Test a rule to try again."
+            if is_denial(r.error) { why = "popups aren't allowed yet. Test a rule to allow them." }
+            if is_denial(r.error) && action.service == "matrix.send_message" { why = "auto-replies aren't allowed yet. Test a reply to allow them." }
+            set_status("Automatic actions paused: " + why, "err")
         }
         start_timeout(1.0, || {
             if generation != action_generation { return nil }
@@ -255,7 +411,7 @@ fn run_next_action(){
 fn queue_action(service, args){
     if actions_paused { return nil }
     if action_queue.len() >= 32 {
-        ui.status.set_text("Simple Watcher is busy. Some automatic replies or notifications were skipped.")
+        set_status("Simple Watcher is busy. Some automatic replies or notifications were skipped.", "err")
         return nil
     }
     action_queue.push({service: service, args: args})
@@ -264,11 +420,17 @@ fn queue_action(service, args){
 
 // Own messages never match, so a rule can't loop on its own replies.
 fn check(m){
-    if m.is_own { return nil }
-    let line = m.sender_name + ": " + m.body
+    if m["is_own"] == true || !m["body"].is_string() { return nil }
+    let who = m["sender_name"]
+    if !who.is_string() || who == "" { who = m["sender"] }
+    if !who.is_string() || who == "" { who = "Someone" }
+    let line = who + ": " + m.body
+    let at = time_now()
+    let ts = get(m, "ts", 0)
+    if ts.is_number() && ts / 1000 < at && ts / 1000 > at - 604800 { at = ts / 1000 }
     for rule in rules {
         if regex(rule.pattern, "i").test(m.body) {
-            hits.push(line)
+            hits.push({who: who, body: m.body, rule: rule.keyword, at: at})
             if rule.notify {
                 queue_action("notify.post", {title: "Simple Watcher: " + rule.keyword, body: line})
             }
@@ -283,104 +445,333 @@ fn check(m){
 fn on_room_message(json){
     let batch = json.parse_json()
     for m in batch { check(m) }
+    render_hits()
+    show_header()
+}
+
+// ---- Recent matches
+
+fn ago(at){
+    let s = time_now() - at
+    if s < 60 { return "Just now" }
+    if s < 3600 { return "" + floor(s / 60) + "m ago" }
+    if s < 86400 { return "" + floor(s / 3600) + "h ago" }
+    if s < 172800 { return "Yesterday" }
+    if s < 604800 { return "" + floor(s / 86400) + "d ago" }
+    if s < 2592000 { return "" + floor(s / 604800) + "w ago" }
+    if s < 31536000 { return "" + floor(s / 2592000) + "mo ago" }
+    return "" + floor(s / 31536000) + "y ago"
+}
+
+fn newest_first(){
+    let out = []
+    let k = hits.len() - 1
+    while k >= 0 {
+        let h = hits[k]
+        out.push({who: h.who, body: h.body, rule: h.rule, when: ago(h.at), first: out.len() == 0})
+        k = k - 1
+    }
+    return out
+}
+
+fn render_hits(){
+    shown_unwatched = watch_tried && !watch_ready
+    let sig = ""
+    for h in hits { sig = sig + ago(h.at) + "|" }
+    ago_sig = sig
     ui.hit_list.render()
+    ui.hit_list_side.render()
+    return nil
+}
+
+// Keeps "5m ago" current without touching the host.
+fn tick(){
+    if hits.len() == 0 { return nil }
+    let sig = ""
+    for h in hits { sig = sig + ago(h.at) + "|" }
+    if sig == ago_sig { return nil }
+    render_hits()
+    return nil
+}
+
+// ---- Look: Robrix's buttons, inputs and chips
+
+let PrimaryButton = Button{
+    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
+    draw_bg +: {
+        border_size: 0.0 border_radius: 4.0
+        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+}
+let NeutralButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
+        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+}
+let GhostButton = PrimaryButton{
+    padding: Inset{left: 6 right: 6 top: 4 bottom: 4}
+    margin: Inset{left: -6}
+    draw_bg +: { border_size: 0.0 color: #xFFFFFF00 color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF00 }
+    draw_text +: { color: #x66708F color_hover: #x1C274C color_down: #x1C274C color_focus: #x66708F }
+}
+let NegativeButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xDC0005 border_color_hover: #xDC0005 border_color_down: #xDC0005 border_color_focus: #xDC0005
+        color: #xFFF0F0 color_hover: #xF0D4D4 color_down: #xE0B8B8 color_focus: #xFFF0F0 }
+    draw_text +: { color: #xDC0005 color_hover: #xDC0005 color_down: #xDC0005 color_focus: #xDC0005 }
+}
+let Field = TextInput{
+    width: Fill height: Fit padding: 10
+    draw_bg +: {
+        border_radius: 4.0 border_size: 1.0
+        color: #xFFFFFF color_hover: #xFFFFFF color_focus: #xFFFFFF color_down: #xFFFFFF color_empty: #xFFFFFF
+        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_focus: #x106fcc border_color_down: #x106fcc border_color_empty: #xC8C8C8
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #x333333 color_hover: #x333333 color_focus: #x333333 color_down: #x333333 color_empty: #xBBBBBB color_empty_hover: #x999999 color_empty_focus: #x999999 text_style: theme.font_regular{font_size: 11} }
+}
+// A pill; `selected` fills it with the accent color.
+let Chip = PrimaryButton{
+    margin: Inset{top: 2 bottom: 2}
+    padding: Inset{left: 10 right: 10 top: 5 bottom: 5}
+    draw_bg +: {
+        selected: instance(0.0)
+        border_size: 1.0
+        color: #xFFFFFF color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF
+        border_color: #xC8C8C8 border_color_hover: #xC8C8C8 border_color_down: #xC8C8C8 border_color_focus: #xC8C8C8
+        pixel: fn(){
+            let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+            sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, min(12.0, self.rect_size.y * 0.5 - 0.5))
+            let rest = mix(mix(self.color, self.color_hover, self.hover), self.color_down, self.down)
+            sdf.fill_keep(mix(rest, #x0f88fe, self.selected))
+            sdf.stroke(mix(self.border_color, #x0f88fe, self.selected), 1.0)
+            return sdf.result
+        }
+    }
+    draw_text +: {
+        selected: instance(0.0)
+        color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C
+        get_color: fn(){ return mix(self.color, #xFFFFFF, self.selected) }
+    }
+}
+let Caption = Label{ padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+let Meta = Label{ padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+let Body = Label{ padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
+let Dot = Label{ text: "•" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+let EmptyCard = RoundedView{
+    width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5}
+    padding: Inset{left: 16 right: 16 top: 20 bottom: 20}
+    show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+}
+let EmptyEmoji = Label{ padding: 0 margin: 0 draw_text +: { text_style: theme.font_regular{font_size: 28} } }
+let EmptyTitle = Label{ width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} } }
+let EmptyText = Label{ width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+
+// Recent matches, newest first. Wide panes show a second copy in their side column.
+let HitList = View{
+    width: Fill height: Fit flow: Down
+    on_render: || {
+        let rows = newest_first()
+        if rows.len() > 0 {
+            RoundedView{
+                width: Fill height: Fit flow: Down padding: Inset{left: 12 right: 12 top: 2 bottom: 2}
+                show_bg: true draw_bg +: { color: #xFFFFFF border_radius: 8.0 border_size: 1.0 border_color: #xE0E0E0 }
+                for h in rows {
+                    if !h.first { SolidView{ width: Fill height: 1 draw_bg +: { color: #x00000018 } } }
+                    View{
+                        width: Fill height: Fit flow: Right spacing: 10 padding: Inset{top: 10 bottom: 10}
+                        RoundedView{
+                            visible: !is_compact width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
+                            show_bg: true draw_bg +: { color: #x52b2ac border_radius: 16.0 }
+                            Label{ text: initial(h.who) padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
+                        }
+                        View{
+                            width: Fill height: Fit flow: Down spacing: 3
+                            View{
+                                width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                Label{ text: h.who width: Fill max_lines: 1 text_overflow: TextOverflow.Ellipsis padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} } }
+                                Meta{ text: h.when }
+                            }
+                            Body{ text: h.body width: Fill max_lines: 3 text_overflow: TextOverflow.Ellipsis }
+                            Meta{ text: "Keyword: “" + h.rule + "”" width: Fill max_lines: 1 text_overflow: TextOverflow.Ellipsis }
+                        }
+                    }
+                }
+            }
+        }
+        if rows.len() == 0 && watch_tried && !watch_ready {
+            EmptyCard{
+                EmptyEmoji{ text: if no_room { "🧭" } else { "🔒" } }
+                EmptyTitle{ text: if no_room { "No room attached" } else { "Not watching" } }
+                EmptyText{ text: if no_room { "Open Simple Watcher from a room to watch its messages." } else { "Rules can't match new messages until watching is on." } }
+            }
+        }
+        if rows.len() == 0 && !(watch_tried && !watch_ready) {
+            EmptyCard{
+                EmptyEmoji{ text: "📭" }
+                EmptyTitle{ text: "No matches yet" }
+                EmptyText{ text: "New messages with one of your keywords show up here." }
+            }
+        }
+        nil
+    }
 }
 
 let _init = load()
 let _boot = start_timeout(0.05, || {
     subscribe()
     ui.rule_list.render()
+    ui.notify_chips.render()
+    ui.status_box.render()
+    render_hits()
+    show_layout()
+    show_header()
 })
+let _tick = start_interval(30, || tick())
 
 View{
-    width: Fill height: Fill flow: Down align: Align{x: 0.5}
-    col := ScrollYView{
-        width: Fill height: Fill flow: Down spacing: 10 padding: 14
-        status := Label{
-            text: "Starting…" width: Fill padding: 0 margin: 0
-            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
-        }
-        Button{ text: "Refresh" on_click: || subscribe() draw_text +: { color: #x1C274C } }
-        RoundedView{
-            width: Fill height: Fit flow: Down spacing: 8 padding: 10
-            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
-            keyword_input := TextInput{ width: Fill empty_text: "Keyword to watch for" on_return: |t| add_rule() }
-            reply_input := TextInput{ width: Fill empty_text: "Auto-reply text (optional)" on_return: |t| add_rule() }
-            View{
-                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8 align: Align{y: 0.5}
-                silent_toggle := Toggle{
-                    text: "Silent (no notification)"
-                    draw_text +: { color: #x333333 }
-                }
-                Button{ text: "Add rule" on_click: || add_rule() draw_text +: { color: #x1C274C } }
-                Button{ text: "Draft reply" on_click: || draft_reply(ui.reply_input.text()) draw_text +: { color: #x1C274C } }
+    width: Fill height: Fill flow: Down
+    head := View{
+        width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5} padding: Inset{left: 14 right: 14 top: 14 bottom: 12}
+        View{
+            width: Fill height: Fit flow: Down spacing: 4
+            summary_wrap := View{
+                width: Fill height: Fit visible: false
+                summary := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
             }
-        }
-        Label{
-            text: "Rules" padding: 0 margin: 0
-            draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
-        }
-        rule_list := View{
-            width: Fill height: Fit flow: Down spacing: 5
-            on_render: || {
-                if rules.len() == 0 {
-                    Label{
-                        text: "No rules yet. Add a keyword above." width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
-                    }
-                } else {
-                    let i = 0
-                    for rule in rules {
-                        let index = i
-                        i = i + 1
-                        RoundedView{
-                            width: Fill height: Fit flow: Down spacing: 2 padding: 8
-                            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
-                            Label{
-                                text: rule.keyword width: Fill padding: 0 margin: 0
-                                draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} }
-                            }
-                            Label{
-                                text: rule_line(rule) width: Fill padding: 0 margin: 0
-                                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 11} }
-                            }
-                            View{
-                                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
-                                Button{text: "Draft reply" on_click: || draft_reply(rule.reply)}
-                                Button{text: if rule.reply != "" { "Test and send reply" } else { "Test notification" } on_click: || test_rule(rule)}
-                                Button{text: "Remove rule" on_click: || remove_rule(index)}
-                            }
+            status_box := View{
+                width: Fill height: Fit
+                on_render: || {
+                    if status_kind == "ok" { status := Meta{ text: status_text width: Fill draw_text +: { color: #x138808 } } }
+                    if status_kind == "err" { status := Meta{ text: status_text width: Fill draw_text +: { color: #xDC0005 } } }
+                    if status_kind == "info" { status := Meta{ text: status_text width: Fill } }
+                    if status_kind == "busy" {
+                        View{
+                            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
+                            status := Meta{ text: status_text width: Fill }
                         }
                     }
                     nil
                 }
             }
         }
-        Label{
-            text: "Draft reply prepares local text for review and needs no sending permission. Test and send reply posts the saved reply and shows any notification. Separate sending permission allows saved auto-replies on future matches. Adding a rule only saves it."
-            width: Fill padding: 0 margin: 0
-            draw_text +: {color: #x66708F text_style: theme.font_regular{font_size: 11}}
+        refresh_wrap := View{
+            width: Fit height: Fit visible: false
+            NeutralButton{ text: "Refresh" on_click: || subscribe() }
         }
-        Label{
-            text: "Recent matches" padding: 0 margin: 0
-            draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
-        }
-        hit_list := View{
-            width: Fill height: Fit flow: Down spacing: 4
-            on_render: || {
-                if hits.len() == 0 {
-                    Label{
-                        text: "Nothing has matched yet." width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+    }
+    SolidView{ width: Fill height: 1 draw_bg +: { color: #x00000018 } }
+    col := ScrollYView{
+        width: Fill height: Fill flow: Down spacing: 12 padding: 14
+        View{
+            width: Fill height: Fit flow: Right spacing: 16
+            main_col := View{
+                width: Fill height: Fit flow: Down spacing: 12
+                RoundedView{
+                    width: Fill height: Fit flow: Down spacing: 12 padding: 12
+                    show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                    Caption{ text: "NEW RULE" }
+                    keyword_input := Field{ empty_text: "Keyword to watch for" draw_text +: { max_lines: 1 text_overflow: TextOverflow.Ellipsis } on_return: |t| add_rule() }
+                    reply_input := Field{ empty_text: "Auto-reply text (optional)" draw_text +: { max_lines: 1 text_overflow: TextOverflow.Ellipsis } on_return: |t| add_rule() }
+                    notify_chips := View{
+                        width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
+                        on_render: || {
+                            Chip{ text: "🔔 Notify me" draw_bg +: {selected: if new_notify {1.0} else {0.0}} draw_text +: {selected: if new_notify {1.0} else {0.0}} on_click: || set_notify(true) }
+                            Chip{ text: "🔕 Silent" draw_bg +: {selected: if new_notify {0.0} else {1.0}} draw_text +: {selected: if new_notify {0.0} else {1.0}} on_click: || set_notify(false) }
+                            nil
+                        }
                     }
-                } else {
-                    for line in hits {
-                        Label{
-                            text: line width: Fill padding: 0 margin: 0
-                            draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                    View{
+                        width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8 align: Align{y: 0.5}
+                        PrimaryButton{ text: "Add rule" on_click: || add_rule() }
+                        NeutralButton{ text: "Draft reply" on_click: || draft_reply(ui.reply_input.text()) }
+                    }
+                }
+                View{
+                    width: Fill height: Fit flow: Down spacing: 8
+                    Caption{ text: "RULES" }
+                    rule_list := View{
+                        width: Fill height: Fit flow: Down spacing: 8
+                        on_render: || {
+                            let i = 0
+                            for rule in rules {
+                                let index = i
+                                i = i + 1
+                                let parts = meta_parts(rule)
+                                let has_reply = rule.reply != ""
+                                let quote = "“" + rule.reply + "”"
+                                let can_test = rule.notify || has_reply
+                                let confirming = confirm_remove == index
+                                let test_text = "Test notification"
+                                if has_reply { test_text = "Test and send reply" }
+                                if is_compact { test_text = "Test" }
+                                RoundedView{
+                                    width: Fill height: Fit flow: Down spacing: 8 padding: 12
+                                    show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                                    View{
+                                        width: Fill height: Fit flow: Down spacing: 4
+                                        Label{ text: rule.keyword width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
+                                        if is_compact {
+                                            View{
+                                                width: Fill height: Fit flow: Down spacing: 2
+                                                for part in parts { Meta{ text: part width: Fill } }
+                                            }
+                                        }
+                                        if !is_compact {
+                                            View{
+                                                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 12
+                                                for part in parts { Meta{ text: part } }
+                                            }
+                                        }
+                                    }
+                                    if has_reply { Body{ text: quote width: Fill max_lines: 2 text_overflow: TextOverflow.Ellipsis } }
+                                    View{
+                                        width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
+                                        if !confirming {
+                                            if can_test { test_btn := NeutralButton{ text: test_text on_click: || test_rule(rule) } }
+                                            if has_reply { draft_btn := NeutralButton{ text: "Draft reply" on_click: || draft_reply(rule.reply) } }
+                                            remove_btn := NeutralButton{ text: "Remove" on_click: || ask_remove(index) }
+                                        }
+                                        if confirming {
+                                            confirm_btn := NegativeButton{ text: "Remove rule?" on_click: || remove_rule(index) }
+                                            keep_btn := NeutralButton{ text: "Keep" on_click: || ask_remove(-1) }
+                                        }
+                                    }
+                                }
+                            }
+                            if rules.len() == 0 {
+                                EmptyCard{
+                                    EmptyEmoji{ text: "🔔" }
+                                    EmptyTitle{ text: "No rules yet" }
+                                    EmptyText{ text: "Add a keyword above to get a notification when a new message mentions it." }
+                                }
+                            }
+                            nil
                         }
                     }
                 }
+                matches_main := View{
+                    width: Fill height: Fit flow: Down spacing: 8 visible: false
+                    Caption{ text: "RECENT MATCHES" }
+                    hit_list := HitList{}
+                }
+                View{
+                    width: Fill height: Fit flow: Down spacing: 8
+                    how_btn := GhostButton{ text: "How it works ▼" on_click: || toggle_how() }
+                    how_wrap := View{
+                        width: Fill{max: 480} height: Fit flow: Down spacing: 6 visible: false
+                        View{ width: Fill height: Fit spacing: 6 Dot{} Meta{ text: "Rules check each new message here, ignoring case. Your own messages never match." width: Fill } }
+                        View{ width: Fill height: Fit spacing: 6 Dot{} Meta{ text: "Draft reply puts the reply in your message box. Nothing is sent until you send it." width: Fill } }
+                        View{ width: Fill height: Fit spacing: 6 Dot{} Meta{ text: "Test shows the notification and posts the reply here once. Later auto-replies need permission to send." width: Fill } }
+                    }
+                }
+            }
+            side_col := View{
+                width: Fill height: Fit flow: Down spacing: 8 visible: false
+                Caption{ text: "RECENT MATCHES" }
+                hit_list_side := HitList{}
             }
         }
     }

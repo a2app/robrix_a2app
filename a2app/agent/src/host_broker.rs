@@ -12,7 +12,7 @@ use octos_llm::{LlmProvider, ToolSpec, host::*};
 use serde_json::Value;
 use tokio::sync::{mpsc, watch, Semaphore};
 
-use crate::{AgentTransport, acp_client::AcpClient, mcp::McpServer, prefs::AgentPrefs};
+use crate::{AgentTransport, acp_client::AcpClient, mcp::McpServer, model_transport::PreviewSink, prefs::AgentPrefs};
 
 const MAX_PENDING: usize = 8;
 const MAX_ACTIVE: usize = 4;
@@ -44,6 +44,8 @@ pub(crate) struct HostBroker {
     /// Blocking calls keep their permit after their async waiter is cancelled.
     /// This bounds detached work across repeated cancel/restart cycles.
     tool_slots: Arc<Semaphore>,
+    /// Shows a generation's model output while it streams; the client connects it.
+    preview: PreviewSink,
 }
 
 impl HostBroker {
@@ -56,7 +58,10 @@ impl HostBroker {
         let epoch = flow::context_epoch(&context)?;
         let stopped = Arc::new(AtomicBool::new(false));
         let tools = if room_agent { tools.ok_or("The room's host tools are unavailable.")? } else { McpServer::new() };
-        let provider = crate::model_transport::provider_with_outputs(prefs, context.clone(), stopped.clone(), tools.output_store())?;
+        // Only app generation shows its model output live; room agents reply as before.
+        let preview = PreviewSink::default();
+        let provider_preview = if room_agent { PreviewSink::default() } else { preview.clone() };
+        let provider = crate::model_transport::provider_with_outputs(prefs, context.clone(), stopped.clone(), tools.output_store(), provider_preview)?;
         let output_context = context.clone();
         let check: Check = Arc::new(move || flow::ensure_context_epoch(&context, epoch));
         #[allow(unused_mut)]
@@ -67,10 +72,10 @@ impl HostBroker {
         };
         #[cfg(feature = "persistent-guide")]
         { system_prompt.push('\n'); system_prompt.push_str(crate::SPLASH_GUIDE); }
-        Self::with_provider(provider, tools, check, stopped, system_prompt, Some((output_context, epoch)))
+        Self::with_provider(provider, tools, check, stopped, system_prompt, Some((output_context, epoch)), preview)
     }
 
-    fn with_provider(provider: Arc<dyn LlmProvider>, tools: McpServer, check: Check, stopped: Arc<AtomicBool>, system_prompt: String, output_context: Option<(ContextId, u64)>) -> Result<Arc<Self>, String> {
+    fn with_provider(provider: Arc<dyn LlmProvider>, tools: McpServer, check: Check, stopped: Arc<AtomicBool>, system_prompt: String, output_context: Option<(ContextId, u64)>, preview: PreviewSink) -> Result<Arc<Self>, String> {
         let config = HostConfig {
             version: VERSION,
             model: HostModel {
@@ -87,7 +92,7 @@ impl HostBroker {
         let broker = Arc::new(Self {
             config, provider, tools, check, output_context, stopped, ready: AtomicBool::new(false), active: AtomicBool::new(false), generation,
             requests: Mutex::new(Some(tx)), pending: Mutex::new(HashSet::new()), pending_bytes: AtomicUsize::new(0),
-            tool_slots: Arc::new(Semaphore::new(MAX_ACTIVE)),
+            tool_slots: Arc::new(Semaphore::new(MAX_ACTIVE)), preview,
         });
         let weak = Arc::downgrade(&broker);
         std::thread::Builder::new().name("a2app-host-broker".into()).spawn(move || runtime.block_on(async move {
@@ -126,6 +131,8 @@ impl HostBroker {
     }
 
     pub(crate) fn config(&self) -> &HostConfig { &self.config }
+
+    pub(crate) fn preview(&self) -> &PreviewSink { &self.preview }
 
     pub(crate) fn accept_handshake(&self, result: &Value) -> Result<(), String> {
         let capabilities: HostCapabilities = serde_json::from_value(result["agentCapabilities"]["_meta"][CAPABILITY_KEY].clone())
@@ -322,7 +329,7 @@ mod tests {
         let epoch = Arc::new(AtomicUsize::new(1));
         let captured = epoch.clone();
         let check: Check = Arc::new(move || if captured.load(Ordering::Acquire) == 1 { Ok(()) } else { Err("Stale activation.".into()) });
-        let broker = HostBroker::with_provider(model.clone(), McpServer::new(), check, Arc::new(AtomicBool::new(false)), "Assistant".into(), None).unwrap();
+        let broker = HostBroker::with_provider(model.clone(), McpServer::new(), check, Arc::new(AtomicBool::new(false)), "Assistant".into(), None, Default::default()).unwrap();
         (broker, model, epoch)
     }
 
@@ -382,7 +389,7 @@ mod tests {
         let check: Check = Arc::new(move || flow::ensure_context_epoch(&expected,epoch));
         let model = Arc::new(Model { calls:AtomicUsize::new(0),wait:AtomicBool::new(false),tool_loop:false,seen_tools:Mutex::new(vec![]) });
         let tools = McpServer::new(); tools.add_tool(Media);
-        let broker = HostBroker::with_provider(model,tools,check,Arc::new(AtomicBool::new(false)),"Assistant".into(),Some((context.clone(),epoch))).unwrap();
+        let broker = HostBroker::with_provider(model,tools,check,Arc::new(AtomicBool::new(false)),"Assistant".into(),Some((context.clone(),epoch)),Default::default()).unwrap();
         negotiate(&broker); broker.begin_turn().unwrap();
         let reply = request(&broker,1,TOOLS_CALL_METHOD,json!({"name":"inspect_media","arguments":{}})).unwrap().recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
         assert_eq!(reply["is_error"],false);

@@ -3,693 +3,7 @@
 //! provider, OS dialog or internet service. The same FlowContract planner used
 //! by Robrix resolves sources and recipients; Registry persists enforcement.
 
-use std::{cell::RefCell, collections::{HashMap, VecDeque}, path::PathBuf, sync::atomic::{AtomicU64, Ordering}};
-use a2app_core::{
-    capabilities::Capability,
-    information_flow::{ContextId, FlowPolicy, Influence, Recipient, Registry, Source, SharingDuration},
-    manifest::{AppRegistry, instance_tag},
-    permissions::{Effective, GrantDuration, GrantState, NetworkScope, Permission, PermissionStore, RoomScope},
-    services::{self, Broker, BrokerAsk, BrokerCtx, HostAction, PaneState, Reply},
-};
-use makepad_widgets::{*, splash::Splash, splash_host::SplashHostRequest, widget_async::CxSplashVmExt};
-use makepad_widgets::{makepad_script::ScriptFnRef, widget_async::CxWidgetToScriptCallExt};
-use makepad_widgets::{makepad_script::ScriptRunBudget, widget_async::{SplashVmId, with_isolate}};
-
-const ACCOUNT: &str = "@owner:test";
-const ROOM: &str = "!private:test";
-const SITE: &str = "https://example.test/";
-static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
-static CALLBACK_LOG_TAP: std::sync::Once = std::sync::Once::new();
-
-thread_local! {
-    static CALLBACK_ERRORS: RefCell<Vec<String>> = RefCell::new(Vec::new());
-}
-
-fn capture_callback_error(message: &str, _: LogLevel) {
-    // splash_host_respond drains synchronous errors into the logger before
-    // the caller can inspect its VM. Observe that real path without replacing it.
-    if message.starts_with("splash host callback error:") || message.starts_with("splash: ") {
-        CALLBACK_ERRORS.with(|errors| errors.borrow_mut().push(message.into()));
-    }
-}
-
-fn headless_splash_entry<R>(cx: &mut Cx, vm_id: SplashVmId, run: impl FnOnce(&mut Cx) -> R) -> R {
-    // The UI's 64ms wall deadline includes time a parallel test is descheduled.
-    // Keep Splash's own 200,000-instruction guards, with the longer wall budget
-    // used by Makepad's headless script benchmark instead of testing CPU load.
-    with_isolate(cx, vm_id, |cx| {
-        let previous = cx.with_vm(|vm| vm.bx.run_budget.replace(ScriptRunBudget::from_durations(
-            std::time::Duration::from_secs(10), std::time::Duration::from_secs(10), 512,
-        )));
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(cx)));
-        cx.with_vm(|vm| vm.bx.run_budget = previous);
-        match result {
-            Ok(result) => result,
-            Err(error) => std::panic::resume_unwind(error),
-        }
-    })
-}
-
-struct Harness {
-    cx: Cx,
-    broker: Broker,
-    apps: AppRegistry,
-    permissions: PermissionStore,
-    flow: RefCell<Registry>,
-    contexts: HashMap<usize, ContextId>,
-    panes: HashMap<usize, PaneState>,
-    foreground_app: Option<String>,
-    splashes: Vec<Splash>,
-    stock_hosts: Vec<WidgetRef>,
-    attempted_bodies: RefCell<Vec<String>>,
-    root: PathBuf,
-    review_effects: bool,
-    network_bodies: VecDeque<String>,
-    matrix_replies: HashMap<String, VecDeque<serde_json::Value>>,
-}
-
-impl Harness {
-    fn new() -> Self {
-        CALLBACK_LOG_TAP.call_once(|| set_log_tap(Some(capture_callback_error)));
-        let root = std::env::temp_dir().join(format!("robrix_ifc_vm_{}_{}", std::process::id(), NEXT_ROOT.fetch_add(1, Ordering::Relaxed)));
-        std::fs::create_dir(&root).unwrap();
-        let mut cx = Cx::new(Box::new(|_, _| {}));
-        cx.with_vm(makepad_widgets::script_mod);
-        Self {
-            cx, broker: Broker::new(), apps: AppRegistry::default(), permissions: PermissionStore::default(),
-            flow: RefCell::new(Registry::open(&root).unwrap()), contexts: HashMap::new(), panes: HashMap::new(), foreground_app: None,
-            splashes: Vec::new(), stock_hosts: Vec::new(),
-            attempted_bodies: RefCell::new(Vec::new()), root, review_effects: false, network_bodies: VecDeque::new(), matrix_replies: HashMap::new(),
-        }
-    }
-
-    fn load_splash(&mut self, splash: &mut Splash, app: &str, source: &str) -> usize {
-        splash.set_debug_name(app);
-        // Allocate Splash's private VM with an empty view before running the
-        // actual guest source. This lets the test install its entry budget
-        // without replacing the real Splash evaluator or its instruction cap.
-        splash.set_text(&mut self.cx, " ");
-        let vm_id = self.cx.script_ref_vm_id(&splash.view.source).expect("empty Splash owns an isolate");
-        headless_splash_entry(&mut self.cx, vm_id, |cx| {
-            cx.with_script_vm_id_trusted(vm_id, |vm| vm.bx.captured_errors = Some(Vec::new()));
-            splash.set_text(cx, source);
-        });
-        let logged = CALLBACK_ERRORS.with(|errors| std::mem::take(&mut *errors.borrow_mut()));
-        assert!(logged.is_empty(), "{app} source startup errors: {logged:?}");
-        self.cx.with_script_vm_id_trusted(vm_id, |vm| {
-            let errors = vm.take_errors();
-            assert!(errors.is_empty(), "{app} source startup errors: {errors:?}");
-            vm.bx.captured_errors = Some(Vec::new());
-        });
-        splash.isolate_heap_key(&mut self.cx).expect("script isolate was created")
-    }
-
-    fn launch(&mut self, app: &str, public: bool, source: &str) -> (usize, ContextId) {
-        let context = if public { ContextId::PublicApp { account: ACCOUNT.into(), app: app.into() } }
-            else { ContextId::App { account: ACCOUNT.into(), app: app.into(), room: Some(ROOM.into()) } };
-        self.launch_context(app, context, source)
-    }
-
-    fn launch_context(&mut self, app: &str, context: ContextId, source: &str) -> (usize, ContextId) {
-        self.flow.borrow_mut().register_context(&context).unwrap();
-        let mut manifest = a2app_core::builtin::stock("room-peek").unwrap();
-        manifest.id = app.into();
-        manifest.permissions = Permission::ALL.iter().map(|permission| permission.as_str().into()).collect();
-        manifest.source = source.into();
-        self.apps.insert(manifest);
-        for permission in Permission::ALL { self.permissions.set(app, permission, GrantState::Granted); }
-        self.permissions.set_matrix_write(true);
-        self.permissions.allow_network(app, NetworkScope::AllHosts, RoomScope::AllRooms, GrantDuration::Always, None).unwrap();
-        let mut splash = self.cx.with_vm(|vm| {
-            let value = vm.eval(script! { use mod.widgets.* Splash{} });
-            assert!(!value.is_err(), "{app} host widget startup errors: {:?}", vm.take_errors());
-            Splash::script_from_value(vm, value)
-        });
-        splash.set_host_io_only(true);
-        splash.set_allow_net(false);
-        splash.set_host_tag(&mut self.cx, Some(instance_tag(app, context.room())));
-        let jail = self.flow.borrow().context_storage_path(&context).unwrap();
-        std::fs::create_dir_all(&jail).unwrap();
-        splash.set_sandbox_dir(&mut self.cx, Some(jail));
-        let heap = self.load_splash(&mut splash, app, source);
-        self.contexts.insert(heap, context.clone());
-        self.splashes.push(splash);
-        (heap, context)
-    }
-
-    fn launch_stock(&mut self, app: &str, public: bool) -> (WidgetRef, ContextId) {
-        self.launch_stock_permissions(app, public, true)
-    }
-
-    fn launch_stock_permissions(&mut self, app: &str, public: bool, granted: bool) -> (WidgetRef, ContextId) {
-        self.review_effects = true;
-        let manifest = a2app_core::builtin::stock(app).expect("installed stock mini-app");
-        let context = if public { ContextId::PublicApp { account: ACCOUNT.into(), app: app.into() } }
-            else { ContextId::App { account: ACCOUNT.into(), app: app.into(), room: Some(if app == "spaces" {"!space:test"} else {ROOM}.into()) } };
-        self.flow.borrow_mut().register_context(&context).unwrap();
-        self.apps.insert(manifest.clone());
-        for permission in Permission::ALL.into_iter().filter(|permission| granted && manifest.declares(*permission)) {
-            self.permissions.set(app, permission, GrantState::Granted);
-        }
-        self.permissions.set_matrix_write(true);
-        if granted && manifest.declares(Permission::Network) {
-            self.permissions.allow_network(app, NetworkScope::ExactUrl("https://example.com/".into()),
-                RoomScope::AllRooms, GrantDuration::Always, None).unwrap();
-        }
-        let host = self.cx.with_vm(|vm| {
-            let value = vm.eval(script! { use mod.widgets.* Splash{} });
-            assert!(!value.is_err(), "{app} host widget startup errors: {:?}", vm.take_errors());
-            WidgetRef::script_from_value(vm, value)
-        });
-        makepad_widgets::widget_tree::set_ui_root(&mut self.cx, &host);
-        let jail = self.flow.borrow().context_storage_path(&context).unwrap();
-        std::fs::create_dir_all(&jail).unwrap();
-        let heap = {
-            let mut splash = host.borrow_mut::<Splash>().unwrap();
-            splash.set_host_io_only(true);
-            splash.set_allow_net(false);
-            splash.set_host_tag(&mut self.cx, Some(instance_tag(app, context.room())));
-            splash.set_host_caps(&mut self.cx, self.permissions.granted_caps(&manifest));
-            splash.set_sandbox_dir(&mut self.cx, Some(jail));
-            self.load_splash(&mut splash, app, &manifest.source)
-        };
-        self.contexts.insert(heap, context.clone());
-        self.panes.insert(heap, PaneState { surface: "dock", side: None, foreground: true, width: 460.0, height: 700.0 });
-        self.stock_hosts.push(host.clone());
-        // Drawing populates these widget paths in the real host. Resolve them
-        // before invoking a guest callback that borrows its Splash widget.
-        for line in manifest.source.lines() {
-            if let Some((prefix, _)) = line.split_once(":=") {
-                if let Some(name) = prefix.split_whitespace().last() {
-                    host.widget(&self.cx, &[LiveId::from_str(name)]);
-                }
-            }
-        }
-        let source = host.borrow::<Splash>().unwrap().view.source.clone();
-        let vm_id = self.cx.script_ref_vm_id(&source).unwrap();
-        self.cx.with_script_vm_id(vm_id, |vm| vm.bx.captured_errors = Some(Vec::new()));
-        (host, context)
-    }
-
-    fn process(&mut self) -> Vec<BrokerAsk> {
-        let mut pending = Vec::new();
-        for _ in 0..100 {
-            let mut answered = false;
-            for ask in self.dispatch(None) {
-                match ask {
-                    BrokerAsk::PermissionBatch { app_id, request, perms }
-                        if perms.iter().all(|permission| self.batch_status(&app_id, &request, *permission) == Effective::Granted) =>
-                    {
-                        let answers: serde_json::Map<String, serde_json::Value> = perms.into_iter()
-                            .map(|permission| (permission.as_str().into(), true.into())).collect();
-                        self.reply(Reply { heap_key: request.heap_key, req_id: request.req_id },
-                            &serde_json::json!({"granted":true,"permissions":answers}).to_string());
-                        answered = true;
-                    }
-                    other => pending.push(other),
-                }
-            }
-            if !answered { return pending; }
-        }
-        panic!("already approved stock setup did not finish");
-    }
-
-    fn batch_status(&self, app_id: &str, request: &SplashHostRequest, permission: Permission) -> Effective {
-        let args: serde_json::Value = serde_json::from_str(&request.args_json).unwrap();
-        let context = self.contexts.get(&request.heap_key).unwrap();
-        services::permission_setup_status(&self.permissions, self.apps.get(app_id).unwrap(), permission,
-            services::permission_context(&request.service, &args, context.room()))
-    }
-
-    fn take_stock_batch(&mut self, app_id: &str) -> (SplashHostRequest, Vec<Permission>) {
-        for _ in 0..20 {
-            let mut batch = None;
-            for ask in self.process() {
-                match ask {
-                    BrokerAsk::PermissionBatch { app_id: subject, request, perms } => {
-                        assert_eq!(subject, app_id);
-                        assert!(batch.replace((request, perms)).is_none(), "one setup produces one batch");
-                    }
-                    BrokerAsk::Used { .. } => {},
-                    _ => panic!("{app_id} performs no protected work before its setup answer"),
-                }
-            }
-            if let Some(batch) = batch { return batch; }
-        }
-        panic!("{app_id} did not request its startup group batch");
-    }
-
-    fn answer_stock_batch(&mut self, app: &WidgetRef, app_id: &str, request: SplashHostRequest,
-        perms: &[Permission], selected: &[Permission], audit: &mut StockAudit)
-    {
-        assert!(selected.iter().all(|permission| perms.contains(permission)), "a batch cannot grant an unrequested group");
-        let needs_prompt = perms.iter().any(|permission| self.batch_status(app_id, &request, *permission) != Effective::Granted);
-        if needs_prompt { audit.batch_prompts += 1; }
-        for permission in perms {
-            if selected.contains(permission) {
-                if self.batch_status(app_id, &request, *permission) != Effective::Granted {
-                    assert!(!audit.prompts.contains(permission), "{app_id} repeatedly prompts for {permission:?}");
-                    audit.prompts.push(*permission);
-                }
-                if services::can_enable_permission_writes(&self.permissions, self.apps.get(app_id).unwrap(), *permission,
-                    services::permission_context(&request.service, &serde_json::from_str(&request.args_json).unwrap(),
-                        self.contexts.get(&request.heap_key).unwrap().room()))
-                {
-                    audit.write_setups += 1;
-                    self.permissions.set_matrix_write(true);
-                }
-                self.permissions.set(app_id, *permission, GrantState::Granted);
-            } else {
-                self.permissions.set(app_id, *permission, GrantState::Denied);
-            }
-        }
-        self.publish_grants(app, app_id);
-        let answers: serde_json::Map<String, serde_json::Value> = perms.iter().map(|permission|
-            (permission.as_str().into(), selected.contains(permission).into())).collect();
-        // A batch resolves its setup callback once. It does not replay that
-        // request once per group or approve any future outgoing effect.
-        self.reply(Reply { heap_key: request.heap_key, req_id: request.req_id },
-            &serde_json::json!({"granted":selected.len() == perms.len(),"permissions":answers}).to_string());
-    }
-
-    fn grant_stock_request(&mut self, app_id: &str, permission: Permission, request: &SplashHostRequest) {
-        if request.service == "permissions.request" {
-            self.permissions.set(app_id, permission, GrantState::Granted);
-            return;
-        }
-        let capability = if request.service == "events.subscribe" {
-            let args: serde_json::Value = serde_json::from_str(&request.args_json).unwrap();
-            a2app_core::capabilities::for_hook(args["event"].as_str().unwrap()).unwrap()
-        } else { a2app_core::capabilities::for_service(&request.service).unwrap() };
-        assert_eq!(capability.group, Some(permission));
-        assert!(self.apps.get(app_id).unwrap().declares_capability(capability));
-        // Concrete prompts authorize the captured ability, not every other
-        // ability in its group. Spatial/lifetime enforcement has separate tests.
-        self.permissions.set_capability(app_id, capability.id, GrantState::Granted);
-    }
-
-    fn deny_stock_pending(&mut self, app: &WidgetRef, app_id: &str) -> usize {
-        let mut denied = 0;
-        let mut idle_passes = 0;
-        for _ in 0..20 {
-            let asks = self.process();
-            if asks.is_empty() {
-                idle_passes += 1;
-                if denied > 0 && idle_passes >= 2 && !self.stock_callbacks_paused() { return denied; }
-            } else { idle_passes = 0; }
-            for ask in asks {
-                match ask {
-                    BrokerAsk::PermissionBatch { app_id: subject, request, perms } => {
-                        assert_eq!(subject, app_id);
-                        self.answer_stock_batch(app, app_id, request, &perms, &[], &mut StockAudit::default());
-                        denied += 1;
-                    }
-                    BrokerAsk::Prompt { app_id: subject, request: Some(request), .. }
-                    | BrokerAsk::EnableWrites { app_id: subject, request, .. } => {
-                        assert_eq!(subject, app_id);
-                        services::respond(&mut self.cx, Reply { heap_key: request.heap_key, req_id: request.req_id }, Err("Permission denied."));
-                        self.cx.with_vm_and_async(|_| {});
-                        self.assert_callback_errors(app_id);
-                        denied += 1;
-                    }
-                    BrokerAsk::Used { .. } => {},
-                    _ => panic!("{app_id} must not perform protected work after refusing its request"),
-                }
-            }
-        }
-        panic!("{app_id} did not finish a refused request");
-    }
-
-    fn dispatch(&mut self, pending: Option<SplashHostRequest>) -> Vec<BrokerAsk> {
-        let contexts = &self.contexts;
-        let flow = &self.flow;
-        let bodies = &self.attempted_bodies;
-        let check_flow = |request: &SplashHostRequest, cap: &Capability, args: &serde_json::Value, _: &AppRegistry| {
-            let context = contexts.get(&request.heap_key).ok_or("Unknown test context")?;
-            let contract = cap.flow_contract().ok_or("Missing flow contract")?;
-            let room = context.room();
-            let target = services::permission_context(&request.service, args, room).target_room;
-            let mut registry = flow.borrow_mut();
-            if request.service == "network.http" {
-                bodies.borrow_mut().push(args["body"].as_str().unwrap_or_default().into());
-                let origin = match Recipient::network_origin(args["url"].as_str().ok_or("Missing network URL")?)? {
-                    Recipient::NetworkOrigin(origin) => origin,
-                    _ => unreachable!(),
-                };
-                // The real HTTP worker records the origin before reviewing
-                // any outgoing request, including the first public response.
-                registry.add_influences(context, [Influence::InternetOrigin(origin)])?;
-            }
-            let recipient = contract.recipient(ACCOUNT, target, args, Some("https://homeserver.test"))?;
-            let action = contract.sensitive_action(cap.id, args, target);
-            if recipient.is_some() || action.is_some() {
-                let epoch = registry.context_epoch(context)?;
-                let review = registry.prepare_effect_for_activation(context, epoch, recipient.as_ref(), action.as_ref(), args)?;
-                if !review.allowed {
-                    if self.review_effects { return Ok(Some(review)); }
-                    // The adversarial tests also exercise refusal callbacks.
-                    if let Some(recipient) = &recipient { registry.ensure_allowed(context, recipient)?; }
-                    if let Some(action) = &action { registry.ensure_action_allowed(context, action)?; }
-                }
-                registry.commit_effect_for_activation(context, epoch, recipient.as_ref(), action.as_ref(), args)?;
-            }
-            let sources = contract.source_labels(ACCOUNT, room, target)?;
-            registry.add_sources(context, sources.clone())?;
-            if contract.untrusted_content {
-                registry.add_influences(context, sources.into_iter().map(|source| match source {
-                    Source::Room { account, room } => Influence::RoomContent { account, room },
-                    _ => Influence::Unknown,
-                }))?;
-            }
-            Ok(None)
-        };
-        let check_response = |reply: Reply, data: &str| {
-            let context = contexts.get(&reply.heap_key).ok_or("Closed test context")?;
-            let mut sources = Vec::new();
-            if let Ok(value) = serde_json::from_str(data) { response_room_sources(&value, &mut sources); }
-            let influences = sources.iter().filter_map(|source| match source {
-                Source::Room { account, room } => Some(Influence::RoomContent { account: account.clone(), room: room.clone() }),
-                _ => None,
-            }).collect::<Vec<_>>();
-            let mut registry = flow.borrow_mut();
-            registry.add_sources(context, sources)?;
-            registry.add_influences(context, influences)
-        };
-        let storage_path = |heap| {
-            flow.borrow().context_storage_path(contexts.get(&heap).ok_or("Unknown test context")?)
-        };
-        let ctx = BrokerCtx {
-            registry: &self.apps, permissions: &self.permissions, foreground_app: self.foreground_app.as_deref(),
-            is_docked: &|_| true, is_running: &|_| true, pane_state: &|heap| self.panes.get(&heap).cloned(), storage_path: &storage_path,
-            room_name: &|_| Some("Private room".into()), desktop_view: true,
-            permission_target_room: None,
-            check_flow: &check_flow, check_response: &check_response,
-        };
-        let asks = if let Some(request) = pending { self.broker.dispatch_after_grant(&mut self.cx, ctx, request) }
-        else { self.broker.process(&mut self.cx, ctx) };
-        // Broker-local replies (env, pane reads) can suspend on widget
-        // methods before they enqueue their next host request. Pump their
-        // continuations even when the broker returns no host work.
-        for host in &self.stock_hosts {
-            let source = host.borrow::<Splash>().unwrap().view.source.clone();
-            let vm_id = self.cx.script_ref_vm_id(&source).unwrap();
-            self.cx.with_script_vm_id(vm_id, |vm| { vm.bx.captured_errors.get_or_insert_with(Vec::new); });
-        }
-        self.cx.with_vm_and_async(|_| {});
-        self.assert_callback_errors("broker dispatch");
-        asks
-    }
-
-    fn call_guest(&mut self, app: &WidgetRef, name: &str, call: impl FnOnce(&mut Splash, &mut Cx) -> bool) -> bool {
-        let source = app.borrow::<Splash>().unwrap().view.source.clone();
-        let vm_id = self.cx.script_ref_vm_id(&source).expect("guest call belongs to its live isolate");
-        let called = headless_splash_entry(&mut self.cx, vm_id, |cx|
-            call(&mut app.borrow_mut::<Splash>().unwrap(), cx));
-        // Restore MAIN before pumping continuations: widget async dispatch
-        // owns cross-VM routing and must not run with this isolate installed.
-        self.cx.with_vm_and_async(|_| {});
-        self.assert_callback_errors(name);
-        called
-    }
-
-    fn call(&mut self, app: &WidgetRef, name: &str, args: &[ScriptValue]) -> bool {
-        self.call_guest(app, name, |splash, cx| splash.call_script_fn(cx, LiveId::from_str(name), args))
-    }
-
-    fn call_strings(&mut self, app: &WidgetRef, name: &str, args: &[&str]) -> bool {
-        self.call_guest(app, name, |splash, cx| splash.call_script_fn_with_strings(cx, LiveId::from_str(name), args))
-    }
-
-    fn call_json(&mut self, app: &WidgetRef, name: &str, text: &str, json: &str) -> bool {
-        let source = app.borrow::<Splash>().unwrap().view.source.clone();
-        let vm_id = self.cx.script_ref_vm_id(&source).unwrap();
-        let args = self.cx.with_script_vm_id(vm_id, |vm| {
-            let text = vm.new_string_with(|_, out| out.push_str(text));
-            let object = makepad_widgets::makepad_script::json::JsonParserThread::default().read_json(json, &mut vm.bx.heap);
-            [text, object]
-        });
-        self.call(app, name, &args)
-    }
-
-    fn call_index_text(&mut self, app: &WidgetRef, name: &str, index: u32, text: &str) -> bool {
-        let source = app.borrow::<Splash>().unwrap().view.source.clone();
-        let vm_id = self.cx.script_ref_vm_id(&source).unwrap();
-        let text = self.cx.with_script_vm_id(vm_id, |vm| vm.new_string_with(|_, out| out.push_str(text)));
-        self.call(app, name, &[index.into(), text])
-    }
-
-    fn call_object(&mut self, app: &WidgetRef, name: &str, json: &str) -> bool {
-        let source = app.borrow::<Splash>().unwrap().view.source.clone();
-        let vm_id = self.cx.script_ref_vm_id(&source).unwrap();
-        let argument = self.cx.with_script_vm_id(vm_id, |vm|
-            makepad_widgets::makepad_script::json::JsonParserThread::default().read_json(json, &mut vm.bx.heap));
-        self.call(app, name, &[argument])
-    }
-
-    fn widget_click(&mut self, app: &WidgetRef, text: &str, args: &[ScriptValue]) {
-        fn find(root: &WidgetRef, text: &str) -> Option<WidgetRef> {
-            if root.text() == text { return Some(root.clone()); }
-            let mut children = Vec::new();
-            root.children(&mut |_, child| children.push(child));
-            children.into_iter().find_map(|child| find(&child, text))
-        }
-        let widget = find(app, text).expect("the actual stock control exists");
-        self.widget_callback(app, &widget, id!(on_click), args);
-    }
-
-    fn widget_callback(&mut self, app: &WidgetRef, widget: &WidgetRef, method: LiveId, args: &[ScriptValue]) {
-        let source = app.borrow::<Splash>().unwrap().view.source.clone();
-        let vm_id = self.cx.script_ref_vm_id(&source).unwrap();
-        let (source, callback) = self.cx.with_script_vm_id(vm_id, |vm| {
-            let source = widget.script_source();
-            let value = vm.bx.heap.value(source, method.into(), NoTrap);
-            assert!(!value.is_nil(), "the actual stock control has its guest callback");
-            let callback = ScriptFnRef::script_from_value(vm, value);
-            let source = vm.bx.heap.new_object_ref(source);
-            (source, callback)
-        });
-        self.cx.widget_to_script_call(widget.widget_uid(), NIL, source, callback, args);
-        self.cx.with_vm_and_async(|_| {});
-        self.assert_callback_errors("stock widget callback");
-    }
-
-    fn queue_matrix_reply(&mut self, capability: &str, data: serde_json::Value) {
-        self.matrix_replies.entry(capability.into()).or_default().push_back(data);
-    }
-
-    fn assert_callback_errors(&mut self, operation: &str) {
-        let logged = CALLBACK_ERRORS.with(|errors| std::mem::take(&mut *errors.borrow_mut()));
-        assert!(logged.is_empty(), "{operation} synchronous callback errors: {logged:?}");
-        for host in &self.stock_hosts {
-            let source = host.borrow::<Splash>().unwrap().view.source.clone();
-            let vm_id = self.cx.script_ref_vm_id(&source).unwrap();
-            let errors = self.cx.with_script_vm_id(vm_id, |vm| {
-                let errors = vm.take_errors();
-                vm.bx.captured_errors = Some(Vec::new());
-                errors
-            });
-            assert!(errors.is_empty(), "{operation} asynchronous callback errors: {errors:?}");
-        }
-    }
-
-    fn publish_grants(&mut self, app: &WidgetRef, app_id: &str) {
-        let caps = self.permissions.granted_caps(self.apps.get(app_id).unwrap());
-        app.borrow_mut::<Splash>().unwrap().set_host_caps(&mut self.cx, caps.clone());
-        self.call_strings(app, "on_permissions_changed", &[&serde_json::to_string(&caps).unwrap()]);
-    }
-
-    fn stock_callbacks_paused(&mut self) -> bool {
-        self.stock_hosts.iter().any(|host| {
-            let source = host.borrow::<Splash>().unwrap().view.source.clone();
-            let vm_id = self.cx.script_ref_vm_id(&source).unwrap();
-            self.cx.with_script_vm_id(vm_id, |vm| {
-                (0..vm.bx.threads.len()).any(|index| vm.bx.threads.get(index).unwrap().is_paused())
-            })
-        })
-    }
-
-    fn settle_stock(&mut self, app: &WidgetRef, app_id: &str, audit: &mut StockAudit) {
-        let mut pending = VecDeque::from(self.process());
-        let mut idle_passes = 0;
-        for _ in 0..100 {
-            while let Some(ask) = pending.pop_front() {
-                match ask {
-                    BrokerAsk::PermissionBatch { app_id: subject, request, perms } => {
-                        assert_eq!(subject, app_id);
-                        self.answer_stock_batch(app, app_id, request, &perms, &perms, audit);
-                    }
-                    BrokerAsk::Prompt { app_id: subject, perm, request, .. } => {
-                        assert_eq!(subject, app_id);
-                        if !audit.prompts.contains(&perm) { audit.prompts.push(perm); }
-                        audit.concrete_prompts += 1;
-                        if perm == Permission::Network {
-                            self.permissions.allow_network(app_id, NetworkScope::ExactUrl("https://example.com/".into()),
-                                RoomScope::AllRooms, GrantDuration::RobrixSession, None).unwrap();
-                        }
-                        let mut requests = request.into_iter().collect::<Vec<_>>();
-                        let mut rest = VecDeque::new();
-                        while let Some(queued) = pending.pop_front() {
-                            match queued {
-                                BrokerAsk::Prompt { app_id: queued_app, perm: queued_perm, request, .. }
-                                    if queued_app == app_id && queued_perm == perm => requests.extend(request),
-                                other => rest.push_back(other),
-                            }
-                        }
-                        pending = rest;
-                        for request in &requests { self.grant_stock_request(app_id, perm, request); }
-                        // Publish all captured abilities before resuming any
-                        // callback, matching the host's coalesced prompt.
-                        self.publish_grants(app, app_id);
-                        for request in requests { pending.extend(self.dispatch(Some(request))); }
-                    }
-                    BrokerAsk::EnableWrites { request, app_id: subject, perm } => {
-                        assert_eq!(subject, app_id);
-                        audit.write_setups += 1;
-                        self.permissions.set_matrix_write(true);
-                        self.grant_stock_request(app_id, perm, &request);
-                        self.publish_grants(app, app_id);
-                        pending.extend(self.dispatch(Some(request)));
-                    }
-                    BrokerAsk::FlowReview { request, review } => {
-                        assert!(!review.allowed);
-                        audit.reviews += 1;
-                        self.flow.borrow_mut().approve_effect_session(&review, SharingDuration::RobrixSession).unwrap();
-                        pending.extend(self.dispatch(Some(request)));
-                    }
-                    BrokerAsk::Matrix { reply, capability, call, .. } => {
-                        audit.services.push(capability.into());
-                        audit.matrix_args.push(matrix_recipe(&call));
-                        let data = self.matrix_replies.get_mut(capability).and_then(VecDeque::pop_front).unwrap_or_else(|| matrix_fixture(&call));
-                        self.reply(reply, &data.to_string());
-                    }
-                    BrokerAsk::Network { reply, args, .. } => {
-                        audit.services.push("network.http".into());
-                        assert_eq!(args["url"], "https://example.com/");
-                        let context = self.contexts.get(&reply.heap_key).unwrap();
-                        self.flow.borrow_mut().add_influences(context, [Influence::InternetOrigin("https://example.com".into())]).unwrap();
-                        let body = self.network_bodies.pop_front().unwrap_or_else(|| "Example Domain fixture".into());
-                        self.reply(reply, &serde_json::json!({"status":200,"body":body,"headers":{}}).to_string());
-                    }
-                    BrokerAsk::Subscribe { reply, hook, .. } => {
-                        audit.subscriptions.push(hook.into());
-                        self.reply(reply, "{\"subscribed\":true}");
-                    }
-                    BrokerAsk::HostQuery { reply, query } => {
-                        let data = match query {
-                            services::HostQuery::Prefs => {
-                                audit.services.push("host.prefs".into());
-                                serde_json::json!({"view_mode":"desktop","view_mode_override":"auto","ui_zoom":1,"thumbnail_max_height":400,"send_on_enter":true,"show_read_receipts":true})
-                            }
-                            services::HostQuery::DeviceInfo => {
-                                audit.services.push("device.info".into());
-                                serde_json::json!({"platform":"test","os_version":"fixture","model":"Test device","locale":"en-US","time_zone":"UTC","utc_offset_minutes":0,"cpu_cores":4})
-                            }
-                        };
-                        self.reply(reply, &data.to_string());
-                    }
-                    BrokerAsk::HostAction { reply, action, .. } => {
-                        audit.actions.push(match action {
-                            HostAction::OpenRoom { .. } => "room", HostAction::JumpToEvent { .. } => "event",
-                            HostAction::OpenThread { .. } => "thread", HostAction::ShowUser { .. } => "user",
-                            HostAction::OpenSpace { .. } => "space", HostAction::ClosePane => "close",
-                            HostAction::SetSide { .. } => "side", HostAction::BreakOut => "break_out",
-                            HostAction::Minimize => "minimize", HostAction::Restore => "restore", _ => "host",
-                        }.into());
-                        self.reply(reply, "{}");
-                    }
-                    BrokerAsk::Notify { summary, .. } => audit.notifications.push(summary),
-                    BrokerAsk::BackgroundComplete { reply, run_id, success } => {
-                        audit.completions.push((run_id, success));
-                        self.reply(reply, "{}");
-                    }
-                    BrokerAsk::McpToolResult { reply, ok, text, .. } => {
-                        audit.tool_results.push((ok, text));
-                        self.reply(reply, "{}");
-                    }
-                    BrokerAsk::Used { .. } => {},
-                    BrokerAsk::Restrict { reason, .. } => panic!("{app_id} was restricted: {reason}"),
-                    _ => panic!("unexpected stock mini-app request"),
-                }
-                self.cx.with_vm_and_async(|_| {});
-                self.assert_callback_errors(app_id);
-            }
-            pending.extend(self.process());
-            if pending.is_empty() {
-                idle_passes += 1;
-                if idle_passes < 2 || self.stock_callbacks_paused() { continue; }
-                let failures = self.broker.failures();
-                assert!(failures.is_empty(), "{app_id} service failures: {:?}", failures.iter().map(|failure| &failure.error).collect::<Vec<_>>());
-                self.assert_callback_errors(app_id);
-                return;
-            }
-            idle_passes = 0;
-        }
-        panic!("{app_id} did not finish its callbacks");
-    }
-
-    fn boot(&mut self) {
-        let timers = std::mem::take(&mut self.cx.script_data.timers.timers);
-        for timer in timers {
-            if timer.repeat { self.cx.script_data.timers.timers.push(timer); continue; }
-            let hooks = self.cx.script_data.timers.dispatch_hooks.clone();
-            assert!(hooks.into_iter().any(|hook| hook(&mut self.cx, &timer, NIL)), "stock boot timer belongs to its isolate");
-        }
-        self.cx.with_vm_and_async(|_| {});
-        self.assert_callback_errors("boot");
-    }
-
-    fn reply(&mut self, reply: Reply, data: &str) {
-        if let Some(context) = self.contexts.get(&reply.heap_key) {
-            let mut sources = Vec::new();
-            if let Ok(value) = serde_json::from_str(data) { response_room_sources(&value, &mut sources); }
-            let influences = sources.iter().filter_map(|source| match source {
-                Source::Room { account, room } => Some(Influence::RoomContent { account: account.clone(), room: room.clone() }),
-                _ => None,
-            }).collect::<Vec<_>>();
-            self.flow.borrow_mut().add_sources(context, sources).unwrap();
-            self.flow.borrow_mut().add_influences(context, influences).unwrap();
-        }
-        services::respond(&mut self.cx, reply, Ok(data));
-        self.assert_callback_errors(&format!("reply {}", reply.req_id));
-        if let Some(app) = self.stock_hosts.iter().find(|app| app.borrow_mut::<Splash>().unwrap().isolate_heap_key(&mut self.cx) == Some(reply.heap_key)) {
-            let source = app.borrow::<Splash>().unwrap().view.source.clone();
-            let vm_id = self.cx.script_ref_vm_id(&source).unwrap();
-            self.cx.with_script_vm_id(vm_id, |vm| { vm.bx.captured_errors.get_or_insert_with(Vec::new); });
-        }
-    }
-
-    fn notifications(&mut self) -> Vec<String> {
-        self.process().into_iter().filter_map(|ask| match ask {
-            BrokerAsk::Notify { summary, .. } => Some(summary),
-            _ => None,
-        }).collect()
-    }
-
-    fn stop(&mut self, heap: usize) {
-        for splash in &mut self.splashes {
-            if splash.isolate_heap_key(&mut self.cx) == Some(heap) { splash.set_text(&mut self.cx, ""); }
-        }
-        if let Some(context) = self.contexts.remove(&heap) { self.flow.borrow_mut().remove_context(&context); }
-    }
-
-    fn retire_stock(&mut self, app: &WidgetRef, context: &ContextId) {
-        let heap = app.borrow_mut::<Splash>().unwrap().isolate_heap_key(&mut self.cx).unwrap();
-        app.set_text(&mut self.cx, "");
-        self.stock_hosts.retain(|host| host.widget_uid() != app.widget_uid());
-        self.contexts.remove(&heap);
-        self.panes.remove(&heap);
-        self.flow.borrow_mut().remove_context(context);
-        self.broker.forget_app(context.app().unwrap());
-    }
-}
-
-impl Drop for Harness {
-    fn drop(&mut self) {
-        for splash in &mut self.splashes { splash.set_text(&mut self.cx, ""); }
-        for host in &self.stock_hosts { host.set_text(&mut self.cx, ""); }
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
+include!("support/stock_harness.rs");
 
 #[test]
 fn headless_guest_startup_keeps_the_instruction_ceiling_and_reports_errors_immediately() {
@@ -704,156 +18,22 @@ fn headless_guest_startup_keeps_the_instruction_ceiling_and_reports_errors_immed
         "the actual Splash evaluator must report its instruction refusal at startup: {message}");
 }
 
-fn matrix_reply(asks: Vec<BrokerAsk>) -> Reply {
-    let mut response = None;
-    for ask in asks {
-        match ask {
-            BrokerAsk::Matrix { reply, .. } => { assert!(response.replace(reply).is_none(), "expected one Matrix request"); }
-            BrokerAsk::Used { .. } => {},
-            _ => panic!("unexpected request while awaiting Matrix service"),
-        }
-    }
-    response.expect("real broker accepted read")
+#[test]
+fn headless_replies_and_timers_keep_the_instruction_ceiling() {
+    let mut host = Harness::new();
+    let (heap, _) = host.launch("runaway-timer-fixture", false,
+        "let _tick = start_timeout(0.01, || { let total = 0\nfor i in 1000000 { total += i } })\nView{}");
+    assert_eq!(host.cx.script_data.timers.timers.first().expect("the guest's timer").callback.heap_key(), heap);
+    // Only the headless budget ends more than a second from now; the UI's ends after 64ms.
+    let second = ScriptRunBudget::from_durations(std::time::Duration::from_secs(1), std::time::Duration::from_secs(1), 512).hard_deadline;
+    let deadline = host.guest_work(heap, |cx| cx.with_vm(|vm| vm.bx.run_budget.as_ref().map(|budget| budget.hard_deadline)));
+    assert!(deadline.is_some_and(|deadline| deadline > second), "replies and timers run under the headless wall budget");
+    host.boot();
+    let vm_id = host.cx.script_ref_vm_id(&host.splashes[0].view.source).unwrap();
+    let errors = format!("{:?}", host.cx.with_script_vm_id_trusted(vm_id, |vm| vm.take_errors()));
+    assert!(errors.contains("script instruction limit exceeded"), "a runaway timer still stops: {errors}");
 }
 
-fn effect_review(asks: Vec<BrokerAsk>) -> (SplashHostRequest, a2app_core::information_flow::EffectReview) {
-    let mut response = None;
-    for ask in asks {
-        match ask {
-            BrokerAsk::FlowReview { request, review } => { assert!(response.replace((request, review)).is_none(), "expected one flow review"); }
-            BrokerAsk::Used { .. } => {},
-            _ => panic!("unexpected request while awaiting exact effect review"),
-        }
-    }
-    response.expect("real broker parked one exact effect")
-}
-
-fn stock_send(asks: Vec<BrokerAsk>) -> (Reply, String) {
-    let mut response = None;
-    for ask in asks {
-        match ask {
-            BrokerAsk::Matrix { reply, call: services::MatrixServiceCall::SendMessage { body }, .. } => {
-                assert!(response.replace((reply, body)).is_none(), "expected one stock post");
-            }
-            BrokerAsk::Used { .. } => {},
-            _ => panic!("unexpected request while awaiting stock post"),
-        }
-    }
-    response.expect("real broker accepted the stock post")
-}
-
-fn stock_network(asks: Vec<BrokerAsk>) -> (Reply, serde_json::Value) {
-    let mut response = None;
-    for ask in asks {
-        match ask {
-            BrokerAsk::Network { reply, args, .. } => {
-                assert!(response.replace((reply, args)).is_none(), "expected one stock HTTP request");
-            }
-            BrokerAsk::Used { .. } => {},
-            _ => panic!("unexpected request while awaiting stock HTTP"),
-        }
-    }
-    response.expect("real broker accepted stock HTTP")
-}
-
-fn stock_matrix_requests(host: &mut Harness, count: usize) -> Vec<(Reply, services::MatrixServiceCall)> {
-    let mut requests = Vec::new();
-    for _ in 0..20 {
-        for ask in host.process() {
-            match ask {
-                BrokerAsk::Matrix { reply, call, .. } => requests.push((reply, call)),
-                BrokerAsk::Used { .. } => {},
-                _ => panic!("unexpected request while awaiting stock Matrix reads"),
-            }
-        }
-        if requests.len() >= count {
-            assert_eq!(requests.len(), count);
-            return requests;
-        }
-    }
-    panic!("expected {count} stock Matrix reads, received {}", requests.len());
-}
-
-#[derive(Default)]
-struct StockAudit {
-    prompts: Vec<Permission>,
-    batch_prompts: usize,
-    concrete_prompts: usize,
-    reviews: usize,
-    services: Vec<String>,
-    subscriptions: Vec<String>,
-    actions: Vec<String>,
-    notifications: Vec<String>,
-    completions: Vec<(u64, bool)>,
-    write_setups: usize,
-    matrix_args: Vec<String>,
-    tool_results: Vec<(bool, String)>,
-}
-
-fn matrix_recipe(call: &services::MatrixServiceCall) -> String {
-    use services::MatrixServiceCall::*;
-    match call {
-        Join { room, .. } => format!("join:{room}"),
-        InviteRespond { room_id, accept } => format!("invite:{room_id}:{accept}"),
-        RoomFlag { flag, on } => format!("flag:{flag:?}:{on}"),
-        Search { scope, server, .. } => format!("search:{}:{server}", match scope {
-            services::SearchScope::Attached => "attached", services::SearchScope::AllJoined => "all", services::SearchScope::Rooms(_) => "picked",
-        }),
-        _ => String::new(),
-    }
-}
-
-fn matrix_fixture(call: &services::MatrixServiceCall) -> serde_json::Value {
-    use services::MatrixServiceCall::*;
-    let message = serde_json::json!({"event_id":"$message:test","room_id":ROOM,"room_name":"Private room","sender":"Alice","sender_id":"@alice:test","sender_name":"Alice","body":"release fixture","is_own":false,"ts":1720000000000_u64});
-    let room = serde_json::json!({"room_id":ROOM,"name":"Private room","topic":"Fixture topic","member_count":2,"is_space":false,"joined":true,"is_encrypted":true,"unread":2,"mentions":1,"favorite":false,"low_priority":false,"marked_unread":false});
-    match call {
-        RoomInfo | RoomsInfo { .. } => serde_json::json!({"room_id":ROOM,"room_name":"Private room","topic":"Fixture topic","member_count":2,"encrypted":true,"join_rule":"invite","history_visibility":"shared","alias":null}),
-        ReadMessages { .. } | RoomsMessages { .. } => serde_json::json!({"messages":[message]}),
-        Members { .. } => serde_json::json!({"count":1,"members":[{"name":"Alice","user_id":"@alice:test","power":0}]}),
-        PinnedEvents => serde_json::json!({"pinned":[message]}),
-        Threads { .. } => serde_json::json!({"threads":[message]}),
-        ThreadReplies { .. } => serde_json::json!({"root":message,"replies":[message]}),
-        OlderMessages { .. } => serde_json::json!({"messages":[],"has_more":false}),
-        Event { .. } => serde_json::json!({"body":"release fixture","reactions":[],"edited":false}),
-        ReadReceipts { .. } => serde_json::json!({"receipts":[{"name":"Alice","user_id":"@alice:test","event_id":"$message:test","ts":1720000000000_u64}]}),
-        Unread => serde_json::json!({"unread":2,"mentions":1,"marked_unread":false,"favorite":false,"low_priority":false}),
-        PowerLevels => serde_json::json!({"mine":100,"can":{"invite":true,"kick":true,"ban":true,"redact_others":true,"pin":true,"send_message":true,"notify_room":true,"change_settings":true}}),
-        Permalink { .. } => serde_json::json!({"url":"https://matrix.to/#/!private:test/$message:test"}),
-        Successor => serde_json::json!({"upgraded":false,"room_id":null}),
-        RoomsList | RoomsSearch { .. } => serde_json::json!({"rooms":[room]}),
-        Search { server, .. } => serde_json::json!({"results":[message],"server_used":server}),
-        Invites => serde_json::json!({"invites":[{"room_id":"!invite:test","name":"Invited room","inviter_name":"Alice","inviter":"@alice:test","is_space":false,"is_direct":false}]}),
-        RoomPreview { .. } => serde_json::json!({"name":"Preview room","topic":"Fixture topic","member_count":2,"join_rule":"public"}),
-        Spaces => serde_json::json!({"spaces":[{"space_id":"!space:test","name":"Test Space","topic":"Fixture topic","member_count":2}]}),
-        SpaceInfo { .. } => serde_json::json!({"children_count":1,"member_count":2,"join_rule":"invite","topic":"Fixture topic"}),
-        SpaceRooms { .. } => serde_json::json!({"rooms":[room]}),
-        Profile => serde_json::json!({"user_id":ACCOUNT,"display_name":"Owner"}),
-        UserProfile { user_id } => serde_json::json!({"user_id":user_id,"display_name":"Alice","has_avatar":false,"ignored":false}),
-        DmFind { .. } => serde_json::json!({"room_id":ROOM,"name":"Private room"}),
-        Device => serde_json::json!({"device_id":"TEST","name":"Test device","verified":true}),
-        AccountInfo => serde_json::json!({"user_id":ACCOUNT,"homeserver":"https://homeserver.test","account_management_url":"https://homeserver.test/account?tab=profile"}),
-        IgnoredUsers => serde_json::json!({"users":["@alice:test"]}),
-        Join { .. } => serde_json::json!({"knocked":false,"room_id":ROOM}),
-        _ => serde_json::json!({"event_id":"$posted:test","added":true}),
-    }
-}
-
-fn response_room_sources(value: &serde_json::Value, sources: &mut Vec<Source>) {
-    match value {
-        serde_json::Value::String(room) if room.starts_with('!') && room.contains(':') => {
-            sources.push(Source::Room { account: ACCOUNT.into(), room: room.clone() });
-        }
-        serde_json::Value::Array(values) => { for value in values { response_room_sources(value, sources); } }
-        serde_json::Value::Object(values) => {
-            for (key, value) in values {
-                if key.starts_with('!') && key.contains(':') { sources.push(Source::Room { account: ACCOUNT.into(), room: key.clone() }); }
-                response_room_sources(value, sources);
-            }
-        }
-        _ => {},
-    }
-}
 
 #[test]
 fn every_stock_app_runs_real_boot_and_finishes_parked_permission_callbacks() {
@@ -867,7 +47,7 @@ fn every_stock_app_finishes_its_primary_action_with_strict_permissions() {
 
 fn run_every_stock_app(strict: bool) {
     let stock = a2app_core::builtin::builtin_apps();
-    assert_eq!(stock.len(), 20);
+    assert_eq!(stock.len(), 23);
     for manifest in stock {
         let mut host = Harness::new();
         host.permissions.set_strict(strict);
@@ -926,6 +106,20 @@ fn run_every_stock_app(strict: bool) {
                 assert!(host.call(&app, "save_rule", &[]));
                 assert!(host.call_strings(&app, "on_room_message", &[r#"[{"room_id":"!private:test","event_id":"$message:test","sender":"alice","sender_id":"@alice:test","sender_name":"Alice","body":"release today","ts":1,"msgtype":"m.text","is_own":false}]"#]));
             }
+            "link-library" => {
+                assert!(host.call_strings(&app, "on_room_message", &[r#"[{"room_id":"!private:test","event_id":"$link:test","sender":"alice","sender_id":"@alice:test","sender_name":"Alice","body":"Notes: https://example.org/guide","ts":1720000000000,"msgtype":"m.text","is_own":false}]"#]));
+                assert!(host.call(&app, "select_row", &[0_u32.into()]));
+                assert!(host.call(&app, "show_in_chat", &[]));
+            }
+            "translator" => { assert!(host.call(&app, "set_live", &[true.into()])); }
+            "room-gallery" => {
+                host.queue_matrix_reply("matrix.room.event.read", serde_json::json!({"event_id":"$photo:test","room_id":ROOM,"sender":"alice","sender_id":"@alice:test","body":"cat.jpg","ts":1720000000000_u64,"msgtype":"m.image","media":{"uri":"mxc://media.test/cat","encrypted":false,"filename":"cat.jpg","mime_type":"image/jpeg","size":2048,"width":640,"height":480,"duration_ms":null},"edited":false,"reactions":[],"thread_root":null}));
+                assert!(host.call_strings(&app, "on_room_message", &[r#"[{"room_id":"!private:test","event_id":"$photo:test","sender":"alice","sender_id":"@alice:test","sender_name":"Alice","body":"cat.jpg","ts":1720000000000,"msgtype":"m.image","is_own":false}]"#]));
+                host.settle_stock(&app, &manifest.id, &mut audit);
+                assert!(host.call(&app, "open_tile", &[0_u32.into()]));
+                host.settle_stock(&app, &manifest.id, &mut audit);
+                assert!(host.call(&app, "show_in_chat", &[]));
+            }
             _ => {},
         }
         host.settle_stock(&app, &manifest.id, &mut audit);
@@ -933,8 +127,9 @@ fn run_every_stock_app(strict: bool) {
             "public-web" | "reminder" | "roll-call" | "search" => (0, 1),
             "website-watch" | "keyword-alert" => (0, 2),
             "room-info" => (0, 0),
-            "room-peek" | "room-members" | "room-threads" | "presence" => (2, 1),
-            "account" | "inspector" | "room-pins" | "room-tools" | "spaces" | "inbox" | "room-stats" | "watcher" | "simple-watcher" => (1, 1),
+            "room-peek" | "room-members" | "room-threads" | "presence" | "link-library" | "room-gallery" => (2, 1),
+            "account" | "inspector" | "room-pins" | "room-tools" | "spaces" | "inbox" | "room-stats" | "watcher" | "simple-watcher"
+                | "translator" => (1, 1),
             _ => (1, 0),
         };
         eprintln!("stock permission audit: {} strict={} initial={} action={} initial_reviews={} action_reviews={}",
@@ -943,8 +138,8 @@ fn run_every_stock_app(strict: bool) {
             "{} initial and primary-action permission groups: {:?}", manifest.id, audit.prompts);
         let expected_reviews = match manifest.id.as_str() {
             "room-peek" | "presence" | "room-stats" | "spaces" => (1, 1),
-            "room-threads" => (0, 2),
-            "room-members" | "room-pins" | "room-tools" | "inbox" | "account" => (0, 1),
+            "room-threads" | "room-gallery" => (0, 2),
+            "room-members" | "room-pins" | "room-tools" | "inbox" | "account" | "link-library" => (0, 1),
             _ => (0, 0),
         };
         assert_eq!((initial_reviews, audit.reviews - initial_reviews), expected_reviews,
@@ -958,6 +153,9 @@ fn run_every_stock_app(strict: bool) {
             assert_eq!(audit.notifications.len(), 2, "foreground setup and unattended match both report");
         } else if manifest.id != "inspector" {
             assert!(!audit.services.is_empty() || !audit.subscriptions.is_empty(), "{} must complete a real service path", manifest.id);
+        }
+        if matches!(manifest.id.as_str(), "link-library" | "room-gallery") {
+            assert_eq!(audit.actions, ["event"], "{} shows the tapped item's message in the chat", manifest.id);
         }
         // A grant to another app causes this same host hook in production.
         // Completed reads and subscriptions must not start again.
@@ -980,7 +178,7 @@ fn stock_spaces_loads_attached_space_after_its_environment_callback() {
     let mut audit = StockAudit::default();
     host.settle_stock(&app, "spaces", &mut audit);
     assert_eq!(audit.services, ["matrix.space.info.read", "matrix.space.rooms.list"]);
-    assert_eq!(app.widget(&host.cx, ids!(status)).text(), "1 room");
+    assert_eq!(app.widget(&host.cx, ids!(status)).text(), "1 room · 2 members · Invite only");
 }
 
 fn grouped_stock_startups() -> Vec<(&'static str, Vec<Permission>, Permission)> {
@@ -993,8 +191,11 @@ fn grouped_stock_startups() -> Vec<(&'static str, Vec<Permission>, Permission)> 
         ("room-pins", vec![MatrixRoomRead, MatrixRoomInfo], MatrixRoomRead),
         ("room-threads", vec![MatrixRoomRead, MatrixRoomWatch], MatrixRoomRead),
         ("room-peek", vec![MatrixRoomInfo, MatrixRoomRead, MatrixRoomWatch], MatrixRoomRead),
-        ("room-stats", vec![MatrixRoomRead, MatrixRoomInfo], MatrixRoomRead),
+        ("room-stats", vec![MatrixRoomRead, MatrixRoomInfo, DeviceInfo], MatrixRoomRead),
         ("room-tools", vec![MatrixRoomRead, MatrixRoomInfo], MatrixRoomRead),
+        ("link-library", vec![MatrixRoomRead, MatrixRoomWatch], MatrixRoomRead),
+        ("translator", vec![MatrixRoomRead, DeviceInfo], MatrixRoomRead),
+        ("room-gallery", vec![MatrixRoomRead, MatrixRoomWatch], MatrixRoomRead),
     ]
 }
 
@@ -1024,7 +225,7 @@ fn grouped_stock_startups_finish_a_denial_and_refresh_after_a_new_approval() {
         // The runtime separately tests trusted-input refusal clearing. This
         // VM fixture restores Ask to model that explicit retry's new snapshot.
         for permission in &perms { host.permissions.set(app_id, *permission, GrantState::Ask); }
-        host.widget_click(&app, "Refresh", &[]);
+        host.widget_click_any(&app, &["Ask again", "Refresh"], &[]);
         host.settle_stock(&app, app_id, &mut audit);
         assert!(!audit.services.is_empty(), "{app_id} must actually load its approved data");
         assert!(!host.stock_callbacks_paused());
@@ -1076,7 +277,9 @@ fn grouped_stock_startups_use_selected_reads_without_requesting_unselected_group
 
 #[test]
 fn other_stock_apps_finish_refusals_and_retry_from_visible_controls() {
-    for app_id in ["public-web", "website-watch", "reminder", "keyword-alert", "roll-call", "room-info", "search", "watcher", "spaces", "inbox"] {
+    for app_id in ["public-web", "website-watch", "reminder", "keyword-alert", "roll-call", "room-info", "search", "watcher", "spaces", "inbox",
+        "link-library", "translator", "room-gallery"]
+    {
         let mut host = Harness::new();
         host.permissions.set_strict(true);
         let (app, _) = host.launch_stock_permissions(app_id, false, false);
@@ -1084,14 +287,17 @@ fn other_stock_apps_finish_refusals_and_retry_from_visible_controls() {
         host.boot();
         let control = match app_id {
             "public-web" => "Fetch example.com",
-            "website-watch" => "Test saved website and report",
-            "reminder" => "Test saved reminder",
-            "keyword-alert" => "Set up and test saved keyword",
+            "website-watch" => "Test report",
+            "reminder" => "Test reminder",
+            "keyword-alert" => "Test alert",
             "roll-call" => { assert!(host.call(&app, "roll", &[])); "Post to room" }
+            // A refused first load shows only the empty state's retry.
+            "room-info" => "Ask again",
             "search" => { app.text_input(&host.cx, ids!(q)).set_text(&mut host.cx, "release"); "Search" }
+            "link-library" => "Ask again",
             _ => "Refresh",
         };
-        if !matches!(app_id, "room-info" | "watcher" | "spaces" | "inbox") { host.widget_click(&app, control, &[]); }
+        if !matches!(app_id, "room-info" | "watcher" | "spaces" | "inbox" | "room-gallery" | "link-library") { host.widget_click(&app, control, &[]); }
         assert!(host.deny_stock_pending(&app, app_id) > 0, "{app_id} exposes its first needed permission");
         assert!(!host.stock_callbacks_paused(), "{app_id} refusal finishes the original callback");
         let failures = host.broker.failures();
@@ -1101,7 +307,8 @@ fn other_stock_apps_finish_refusals_and_retry_from_visible_controls() {
         for ask in host.process() { assert!(matches!(ask, BrokerAsk::Used { .. }), "{app_id} cannot automatically retry a denied request"); }
         let declared = host.apps.get(app_id).unwrap().permissions.clone();
         for permission in declared { host.permissions.set(app_id, Permission::from_str(&permission).unwrap(), GrantState::Ask); }
-        host.widget_click(&app, control, &[]);
+        // Public Web's refusal card retries from its Ask again button.
+        host.widget_click(&app, if app_id == "public-web" { "Ask again" } else { control }, &[]);
         let mut audit = StockAudit::default();
         host.settle_stock(&app, app_id, &mut audit);
         assert!(!host.stock_callbacks_paused());
@@ -1212,7 +419,7 @@ fn stock_space_selection_ignores_replies_from_earlier_visits() {
         host.reply(reply, &data);
         host.settle_stock(&app, "spaces", &mut StockAudit::default());
         assert_eq!(app.widget(&host.cx, ids!(space_topic)).text(), "current visit");
-        assert_eq!(app.widget(&host.cx, ids!(status)).text(), "2 rooms", "stale space replies must not replace the current visit");
+        assert_eq!(app.widget(&host.cx, ids!(status)).text(), "2 rooms · 2 members · Invite only", "stale space replies must not replace the current visit");
     }
     host.settle_stock(&app, "spaces", &mut StockAudit::default());
 }
@@ -1360,6 +567,21 @@ fn stock_simple_watcher_saves_without_write_permission_and_tests_only_the_select
 }
 
 #[test]
+fn stock_simple_watcher_matches_rows_without_a_display_name() {
+    let mut host = Harness::new();
+    let (app, _) = host.launch_stock_permissions("simple-watcher", false, false);
+    host.boot();
+    let mut audit = StockAudit::default();
+    host.settle_stock(&app, "simple-watcher", &mut audit);
+    app.text_input(&host.cx, ids!(keyword_input)).set_text(&mut host.cx, "release");
+    assert!(host.call(&app, "add_rule", &[]));
+    // A row without sender_name used to be a script error; the short sender stands in.
+    assert!(host.call_strings(&app, "on_room_message", &[r#"[{"event_id":"$message:test","sender":"alice","body":"release today","is_own":false}]"#]));
+    host.settle_stock(&app, "simple-watcher", &mut audit);
+    assert_eq!(audit.notifications, ["Simple Watcher: release: alice: release today"]);
+}
+
+#[test]
 fn stock_watcher_saves_without_write_permission_and_tests_only_the_selected_rule_actions() {
     let mut host = Harness::new();
     let (app, context) = host.launch_stock_permissions("watcher", false, false);
@@ -1436,18 +658,18 @@ fn stock_watcher_disclosure_toggles_choices_and_tracks_advanced_rule_edits() {
     assert!(has_text(&header, "Advanced filters"));
     assert!(!opened(&mut host, &app));
     assert!(host.call_index_text(&app, "open_menu", 0, "field"));
-    assert!(!has_text(&app, "   Message type"));
+    assert!(!has_text(&app, "Message type"));
     let control = app.widget(&host.cx, ids!(adv_btn.disclosure_control));
     host.widget_callback(&app, &control, id!(on_click), &[]);
     assert!(opened(&mut host, &app));
     assert!(host.call_index_text(&app, "open_menu", 0, "field"));
-    assert!(has_text(&app, "   Message type"));
+    assert!(has_text(&app, "Message type"));
     let control = app.widget(&host.cx, ids!(adv_btn.disclosure_control));
     host.widget_callback(&app, &control, id!(on_click), &[]);
     assert!(!opened(&mut host, &app));
-    assert!(!has_text(&app, "   Message type"), "closing the disclosure also closes the active menu");
+    assert!(!has_text(&app, "Message type"), "closing the disclosure also closes the active menu");
     assert!(host.call_index_text(&app, "open_menu", 0, "field"));
-    assert!(!has_text(&app, "   Message type"));
+    assert!(!has_text(&app, "Message type"));
     assert!(host.call_object(&app, "restore", r#"{"match":"all","filters":[{"field":"type","op":"is","value":"m.image"}],"notify":true,"reply":""}"#));
     assert!(host.call(&app, "edit_rule", &[0_u32.into()]));
     assert!(opened(&mut host, &app), "editing an advanced saved rule synchronizes the triangle");
@@ -1534,11 +756,11 @@ fn stock_watcher_filters_combine_any_all_and_negation_and_the_ai_adds_notify_onl
     assert_eq!(saved[2]["match"], "any");
     assert_eq!(saved[2]["by_ai"], true);
     assert!(host.call(&app, "edit_rule", &[2_u32.into()]));
-    assert_eq!(app.widget(&host.cx, ids!(match_btn)).text(), "any ▼");
+    assert_eq!(app.widget(&host.cx, ids!(match_btn)).text(), "any");
     assert!(host.call(&app, "toggle_match", &[]));
-    assert_eq!(app.widget(&host.cx, ids!(match_btn)).text(), "all ▼");
+    assert_eq!(app.widget(&host.cx, ids!(match_btn)).text(), "all");
     assert!(host.call(&app, "toggle_match", &[]));
-    assert_eq!(app.widget(&host.cx, ids!(match_btn)).text(), "any ▼");
+    assert_eq!(app.widget(&host.cx, ids!(match_btn)).text(), "any");
     assert!(host.call(&app, "clear_editor", &[]));
 
     let batch = r#"[
@@ -1564,6 +786,203 @@ fn stock_watcher_filters_combine_any_all_and_negation_and_the_ai_adds_notify_onl
         format!("Watcher: {ai}: Bob: slides: https://example.org/talk"),
         "Watcher: Message contains “lunch”: Bob: Lunch at noon?".to_string(),
     ]);
+}
+
+#[test]
+fn stock_watcher_advanced_filters_match_words_mentions_lists_patterns_attachments_and_sites() {
+    let mut host = Harness::new();
+    let (app, context) = host.launch_stock("watcher", false);
+    host.boot();
+    let mut audit = StockAudit::default();
+    host.settle_stock(&app, "watcher", &mut audit);
+    let rules = [
+        r#"{"match":"all","filters":[{"field":"text","op":"none_of","value":"lunch, coffee"},{"field":"text","op":"word","value":"bug"}],"notify":true,"reply":""}"#,
+        r#"{"match":"all","filters":[{"field":"text","op":"mentions","value":"@kevin"},{"field":"sender","op":"none_of","value":"Build Bot, @ci:test"}],"notify":true,"reply":""}"#,
+        r#"{"match":"all","filters":[{"field":"text","op":"ends_with","value":"?"},{"field":"sender","op":"any_of","value":"alice, @bob:test"}],"notify":true,"reply":""}"#,
+        r#"{"match":"all","filters":[{"field":"text","op":"pattern","value":"deploy * to prod"}],"notify":true,"reply":""}"#,
+        r#"{"match":"any","filters":[{"field":"type","op":"is","value":"media"},{"field":"link","op":"to","value":"https://www.github.com/robius"}],"notify":true,"reply":""}"#,
+        r#"{"match":"all","filters":[{"field":"type","op":"is_not","value":"media"},{"field":"type","op":"is","value":"m.location"}],"notify":true,"reply":""}"#,
+    ];
+    for rule in rules { assert!(host.call_object(&app, "restore", rule)); }
+    assert!(host.call(&app, "save", &[]));
+    let rules_path = host.flow.borrow().context_storage_path(&context).unwrap().join("rules.json");
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&rules_path).unwrap()).unwrap();
+    assert_eq!(saved.as_array().unwrap().len(), rules.len(), "every advanced rule passes validation");
+    assert_eq!(saved[4]["filters"][1]["value"], "github.com", "a link filter keeps just the site");
+
+    let batch = r#"[
+        {"event_id":"$1:test","sender_id":"@alice:test","sender_name":"Alice","body":"Found a bug in the login flow","msgtype":"m.text","is_own":false},
+        {"event_id":"$2:test","sender_id":"@alice:test","sender_name":"Alice","body":"a bug in the lunch order","msgtype":"m.text","is_own":false},
+        {"event_id":"$3:test","sender_id":"@priya:test","sender_name":"Priya","body":"@kevin can you look at this","msgtype":"m.text","is_own":false},
+        {"event_id":"$4:test","sender_id":"@ci:test","sender_name":"Build Bot","body":"kevin: nightly failed","msgtype":"m.notice","is_own":false},
+        {"event_id":"$5:test","sender_id":"@bob:test","sender_name":"Bob","body":"Is the release ready?","msgtype":"m.text","is_own":false},
+        {"event_id":"$6:test","sender_id":"@carol:test","sender_name":"Carol","body":"Shall we deploy v2 to prod tonight","msgtype":"m.text","is_own":false},
+        {"event_id":"$7:test","sender_id":"@dan:test","sender_name":"Dan","body":"screenshot.png","msgtype":"m.image","is_own":false},
+        {"event_id":"$8:test","sender_id":"@dan:test","sender_name":"Dan","body":"PR: https://github.com/robius/robrix/pull/12","msgtype":"m.text","is_own":false},
+        {"event_id":"$9:test","sender_id":"@dan:test","sender_name":"Dan","body":"mirror at https://notgithub.com/x","msgtype":"m.text","is_own":false},
+        {"event_id":"$10:test","sender_id":"@dan:test","sender_name":"Dan","body":"Meet here","msgtype":"m.location","is_own":false},
+        {"event_id":"$11:test","sender_id":"@eve:test","sender_name":"Eve","body":"Is this a debug build?","msgtype":"m.text","is_own":false}
+    ]"#;
+    assert!(host.call_strings(&app, "on_room_message", &[batch]));
+    for _ in 0..10 {
+        host.settle_stock(&app, "watcher", &mut audit);
+        host.boot(); // Watcher paces its automatic notifications with a timer.
+    }
+    host.settle_stock(&app, "watcher", &mut audit);
+    let sites = "Message type is any attachment or Link goes to “github.com”";
+    assert_eq!(audit.notifications, [
+        "Watcher: Message contains none of “lunch, coffee” and Message has the word “bug”: Alice: Found a bug in the login flow".to_string(),
+        "Watcher: Message mentions “@kevin” and Sender is none of “Build Bot, @ci:test”: Priya: @kevin can you look at this".to_string(),
+        "Watcher: Message ends with “?” and Sender is any of “alice, @bob:test”: Bob: Is the release ready?".to_string(),
+        "Watcher: Message matches pattern “deploy * to prod”: Carol: Shall we deploy v2 to prod tonight".to_string(),
+        format!("Watcher: {sites}: Dan: screenshot.png"),
+        format!("Watcher: {sites}: Dan: PR: https://github.com/robius/robrix/pull/12"),
+        "Watcher: Message type is not any attachment and Message type is location: Dan: Meet here".to_string(),
+    ]);
+
+}
+
+#[test]
+fn stock_watcher_editor_resets_and_validates_advanced_filters_and_the_ai_gets_each_reason() {
+    let mut host = Harness::new();
+    let (app, context) = host.launch_stock("watcher", false);
+    host.boot();
+    let mut audit = StockAudit::default();
+    host.settle_stock(&app, "watcher", &mut audit);
+    // Changing a filter's field resets its operator and value.
+    assert!(host.call(&app, "set_advanced", &[true.into()]));
+    assert!(host.call_index_text(&app, "set_value", 0, "stale"));
+    assert!(host.call_index_text(&app, "open_menu", 0, "field"));
+    assert!(host.call_strings(&app, "choose", &["link"]));
+    assert!(host.call(&app, "save_rule", &[]));
+    assert!(host.call_index_text(&app, "open_menu", 0, "field"));
+    assert!(host.call_strings(&app, "choose", &["type"]));
+    assert!(host.call(&app, "save_rule", &[]));
+    let rules_path = host.flow.borrow().context_storage_path(&context).unwrap().join("rules.json");
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&rules_path).unwrap()).unwrap();
+    assert_eq!(saved[0]["filters"][0], serde_json::json!({"field": "link", "op": "has", "value": ""}));
+    assert_eq!(saved[1]["filters"][0], serde_json::json!({"field": "type", "op": "is", "value": "m.notice"}));
+    // Each advanced operator's own check, through the editor's Save rule.
+    assert!(host.call(&app, "set_advanced", &[true.into()]));
+    for (field, op, value, reason) in [
+        ("text", "pattern", " * ", "Add some text around the * in the pattern."),
+        ("link", "to", "not a site", "Enter a site, like github.com."),
+        ("text", "mentions", "@", "Enter a name to look for."),
+        ("text", "none_of", " , ", "List words, separated by commas."),
+        ("sender", "any_of", ",", "List names, separated by commas."),
+    ] {
+        assert!(host.call_index_text(&app, "open_menu", 0, "field"));
+        assert!(host.call_strings(&app, "choose", &[field]));
+        assert!(host.call_index_text(&app, "open_menu", 0, "op"));
+        assert!(host.call_strings(&app, "choose", &[op]));
+        assert!(host.call_index_text(&app, "set_value", 0, value));
+        assert!(host.call(&app, "save_rule", &[]));
+        assert_eq!(app.widget(&host.cx, ids!(status)).text(), format!("Rule not saved: {reason}"), "{field} {op}");
+    }
+    // The AI may use the new operators, and hears why a filter is refused.
+    let calls = [
+        r#"{"field":"sender","op":"any_of","value":"alice, bob"}"#,
+        r#"{"field":"type","op":"is","value":"m.sticker"}"#,
+    ];
+    for (id, filter) in calls.iter().enumerate() {
+        let call = format!(r#"{{"call_id":{id},"tool":"app_watcher_add_rule","name":"add_rule","arguments":{{"match":"all","filters":[{filter}]}}}}"#);
+        assert!(host.call_strings(&app, "on_tool_call", &[&call]));
+        host.settle_stock(&app, "watcher", &mut audit);
+    }
+    assert_eq!(audit.tool_results.len(), 2);
+    assert!(audit.tool_results[0].0 && audit.tool_results[0].1.contains("Sender is any of “alice, bob”"), "{:?}", audit.tool_results);
+    assert_eq!(audit.tool_results[1], (false, "Rule not added: Choose a message type.".to_string()));
+    assert!(audit.notifications.is_empty());
+}
+
+#[test]
+fn stock_watcher_mentions_replies_and_threads_match_whether_or_not_the_host_sends_them() {
+    let mut host = Harness::new();
+    let (app, _) = host.launch_stock("watcher", false);
+    host.boot();
+    let mut audit = StockAudit::default();
+    host.settle_stock(&app, "watcher", &mut audit);
+    for rule in [
+        r#"{"match":"all","filters":[{"field":"text","op":"mentions_me"}],"notify":true,"reply":""}"#,
+        r#"{"match":"all","filters":[{"field":"text","op":"is_reply"},{"field":"sender","op":"is","value":"alice"}],"notify":true,"reply":""}"#,
+        r#"{"match":"any","filters":[{"field":"text","op":"in_thread"},{"field":"text","op":"contains","value":"urgent"}],"notify":true,"reply":""}"#,
+        r#"{"match":"all","filters":[{"field":"text","op":"not_reply"},{"field":"text","op":"not_thread"},{"field":"text","op":"contains","value":"standup"}],"notify":true,"reply":""}"#,
+    ] { assert!(host.call_object(&app, "restore", rule)); }
+    // Rows from older hosts omit the new fields: missing means false or null.
+    let batch = r#"[
+        {"event_id":"$1:test","sender_id":"@alice:test","sender_name":"Alice","body":"hey kevin, quick question","msgtype":"m.text","is_own":false,"mentions_me":true,"reply_to":null,"thread_root":null},
+        {"event_id":"$2:test","sender_id":"@alice:test","sender_name":"Alice","body":"sounds good","msgtype":"m.text","is_own":false,"mentions_me":false,"reply_to":"$1:test","thread_root":null},
+        {"event_id":"$3:test","sender_id":"@bob:test","sender_name":"Bob","body":"thread notes","msgtype":"m.text","is_own":false,"mentions_me":false,"reply_to":null,"thread_root":"$root:test"},
+        {"event_id":"$4:test","sender_id":"@bob:test","sender_name":"Bob","body":"standup at 10","msgtype":"m.text","is_own":false},
+        {"event_id":"$5:test","sender_id":"@bob:test","sender_name":"Bob","body":"urgent: prod is down","msgtype":"m.text","is_own":false},
+        {"event_id":"$6:test","sender_id":"@carol:test","sender_name":"Carol","body":"standup moved","msgtype":"m.text","is_own":false,"reply_to":"$4:test"},
+        {"event_id":"$7:test","sender_id":"@alice:test","sender_name":"Alice","body":"replying in the thread","msgtype":"m.text","is_own":false,"reply_to":"$3:test","thread_root":"$root:test"}
+    ]"#;
+    assert!(host.call_strings(&app, "on_room_message", &[batch]));
+    for _ in 0..10 {
+        host.settle_stock(&app, "watcher", &mut audit);
+        host.boot(); // Watcher paces its automatic notifications with a timer.
+    }
+    host.settle_stock(&app, "watcher", &mut audit);
+    let reply = "Message is a reply and Sender is “alice”";
+    let thread = "Message is in a thread or Message contains “urgent”";
+    assert_eq!(audit.notifications, [
+        "Watcher: Message mentions me: Alice: hey kevin, quick question".to_string(),
+        format!("Watcher: {reply}: Alice: sounds good"),
+        format!("Watcher: {thread}: Bob: thread notes"),
+        "Watcher: Message isn't a reply and Message isn't in a thread and Message contains “standup”: Bob: standup at 10".to_string(),
+        format!("Watcher: {thread}: Bob: urgent: prod is down"),
+        format!("Watcher: {reply}: Alice: replying in the thread"),
+        format!("Watcher: {thread}: Alice: replying in the thread"),
+    ]);
+}
+
+#[test]
+fn stock_watcher_offers_mentions_me_by_default_and_the_ai_adds_reply_and_thread_rules() {
+    let mut host = Harness::new();
+    let (app, context) = host.launch_stock("watcher", false);
+    host.boot();
+    let mut audit = StockAudit::default();
+    host.settle_stock(&app, "watcher", &mut audit);
+    fn has_text(widget: &WidgetRef, text: &str) -> bool {
+        if widget.text() == text { return true; }
+        let mut children = Vec::new();
+        widget.children(&mut |_, child| children.push(child));
+        children.iter().any(|child| has_text(child, text))
+    }
+    // "mentions me" is a basic choice; replies and threads wait for Advanced.
+    assert!(host.call_index_text(&app, "open_menu", 0, "op"));
+    assert!(has_text(&app, "mentions me"));
+    assert!(!has_text(&app, "is a reply"));
+    assert!(host.call_strings(&app, "choose", &["mentions_me"]));
+    assert!(host.call_index_text(&app, "set_value", 0, "stray text"));
+    assert!(host.call(&app, "save_rule", &[]));
+    assert!(host.call(&app, "set_advanced", &[true.into()]));
+    assert!(host.call_index_text(&app, "open_menu", 0, "op"));
+    assert!(has_text(&app, "is a reply") && has_text(&app, "isn't in a thread"));
+
+    let good = r#"{"call_id":1,"tool":"app_watcher_add_rule","name":"add_rule","arguments":{"match":"any","filters":[{"field":"text","op":"is_reply","value":"ignored"},{"field":"text","op":"in_thread"}]}}"#;
+    let bad = r#"{"call_id":2,"tool":"app_watcher_add_rule","name":"add_rule","arguments":{"match":"all","filters":[{"field":"sender","op":"in_thread"}]}}"#;
+    for call in [good, bad] {
+        assert!(host.call_strings(&app, "on_tool_call", &[call]));
+        host.settle_stock(&app, "watcher", &mut audit);
+    }
+    assert_eq!(audit.tool_results.len(), 2);
+    assert!(audit.tool_results[0].0 && audit.tool_results[0].1.contains("Message is a reply or Message is in a thread"), "{:?}", audit.tool_results);
+    assert_eq!(audit.tool_results[1], (false, "Rule not added: Sender can't use “in_thread”.".to_string()));
+    let rules_path = host.flow.borrow().context_storage_path(&context).unwrap().join("rules.json");
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(rules_path).unwrap()).unwrap();
+    assert_eq!(saved[0]["filters"][0], serde_json::json!({"field": "text", "op": "mentions_me", "value": ""}), "value-less filters keep no stray text");
+    assert_eq!(saved[1]["filters"][0], serde_json::json!({"field": "text", "op": "is_reply", "value": ""}));
+    assert_eq!(saved[1]["by_ai"], true);
+
+    let batch = r#"[
+        {"event_id":"$1:test","sender_id":"@bob:test","sender_name":"Bob","body":"top-level note","msgtype":"m.text","is_own":false},
+        {"event_id":"$2:test","sender_id":"@bob:test","sender_name":"Bob","body":"in the thread","msgtype":"m.text","is_own":false,"mentions_me":false,"reply_to":null,"thread_root":"$1:test"}
+    ]"#;
+    assert!(host.call_strings(&app, "on_room_message", &[batch]));
+    host.settle_stock(&app, "watcher", &mut audit);
+    assert_eq!(audit.notifications, ["Watcher: Message is a reply or Message is in a thread: Bob: in the thread"]);
 }
 
 #[test]
@@ -1622,7 +1041,7 @@ fn stock_website_room_reports_and_keyword_empty_batches_finish_without_prompt_lo
     assert_eq!(audit.services, ["network.http", "matrix.room.message.send"]);
     assert!(audit.completions.is_empty());
     assert_eq!(audit.write_setups, 1);
-    assert_eq!(app.widget(&host.cx, ids!(status)).text(), "Test report posted to this room.");
+    assert_eq!(app.widget(&host.cx, ids!(status)).text(), "Keyword found. Test report posted to this room.");
     let grants = (audit.prompts.len(), audit.reviews, audit.write_setups);
     app.borrow_mut::<Splash>().unwrap().set_host_prompts(&mut host.cx, false);
     // A real scheduled check occurs after the setup rate budget refills.
@@ -1769,7 +1188,8 @@ fn stock_spaces_unjoined_room_join_and_knock_finish_and_reuse_their_grants() {
         host.settle_stock(&app, "spaces", &mut audit);
         assert!(host.call(&app, "tap_item", &[0_u32.into()]));
         host.settle_stock(&app, "spaces", &mut audit);
-        assert_eq!(app.widget(&host.cx, ids!(preview_line)).text(), "2 members · Fixture topic · public");
+        assert_eq!(app.widget(&host.cx, ids!(preview_line)).text(), "2 members · Public");
+        assert_eq!(app.widget(&host.cx, ids!(preview_topic)).text(), "Fixture topic");
         host.broker.forget_app("spaces");
         assert!(host.call(&app, "join_room", &[]));
         host.settle_stock(&app, "spaces", &mut audit);
@@ -1868,7 +1288,8 @@ fn stock_inspector_pane_controls_finish_and_reuse_their_control_grant() {
     assert!(host.call_strings(&app, "pane_call", &["ui.pane.close"]));
     host.settle_stock(&app, "inspector", &mut audit);
     assert_eq!(audit.actions, ["side", "side", "side", "side", "break_out", "minimize", "restore", "minimize", "restore", "close"]);
-    assert_eq!(app.widget(&host.cx, ids!(pane_state)).text(), "foreground yes");
+    assert_eq!(app.widget(&host.cx, ids!(pane_state)).text(), "On screen · 460 × 700");
+    assert_eq!(app.widget(&host.cx, ids!(pane_err)).text(), "", "every pane control succeeded");
     assert_eq!((audit.prompts.len(), audit.reviews, audit.write_setups), grants);
 }
 
@@ -1893,6 +1314,38 @@ fn stock_search_all_rooms_and_server_variants_finish_and_reuse_their_read_grant(
         }
     }
     assert_eq!(audit.services.iter().filter(|service| service.as_str() == "matrix.rooms.messages.search").count(), 4);
+}
+
+#[test]
+fn stock_room_stats_search_and_room_tools_show_sender_names_or_fall_back_to_the_localpart() {
+    fn shows(root: &WidgetRef, text: &str) -> bool {
+        if root.text() == text { return true; }
+        let mut children = Vec::new();
+        root.children(&mut |_, child| children.push(child));
+        children.iter().any(|child| shows(child, text))
+    }
+    // Older hosts omit sender_name, so the second row must fall back to its localpart.
+    let named = serde_json::json!({"event_id":"$named:test","room_id":ROOM,"room_name":"Private room","sender":"alice","sender_id":"@alice:test","sender_name":"Alice Liddell","body":"release named","ts":1720000000000_u64});
+    let plain = serde_json::json!({"event_id":"$plain:test","room_id":ROOM,"room_name":"Private room","sender":"bob","sender_id":"@bob:test","body":"release plain","ts":1720000060000_u64});
+    for (app_id, capability, data, expected) in [
+        ("room-stats", "matrix.room.messages.read", serde_json::json!({"messages":[named.clone(), plain.clone()]}), ["Alice Liddell", "bob"]),
+        ("room-tools", "matrix.room.messages.read", serde_json::json!({"messages":[named.clone(), plain.clone()]}), ["Alice Liddell", "bob"]),
+        ("search", "matrix.rooms.messages.search", serde_json::json!({"results":[named.clone(), plain.clone()],"server_used":false}),
+            ["Alice Liddell · Private room", "bob · Private room"]),
+    ] {
+        let mut host = Harness::new();
+        host.queue_matrix_reply(capability, data);
+        let (app, _) = host.launch_stock_permissions(app_id, false, false);
+        host.boot();
+        let mut audit = StockAudit::default();
+        host.settle_stock(&app, app_id, &mut audit);
+        if app_id == "search" {
+            assert!(host.call_strings(&app, "set_mode", &["all"]));
+            assert!(host.call_strings(&app, "run_search", &["release"]));
+            host.settle_stock(&app, app_id, &mut audit);
+        }
+        for name in expected { assert!(shows(&app, name), "{app_id} shows {name}"); }
+    }
 }
 
 #[test]
@@ -1968,6 +1421,38 @@ fn stock_account_management_reviews_the_browser_origin_and_finishes_its_original
 }
 
 #[test]
+fn stock_account_lookup_of_an_unknown_user_hides_its_dm_line() {
+    let mut host = Harness::new();
+    let (app, _) = host.launch_stock("account", false);
+    host.boot();
+    let mut audit = StockAudit::default();
+    host.settle_stock(&app, "account", &mut audit);
+    assert!(host.call_strings(&app, "lookup", &["@nobody:test"]));
+    let (mut profile, mut dm) = (None, None);
+    for _ in 0..4 {
+        let mut pending: VecDeque<_> = host.process().into();
+        while let Some(ask) = pending.pop_front() { match ask {
+            BrokerAsk::Matrix { reply, call: services::MatrixServiceCall::UserProfile { .. }, .. } => profile = Some(reply),
+            BrokerAsk::Matrix { reply, call: services::MatrixServiceCall::DmFind { .. }, .. } => dm = Some(reply),
+            BrokerAsk::FlowReview { request, review } => {
+                host.flow.borrow_mut().approve_effect_session(&review, SharingDuration::RobrixSession).unwrap();
+                pending.extend(host.dispatch(Some(request)));
+            }
+            BrokerAsk::Used { .. } => {},
+            _ => panic!("unexpected account lookup request"),
+        } }
+        if profile.is_some() && dm.is_some() { break; }
+    }
+    // The empty DM answer lands first; the profile's "not found" must still hide it.
+    host.reply(dm.expect("the lookup checks for a DM"), r#"{"room_id":null,"name":null}"#);
+    let profile = profile.expect("the lookup reads the profile");
+    host.guest_work(profile.heap_key, |cx| services::respond(cx, profile, Err("M_NOT_FOUND: Profile was not found")));
+    host.settle_stock(&app, "account", &mut audit);
+    assert_eq!(app.widget(&host.cx, ids!(lookup_err)).text(), "No one with that user id was found.");
+    assert!(!app.widget(&host.cx, ids!(result_wrap)).visible(), "an unknown user gets no \"No direct message\" card");
+}
+
+#[test]
 fn stock_website_test_explains_malformed_saved_urls_before_requesting_permission() {
     for invalid in ["example.com", "https://alice:secret@example.com/", "ftp://example.com/"] {
         let mut host = Harness::new();
@@ -1992,7 +1477,7 @@ fn stock_website_test_explains_malformed_saved_urls_before_requesting_permission
         assert_eq!(audit.services, ["network.http"]);
         assert_eq!(audit.notifications.len(), 1);
         assert!(audit.completions.is_empty());
-        assert_eq!(app.widget(&host.cx, ids!(status)).text(), "Test report shown in a Robrix popup.");
+        assert_eq!(app.widget(&host.cx, ids!(status)).text(), "Keyword found. Test report shown in a Robrix popup.");
     }
 }
 
@@ -2018,7 +1503,9 @@ fn stock_room_tools_captures_exact_clipboard_contents_for_review_before_native_w
     // here would overwrite the developer's clipboard from a test.
     host.reply(Reply { heap_key: request.heap_key, req_id: request.req_id }, "{}");
     host.cx.with_vm_and_async(|_| {});
-    assert_eq!(app.widget(&host.cx, ids!(status)).text(), "Copied https://matrix.to/#/!private:test/$message:test");
+    let args: serde_json::Value = serde_json::from_str(&request.args_json).unwrap();
+    assert_eq!(args["text"], "https://matrix.to/#/!private:test/$message:test");
+    assert_eq!(app.widget(&host.cx, ids!(status)).text(), "Latest message link copied.");
 }
 
 #[test]
@@ -2029,12 +1516,19 @@ fn stock_live_apps_resubscribe_after_revocation_and_regrant_without_prompting_ag
         ("presence", Permission::MatrixRoomWatch), ("watcher", Permission::MatrixRoomWatch),
         ("simple-watcher", Permission::MatrixRoomWatch),
         ("inbox", Permission::MatrixRoomsList), ("inspector", Permission::RobrixObserve),
+        ("link-library", Permission::MatrixRoomWatch), ("room-gallery", Permission::MatrixRoomWatch),
+        ("translator", Permission::MatrixRoomWatch),
     ] {
         let mut host = Harness::new();
         let (app, _) = host.launch_stock(app_id, false);
         host.boot();
         let mut audit = StockAudit::default();
         host.settle_stock(&app, app_id, &mut audit);
+        if app_id == "translator" {
+            // Live translation is off by default; its toggle adds the hook.
+            assert!(host.call(&app, "set_live", &[true.into()]));
+            host.settle_stock(&app, app_id, &mut audit);
+        }
         let hooks = audit.subscriptions.clone();
         assert!(!hooks.is_empty());
         host.permissions.set(app_id, permission, GrantState::Denied);
@@ -2295,13 +1789,15 @@ fn stock_roll_call_posts_dice_without_private_profile_reads_or_action_review() {
     host.cx.with_vm_and_async(|_| {});
     let dice = dice_label.text();
     let total = total_label.text();
-    assert!(dice.contains("●"));
-    assert!(total.starts_with("total "));
+    // The dice label shows the faces ("3 + 5"), the total label their sum.
+    let faces = dice.split(" + ").map(|face| face.parse::<u32>().unwrap()).collect::<Vec<_>>();
+    assert!(faces.len() == 2 && faces.iter().all(|face| (1..=6).contains(face)), "{dice}");
+    assert_eq!(total.parse::<u32>().unwrap(), faces[0] + faces[1]);
     assert!(app.borrow_mut::<Splash>().unwrap().call_script_fn(&mut host.cx, id!(post), &[]));
     host.cx.with_vm_and_async(|_| {});
     let (reply, body) = stock_send(host.process());
     assert!(body.starts_with("🎲 Rolled "));
-    assert!(body.ends_with(total.strip_prefix("total ").unwrap()));
+    assert!(body.ends_with(&format!("{dice} = {total}")));
     assert!(host.flow.borrow().labels(&context).unwrap().is_empty());
     assert!(host.flow.borrow().influences(&context).unwrap().is_empty());
     host.reply(reply, "{}");
@@ -2664,6 +2160,64 @@ fn stock_room_peek_sends_picked_media_only_from_its_explicit_send_control() {
 }
 
 #[test]
+fn stock_room_peek_names_senders_by_display_name_with_a_localpart_fallback() {
+    fn has_text(widget: &WidgetRef, text: &str) -> bool {
+        if widget.text() == text { return true; }
+        let mut children = Vec::new();
+        widget.children(&mut |_, child| children.push(child));
+        children.iter().any(|child| has_text(child, text))
+    }
+    let mut host = Harness::new();
+    let (app, _) = host.launch_stock("room-peek", false);
+    // Current hosts add each row's room display name; older hosts send only the localpart.
+    host.queue_matrix_reply("matrix.room.messages.read", serde_json::json!({"messages": [
+        {"event_id": "$named:test", "room_id": ROOM, "sender": "priya", "sender_id": "@priya:test", "sender_name": "Priya Shah",
+            "body": "named row", "ts": 1720000000000_u64, "msgtype": "m.text"},
+        {"event_id": "$plain:test", "room_id": ROOM, "sender": "diego", "sender_id": "@diego:test",
+            "body": "plain row", "ts": 1720000060000_u64, "msgtype": "m.text"},
+    ]}));
+    host.boot();
+    host.settle_stock(&app, "room-peek", &mut StockAudit::default());
+    for text in ["named row", "Priya Shah", "P", "plain row", "diego", "D"] {
+        assert!(has_text(&app, text), "room peek's message list shows {text:?}");
+    }
+    assert!(!has_text(&app, "priya"), "a display name replaces the localpart");
+}
+
+#[test]
+fn stock_room_peek_without_a_room_explains_itself_instead_of_offering_its_composer() {
+    let mut host = Harness::new();
+    let (app, _) = host.launch_stock("room-peek", false);
+    host.boot();
+    // Every room read fails the way the host refuses a pane opened without a room.
+    let mut pending = VecDeque::from(host.process());
+    for _ in 0..20 {
+        while let Some(ask) = pending.pop_front() {
+            match ask {
+                BrokerAsk::Matrix { reply, .. } => {
+                    host.guest_work(reply.heap_key, |cx| services::respond(cx, reply, Err("this mini-app is not attached to a room")));
+                    host.cx.with_vm_and_async(|_| {});
+                    host.assert_callback_errors("room-peek");
+                }
+                BrokerAsk::FlowReview { request, review } => {
+                    host.flow.borrow_mut().approve_effect_session(&review, SharingDuration::RobrixSession).unwrap();
+                    pending.extend(host.dispatch(Some(request)));
+                }
+                BrokerAsk::Subscribe { reply, .. } => host.reply(reply, r#"{"subscribed":true}"#),
+                BrokerAsk::Used { .. } => {},
+                _ => panic!("unexpected room peek request without a room"),
+            }
+        }
+        pending.extend(host.process());
+        if pending.is_empty() { break; }
+    }
+    assert!(app.widget(&host.cx, ids!(no_room_wrap)).visible(), "the no-room card explains what to do");
+    assert!(!app.widget(&host.cx, ids!(head_row)).visible(), "the header doesn't show the host's raw refusal");
+    assert!(!app.widget(&host.cx, ids!(compose_wrap)).visible(), "drafting and sending need a room");
+    assert!(visible_control(&app, "Send now").is_none());
+}
+
+#[test]
 fn stock_roll_call_drafts_results_while_direct_posting_is_denied() {
     let mut host = Harness::new();
     let (app, _) = host.launch_stock("roll-call", false);
@@ -2725,7 +2279,7 @@ fn stock_watcher_drafts_leave_fetching_watching_and_automatic_sending_denied() {
         host.cx.with_vm_and_async(|_| {});
         let expected = if app_id == "website-watch" {
             "Test report drafted. Review and send it in Robrix. The website was not checked."
-        } else { "Reply drafted. Review and send it in Robrix. Automatic sending is unchanged." };
+        } else { "Reply drafted. Review and send it in Robrix." };
         assert_eq!(app.widget(&host.cx, ids!(status)).text(), expected);
         assert!(host.process().is_empty(), "draft completion must not enqueue automatic work");
         assert!(!host.permissions.matrix_write());

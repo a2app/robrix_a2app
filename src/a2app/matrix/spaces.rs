@@ -13,7 +13,7 @@ use matrix_sdk_ui::spaces::room_list::SpaceRoomListPaginationState;
 use super::rooms::room_name;
 use crate::sliding_sync::get_client;
 use a2app_core::permissions::RoomAccess;
-use super::policy::{ensure_room_access, room_access_allowed};
+use super::policy::{ensure_room_access, room_access_allowed, space_child_access_allowed};
 
 /// A complete, host-only ancestry snapshot. Failures never mark a partial
 /// graph complete: unknown membership stays blocked by space deny rules.
@@ -203,9 +203,9 @@ pub(crate) async fn info(space_id: OwnedRoomId) -> Result<String, String> {
         .map(|children| children.iter()
             .filter(|c| match c.deserialize() {
                 Ok(SyncOrStrippedState::Sync(SyncStateEvent::Original(event))) =>
-                    !event.content.via.is_empty() && room_access_allowed(event.state_key.as_str(), RoomAccess::Read),
+                    !event.content.via.is_empty() && space_child_access_allowed(event.state_key.as_str()),
                 Ok(SyncOrStrippedState::Stripped(event)) =>
-                    event.content.via.as_ref().is_some_and(|via| !via.is_empty()) && room_access_allowed(event.state_key.as_str(), RoomAccess::Read),
+                    event.content.via.as_ref().is_some_and(|via| !via.is_empty()) && space_child_access_allowed(event.state_key.as_str()),
                 _ => false,
             })
             .count())
@@ -251,7 +251,7 @@ pub(crate) async fn rooms(space_id: OwnedRoomId) -> Result<String, String> {
         }
     }
     let out: Vec<serde_json::Value> = list.rooms().await.into_iter()
-        .filter(|room| room_access_allowed(room.room_id.as_str(), RoomAccess::Read))
+        .filter(|room| space_child_access_allowed(room.room_id.as_str()))
         .take(200)
         .map(|r| serde_json::json!({
             "room_id": r.room_id,

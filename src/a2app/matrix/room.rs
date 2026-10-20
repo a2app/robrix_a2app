@@ -27,7 +27,8 @@ fn as_message(event: &TimelineEvent) -> Option<OriginalSyncRoomMessageEvent> {
 /// wrote — a truncated body makes it report that the tool cut the message.
 const SERVICE_BODY_CLIP: usize = 500;
 
-/// The `{sender, sender_id, event_id, body, ts, msgtype, media}` shape every message list carries.
+/// The `{sender, sender_id, event_id, body, ts, msgtype, media}` shape every message list carries;
+/// services then add `sender_name` with [`add_sender_names`].
 ///
 /// `full_body` keeps the whole message text; only the mini-app services clip
 /// (to `SERVICE_BODY_CLIP`), so a scripted reader does not have to guard
@@ -46,6 +47,24 @@ fn message_json(msg: &OriginalSyncRoomMessageEvent, full_body: bool) -> serde_js
         "msgtype": msg.content.msgtype(),
         "media": media_json(&msg.content.msgtype),
     })
+}
+
+/// Adds each row's `sender_name` from the room's cached members, without network requests.
+pub(super) async fn add_sender_names(room: &matrix_sdk::Room, rows: &mut [serde_json::Value]) {
+    let sender_id = |row: &serde_json::Value| row["sender_id"].as_str().and_then(|id| OwnedUserId::try_from(id).ok());
+    let mut senders: Vec<OwnedUserId> = rows.iter().filter_map(sender_id).collect();
+    senders.sort();
+    senders.dedup();
+    let mut names: HashMap<OwnedUserId, String> = HashMap::new();
+    for user_id in senders {
+        let name = crate::a2app::room_watch::member_name(room, &user_id).await;
+        names.insert(user_id, name);
+    }
+    for row in rows.iter_mut() {
+        if let Some(name) = sender_id(row).and_then(|id| names.get(&id).cloned()) {
+            row["sender_name"] = name.into();
+        }
+    }
 }
 
 /// Attachment discovery never returns decryption keys. An agent can request
@@ -152,9 +171,12 @@ pub(super) async fn thread_replies(room_id: OwnedRoomId, event_id: OwnedEventId,
     let mut replies: Vec<OriginalSyncRoomMessageEvent> = related.iter().filter_map(as_message).collect();
     replies.sort_by_key(|m| m.origin_server_ts);
     let newest = replies.len().saturating_sub(limit as usize);
-    let replies: Vec<serde_json::Value> = replies[newest..].iter().map(|m| message_json(m, false)).collect();
+    let mut replies: Vec<serde_json::Value> = replies[newest..].iter().map(|m| message_json(m, false)).collect();
+    let mut root = as_message(&root).map(|m| message_json(&m, false));
+    add_sender_names(&room, &mut replies).await;
+    if let Some(root) = root.as_mut() { add_sender_names(&room, std::slice::from_mut(root)).await; }
     Ok(serde_json::json!({
-        "root": as_message(&root).map(|m| message_json(&m, false)),
+        "root": root,
         "replies": replies,
     }).to_string())
 }
@@ -216,6 +238,7 @@ pub(crate) async fn older_messages(room_id: OwnedRoomId, before: Option<OwnedEve
     out.truncate(limit);
     // Both endpoints answer newest-first; apps read oldest-first.
     out.reverse();
+    add_sender_names(&room, &mut out).await;
     Ok(serde_json::json!({ "messages": out, "has_more": has_more }).to_string())
 }
 
@@ -271,6 +294,7 @@ pub(super) async fn event(room_id: OwnedRoomId, event_id: OwnedEventId) -> Resul
         Some(Relation::Thread(thread)) => serde_json::json!(thread.event_id),
         _ => serde_json::Value::Null,
     };
+    add_sender_names(&room, std::slice::from_mut(&mut out)).await;
     Ok(out.to_string())
 }
 
@@ -530,6 +554,7 @@ pub(crate) async fn read_messages(room_id: matrix_sdk::ruma::OwnedRoomId, limit:
     }
     // Backward pagination is newest-first; apps read oldest-first.
     out.reverse();
+    add_sender_names(&room, &mut out).await;
     Ok(serde_json::json!({ "messages": out, "unread_count": room.num_unread_messages() }).to_string())
 }
 

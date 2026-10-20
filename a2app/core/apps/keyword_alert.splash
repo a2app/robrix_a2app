@@ -10,11 +10,45 @@
 let keyword = "release"
 let initialized = false
 let test_pending = false
-let status = "Ready. Configure and run this app from Background tasks."
+let how_open = false
+// The status line's text and tone (0 neutral, 1 success, 2 error); drawn once the pane exists.
+let status = ""
+let tone = 0
+let upper = {a: "A" b: "B" c: "C" d: "D" e: "E" f: "F" g: "G" h: "H" i: "I" j: "J" k: "K" l: "L" m: "M" n: "N" o: "O" p: "P" q: "Q" r: "R" s: "S" t: "T" u: "U" v: "V" w: "W" x: "X" y: "Y" z: "Z"}
 
-fn show_status(text){
+fn paint_status(){
+    ui.status.set_text(status)
+    ui.status_ok.set_text(status)
+    ui.status_err.set_text(status)
+    ui.status_wrap.set_visible(status != "" && tone == 0)
+    ui.status_ok_wrap.set_visible(status != "" && tone == 1)
+    ui.status_err_wrap.set_visible(status != "" && tone == 2)
+}
+
+// Host errors read as sentences: a capital first letter and a final period.
+fn sentence(text){
+    let chars = text.split("")
+    if chars.len() < 3 { return text }
+    let up = upper[chars[1]]
+    if up == nil { up = chars[1] }
+    let out = up + text.strip_prefix(chars[1])
+    let last = chars[chars.len() - 2]
+    if last != "." && last != "!" && last != "?" { out = out + "." }
+    return out
+}
+
+// A refused or missing popup grant says how to allow it.
+fn error_text(error){
+    if error.search("denied") >= 0 || error.search("not approved") >= 0 || error.search("needs approval") >= 0 {
+        return "Alerts aren't allowed yet. Tap Test alert to allow them."
+    }
+    return sentence(error)
+}
+
+fn show_status(text, next_tone){
     status = text
-    if initialized { ui.status.set_text(text) }
+    tone = next_tone
+    if initialized { paint_status() }
 }
 
 fn load(){
@@ -26,13 +60,11 @@ fn load(){
 
 fn save(){
     let next = ui.keyword_input.text().trim()
-    if next == "" || next.len() > 100 {
-        show_status("Enter a keyword between 1 and 100 characters.")
-        return nil
-    }
+    if next == "" { show_status("Enter a keyword first.", 2) return nil }
+    if next.len() > 100 { show_status("Use a keyword of up to 100 characters.", 2) return nil }
     keyword = next
     fs.write("/keyword.txt", keyword)
-    show_status("Saved. Choose New room messages in Mini Apps > Background tasks for this room.")
+    show_status("Saved. Turn it on in Mini Apps > Background tasks.", 1)
 }
 
 fn on_background(json){
@@ -46,21 +78,25 @@ fn on_background(json){
         }
     }
     if count == 0 {
-        show_status("No new messages matched '" + keyword + "'.")
+        show_status("No new message mentioned “" + keyword + "”.", 0)
         host.request("background.complete", {run_id: trigger.run_id, success: true})
         return nil
     }
-    host.request("notify.post", {title: "Keyword Alert", body: "'" + keyword + "' matched " + count + " new messages."}, fn(r){
-        if r.is_ok { show_status("Match reported.") } else { show_status(r.error) }
+    let matches = "" + count + " new messages"
+    if count == 1 { matches = "1 new message" }
+    host.request("notify.post", {title: "Keyword Alert", body: "'" + keyword + "' matched " + matches + "."}, fn(r){
+        if r.is_ok { show_status(matches + " mentioned “" + keyword + "”. Alert shown.", 1) } else { show_status(error_text(r.error), 2) }
         host.request("background.complete", {run_id: trigger.run_id, success: r.is_ok})
     })
 }
 
-fn show_test(test_keyword){
+fn show_test(test_keyword, edited){
     host.request("notify.post", {title: "Keyword Alert", body: "Test alert for '" + test_keyword + "'."}, fn(out){
         test_pending = false
-        if out.is_ok { show_status("Test alert shown for '" + test_keyword + "'.") }
-        else { show_status(out.error) }
+        if !out.is_ok { show_status(error_text(out.error), 2) return nil }
+        if edited { show_status("Tested your saved keyword “" + test_keyword + "”. Tap Save to use your edit.", 0) return nil }
+        show_status("Test alert shown for “" + test_keyword + "”.", 1)
+        return nil
     })
 }
 
@@ -68,38 +104,107 @@ fn test_alert(){
     if test_pending { return nil }
     test_pending = true
     let test_keyword = keyword
-    if host.has("on_room_message") { show_test(test_keyword) return nil }
+    // Tests always use the saved keyword; the status says so when the field differs.
+    let edited = initialized && ui.keyword_input.text().trim() != keyword
+    if host.has("on_room_message") { show_test(test_keyword, edited) return nil }
     host.request("permissions.request", {perms: ["matrix-room-watch"], retry: true}, fn(r){
-        if !r.is_ok { test_pending = false show_status(r.error) return nil }
+        if !r.is_ok { test_pending = false show_status(sentence(r.error), 2) return nil }
         if r.data.permissions["matrix-room-watch"] != true || !host.has("on_room_message") {
             test_pending = false
-            show_status("Room message watching was not allowed. Test again when you want to enable alerts.")
+            show_status("Room watching wasn't allowed. Tap Test alert to ask again.", 2)
             return nil
         }
-        show_test(test_keyword)
+        show_test(test_keyword, edited)
     })
 }
 
+fn toggle_how(){
+    how_open = !how_open
+    ui.how_body.set_visible(how_open)
+    ui.how_button.set_text(if how_open { "How it works ▲" } else { "How it works ▼" })
+}
+
 fn on_app_resize(width, height){
-    if initialized { return nil }
-    initialized = true
-    ui.status.set_text(status)
-    ui.keyword_input.set_text(keyword)
+    if !initialized {
+        initialized = true
+        ui.keyword_input.set_text(keyword)
+        paint_status()
+    }
+    return nil
 }
 
 let _load = load()
 
+let PrimaryButton = Button{
+    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
+    draw_bg +: {
+        border_size: 0.0 border_radius: 4.0
+        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+}
+let NeutralButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
+        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+}
+let GhostButton = PrimaryButton{
+    padding: Inset{left: 6 right: 6 top: 4 bottom: 4}
+    margin: Inset{left: -6}
+    draw_bg +: { border_size: 0.0 color: #xFFFFFF00 color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF00 }
+    draw_text +: { color: #x66708F color_hover: #x1C274C color_down: #x1C274C color_focus: #x66708F }
+}
+let Field = TextInput{
+    width: Fill height: Fit padding: 10
+    draw_bg +: {
+        border_radius: 4.0 border_size: 1.0
+        color: #xFFFFFF color_hover: #xFFFFFF color_focus: #xFFFFFF color_down: #xFFFFFF color_empty: #xFFFFFF
+        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_focus: #x106fcc border_color_down: #x106fcc border_color_empty: #xC8C8C8
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #x333333 color_hover: #x333333 color_focus: #x333333 color_down: #x333333 color_empty: #xBBBBBB color_empty_hover: #x999999 color_empty_focus: #x999999 text_style: theme.font_regular{font_size: 11} }
+}
+let Caption = Label{padding: 0 margin: 0 draw_text +: {color: #x66708F text_style: theme.font_bold{font_size: 9.5}}}
+let Hint = Label{width: Fill padding: 0 margin: 0 draw_text +: {color: #x66708F text_style: theme.font_regular{font_size: 10}}}
+let Dot = Label{text: "•" padding: 0 margin: 0 draw_text +: {color: #x66708F text_style: theme.font_regular{font_size: 10}}}
+let Divider = SolidView{width: Fill{max: 480} height: 1 draw_bg +: {color: #x00000018}}
+
 View{
     width: Fill height: Fill flow: Down
     ScrollYView{
-        width: Fill height: Fill flow: Down spacing: 12 padding: 16
-        Label{text: "Keyword Alert" width: Fill draw_text +: {color: #x1C274C text_style: theme.font_bold{font_size: 20}}}
-        Label{text: "Watch for a project release, an incident tag, or any literal case-sensitive phrase. Your own messages are ignored. One popup summarizes each matching batch." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 12}}}
-        keyword_input := TextInput{width: Fill empty_text: "release"}
-        Button{text: "Save keyword" on_click: || save()}
-        Button{text: "Set up and test saved keyword" on_click: || test_alert()}
-        status := Label{text: "Default keyword: release. Enable New room messages in Background tasks for this same room." width: Fill draw_text +: {color: #xD9822B text_style: theme.font_regular{font_size: 12}}}
-        Label{text: "Save a keyword, then set up and test alerts. Approve room watching and notifications. Until this room closes permits alerts while this room stays open; closing it expires that approval. Choose Until you quit Robrix or Forever for scheduled alerts after closing the room. Saved tasks cannot renew expired permissions." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
-        Label{text: "Uses new messages delivered by Robrix's live room timeline, with bounded message previews. It does not replay offline history, edits or messages dropped while a run is busy. Read protection and notification permissions always apply." width: Fill draw_text +: {color: #x445566 text_style: theme.font_regular{font_size: 11}}}
+        width: Fill height: Fill flow: Down spacing: 12 padding: 14
+        Hint{text: "Pops up an alert when a new message here contains your keyword."}
+        View{
+            width: Fill{max: 480} height: Fit flow: Down spacing: 6
+            Caption{text: "KEYWORD"}
+            keyword_input := Field{empty_text: "e.g. release"}
+            Hint{text: "Case-sensitive. Your own messages don't count."}
+        }
+        View{
+            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
+            PrimaryButton{text: "Save" on_click: || save()}
+            NeutralButton{text: "Test alert" on_click: || test_alert()}
+        }
+        status_wrap := View{
+            visible: false width: Fill{max: 480} height: Fit
+            status := Hint{text: ""}
+        }
+        status_ok_wrap := View{
+            visible: false width: Fill{max: 480} height: Fit
+            status_ok := Hint{text: "" draw_text +: {color: #x138808}}
+        }
+        status_err_wrap := View{
+            visible: false width: Fill{max: 480} height: Fit
+            status_err := Hint{text: "" draw_text +: {color: #xDC0005}}
+        }
+        Divider{}
+        how_button := GhostButton{text: "How it works ▼" on_click: || toggle_how()}
+        how_body := View{
+            visible: false width: Fill{max: 480} height: Fit flow: Down spacing: 6
+            View{width: Fill height: Fit spacing: 6 Dot{} Hint{text: "Tap Test alert and allow access “Until you quit Robrix” or “Forever”."}}
+            View{width: Fill height: Fit spacing: 6 Dot{} Hint{text: "Then turn it on in Mini Apps > Background tasks: pick “When new room messages arrive”."}}
+            View{width: Fill height: Fit spacing: 6 Dot{} Hint{text: "Only new messages count, not history or edits. One popup per batch."}}
+        }
     }
 }

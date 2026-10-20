@@ -348,7 +348,7 @@ pub const CATALOG: &[Capability] = &[
     // ----- matrix-room-invite -----
     cap!("matrix.room.invite.send", "Invite someone", "Invite a user to the attached room as you; the user id is shown on every prompt.", Write, Outgoing, Room, Some(P::MatrixRoomInvite), RefusedBySwitch, High, ["matrix.invite"]),
     // ----- matrix-media -----
-    cap!("matrix.media.download", "Read an attachment", "Read an image, audio clip, video, or file from an approved room using the same room and space read rules as messages. Matrix downloads use your homeserver.", Read, Outgoing, Room, Some(P::MatrixMedia), Available, High, ["matrix.download_media"]),
+    cap!("matrix.media.download", "Read an attachment", "Read an image, audio clip, video, or file from an approved room using the same room and space read rules as messages. Matrix downloads use your homeserver.", Read, Outgoing, Room, Some(P::MatrixMedia), Available, High, ["matrix.download_media", "matrix.media_preview"]),
     cap!("matrix.media.save", "Download to disk", "Save an attachment from the attached room to Downloads with host progress UI.", Act, Outgoing, Room, Some(P::MatrixMedia), PlannedMachinery, Medium, []),
     cap!("matrix.media.share", "Share an attachment", "Hand a room attachment to the system share sheet.", Act, Outgoing, Room, Some(P::MatrixMedia), PlannedMachinery, Medium, []),
     cap!("matrix.media.avatar.read", "Avatars", "A member's or the room's avatar thumbnail.", Read, Outgoing, Room, Some(P::MatrixMedia), PlannedMachinery, Low, []),
@@ -548,7 +548,9 @@ mod tests {
         }
         assert!(by_id("matrix.media.upload").unwrap().wire.is_empty(), "upload is a prerequisite rather than a separate mini-app service");
         assert_eq!(for_service("matrix.send_media").unwrap().id, "matrix.media.send");
-        assert_eq!(for_service("matrix.download_media").unwrap().id, "matrix.media.download");
+        for service in ["matrix.download_media", "matrix.media_preview"] {
+            assert_eq!(for_service(service).unwrap().id, "matrix.media.download", "a preview needs the download's grant and contract");
+        }
         for id in ["host.composer.insert", "host.composer.attach", "host.composer.reply_to"] {
             let contract = by_id(id).unwrap().flow_contract().unwrap();
             assert_eq!(contract.source, FlowSource::None);

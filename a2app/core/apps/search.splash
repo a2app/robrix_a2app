@@ -8,6 +8,59 @@
 // why-matrix-rooms-read: Searches messages across the rooms you pick.
 // why-robrix-navigation: Jumps to a result you tap.
 
+let PrimaryButton = Button{
+    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
+    draw_bg +: {
+        border_size: 0.0 border_radius: 4.0
+        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+}
+let NeutralButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
+        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+}
+let Field = TextInput{
+    width: Fill height: Fit padding: 10
+    draw_bg +: {
+        border_radius: 4.0 border_size: 1.0
+        color: #xFFFFFF color_hover: #xFFFFFF color_focus: #xFFFFFF color_down: #xFFFFFF color_empty: #xFFFFFF
+        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_focus: #x106fcc border_color_down: #x106fcc border_color_empty: #xC8C8C8
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #x333333 color_hover: #x333333 color_focus: #x333333 color_down: #x333333 color_empty: #xBBBBBB color_empty_hover: #x999999 color_empty_focus: #x999999 text_style: theme.font_regular{font_size: 11} }
+}
+// Chips: both variants are declared and the matching one is shown.
+let ChipOff = Button{
+    padding: Inset{left: 10 right: 10 top: 5 bottom: 5}
+    draw_bg +: {
+        border_size: 1.0 border_radius: 12.0
+        color: #xFFFFFF color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF
+        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_down: #x0f88fe border_color_focus: #xC8C8C8
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C text_style: theme.font_regular{font_size: 10} }
+}
+let ChipOn = ChipOff{
+    draw_bg +: {
+        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        border_color: #x0f88fe border_color_hover: #x106fcc border_color_down: #x0C5DAA border_color_focus: #x0f88fe
+    }
+    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF }
+}
+// Robrix's own settings switch: blue track and white knob when on.
+let Switch = ToggleFlat{
+    draw_bg +: {
+        size: 18.0
+        color: #xE3E3E3 color_hover: #xC8C8C8 color_active: #x0f88fe color_focus: #xE3E3E3 color_down: #x106fcc color_disabled: #xE3E3E3
+        border_color: #xC8C8C8 border_color_hover: #xC8C8C8 border_color_active: #x106fcc border_color_focus: #xC8C8C8 border_color_down: #x106fcc
+        mark_color: #x333333 mark_color_hover: #x333333 mark_color_active: #xFFFFFF mark_color_disabled: #xB3B3B3
+    }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_active: #x1C274C color_focus: #x1C274C color_down: #x1C274C text_style: theme.font_regular{font_size: 10} }
+}
+
 let rooms_loading = false
 let rooms_loaded = false
 
@@ -16,23 +69,84 @@ let attached = false
 let server = false
 let rooms = []
 let rooms_line = "Loading rooms…"
+let rooms_failed = false
 let picked = []
 let results = []
+let rows = []
+let room_rows = []
 let searched = false
+let is_searching = false
+let search_error = ""
 let search_request = 0
+let is_tiny = false
+let is_narrow = false
 
-fn mode_label(m, text){
-    if mode == m { return "● " + text }
-    return "○ " + text
+let upper = {a: "A" b: "B" c: "C" d: "D" e: "E" f: "F" g: "G" h: "H" i: "I" j: "J" k: "K" l: "L" m: "M" n: "N" o: "O" p: "P" q: "Q" r: "R" s: "S" t: "T" u: "U" v: "V" w: "W" x: "X" y: "Y" z: "Z"}
+
+// "room not joined" -> "Room not joined."
+fn sentence(text){
+    let t = "" + text
+    let chars = t.split("")
+    if chars.len() < 3 { return t }
+    let first = chars[1]
+    let up = upper[first]
+    if up == nil { up = first }
+    let out = up + t.strip_prefix(first)
+    let last = chars[chars.len() - 2]
+    if last != "." && last != "!" && last != "?" { out = out + "." }
+    return out
+}
+
+// The avatar letter: the name's first character, skipping a leading "@" or "#".
+fn initial(name){
+    let chars = ("" + name).split("")
+    if chars.len() < 3 { return "?" }
+    let c = chars[1]
+    if (c == "@" || c == "#") && chars.len() > 3 { c = chars[2] }
+    let up = upper[c]
+    if up != nil { c = up }
+    return c
+}
+
+fn plural(n, word){
+    if "" + n == "1" { return word }
+    return word + "s"
+}
+
+fn ago(ts){
+    if !ts.is_number() || ts <= 0 { return "" }
+    let s = time_now() - ts / 1000.0
+    if s < 60.0 { return "Just now" }
+    if s < 3600.0 { return "" + floor(s / 60.0) + "m ago" }
+    if s < 86400.0 { return "" + floor(s / 3600.0) + "h ago" }
+    if s < 172800.0 { return "Yesterday" }
+    if s < 604800.0 { return "" + floor(s / 86400.0) + "d ago" }
+    if s < 2592000.0 { return "" + floor(s / 604800.0) + "w ago" }
+    if s < 31536000.0 { return "" + floor(s / 2592000.0) + "mo ago" }
+    return "" + floor(s / 31536000.0) + "y ago"
+}
+
+// One status line: note (gray) or err (red); "" hides it. `status` always holds the text.
+fn say(kind, text){
+    ui.status.set_text(text)
+    ui.status_err.set_text(text)
+    ui.note_wrap.set_visible(kind == "note")
+    ui.err_wrap.set_visible(kind == "err")
+    return nil
 }
 
 fn sync_mode(){
-    ui.mode_room.set_text(mode_label("room", "This room"))
-    ui.mode_all.set_text(mode_label("all", "All rooms"))
-    ui.mode_pick.set_text(mode_label("pick", "Pick rooms"))
-    ui.mode_room.set_visible(attached)
+    ui.room_chip.set_visible(attached)
+    ui.room_on.set_visible(mode == "room")
+    ui.room_off.set_visible(mode != "room")
+    ui.all_on.set_visible(mode == "all")
+    ui.all_off.set_visible(mode != "all")
+    ui.pick_on.set_visible(mode == "pick")
+    ui.pick_off.set_visible(mode != "pick")
     ui.room_list_wrap.set_visible(mode == "pick")
     if mode == "pick" && !rooms_loaded { load_rooms() }
+    show_rooms()
+    show_results()
 }
 
 fn set_mode(m){
@@ -43,21 +157,26 @@ fn set_mode(m){
 fn load_rooms(){
     if rooms_loading { return nil }
     rooms_loading = true
+    rooms_failed = false
     rooms_line = "Loading rooms…"
-    ui.room_list.render()
+    show_rooms()
     host.request("matrix.rooms_list", nil, fn(r){
         rooms_loading = false
         rooms_loaded = r.is_ok
         rooms = []
         if r.is_ok {
             for it in r.data.rooms {
-                if !it.is_space { rooms.push(it) }
+                if it["is_space"] != true { rooms.push(it) }
             }
             if rooms.len() == 0 { rooms_line = "No rooms to pick from." }
+        } elif is_denial(r.error) {
+            rooms_failed = true
+            rooms_line = "Listing your rooms isn't allowed. Tap Pick rooms to ask again."
         } else {
-            rooms_line = r.error
+            rooms_failed = true
+            rooms_line = "Couldn't list your rooms: " + sentence(r.error) + " Tap Pick rooms to try again."
         }
-        ui.room_list.render()
+        show_rooms()
     })
 }
 
@@ -68,12 +187,37 @@ fn is_picked(id){
     return false
 }
 
-fn mode_label_room(it){
-    let mark = "○ "
-    if is_picked(it.room_id) { mark = "● " }
-    let lock = ""
-    if it.is_encrypted { lock = "  🔒" }
-    return mark + it.name + lock
+fn show_rooms(){
+    room_rows = []
+    for it in rooms {
+        let bg = #xFFFFFF
+        let edge = #xE3E8F0
+        let mark = "○"
+        let mark_c = #x66708F
+        if is_picked(it.room_id) {
+            bg = #xE4EEFF
+            edge = #x0f88fe
+            mark = "●"
+            mark_c = #x0f88fe
+        }
+        let lock = ""
+        if it["is_encrypted"] == true { lock = "🔒" }
+        room_rows.push({name: "" + it.name initial: initial(it.name) lock: lock mark: mark mark_c: mark_c bg: bg edge: edge})
+    }
+    let count = "Tap rooms to include them"
+    // Narrow panes keep the caption's row for the caption alone.
+    if rooms.len() == 0 || is_narrow { count = "" }
+    if picked.len() > 0 { count = "" + picked.len() + " selected" }
+    ui.picked_count.set_text(count)
+    ui.rooms_note.set_text(rooms_line)
+    ui.rooms_err.set_text(rooms_line)
+    ui.rooms_wait_wrap.set_visible(mode == "pick" && rooms.len() == 0 && rooms_loading)
+    ui.rooms_note_wrap.set_visible(mode == "pick" && rooms.len() == 0 && !rooms_failed && !rooms_loading)
+    ui.rooms_err_wrap.set_visible(mode == "pick" && rooms.len() == 0 && rooms_failed)
+    // A render with no rows keeps the old ones, so hide the list instead.
+    ui.room_rows_wrap.set_visible(rooms.len() > 0)
+    ui.room_list.render()
+    return nil
 }
 
 fn toggle_pick(i){
@@ -84,21 +228,80 @@ fn toggle_pick(i){
     } else {
         picked.push(id)
     }
-    ui.room_list.render()
+    show_rooms()
 }
 
-fn plural(n, word){
-    if "" + n == "1" { return word }
-    return word + "s"
+fn is_denial(err){
+    let e = "" + err
+    return e.search("not approved") >= 0 || e.search("ermission denied") >= 0
 }
 
-fn empty_line(){
-    if searched { return "Nothing matched." }
-    return "No results yet. Tap a result to jump to that message."
+fn show_results(){
+    let has_rows = rows.len() > 0
+    ui.results_wrap.set_visible(has_rows)
+    ui.searching_wrap.set_visible(!has_rows && is_searching)
+    ui.empty_wrap.set_visible(!has_rows && !is_searching)
+    if has_rows { return nil }
+    let icon = "🔍"
+    let title = "Search messages"
+    let body = "Find messages in this room or across your rooms. Tap a result to jump to it."
+    let action = ""
+    if !attached { body = "Find messages across your rooms. Tap a result to jump to it." }
+    if search_error != "" && is_denial(search_error) {
+        icon = "🔒"
+        title = "Can't search messages"
+        body = "Allow Search to read messages so it can find them."
+        action = "Ask again"
+    } elif search_error != "" {
+        icon = "😕"
+        title = "Couldn't search"
+        body = sentence(search_error)
+        action = "Try again"
+        if search_error.search("blocked") >= 0 { action = "" }
+    } elif searched {
+        icon = "🔍"
+        title = "No matches"
+        body = "Try other words."
+        if mode == "room" && attached { body = "Try other words, or search All rooms." }
+        elif !server { body = "Try other words, or ask the server too." }
+    }
+    ui.empty_icon.set_text(icon)
+    ui.empty_title.set_text(title)
+    ui.empty_body.set_text(body)
+    ui.empty_btn.set_text(action)
+    ui.empty_btn_wrap.set_visible(action == "Try again")
+    ui.ask_btn_wrap.set_visible(action == "Ask again")
+    return nil
+}
+
+fn build_rows(){
+    rows = []
+    let first_room = ""
+    let many_rooms = false
+    for it in results {
+        if first_room == "" { first_room = it.room_id }
+        if it.room_id != first_room { many_rooms = true }
+    }
+    for it in results {
+        // Robrix sends the room display name; older hosts and fixtures may not.
+        let who = "" + it.sender
+        let name = it["sender_name"]
+        if name.is_string() && name != "" { who = name }
+        let room = it["room_name"]
+        if (many_rooms || mode != "room") && room.is_string() && room != "" { who = who + " · " + room }
+        let sender = "" + it.sender
+        if name.is_string() && name != "" { sender = name }
+        rows.push({who: who initial: initial(sender) when: ago(it["ts"]) body: "" + it.body})
+    }
+    show_results()
+    ui.result_list.render()
+    return nil
 }
 
 fn on_results(r){
+    is_searching = false
     searched = r.is_ok
+    search_error = ""
     if r.is_ok {
         results = r.data.results
         let note = "" + results.len() + " " + plural(results.len(), "result")
@@ -113,18 +316,21 @@ fn on_results(r){
             let room_count = result_rooms.len()
             note = note + " in " + room_count + " " + plural(room_count, "room")
         }
-        if r.data.server_used { note = note + " · server included" }
-        ui.status.set_text(note)
+        if r.data["server_used"] == true { note = note + " · server included" }
+        if results.len() > 0 { say("note", note) } else { say("", note) }
     } else {
         results = []
-        ui.status.set_text(r.error)
+        search_error = r.error
+        say("", r.error)
     }
-    ui.result_list.render()
+    build_rows()
 }
 
 fn request_search(service, args){
     search_request += 1
     let request_id = search_request
+    is_searching = true
+    show_results()
     host.request(service, args, fn(r){
         if request_id != search_request { return nil }
         on_results(r)
@@ -134,17 +340,18 @@ fn request_search(service, args){
 fn run_search(t){
     let query = ("" + t).trim()
     if query == "" {
-        ui.status.set_text("Type something to search for.")
+        say("note", "Type something to search for.")
         return nil
     }
-    ui.status.set_text("Searching…")
+    // The card says it while there are no rows to keep showing.
+    if rows.len() > 0 { say("note", "Searching…") } else { say("", "Searching…") }
     if mode == "room" {
         request_search("matrix.search_room", {query: query, limit: 40, server: server})
         return nil
     }
     if mode == "pick" {
         if picked.len() == 0 {
-            ui.status.set_text("Pick at least one room first.")
+            say("note", "Pick at least one room first.")
             return nil
         }
         request_search("matrix.search_rooms", {query: query, room_ids: picked, limit: 40, server: server})
@@ -156,8 +363,24 @@ fn run_search(t){
 fn open_result(i){
     if i >= results.len() { return nil }
     host.request("nav.event", {event_id: results[i].event_id, room_id: results[i].room_id}, fn(r){
-        if !r.is_ok { ui.status.set_text(r.error) }
+        if !r.is_ok { say("err", "Couldn't open that message: " + sentence(r.error)) }
+        return nil
     })
+}
+
+fn on_app_resize(w, h){
+    // The server hint sits beside the switch when there's room, else below it.
+    ui.server_hint.set_visible(w >= 400)
+    ui.server_hint_below.set_visible(w < 400)
+    ui.row_search.set_visible(w >= 260)
+    ui.tiny_search.set_visible(w < 260)
+    if is_tiny != (w < 260) || is_narrow != (w < 300) {
+        is_tiny = w < 260
+        is_narrow = w < 300
+        ui.result_list.render()
+        show_rooms()
+    }
+    return nil
 }
 
 fn on_permissions_changed(caps){
@@ -174,92 +397,159 @@ let _boot = start_timeout(0.05, || {
 })
 
 View{
-    width: Fill height: Fill flow: Down align: Align{x: 0.5}
+    width: Fill height: Fill flow: Down
     col := ScrollYView{
-        width: Fill height: Fill flow: Down spacing: 10 padding: 14
+        width: Fill height: Fill flow: Down spacing: 12 padding: 14
         View{
             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-            q := TextInput{
-                width: Fill height: Fit empty_text: "Search messages"
+            q := Field{
+                empty_text: "Search messages"
                 on_return: |t| run_search(t)
             }
-            Button{
-                text: "Search" on_click: || run_search(ui.q.text())
-                draw_text +: { color: #x1C274C }
+            row_search := View{
+                width: Fit height: Fit
+                // Matches the field's height.
+                PrimaryButton{ text: "Search" height: 36 on_click: || run_search(ui.q.text()) }
             }
+        }
+        // Very narrow panes give the field the whole row and put Search below it.
+        tiny_search := View{
+            width: Fill height: Fit visible: false
+            PrimaryButton{ text: "Search" on_click: || run_search(ui.q.text()) }
         }
         View{
-            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 6 align: Align{y: 0.5}
-            mode_room := Button{ text: "● This room" on_click: || set_mode("room") draw_text +: { color: #x1C274C } }
-            mode_all := Button{ text: "○ All rooms" on_click: || set_mode("all") draw_text +: { color: #x1C274C } }
-            mode_pick := Button{ text: "○ Pick rooms" on_click: || set_mode("pick") draw_text +: { color: #x1C274C } }
-            Toggle{
-                text: "Ask the server too"
-                on_click: |on| { server = on }
-                draw_text +: { color: #x333333 }
+            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
+            room_chip := View{
+                width: Fit height: Fit
+                room_on := View{ width: Fit height: Fit ChipOn{ text: "This room" on_click: || set_mode("room") } }
+                room_off := View{ width: Fit height: Fit visible: false ChipOff{ text: "This room" on_click: || set_mode("room") } }
             }
+            all_on := View{ width: Fit height: Fit visible: false ChipOn{ text: "All rooms" on_click: || set_mode("all") } }
+            all_off := View{ width: Fit height: Fit ChipOff{ text: "All rooms" on_click: || set_mode("all") } }
+            pick_on := View{ width: Fit height: Fit visible: false ChipOn{ text: "Pick rooms" on_click: || set_mode("pick") } }
+            pick_off := View{ width: Fit height: Fit ChipOff{ text: "Pick rooms" on_click: || set_mode("pick") } }
         }
-        Label{
-            text: "Server search covers unencrypted rooms only" width: Fill padding: 0 margin: 0
-            draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+        View{
+            width: Fill height: Fit flow: Down spacing: 4
+            View{
+                width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                Switch{
+                    text: "Ask the server too"
+                    on_click: |on| { server = on }
+                }
+                server_hint := View{
+                    width: Fill height: Fit visible: false
+                    Label{ text: "Unencrypted rooms only" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                }
+            }
+            server_hint_below := View{
+                width: Fill height: Fit
+                Label{ text: "The server can't search encrypted rooms." width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+            }
         }
         room_list_wrap := View{
-            width: Fill height: Fit flow: Down spacing: 4 visible: false
-            Label{
-                text: "Tap rooms to include them" padding: 0 margin: 0
-                draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+            width: Fill height: Fit flow: Down spacing: 8 visible: false
+            View{
+                width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                Label{ text: "PICK ROOMS" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+                picked_count := Label{ text: "Tap rooms to include them" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
             }
-            room_list := ScrollYView{
-                width: Fill height: Fit{max: FitBound.Rel{base: Base.Full, factor: 0.3}} flow: Down spacing: 3
-                on_item_tap: |i| toggle_pick(i)
-                on_render: || {
-                    if rooms.len() == 0 {
-                        Label{
-                            text: rooms_line width: Fill padding: 0 margin: 0
-                            draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
-                        }
-                    } else {
-                        for it in rooms {
+            rooms_wait_wrap := View{
+                width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5} visible: false
+                LoadingSpinner{ width: 16 height: 16 draw_bg +: { color: #x0f88fe } }
+                Label{ text: "Loading rooms…" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+            }
+            rooms_note_wrap := View{
+                width: Fill height: Fit visible: false
+                rooms_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+            }
+            rooms_err_wrap := View{
+                width: Fill height: Fit visible: false
+                rooms_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} } }
+            }
+            // Lists with on_render keep no visibility of their own (render() re-applies it); wrappers hold it.
+            room_rows_wrap := View{
+                width: Fill height: Fit
+                room_list := ScrollYView{
+                    width: Fill height: Fit{max: FitBound.Rel{base: Base.Full, factor: 0.3}} flow: Down spacing: 6
+                    on_item_tap: |i| toggle_pick(i)
+                    on_render: || {
+                        for it in room_rows {
                             RoundedView{
-                                width: Fill height: Fit flow: Right spacing: 6 padding: 8
-                                show_bg: true
-                                draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
-                                Label{
-                                    text: mode_label_room(it) width: Fill padding: 0 margin: 0
-                                    draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                                width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
+                                padding: Inset{left: 10 right: 12 top: 6 bottom: 6}
+                                show_bg: true draw_bg +: { color: it.bg border_size: 1.0 border_color: it.edge border_radius: 8.0 }
+                                RoundedView{
+                                    visible: !is_tiny width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
+                                    show_bg: true draw_bg +: { color: #x52b2ac border_radius: 16.0 }
+                                    Label{ text: it.initial padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
                                 }
+                                Label{ text: it.name width: Fill padding: 0 margin: 0 max_lines: 1 text_overflow: TextOverflow.Ellipsis draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 11} } }
+                                Label{ text: it.lock padding: 0 margin: 0 draw_text +: { text_style: theme.font_regular{font_size: 10} } }
+                                Label{ text: it.mark padding: 0 margin: 0 draw_text +: { color: it.mark_c text_style: theme.font_regular{font_size: 12} } }
                             }
                         }
                     }
                 }
             }
         }
-        status := Label{
-            text: "Search messages Robrix has, across one room or many." width: Fill padding: 0 margin: 0
-            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
+        note_wrap := View{
+            width: Fill height: Fit visible: false
+            status := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
         }
-        result_list := ScrollYView{
-            width: Fill height: Fill{min: 80.0} flow: Down spacing: 5
-            on_item_tap: |i| open_result(i)
-            on_render: || {
-                if results.len() == 0 {
-                    Label{
-                        text: empty_line() width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
-                    }
-                } else {
-                    for it in results {
+        err_wrap := View{
+            width: Fill height: Fit visible: false
+            status_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} } }
+        }
+        searching_wrap := View{
+            width: Fill height: Fit flow: Right spacing: 10 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24} visible: false
+            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
+            Label{ text: "Searching…" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+        }
+        empty_wrap := View{
+            width: Fill height: Fit
+            RoundedView{
+                width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5}
+                padding: Inset{left: 16 right: 16 top: 20 bottom: 20}
+                show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                empty_icon := Label{ text: "🔍" padding: 0 margin: 0 draw_text +: { text_style: theme.font_regular{font_size: 28} } }
+                empty_title := Label{ text: "Search messages" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} } }
+                empty_body := Label{ text: "Find messages in this room or across your rooms. Tap a result to jump to it." width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                empty_btn_wrap := View{
+                    width: Fit height: Fit visible: false margin: Inset{top: 6}
+                    empty_btn := NeutralButton{ text: "Try again" on_click: || run_search(ui.q.text()) }
+                }
+                ask_btn_wrap := View{
+                    width: Fit height: Fit visible: false margin: Inset{top: 6}
+                    PrimaryButton{ text: "Ask again" on_click: || run_search(ui.q.text()) }
+                }
+            }
+        }
+        // Lists with on_render keep no visibility of their own (render() re-applies it); wrappers hold it.
+        results_wrap := View{
+            width: Fill height: Fill{min: 80.0} visible: false
+            result_list := ScrollYView{
+                width: Fill height: Fill flow: Down spacing: 8
+                on_item_tap: |i| open_result(i)
+                on_render: || {
+                    for it in rows {
                         RoundedView{
-                            width: Fill height: Fit flow: Down spacing: 2 padding: 10
-                            show_bg: true
-                            draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
-                            Label{
-                                text: it.sender + " · " + it.room_name padding: 0 margin: 0 width: Fill
-                                draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
+                            width: Fill height: Fit flow: Right spacing: 10
+                            padding: Inset{left: 12 right: 12 top: 10 bottom: 10}
+                            show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                            RoundedView{
+                                visible: !is_tiny width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
+                                show_bg: true draw_bg +: { color: #x52b2ac border_radius: 16.0 }
+                                Label{ text: it.initial padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
                             }
-                            Label{
-                                text: it.body width: Fill padding: 0 margin: 0
-                                draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                            View{
+                                width: Fill height: Fit flow: Down spacing: 4
+                                View{
+                                    width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
+                                    Label{ text: it.who width: Fill padding: 0 margin: 0 max_lines: 1 text_overflow: TextOverflow.Ellipsis draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} } }
+                                    Label{ text: it.when padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                                }
+                                Label{ text: it.body width: Fill padding: 0 margin: 0 max_lines: 3 text_overflow: TextOverflow.Ellipsis draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
                             }
                         }
                     }

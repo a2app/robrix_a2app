@@ -38,6 +38,7 @@ use crate::host_broker::HostBroker;
 /// rather than buffering without bound.
 const MAX_LINE_BYTES: usize = octos_llm::host::MAX_FRAME_BYTES;
 const MAX_QUEUED_BYTES: usize = 2 * MAX_LINE_BYTES;
+const MAX_QUEUED_EVENTS: usize = 128;
 
 /// Events surfaced to the UI thread, already reduced from raw JSON-RPC to what
 /// the generation pipeline cares about.
@@ -73,6 +74,9 @@ pub enum AcpEvent {
     /// The prompt turn finished with this ACP stop reason (e.g. `end_turn`,
     /// `cancelled`, `refusal`), plus the full accumulated reply text.
     TurnDone { stop_reason: String, text: String },
+    /// Model output shown while the host streams it in. The agent's own
+    /// `Chunk`/`Thought` copy of the finished reply follows and replaces it.
+    Preview { is_thought: bool, text: String },
     /// A JSON-RPC error reply, or a protocol-level failure.
     Error(String),
     /// The agent process exited (or its stdout closed). Carries a short
@@ -91,7 +95,8 @@ pub struct PlanStep {
 
 fn event_size(event: &AcpEvent) -> usize {
     match event {
-        AcpEvent::Chunk(text) | AcpEvent::Thought(text) | AcpEvent::Error(text) | AcpEvent::ProcessGone(text) => text.len(),
+        AcpEvent::Chunk(text) | AcpEvent::Thought(text) | AcpEvent::Error(text) | AcpEvent::ProcessGone(text)
+            | AcpEvent::Preview { text, .. } => text.len(),
         AcpEvent::ToolCall { id, title } => id.len() + title.len(),
         AcpEvent::ToolCallDone { id, summary, .. } => id.len() + summary.len(),
         AcpEvent::Plan(steps) => steps.iter().map(|step| step.content.len() + step.status.len()).sum(),
@@ -118,6 +123,8 @@ struct Shared {
     write_tx: Mutex<Option<SyncSender<String>>>,
     queued_bytes: AtomicUsize,
     queued_event_bytes: AtomicUsize,
+    /// Streamed model output waiting for the UI, kept apart from the agent's own events.
+    previews: Mutex<Previews>,
     turn_bytes: AtomicUsize,
     closed: AtomicBool,
     failure: Mutex<Option<String>>,
@@ -136,6 +143,37 @@ struct Shared {
     /// create-app pipeline needs no tools — and set only by a session host
     /// that runs a tool server (see the app's `a2app::ai::session`).
     mcp_servers: Vec<McpServerConfig>,
+}
+
+/// The broker's streamed model output that the UI has not drained, joined by kind.
+#[derive(Default)]
+struct Previews {
+    text: Vec<(bool, String)>,
+    bytes: usize,
+    /// Text past the byte budget was dropped, so later text waits for the agent's own copy.
+    is_gapped: bool,
+}
+
+impl Previews {
+    fn push(&mut self, is_thought: bool, text: &str) {
+        if self.is_gapped || self.bytes + text.len() > MAX_LINE_BYTES { self.is_gapped = true; return; }
+        self.bytes += text.len();
+        match self.text.last_mut() {
+            Some((kind, shown)) if *kind == is_thought => shown.push_str(text),
+            _ => self.text.push((is_thought, text.to_string())),
+        }
+    }
+
+    /// Drops the output that `event` replaces in the UI, which also ends a gap.
+    fn replaced_by(&mut self, event: &AcpEvent) {
+        match event {
+            AcpEvent::Thought(_) => self.text.retain(|(is_thought, _)| !is_thought),
+            AcpEvent::Chunk(_) | AcpEvent::ToolCall { .. } | AcpEvent::TurnDone { .. } => self.text.clear(),
+            _ => return,
+        }
+        self.bytes = self.text.iter().map(|(_, text)| text.len()).sum();
+        self.is_gapped = false;
+    }
 }
 
 impl Shared {
@@ -232,12 +270,12 @@ impl AcpClient {
         let stderr = child.stderr.take().expect("piped stderr");
         let mut stdin = child.stdin.take().expect("piped stdin");
 
-        let (tx, events) = std::sync::mpsc::sync_channel::<(usize, AcpEvent)>(128);
+        let (tx, events) = std::sync::mpsc::sync_channel::<(usize, AcpEvent)>(MAX_QUEUED_EVENTS);
         let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<String>(16);
         let shared = Arc::new(Shared {
             write_tx: Mutex::new(Some(write_tx)),
             queued_bytes: AtomicUsize::new(0), closed: AtomicBool::new(false),
-            queued_event_bytes: AtomicUsize::new(0), turn_bytes: AtomicUsize::new(0),
+            queued_event_bytes: AtomicUsize::new(0), previews: Mutex::default(), turn_bytes: AtomicUsize::new(0),
             failure: Mutex::new(None), broker,
             next_id: AtomicU64::new(1),
             pending: Mutex::new(None),
@@ -246,6 +284,17 @@ impl AcpClient {
             workspace: workspace.to_string_lossy().into_owned(),
             mcp_servers: mcp_servers.to_vec(),
         });
+
+        // The broker's streamed model output waits beside the event queue, so a slow UI
+        // shows it late but whole. It is only a preview, so past its budget it is dropped.
+        if let Some(broker) = &shared.broker {
+            let weak = Arc::downgrade(&shared);
+            broker.preview().connect(move |is_thought, text| {
+                let Some(shared) = weak.upgrade().filter(|shared| !shared.closed.load(Ordering::Acquire)) else { return };
+                shared.previews.lock().unwrap().push(is_thought, text);
+                SignalToUI::set_ui_signal();
+            });
+        }
 
         // Writer thread: sole owner of the child's stdin. Exits when every
         // Sender is gone (client dropped) or the pipe breaks (child died).
@@ -320,6 +369,8 @@ impl AcpClient {
                             shared.fail("Agent exceeded the pending event byte limit.");
                             return;
                         }
+                        // What replaces a preview drops it first, so the UI never shows it after.
+                        shared.previews.lock().unwrap().replaced_by(&event);
                         if tx.try_send((size, event)).is_err() {
                             shared.queued_event_bytes.fetch_sub(size, Ordering::AcqRel);
                             shared.fail("Agent exceeded the pending event limit.");
@@ -386,6 +437,10 @@ impl AcpClient {
             self.shared.queued_event_bytes.fetch_sub(size, Ordering::AcqRel);
             out.push(e);
         }
+        // Streamed output follows the queued events; whatever replaced it was dropped first.
+        let mut previews = self.shared.previews.lock().unwrap();
+        out.extend(previews.text.drain(..).map(|(is_thought, text)| AcpEvent::Preview { is_thought, text }));
+        previews.bytes = 0;
         out
     }
 
@@ -604,7 +659,7 @@ mod tests {
     fn protected_state(session_id: Option<&str>, pending: Option<(u64, Pending)>) -> Arc<Shared> {
         Arc::new(Shared {
             write_tx: Mutex::new(None), queued_bytes: AtomicUsize::new(0),
-            queued_event_bytes: AtomicUsize::new(0), turn_bytes: AtomicUsize::new(0),
+            queued_event_bytes: AtomicUsize::new(0), previews: Mutex::default(), turn_bytes: AtomicUsize::new(0),
             closed: AtomicBool::new(false), failure: Mutex::new(None),
             broker: Some(HostBroker::for_protocol_test()), next_id: AtomicU64::new(1),
             pending: Mutex::new(pending), session_id: Mutex::new(session_id.map(str::to_string)),
@@ -638,6 +693,121 @@ mod tests {
             assert!(shared.closed.load(Ordering::Acquire));
             assert!(shared.session_id.lock().unwrap().is_none());
         }
+    }
+
+    /// A confined test agent that relays one reply chunk as soon as the prompt arrives, once ready.
+    fn ready_relaying_agent(dir: &std::path::Path) -> (AcpClient, Arc<HostBroker>) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("agent.sh");
+        let capabilities = json!({"protocolVersion":1,"agentCapabilities":{"_meta":{octos_llm::host::CAPABILITY_KEY:
+            {"version":octos_llm::host::VERSION,"confined":true,"sandbox":"test"}}}});
+        std::fs::write(&script, format!(r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"initialize"'*) echo '{{"jsonrpc":"2.0","id":1,"result":{capabilities}}}' ;;
+    *'"session/new"'*) echo '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"s1"}}}}' ;;
+    *'"session/prompt"'*)
+      echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s1","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"done"}}}}}}}}'
+      echo '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}' ;;
+  esac
+done
+"#)).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let broker = HostBroker::for_protocol_test();
+        let mut client = AcpClient::spawn_command(Command::new(&script), "test agent", dir, &[], Some(broker.clone())).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !client.drain_events().iter().any(|event| matches!(event, AcpEvent::SessionReady)) {
+            assert!(std::time::Instant::now() < deadline, "the test agent never became ready");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        (client, broker)
+    }
+
+    /// Drains until the turn ends; `pending` clears before its last events are queued.
+    fn events_through_turn_done(client: &mut AcpClient) -> Vec<AcpEvent> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut events = Vec::new();
+        while !events.iter().any(|event| matches!(event, AcpEvent::TurnDone { .. })) {
+            assert!(std::time::Instant::now() < deadline, "the test agent never replied: {events:?}");
+            events.extend(client.drain_events());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        events
+    }
+
+    #[test]
+    fn previews_never_take_the_capacity_the_agents_own_events_need() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut client, broker) = ready_relaying_agent(dir.path());
+        // A flood of streamed output that the UI has not drained yet.
+        let show = broker.preview().show().unwrap();
+        for _ in 0..10_000 { show(false, "x"); }
+        client.send_prompt("Write the app.");
+        let events = events_through_turn_done(&mut client);
+        let previews = events.iter().take_while(|event| matches!(event, AcpEvent::Preview { .. })).count();
+        assert!(matches!(&events[previews..], [AcpEvent::Chunk(text), AcpEvent::TurnDone { .. }] if text == "done"), "{events:?}");
+    }
+
+    #[test]
+    fn a_slow_ui_shows_streamed_output_late_but_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut client, broker) = ready_relaying_agent(dir.path());
+        let show = broker.preview().show().unwrap();
+        // More pieces than one UI pass used to take, joined by kind.
+        for _ in 0..200 { show(true, "t"); }
+        for _ in 0..200 { show(false, "x"); }
+        assert!(matches!(&client.drain_events()[..], [AcpEvent::Preview { is_thought: true, text: thought }, AcpEvent::Preview { is_thought: false, text }]
+            if *thought == "t".repeat(200) && *text == "x".repeat(200)));
+        show(false, "y");
+        assert!(matches!(&client.drain_events()[..], [AcpEvent::Preview { text, .. }] if text == "y"));
+        // Output the agent's copy replaces is dropped as the copy is queued, so it never shows after it.
+        show(true, "replaced");
+        client.send_prompt("Write the app.");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !client.shared.previews.lock().unwrap().text.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the agent's copy never replaced the preview");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let events = events_through_turn_done(&mut client);
+        assert!(matches!(&events[..], [AcpEvent::Chunk(text), AcpEvent::TurnDone { .. }] if text == "done"), "{events:?}");
+    }
+
+    #[test]
+    fn past_its_byte_budget_the_preview_waits_for_the_agents_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut client, broker) = ready_relaying_agent(dir.path());
+        let show = broker.preview().show().unwrap();
+        let half = "x".repeat(MAX_LINE_BYTES / 2);
+        let shown = |events: Vec<AcpEvent>| events.into_iter().map(|event| match event {
+            AcpEvent::Preview { is_thought, text } => (is_thought, text.len()),
+            other => panic!("unexpected {other:?}"),
+        }).collect::<Vec<_>>();
+        show(true, &half);
+        show(false, &half);
+        show(false, "over");
+        assert_eq!(shown(client.drain_events()), [(true, half.len()), (false, half.len())]);
+        // Room again, but showing this would leave a hole where the dropped text was.
+        show(false, "held");
+        assert!(client.drain_events().is_empty());
+        client.send_prompt("Write the app.");
+        let events = events_through_turn_done(&mut client);
+        assert!(matches!(&events[..], [AcpEvent::Chunk(text), AcpEvent::TurnDone { .. }] if text == "done"), "{events:?}");
+        show(false, "next");
+        assert!(matches!(&client.drain_events()[..], [AcpEvent::Preview { text, .. }] if text == "next"));
+    }
+
+    #[test]
+    fn the_agents_copy_drops_only_the_preview_it_replaces() {
+        let mut previews = Previews::default();
+        previews.push(true, "plan");
+        previews.push(false, "code");
+        previews.is_gapped = true;
+        previews.replaced_by(&AcpEvent::Tick);
+        assert!(previews.is_gapped && previews.bytes == 8);
+        previews.replaced_by(&AcpEvent::Thought("plan".into()));
+        assert_eq!((previews.text.as_slice(), previews.bytes, previews.is_gapped), (&[(false, "code".to_string())][..], 4, false));
+        previews.replaced_by(&AcpEvent::ToolCall { id: "call-1".into(), title: "Read".into() });
+        assert!(previews.text.is_empty() && previews.bytes == 0);
     }
 
     #[test]

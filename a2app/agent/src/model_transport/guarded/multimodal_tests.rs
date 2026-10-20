@@ -152,11 +152,11 @@ async fn live_configured_model_sees_synthetic_image_pixels() {
     };
     #[cfg(feature="embedded")]
     let answer=crate::octos_embedded::tests::run_media_tool_loop(&context.0,|outputs|
-        crate::model_transport::provider_with_outputs(&prefs,context.0.clone(),Arc::new(AtomicBool::new(false)),outputs).unwrap()).await.to_lowercase();
+        crate::model_transport::provider_with_outputs(&prefs,context.0.clone(),Arc::new(AtomicBool::new(false)),outputs,Default::default()).unwrap()).await.to_lowercase();
     #[cfg(not(feature="embedded"))]
     let answer = {
     let outputs = Arc::new(ToolOutputStore::default());
-    let provider = crate::model_transport::provider_with_outputs(&prefs,context.0.clone(),Arc::new(AtomicBool::new(false)),outputs.clone()).unwrap();
+    let provider = crate::model_transport::provider_with_outputs(&prefs,context.0.clone(),Arc::new(AtomicBool::new(false)),outputs.clone(),Default::default()).unwrap();
     let receipt = outputs.register(&context.0,information_flow::context_epoch(&context.0).unwrap(),ToolOutput {text:"Synthetic image, no filename hints".into(),attachments:vec![ModelAttachment::new(include_bytes!("../../../tests/fixtures/vision-colors.png").to_vec(),"image/png".into(),"fixture.png".into()).unwrap()]}).unwrap();
     let mut assistant = message(MessageRole::Assistant,"");
     assistant.tool_calls=Some(vec![ToolCall{id:"vision-probe".into(),name:"inspect_media".into(),arguments:json!({"draft_id":"synthetic"}),metadata:None}]);

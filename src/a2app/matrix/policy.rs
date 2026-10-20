@@ -189,6 +189,14 @@ impl MatrixAuthorization {
         }
     }
 
+    /// A space's own child list proves its rooms belong to it, so consent covering the queried
+    /// space covers the children it returns, before the space crawl has placed them.
+    pub fn permits_space_child(&self, store: &PermissionStore, room: &str) -> bool {
+        self.permits(store, Some(room))
+            || (matches!(self.capability.as_str(), "matrix.space.rooms.list" | "matrix.space.info.read")
+                && self.target_room.as_deref().is_some_and(|space| self.permits(store, Some(space))))
+    }
+
     pub fn permits(&self, store: &PermissionStore, room: Option<&str>) -> bool {
         let Some(cap) = a2app_core::capabilities::by_id(&self.capability) else { return false };
         let context = PermissionContext { origin_room: self.origin_room.as_deref(), target_room: room };
@@ -393,6 +401,15 @@ pub fn room_access_allowed(room: &str, access: RoomAccess) -> bool {
     })
 }
 
+/// [`room_access_allowed`] for a room the queried space lists as its child; its protection still applies.
+pub fn space_child_access_allowed(room: &str) -> bool {
+    with_current_policy(|store| {
+        store.room_policy(Some(room), RoomAccess::Read) != PolicyDecision::Deny
+            && AUTHORIZATION.try_with(|auth| auth.permits_space_child(store, room)
+                && auth.check_flow(Some(room), RoomAccess::Read).is_ok()).unwrap_or(true)
+    })
+}
+
 /// The worker must still require source sharing consent for the actual URL.
 pub fn network_allowed(subject: &str, origin_room: Option<&str>, url: &str, consent: &PermissionStore) -> bool {
     with_current_policy(|store| network_permitted(store, consent, subject, origin_room, url))
@@ -467,7 +484,7 @@ pub fn filter_read_result(
     let mut value: serde_json::Value = serde_json::from_str(result).map_err(|_| "invalid Matrix service response")?;
     let allowed = |room: &str| {
         store.room_policy(Some(room), RoomAccess::Read) != PolicyDecision::Deny
-            && authorization.is_none_or(|auth| auth.permits(store, Some(room)))
+            && authorization.is_none_or(|auth| auth.permits_space_child(store, room))
     };
     let row_allowed = |row: &serde_json::Value| {
         row.get("room_id").or_else(|| row.get("space_id"))
@@ -592,6 +609,48 @@ mod tests {
         store.set_room_policy("!allowed:s", RoomAccess::Read, PolicyDecision::Allow);
         store.set("app", Permission::MatrixRoomsList, GrantState::Denied);
         assert!(!auth.permits(&store, Some("!allowed:s")));
+    }
+
+    #[test]
+    fn consent_for_a_space_covers_the_children_it_lists_without_crawled_ancestry() {
+        let space_scope = RoomScope::Selection { rooms: Vec::new(), spaces: vec!["!space:s".into()] };
+        let response = r#"{"rooms":[{"room_id":"!child:s"},{"room_id":"!other:s"}]}"#;
+        let rooms = |store: &PermissionStore, auth: &MatrixAuthorization| -> Vec<String> {
+            let filtered: serde_json::Value = serde_json::from_str(&filter_read_result(response, store, Some(auth)).unwrap()).unwrap();
+            filtered["rooms"].as_array().unwrap().iter().map(|row| row["room_id"].as_str().unwrap().to_string()).collect()
+        };
+        for capability in ["matrix.space.rooms.list", "matrix.space.info.read"] {
+            let cap = a2app_core::capabilities::by_id(capability).unwrap();
+            let mut store = PermissionStore::default();
+            store.set_global_policy(RoomAccess::Read, PolicyDecision::Ask);
+            store.grant_scoped("app", cap.group.unwrap(), Some(capability), space_scope.clone(),
+                GrantDuration::RobrixSession, None).unwrap();
+            let mut auth = MatrixAuthorization::new("app", capability, None, &store);
+            auth.target_room = Some("!space:s".into());
+            // The space crawl hasn't placed the children; the space's own list is the proof.
+            assert!(!auth.permits(&store, Some("!child:s")), "{capability}");
+            assert!(auth.permits_space_child(&store, "!child:s"), "{capability}");
+            assert_eq!(rooms(&store, &auth), ["!child:s", "!other:s"], "{capability}");
+
+            let mut protected = store.clone();
+            protected.set_room_policy("!child:s", RoomAccess::Read, PolicyDecision::Deny);
+            assert_eq!(rooms(&protected, &auth), ["!other:s"], "room protection still hides a child");
+
+            let mut elsewhere = auth.clone();
+            elsewhere.target_room = Some("!another-space:s".into());
+            assert!(!elsewhere.permits_space_child(&store, "!child:s"), "consent for one space covers no other");
+            let mut revoked = store.clone();
+            revoked.set_capability("app", capability, GrantState::Denied);
+            assert!(!auth.permits_space_child(&revoked, "!child:s"));
+        }
+        // Other capabilities keep exact per-room consent, even under a group-wide space grant.
+        let mut store = PermissionStore::default();
+        store.set_global_policy(RoomAccess::Read, PolicyDecision::Ask);
+        store.grant_scoped("app", Permission::MatrixSpaces, None, space_scope, GrantDuration::RobrixSession, None).unwrap();
+        let mut auth = MatrixAuthorization::new("app", "matrix.spaces.list", None, &store);
+        auth.target_room = Some("!space:s".into());
+        assert!(auth.permits(&store, Some("!space:s")));
+        assert!(!auth.permits_space_child(&store, "!child:s"));
     }
 
     #[test]

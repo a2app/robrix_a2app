@@ -16,11 +16,143 @@ let live_refresh_pending = false
 let setup_pending = false
 
 let items = []
-let status = "Loading…"
+let total = 0
+// loading | list | empty | denied | error | no_room
+let state = "loading"
+let error_text = ""
 let live_note = ""
-let empty_msg = "Loading members…"
+let nav_error = ""
+let is_narrow = false
 
-fn show_header(){ ui.header.set_text(status + live_note) }
+let upper = {a: "A" b: "B" c: "C" d: "D" e: "E" f: "F" g: "G" h: "H" i: "I" j: "J" k: "K" l: "L" m: "M" n: "N" o: "O" p: "P" q: "Q" r: "R" s: "S" t: "T" u: "U" v: "V" w: "W" x: "X" y: "Y" z: "Z"}
+let error_prefix = regex("^[Cc]ouldn't [^:]*: ")
+
+// The avatar letter: the name's first character, skipping a leading "@".
+fn initial(name){
+    let chars = name.split("")
+    if chars.len() < 3 { return "?" }
+    let c = chars[1]
+    if c == "@" && chars.len() > 3 { c = chars[2] }
+    let up = upper[c]
+    if up != nil { c = up }
+    return c
+}
+
+// "couldn't load members: the server timed out" -> "The server timed out."
+fn sentence(text){
+    let t = text.replace(error_prefix, "")
+    let chars = t.split("")
+    if chars.len() < 3 { return t }
+    let first = chars[1]
+    let up = upper[first]
+    if up == nil { up = first }
+    let out = up + t.strip_prefix(first)
+    let last = chars[chars.len() - 2]
+    if last != "." && last != "!" && last != "?" { out = out + "." }
+    return out
+}
+
+fn count_text(n){
+    if n < 1000 { return "" + n }
+    let k = floor(n / 1000)
+    let r = n - k * 1000
+    let pad = ""
+    if r < 100 { pad = "0" }
+    if r < 10 { pad = "00" }
+    return count_text(k) + "," + pad + r
+}
+
+// Robrix's role names; a v12 room creator's power arrives as i64::MAX.
+fn role_of(power){
+    if power > 1000000000000.0 { return "Creator" }
+    if power >= 100 {
+        if power == 100 { return "Admin" }
+        return "Admin (" + power + ")"
+    }
+    if power >= 50 {
+        if power == 50 { return "Moderator" }
+        return "Moderator (" + power + ")"
+    }
+    return ""
+}
+
+fn rank(power){
+    if power > 1000000000000.0 { return 0 }
+    if power >= 100 { return 1 }
+    if power >= 50 { return 2 }
+    return 3
+}
+
+// Creators, admins and moderators first, like Robrix's member list.
+fn by_role(list){
+    let out = []
+    let tier = 0
+    while tier < 4 {
+        for m in list {
+            if rank(m.power) == tier { out.push(m) }
+        }
+        tier += 1
+    }
+    return out
+}
+
+fn show(){
+    ui.loading_wrap.set_visible(state == "loading")
+    ui.header_row.set_visible(state == "list")
+    ui.refresh_wide.set_visible(!is_narrow)
+    ui.refresh_narrow.set_visible(is_narrow && state == "list")
+    ui.empty_card.set_visible(state != "loading" && state != "list")
+    ui.ask_wrap.set_visible(state == "denied")
+    ui.retry_wrap.set_visible(state == "error" || state == "empty")
+    let word = " members"
+    if total == 1 { word = " member" }
+    ui.summary.set_text(count_text(total) + word)
+    let hint = "Tap someone to see their profile"
+    let more = "tap someone to see their profile"
+    if is_narrow {
+        hint = "Tap for a profile"
+        more = "tap for a profile"
+    }
+    if total > items.len() { hint = "Showing " + items.len() + " · " + more }
+    ui.meta.set_text(hint)
+    ui.live_wrap.set_visible(live_note != "")
+    ui.live.set_text(live_note)
+    ui.nav_wrap.set_visible(nav_error != "")
+    ui.nav_err.set_text(nav_error)
+    if state == "empty" {
+        ui.empty_icon.set_text("👥")
+        ui.empty_title.set_text("No members to show")
+        ui.empty_body.set_text("People who join this room show up here.")
+        ui.retry.set_text("Refresh")
+    }
+    if state == "denied" {
+        ui.empty_icon.set_text("🔒")
+        ui.empty_title.set_text("Can't see members")
+        ui.empty_body.set_text("Allow Room Members to see who's in this room.")
+    }
+    if state == "error" {
+        ui.empty_icon.set_text("😕")
+        ui.empty_title.set_text("Couldn't load members")
+        ui.empty_body.set_text(sentence(error_text))
+        ui.retry.set_text("Try again")
+    }
+    if state == "no_room" {
+        ui.empty_icon.set_text("🧭")
+        ui.empty_title.set_text("No room attached")
+        ui.empty_body.set_text("Open Room Members from a room to see who's in it.")
+    }
+    ui.item_list.render()
+}
+
+fn fail(error){
+    items = []
+    total = 0
+    error_text = error
+    state = "error"
+    if error.search("not attached to a room") >= 0 { state = "no_room" }
+    if error.search("ermission") >= 0 || error.search("not approved") >= 0 { state = "denied" }
+    show()
+}
 
 fn load(){
     if members_loading { return nil }
@@ -28,20 +160,14 @@ fn load(){
     host.request("matrix.room_members", {limit: 60}, fn(r){
         members_loading = false
         members_loaded = r.is_ok
-        if r.is_ok {
-            items = r.data.members
-            empty_msg = "No members to show."
-            status = "" + r.data.count + " members · tap one for their profile"
-            if r.data.count > items.len() {
-                status = "Showing " + items.len() + " of " + r.data.count + " members · tap one for their profile"
-            }
-        } else {
-            items = []
-            status = r.error
-            empty_msg = r.error
-        }
-        show_header()
-        ui.item_list.render()
+        if !r.is_ok { fail(r.error) return nil }
+        items = by_role(r.data.members)
+        total = max(r.data.count, items.len())
+        nav_error = ""
+        state = "list"
+        if items.len() == 0 { state = "empty" }
+        show()
+        return nil
     })
 }
 
@@ -64,8 +190,9 @@ fn watch(){
     host.request("events.subscribe", {event: "on_room_members_changed"}, fn(r){
         watch_pending = false
         watch_ready = r.is_ok
-        if r.is_ok { live_note = "" } else { live_note = " · live updates off: " + r.error }
-        show_header()
+        if r.is_ok { live_note = "" } else { live_note = "Live updates are off. Tap Refresh to update." }
+        show()
+        return nil
     })
 }
 
@@ -79,14 +206,18 @@ fn on_permissions_changed(caps){
 fn open_member(i){
     if i >= items.len() { return nil }
     host.request("nav.user", {user_id: items[i].user_id}, fn(r){
-        if !r.is_ok { ui.header.set_text(r.error) }
+        if r.is_ok { nav_error = "" } else { nav_error = "Couldn't open that profile. " + sentence(r.error) }
+        show()
+        return nil
     })
 }
 
-fn member_line(m){
-    let line = m.name
-    if m.power > 0 { line = m.name + "  ·  power " + m.power }
-    return line
+fn on_app_resize(w, h){
+    let narrow = w < 300
+    if narrow == is_narrow { return nil }
+    is_narrow = narrow
+    show()
+    return nil
 }
 
 fn setup(retry){
@@ -94,65 +225,139 @@ fn setup(retry){
     setup_pending = true
     host.request("permissions.request", {perms: ["matrix-room-read", "matrix-room-watch"], retry: retry}, fn(r){
         setup_pending = false
-        if !r.is_ok { status = r.error empty_msg = r.error show_header() ui.item_list.render() return nil }
+        if !r.is_ok { fail(r.error) return nil }
         if r.data.permissions["matrix-room-read"] == true && host.has("matrix.room.members.read") { load() }
         else {
             items = []
-            status = "Permission denied. Click Refresh to ask again."
-            empty_msg = status
-            show_header()
-            ui.item_list.render()
+            total = 0
+            state = "denied"
+            show()
         }
         if r.data.permissions["matrix-room-watch"] == true && host.has("on_room_members_changed") { watch() }
+        return nil
     })
 }
 
 let _boot = start_timeout(0.05, || setup(false))
 
+let PrimaryButton = Button{
+    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
+    draw_bg +: {
+        border_size: 0.0 border_radius: 4.0
+        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+}
+let NeutralButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
+        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+}
+
 View{
-    width: Fill height: Fill flow: Down align: Align{x: 0.5}
+    width: Fill height: Fill flow: Down
     col := ScrollYView{
-        width: Fill height: Fill flow: Down spacing: 10 padding: 14
-        header := Label{
-            text: "Loading…" padding: 0 margin: 0
-            width: Fill
-            draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} }
-        }
-        item_list := ScrollYView{
-            width: Fill height: Fill{min: 80} flow: Down spacing: 5
-            on_item_tap: |i| open_member(i)
-            on_render: || {
-                if items.len() == 0 {
-                    Label{
-                        text: empty_msg
-                        width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+        width: Fill height: Fill flow: Down spacing: 12 padding: 14
+        header_row := View{
+            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5} visible: false
+            View{
+                width: Fill height: Fit flow: Down spacing: 3
+                summary := Label{
+                    text: "" width: Fill padding: 0 margin: 0
+                    draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} }
+                }
+                meta := Label{
+                    text: "" width: Fill padding: 0 margin: 0
+                    draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                }
+                live_wrap := View{
+                    width: Fill height: Fit visible: false
+                    live := Label{
+                        text: "" width: Fill padding: 0 margin: 0
+                        draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
                     }
-                } else {
-                    for it in items {
-                        RoundedView{
-                            width: Fill height: Fit flow: Down spacing: 2 padding: 10
-                            show_bg: true
-                            draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
-                            Label{
-                                text: it.user_id padding: 0 margin: 0
-                                width: Fill
-                                draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
-                            }
-                            Label{
-                                text: member_line(it) width: Fill padding: 0 margin: 0
-                                draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
-                            }
-                        }
+                }
+                nav_wrap := View{
+                    width: Fill height: Fit visible: false
+                    nav_err := Label{
+                        text: "" width: Fill padding: 0 margin: 0
+                        draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} }
                     }
                 }
             }
+            refresh_wide := View{
+                width: Fit height: Fit
+                NeutralButton{ text: "Refresh" on_click: || setup(true) }
+            }
         }
-        View{
-            width: Fill height: Fit flow: Right align: Align{x: 0.5}
-            Button{
-                text: "Refresh" on_click: || setup(true)
-                draw_text +: { color: #x1C274C }
+        refresh_narrow := View{
+            width: Fill height: Fit visible: false
+            NeutralButton{ text: "Refresh" on_click: || setup(true) }
+        }
+        loading_wrap := View{
+            width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 10 wrap_spacing: 8 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24}
+            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
+            Label{
+                text: "Loading members…" padding: 0 margin: 0
+                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} }
+            }
+        }
+        empty_card := RoundedView{
+            width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5} padding: Inset{top: 20 bottom: 20 left: 16 right: 16} visible: false
+            show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+            empty_icon := Label{ text: "👥" padding: 0 margin: 0 draw_text +: { text_style: theme.font_regular{font_size: 28} } }
+            empty_title := Label{
+                text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
+                draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} }
+            }
+            empty_body := Label{
+                text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
+                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} }
+            }
+            ask_wrap := View{
+                width: Fit height: Fit margin: Inset{top: 6} visible: false
+                PrimaryButton{ text: "Ask again" on_click: || setup(true) }
+            }
+            retry_wrap := View{
+                width: Fit height: Fit margin: Inset{top: 6} visible: false
+                retry := NeutralButton{ text: "Try again" on_click: || setup(true) }
+            }
+        }
+        item_list := ScrollYView{
+            width: Fill height: Fill{min: 80} flow: Down
+            on_item_tap: |i| open_member(i)
+            on_render: || {
+                for it in items {
+                    let role = role_of(it.power)
+                    let sub = it.user_id
+                    if is_narrow && role != "" { sub = role }
+                    let side = role
+                    if is_narrow { side = "" }
+                    View{
+                        width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5} padding: Inset{top: 8 bottom: 8}
+                        RoundedView{
+                            width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
+                            show_bg: true draw_bg +: { color: #x52b2ac border_radius: 16.0 }
+                            Label{ text: initial(it.name) padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
+                        }
+                        View{
+                            width: Fill height: Fit flow: Down spacing: 2
+                            Label{
+                                text: it.name width: Fill max_lines: 1 text_overflow: TextOverflow.Ellipsis padding: 0 margin: 0
+                                draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} }
+                            }
+                            Label{
+                                text: sub width: Fill max_lines: 1 text_overflow: TextOverflow.Ellipsis padding: 0 margin: 0
+                                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                            }
+                        }
+                        Label{
+                            text: side padding: 0 margin: 0
+                            draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                        }
+                    }
+                }
             }
         }
     }

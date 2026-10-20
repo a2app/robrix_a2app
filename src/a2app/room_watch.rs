@@ -30,6 +30,10 @@ pub enum RoomWatchKind {
         msgtype: String,
         ts: u64,
         is_own: bool,
+        /// Whether Robrix highlights it as mentioning the user.
+        mentions_me: bool,
+        reply_to: Option<OwnedEventId>,
+        thread_root: Option<OwnedEventId>,
     },
     /// An edit (`body` is the new text) or a redaction of a message.
     MessageChanged { event_id: OwnedEventId, edited: bool, redacted: bool, body: String },
@@ -119,7 +123,8 @@ pub fn stop_all() {
     ROOM_WATCHES.lock().unwrap().clear();
 }
 
-async fn member_name(room: &Room, user_id: &UserId) -> String {
+/// The sender's display name from the local member cache, else their user ID's localpart.
+pub(crate) async fn member_name(room: &Room, user_id: &UserId) -> String {
     room.get_member_no_sync(user_id).await
         .ok().flatten()
         .and_then(|m| m.display_name().map(str::to_string))
@@ -206,6 +211,19 @@ async fn watch_room(client: Client, room_id: OwnedRoomId, identity: WatchIdentit
                                             let mut body = msg.content.body().to_string();
                                             clip_chars(&mut body, 500);
                                             let is_own = own == &msg.sender;
+                                            // Push rules decide highlights; without them, only explicit mentions count.
+                                            let mentions_me = ev.push_actions()
+                                                .map(|actions| actions.iter().any(|action| action.is_highlight()))
+                                                .unwrap_or_else(|| msg.content.mentions.as_ref()
+                                                    .is_some_and(|mentions| mentions.room || mentions.user_ids.contains(own)));
+                                            let (reply_to, thread_root) = match &msg.content.relates_to {
+                                                Some(Relation::Reply(reply)) => (Some(reply.in_reply_to.event_id.clone()), None),
+                                                Some(Relation::Thread(thread)) => (
+                                                    thread.in_reply_to.as_ref().filter(|_| !thread.is_falling_back).map(|reply| reply.event_id.clone()),
+                                                    Some(thread.event_id.clone()),
+                                                ),
+                                                _ => (None, None),
+                                            };
                                             post(RoomWatchKind::Message {
                                                 event_id: msg.event_id,
                                                 sender: msg.sender,
@@ -214,6 +232,9 @@ async fn watch_room(client: Client, room_id: OwnedRoomId, identity: WatchIdentit
                                                 msgtype: msg.content.msgtype().to_string(),
                                                 ts: u64::from(msg.origin_server_ts.get()),
                                                 is_own,
+                                                mentions_me,
+                                                reply_to,
+                                                thread_root,
                                             });
                                         }
                                         (AnySyncTimelineEvent::MessageLike(

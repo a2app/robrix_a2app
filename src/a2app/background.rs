@@ -668,6 +668,7 @@ mod tests {
 
     #[test]
     fn real_parked_splash_completes_through_broker_and_reuses_foreground_instance() {
+        let _policy_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
         let mut fixture = Fixture::new(r#"// background: true
 let initial = host.request("env", {})
 fn on_background(json){
@@ -718,6 +719,7 @@ View{width: Fill height: Fill}
 
     #[test]
     fn minimized_app_outlives_a_run_but_one_closed_during_a_run_stops_after_it() {
+        let _policy_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
         let mut fixture = Fixture::new(r#"// background: true
 fn on_background(json){
     let run = json.parse_json().run_id
@@ -778,6 +780,7 @@ View{width: Fill height: Fill}
 
     #[test]
     fn lifecycle_restore_pause_and_remove_retire_idle_and_pending_activations() {
+        let _policy_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
         let mut fixture = Fixture::new("// background: true\nfn on_background(json){}\nView{width: Fill height: Fill}");
         let id = fixture.enable();
         let key = job_key(&fixture.binding).unwrap();
@@ -816,6 +819,7 @@ View{width: Fill height: Fill}
     }
     #[test]
     fn host_deadlines_and_storage_errors_stop_workers_without_releasing_uncertain_claims() {
+        let _policy_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
         let mut fixture = Fixture::new("// background: true\nfn on_background(json){}\nView{width: Fill height: Fill}");
         let id = fixture.enable();
         run_now(&mut fixture.cx, id).unwrap();
@@ -838,6 +842,7 @@ View{width: Fill height: Fill}
 
     #[test]
     fn missing_hook_and_source_changes_pause_without_autostarting_new_source() {
+        let _policy_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
         let mut fixture = Fixture::new("// background: true\nView{width: Fill height: Fill}");
         let id = fixture.enable();
         run_now(&mut fixture.cx, id).unwrap();
@@ -858,6 +863,7 @@ View{width: Fill height: Fill}
 
     #[test]
     fn app_permission_reset_stops_workers_and_durably_pauses_tasks() {
+        let _policy_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
         let mut fixture = Fixture::new("// background: true\nfn on_background(json){}\nView{width: Fill height: Fill}");
         let id = fixture.enable();
         run_now(&mut fixture.cx, id).unwrap();
@@ -874,6 +880,7 @@ View{width: Fill height: Fill}
 
     #[test]
     fn app_permission_reset_reports_background_storage_failures() {
+        let _policy_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
         let mut fixture = Fixture::new("// background: true\nfn on_background(json){}\nView{width: Fill height: Fill}");
         let id = fixture.enable();
         run_now(&mut fixture.cx, id).unwrap();

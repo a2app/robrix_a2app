@@ -8,6 +8,26 @@
 // why-robrix-observe: Logs which room and screen you switch to, so you can see what an app would see.
 // why-device-info: Shows what this device reports about itself.
 
+let PrimaryButton = Button{
+    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
+    draw_bg +: {
+        border_size: 0.0 border_radius: 4.0
+        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+}
+let NeutralButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
+        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+}
+let NegativeButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xDC0005 border_color_hover: #xDC0005 border_color_down: #xDC0005 border_color_focus: #xDC0005
+        color: #xFFF0F0 color_hover: #xF0D4D4 color_down: #xE0B8B8 color_focus: #xFFF0F0 }
+    draw_text +: { color: #xDC0005 color_hover: #xDC0005 color_down: #xDC0005 color_focus: #xDC0005 }
+}
+
 let subscribed_events = []
 let pending_events = []
 
@@ -24,20 +44,60 @@ let setup_pending = false
 
 let events = []
 let pane = nil
+// Minutes east of UTC from device.info; nil until it is known.
+let utc_offset = nil
+let is_narrow = false
+let is_wide = false
+let env_rows = [{k: "Room" v: "…" c: #x66708F}]
+let prefs_rows = []
+let device_rows = []
 
-fn clock(){
-    let s = floor(time_now())
-    let h = floor(s / 3600.0) % 24
-    let m = floor(s / 60.0) % 60
-    let mm = "" + m
-    if m < 10 { mm = "0" + m }
-    return "" + h + ":" + mm
+let platform_names = {macos: "macOS" ios: "iOS" android: "Android" windows: "Windows" linux: "Linux"}
+let event_names = {on_prefs_changed: "Settings updates" on_active_room_changed: "Room updates" on_navigation_changed: "Screen updates"}
+let upper = {a: "A" b: "B" c: "C" d: "D" e: "E" f: "F" g: "G" h: "H" i: "I" j: "J" k: "K" l: "L" m: "M" n: "N" o: "O" p: "P" q: "Q" r: "R" s: "S" t: "T" u: "U" v: "V" w: "W" x: "X" y: "Y" z: "Z"}
+
+// "room not joined" -> "Room not joined."
+fn sentence(text){
+    let t = "" + text
+    let chars = t.split("")
+    if chars.len() < 3 { return t }
+    let first = chars[1]
+    let up = upper[first]
+    if up == nil { up = first }
+    let out = up + t.strip_prefix(first)
+    let last = chars[chars.len() - 2]
+    if last != "." && last != "!" && last != "?" { out = out + "." }
+    return out
+}
+let screen_names = {home: "Home" add_room: "Add room" mini_apps: "Mini apps" settings: "Settings" space: "Space lobby"}
+
+fn two(n){
+    if n < 10 { return "0" + n }
+    return "" + n
 }
 
-fn log(line){
-    events.push(clock() + "  " + line)
-    while events.len() > 20 { events.remove(0) }
-    ui.event_list.render()
+// Local time of day for a time_now() stamp; UTC (and the caption says so) until the offset is known.
+fn clock(t){
+    let off = 0
+    if !utc_offset.is_nil() { off = utc_offset * 60 }
+    let day = (t + off) % 86400
+    if day < 0 { day += 86400 }
+    return "" + floor(day / 3600) + ":" + two(floor((day % 3600) / 60))
+}
+
+fn offset_text(mins){
+    if mins == 0 { return "UTC" }
+    let sign = if mins < 0 {"−"} else {"+"}
+    let a = abs(mins)
+    let m = a % 60
+    if m == 0 { return "UTC" + sign + floor(a / 60) }
+    return "UTC" + sign + floor(a / 60) + ":" + two(m)
+}
+
+fn platform_name(p){
+    let name = platform_names[p]
+    if name.is_nil() { return "" + p }
+    return name
 }
 
 fn yes_no(b){
@@ -45,13 +105,44 @@ fn yes_no(b){
     return "no"
 }
 
+fn log_line(line, color){
+    events.push({t: time_now() text: line c: color})
+    while events.len() > 20 { events.remove(0) }
+    ui.event_list.render()
+    ui.events_empty_wrap.set_visible(false)
+    ui.event_list_wrap.set_visible(true)
+}
+
+fn log(line){
+    log_line(line, #x333333)
+}
+
+fn pane_say(text){
+    ui.pane_err.set_text(text)
+    ui.pane_err_wrap.set_visible(text != "")
+}
+
+fn surface_text(surface, side){
+    if surface == "dock" {
+        if side.is_nil() { return "Docked in a room" }
+        if side == "top" || side == "bottom" { return "Docked at the " + side }
+        return "Docked on the " + side
+    }
+    if surface == "tab" { return "Popped out" }
+    if surface == "modal" { return "Full screen" }
+    if surface == "parked" { return "Hidden" }
+    return "" + surface
+}
+
 fn show_pane(){
     if pane.is_nil() { return nil }
-    let side = pane.side
-    if side.is_nil() { side = "none" }
-    ui.pane_line.set_text(pane.surface + " · side " + side + " · " + floor(pane.width) + "×" + floor(pane.height))
-    ui.pane_state.set_text("foreground " + yes_no(pane.foreground))
+    ui.pane_line.set_text(surface_text(pane.surface, pane["side"]))
+    let shown = if pane.foreground {"On screen"} else {"Not on screen"}
+    ui.pane_state.set_text(shown + " · " + floor(pane.width) + " × " + floor(pane.height))
     ui.dock_controls.set_visible(pane.surface == "dock")
+    ui.dock_pop.set_visible(pane.surface == "dock")
+    ui.dock_min.set_visible(pane.surface == "dock")
+    ui.dock_brief.set_visible(pane.surface == "dock")
     ui.dock_note.set_visible(pane.surface != "dock")
 }
 
@@ -62,11 +153,13 @@ fn read_pane(){
         pane_loading = false
         pane_loaded = r.is_ok
         if !r.is_ok {
-            ui.pane_line.set_text(r.error)
+            ui.pane_line.set_text("Pane unavailable")
+            ui.pane_state.set_text(sentence(r.error))
             return nil
         }
         pane = r.data
         show_pane()
+        return nil
     })
 }
 
@@ -77,15 +170,20 @@ fn read_env(){
         env_loading = false
         env_loaded = r.is_ok
         if !r.is_ok {
-            ui.env_line.set_text(r.error)
+            env_rows = [{k: "Context" v: sentence(r.error) c: #xDC0005}]
+            ui.env_kv.render()
             return nil
         }
-        let room = "no room attached"
+        let room = "Not attached"
         if r.data.room_attached {
-            room = r.data.room_name
-            if room.is_nil() { room = "a room" }
+            room = r.data["room_name"]
+            if room.is_nil() { room = "A room" }
         }
-        ui.env_line.set_text(r.data.platform + " · " + r.data.view_mode + " layout · " + room)
+        env_rows = [{k: "Room" v: room c: #x333333},
+            {k: "Platform" v: platform_name(r.data.platform) c: #x333333},
+            {k: "Layout" v: if r.data.view_mode == "mobile" {"Mobile"} else {"Desktop"} c: #x333333}]
+        ui.env_kv.render()
+        return nil
     })
 }
 
@@ -96,16 +194,36 @@ fn read_prefs(){
         prefs_loading = false
         prefs_loaded = r.is_ok
         if !r.is_ok {
-            ui.prefs_line.set_text(r.error)
+            show_prefs_note(sentence(r.error))
             return nil
         }
         show_prefs(r.data)
+        return nil
     })
 }
 
+fn show_prefs_note(text){
+    prefs_rows = []
+    ui.prefs_kv.render()
+    ui.prefs_kv_w.render()
+    ui.prefs_note.set_text(text)
+    ui.prefs_note_w.set_text(text)
+    ui.prefs_note_wrap.set_visible(true)
+    ui.prefs_note_wrap_w.set_visible(true)
+}
+
 fn show_prefs(p){
-    ui.prefs_line.set_text(p.view_mode + " (" + p.view_mode_override + ") · zoom " + p.ui_zoom + " · thumbnails " + p.thumbnail_max_height + "px")
-    ui.prefs_more.set_text("send on Enter " + yes_no(p.send_on_enter) + " · read receipts shown " + yes_no(p.show_read_receipts))
+    let mode = if p.view_mode == "mobile" {"Mobile"} else {"Desktop"}
+    let how = if p.view_mode_override == "auto" {" (automatic)"} else {" (set in Settings)"}
+    prefs_rows = [{k: "View mode" v: mode + how c: #x333333},
+        {k: "UI zoom" v: "" + floor(p.ui_zoom * 100 + 0.5) + "%" c: #x333333},
+        {k: "Thumbnails" v: "Up to " + p.thumbnail_max_height + " px tall" c: #x333333},
+        {k: "Send on Enter" v: if p.send_on_enter {"On"} else {"Off"} c: #x333333},
+        {k: "Read receipts" v: if p.show_read_receipts {"Shown"} else {"Hidden"} c: #x333333}]
+    ui.prefs_note_wrap.set_visible(false)
+    ui.prefs_note_wrap_w.set_visible(false)
+    ui.prefs_kv.render()
+    ui.prefs_kv_w.render()
 }
 
 fn read_device(){
@@ -115,31 +233,61 @@ fn read_device(){
         device_loading = false
         device_loaded = r.is_ok
         if !r.is_ok {
-            ui.device_line.set_text(r.error)
+            show_device_note(sentence(r.error))
             return nil
         }
-        let tz = r.data.time_zone
-        if tz.is_nil() { tz = "UTC" + r.data.utc_offset_minutes / 60 }
-        let locale = r.data.locale
-        if locale.is_nil() { locale = "unknown locale" }
-        ui.device_line.set_text(r.data.platform + " · " + tz + " · " + locale)
+        utc_offset = r.data["utc_offset_minutes"]
+        let tz = r.data["time_zone"]
+        if utc_offset.is_nil() {
+            if tz.is_nil() { tz = "Unknown" }
+        } else {
+            if tz.is_nil() { tz = offset_text(utc_offset) } else { tz = tz + " (" + offset_text(utc_offset) + ")" }
+        }
+        let locale = r.data["locale"]
+        if locale.is_nil() { locale = "Unknown" }
+        device_rows = [{k: "Platform" v: platform_name(r.data.platform) c: #x333333},
+            {k: "Time zone" v: tz c: #x333333},
+            {k: "Locale" v: locale c: #x333333}]
+        ui.device_note_wrap.set_visible(false)
+        ui.device_note_wrap_w.set_visible(false)
+        ui.device_kv.render()
+        ui.device_kv_w.render()
+        ui.event_list.render()
+        ui.events_head.set_text("EVENTS · NEWEST FIRST")
+        return nil
     })
 }
 
+fn show_device_note(text){
+    device_rows = []
+    ui.device_kv.render()
+    ui.device_kv_w.render()
+    ui.device_note.set_text(text)
+    ui.device_note_w.set_text(text)
+    ui.device_note_wrap.set_visible(true)
+    ui.device_note_wrap_w.set_visible(true)
+}
+
+let failed_verbs = {"ui.pane.set_side": "Couldn't move the pane" "ui.pane.break_out": "Couldn't pop out"
+    "ui.pane.minimize": "Couldn't minimize" "ui.pane.restore": "Couldn't restore the pane" "ui.pane.close": "Couldn't close"}
+
 fn pane_call(service, args){
+    pane_say("")
     host.request(service, args, fn(r){
         if r.is_ok { return nil }
-        let line = service + ": " + r.error
-        log(line)
-        ui.pane_state.set_text(line)
+        let verb = failed_verbs[service]
+        if verb.is_nil() { verb = "Couldn't change the pane" }
+        log_line(verb + ": " + sentence(r.error), #xDC0005)
+        pane_say(verb + ": " + sentence(r.error))
     })
 }
 
 fn minimize_briefly(){
+    pane_say("")
     host.request("ui.pane.minimize", nil, fn(r){
         if !r.is_ok {
-            log("Minimize: " + r.error)
-            ui.pane_state.set_text(r.error)
+            log_line("Couldn't minimize: " + sentence(r.error), #xDC0005)
+            pane_say("Couldn't minimize: " + sentence(r.error))
             return nil
         }
         // Start the five seconds after permission and minimization have completed.
@@ -149,19 +297,32 @@ fn minimize_briefly(){
 
 fn on_focus_changed(json){
     let ev = json.parse_json()
-    log("focus: foreground " + yes_no(ev.foreground))
+    log(if ev.foreground {"Pane is on screen"} else {"Pane went off screen"})
     read_pane()
 }
 
 fn on_surface_changed(json){
     let ev = json.parse_json()
-    let side = ev.side
-    if side.is_nil() { side = "none" }
-    log("surface: " + ev.surface + ", side " + side)
+    log(surface_text(ev.surface, ev["side"]))
     read_pane()
 }
 
+// Narrow panes stack keys over values; wide ones put settings and device side by side.
 fn on_app_resize(w, h){
+    let narrow = w < 300
+    let wide = w >= 700
+    if narrow != is_narrow || wide != is_wide {
+        is_narrow = narrow
+        is_wide = wide
+        ui.refresh_btn.set_text(if narrow {"↻"} else {"Refresh"})
+        ui.info_stack.set_visible(!wide)
+        ui.info_wide.set_visible(wide)
+        ui.env_kv.render()
+        ui.prefs_kv.render()
+        ui.device_kv.render()
+        ui.prefs_kv_w.render()
+        ui.device_kv_w.render()
+    }
     if resize_pending { return nil }
     resize_pending = start_timeout(0.5, || {
         resize_pending = false
@@ -171,22 +332,34 @@ fn on_app_resize(w, h){
 }
 
 fn on_prefs_changed(json){
-    log("settings changed")
+    log("Robrix settings changed")
     show_prefs(json.parse_json())
 }
 
 fn on_active_room_changed(json){
     let ev = json.parse_json()
+    let name = ev["name"]
+    if name.is_nil() { name = "a room" }
     if ev.kind == "space" {
-        log("looking at a space")
+        log("Viewing a space")
         return nil
     }
-    log("looking at " + ev.kind + " " + ev.name)
+    if ev.kind == "thread" {
+        log("Viewing a thread in " + name)
+        return nil
+    }
+    if ev.kind == "invite" {
+        log("Viewing an invite to " + name)
+        return nil
+    }
+    log("Viewing room " + name)
 }
 
 fn on_navigation_changed(json){
     let ev = json.parse_json()
-    log("screen: " + ev.screen)
+    let name = screen_names[ev.screen]
+    if name.is_nil() { name = "" + ev.screen }
+    log("Screen: " + name)
 }
 
 fn subscribe(name){
@@ -196,7 +369,11 @@ fn subscribe(name){
     host.request("events.subscribe", {event: name}, fn(r){
         pending_events.retain(|event| event != name)
         if r.is_ok { subscribed_events.push(name) }
-        if !r.is_ok { log(name + ": " + r.error) }
+        if !r.is_ok {
+            let what = event_names[name]
+            if what.is_nil() { what = "Live updates" }
+            log_line(what + " are off: " + sentence(r.error), #xDC0005)
+        }
     })
 }
 
@@ -237,85 +414,275 @@ fn setup(retry){
     setup_pending = true
     host.request("permissions.request", {perms: ["robrix-preferences", "robrix-observe", "device-info"], retry: retry}, fn(r){
         setup_pending = false
-        if !r.is_ok { ui.pane_state.set_text(r.error) return nil }
+        if !r.is_ok { pane_say(sentence(r.error)) return nil }
         read_env()
         read_pane()
         if r.data.permissions["robrix-preferences"] == true && host.has("host.prefs.read") { read_prefs() }
-        else { ui.prefs_line.set_text("Permission denied. Click Refresh to ask again.") }
+        else { show_prefs_note("Not shared with this app. Tap Refresh to ask again.") }
         if r.data.permissions["device-info"] == true && host.has("device.info.read") { read_device() }
-        else { ui.device_line.set_text("Permission denied. Click Refresh to ask again.") }
+        else { show_device_note("Not shared with this app. Tap Refresh to ask again.") }
         subscribed_events.retain(|event| host.has(event))
         if r.data.permissions["robrix-preferences"] == true && host.has("on_prefs_changed") { subscribe("on_prefs_changed") }
         if r.data.permissions["robrix-observe"] == true {
             if host.has("on_active_room_changed") { subscribe("on_active_room_changed") }
             if host.has("on_navigation_changed") { subscribe("on_navigation_changed") }
         }
+        return nil
     })
 }
 
-let _boot = start_timeout(0.05, || setup(false))
+let _boot = start_timeout(0.05, || {
+    ui.env_kv.render()
+    setup(false)
+})
 
 View{
-    width: Fill height: Fill flow: Down align: Align{x: 0.5}
+    width: Fill height: Fill flow: Down
     col := ScrollYView{
-        width: Fill height: Fill flow: Down spacing: 10 padding: 14
-        RoundedView{
-            width: Fill height: Fit flow: Down spacing: 4 padding: 12
-            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
-            Label{ text: "THIS PANE" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
-            env_line := Label{ text: "…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
-            pane_line := Label{ text: "…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} } }
-            pane_state := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
-            dock_controls := View{
-                width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 6 margin: Inset{top: 4} visible: false
-                Button{ text: "Top" on_click: || pane_call("ui.pane.set_side", {side: "top"}) draw_text +: { color: #x1C274C } }
-                Button{ text: "Bottom" on_click: || pane_call("ui.pane.set_side", {side: "bottom"}) draw_text +: { color: #x1C274C } }
-                Button{ text: "Left" on_click: || pane_call("ui.pane.set_side", {side: "left"}) draw_text +: { color: #x1C274C } }
-                Button{ text: "Right" on_click: || pane_call("ui.pane.set_side", {side: "right"}) draw_text +: { color: #x1C274C } }
-                Button{ text: "Pop out" on_click: || pane_call("ui.pane.break_out", nil) draw_text +: { color: #x1C274C } }
-                Button{ text: "Minimize" on_click: || pane_call("ui.pane.minimize", nil) draw_text +: { color: #x1C274C } }
-                Button{ text: "Minimize for 5 s" on_click: || minimize_briefly() draw_text +: { color: #x1C274C } }
+        width: Fill height: Fill flow: Down spacing: 12 padding: 14
+        View{
+            width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
+            View{
+                width: Fill height: Fit flow: Down spacing: 3
+                pane_line := Label{ text: "Reading this pane…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
+                pane_state := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
             }
-            dock_note := Label{
-                text: "Pane movement and minimizing are available for apps docked in a room."
-                visible: false width: Fill padding: 0 margin: 0
-                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 11} }
-            }
-            Button{ text: "Close app" on_click: || pane_call("ui.pane.close", nil) draw_text +: { color: #xB91C1C } }
+            refresh_btn := NeutralButton{ text: "Refresh" on_click: || setup(true) }
         }
-        RoundedView{
-            width: Fill height: Fit flow: Down spacing: 4 padding: 12
-            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
-            Label{ text: "ROBRIX SETTINGS" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
-            prefs_line := Label{ text: "…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
-            prefs_more := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
+        pane_err_wrap := View{
+            width: Fill height: Fit visible: false
+            pane_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} } }
         }
-        RoundedView{
-            width: Fill height: Fit flow: Down spacing: 4 padding: 12
-            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
-            Label{ text: "DEVICE" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
-            device_line := Label{ text: "…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
-        }
-        Button{ text: "Refresh" on_click: || setup(true) draw_text +: { color: #x1C274C } }
-        Label{
-            text: "EVENTS · newest first" width: Fill padding: 0 margin: 0
-            draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} }
-        }
-        event_list := View{
-            width: Fill height: Fit flow: Down spacing: 3
-            on_render: || {
-                if events.len() == 0 {
-                    Label{
-                        text: "Nothing yet. Switch rooms, change a setting, or move this pane." width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+        View{
+            width: Fill height: Fit flow: Down spacing: 8
+            Label{ text: "THIS PANE" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+            RoundedView{
+                width: Fill height: Fit flow: Down spacing: 12 padding: 12
+                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                env_kv := View{
+                    width: Fill height: Fit flow: Down spacing: 8
+                    on_render: || {
+                        for kv in env_rows {
+                            if is_narrow {
+                                View{
+                                    width: Fill height: Fit flow: Down spacing: 2
+                                    Label{ text: kv.k padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                                    Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                }
+                            }
+                            if !is_narrow {
+                                View{
+                                    width: Fill height: Fit flow: Right spacing: 8
+                                    Label{ text: kv.k width: 96 padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                                    Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                }
+                            }
+                        }
                     }
-                } else {
-                    let i = events.len()
-                    while i > 0 {
-                        i -= 1
-                        Label{
-                            text: events[i] width: Fill padding: 0 margin: 0
-                            draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} }
+                }
+                dock_controls := View{
+                    width: Fill height: Fit flow: Down spacing: 6 visible: false
+                    Label{ text: "Move to" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                    View{
+                        width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
+                        NeutralButton{ text: "Top" on_click: || pane_call("ui.pane.set_side", {side: "top"}) }
+                        NeutralButton{ text: "Bottom" on_click: || pane_call("ui.pane.set_side", {side: "bottom"}) }
+                        NeutralButton{ text: "Left" on_click: || pane_call("ui.pane.set_side", {side: "left"}) }
+                        NeutralButton{ text: "Right" on_click: || pane_call("ui.pane.set_side", {side: "right"}) }
+                    }
+                }
+                dock_note := View{
+                    width: Fill height: Fit visible: false
+                    Label{ text: "Moving and minimizing work when the app is docked in a room." width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                }
+                View{
+                    width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
+                    dock_pop := View{
+                        width: Fit height: Fit visible: false
+                        NeutralButton{ text: "Pop out" on_click: || pane_call("ui.pane.break_out", nil) }
+                    }
+                    dock_min := View{
+                        width: Fit height: Fit visible: false
+                        NeutralButton{ text: "Minimize" on_click: || pane_call("ui.pane.minimize", nil) }
+                    }
+                    dock_brief := View{
+                        width: Fit height: Fit visible: false
+                        NeutralButton{ text: "Minimize for 5 s" on_click: || minimize_briefly() }
+                    }
+                    NegativeButton{ text: "Close app" on_click: || pane_call("ui.pane.close", nil) }
+                }
+            }
+        }
+        info_stack := View{
+            width: Fill height: Fit flow: Down spacing: 12
+            View{
+                width: Fill height: Fit flow: Down spacing: 8
+                Label{ text: "ROBRIX SETTINGS" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+                RoundedView{
+                    width: Fill height: Fit flow: Down padding: 12
+                    show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                    prefs_note_wrap := View{
+                        width: Fill height: Fit
+                        prefs_note := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                    }
+                    prefs_kv := View{
+                        width: Fill height: Fit flow: Down spacing: 8
+                        on_render: || {
+                            if prefs_rows.len() == 0 { prefs_spacer := View{ width: Fill height: 0 } }
+                            for kv in prefs_rows {
+                                if is_narrow {
+                                    View{
+                                        width: Fill height: Fit flow: Down spacing: 2
+                                        Label{ text: kv.k padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                    }
+                                }
+                                if !is_narrow {
+                                    View{
+                                        width: Fill height: Fit flow: Right spacing: 8
+                                        Label{ text: kv.k width: 96 padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            View{
+                width: Fill height: Fit flow: Down spacing: 8
+                Label{ text: "DEVICE" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+                RoundedView{
+                    width: Fill height: Fit flow: Down padding: 12
+                    show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                    device_note_wrap := View{
+                        width: Fill height: Fit
+                        device_note := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                    }
+                    device_kv := View{
+                        width: Fill height: Fit flow: Down spacing: 8
+                        on_render: || {
+                            if device_rows.len() == 0 { device_spacer := View{ width: Fill height: 0 } }
+                            for kv in device_rows {
+                                if is_narrow {
+                                    View{
+                                        width: Fill height: Fit flow: Down spacing: 2
+                                        Label{ text: kv.k padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                    }
+                                }
+                                if !is_narrow {
+                                    View{
+                                        width: Fill height: Fit flow: Right spacing: 8
+                                        Label{ text: kv.k width: 96 padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        info_wide := View{
+            width: Fill height: Fit flow: Right spacing: 12 visible: false
+            View{
+                width: Fill height: Fit flow: Down spacing: 8
+                Label{ text: "ROBRIX SETTINGS" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+                RoundedView{
+                    width: Fill height: Fit flow: Down padding: 12
+                    show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                    prefs_note_wrap_w := View{
+                        width: Fill height: Fit
+                        prefs_note_w := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                    }
+                    prefs_kv_w := View{
+                        width: Fill height: Fit flow: Down spacing: 8
+                        on_render: || {
+                            if prefs_rows.len() == 0 { prefs_spacer_w := View{ width: Fill height: 0 } }
+                            for kv in prefs_rows {
+                                if is_narrow {
+                                    View{
+                                        width: Fill height: Fit flow: Down spacing: 2
+                                        Label{ text: kv.k padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                    }
+                                }
+                                if !is_narrow {
+                                    View{
+                                        width: Fill height: Fit flow: Right spacing: 8
+                                        Label{ text: kv.k width: 96 padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            View{
+                width: Fill height: Fit flow: Down spacing: 8
+                Label{ text: "DEVICE" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+                RoundedView{
+                    width: Fill height: Fit flow: Down padding: 12
+                    show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                    device_note_wrap_w := View{
+                        width: Fill height: Fit
+                        device_note_w := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                    }
+                    device_kv_w := View{
+                        width: Fill height: Fit flow: Down spacing: 8
+                        on_render: || {
+                            if device_rows.len() == 0 { device_spacer_w := View{ width: Fill height: 0 } }
+                            for kv in device_rows {
+                                if is_narrow {
+                                    View{
+                                        width: Fill height: Fit flow: Down spacing: 2
+                                        Label{ text: kv.k padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                    }
+                                }
+                                if !is_narrow {
+                                    View{
+                                        width: Fill height: Fit flow: Right spacing: 8
+                                        Label{ text: kv.k width: 96 padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        View{
+            width: Fill height: Fit flow: Down spacing: 8
+            events_head := Label{ text: "EVENTS · NEWEST FIRST · UTC" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+            events_empty_wrap := View{
+                width: Fill height: Fit
+                RoundedView{
+                    width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5}
+                    padding: Inset{top: 20 bottom: 20 left: 16 right: 16}
+                    show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                    Label{ text: "📋" padding: 0 margin: 0 draw_text +: { text_style: theme.font_regular{font_size: 28} } }
+                    Label{ text: "No events yet" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} } }
+                    Label{ text: "Switch rooms, change a setting, or move this pane." width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                }
+            }
+            event_list_wrap := View{
+                width: Fill height: Fit visible: false
+                event_list := View{
+                    width: Fill height: Fit flow: Down spacing: 6
+                    on_render: || {
+                        if events.len() == 0 { event_spacer := View{ width: Fill height: 1 } }
+                        let i = events.len()
+                        while i > 0 {
+                            i -= 1
+                            View{
+                                width: Fill height: Fit flow: Right spacing: 10
+                                Label{ text: clock(events[i].t) width: 36 padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                                Label{ text: events[i].text width: Fill padding: 0 margin: 0 draw_text +: { color: events[i].c text_style: theme.font_regular{font_size: 11} } }
+                            }
                         }
                     }
                 }

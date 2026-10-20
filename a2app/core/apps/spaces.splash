@@ -8,6 +8,26 @@
 // why-robrix-navigation: Opens a room you tap.
 // why-matrix-membership: Joins a room when you tap Join.
 
+let PrimaryButton = Button{
+    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
+    draw_bg +: {
+        border_size: 0.0 border_radius: 4.0
+        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+}
+let NeutralButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
+        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+}
+let PositiveButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #x138808 border_color_hover: #x138808 border_color_down: #x138808 border_color_focus: #x138808
+        color: #xF0FFF0 color_hover: #xD4EED4 color_down: #xB8E0B8 color_focus: #xF0FFF0 }
+    draw_text +: { color: #x138808 color_hover: #x138808 color_down: #x138808 color_focus: #x138808 }
+}
+
 let spaces_loading = false
 let spaces_loaded = false
 let rooms_loading = ""
@@ -18,15 +38,57 @@ let info_request = 0
 let info_loaded = false
 
 let items = []
+let rows = []
 let trail = []
-let empty_note = ""
+// "loading", "ready" or "error" for the list at the current level.
+let phase = "loading"
+let fail_text = ""
+let is_fail_denied = false
+let info = nil
+let is_info_failed = false
 let preview_id = ""
+let preview_kind = "ROOM"
 let preview_request = 0
 let joining_room = ""
+let is_narrow = false
+let is_compact = false
+
+let upper_map = {a: "A" b: "B" c: "C" d: "D" e: "E" f: "F" g: "G" h: "H" i: "I" j: "J" k: "K" l: "L" m: "M"
+    n: "N" o: "O" p: "P" q: "Q" r: "R" s: "S" t: "T" u: "U" v: "V" w: "W" x: "X" y: "Y" z: "Z"}
 
 fn plural(n, word){
     if "" + n == "1" { return word }
     return word + "s"
+}
+
+// "room not joined" -> "Room not joined."
+fn sentence(text){
+    let t = "" + text
+    let chars = t.split("")
+    if chars.len() < 3 { return t }
+    let first = chars[1]
+    let up = upper_map[first]
+    if up == nil { up = first }
+    let out = up + t.strip_prefix(first)
+    let last = chars[chars.len() - 2]
+    if last != "." && last != "!" && last != "?" { out = out + "." }
+    return out
+}
+
+// 15302 -> "15,302"
+fn grouped(n){
+    if n < 1000 { return "" + n }
+    let k = floor(n / 1000)
+    let r = n - k * 1000
+    let pad = ""
+    if r < 100 { pad = "0" }
+    if r < 10 { pad = "00" }
+    return grouped(k) + "," + pad + r
+}
+
+fn count_text(n, word){
+    if n.is_nil() { return "" }
+    return grouped(n) + " " + plural(n, word)
 }
 
 fn shown_name(name, id){
@@ -34,48 +96,198 @@ fn shown_name(name, id){
     return name
 }
 
-fn detail_line(it){
-    let line = "" + it.member_count + " " + plural(it.member_count, "member")
-    if it.topic != "" { line = line + " · " + it.topic }
-    return line
+fn initial(name){
+    let parts = ("" + name).split("")
+    let i = 1
+    while i < parts.len() - 1 {
+        let c = parts[i]
+        if c != "#" && c != "@" && c != "!" && c != " " {
+            let up = upper_map[c]
+            if up.is_nil() { return c }
+            return up
+        }
+        i += 1
+    }
+    return "?"
 }
 
-// The top level only lists joined spaces, so the joined mark is noise there.
-fn item_line(it){
-    if trail.len() == 0 { return detail_line(it) }
-    let mark = "○ not joined"
-    if it.joined { mark = "● joined" }
-    if it.is_space { mark = mark + " · subspace" }
-    return mark + " · " + detail_line(it)
+// Keeps a button label short; counts characters, not bytes.
+fn clip(text, n){
+    if text.len() <= n { return text }
+    let parts = text.split("")
+    if parts.len() - 2 <= n { return text }
+    let out = ""
+    let i = 1
+    while i <= n {
+        out = out + parts[i]
+        i += 1
+    }
+    return out + "…"
 }
 
-fn crumb_text(){
-    let out = "Spaces"
-    for s in trail {
-        let next = out + " / " + s.name
-        out = next
+fn rule_text(rule){
+    if rule == "public" { return "Public" }
+    if rule == "invite" { return "Invite only" }
+    if rule == "knock" || rule == "knock_restricted" { return "Ask to join" }
+    if rule == "restricted" { return "Space members" }
+    if rule == "private" { return "Private" }
+    if rule.is_nil() { return "" }
+    return "" + rule
+}
+
+fn joined_line(parts){
+    let out = ""
+    for p in parts {
+        if p == "" { continue }
+        if out != "" { out = out + " · " }
+        out = out + p
     }
     return out
+}
+
+fn row_meta(it){
+    let parts = []
+    // Compact panes fold the "Not joined" pill into this line.
+    if is_compact && !it.joined { parts.push("Not joined") }
+    if trail.len() > 0 && it.is_space { parts.push("Space") }
+    parts.push(count_text(it["member_count"], "member"))
+    if !it["topic"].is_nil() { parts.push(it["topic"]) }
+    return joined_line(parts)
+}
+
+fn build_rows(){
+    rows = []
+    let inside = trail.len() > 0
+    for it in items {
+        let bg = #xF7F9FC
+        let edge = #xF7F9FC
+        if it.room_id == preview_id {
+            bg = #xE4EEFF
+            edge = #x0f88fe
+        }
+        let pill = ""
+        if !it.joined && !is_compact { pill = "Not joined" }
+        let is_chevron = it.joined && (it.is_space || !inside)
+        rows.push({name: shown_name(it.name, it.room_id) initial: initial(shown_name(it.name, it.room_id)) meta: row_meta(it)
+            bg: bg edge: edge pill: pill is_chevron: is_chevron})
+    }
+}
+
+// The spinner says "Loading…", so the header line stays empty until there's something to count.
+fn level_line(){
+    if trail.len() == 0 {
+        if phase == "ready" && items.len() > 0 && is_compact { return count_text(items.len(), "space") }
+        if phase == "ready" && items.len() > 0 { return count_text(items.len(), "space") + " · tap one to see its rooms" }
+        return ""
+    }
+    let parts = []
+    if rooms_loaded { parts.push(count_text(items.len(), "room")) }
+    elif !info.is_nil() { parts.push(count_text(info["children_count"], "room")) }
+    if !info.is_nil() {
+        parts.push(count_text(info["member_count"], "member"))
+        parts.push(rule_text(info["join_rule"]))
+    }
+    if is_info_failed && phase != "error" { parts.push("details unavailable") }
+    return joined_line(parts)
+}
+
+fn show_header(){
+    let line = level_line()
+    ui.status.set_text(line)
+    ui.status_wrap.set_visible(line != "")
+}
+
+fn show_empty(){
+    let inside = trail.len() > 0
+    ui.loading_wrap.set_visible(phase == "loading" && items.len() == 0)
+    ui.loading_line.set_text(if inside {"Loading rooms…"} else {"Loading your spaces…"})
+    if phase == "error" {
+        ui.empty_wrap.set_visible(true)
+        ui.empty_btn_wrap.set_visible(!is_fail_denied)
+        ui.ask_btn_wrap.set_visible(is_fail_denied)
+        if is_fail_denied {
+            ui.empty_icon.set_text("🔒")
+            ui.empty_title.set_text(if inside {"Can't see this space's rooms"} else {"Can't see your spaces"})
+            ui.empty_text.set_text(if inside {"Allow Spaces to list its rooms."} else {"Allow Spaces to list your spaces."})
+            return nil
+        }
+        ui.empty_icon.set_text("😕")
+        ui.empty_title.set_text(if inside {"Couldn't load this space"} else {"Couldn't load your spaces"})
+        ui.empty_text.set_text(sentence(fail_text))
+        ui.empty_btn.set_text("Try again")
+        return nil
+    }
+    if phase == "ready" && items.len() == 0 {
+        ui.empty_wrap.set_visible(true)
+        ui.empty_btn_wrap.set_visible(false)
+        ui.ask_btn_wrap.set_visible(false)
+        ui.empty_icon.set_text("🪐")
+        ui.empty_title.set_text(if inside {"No rooms here yet"} else {"No spaces yet"})
+        ui.empty_text.set_text(if inside {"Rooms added later show up here."} else {"Spaces you join show up here."})
+        return nil
+    }
+    ui.empty_wrap.set_visible(false)
+    return nil
+}
+
+fn show_list(){
+    build_rows()
+    ui.list_wrap.set_visible(rows.len() > 0)
+    ui.item_list.render()
+    show_empty()
+    show_header()
+}
+
+fn say_alert(text){
+    ui.alert.set_text(text)
+    ui.alert_wrap.set_visible(text != "")
+}
+
+fn say_join(kind, text){
+    ui.join_wait.set_text(if kind == "wait" {text} else {""})
+    ui.join_note.set_text(if kind == "ok" {text} else {""})
+    ui.preview_err.set_text(if kind == "err" {text} else {""})
+    ui.join_wait_wrap.set_visible(kind == "wait")
+    ui.join_ok_wrap.set_visible(kind == "ok")
+    ui.preview_err_wrap.set_visible(kind == "err")
 }
 
 fn close_preview(){
     preview_id = ""
     preview_request += 1
     ui.preview_wrap.set_visible(false)
+    show_list()
 }
 
 fn show_level(){
     let inside = trail.len() > 0
-    ui.crumb.set_text(crumb_text())
     ui.back_wrap.set_visible(inside)
-    ui.info_wrap.set_visible(inside)
-    close_preview()
+    if inside {
+        let parent = "Your spaces"
+        if trail.len() > 1 { parent = trail[trail.len() - 2].name }
+        ui.back_btn.set_text("‹ " + clip(parent, 24))
+        ui.head_title.set_text(trail[trail.len() - 1].name)
+    } else {
+        ui.head_title.set_text("Your spaces")
+    }
+    ui.space_topic.set_text("")
+    ui.topic_wrap.set_visible(false)
+    say_alert("")
+    preview_id = ""
+    preview_request += 1
+    ui.preview_wrap.set_visible(false)
 }
 
 fn clear_list(){
     items = []
-    empty_note = ""
-    ui.item_list.render()
+    phase = "loading"
+    show_list()
+}
+
+fn fail(error, cap){
+    phase = "error"
+    fail_text = error
+    is_fail_denied = !host.has(cap)
 }
 
 fn load_spaces(){
@@ -83,7 +295,6 @@ fn load_spaces(){
     spaces_loading = true
     show_level()
     clear_list()
-    ui.status.set_text("Loading your spaces…")
     host.request("matrix.spaces", nil, fn(r){
         spaces_loading = false
         spaces_loaded = r.is_ok
@@ -91,15 +302,14 @@ fn load_spaces(){
         if r.is_ok {
             items = []
             for s in r.data.spaces {
-                items.push({room_id: s.space_id name: s.name topic: s.topic member_count: s.member_count is_space: true joined: true})
+                items.push({room_id: s.space_id name: s["name"] topic: s["topic"] member_count: s["member_count"] is_space: true joined: true})
             }
-            empty_note = "You haven't joined any spaces yet."
-            ui.status.set_text("" + items.len() + " " + plural(items.len(), "space") + " · tap one to explore it")
+            phase = "ready"
         } else {
-            empty_note = r.error
-            ui.status.set_text(r.error)
+            fail(r.error, "matrix.spaces.list")
         }
-        ui.item_list.render()
+        show_list()
+        return nil
     })
 }
 
@@ -110,8 +320,7 @@ fn load_rooms(){
     rooms_loading = cur.space_id
     rooms_request += 1
     let request_id = rooms_request
-    clear_list()
-    ui.status.set_text("Loading rooms…")
+    show_header()
     host.request("matrix.space_rooms", {space_id: cur.space_id}, fn(r){
         if request_id != rooms_request { return nil }
         rooms_loading = ""
@@ -120,13 +329,13 @@ fn load_rooms(){
         rooms_loaded = r.is_ok
         if r.is_ok {
             items = r.data.rooms
-            empty_note = "This space has no rooms yet."
-            ui.status.set_text("" + items.len() + " " + plural(items.len(), "room"))
+            phase = "ready"
         } else {
-            empty_note = r.error
-            ui.status.set_text(r.error)
+            items = []
+            fail(r.error, "matrix.space.rooms.list")
         }
-        ui.item_list.render()
+        show_list()
+        return nil
     })
 }
 
@@ -143,24 +352,26 @@ fn load_info(){
         if trail.len() == 0 { return nil }
         if trail[trail.len() - 1].space_id != cur.space_id { return nil }
         info_loaded = r.is_ok
-        if !r.is_ok {
-            ui.space_line.set_text(r.error)
-            return nil
+        is_info_failed = !r.is_ok
+        if r.is_ok {
+            info = r.data
+            let topic = r.data["topic"]
+            if topic.is_nil() { topic = "" }
+            ui.space_topic.set_text(topic)
+            ui.topic_wrap.set_visible(topic != "")
         }
-        let n = r.data.children_count
-        ui.space_line.set_text("" + r.data.member_count + " " + plural(r.data.member_count, "member") + " · " + n + " " + plural(n, "room") + " · " + r.data.join_rule)
-        ui.space_topic.set_text(r.data.topic)
+        show_header()
+        return nil
     })
 }
 
 fn open_current(){
-    let cur = trail[trail.len() - 1]
     info_loaded = false
     rooms_loaded = false
+    info = nil
+    is_info_failed = false
     show_level()
-    ui.space_title.set_text(cur.name)
-    ui.space_line.set_text("Loading…")
-    ui.space_topic.set_text("")
+    clear_list()
     load_info()
     load_rooms()
 }
@@ -191,8 +402,10 @@ fn tap_item(i){
         return nil
     }
     if it.joined {
+        say_alert("")
         host.request("nav.room", {room_id: it.room_id}, fn(r){
-            if !r.is_ok { ui.status.set_text(r.error) }
+            if !r.is_ok { say_alert("Couldn't open that room: " + sentence(r.error)) }
+            return nil
         })
         return nil
     }
@@ -200,43 +413,75 @@ fn tap_item(i){
     preview_request += 1
     let request_id = preview_request
     let requested_room = preview_id
+    preview_kind = if it.is_space {"SPACE"} else {"ROOM"}
+    ui.preview_kind.set_text(preview_kind + " · NOT JOINED")
+    ui.join_btn_wrap.set_visible(true)
     ui.preview_title.set_text(shown_name(it.name, it.room_id))
     ui.preview_line.set_text("Loading preview…")
-    ui.join_note.set_text("")
+    ui.preview_topic.set_text("")
+    ui.preview_topic_wrap.set_visible(false)
+    ui.join_btn.set_text(if it["join_rule"] == "knock" {"Ask to join"} else {"Join"})
+    say_join("", "")
     ui.preview_wrap.set_visible(true)
+    show_list()
     host.request("matrix.room_preview", {room: requested_room}, fn(r){
         if request_id != preview_request || preview_id != requested_room { return nil }
         if !r.is_ok {
-            ui.preview_line.set_text(r.error)
+            ui.preview_line.set_text("")
+            say_join("err", "Couldn't load a preview: " + sentence(r.error))
             return nil
         }
-        ui.preview_line.set_text(detail_line(r.data) + " · " + r.data.join_rule)
+        ui.preview_line.set_text(joined_line([count_text(r.data["member_count"], "member"), rule_text(r.data["join_rule"])]))
+        let topic = r.data["topic"]
+        if topic.is_nil() { topic = "" }
+        ui.preview_topic.set_text(topic)
+        ui.preview_topic_wrap.set_visible(topic != "")
+        if r.data["join_rule"] == "knock" { ui.join_btn.set_text("Ask to join") }
+        return nil
     })
+}
+
+// After a join or knock the card says so and drops its Join button.
+fn joined_preview(state, note){
+    ui.preview_kind.set_text(preview_kind + " · " + state)
+    ui.join_btn_wrap.set_visible(false)
+    say_join("ok", note)
 }
 
 fn join_room(){
     if joining_room != "" { return nil }
     if preview_id == "" {
-        ui.join_note.set_text("Tap a room you haven't joined first.")
+        say_alert("Tap a room you haven't joined first.")
         return nil
     }
     let requested_room = preview_id
     joining_room = requested_room
-    ui.join_note.set_text("Joining…")
+    say_join("wait", "Joining…")
     host.request("matrix.join", {room: requested_room}, fn(r){
         joining_room = ""
         if !r.is_ok {
-            if preview_id == requested_room { ui.join_note.set_text(r.error) }
-            ui.status.set_text(r.error)
+            if preview_id == requested_room { say_join("err", sentence(r.error)) } else { say_alert(sentence(r.error)) }
             return nil
         }
         if r.data.knocked {
-            if preview_id == requested_room { ui.join_note.set_text("Knocked. You're in once someone lets you in.") }
+            if preview_id == requested_room { joined_preview("ASKED TO JOIN", "Knocked. You're in once someone lets you in.") }
             return nil
         }
-        if preview_id == requested_room { ui.join_note.set_text("Joined! Tap it in the list to open it.") }
+        if preview_id == requested_room { joined_preview("JOINED", "Joined! Tap it in the list to open it.") }
         load_rooms()
+        return nil
     })
+}
+
+fn on_app_resize(w, h){
+    let narrow = w < 300
+    let compact = w < 400
+    if narrow == is_narrow && compact == is_compact { return nil }
+    is_narrow = narrow
+    is_compact = compact
+    ui.refresh_btn.set_text(if narrow {"↻"} else {"Refresh"})
+    show_list()
+    return nil
 }
 
 fn on_permissions_changed(caps){
@@ -249,6 +494,7 @@ fn on_permissions_changed(caps){
         if !info_loaded && host.has("matrix.space.info.read") { load_info() }
         if !rooms_loaded && host.has("matrix.space.rooms.list") { load_rooms() }
     }
+    return nil
 }
 
 let _boot = start_timeout(0.05, || {
@@ -261,63 +507,131 @@ let _boot = start_timeout(0.05, || {
 })
 
 View{
-    width: Fill height: Fill flow: Down align: Align{x: 0.5}
+    width: Fill height: Fill flow: Down
     col := ScrollYView{
-        width: Fill height: Fill flow: Down spacing: 10 padding: 14
+        width: Fill height: Fill flow: Down spacing: 12 padding: 14
         View{
-            width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-            crumb := Label{ text: "Spaces" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
-            Button{ text: "Refresh" on_click: || reload() draw_text +: { color: #x1C274C } }
+            width: Fill height: Fit flow: Down spacing: 8
             back_wrap := View{
                 width: Fit height: Fit visible: false
-                Button{ text: "Back" on_click: || go_back() draw_text +: { color: #x1C274C } }
+                back_btn := NeutralButton{ text: "‹ Your spaces" on_click: || go_back() }
+            }
+            View{
+                width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
+                View{
+                    width: Fill height: Fit flow: Down spacing: 3
+                    head_title := Label{ text: "Your spaces" width: Fill max_lines: 2 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
+                    status_wrap := View{
+                        width: Fill height: Fit visible: false
+                        status := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                    }
+                }
+                refresh_btn := NeutralButton{ text: "Refresh" on_click: || reload() }
+            }
+            topic_wrap := View{
+                width: Fill height: Fit visible: false
+                space_topic := Label{ text: "" width: Fill max_lines: 3 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
             }
         }
-        status := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
-        info_wrap := View{
-            width: Fill height: Fit flow: Down visible: false
-            RoundedView{
-                width: Fill height: Fit flow: Down spacing: 4 padding: 12
-                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
-                space_title := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 14} } }
-                space_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
-                space_topic := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
-            }
+        alert_wrap := View{
+            width: Fill height: Fit visible: false
+            alert := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} } }
         }
         preview_wrap := View{
-            width: Fill height: Fit flow: Down visible: false
+            width: Fill height: Fit visible: false
             RoundedView{
-                width: Fill height: Fit flow: Down spacing: 6 padding: 12
-                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
-                Label{ text: "NOT JOINED" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 10} } }
-                preview_title := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 14} } }
-                preview_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
+                width: Fill height: Fit flow: Down spacing: 8 padding: 12
+                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                View{
+                    width: Fill height: Fit flow: Down spacing: 3
+                    preview_kind := Label{ text: "ROOM · NOT JOINED" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+                    preview_title := Label{ text: "" width: Fill max_lines: 2 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
+                    preview_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                }
+                preview_topic_wrap := View{
+                    width: Fill height: Fit visible: false
+                    preview_topic := Label{ text: "" width: Fill max_lines: 4 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
+                }
                 View{
                     width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
-                    Button{ text: "Join" on_click: || join_room() draw_text +: { color: #x1C274C } }
-                    Button{ text: "Close" on_click: || close_preview() draw_text +: { color: #x1C274C } }
+                    join_btn_wrap := View{
+                        width: Fit height: Fit
+                        join_btn := PositiveButton{ text: "Join" on_click: || join_room() }
+                    }
+                    NeutralButton{ text: "Close" on_click: || close_preview() }
                 }
-                join_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 12} } }
+                join_wait_wrap := View{
+                    width: Fill height: Fit visible: false
+                    join_wait := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                }
+                join_ok_wrap := View{
+                    width: Fill height: Fit visible: false
+                    join_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x138808 text_style: theme.font_regular{font_size: 10} } }
+                }
+                preview_err_wrap := View{
+                    width: Fill height: Fit visible: false
+                    preview_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} } }
+                }
             }
         }
-        item_list := ScrollYView{
-            width: Fill height: Fill{min: 80} flow: Down spacing: 5
-            on_item_tap: |i| tap_item(i)
-            on_render: || {
-                if items.len() == 0 {
-                    Label{ text: empty_note width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 12} } }
-                } else {
-                    for it in items {
+        loading_wrap := View{
+            width: Fill height: Fit flow: Right spacing: 10 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24}
+            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
+            loading_line := Label{ text: "Loading your spaces…" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+        }
+        empty_wrap := View{
+            width: Fill height: Fit visible: false
+            RoundedView{
+                width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5}
+                padding: Inset{top: 20 bottom: 20 left: 16 right: 16}
+                show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                empty_icon := Label{ text: "🪐" padding: 0 margin: 0 draw_text +: { text_style: theme.font_regular{font_size: 28} } }
+                empty_title := Label{ text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} } }
+                empty_text := Label{ text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                empty_btn_wrap := View{
+                    width: Fit height: Fit visible: false margin: Inset{top: 6}
+                    empty_btn := NeutralButton{ text: "Try again" on_click: || reload() }
+                }
+                ask_btn_wrap := View{
+                    width: Fit height: Fit visible: false margin: Inset{top: 6}
+                    PrimaryButton{ text: "Ask again" on_click: || reload() }
+                }
+            }
+        }
+        list_wrap := View{
+            width: Fill height: Fill{min: 80} visible: false
+            item_list := ScrollYView{
+                width: Fill height: Fill flow: Down spacing: 8
+                on_item_tap: |i| tap_item(i)
+                on_render: || {
+                    // A render with no children keeps the old ones, so an empty list draws a spacer.
+                    if rows.len() == 0 { list_spacer := View{ width: Fill height: 1 } }
+                    for r in rows {
                         RoundedView{
-                            width: Fill height: Fit flow: Down spacing: 2 padding: 10
-                            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
-                            Label{
-                                text: shown_name(it.name, it.room_id) width: Fill padding: 0 margin: 0
-                                draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} }
+                            width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
+                            padding: Inset{top: 10 bottom: 10 left: 10 right: 12}
+                            show_bg: true draw_bg +: { color: r.bg border_size: 1.0 border_color: r.edge border_radius: 8.0 }
+                            if !is_narrow {
+                                RoundedView{
+                                    width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
+                                    show_bg: true draw_bg +: { color: #x52b2ac border_radius: 16.0 }
+                                    Label{ text: r.initial padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
+                                }
                             }
-                            Label{
-                                text: item_line(it) width: Fill padding: 0 margin: 0
-                                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 11} }
+                            View{
+                                width: Fill height: Fit flow: Down spacing: 2
+                                Label{ text: r.name width: Fill max_lines: 1 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} } }
+                                Label{ text: r.meta width: Fill max_lines: 2 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                            }
+                            if r.pill != "" {
+                                RoundedView{
+                                    width: Fit height: Fit padding: Inset{top: 3 bottom: 3 left: 8 right: 8}
+                                    show_bg: true draw_bg +: { color: #xFFFFFF border_size: 1.0 border_color: #xC8C8C8 border_radius: 10.0 }
+                                    Label{ text: r.pill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 9.5} } }
+                                }
+                            }
+                            if r.is_chevron {
+                                Label{ text: "›" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 16} } }
                             }
                         }
                     }

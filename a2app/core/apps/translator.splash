@@ -1,0 +1,2501 @@
+// name: Translator
+// icon: 🌍
+// tint: #2B8A3E
+// description: Translates this room's messages and your replies through a translation service you choose.
+// permissions: matrix-room-read, matrix-room-watch, network, robrix-composer, clipboard-write, device-info, matrix.room.messages.read, on_room_message, network.http, host.composer.insert, device.clipboard.write, device.info.read
+// why-matrix-room-read: Shows this room's recent messages so you can translate them.
+// why-matrix-room-watch: Translates new messages as they arrive, when you turn that on.
+// why-network: Sends the messages and text you translate to your translation service (MyMemory unless you choose another).
+// why-robrix-composer: Puts your translated reply in the message box for you to review and send.
+// why-clipboard-write: Copies a translation when you tap Copy.
+// why-device-info: Uses your device's language and time zone for the default translation language and message dates.
+
+// ---- Languages
+
+// mm and lt are each service's code for the language.
+let languages = [
+    {id: "en", name: "English", english: "English", mm: "en", lt: "en"}
+    {id: "zh-CN", name: "简体中文", english: "Chinese (Simplified)", mm: "zh-CN", lt: "zh"}
+    {id: "zh-TW", name: "繁體中文", english: "Chinese (Traditional)", mm: "zh-TW", lt: "zt"}
+    {id: "ja", name: "日本語", english: "Japanese", mm: "ja", lt: "ja"}
+    {id: "ko", name: "한국어", english: "Korean", mm: "ko", lt: "ko"}
+    {id: "es", name: "Español", english: "Spanish", mm: "es", lt: "es"}
+    {id: "fr", name: "Français", english: "French", mm: "fr", lt: "fr"}
+    {id: "de", name: "Deutsch", english: "German", mm: "de", lt: "de"}
+    {id: "it", name: "Italiano", english: "Italian", mm: "it", lt: "it"}
+    {id: "pt", name: "Português", english: "Portuguese", mm: "pt", lt: "pt"}
+    {id: "ru", name: "Русский", english: "Russian", mm: "ru", lt: "ru"}
+    {id: "uk", name: "Українська", english: "Ukrainian", mm: "uk", lt: "uk"}
+    {id: "pl", name: "Polski", english: "Polish", mm: "pl", lt: "pl"}
+    {id: "nl", name: "Nederlands", english: "Dutch", mm: "nl", lt: "nl"}
+    {id: "tr", name: "Türkçe", english: "Turkish", mm: "tr", lt: "tr"}
+    {id: "vi", name: "Tiếng Việt", english: "Vietnamese", mm: "vi", lt: "vi"}
+    {id: "id", name: "Bahasa Indonesia", english: "Indonesian", mm: "id", lt: "id"}
+    {id: "el", name: "Ελληνικά", english: "Greek", mm: "el", lt: "el"}
+]
+
+// Detected languages that can be named but not chosen (the fonts lack their scripts or they are rare here).
+let other_languages = [
+    {id: "ar", english: "Arabic"} {id: "he", english: "Hebrew"} {id: "hi", english: "Hindi"} {id: "th", english: "Thai"}
+    {id: "sv", english: "Swedish"} {id: "da", english: "Danish"} {id: "no", english: "Norwegian"} {id: "fi", english: "Finnish"}
+    {id: "cs", english: "Czech"} {id: "ro", english: "Romanian"} {id: "hu", english: "Hungarian"} {id: "fa", english: "Persian"}
+    {id: "bg", english: "Bulgarian"} {id: "ca", english: "Catalan"} {id: "ms", english: "Malay"} {id: "bn", english: "Bengali"}
+]
+
+let mymemory_host = "api.mymemory.translated.net"
+// MyMemory accepts at most 500 bytes of text per request.
+let chunk_limit = 450
+let chunk_max = 8
+let batch_limit = 12
+let live_queue_limit = 10
+let row_limit = 40
+let cache_limit = 200
+// Keeps cache.json far below the 1 MiB file limit.
+let cache_byte_limit = 400000
+// Robrix sends at most 500 characters a message; longer text from elsewhere is cut here.
+let body_byte_limit = 4000
+// Each HTTP request costs 8 host request tokens, refilled at 6 a second, so queued requests wait 1.4 s.
+let pace_seconds = 1.4
+
+let upper_letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("")
+let lower_letters = "abcdefghijklmnopqrstuvwxyz".split("")
+let hex_digits = "0123456789abcdef".split("")
+let month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+let entity_pattern = regex("&(#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[a-zA-Z]{2,8});")
+let named_entities = {quot: "\"", amp: "&", lt: "<", gt: ">", apos: "'", nbsp: " ", hellip: "…", mdash: "—", ndash: "–",
+    lsquo: "‘", rsquo: "’", ldquo: "“", rdquo: "”", laquo: "«", raquo: "»", iexcl: "¡", iquest: "¿", euro: "€", deg: "°"}
+
+// ---- State
+
+// Saved settings; an empty target or reply language means automatic.
+let settings = {target: "", reply: "", service: "mymemory", server: "", key: "", is_live: false}
+
+let is_attached = false
+let device_lang = "en"
+let utc_offset = 0
+let is_device_read = false
+let is_device_pending = false
+
+// Oldest first, as Robrix sends them; shown holds the same rows newest first.
+let rows = []
+let shown = []
+let read_token = 0
+let is_read_pending = false
+let is_read_done = false
+let is_setup_pending = false
+let list_line = "Loading…"
+// Status tones: 0 neutral, 1 done, 2 failed.
+let list_tone = 0
+// The card shown while the list is empty, with an optional button.
+let empty_icon = "⏳"
+let empty_title = "Loading messages…"
+let empty_line = "Reading the latest messages in this room."
+let empty_ask = ""
+let render_year = 0
+
+// One request in flight at a time; jobs wait in the queue.
+let queue = []
+let in_flight = nil
+let is_pacing = false
+let batch_id = 0
+let batch_total = 0
+let batch_done = 0
+
+// Translations by "event_id|language", oldest first in cache_list.
+let cache = {}
+let cache_list = []
+let cache_bytes = 0
+let is_cache_dirty = false
+// The language last detected for each message.
+let detected_by_event = {}
+// How often each language was detected in messages that needed translating: [{id, n}].
+let detections = []
+
+let is_watch_ask_pending = false
+let is_live_pending = false
+let is_live_ready = false
+let live_gen = 0
+let is_live_paused = false
+let live_line = "Off. New messages aren't translated."
+let live_pause_line = ""
+
+let reply_token = 0
+let reply_result = nil
+let reply_line = ""
+let reply_tone = 0
+let is_inserting = false
+let is_copying = false
+
+let menu_open = ""
+let is_service_open = false
+let is_libre_form = false
+let service_line = ""
+let service_tone = 0
+let is_narrow = false
+// Tiny panes move Refresh into the action row and shorten the privacy note.
+let is_tiny = false
+// Known once env answers; a room-less pane has nothing to watch.
+let is_detached = false
+
+// ---- Small helpers
+
+fn text_of(v){
+    if v.is_string() { return v }
+    return ""
+}
+
+// Reading a missing field is an error, so optional fields go through here.
+fn get(obj, key, fallback){
+    if !obj.is_object() { return fallback }
+    for field value in obj {
+        if field.to_string() == key { return value }
+    }
+    return fallback
+}
+
+// Objects have no has(); delete answers nil for a missing key without raising an error.
+fn lookup(table, key){
+    let value = table.delete(key)
+    if !value.is_nil() { table[key] = value }
+    return value
+}
+
+fn join(list, sep){
+    let out = ""
+    let i = 0
+    for item in list {
+        if i > 0 { out = out + sep }
+        out = out + item
+        i += 1
+    }
+    return out
+}
+
+fn is_containing(text, part){ return text.search(part) >= 0 }
+
+fn is_ending_with(text, suffix){ return text.strip_suffix(suffix) != text }
+
+// Ends host-provided text with a period so a hint can follow it.
+fn sentence(text){
+    let trimmed = text.trim()
+    if trimmed == "" || is_ending_with(trimmed, ".") || is_ending_with(trimmed, "!") || is_ending_with(trimmed, "?") { return trimmed }
+    return trimmed + "."
+}
+
+// A host error on a line of its own: without Robrix's lead-in, capitalized, ending in a period.
+fn error_line(text){
+    let codes = sentence(text.strip_prefix("couldn't read messages: ")).to_chars()
+    if codes.len() == 0 { return "Something went wrong." }
+    if codes[0] >= 97 && codes[0] <= 122 { codes[0] = codes[0] - 32 }
+    return codes.to_string()
+}
+
+fn plural(n, word){
+    if "" + n == "1" { return word }
+    return word + "s"
+}
+
+fn mark(is_on){
+    if is_on { return "● " }
+    return "○ "
+}
+
+fn ascii_lower(text){
+    let out = ""
+    for c in text.split("") {
+        let mapped = c
+        let i = 0
+        for u in upper_letters {
+            if u == c { mapped = lower_letters[i] }
+            i += 1
+        }
+        out = out + mapped
+    }
+    return out
+}
+
+fn last_chars(text, n){
+    let chars = text.split("")
+    let count = chars.len() - 2
+    let out = ""
+    let i = 0
+    for c in chars {
+        if c != "" && i > count - n { out = out + c }
+        i += 1
+    }
+    return out
+}
+
+// Short texts such as "ok" or a link come back unchanged, with a guessed source language.
+fn is_echo(translated, original){
+    let a = translated.trim()
+    let b = original.trim()
+    if a == b { return true }
+    // Lowercasing ASCII keeps the byte length, so only same-length short texts can still match.
+    if a.len() != b.len() || a.len() > 80 { return false }
+    return ascii_lower(a) == ascii_lower(b)
+}
+
+// Keeps the work for one message bounded, cutting at a word when it can; .len() counts UTF-8 bytes.
+// An array's to_string() joins its strings natively.
+fn clip_body(text){
+    if text.len() <= body_byte_limit { return text }
+    let words = text.split(" ")
+    let kept = []
+    let size = 0
+    let i = 0
+    while i < words.len() && size + words[i].len() + 1 <= body_byte_limit {
+        kept.push(words[i])
+        kept.push(" ")
+        size += words[i].len() + 1
+        i += 1
+    }
+    if i == 0 {
+        let chars = words[0].split("")
+        let j = 0
+        while j < chars.len() && size + chars[j].len() <= body_byte_limit {
+            kept.push(chars[j])
+            size += chars[j].len()
+            j += 1
+        }
+        nil
+    }
+    return kept.to_string().trim() + " …"
+}
+
+// The avatar letter: the name's first character, skipping a leading "@".
+fn initial(name){
+    let chars = name.split("")
+    if chars.len() < 3 { return "?" }
+    let c = chars[1]
+    if c == "@" && chars.len() > 3 { c = chars[2] }
+    let i = 0
+    for l in lower_letters {
+        if l == c && l != "" { return upper_letters[i] }
+        i += 1
+    }
+    return c
+}
+
+fn flag(is_on){
+    if is_on { return "1" }
+    return "0"
+}
+
+fn set_list(line, tone){
+    list_line = line
+    list_tone = tone
+    return nil
+}
+
+fn set_empty(icon, title, line, ask){
+    empty_icon = icon
+    empty_title = title
+    empty_line = line
+    empty_ask = ask
+    return nil
+}
+
+fn set_reply_line(line, tone){
+    reply_line = line
+    reply_tone = tone
+    return nil
+}
+
+fn set_service_line(line, tone){
+    service_line = line
+    service_tone = tone
+    return nil
+}
+
+// ---- Language names and defaults
+
+// Keyed copies of the language lists, so lookups don't scan them.
+let lang_table = {}
+let name_table = {}
+
+fn build_tables(){
+    for l in languages {
+        lang_table[l.id] = l
+        name_table[l.id] = l.english
+    }
+    for o in other_languages { name_table[o.id] = o.english }
+    return nil
+}
+
+fn lang_of(id){
+    if !id.is_string() || id == "" { return nil }
+    return lookup(lang_table, id)
+}
+
+// The English name of a language, or "" for a code Translator doesn't know.
+fn english_name(id){
+    if !id.is_string() || id == "" { return "" }
+    return text_of(lookup(name_table, id))
+}
+
+fn lang_name(id){
+    let l = lang_of(id)
+    if l.is_object() { return l.name }
+    return english_name(id)
+}
+
+// Maps tags like "es-ES", "zh_TW" or "ZH-Hant" to a language id.
+fn canonical_lang(tag){
+    if !tag.is_string() { return "" }
+    let subtags = join(ascii_lower(tag.trim()).split("_"), "-").split("-")
+    let main = subtags[0]
+    if main == "zt" { return "zh-TW" }
+    if main == "zh" || main == "cmn" {
+        for s in subtags {
+            if s == "tw" || s == "hk" || s == "mo" || s == "hant" { return "zh-TW" }
+        }
+        return "zh-CN"
+    }
+    if main == "iw" { return "he" }
+    if main == "in" { return "id" }
+    if main == "nb" || main == "nn" { return "no" }
+    return main
+}
+
+fn target_lang(){
+    if settings.target != "" { return settings.target }
+    return device_lang
+}
+
+// The language most often detected in this room, or "" before any detection.
+fn room_lang(){
+    let best = ""
+    let most = 0
+    for c in detections {
+        if c.n > most {
+            best = c.id
+            most = c.n
+        }
+    }
+    return best
+}
+
+fn reply_lang(){
+    if settings.reply != "" { return settings.reply }
+    let best = room_lang()
+    if best == "" { return "en" }
+    return best
+}
+
+fn count_detection(lang){
+    if !lang_of(lang).is_object() { return nil }
+    for c in detections {
+        if c.id == lang {
+            c.n = c.n + 1
+            return nil
+        }
+    }
+    detections.push({id: lang, n: 1})
+    return nil
+}
+
+// ---- Text handling
+
+fn split_keep(pieces, sep){
+    let out = []
+    for piece in pieces {
+        let parts = piece.split(sep)
+        let i = 0
+        for part in parts {
+            let text = part
+            if i + 1 < parts.len() { text = part + sep }
+            if text != "" { out.push(text) }
+            i += 1
+        }
+    }
+    return out
+}
+
+fn sentences(text){
+    let pieces = [text]
+    for sep in ["\n", ". ", "! ", "? ", "; ", "。", "！", "？"] {
+        pieces = split_keep(pieces, sep)
+    }
+    return pieces
+}
+
+// A sentence too long for one request falls back to words, then characters.
+fn small_pieces(sentence){
+    if sentence.len() <= chunk_limit { return [sentence] }
+    let out = []
+    for word in split_keep([sentence], " ") {
+        if word.len() <= chunk_limit {
+            out.push(word)
+        } else {
+            for c in word.split("") {
+                if c != "" { out.push(c) }
+            }
+            nil
+        }
+    }
+    return out
+}
+
+// Splits text into requests of at most chunk_limit UTF-8 bytes (.len() counts bytes).
+fn chunk_text(text){
+    if text.len() <= chunk_limit { return [text] }
+    let chunks = []
+    let current = ""
+    for sentence in sentences(text) {
+        for piece in small_pieces(sentence) {
+            let longer = current + piece
+            if current != "" && longer.len() > chunk_limit {
+                chunks.push(current)
+                longer = piece
+            }
+            current = longer
+        }
+    }
+    if current != "" { chunks.push(current) }
+    return chunks
+}
+
+fn hex_value(c){
+    let lower = ascii_lower(c)
+    let i = 0
+    for h in hex_digits {
+        if h == lower && h != "" { return i - 1 }
+        i += 1
+    }
+    return -1
+}
+
+fn parse_hex(text){
+    let value = 0
+    for c in text.split("") {
+        if c == "" { continue }
+        let digit = hex_value(c)
+        if digit < 0 { return -1 }
+        value = value * 16 + digit
+    }
+    return value
+}
+
+fn hex4(code){
+    let out = ""
+    let unit = 4096
+    for step in 4 {
+        out = out + hex_digits[floor(code / unit) % 16 + 1]
+        unit = unit / 16
+    }
+    return out
+}
+
+// The VM has no chr(), so a character is built through a JSON \u escape.
+fn char_of(code){
+    if !code.is_number() || code < 1 || code > 65535 { return "" }
+    if code >= 55296 && code <= 57343 { return "" }
+    let json = "\"\\u" + hex4(code) + "\""
+    let value = json.parse_json()
+    if value.is_string() { return value }
+    return ""
+}
+
+fn entity_code(name){
+    let digits = name.strip_prefix("#")
+    if digits == name { return -1 }
+    let hex = digits.strip_prefix("x")
+    if hex == digits { hex = digits.strip_prefix("X") }
+    if hex != digits { return parse_hex(hex) }
+    let value = digits.to_f64()
+    if !value.is_number() { return -1 }
+    return value
+}
+
+fn entity_text(name){
+    let code = entity_code(name)
+    if code < 0 {
+        let named = get(named_entities, name, nil)
+        if named.is_string() { return named }
+        return "&" + name + ";"
+    }
+    let ch = char_of(code)
+    if ch == "" { return "&" + name + ";" }
+    return ch
+}
+
+// MyMemory returns HTML entities such as &#39; and &quot;.
+fn unescape(text){
+    if !is_containing(text, "&") { return text }
+    let out = ""
+    let i = 0
+    for part in text.split(entity_pattern) {
+        if i % 2 == 0 { out = out + part } else { out = out + entity_text(part) }
+        i += 1
+    }
+    return out
+}
+
+fn head_chars(text, n){
+    let out = ""
+    let count = 0
+    for c in text.split("") {
+        if count >= n { break }
+        if c != "" {
+            out = out + c
+            count += 1
+        }
+    }
+    return out
+}
+
+fn hex_text(code){
+    let out = ""
+    let rest = code
+    while rest > 0 {
+        out = hex_digits[rest % 16 + 1] + out
+        rest = floor(rest / 16)
+    }
+    return out
+}
+
+fn has_high_surrogate(text){
+    for p in ["\\ud8", "\\ud9", "\\uda", "\\udb", "\\uD8", "\\uD9", "\\uDA", "\\uDB"] {
+        if is_containing(text, p) { return true }
+    }
+    return false
+}
+
+fn is_high_prefix(piece){
+    let rest = piece.strip_prefix("d")
+    if rest == piece { rest = piece.strip_prefix("D") }
+    if rest == piece { return false }
+    for p in ["8", "9", "a", "b", "A", "B"] {
+        if rest.strip_prefix(p) != rest { return true }
+    }
+    return false
+}
+
+// The code point of a high surrogate piece followed by a low one, or -1.
+fn surrogate_code(high_piece, next){
+    if high_piece.len() != 4 || !is_high_prefix(high_piece) { return -1 }
+    let high = parse_hex(high_piece)
+    let low = parse_hex(head_chars(next, 4))
+    if high < 55296 || high > 56319 || low < 56320 || low > 57343 { return -1 }
+    return 65536 + (high - 55296) * 1024 + (low - 56320)
+}
+
+// Rewrites an escaped pair such as \ud83c\udf89 as \u{1f389}, which the VM can read.
+fn join_surrogates(part){
+    if !has_high_surrogate(part) { return part }
+    let pieces = part.split("\\u")
+    let out = pieces[0]
+    let i = 1
+    while i < pieces.len() {
+        let code = -1
+        if i + 1 < pieces.len() { code = surrogate_code(pieces[i], pieces[i + 1]) }
+        if code > 0 {
+            let next = pieces[i + 1]
+            out = out + "\\u{" + hex_text(code) + "}" + next.strip_prefix(head_chars(next, 4))
+            i += 2
+        } else {
+            out = out + "\\u" + pieces[i]
+            i += 1
+        }
+    }
+    return out
+}
+
+// The VM's JSON reader lacks the \/ \b \f escapes and drops surrogate pairs; MyMemory
+// escapes every slash, and every emoji as a pair.
+fn plain_escapes(body){
+    if !is_containing(body, "\\") { return body }
+    let parts = []
+    for part in body.split("\\\\") {
+        parts.push(join_surrogates(join(join(join(part.split("\\/"), "/").split("\\b"), "").split("\\f"), " ")))
+    }
+    return join(parts, "\\\\")
+}
+
+// Civil date from days since 1970 (Howard Hinnant's algorithm).
+fn civil(days){
+    let z = days + 719468
+    let era = floor(z / 146097)
+    let doe = z - era * 146097
+    let yoe = floor((doe - floor(doe / 1460) + floor(doe / 36524) - floor(doe / 146096)) / 365)
+    let doy = doe - (365 * yoe + floor(yoe / 4) - floor(yoe / 100))
+    let mp = floor((5 * doy + 2) / 153)
+    let d = doy - floor((153 * mp + 2) / 5) + 1
+    let m = mp + 3
+    if mp >= 10 { m = mp - 9 }
+    let y = yoe + era * 400
+    if m <= 2 { y += 1 }
+    return {y: y, m: m, d: d}
+}
+
+fn time_label(ts){
+    if !ts.is_number() || ts <= 0 { return "" }
+    let age = time_now() - ts / 1000
+    if age < 60 { return "Just now" }
+    if age < 3600 { return "" + floor(age / 60) + "m ago" }
+    if age < 86400 { return "" + floor(age / 3600) + "h ago" }
+    let day = civil(floor((ts + utc_offset * 60000) / 86400000))
+    let label = month_names[day.m - 1] + " " + day.d
+    if day.y != render_year { label = label + ", " + day.y }
+    return label
+}
+
+// ---- Saved settings and translations
+
+fn read_json(path){
+    if !fs.exists(path) { return nil }
+    return fs.read(path).parse_json()
+}
+
+fn save_settings(){
+    fs.write("/settings.json", settings.to_json())
+    return nil
+}
+
+fn save_cache(){
+    if !is_cache_dirty { return nil }
+    is_cache_dirty = false
+    fs.write("/cache.json", cache_list.to_json())
+    fs.write("/detected.json", detections.to_json())
+    return nil
+}
+
+fn cache_key(event_id, lang){ return event_id + "|" + lang }
+
+fn cached(event_id, lang){ return lookup(cache, cache_key(event_id, lang)) }
+
+fn event_of(key){ return key.split("|")[0] }
+
+fn entry_bytes(entry){ return entry.to_json().len() + 1 }
+
+// The cache is bounded by entries and by bytes; the oldest entries go first.
+fn remember(key, text, source_lang, is_same){
+    let entry = lookup(cache, key)
+    if entry.is_object() {
+        cache_bytes -= entry_bytes(entry)
+        entry.text = text
+        entry.source = source_lang
+        entry.is_same = is_same
+    } else {
+        entry = {key: key, text: text, source: source_lang, is_same: is_same}
+        cache[key] = entry
+        cache_list.push(entry)
+    }
+    cache_bytes += entry_bytes(entry)
+    if source_lang != "" { detected_by_event[event_of(key)] = source_lang }
+    while cache_list.len() > 1 && (cache_list.len() > cache_limit || cache_bytes > cache_byte_limit) {
+        let oldest = cache_list[0]
+        cache_bytes -= entry_bytes(oldest)
+        cache.delete(oldest.key)
+        detected_by_event.delete(event_of(oldest.key))
+        cache_list.remove(0)
+    }
+    is_cache_dirty = true
+    return nil
+}
+
+fn restore_entry(e){
+    let key = text_of(get(e, "key", ""))
+    let text = text_of(get(e, "text", ""))
+    let is_same = get(e, "is_same", false) == true
+    if !is_containing(key, "|") || text.len() > 8000 || (!is_same && text == "") { return nil }
+    remember(key, text, text_of(get(e, "source", "")), is_same)
+    return nil
+}
+
+fn load(){
+    let saved = read_json("/settings.json")
+    if saved.is_object() {
+        let target = text_of(get(saved, "target", ""))
+        if lang_of(target).is_object() { settings.target = target }
+        let reply = text_of(get(saved, "reply", ""))
+        if lang_of(reply).is_object() { settings.reply = reply }
+        let server = text_of(get(saved, "server", ""))
+        if server_problem(server) == "" { settings.server = server }
+        let key = text_of(get(saved, "key", ""))
+        if key.len() <= 200 && settings.server != "" { settings.key = key }
+        if get(saved, "service", "") == "libre" && settings.server != "" { settings.service = "libre" }
+        settings.is_live = get(saved, "is_live", false) == true
+    }
+    let saved_counts = read_json("/detected.json")
+    if saved_counts.is_array() {
+        for c in saved_counts {
+            let n = get(c, "n", 0)
+            let lang = text_of(get(c, "id", ""))
+            if n.is_number() && n > 0 && lang_of(lang).is_object() && detection_count(lang) == 0 { detections.push({id: lang, n: n}) }
+        }
+        nil
+    }
+    let saved_cache = read_json("/cache.json")
+    if saved_cache.is_array() {
+        for e in saved_cache { restore_entry(e) }
+        nil
+    }
+    is_cache_dirty = false
+    if settings.is_live { live_line = "Starting…" }
+    return nil
+}
+
+fn detection_count(lang){
+    for c in detections {
+        if c.id == lang { return c.n }
+    }
+    return 0
+}
+
+// ---- Room messages
+
+fn is_text_kind(kind){ return kind == "m.text" || kind == "m.notice" || kind == "m.emote" }
+
+fn to_row(m){
+    if !m.is_object() { return nil }
+    let event_id = text_of(get(m, "event_id", ""))
+    let body = text_of(get(m, "body", ""))
+    let kind = text_of(get(m, "msgtype", "m.text"))
+    if event_id == "" || body.trim() == "" || !is_text_kind(kind) { return nil }
+    // The room display name, as Robrix sends it for history and live rows; older hosts sent only the short name.
+    let sender = text_of(get(m, "sender_name", ""))
+    if sender == "" { sender = text_of(get(m, "sender", "")) }
+    if sender == "" { sender = text_of(get(m, "sender_id", "")) }
+    let ts = get(m, "ts", 0)
+    if !ts.is_number() { ts = 0 }
+    return {event_id: event_id, sender: sender, body: clip_body(body), ts: ts, is_own: get(m, "is_own", false) == true,
+        is_live_row: false, is_hidden: false, error: "", state: "plain", tr_text: "", tr_note: "", when: "", initial: initial(sender)}
+}
+
+fn row_of(event_id){
+    for m in rows {
+        if m.event_id == event_id { return m }
+    }
+    return nil
+}
+
+// Keeps per-row choices and messages that arrived while the list was loading.
+fn merge_rows(list){
+    let earlier = {}
+    for old in rows { earlier[old.event_id] = old }
+    let fresh = {}
+    for row in list {
+        fresh[row.event_id] = row
+        let old = lookup(earlier, row.event_id)
+        if old.is_object() {
+            row.is_hidden = old.is_hidden
+            row.error = old.error
+        }
+    }
+    for old in rows {
+        if old.is_live_row && lookup(fresh, old.event_id).is_nil() { list.push(old) }
+    }
+    while list.len() > row_limit { list.remove(0) }
+    rows = list
+    return nil
+}
+
+fn show_loading(){
+    set_list("Loading recent messages…", 0)
+    if rows.len() == 0 { set_empty("⏳", "Loading messages…", "Reading the latest messages in this room.", "") }
+    render_rows()
+    return nil
+}
+
+fn setup(is_retry){
+    if is_setup_pending { return nil }
+    if !is_attached {
+        set_list("Open Translator from a room to read its messages.", 0)
+        show_list_status()
+        return nil
+    }
+    is_setup_pending = true
+    // Device facts give the default language and local dates; they never prompt outside strict mode.
+    let perms = ["matrix-room-read"]
+    if settings.is_live { perms.push("matrix-room-watch") }
+    perms.push("device-info")
+    show_loading()
+    host.request("permissions.request", {perms: perms, retry: is_retry}, fn(r){
+        is_setup_pending = false
+        if !r.is_ok {
+            set_list(sentence(r.error) + " Tap Refresh to try again.", 2)
+            if rows.len() == 0 { set_empty("😕", "Couldn't ask for permission", error_line(r.error), "Try again") }
+            if settings.is_live && !is_live_ready && !is_live_pending { live_line = "Not started: " + list_line }
+            show_controls()
+            render_rows()
+            return nil
+        }
+        let answers = get(r.data, "permissions", nil)
+        if get(answers, "device-info", false) == true && host.has("device.info.read") && !is_device_read { read_device() }
+        if get(answers, "matrix-room-read", false) == true && host.has("matrix.room.messages.read") {
+            load_messages()
+        } else {
+            deny_read()
+        }
+        if settings.is_live {
+            if get(answers, "matrix-room-watch", false) == true && host.has("on_room_message") {
+                subscribe_live()
+            } else {
+                live_refused("Off: watching this room for new messages wasn't allowed. Turn it on to ask again.")
+            }
+        }
+        return nil
+    })
+    return nil
+}
+
+fn load_messages(){
+    if is_read_pending { return nil }
+    is_read_pending = true
+    read_token += 1
+    let token = read_token
+    show_loading()
+    host.request("matrix.read_messages", {limit: 30}, fn(r){
+        if token != read_token { return nil }
+        is_read_pending = false
+        is_read_done = r.is_ok
+        if !r.is_ok {
+            set_list("Couldn't load messages: " + error_line(r.error) + " Tap Refresh to try again.", 2)
+            if rows.len() == 0 { set_empty("😕", "Couldn't read this room", error_line(r.error), "Try again") }
+            render_rows()
+            return nil
+        }
+        let list = []
+        let found = get(r.data, "messages", nil)
+        if found.is_array() {
+            for m in found {
+                let row = to_row(m)
+                if row.is_object() { list.push(row) }
+            }
+            nil
+        }
+        merge_rows(list)
+        set_list("", 0)
+        set_empty("📭", "No messages yet", "Tap Refresh later, or turn on Translate new messages.", "")
+        render_rows()
+        return nil
+    })
+    return nil
+}
+
+fn deny_read(){
+    set_list("Reading this room wasn't allowed. Tap Refresh to ask again, or allow it in Mini Apps settings.", 0)
+    set_empty("🔒", "Can't read this room", "Allow Translator to read this room's messages. You can still translate your own reply below.", "Ask again")
+    render_rows()
+    return nil
+}
+
+// A revoked read stops refreshing; messages shown earlier stay.
+fn stop_reading(){
+    read_token += 1
+    is_read_pending = false
+    is_read_done = false
+    set_list("Reading this room is off, so the list won't refresh. Tap Refresh to ask again.", 0)
+    if rows.len() == 0 { set_empty("🔒", "Reading this room is off", "Allow Translator to read this room's messages.", "Ask again") }
+    render_rows()
+    return nil
+}
+
+fn refresh(){
+    if !is_attached {
+        set_list("Open Translator from a room to read its messages.", 0)
+        show_list_status()
+        return nil
+    }
+    setup(true)
+    return nil
+}
+
+// ---- Translation queue
+
+fn site_host(){
+    if settings.service == "libre" { return host_of(settings.server) }
+    return mymemory_host
+}
+
+fn service_name(){
+    if settings.service == "libre" { return "LibreTranslate" }
+    return "MyMemory"
+}
+
+fn new_job(kind, event_id, text, target, origin){
+    let chunks = [text]
+    if settings.service == "mymemory" { chunks = chunk_text(text) }
+    let is_clipped = chunks.len() > chunk_max
+    if is_clipped {
+        let kept = []
+        for c in chunks {
+            if kept.len() < chunk_max { kept.push(c) }
+        }
+        chunks = kept
+    }
+    return {kind: kind, event_id: event_id, text: text, target: target, origin: origin, service: settings.service, batch: batch_id,
+        chunks: chunks, idx: 0, out: [], detected: "", token: 0, is_clipped: is_clipped, is_cancelled: false}
+}
+
+fn push_front(job){
+    let upcoming = [job]
+    for j in queue { upcoming.push(j) }
+    queue = upcoming
+    return nil
+}
+
+fn count_origin(origin){
+    let n = 0
+    for job in queue {
+        if job.origin == origin { n += 1 }
+    }
+    return n
+}
+
+fn is_sending(event_id){
+    return in_flight.is_object() && !in_flight.is_cancelled && in_flight.kind == "msg" && in_flight.event_id == event_id
+}
+
+fn is_queued(event_id){
+    for job in queue {
+        if job.kind == "msg" && job.event_id == event_id { return true }
+    }
+    return false
+}
+
+fn is_reply_pending(){
+    if in_flight.is_object() && !in_flight.is_cancelled && in_flight.kind == "reply" { return true }
+    for job in queue {
+        if job.kind == "reply" { return true }
+    }
+    return false
+}
+
+// Drops queued jobs of one kind ("" for every kind); a request already sent finishes unseen.
+fn cancel_jobs(kind){
+    queue.retain(|job| kind != "" && job.kind != kind)
+    if in_flight.is_object() && (kind == "" || in_flight.kind == kind) { in_flight.is_cancelled = true }
+    if kind != "reply" {
+        batch_total = 0
+        batch_done = 0
+    }
+    return nil
+}
+
+fn http_args(job, text){
+    let l = lang_of(job.target)
+    if job.service == "libre" {
+        let body = {q: text, source: "auto", target: l.lt, format: "text"}
+        if settings.key != "" { body.api_key = settings.key }
+        return {url: settings.server + "/translate", method: "POST", headers: {"Content-Type": "application/json"}, body: body.to_json()}
+    }
+    let pair = "autodetect|" + l.mm
+    return {url: "https://" + mymemory_host + "/get?q=" + text.url_encode() + "&langpair=" + pair.url_encode()}
+}
+
+fn pump(){
+    if in_flight.is_object() || is_pacing || queue.len() == 0 { return nil }
+    let job = queue[0]
+    queue.remove(0)
+    send_chunk(job)
+    return nil
+}
+
+fn send_chunk(job){
+    let text = job.chunks[job.idx].trim()
+    if text == "" {
+        job.out.push("")
+        job.idx += 1
+        next_step(job)
+        after_request()
+        return nil
+    }
+    in_flight = job
+    host.request("network.http", http_args(job, text), fn(r){
+        in_flight = nil
+        on_reply(job, r)
+        after_request()
+        return nil
+    })
+    return nil
+}
+
+fn on_reply(job, r){
+    if job.is_cancelled { return nil }
+    let res = read_reply(job, r)
+    if res.error != "" {
+        fail_job(job, res)
+        return nil
+    }
+    job.out.push(res.text)
+    if job.detected == "" { job.detected = res.detected }
+    job.idx += 1
+    next_step(job)
+    return nil
+}
+
+// After each part: the next part, or the finished job. A same-language first part ends it early.
+fn next_step(job){
+    let is_same = job.detected != "" && job.detected == job.target
+    if job.idx < job.chunks.len() && !is_same {
+        push_front(job)
+        return nil
+    }
+    finish_job(job, is_same)
+    return nil
+}
+
+fn after_request(){
+    if queue.len() > 0 {
+        is_pacing = start_timeout(pace_seconds, || {
+            is_pacing = false
+            pump()
+            render_rows()
+        }) != nil
+        if !is_pacing { pump() }
+    }
+    show_controls()
+    show_reply()
+    render_rows()
+    // Saved last, so a storage failure can't leave the screen stale.
+    save_cache()
+    return nil
+}
+
+fn failure(text){ return {text: "", detected: "", error: text, retry: "tap"} }
+
+// A block set in Mini Apps settings stays until it is lifted there.
+fn blocked(text){ return {text: "", detected: "", error: text, retry: "settings"} }
+
+// The quota note already says when and how to try again.
+fn used_up(text){ return {text: "", detected: "", error: text, retry: "none"} }
+
+fn success(text, detected){ return {text: text, detected: detected, error: "", retry: "tap"} }
+
+// What to tap next, if anything.
+fn retry_hint(res, control){
+    if res.retry == "none" { return "" }
+    if res.retry == "settings" { return " Allow it in Mini Apps settings, then tap" + control + " again." }
+    return " Tap" + control + " to try again."
+}
+
+fn quota_text(){
+    return "MyMemory's free daily limit (about 5,000 characters) is used up. Try again tomorrow, or use a LibreTranslate server under Translation service."
+}
+
+fn unreadable(){ return failure("MyMemory sent a reply Translator couldn't read.") }
+
+fn refusal(error){
+    let site = site_host()
+    if is_containing(error, "blocked for this app") || is_containing(error, "blocked by your app") {
+        return blocked("Internet access to " + site + " is blocked for Translator.")
+    }
+    if is_containing(error, "HTTP requests") || is_containing(error, "ermission denied") {
+        return failure("Internet access to " + site + " wasn't allowed.")
+    }
+    if is_containing(error, "foreground") || is_containing(error, "Open this mini-app") {
+        return failure("Open Translator to approve sending text to " + site + ".")
+    }
+    if is_containing(error, "not approved") || is_containing(error, "before this data can be sent") || is_containing(error, "approval is needed") {
+        return failure("Sharing this room's text with " + site + " wasn't approved.")
+    }
+    if is_containing(error, "too many requests") { return failure("Robrix asked Translator to slow down.") }
+    return failure("Couldn't reach " + site + ": " + sentence(error))
+}
+
+fn read_reply(job, r){
+    if !r.is_ok { return refusal(r.error) }
+    let status = get(r.data, "status", nil)
+    let data = plain_escapes(text_of(get(r.data, "body", ""))).parse_json()
+    if job.service == "libre" { return read_libre(status, data) }
+    return read_mymemory(job, status, data)
+}
+
+fn read_mymemory(job, status, data){
+    let response = get(data, "responseData", nil)
+    let text = get(response, "translatedText", nil)
+    let is_warning = text.is_string() && is_containing(text, "MYMEMORY WARNING")
+    if get(data, "quotaFinished", false) == true || is_warning { return used_up(quota_text()) }
+    if !status.is_number() { return unreadable() }
+    if status < 200 || status >= 300 { return failure("MyMemory answered with HTTP error " + status + ".") }
+    let code = get(data, "responseStatus", nil)
+    if !text.is_string() || !(code.is_number() || code.is_string()) { return unreadable() }
+    if is_containing(text, "DISTINCT LANGUAGES") { return success("", job.target) }
+    if "" + code != "200" {
+        let details = text_of(get(data, "responseDetails", ""))
+        let line = "MyMemory couldn't translate this (error " + code + ")"
+        if details != "" { line = line + ": " + details }
+        return failure(line + ".")
+    }
+    if text.trim() == "" { return failure("MyMemory sent back an empty translation.") }
+    return success(unescape(text), canonical_lang(get(response, "detectedLanguage", "")))
+}
+
+fn read_libre(status, data){
+    let unclear = failure("The LibreTranslate server sent a reply Translator couldn't read.")
+    if !status.is_number() { return unclear }
+    if status < 200 || status >= 300 {
+        let line = "The LibreTranslate server answered with HTTP error " + status
+        let detail = text_of(get(data, "error", ""))
+        if detail != "" { line = line + ": " + detail }
+        return failure(line + ".")
+    }
+    let text = get(data, "translatedText", nil)
+    if !text.is_string() { return unclear }
+    let detected = get(data, "detectedLanguage", nil)
+    return success(text, canonical_lang(get(detected, "language", "")))
+}
+
+fn joined(job){
+    let glue = " "
+    if job.target == "zh-CN" || job.target == "zh-TW" || job.target == "ja" { glue = "" }
+    let out = ""
+    let i = 0
+    for part in job.out {
+        if i > 0 {
+            let sep = glue
+            if is_ending_with(job.chunks[i - 1], "\n") { sep = "\n" }
+            out = out + sep
+        }
+        out = out + part
+        i += 1
+    }
+    if job.is_clipped { out = out + " …" }
+    return out
+}
+
+// An unchanged result needs no translation and says nothing about the room's language.
+fn finish_job(job, is_same){
+    let text = ""
+    let detected = job.detected
+    let is_unchanged = is_same
+    if !is_same {
+        text = joined(job)
+        if is_echo(text, job.text) {
+            is_unchanged = true
+            text = ""
+            detected = ""
+        }
+    }
+    if job.kind == "reply" {
+        finish_reply(job, text, detected, is_unchanged)
+        return nil
+    }
+    remember(cache_key(job.event_id, job.target), text, detected, is_unchanged)
+    if !is_unchanged { count_detection(detected) }
+    let m = row_of(job.event_id)
+    if m.is_object() {
+        m.error = ""
+        m.is_hidden = false
+    }
+    if job.origin == "batch" && job.batch == batch_id { batch_step() }
+    return nil
+}
+
+fn batch_step(){
+    if batch_total == 0 { return nil }
+    batch_done += 1
+    if batch_done >= batch_total { finish_batch() }
+    return nil
+}
+
+fn finish_batch(){
+    set_list("Translated " + batch_total + " " + plural(batch_total, "message") + " into " + lang_name(target_lang()) + ".", 1)
+    batch_total = 0
+    batch_done = 0
+    return nil
+}
+
+fn fail_job(job, res){
+    if job.kind == "reply" {
+        if job.token == reply_token { set_reply_line(res.error + " Your text is kept." + retry_hint(res, " Translate"), 2) }
+    } else {
+        let m = row_of(job.event_id)
+        if m.is_object() { m.error = res.error + retry_hint(res, "") }
+    }
+    halt(res)
+    return nil
+}
+
+// A failure stops queued and live work; nothing is retried until you ask again.
+fn halt(res){
+    if count_origin("reply") > 0 { set_reply_line(res.error + " Your text is kept." + retry_hint(res, " Translate"), 2) }
+    if batch_total > 0 { set_list("Stopped: " + res.error + retry_hint(res, " Translate all"), 2) }
+    for job in queue {
+        let m = nil
+        if job.kind == "msg" && job.origin == "tap" { m = row_of(job.event_id) }
+        if m.is_object() { m.error = "Stopped after an error. Tap to try again." }
+    }
+    queue = []
+    batch_total = 0
+    batch_done = 0
+    if is_live_ready && settings.is_live {
+        is_live_paused = true
+        live_pause_line = "Paused: " + res.error + retry_hint(res, " Resume")
+        live_line = live_pause_line
+    }
+    return nil
+}
+
+// ---- Translating messages
+
+// Queues one message; false when its known language already matches, so nothing is sent.
+fn enqueue_message(m, origin){
+    let target = target_lang()
+    m.error = ""
+    let known = lookup(detected_by_event, m.event_id)
+    if known.is_string() && known == target {
+        remember(cache_key(m.event_id, target), "", target, true)
+        return false
+    }
+    let job = new_job("msg", m.event_id, m.body, target, origin)
+    if origin == "tap" {
+        push_front(job)
+        return true
+    }
+    queue.push(job)
+    return true
+}
+
+// The list shows rows newest first.
+fn tap_shown(i){
+    if i < 0 || i >= shown.len() { return nil }
+    let m = shown[i]
+    if is_sending(m.event_id) || is_queued(m.event_id) { return nil }
+    let entry = cached(m.event_id, target_lang())
+    if entry.is_object() {
+        if !entry.is_same { m.is_hidden = !m.is_hidden }
+        render_rows()
+        return nil
+    }
+    enqueue_message(m, "tap")
+    pump()
+    render_rows()
+    return nil
+}
+
+fn translate_all(){
+    if batch_total > 0 {
+        queue.retain(|job| job.origin != "batch")
+        set_list("Stopped. " + batch_done + " of " + batch_total + " translated.", 0)
+        batch_total = 0
+        batch_done = 0
+        show_controls()
+        render_rows()
+        return nil
+    }
+    let target = target_lang()
+    // The newest first, so translations fill in from the top of the list.
+    let picked = []
+    let i = rows.len() - 1
+    while i >= 0 && picked.len() < batch_limit {
+        let m = rows[i]
+        if !cached(m.event_id, target).is_object() && !is_sending(m.event_id) && !is_queued(m.event_id) { picked.push(m) }
+        i -= 1
+    }
+    if picked.len() == 0 {
+        set_list("Every message shown is already translated into " + lang_name(target) + ".", 0)
+        show_list_status()
+        return nil
+    }
+    batch_id += 1
+    let done = 0
+    for m in picked {
+        if !enqueue_message(m, "batch") { done += 1 }
+    }
+    batch_total = picked.len()
+    batch_done = done
+    if batch_done >= batch_total { finish_batch() }
+    pump()
+    show_controls()
+    render_rows()
+    return nil
+}
+
+// ---- Live translation of new messages
+
+fn live_on_line(){ return "On. New messages from others are translated as they arrive." }
+
+fn live_off_line(){ return "Off. New messages aren't translated." }
+
+fn watch_off_line(){ return "Paused: watching this room is off. It resumes when it's allowed again." }
+
+fn toggle_live(){
+    set_live(!settings.is_live)
+    return nil
+}
+
+fn set_live(is_on){
+    if !is_on {
+        settings.is_live = false
+        save_settings()
+        stop_live(live_off_line())
+        return nil
+    }
+    if !is_attached {
+        live_line = "Open Translator from a room to translate its new messages."
+        show_controls()
+        return nil
+    }
+    settings.is_live = true
+    save_settings()
+    if is_live_ready || is_live_pending || is_watch_ask_pending {
+        show_controls()
+        return nil
+    }
+    is_live_paused = false
+    if host.has("on_room_message") {
+        subscribe_live()
+        return nil
+    }
+    is_watch_ask_pending = true
+    live_line = "Asking to watch this room for new messages…"
+    show_controls()
+    host.request("permissions.request", {perms: ["matrix-room-watch"], retry: true}, fn(r){
+        is_watch_ask_pending = false
+        if !settings.is_live { return nil }
+        let answers = get(r.data, "permissions", nil)
+        if r.is_ok && get(answers, "matrix-room-watch", false) == true && host.has("on_room_message") {
+            subscribe_live()
+            return nil
+        }
+        let why = "watching this room for new messages wasn't allowed."
+        if !r.is_ok { why = sentence(r.error) }
+        live_refused("Off: " + why + " Turn it on to ask again.")
+        return nil
+    })
+    return nil
+}
+
+fn live_refused(note){
+    settings.is_live = false
+    save_settings()
+    live_line = note
+    show_controls()
+    return nil
+}
+
+fn subscribe_live(){
+    if is_live_pending || is_live_ready { return nil }
+    is_live_pending = true
+    let gen = live_gen
+    live_line = "Starting…"
+    show_controls()
+    host.request("events.subscribe", {event: "on_room_message"}, fn(r){
+        if gen != live_gen {
+            if r.is_ok && !settings.is_live { unsubscribe_live() }
+            return nil
+        }
+        is_live_pending = false
+        is_live_ready = r.is_ok
+        if r.is_ok {
+            live_line = live_on_line()
+            if is_live_paused { live_line = live_pause_line }
+            show_controls()
+            return nil
+        }
+        live_refused("Off: " + sentence(r.error) + " Turn it on to ask again.")
+        return nil
+    })
+    return nil
+}
+
+fn unsubscribe_live(){
+    host.request("events.unsubscribe", {event: "on_room_message"}, fn(r){
+        if !r.is_ok {
+            live_line = "Couldn't stop watching new messages: " + sentence(r.error)
+            show_controls()
+        }
+        return nil
+    })
+    return nil
+}
+
+fn stop_live(note){
+    let was_active = is_live_ready
+    live_gen += 1
+    is_live_ready = false
+    is_live_pending = false
+    is_live_paused = false
+    live_pause_line = ""
+    queue.retain(|job| job.origin != "live")
+    live_line = note
+    if was_active { unsubscribe_live() }
+    show_controls()
+    render_rows()
+    return nil
+}
+
+// New messages from others that are still untranslated, at most a queue's worth, oldest first.
+fn live_backlog(){
+    let target = target_lang()
+    let newest = []
+    let i = rows.len() - 1
+    while i >= 0 && newest.len() < live_queue_limit {
+        let m = rows[i]
+        if m.is_live_row && !m.is_own && !cached(m.event_id, target).is_object() && !is_sending(m.event_id) && !is_queued(m.event_id) { newest.push(m) }
+        i -= 1
+    }
+    let out = []
+    let j = newest.len() - 1
+    while j >= 0 {
+        out.push(newest[j])
+        j -= 1
+    }
+    return out
+}
+
+// Sending during the tap lets Robrix ask again about a site you declined.
+fn resume_live(){
+    if !is_live_paused { return nil }
+    is_live_paused = false
+    live_pause_line = ""
+    live_line = live_on_line()
+    if !is_live_ready { live_line = watch_off_line() }
+    for m in live_backlog() { enqueue_message(m, "live") }
+    pump()
+    show_controls()
+    render_rows()
+    return nil
+}
+
+// Watching follows the current grant: lost hooks pause, regained ones resume.
+fn sync_live(){
+    if is_watch_ask_pending { return nil }
+    if !host.has("on_room_message") {
+        if is_live_ready || is_live_pending {
+            live_gen += 1
+            is_live_ready = false
+            is_live_pending = false
+            queue.retain(|job| job.origin != "live")
+            live_line = watch_off_line()
+        }
+        return nil
+    }
+    if settings.is_live && !is_live_ready && !is_live_pending { subscribe_live() }
+    return nil
+}
+
+fn is_live_wanted(row){
+    return settings.is_live && !is_live_paused && !row.is_own && !cached(row.event_id, target_lang()).is_object()
+}
+
+fn on_room_message(json){
+    if !is_live_ready { return nil }
+    let batch = json.parse_json()
+    if !batch.is_array() { return nil }
+    let skipped = 0
+    for m in batch {
+        let row = to_row(m)
+        if row.is_object() && !row_of(row.event_id).is_object() {
+            row.is_live_row = true
+            rows.push(row)
+            let is_wanted = is_live_wanted(row)
+            let is_queue_open = count_origin("live") < live_queue_limit
+            if is_wanted && is_queue_open { enqueue_message(row, "live") }
+            if is_wanted && !is_queue_open { skipped += 1 }
+        }
+    }
+    while rows.len() > row_limit { rows.remove(0) }
+    if skipped > 0 { live_line = "Busy: " + skipped + " new " + plural(skipped, "message") + " skipped. Tap one to translate it." }
+    pump()
+    show_controls()
+    render_rows()
+    return nil
+}
+
+// ---- Your reply
+
+fn translate_reply(){
+    let text = ui.reply_input.text().trim()
+    if text == "" {
+        set_reply_line("Write your reply first, in any language.", 0)
+        show_reply()
+        return nil
+    }
+    if text.to_chars().len() > 1000 {
+        set_reply_line("Keep your reply under 1,000 characters.", 2)
+        show_reply()
+        return nil
+    }
+    cancel_jobs("reply")
+    reply_token += 1
+    reply_result = nil
+    let job = new_job("reply", "", text, reply_lang(), "reply")
+    job.token = reply_token
+    push_front(job)
+    set_reply_line("Translating into " + lang_name(job.target) + " with " + service_name() + "…", 0)
+    show_reply()
+    pump()
+    return nil
+}
+
+fn finish_reply(job, text, detected, is_unchanged){
+    if job.token != reply_token { return nil }
+    let result_text = text
+    if is_unchanged { result_text = job.text }
+    reply_result = {text: result_text, source: job.text, target: job.target, detected: detected, is_same: is_unchanged}
+    set_reply_line("", 0)
+    return nil
+}
+
+fn reply_edited(text){
+    if !reply_result.is_object() || text.trim() == reply_result.source { return nil }
+    set_reply_line("You changed your reply. Tap Translate to update the translation.", 0)
+    show_reply()
+    return nil
+}
+
+fn insert_reply(){
+    if is_inserting { return nil }
+    if !reply_result.is_object() {
+        set_reply_line("Translate your reply first.", 0)
+        show_reply()
+        return nil
+    }
+    if !is_attached {
+        set_reply_line("Open Translator from a room to use its message box. Copy still works.", 0)
+        show_reply()
+        return nil
+    }
+    is_inserting = true
+    set_reply_line("Putting the translation in the message box…", 0)
+    show_reply()
+    host.request("composer.insert", {text: reply_result.text}, fn(r){
+        is_inserting = false
+        set_reply_line("Added to the message box. Review it there, then press Send.", 1)
+        if !r.is_ok { set_reply_line("The message box wasn't changed: " + sentence(r.error), 2) }
+        show_reply()
+        return nil
+    })
+    return nil
+}
+
+fn copy_reply(){
+    if is_copying { return nil }
+    if !reply_result.is_object() {
+        set_reply_line("Translate your reply first.", 0)
+        show_reply()
+        return nil
+    }
+    is_copying = true
+    host.request("clipboard.write", {text: reply_result.text}, fn(r){
+        is_copying = false
+        set_reply_line("Copied the translation.", 1)
+        if !r.is_ok { set_reply_line("Couldn't copy: " + sentence(r.error), 2) }
+        show_reply()
+        return nil
+    })
+    return nil
+}
+
+// ---- Languages and menus
+
+fn toggle_menu(kind){
+    if menu_open == kind { menu_open = "" } else { menu_open = kind }
+    show_menus()
+    return nil
+}
+
+fn menu_items(kind){
+    let current = settings.target
+    let auto_lang = device_lang
+    if kind == "reply" {
+        current = settings.reply
+        auto_lang = room_lang()
+        if auto_lang == "" { auto_lang = "en" }
+    }
+    let items = [{label: "Automatic · " + lang_name(auto_lang), is_selected: current == ""}]
+    for l in languages {
+        items.push({label: l.name, is_selected: current == l.id})
+    }
+    return items
+}
+
+fn choose_language(kind, i){
+    if i < 0 || i > languages.len() { return nil }
+    let id = ""
+    if i > 0 { id = languages[i - 1].id }
+    menu_open = ""
+    if kind == "target" { set_target(id) } else { set_reply(id) }
+    show_menus()
+    return nil
+}
+
+fn set_target(id){
+    let before = target_lang()
+    settings.target = id
+    save_settings()
+    if target_lang() != before {
+        let was_batch = batch_total > 0
+        cancel_jobs("msg")
+        if was_batch { set_list("Language changed. Tap Translate all to translate into " + lang_name(target_lang()) + ".", 0) }
+    }
+    show_controls()
+    render_rows()
+    return nil
+}
+
+fn set_reply(id){
+    let before = reply_lang()
+    settings.reply = id
+    save_settings()
+    if reply_lang() != before && (reply_result.is_object() || is_reply_pending()) {
+        cancel_jobs("reply")
+        reply_token += 1
+        reply_result = nil
+        set_reply_line("Tap Translate to translate your reply into " + lang_name(reply_lang()) + ".", 0)
+    }
+    show_controls()
+    show_reply()
+    return nil
+}
+
+// ---- Translation service
+
+fn host_of(url){ return url.strip_prefix("https://").split("/")[0] }
+
+fn clean_server(text){
+    let server = text.trim()
+    let previous = ""
+    while previous != server {
+        previous = server
+        server = server.strip_suffix("/").strip_suffix("/translate")
+    }
+    return server
+}
+
+fn server_problem(server){
+    if server == "" { return "Enter your LibreTranslate server's address, like https://translate.example.org." }
+    let rest = server.strip_prefix("https://")
+    if rest == server { return "Use the server's https:// address." }
+    if rest == "" || is_containing(rest, " ") || is_containing(rest, "@") || is_containing(rest, "?") || is_containing(rest, "#") || server.len() > 300 {
+        return "Enter just the server's address, like https://translate.example.org."
+    }
+    return ""
+}
+
+// The service chips, in the order service_choice draws them.
+// A LibreTranslate pick shows as chosen while its server is being entered.
+fn service_items(){
+    let is_libre = is_libre_form || settings.service == "libre"
+    return [{label: "MyMemory", is_selected: !is_libre}, {label: "LibreTranslate", is_selected: is_libre}]
+}
+
+fn pick_service(i){
+    if i == 0 { use_mymemory() }
+    if i == 1 { use_libre() }
+    return nil
+}
+
+fn toggle_service(){
+    is_service_open = !is_service_open
+    show_service()
+    return nil
+}
+
+// A new destination cancels work meant for the old one.
+fn switch_service(name){
+    settings.service = name
+    save_settings()
+    if count_origin("reply") > 0 || is_reply_pending() {
+        reply_token += 1
+        set_reply_line("Translation service changed. Tap Translate to try again.", 0)
+    }
+    cancel_jobs("")
+    is_live_paused = false
+    live_pause_line = ""
+    if is_live_ready { live_line = live_on_line() }
+    show_controls()
+    show_reply()
+    render_rows()
+    return nil
+}
+
+fn use_mymemory(){
+    is_libre_form = false
+    if settings.service != "mymemory" { switch_service("mymemory") }
+    set_service_line("Translations now go to " + mymemory_host + ".", 1)
+    show_service()
+    return nil
+}
+
+fn use_libre(){
+    is_libre_form = true
+    ui.server_input.set_text(settings.server)
+    if settings.server == "" {
+        set_service_line("Enter your server's address, then tap Save server.", 0)
+        show_service()
+        return nil
+    }
+    if settings.service != "libre" { switch_service("libre") }
+    set_service_line("Translations now go to " + host_of(settings.server) + ".", 1)
+    show_service()
+    return nil
+}
+
+// A saved key belongs to its server and is never sent to another one.
+fn save_server(){
+    let server = clean_server(ui.server_input.text())
+    let problem = server_problem(server)
+    if problem != "" {
+        set_service_line(problem, 2)
+        show_service()
+        return nil
+    }
+    let key = ui.key_input.text().trim()
+    if key.len() > 200 {
+        set_service_line("That API key is too long.", 2)
+        show_service()
+        return nil
+    }
+    let old_host = host_of(settings.server)
+    let key_note = ""
+    if key == "" && settings.key != "" && old_host != host_of(server) {
+        settings.key = ""
+        if old_host != "" { key_note = " The API key for " + old_host + " was removed." }
+    }
+    let is_new = server != settings.server || (key != "" && key != settings.key)
+    settings.server = server
+    if key != "" { settings.key = key }
+    ui.key_input.set_text("")
+    ui.server_input.set_text(server)
+    if is_new || settings.service != "libre" { switch_service("libre") }
+    save_settings()
+    set_service_line("Saved. Translations now go to " + host_of(server) + "." + key_note, 1)
+    show_service()
+    return nil
+}
+
+fn forget_key(){
+    settings.key = ""
+    save_settings()
+    set_service_line("The API key was removed.", 1)
+    show_service()
+    return nil
+}
+
+// ---- Display
+
+fn privacy_text(){
+    if is_tiny && settings.service == "mymemory" { return "🔒 Sent to MyMemory only when you translate it." }
+    return "🔒 Text is sent to " + site_host() + " only when you translate it."
+}
+
+fn source_note(lang){
+    let name = english_name(lang)
+    if name == "" { return "Translated with " + service_name() }
+    return "from " + name
+}
+
+fn decorate(m, waiting){
+    let target = target_lang()
+    let entry = cached(m.event_id, target)
+    m.when = time_label(m.ts)
+    m.state = "plain"
+    m.tr_text = ""
+    m.tr_note = ""
+    if is_sending(m.event_id) {
+        m.state = "busy"
+        m.tr_note = "Translating…"
+    } elif !lookup(waiting, m.event_id).is_nil() {
+        m.state = "busy"
+        m.tr_note = "Waiting to translate…"
+    } elif entry.is_object() && entry.is_same && entry.source == "" {
+        m.state = "muted"
+        m.tr_note = "No translation needed"
+    } elif entry.is_object() && entry.is_same {
+        m.state = "muted"
+        m.tr_note = "Already in " + english_name(target)
+    } elif entry.is_object() && m.is_hidden {
+        m.state = "muted"
+        m.tr_note = "Translation hidden. Tap to show it."
+    } elif entry.is_object() {
+        m.state = "done"
+        m.tr_text = entry.text
+        m.tr_note = source_note(entry.source)
+    } elif m.error != "" {
+        m.state = "error"
+        m.tr_note = m.error
+    }
+    return nil
+}
+
+// Parts of the screen as last written; each is written again only when it changes.
+let drawn = {rows: "", status: "", empty: "", languages: "", actions: "", privacy: "", reply: "", service: ""}
+
+// What a row shows, so an unchanged list is not built again.
+fn row_look(m){ return [m.event_id, "|", m.state, "|", m.when, "|", m.tr_note, "|", m.tr_text, "|"].to_string() }
+
+fn render_rows(){
+    render_year = civil(floor((time_now() * 1000 + utc_offset * 60000) / 86400000)).y
+    let waiting = {}
+    for job in queue {
+        if job.kind == "msg" { waiting[job.event_id] = true }
+    }
+    shown = []
+    let looks = [empty_line, flag(is_tiny)]
+    let i = rows.len() - 1
+    while i >= 0 {
+        decorate(rows[i], waiting)
+        shown.push(rows[i])
+        looks.push(row_look(rows[i]))
+        i -= 1
+    }
+    let look = looks.to_string()
+    if look != drawn.rows {
+        drawn.rows = look
+        ui.msg_list.render()
+    }
+    show_list_status()
+    return nil
+}
+
+fn loaded_line(){
+    if is_narrow { return "Tap a message to translate it" }
+    return "" + rows.len() + " recent " + plural(rows.len(), "message") + ", newest first · tap one to translate it"
+}
+
+// The card for an empty list, with a Try again or Ask again button when one helps;
+// while loading, a spinner line stands in for it.
+fn show_empty(){
+    let is_empty = rows.len() == 0
+    let look = [flag(is_empty), empty_icon, "|", empty_title, "|", empty_line, "|", empty_ask].to_string()
+    if look == drawn.empty { return nil }
+    drawn.empty = look
+    let is_loading = empty_icon == "⏳"
+    ui.empty_wrap.set_visible(is_empty)
+    ui.loading_wrap.set_visible(is_loading)
+    ui.loading_line.set_text(empty_title)
+    ui.empty_card.set_visible(!is_loading)
+    ui.empty_icon.set_text(empty_icon)
+    ui.empty_title.set_text(empty_title)
+    ui.empty_text.set_text(empty_line)
+    // Ask again is the blue button; Try again is gray.
+    let is_retry = empty_ask != "" && empty_ask != "Ask again"
+    if is_retry { ui.empty_retry.set_text(empty_ask) }
+    ui.empty_ask_wrap.set_visible(empty_ask == "Ask again")
+    ui.empty_retry_wrap.set_visible(is_retry)
+    return nil
+}
+
+// An empty list explains itself in its card, so the status line is only for messages shown.
+// Each tone has its own label; the neutral one always holds the text.
+fn show_list_status(){
+    show_empty()
+    let line = list_line
+    let tone = list_tone
+    if line == "" { line = loaded_line() }
+    if batch_total > 0 {
+        line = "Translating " + min(batch_done + 1, batch_total) + " of " + batch_total + "…"
+        tone = 0
+    }
+    let has_rows = rows.len() > 0
+    let look = line + flag(has_rows) + tone
+    if look == drawn.status { return nil }
+    drawn.status = look
+    ui.list_status.set_text(line)
+    if tone == 1 { ui.list_status_ok.set_text(line) }
+    if tone == 2 { ui.list_status_err.set_text(line) }
+    ui.list_status_n.set_visible(tone == 0)
+    ui.list_status_ok_wrap.set_visible(tone == 1)
+    ui.list_status_err_wrap.set_visible(tone == 2)
+    ui.list_status_wrap.set_visible(has_rows)
+    ui.all_wrap.set_visible(has_rows)
+    return nil
+}
+
+fn target_hint_text(){
+    if settings.target != "" { return "" }
+    if is_narrow { return "Automatic" }
+    return "Automatic · your device language"
+}
+
+fn reply_hint_text(){
+    if settings.reply != "" { return "" }
+    if is_narrow { return "Automatic" }
+    if room_lang() == "" { return "Automatic · until this room's language is detected" }
+    return "Automatic · the language used most here"
+}
+
+fn show_languages(){
+    let target = lang_name(target_lang()) + " ▼"
+    let target_hint = target_hint_text()
+    let reply = lang_name(reply_lang()) + " ▼"
+    let reply_hint = reply_hint_text()
+    let look = [target, "|", target_hint, "|", reply, "|", reply_hint].to_string()
+    if look == drawn.languages { return nil }
+    drawn.languages = look
+    ui.target_btn.set_text(target)
+    ui.target_hint.set_text(target_hint)
+    ui.target_hint_wrap.set_visible(target_hint != "")
+    ui.reply_btn.set_text(reply)
+    ui.reply_hint.set_text(reply_hint)
+    ui.reply_hint_wrap.set_visible(reply_hint != "")
+    return nil
+}
+
+// Refusals and failures read red; the pause that follows a revoked grant is just news.
+fn live_tone(){
+    if live_line == watch_off_line() { return 0 }
+    for p in ["Off: ", "Not started: ", "Paused: ", "Couldn't "] {
+        if live_line.strip_prefix(p) != live_line { return 2 }
+    }
+    return 0
+}
+
+fn show_actions(){
+    let all_label = "Translate all"
+    if batch_total > 0 { all_label = "Stop" }
+    let live_label = "Translate new messages"
+    if is_narrow { live_label = "Live" }
+    live_label = mark(settings.is_live) + live_label
+    let tone = live_tone()
+    let look = [all_label, "|", live_label, "|", live_line, flag(is_live_paused), tone, flag(is_tiny), flag(is_detached)].to_string()
+    if look == drawn.actions { return nil }
+    drawn.actions = look
+    ui.translate_all_btn.set_text(all_label)
+    ui.live_btn.set_text(live_label)
+    ui.live_wrap.set_visible(!is_detached)
+    ui.refresh_wide.set_visible(!is_tiny)
+    ui.refresh_narrow.set_visible(is_tiny)
+    // Without a room the group would be empty, and an empty group still takes the column's spacing.
+    ui.actions_wrap.set_visible(!is_detached || is_tiny)
+    ui.live_note.set_text(live_line)
+    if tone == 2 { ui.live_note_err.set_text(live_line) }
+    // Plain "off" is what the toggle already shows.
+    ui.live_note_wrap.set_visible(live_line != "" && live_line != live_off_line())
+    ui.live_note_n.set_visible(tone == 0)
+    ui.live_note_err_wrap.set_visible(tone == 2)
+    ui.resume_wrap.set_visible(is_live_paused)
+    return nil
+}
+
+fn show_privacy(){
+    let privacy = privacy_text()
+    if privacy == drawn.privacy { return nil }
+    drawn.privacy = privacy
+    ui.privacy_note.set_text(privacy)
+    return nil
+}
+
+fn show_controls(){
+    show_languages()
+    show_actions()
+    show_privacy()
+    show_list_status()
+    return nil
+}
+
+fn show_menus(){
+    ui.target_menu_wrap.set_visible(menu_open == "target")
+    ui.reply_menu_wrap.set_visible(menu_open == "reply")
+    if menu_open == "target" { ui.target_menu.render() }
+    if menu_open == "reply" { ui.reply_menu.render() }
+    return nil
+}
+
+fn reply_note_text(){
+    let lang = english_name(reply_result.target)
+    if reply_result.is_same && reply_result.detected == "" { return "No translation needed" }
+    if reply_result.is_same { return "Already in " + lang }
+    let source_name = english_name(reply_result.detected)
+    if source_name == "" { return lang }
+    return lang + " · from " + source_name
+}
+
+fn show_reply(){
+    let is_ready = reply_result.is_object()
+    let text = ""
+    let note = ""
+    if is_ready {
+        text = reply_result.text
+        note = reply_note_text()
+    }
+    let insert_label = "Put in message box"
+    if is_narrow { insert_label = "Insert" }
+    let look = [flag(is_ready), text, "|", note, "|", insert_label, "|", reply_line, reply_tone].to_string()
+    if look == drawn.reply { return nil }
+    drawn.reply = look
+    ui.result_wrap.set_visible(is_ready)
+    ui.result_text.set_text(text)
+    ui.result_note.set_text(note)
+    ui.insert_btn.set_text(insert_label)
+    ui.reply_status.set_text(reply_line)
+    if reply_tone == 1 { ui.reply_status_ok.set_text(reply_line) }
+    if reply_tone == 2 { ui.reply_status_err.set_text(reply_line) }
+    ui.reply_status_wrap.set_visible(reply_line != "")
+    ui.reply_status_n.set_visible(reply_tone == 0)
+    ui.reply_status_ok_wrap.set_visible(reply_tone == 1)
+    ui.reply_status_err_wrap.set_visible(reply_tone == 2)
+    return nil
+}
+
+fn key_text(){
+    if settings.key.to_chars().len() <= 4 { return "An API key is saved." }
+    return "An API key ending in " + last_chars(settings.key, 4) + " is saved."
+}
+
+fn show_service(){
+    let arrow = " ▼"
+    if is_service_open { arrow = " ▲" }
+    let title = "Translation service: "
+    if is_narrow { title = "Service: " }
+    ui.service_btn.set_text(title + service_name() + arrow)
+    ui.service_body.set_visible(is_service_open)
+    // The chips redraw only when the chosen service changes.
+    let chosen = settings.service + flag(is_libre_form)
+    if drawn.service != chosen {
+        drawn.service = chosen
+        ui.service_choice.render()
+    }
+    ui.lt_wrap.set_visible(is_libre_form || settings.service == "libre")
+    ui.key_wrap.set_visible(settings.key != "")
+    ui.key_line.set_text(key_text())
+    ui.site_line.set_text("Text you translate is sent to " + site_host() + ".")
+    ui.quota_wrap.set_visible(settings.service == "mymemory" && !is_libre_form)
+    ui.service_status.set_text(service_line)
+    if service_tone == 1 { ui.service_status_ok.set_text(service_line) }
+    if service_tone == 2 { ui.service_status_err.set_text(service_line) }
+    ui.service_status_wrap.set_visible(service_line != "")
+    ui.service_status_n.set_visible(service_tone == 0)
+    ui.service_status_ok_wrap.set_visible(service_tone == 1)
+    ui.service_status_err_wrap.set_visible(service_tone == 2)
+    return nil
+}
+
+fn show_all(){
+    show_controls()
+    show_menus()
+    show_reply()
+    show_service()
+    render_rows()
+    return nil
+}
+
+// ---- Host hooks and startup
+
+fn read_device(){
+    if is_device_pending { return nil }
+    is_device_pending = true
+    host.request("device.info", nil, fn(r){
+        is_device_pending = false
+        is_device_read = r.is_ok
+        if r.is_ok {
+            let lang = canonical_lang(get(r.data, "locale", ""))
+            if lang_of(lang).is_object() { device_lang = lang }
+            let offset = get(r.data, "utc_offset_minutes", 0)
+            if offset.is_number() { utc_offset = offset }
+            show_controls()
+            show_menus()
+            render_rows()
+        }
+        return nil
+    })
+    return nil
+}
+
+fn on_permissions_changed(caps){
+    if is_setup_pending { return nil }
+    if host.has("device.info.read") && !is_device_read { read_device() }
+    if !is_attached { return nil }
+    if !host.has("matrix.room.messages.read") {
+        if is_read_done || is_read_pending { stop_reading() }
+    } elif !is_read_done && !is_read_pending {
+        load_messages()
+    }
+    sync_live()
+    show_controls()
+    return nil
+}
+
+fn on_app_resize(w, h){
+    let is_narrow_now = w < 360
+    let is_tiny_now = w < 300
+    if is_narrow_now != is_narrow || is_tiny_now != is_tiny {
+        is_narrow = is_narrow_now
+        is_tiny = is_tiny_now
+        show_controls()
+        show_reply()
+        show_service()
+        render_rows()
+    }
+    return nil
+}
+
+fn boot(){
+    ui.server_input.set_text(settings.server)
+    show_all()
+    host.request("env", nil, fn(r){
+        is_attached = r.is_ok && get(r.data, "room_attached", false) == true
+        is_detached = !is_attached
+        if !is_attached {
+            set_empty("🧭", "No room attached", "Open Translator from a room to read its messages. You can still translate your own reply below.", "")
+            set_list("No room attached", 0)
+            if settings.is_live { live_line = "Open Translator from a room to translate its new messages." }
+            if host.has("device.info.read") { read_device() }
+            show_controls()
+            render_rows()
+            return nil
+        }
+        setup(false)
+        return nil
+    })
+    return nil
+}
+
+// ---- Look: Robrix's kit and the shared text styles
+
+let PrimaryButton = Button{
+    padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
+    draw_bg +: {
+        border_size: 0.0 border_radius: 4.0
+        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+}
+let NeutralButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
+        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
+    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+}
+// The quiet disclosure for the service settings.
+let GhostButton = PrimaryButton{
+    padding: Inset{left: 6 right: 6 top: 4 bottom: 4}
+    margin: Inset{left: -6}
+    draw_bg +: { border_size: 0.0 color: #xFFFFFF00 color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF00 }
+    draw_text +: { color: #x66708F color_hover: #x1C274C color_down: #x1C274C color_focus: #x66708F }
+}
+let NegativeButton = PrimaryButton{
+    draw_bg +: { border_size: 1.0 border_color: #xDC0005 border_color_hover: #xDC0005 border_color_down: #xDC0005 border_color_focus: #xDC0005
+        color: #xFFF0F0 color_hover: #xF0D4D4 color_down: #xE0B8B8 color_focus: #xFFF0F0 }
+    draw_text +: { color: #xDC0005 color_hover: #xDC0005 color_down: #xDC0005 color_focus: #xDC0005 }
+}
+let Field = TextInput{
+    width: Fill height: Fit padding: 10
+    draw_bg +: {
+        border_radius: 4.0 border_size: 1.0
+        color: #xFFFFFF color_hover: #xFFFFFF color_focus: #xFFFFFF color_down: #xFFFFFF color_empty: #xFFFFFF
+        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_focus: #x106fcc border_color_down: #x106fcc border_color_empty: #xC8C8C8
+        color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
+    }
+    draw_text +: { color: #x333333 color_hover: #x333333 color_focus: #x333333 color_down: #x333333 color_empty: #xBBBBBB color_empty_hover: #x999999 color_empty_focus: #x999999 text_style: theme.font_regular{font_size: 11} }
+}
+let Meta = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+let OkText = Meta{ draw_text +: { color: #x138808 } }
+let ErrText = Meta{ draw_text +: { color: #xDC0005 } }
+let Caption = Label{ padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+let Body = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
+let Slot = View{ width: Fill height: Fit }
+let ButtonRow = View{ width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8 }
+// A plain View draws no background here, so the divider is a SolidView.
+let Divider = SolidView{ width: Fill height: 1 draw_bg +: { color: #x00000018 } }
+// A wrapping row aligns items to their tops, so picker rows give every item the same height.
+let PickerButton = NeutralButton{ height: 32 margin: 0 }
+let PickerSlot = View{ width: Fit height: 32 align: Align{y: 0.5} }
+let EmptyCard = RoundedView{
+    width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5} padding: Inset{top: 20 bottom: 20 left: 16 right: 16}
+    show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+}
+// A message row: the sender's avatar beside their name and time, the text, and any translation.
+// Rows use the neutral surface of the other apps' lists; blue stays for the reply card.
+let MessageCard = RoundedView{
+    width: Fill height: Fit flow: Right spacing: 10 padding: Inset{top: 10, bottom: 10, left: 12, right: 12}
+    show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+}
+let Avatar = RoundedView{
+    width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
+    show_bg: true draw_bg +: { color: #x52b2ac border_radius: 16.0 }
+}
+let AvatarLetter = Label{ padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
+let MessageText = View{ width: Fill height: Fit flow: Down spacing: 4 }
+let SenderRow = View{ width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5} }
+let SenderName = Label{ width: Fill padding: 0 margin: 0 max_lines: 1 text_overflow: TextOverflow.Ellipsis draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} } }
+let TranslationBox = RoundedView{
+    width: Fill height: Fit flow: Down spacing: 3 padding: Inset{top: 8, bottom: 8, left: 10, right: 10}
+    show_bg: true draw_bg +: { color: #xFFFFFF border_radius: 6.0 border_size: 1.0 border_color: #xE0E0E0 }
+}
+// Chips: white with a gray edge, or accent-filled when chosen.
+let ChipOff = RoundedView{
+    width: Fit height: Fit padding: Inset{top: 5, bottom: 5, left: 10, right: 10}
+    show_bg: true draw_bg +: { color: #xFFFFFF border_size: 1.0 border_color: #xC8C8C8 border_radius: 12.0 }
+}
+let ChipOn = ChipOff{ draw_bg +: { color: #x0f88fe border_color: #x0f88fe } }
+let ChipText = Label{ padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 10} } }
+let ChipOnText = ChipText{ draw_text +: { color: #xFFFFFF } }
+let ChipRow = View{ width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8 }
+
+let _tables = build_tables()
+let _init = load()
+let _boot = start_timeout(0.05, || boot())
+
+View{
+    width: Fill height: Fill flow: Down
+    col := ScrollYView{
+        width: Fill height: Fill flow: Down spacing: 12 padding: 14
+        // The pane header names the app; this row picks your language.
+        View{
+            width: Fill height: Fit flow: Down spacing: 6
+            View{
+                width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.0}
+                View{
+                    width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
+                    PickerSlot{ Caption{ text: "TRANSLATE INTO" } }
+                    target_btn := PickerButton{ text: "English ▼" on_click: || toggle_menu("target") }
+                    target_hint_wrap := PickerSlot{
+                        target_hint := Meta{ text: "" width: Fit }
+                    }
+                }
+                refresh_wide := View{
+                    width: Fit height: Fit
+                    PickerButton{ text: "Refresh" on_click: || refresh() }
+                }
+            }
+            target_menu_wrap := View{
+                width: Fill height: Fit visible: false padding: Inset{top: 2}
+                target_menu := ChipRow{
+                    on_item_tap: |i| choose_language("target", i)
+                    on_render: || {
+                        for item in menu_items("target") {
+                            if item.is_selected {
+                                ChipOn{ ChipOnText{ text: item.label } }
+                            } else {
+                                ChipOff{ ChipText{ text: item.label } }
+                            }
+                        }
+                        nil
+                    }
+                }
+            }
+            privacy_note := Meta{ text: "" }
+        }
+        actions_wrap := View{
+            width: Fill height: Fit flow: Down spacing: 6
+            ButtonRow{
+                all_wrap := View{
+                    width: Fit height: Fit visible: false
+                    translate_all_btn := PrimaryButton{ text: "Translate all" on_click: || translate_all() }
+                }
+                live_wrap := View{
+                    width: Fit height: Fit
+                    live_btn := NeutralButton{ text: "○ Translate new messages" on_click: || toggle_live() }
+                }
+                refresh_narrow := View{
+                    width: Fit height: Fit visible: false
+                    NeutralButton{ text: "Refresh" on_click: || refresh() }
+                }
+            }
+            live_note_wrap := View{
+                width: Fill height: Fit flow: Down visible: false
+                live_note_n := Slot{
+                    live_note := Meta{ text: "" }
+                }
+                live_note_err_wrap := Slot{
+                    visible: false
+                    live_note_err := ErrText{ text: "" }
+                }
+            }
+            resume_wrap := View{
+                width: Fit height: Fit visible: false
+                NeutralButton{ text: "Resume" on_click: || resume_live() }
+            }
+        }
+        list_status_wrap := View{
+            width: Fill height: Fit flow: Down visible: false
+            list_status_n := Slot{
+                list_status := Meta{ text: "Loading…" }
+            }
+            list_status_ok_wrap := Slot{
+                visible: false
+                list_status_ok := OkText{ text: "" }
+            }
+            list_status_err_wrap := Slot{
+                visible: false
+                list_status_err := ErrText{ text: "" }
+            }
+        }
+        empty_wrap := View{
+            width: Fill height: Fit flow: Down
+            loading_wrap := View{
+                width: Fill height: Fit flow: Right spacing: 10 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24} visible: false
+                LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
+                loading_line := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+            }
+            empty_card := EmptyCard{
+                empty_icon := Label{ text: "⏳" padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 28} } }
+                empty_title := Label{ text: "" width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} } }
+                empty_text := Label{ text: "" width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                empty_ask_wrap := View{
+                    width: Fit height: Fit visible: false margin: Inset{top: 6}
+                    empty_ask := PrimaryButton{ text: "Ask again" on_click: || refresh() }
+                }
+                empty_retry_wrap := View{
+                    width: Fit height: Fit visible: false margin: Inset{top: 6}
+                    empty_retry := NeutralButton{ text: "Try again" on_click: || refresh() }
+                }
+            }
+        }
+        msg_list := ScrollYView{
+            width: Fill height: Fit{max: FitBound.Rel{base: Base.Full, factor: 0.6}} flow: Down spacing: 8
+            on_item_tap: |i| tap_shown(i)
+            on_render: || {
+                // A render with no children keeps the old ones, so an empty list draws a spacer.
+                if shown.len() == 0 { list_spacer := View{ width: Fill height: 1 } }
+                for m in shown {
+                    if m.state == "done" {
+                        MessageCard{
+                            Avatar{ visible: !is_tiny AvatarLetter{ text: m.initial } }
+                            MessageText{
+                                SenderRow{ SenderName{ text: m.sender } Meta{ text: m.when width: Fit } }
+                                Body{ text: m.body }
+                                TranslationBox{
+                                    Body{ text: m.tr_text draw_text +: { color: #x1C274C } }
+                                    Meta{ text: m.tr_note }
+                                }
+                            }
+                        }
+                    } elif m.state == "error" {
+                        MessageCard{
+                            Avatar{ visible: !is_tiny AvatarLetter{ text: m.initial } }
+                            MessageText{
+                                SenderRow{ SenderName{ text: m.sender } Meta{ text: m.when width: Fit } }
+                                Body{ text: m.body }
+                                ErrText{ text: m.tr_note }
+                            }
+                        }
+                    } elif m.state == "busy" || m.state == "muted" {
+                        MessageCard{
+                            Avatar{ visible: !is_tiny AvatarLetter{ text: m.initial } }
+                            MessageText{
+                                SenderRow{ SenderName{ text: m.sender } Meta{ text: m.when width: Fit } }
+                                Body{ text: m.body }
+                                Meta{ text: m.tr_note }
+                            }
+                        }
+                    } else {
+                        MessageCard{
+                            Avatar{ visible: !is_tiny AvatarLetter{ text: m.initial } }
+                            MessageText{
+                                SenderRow{ SenderName{ text: m.sender } Meta{ text: m.when width: Fit } }
+                                Body{ text: m.body }
+                            }
+                        }
+                    }
+                }
+                nil
+            }
+        }
+        Divider{}
+        View{
+            width: Fill height: Fit flow: Down spacing: 8
+            ButtonRow{
+                PickerSlot{ Caption{ text: "REPLY IN" } }
+                reply_btn := PickerButton{ text: "English ▼" on_click: || toggle_menu("reply") }
+                reply_hint_wrap := PickerSlot{
+                    reply_hint := Meta{ text: "" width: Fit }
+                }
+            }
+            reply_menu_wrap := View{
+                width: Fill height: Fit visible: false
+                reply_menu := ChipRow{
+                    on_item_tap: |i| choose_language("reply", i)
+                    on_render: || {
+                        for item in menu_items("reply") {
+                            if item.is_selected {
+                                ChipOn{ ChipOnText{ text: item.label } }
+                            } else {
+                                ChipOff{ ChipText{ text: item.label } }
+                            }
+                        }
+                        nil
+                    }
+                }
+            }
+            reply_input := Field{
+                is_multiline: true empty_text: "Write your reply in any language"
+                on_return: |t| translate_reply()
+                on_change: |t| reply_edited(t)
+            }
+            ButtonRow{
+                PrimaryButton{ text: "Translate" on_click: || translate_reply() }
+            }
+            result_wrap := RoundedView{
+                width: Fill height: Fit flow: Down spacing: 8 padding: 12 visible: false
+                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                result_text := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 12} } }
+                result_note := Meta{ text: "" }
+                ButtonRow{
+                    insert_btn := NeutralButton{ text: "Put in message box" on_click: || insert_reply() }
+                    NeutralButton{ text: "Copy" on_click: || copy_reply() }
+                }
+            }
+            reply_status_wrap := View{
+                width: Fill height: Fit flow: Down visible: false
+                reply_status_n := Slot{
+                    reply_status := Meta{ text: "" }
+                }
+                reply_status_ok_wrap := Slot{
+                    visible: false
+                    reply_status_ok := OkText{ text: "" }
+                }
+                reply_status_err_wrap := Slot{
+                    visible: false
+                    reply_status_err := ErrText{ text: "" }
+                }
+            }
+        }
+        Divider{}
+        View{
+            width: Fill height: Fit flow: Down spacing: 8
+            View{
+                width: Fit height: Fit
+                service_btn := GhostButton{ text: "Translation service: MyMemory ▼" on_click: || toggle_service() }
+            }
+            service_body := View{
+                width: Fill height: Fit flow: Down spacing: 8 visible: false
+                service_choice := ChipRow{
+                    on_item_tap: |i| pick_service(i)
+                    on_render: || {
+                        for item in service_items() {
+                            if item.is_selected {
+                                ChipOn{ ChipOnText{ text: item.label } }
+                            } else {
+                                ChipOff{ ChipText{ text: item.label } }
+                            }
+                        }
+                        nil
+                    }
+                }
+                site_line := Body{ text: "" }
+                quota_wrap := Slot{
+                    Meta{ text: "MyMemory is free and needs no account; its free use is limited to about 5,000 characters a day." }
+                }
+                lt_wrap := View{
+                    width: Fill height: Fit flow: Down spacing: 8 visible: false
+                    Meta{ text: "Any LibreTranslate-compatible server. The key, if any, stays in this app's storage." }
+                    server_input := Field{ empty_text: "https://translate.example.org" }
+                    key_input := Field{ is_password: true empty_text: "API key (optional)" }
+                    ButtonRow{
+                        PrimaryButton{ text: "Save server" on_click: || save_server() }
+                    }
+                    key_wrap := View{
+                        width: Fill height: Fit flow: Down spacing: 6 visible: false
+                        key_line := Body{ text: "" }
+                        View{
+                            width: Fit height: Fit
+                            NegativeButton{ text: "Forget key" on_click: || forget_key() }
+                        }
+                    }
+                }
+                service_status_wrap := View{
+                    width: Fill height: Fit flow: Down visible: false
+                    service_status_n := Slot{
+                        service_status := Meta{ text: "" }
+                    }
+                    service_status_ok_wrap := Slot{
+                        visible: false
+                        service_status_ok := OkText{ text: "" }
+                    }
+                    service_status_err_wrap := Slot{
+                        visible: false
+                        service_status_err := ErrText{ text: "" }
+                    }
+                }
+            }
+        }
+    }
+}
