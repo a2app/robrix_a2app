@@ -160,7 +160,7 @@ View{status := Label{text:"waiting"} hits := Label{text:"none"}}
             let (template, root) = cx.with_vm(|vm| {
                 makepad_widgets::script_mod(vm);
                 makepad_code_editor::script_mod(vm);
-                crate::shared::script_mod(vm);
+                crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
                 super::super::super::host_set::script_mod(vm);
                 let template = script_eval!(vm, { mod.widgets.MiniAppHost {} });
                 let template = vm.bx.heap.new_object_ref(template.as_object().unwrap());

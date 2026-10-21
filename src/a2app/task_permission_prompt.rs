@@ -227,7 +227,7 @@ mod tests {
         let prompt = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.TaskPermissionPrompt {} });
             WidgetRef::script_from_value(vm, value).as_task_permission_prompt()

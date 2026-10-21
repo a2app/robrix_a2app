@@ -70,7 +70,7 @@ script_mod! {
             color_hover: instance(COLOR_NAVIGATION_TAB_BG_HOVER)
             color_active: instance(COLOR_ACTIVE_PRIMARY)
             border_size: uniform(0.0)
-            border_color: instance(#0000)
+            border_color: instance(COLOR_TRANSPARENT)
             border_radius: uniform(4.0)
             border_inset: uniform(vec4(0.0))
 
@@ -117,7 +117,7 @@ script_mod! {
 
                 color: (COLOR_TEXT)
                 color_hover: instance(COLOR_TEXT)
-                color_active: instance(COLOR_TEXT)
+                color_active: instance(COLOR_SPACE_LOBBY_ENTRY_TEXT_ACTIVE)
 
                 get_color: fn() -> vec4 {
                     return mix(
@@ -146,7 +146,7 @@ script_mod! {
 
                 color: (COLOR_TEXT)
                 color_hover: instance(COLOR_TEXT)
-                color_active: instance(COLOR_TEXT)
+                color_active: instance(COLOR_SPACE_LOBBY_ENTRY_TEXT_ACTIVE)
 
                 text_style: REGULAR_TEXT {font_size: 11},
 
@@ -209,7 +209,7 @@ script_mod! {
             level: 0.0
             is_last: 0.0
             parent_mask: 0.0
-            line_color: #888
+            line_color: (COLOR_SPACE_LOBBY_TREE_LINES)
 
             pixel: fn() {
                 let pos = self.pos * self.rect_size;
@@ -290,7 +290,7 @@ script_mod! {
         show_bg: true
         draw_bg +: {
             hover: instance(0.0)
-            color: instance(#fff)
+            color: instance(COLOR_PRIMARY)
             color_hover: instance(COLOR_LIST_ITEM_BG_HOVER)
             pixel: fn() {
                 return mix(self.color, self.color_hover, self.hover);
@@ -314,7 +314,7 @@ script_mod! {
                 width: 16,
                 height: 16,
                 margin: Inset{ left: -6, right: 4 }
-                draw_bg.color: #888
+                draw_bg.color: (COLOR_TEXT_FAINT)
                 draw_bg.border_radius: 1.5 // less rounded
             }
 
@@ -334,7 +334,7 @@ script_mod! {
                     flow: Flow.Right{wrap: true}
                     max_lines: 2
                     text_overflow: Ellipsis
-                    draw_text +: { text_style: REGULAR_TEXT {font_size: 10.5}, color: #1a1a1a }
+                    draw_text +: { text_style: REGULAR_TEXT {font_size: 10.5}, color: (COLOR_SPACE_LOBBY_NAME_TEXT) }
                 }
 
                 suggested_tag := RoundedView {
@@ -343,7 +343,7 @@ script_mod! {
                     padding: Inset { left: 6, right: 6, top: 3, bottom: 3 }
                     show_bg: true
                     draw_bg +: {
-                        color: #E8F4FD
+                        color: (COLOR_BG_INFO_BLUE)
                         border_radius: 3.0
                         border_size: 0.75
                         border_color: (COLOR_INFO_BLUE)
@@ -353,7 +353,7 @@ script_mod! {
                         margin: 0
                         width: Fit, height: Fit,
                         text: "Suggested"
-                        draw_text +: { text_style: REGULAR_TEXT {font_size: 8.5}, color: (COLOR_INFO_BLUE) }
+                        draw_text +: { text_style: REGULAR_TEXT {font_size: 8.5}, color: (COLOR_FG_INFO_BLUE) }
                     }
                 }
 
@@ -364,7 +364,7 @@ script_mod! {
                     flow: Flow.Right{wrap: true}
                     max_lines: 2
                     text_overflow: Ellipsis
-                    draw_text +: { text_style: REGULAR_TEXT {font_size: 8.5}, color: #737373 }
+                    draw_text +: { text_style: REGULAR_TEXT {font_size: 8.5}, color: (COLOR_TEXT_SUBTLE) }
                 }
             }
         }
@@ -462,7 +462,7 @@ script_mod! {
             flow: Flow.Right{wrap: true},
             align: Align{ x: 0, y: 0 }
             draw_text +: {
-                color: #737373,
+                color: (COLOR_TEXT_SUBTLE),
                 text_style: REGULAR_TEXT {font_size: 10}
             }
             text: "Loading rooms and spaces..."
@@ -501,7 +501,7 @@ script_mod! {
                 height: Fit,
                 draw_text +: {
                     text_style: REGULAR_TEXT {font_size: 9},
-                    color: #888,
+                    color: (COLOR_TEXT_FAINT),
                 }
                 text: "Loading..."
             }
@@ -549,7 +549,7 @@ script_mod! {
                     margin: Inset{left: 2}
                     draw_text +: {
                         text_style: REGULAR_TEXT {font_size: 10},
-                        color: #737373,
+                        color: (COLOR_TEXT_SUBTLE),
                     }
                     text: "Welcome to the space:"
                 }
@@ -583,7 +583,7 @@ script_mod! {
                     margin: Inset{top: 4} // vertically center-align with the avatar
                     draw_text +: {
                         text_style: TITLE_TEXT {font_size: 14},
-                        color: #1a1a1a,
+                        color: (COLOR_SPACE_LOBBY_NAME_TEXT),
                     }
                     text: ""
                 }
@@ -612,7 +612,7 @@ script_mod! {
                     max_lines: 2
                     text_overflow: Ellipsis
                     font_size: 10
-                    font_color: #737373
+                    font_color: (COLOR_TEXT_SUBTLE)
                     text_style_normal      +: { font_size: 10, line_spacing: 1.2 }
                     text_style_italic      +: { font_size: 10, line_spacing: 1.2 }
                     text_style_bold        +: { font_size: 10, line_spacing: 1.2 }

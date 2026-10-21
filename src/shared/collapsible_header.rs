@@ -19,10 +19,6 @@ script_mod! {
     use mod.widgets.*
 
 
-    mod.widgets.COLOR_HEADER_FG = #F;
-
-    mod.widgets.COLOR_HEADER_BG = (mod.widgets.COLOR_ROBRIX_PURPLE); // the purple color from the Robrix logo
-
     mod.widgets.CollapsibleHeader = set_type_default() do #(CollapsibleHeader::register_widget(vm)) {
         ..mod.widgets.RoundedView
 
@@ -256,7 +252,7 @@ mod tests {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let (settings, category) = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             let settings = script_eval!(vm, { mod.widgets.RobrixSettingsCollapsibleHeader { title: "Individual abilities" } });
             let category = script_eval!(vm, { mod.widgets.CollapsibleHeader {} });
             (WidgetRef::script_from_value(vm, settings).as_collapsible_header(),

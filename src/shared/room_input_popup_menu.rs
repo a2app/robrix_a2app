@@ -18,9 +18,9 @@ script_mod! {
         align: Align{x: 0, y: 0.5}
 
         draw_bg +: {
-            color: (COLOR_PRIMARY)
-            color_hover: (COLOR_LIST_ITEM_BG_HOVER)
-            color_down: #xD0D8E8
+            color: (COLOR_BG_FLOATING)
+            color_hover: (COLOR_FLOATING_ITEM_BG_HOVER)
+            color_down: (COLOR_ROOM_INPUT_MENU_ITEM_BG_DOWN)
             border_radius: 4.0
         }
         draw_text +: {
@@ -45,7 +45,7 @@ script_mod! {
 
         show_bg: false
         draw_bg +: {
-            color: #00000000
+            color: (COLOR_TRANSPARENT)
         } 
 
         // This works kinda like the other context menus; we position the main content
@@ -60,10 +60,10 @@ script_mod! {
 
             show_bg: true
             draw_bg +: {
-                color: (COLOR_PRIMARY)
+                color: (COLOR_BG_FLOATING)
                 border_radius: 5.0
                 border_size: 0.0
-                shadow_color: #0005
+                shadow_color: (COLOR_SHADOW)
                 shadow_radius: 14.0
                 shadow_offset: vec2(0.0, 4.0)
             }

@@ -297,7 +297,7 @@ mod tests {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let area = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             super::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppHostArea {} });
             WidgetRef::script_from_value(vm, value).as_mini_app_host_area()
@@ -322,7 +322,7 @@ mod tests {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let (host, errors) = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             vm.bx.captured_errors = Some(Vec::new());
             super::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppHost {} });
@@ -423,7 +423,7 @@ mod tests {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let (area, first, second) = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             super::script_mod(vm);
             let area = script_eval!(vm, { mod.widgets.MiniAppHostArea {} });
             let area = WidgetRef::script_from_value(vm, area).as_mini_app_host_area();

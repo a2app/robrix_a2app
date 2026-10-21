@@ -2,8 +2,6 @@
 
 use makepad_widgets::*;
 
-use crate::shared::styles::COLOR_ACTIVE_PRIMARY;
-
 script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
@@ -12,13 +10,14 @@ script_mod! {
         width: Fill,
         height: 8,
         show_bg: true,
+        fill_color: (COLOR_ACTIVE_PRIMARY)
+        fill_color_failed: (COLOR_FG_DANGER_RED)
 
         draw_bg +: {
             progress: instance(0.0)
 
             // Background color (track)
             color: (COLOR_SECONDARY)
-            // Filled portion color
             progress_color: instance((COLOR_ACTIVE_PRIMARY))
 
             border_radius: 2.0
@@ -36,7 +35,7 @@ script_mod! {
                 );
                 sdf.fill(self.color);
 
-                // Draw progress fill (partial width based on progress, rounded)
+                // Draw progress bar (partial width based on progress, rounded)
                 let progress_width = self.rect_size.x * self.progress;
                 if progress_width > 0.0 {
                     sdf.box(
@@ -61,8 +60,12 @@ pub struct ProgressBar {
     #[source] source: ScriptObjectRef,
     #[deref] view: View,
 
+    #[live] fill_color: Vec4f,
+    #[live] fill_color_failed: Vec4f,
+
     /// Current progress value between 0.0 and 1.0
     #[rust] progress: f32,
+    #[rust] is_failed: bool,
 }
 
 impl Widget for ProgressBar {
@@ -71,11 +74,11 @@ impl Widget for ProgressBar {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        // Update the progress uniform before drawing
+        // Update the progress and its color before drawing
         let progress = self.progress.clamp(0.0, 1.0);
-        script_apply_eval!(cx, self.view, {
-            draw_bg.progress: #(progress as f64),
-        });
+        let color = if self.is_failed { self.fill_color_failed } else { self.fill_color };
+        self.view.draw_bg.set_dyn_instance(cx, id!(progress), &[progress]);
+        self.view.draw_bg.set_dyn_instance(cx, id!(progress_color), &[color.x, color.y, color.z, color.w]);
         self.view.draw_walk(cx, scope, walk)
     }
 }
@@ -87,17 +90,12 @@ impl ProgressBar {
         self.redraw(cx);
     }
 
-    /// Sets the color of the filled portion of the progress bar.
-    pub fn set_progress_color(&mut self, cx: &mut Cx, color: Vec4) {
-        script_apply_eval!(cx, self.view, {
-            draw_bg +: { progress_color: #(color) }
-        });
-        self.redraw(cx);
-    }
-
-    /// Restores the default fill color for the progress bar.
-    pub fn reset_progress_color(&mut self, cx: &mut Cx) {
-        self.set_progress_color(cx, COLOR_ACTIVE_PRIMARY);
+    /// Marks this progress bar as failed or not, which also sets its color.
+    pub fn set_failed(&mut self, cx: &mut Cx, failed: bool) {
+        if self.is_failed != failed {
+            self.is_failed = failed;
+            self.redraw(cx);
+        }
     }
 }
 
@@ -109,17 +107,10 @@ impl ProgressBarRef {
         }
     }
 
-    /// Sets the color of the filled portion of the progress bar.
-    pub fn set_progress_color(&self, cx: &mut Cx, color: Vec4) {
+    /// See [`ProgressBar::set_failed()`].
+    pub fn set_failed(&self, cx: &mut Cx, failed: bool) {
         if let Some(mut inner) = self.borrow_mut() {
-            inner.set_progress_color(cx, color);
-        }
-    }
-
-    /// Restores the default fill color for the progress bar.
-    pub fn reset_progress_color(&self, cx: &mut Cx) {
-        if let Some(mut inner) = self.borrow_mut() {
-            inner.reset_progress_color(cx);
+            inner.set_failed(cx, failed);
         }
     }
 }

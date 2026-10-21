@@ -15,7 +15,7 @@ use crate::{
     avatar_cache::{get_or_fetch_avatar, AvatarCacheEntry},
     home::rooms_list::RoomsListRef,
     room::FetchedRoomAvatar,
-    shared::{avatar::{AvatarImage, AvatarWidgetRefExt}, list_rows::{LIST_ROW_HEIGHT, handle_row_actions, status_row}, slash_commands::SlashCommand, styles::*},
+    shared::{avatar::{AvatarImage, TextAvatarBgColor, AvatarWidgetRefExt}, list_rows::{LIST_ROW_HEIGHT, handle_row_actions, status_row}, slash_commands::SlashCommand, styles::set_view_bg_color},
     utils::{self, RoomNameId},
 };
 use matrix_sdk::ruma::{OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedUserId};
@@ -40,8 +40,9 @@ script_mod! {
         flow: Overlay
         align: Align{x: 0.0, y: 0.0}
 
-        color_focus: #xB6D3F2
-        color_hover: (COLOR_LIST_ITEM_BG_HOVER)
+        color: (COLOR_TRANSPARENT)
+        color_focus: (COLOR_LIST_ITEM_BG_FOCUS)
+        color_hover: (COLOR_FLOATING_ITEM_BG_HOVER)
 
         // So the way this works is that we move the popup_frame wrapper view,
         // which allows the `main_content` to just behave like a regular Fill/Fill view.
@@ -56,11 +57,11 @@ script_mod! {
                 cursor: MouseCursor.Default
                 grab_key_focus: false
                 draw_bg +: {
-                    color: (COLOR_PRIMARY)
+                    color: (COLOR_BG_FLOATING)
                     border_radius: 5.0
                     border_size: 1.0
-                    border_color: (COLOR_SECONDARY)
-                    shadow_color: #0006
+                    border_color: (COLOR_MENTION_POPUP_BORDER)
+                    shadow_color: (COLOR_SHADOW_STRONG)
                     shadow_radius: 12.0
                     shadow_offset: vec2(0.0, 3.0)
                 }
@@ -78,7 +79,7 @@ script_mod! {
                     header_label := Label {
                         width: Fill, height: Fit, max_lines: 1, text_overflow: Ellipsis, padding: 0
                         draw_text +: {
-                            color: (COLOR_PRIMARY)
+                            color: (COLOR_TEXT_ON_ACCENT)
                             text_style: theme.font_bold {font_size: 13.0, line_spacing: 1.0}
                         }
                     }
@@ -139,6 +140,7 @@ pub struct MentionablePopup {
     #[source] source: ScriptObjectRef,
     #[deref] view: View,
 
+    #[live] color: Vec4f,
     #[live] color_focus: Vec4f,
     #[live] color_hover: Vec4f,
 
@@ -237,15 +239,15 @@ impl Widget for MentionablePopup {
                 }
                 let row = match self.items.get(index) {
                     Some(mention) => {
-                        let mut row_widget = build_row(cx, &mut list, index, mention);
+                        let row_widget = build_row(cx, &mut list, index, mention);
                         let color = if self.keyboard_focus_index == Some(index) {
                             self.color_focus
                         } else if self.pointer_hover_index == Some(index) {
                             self.color_hover
                         } else {
-                            Vec4f::default()
+                            self.color
                         };
-                        script_apply_eval!(cx, row_widget, { draw_bg.color: #(color) });
+                        set_view_bg_color(cx, &row_widget.as_view(), color);
                         row_widget
                     }
                     None if self.is_loading => status_row(cx, &mut list, index, true, &self.loading_message),
@@ -559,7 +561,7 @@ fn build_row(cx: &mut Cx, list: &mut PortalList, index: usize, item: &MentionIte
             new_widget.label(cx, ids!(info.title)).set_text(cx, "Notify the entire room");
             new_widget.label(cx, ids!(info.subtitle)).set_text(cx, "@room");
             let first = room_name.chars().next().map(|c| c.to_string()).unwrap_or_else(|| "@".into());
-            new_widget.avatar(cx, ids!(avatar)).show_text(cx, Some(COLOR_ROBRIX_PURPLE), None, &first);
+            new_widget.avatar(cx, ids!(avatar)).show_text(cx, Some(TextAvatarBgColor::Accent), None, &first);
             new_widget
         }
         MentionItem::Room(candidate) => {
@@ -601,6 +603,6 @@ fn set_room_avatar(cx: &mut Cx, row: &WidgetRef, room_id: &OwnedRoomId, avatar_u
         return;
     }
     if let FetchedRoomAvatar::Text(fallback) = utils::avatar_from_room_name(name_for_avatar) {
-        avatar.show_text(cx, Some(COLOR_UNKNOWN_ROOM_AVATAR), None, &fallback);
+        avatar.show_text(cx, Some(TextAvatarBgColor::UnknownRoom), None, &fallback);
     }
 }

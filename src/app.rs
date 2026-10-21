@@ -17,7 +17,7 @@ use crate::{
         event_source_modal::{EventSourceModalAction, EventSourceModalWidgetRefExt}, home_screen::{MainViewVariantChangedAction, ScreenRestoredAction}, invite_modal::{InviteModalAction, InviteModalWidgetRefExt}, main_desktop_ui::MainDesktopUiAction, nav_history::{GoForwardAction, NavHistory, can_navigate_history}, nav_history_buttons::enable_nav_history_buttons, nav_history_menu::{ShowNavHistoryMenuAction, show_nav_history_menu}, navigation_tab_bar::{NavigationBarAction, SelectedTab}, new_message_context_menu::NewMessageContextMenuWidgetRefExt, room_context_menu::RoomContextMenuWidgetRefExt, room_screen::{DropDecodedImagesAction, InviteAction, MessageAction, clear_timeline_states, invalidate_single_timeline_state, drop_docked_pane_data}, rooms_list::{RoomsListAction, RoomsListRef, RoomsListUpdate, clear_all_invited_rooms, enqueue_rooms_list_update}
     }, join_leave_room_modal::{
         JoinLeaveModalKind, JoinLeaveRoomModalAction, JoinLeaveRoomModalWidgetRefExt
-    }, login::login_screen::LoginAction, logout::logout_confirm_modal::{LogoutAction, LogoutConfirmModalAction, LogoutConfirmModalWidgetRefExt}, persistence::{self, WindowGeomTracker}, profile::user_profile_cache::{clear_user_profile_cache, process_user_profile_updates}, room::{BasicRoomDetails, room_pane::{self, PaneLayout, RoomPaneKind}}, settings::{app_preferences::{AppPreferences, UiZoom}, encryption_settings::{EncryptionModalAction, EncryptionModalWidgetRefExt}}, shared::{confirmation_modal::{ConfirmationModalContent, ConfirmationModalWidgetRefExt}, context_menu::{ContextMenuClosed, close_context_menus, is_context_menu_shown, menu_position_margin}, image_viewer::{ImageViewerAction, LoadState}, popup_list::{PopupKind, enqueue_popup_notification}, room_picker_modal::{RoomPickerModalAction, RoomPickerModalWidgetRefExt}, speech_text_input::cancel_all_dictation}, sliding_sync::{DirectMessageRoomAction, MatrixRequest, RecoveryAction, TimelineKind, current_user_id, submit_async_request}, utils::RoomNameId, verification::VerificationAction, verification_modal::{
+    }, login::login_screen::LoginAction, logout::logout_confirm_modal::{LogoutAction, LogoutConfirmModalAction, LogoutConfirmModalWidgetRefExt}, persistence::{self, WindowGeomTracker}, profile::user_profile_cache::{clear_user_profile_cache, process_user_profile_updates}, room::{BasicRoomDetails, room_pane::{self, PaneLayout, RoomPaneKind}}, settings::{app_preferences::{AppPreferences, Appearance, AppearanceGlobal, UiZoom}, encryption_settings::{EncryptionModalAction, EncryptionModalWidgetRefExt}}, shared::{confirmation_modal::{ConfirmationModalContent, ConfirmationModalWidgetRefExt}, context_menu::{ContextMenuClosed, close_context_menus, is_context_menu_shown, menu_position_margin}, image_viewer::{ImageViewerAction, LoadState}, popup_list::{PopupKind, enqueue_popup_notification}, room_picker_modal::{RoomPickerModalAction, RoomPickerModalWidgetRefExt}, speech_text_input::cancel_all_dictation}, sliding_sync::{DirectMessageRoomAction, MatrixRequest, RecoveryAction, TimelineKind, current_user_id, submit_async_request}, utils::RoomNameId, verification::VerificationAction, verification_modal::{
         VerificationModalAction,
         VerificationModalWidgetRefExt,
     }
@@ -33,19 +33,43 @@ script_mod! {
             main_window := Window {
                 window.inner_size: vec2(1280, 800)
                 window.title: "Robrix"
-                pass.clear_color: #FFFFFF00
+                pass.clear_color: (COLOR_WINDOW_CLEAR)
                 caption_bar +: {
-                    draw_bg.color: #F3F3F3
+                    draw_bg.color: (COLOR_CAPTION_BAR_BG)
                     caption_label +: {
                         // Overlaying the nav history buttons keeps them from pushing the title off-center.
                         flow: Overlay
                         label +: {
-                            draw_text +: { color: #0 }
+                            draw_text +: { color: (COLOR_TEXT_TITLE) }
                             text: "Robrix"
                         }
                         View {
                             width: Fill, height: Fit
                             nav_history_buttons := NavHistoryButtons {}
+                        }
+                    }
+                    // The min/max/close buttons only show up on Windows and on Linux without native decorations.
+                    windows_buttons +: {
+                        min +: {
+                            draw_bg +: {
+                                color: (COLOR_CAPTION_BUTTON_ICON)
+                                color_hover: (COLOR_CAPTION_BUTTON_ICON_HOVER)
+                                color_down: (COLOR_CAPTION_BUTTON_ICON_HOVER)
+                                bg_color_hover: (COLOR_CAPTION_BUTTON_BG_HOVER)
+                                bg_color_down: (COLOR_CAPTION_BUTTON_BG_DOWN)
+                            }
+                        }
+                        max +: {
+                            draw_bg +: {
+                                color: (COLOR_CAPTION_BUTTON_ICON)
+                                color_hover: (COLOR_CAPTION_BUTTON_ICON_HOVER)
+                                color_down: (COLOR_CAPTION_BUTTON_ICON_HOVER)
+                                bg_color_hover: (COLOR_CAPTION_BUTTON_BG_HOVER)
+                                bg_color_down: (COLOR_CAPTION_BUTTON_BG_DOWN)
+                            }
+                        }
+                        close +: {
+                            draw_bg +: { color: (COLOR_CAPTION_BUTTON_ICON) }
                         }
                     }
                 }
@@ -197,7 +221,10 @@ script_mod! {
                         // since they can be shown as a hover atop any other widget.
                         // This tooltip widget handles TooltipActions directly by itself,
                         // so we don't need to call show/hide ourselves.
-                        app_tooltip := CalloutTooltip {}
+                        app_tooltip := CalloutTooltip {
+                            text_color: (COLOR_TOOLTIP_TEXT)
+                            bg_color: (COLOR_TOOLTIP_BG)
+                        }
                     }
                 } // end of body
             }
@@ -205,7 +232,10 @@ script_mod! {
     }
 }
 
-app_main!(App);
+// This runs before App::script_mod, so even the first frame uses the saved appearance.
+app_main!(App, configure: |cx| {
+    cx.set_global(AppearanceGlobal(persistence::load_appearance()));
+});
 
 #[derive(Script)]
 pub struct App {
@@ -415,10 +445,9 @@ impl MatchEvent for App {
                 // the context menu relative to the body area, which excludes the caption bar.
                 let rect = self.ui.view(cx, ids!(overlay_container)).area().rect(cx);
                 let margin = menu_position_margin(rect, abs_pos, expected_dimensions);
-                let mut main_content_view = new_message_context_menu.view(cx, ids!(main_content));
-                script_apply_eval!(cx, main_content_view, {
-                    margin: #(margin)
-                });
+                if let Some(mut main_content) = new_message_context_menu.view(cx, ids!(main_content)).borrow_mut() {
+                    main_content.walk.margin = margin;
+                }
                 self.ui.redraw(cx);
                 continue;
             }
@@ -432,10 +461,9 @@ impl MatchEvent for App {
                 // the context menu relative to the body area, which excludes the caption bar.
                 let rect = self.ui.view(cx, ids!(overlay_container)).area().rect(cx);
                 let margin = menu_position_margin(rect, pos, expected_dimensions);
-                let mut main_content_view = room_context_menu.view(cx, ids!(main_content));
-                script_apply_eval!(cx, main_content_view, {
-                    margin: #(margin)
-                });
+                if let Some(mut main_content) = room_context_menu.view(cx, ids!(main_content)).borrow_mut() {
+                    main_content.walk.margin = margin;
+                }
                 self.ui.redraw(cx);
                 continue;
             }
@@ -881,17 +909,23 @@ impl AppStateSaveFingerprint {
 
 impl AppMain for App {
     fn script_mod(vm: &mut ScriptVm) -> makepad_widgets::ScriptValue {
+        let appearance = vm.cx_mut().global::<AppearanceGlobal>().0;
         // Order matters: base widgets first, then app widgets, then app UI.
         makepad_widgets::theme_mod(vm);
-        script_eval!(vm, {
-            mod.theme = mod.themes.light
+        match appearance {
+            Appearance::Light => script_eval!(vm, { mod.theme = mod.themes.light }),
+            Appearance::Dark => script_eval!(vm, { mod.theme = mod.themes.dark }),
+        };
+        // Mini-app isolates boot on the host's theme.
+        makepad_widgets::set_splash_theme(match appearance {
+            Appearance::Light => makepad_widgets::SplashTheme::Light,
+            Appearance::Dark => makepad_widgets::SplashTheme::Dark,
         });
-        makepad_widgets::set_splash_theme(makepad_widgets::SplashTheme::Light);
         makepad_widgets::widgets_mod(vm);
         // Complete an explicitly selected Makepad style before Robrix overrides it.
         makepad_widgets::desktop_style::apply_widgets(vm);
         makepad_code_editor::script_mod(vm);
-        crate::shared::script_mod(vm);
+        crate::shared::script_mod(vm, appearance);
 
         #[cfg(feature = "tsp")]
         crate::tsp::script_mod(vm);

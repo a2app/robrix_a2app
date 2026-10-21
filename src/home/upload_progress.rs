@@ -10,7 +10,6 @@ use crate::shared::file_upload_modal::{AttachmentUpload, FileUploadAttemptId, su
 use crate::sliding_sync::{MatrixRequest, TimelineKind, submit_async_request};
 use crate::shared::popup_list::{PopupKind, enqueue_popup_notification};
 use crate::shared::progress_bar::ProgressBarWidgetRefExt;
-use crate::shared::styles::{COLOR_FG_DANGER_RED, COLOR_TEXT};
 use crate::home::send_status_indicator::upload_progress_text;
 
 script_mod! {
@@ -24,6 +23,8 @@ script_mod! {
         flow: Down,
         padding: Inset { top: 10, bottom: 10, left: 15, right: 15 }
         spacing: 15,
+        status_color: (COLOR_TEXT)
+        status_color_failed: (COLOR_FG_DANGER_RED)
 
         show_bg: true,
         draw_bg +: {
@@ -131,6 +132,9 @@ enum UploadPhase {
 pub struct UploadProgressView {
     #[source] source: ScriptObjectRef,
     #[deref] view: View,
+
+    #[live] status_color: Vec4f,
+    #[live] status_color_failed: Vec4f,
 
     #[rust] state: Option<UploadState>,
 }
@@ -321,14 +325,8 @@ impl UploadProgressView {
         self.button(cx, ids!(retry_button)).set_visible(cx, can_retry);
         let progress_bar = self.child_by_path(ids!(progress_bar)).as_progress_bar();
         progress_bar.set_progress(cx, fraction);
-        if let Some(mut label) = status_label.borrow_mut() {
-            label.draw_text.color = if is_failed { COLOR_FG_DANGER_RED } else { COLOR_TEXT };
-        }
-        if is_failed {
-            progress_bar.set_progress_color(cx, COLOR_FG_DANGER_RED);
-        } else {
-            progress_bar.reset_progress_color(cx);
-        }
+        status_label.set_text_color(cx, if is_failed { self.status_color_failed } else { self.status_color });
+        progress_bar.set_failed(cx, is_failed);
         self.redraw(cx);
     }
 }

@@ -7,38 +7,10 @@ use crate::{LivePtr, widget_ref_from_live_ptr};
 use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId};
 use matrix_sdk_ui::timeline::{ReactionInfo, ReactionsByKeyBySender, TimelineEventItemId};
 
-const EMOJI_BORDER_COLOR_INCLUDE_SELF: Vec4 = Vec4 {
-    x: 0.0,
-    y: 0.6,
-    z: 0.47,
-    w: 1.0,
-}; // DarkGreen
-const EMOJI_BORDER_COLOR_NOT_INCLUDE_SELF: Vec4 = Vec4 {
-    x: 0.714,
-    y: 0.73,
-    z: 0.75,
-    w: 1.0,
-}; // Grey
-
-const EMOJI_BG_COLOR_INCLUDE_SELF: Vec4 = Vec4 {
-    x: 0.89,
-    y: 0.967,
-    z: 0.929,
-    w: 1.0,
-}; // LightGreen
-const EMOJI_BG_COLOR_NOT_INCLUDE_SELF: Vec4 = Vec4 {
-    x: 0.968,
-    y: 0.976,
-    z: 0.98,
-    w: 1.0,
-}; // LightGrey
-
 script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
 
-
-    mod.widgets.COLOR_BUTTON_GREY = #B6BABF
 
     mod.widgets.ReactionList = #(ReactionList::register_widget(vm)) {
         width: Fill,
@@ -56,10 +28,10 @@ script_mod! {
             draw_bg +: {
                 // Anything that we apply over must be an `instance`,
                 // and their names must be distinct from the base Button type.
-                reaction_bg_color: instance(mod.widgets.COLOR_BUTTON_GREY)
-                reaction_border_color: instance(#001A11)
+                reaction_bg_color: instance(mod.widgets.COLOR_REACTION_BG)
+                reaction_border_color: instance(mod.widgets.COLOR_REACTION_BORDER)
                 // Override values from the base Button type.
-                color_hover: #fef65b
+                color_hover: (mod.widgets.COLOR_REACTION_HOVER_TINT)
                 hover: 0.0
                 border_size: 1.5
                 border_radius: 3.0
@@ -86,7 +58,7 @@ script_mod! {
             }
             draw_text +: {
                 text_style: REGULAR_TEXT {font_size: 10},
-                color: #000000
+                color: (mod.widgets.COLOR_TEXT_BODY)
                 get_color: fn() -> vec4 {
                     return self.color;
                 }
@@ -107,7 +79,7 @@ pub struct ReactionData {
     pub room_id: OwnedRoomId,
 }
 
-#[derive(Script, ScriptHook, Widget)]
+#[derive(Script, Widget)]
 pub struct ReactionList {
     #[uid] uid: WidgetUid,
     #[redraw] #[rust] area: Area,
@@ -123,6 +95,15 @@ pub struct ReactionList {
     /// Consists of: `(reaction count, total senders, num sent by me)`.
     #[rust] last_reaction_counts: Option<(usize, usize, usize)>,
 }
+
+impl ScriptHook for ReactionList {
+    fn on_after_reload(&mut self, _vm: &mut ScriptVm) {
+        // A reload never reaches the buttons we built from the template,
+        // so we forget the last counts to make the next `set_list()` rebuild them.
+        self.last_reaction_counts = None;
+    }
+}
+
 impl Widget for ReactionList {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         if self.children.is_empty() {
@@ -177,21 +158,13 @@ impl Widget for ReactionList {
                             reaction: reaction_data.reaction.clone(),
                         });
                         // update the reaction button before the timeline is updated
-                        let (bg_color, border_color) = if !reaction_data.includes_user {
-                            (EMOJI_BG_COLOR_INCLUDE_SELF, EMOJI_BORDER_COLOR_INCLUDE_SELF)
-                        } else {
-                            (EMOJI_BG_COLOR_NOT_INCLUDE_SELF, EMOJI_BORDER_COLOR_NOT_INCLUDE_SELF)
-                        };
                         let mut reaction_button = button_ref.clone();
-                        script_apply_eval!(cx, reaction_button, {
-                            draw_bg +: { reaction_bg_color: #(bg_color), reaction_border_color: #(border_color) }
-                        });
+                        apply_reaction_button_colors(cx, &mut reaction_button, !reaction_data.includes_user);
                         self.do_hover_out(cx, scope, button_ref);
                     }
                     // Touch never sends a hover-out, so clear the highlight the long press set.
                     else if fue.has_long_press_occurred {
-                        let mut reaction_button = button_ref.clone();
-                        script_apply_eval!(cx, reaction_button, { draw_bg +: { hover: 0.0 } });
+                        button_ref.reset_hover(cx);
                     }
                     break;
                 }
@@ -221,8 +194,9 @@ impl ReactionList {
                 reaction_data,
             },
         );
-        let mut button_ref = button_ref.clone();
-        script_apply_eval!(cx, button_ref, { draw_bg +: { hover: 1.0 } });
+        if let Some(mut button) = button_ref.borrow_mut() {
+            button.animator_cut(cx, ids!(hover.on));
+        }
         cx.set_cursor(MouseCursor::Hand);
     }
 
@@ -234,8 +208,7 @@ impl ReactionList {
         button_ref: &ButtonRef,
     ) {
         cx.widget_action(self.widget_uid(),  RoomScreenTooltipActions::HoverOut);
-        let mut button_ref = button_ref.clone();
-        script_apply_eval!(cx, button_ref, { draw_bg +: { hover: 0.0 } });
+        button_ref.reset_hover(cx);
         cx.set_cursor(MouseCursor::Default);
     }
 }
@@ -316,17 +289,7 @@ impl ReactionListRef {
                 reaction_data.reaction,
                 reaction_senders.len()
             ));
-            let (bg_color, border_color) = if reaction_data.includes_user {
-                (EMOJI_BG_COLOR_INCLUDE_SELF, EMOJI_BORDER_COLOR_INCLUDE_SELF)
-            } else {
-                (
-                    EMOJI_BG_COLOR_NOT_INCLUDE_SELF,
-                    EMOJI_BORDER_COLOR_NOT_INCLUDE_SELF,
-                )
-            };
-            script_apply_eval!(cx, button, {
-                draw_bg +: { reaction_bg_color: #(bg_color), reaction_border_color: #(border_color) }
-            });
+            apply_reaction_button_colors(cx, &mut button, reaction_data.includes_user);
             inner.children.push((button, reaction_data));
         }
         inner.timeline_kind = Some(timeline_kind.clone());
@@ -361,5 +324,23 @@ impl ReactionListRef {
         } else {
             false
         }
+    }
+}
+
+fn apply_reaction_button_colors(cx: &mut Cx, button: &mut ButtonRef, includes_user: bool) {
+    if includes_user {
+        script_apply_eval!(cx, button, {
+            draw_bg +: {
+                reaction_bg_color: mod.widgets.COLOR_REACTION_BG_INCLUDES_USER,
+                reaction_border_color: mod.widgets.COLOR_REACTION_BORDER_INCLUDES_USER,
+            }
+        });
+    } else {
+        script_apply_eval!(cx, button, {
+            draw_bg +: {
+                reaction_bg_color: mod.widgets.COLOR_REACTION_BG,
+                reaction_border_color: mod.widgets.COLOR_REACTION_BORDER,
+            }
+        });
     }
 }

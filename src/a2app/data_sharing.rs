@@ -988,7 +988,7 @@ mod tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             super::super::permission_choices::script_mod(vm);
             super::super::permission_message_preview::script_mod(vm);
             super::super::permission_prompt::script_mod(vm);

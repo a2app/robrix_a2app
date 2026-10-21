@@ -7,13 +7,11 @@ use matrix_sdk::{QueueWedgeError, media::MediaError, ruma::{api::error::ErrorKin
 use matrix_sdk_base::crypto::{OlmError, SessionRecipientCollectionError};
 use matrix_sdk_ui::timeline::{EventSendState, EventTimelineItem};
 
-use crate::{LivePtr, shared::styles::COLOR_FG_DANGER_RED, sliding_sync::is_offline, utils::{SERVER_REJECTED_TEXT, UNKNOWN_ERROR_TEXT, format_decimal_file_size, stringify_matrix_error}, widget_ref_from_live_ptr};
+use crate::{LivePtr, sliding_sync::is_offline, utils::{SERVER_REJECTED_TEXT, UNKNOWN_ERROR_TEXT, format_decimal_file_size, stringify_matrix_error}, widget_ref_from_live_ptr};
 
 script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
-
-    mod.widgets.SEND_STATUS_ICON_COLOR = #8C8C8C
 
     mod.widgets.SendStatusIndicator = #(SendStatusIndicator::register_widget(vm)) {
         width: Fit,
@@ -22,6 +20,8 @@ script_mod! {
         flow: Right,
         align: Align{y: 0.0},
         spacing: 3,
+
+        tooltip_bg_color_failed: (COLOR_BG_DANGER_RED_SOLID),
 
         sending_icon: LoadingSpinner {
             width: 15,
@@ -48,12 +48,12 @@ script_mod! {
             width: 15, height: 15,
             align: Align{x: 0.5, y: 0.5}
             show_bg: true,
-            draw_bg.color: (COLOR_FG_ACCEPT_GREEN)
+            draw_bg.color: (COLOR_BG_ACCEPT_GREEN_SOLID)
 
             check := Icon {
                 draw_icon +: {
                     svg: (ICON_CHECKMARK),
-                    color: #FFFFFF,
+                    color: (COLOR_TEXT_ON_ACCENT),
                 }
                 icon_walk: Walk{width: 8.5, height: Fit}
             }
@@ -63,21 +63,22 @@ script_mod! {
             width: 15, height: 15,
             align: Align{x: 0.5, y: 0.5}
             show_bg: true,
-            draw_bg.color: (COLOR_FG_DANGER_RED)
+            draw_bg.color: (COLOR_BG_DANGER_RED_SOLID)
 
             exclamation := View {
                 width: 3.0, height: 10.5,
                 show_bg: true,
                 draw_bg +: {
+                    color: uniform((COLOR_TEXT_ON_ACCENT))
                     pixel: fn() {
                         let sdf = Sdf2d.viewport(self.pos * self.rect_size)
                         let w = self.rect_size.x
                         let dot_r = w * 0.5
                         let gap = w * 0.4
                         sdf.box(0.0, 0.0, w, self.rect_size.y - dot_r * 2.0 - gap, dot_r)
-                        sdf.fill(#ffffff)
+                        sdf.fill(self.color)
                         sdf.circle(dot_r, self.rect_size.y - dot_r, dot_r)
-                        sdf.fill(#ffffff)
+                        sdf.fill(self.color)
                         return sdf.result
                     }
                 }
@@ -214,7 +215,7 @@ pub enum SendStatusIndicatorAction {
     None,
 }
 
-#[derive(Script, Widget, ScriptHook)]
+#[derive(Script, Widget)]
 pub struct SendStatusIndicator {
     #[deref] view: View,
     #[walk] walk: Walk,
@@ -230,6 +231,7 @@ pub struct SendStatusIndicator {
     #[live] failed_label: Option<LivePtr>,
     #[live] queued_label: Option<LivePtr>,
     #[live] blocked_label: Option<LivePtr>,
+    #[live] tooltip_bg_color_failed: Vec4f,
 
     /// `None` means this indicator isn't shown by a message.
     #[rust] info: Option<SendStatusInfo>,
@@ -237,6 +239,18 @@ pub struct SendStatusIndicator {
     #[rust] has_failed: bool,
     #[rust] icon_widget: Option<(SendStatusIcon, WidgetRef)>,
     #[rust] label_widget: Option<(SendStatusLabel, LabelRef)>,
+}
+
+impl ScriptHook for SendStatusIndicator {
+    fn on_after_reload(&mut self, _vm: &mut ScriptVm) {
+        // A reload never reaches the icon and label we built from templates, so we drop them,
+        // and reset the info too since `set_from_event()` does nothing when it's unchanged.
+        self.icon_widget = None;
+        self.label_widget = None;
+        self.info = None;
+        self.tooltip_text.clear();
+        self.has_failed = false;
+    }
 }
 
 /// Send status icons are small, so we make their hit box a bit larger.
@@ -251,13 +265,11 @@ impl Widget for SendStatusIndicator {
         let uid = self.widget_uid();
         match event.hits_with_options(cx, self.area, HitOptions::new().with_margin(HIT_MARGIN)) {
             Hit::FingerHoverIn(..) | Hit::FingerLongPress(_) if !self.tooltip_text.is_empty() => {
-                let mut options = CalloutTooltipOptions {
+                let options = CalloutTooltipOptions {
                     position: TooltipPosition::Left,
+                    bg_color: self.has_failed.then_some(self.tooltip_bg_color_failed),
                     ..Default::default()
                 };
-                if self.has_failed {
-                    options.bg_color = COLOR_FG_DANGER_RED;
-                }
                 cx.widget_action(
                     uid,
                     TooltipAction::HoverIn {

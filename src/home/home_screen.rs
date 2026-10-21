@@ -123,7 +123,7 @@ script_mod! {
             color: (COLOR_PRIMARY_DARKER)
             border_radius: 4.0
             border_size: 0.0
-            shadow_color: #0005
+            shadow_color: (COLOR_SHADOW)
             shadow_radius: 15.0
             shadow_offset: vec2(1.0, 0.0)
         }
@@ -138,7 +138,7 @@ script_mod! {
                 show: AnimatorState{
                     redraw: true
                     from: { all: Forward { duration: (mod.widgets.SPACES_BAR_ANIMATION_DURATION_SECS) } }
-                    apply: { height: (NAVIGATION_TAB_BAR_SIZE),  draw_bg: { shadow_color: #x00000055 } }
+                    apply: { height: (NAVIGATION_TAB_BAR_SIZE),  draw_bg: { shadow_color: (COLOR_SHADOW) } }
                 }
                 hide: AnimatorState{
                     redraw: true
@@ -404,7 +404,7 @@ mod navigation_tests {
         let (home, picker) = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::script_mod(vm);
             let home_type = HomeScreen::register_widget(vm);
             let value = script_eval!(vm, {
@@ -691,7 +691,7 @@ impl ScriptHook for SpacesBarWrapper {
         &mut self,
         vm: &mut ScriptVm,
         apply: &Apply,
-        scope: &mut Scope,
+        _scope: &mut Scope,
         _value: ScriptValue,
     ) {
         // When the widget tree is re-applied (e.g. after a preference change),
@@ -699,17 +699,18 @@ impl ScriptHook for SpacesBarWrapper {
         // which clashes with whatever animator state we were in (shown, hidden).
         // Thus, we re-apply the current animator state to prevent a hidden SpacesBar
         // from briefly becoming shown before being hidden again.
-        // Note that we can't just call `animator_cut` cuz that uses the script VM
-        // which is unavailable from this `on_after_apply`
-        if !apply.is_script_reapply() {
+        // Cutting to it also takes its values (e.g., colors) from the new template,
+        // but we let an in-progress show/hide finish rather than cut it short.
+        if !apply.is_reload() || self.animator.is_track_animating(live_id!(spaces_bar_animator)) {
             return;
         }
-        if let Some(state_apply) = self
-            .animator
-            .current_state_apply(live_id!(spaces_bar_animator))
-        {
-            self.script_apply(vm, &Apply::Animate, scope, state_apply.into());
-        }
+        vm.with_cx_mut(|cx| {
+            if self.animator_in_state(cx, ids!(spaces_bar_animator.show)) {
+                self.animator_cut(cx, ids!(spaces_bar_animator.show));
+            } else {
+                self.animator_cut(cx, ids!(spaces_bar_animator.hide));
+            }
+        });
     }
 }
 
@@ -1418,10 +1419,9 @@ impl HomeScreen {
     }
 
     fn set_mobile_stack_header_height(cx: &mut Cx, stack_view: &WidgetRef, height: f64) {
-        let mut body = stack_view.widget(cx, ids!(body));
-        script_apply_eval!(cx, body, {
-            margin +: {top: #(height)}
-        });
+        if let Some(mut body) = stack_view.view(cx, ids!(body)).borrow_mut() {
+            body.walk.margin.top = height;
+        }
         stack_view.redraw(cx);
     }
 

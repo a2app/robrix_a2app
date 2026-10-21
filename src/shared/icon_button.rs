@@ -44,28 +44,28 @@ script_mod! {
             border_radius: 4.0
 
             color: (COLOR_ACTIVE_PRIMARY)
-            color_hover: (COLOR_ACTIVE_PRIMARY_DARKER)
-            color_down: #0C5DAA
+            color_hover: (COLOR_ACTIVE_PRIMARY_HOVER)
+            color_down: (COLOR_ACTIVE_PRIMARY_DOWN)
             color_disabled: (COLOR_BG_DISABLED)
 
-            border_color: #0000
-            border_color_hover: #0000
-            border_color_down: #0000
-            border_color_focus: #0000
-            border_color_disabled: #0000
+            border_color: (COLOR_TRANSPARENT)
+            border_color_hover: (COLOR_TRANSPARENT)
+            border_color_down: (COLOR_TRANSPARENT)
+            border_color_focus: (COLOR_TRANSPARENT)
+            border_color_disabled: (COLOR_TRANSPARENT)
 
             // Disable gradient (color_2) by default
             color_2: vec4(-1.0, -1.0, -1.0, -1.0)
             border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
         }
 
-        draw_icon.color: (COLOR_PRIMARY)
+        draw_icon.color: (COLOR_TEXT_ON_ACCENT)
         icon_walk: Walk{width: 16, height: 16}
 
         draw_text +: {
-            color: (COLOR_PRIMARY)
-            color_hover: (COLOR_PRIMARY)
-            color_down: (COLOR_PRIMARY)
+            color: (COLOR_TEXT_ON_ACCENT)
+            color_hover: (COLOR_TEXT_ON_ACCENT)
+            color_down: (COLOR_TEXT_ON_ACCENT)
             color_disabled: (COLOR_FG_DISABLED)
             text_style: mod.widgets.REGULAR_TEXT {font_size: 10},
         }
@@ -79,8 +79,8 @@ script_mod! {
             border_color_hover: (COLOR_FG_ACCEPT_GREEN)
             border_color_down: (COLOR_FG_ACCEPT_GREEN)
             color: (COLOR_BG_ACCEPT_GREEN)
-            color_hover: #D4EED4
-            color_down: #B8E0B8
+            color_hover: (COLOR_BG_ACCEPT_GREEN_HOVER)
+            color_down: (COLOR_BG_ACCEPT_GREEN_DOWN)
         }
         draw_icon.color: (COLOR_FG_ACCEPT_GREEN)
         draw_text +: {
@@ -97,8 +97,8 @@ script_mod! {
             border_color_hover: (COLOR_FG_DANGER_RED)
             border_color_down: (COLOR_FG_DANGER_RED)
             color: (COLOR_BG_DANGER_RED)
-            color_hover: #F0D4D4
-            color_down: #E0B8B8
+            color_hover: (COLOR_BG_DANGER_RED_HOVER)
+            color_down: (COLOR_BG_DANGER_RED_DOWN)
         }
         draw_icon.color: (COLOR_FG_DANGER_RED)
         draw_text +: {
@@ -114,9 +114,9 @@ script_mod! {
             border_color: (COLOR_BG_DISABLED)
             border_color_hover: (COLOR_BG_DISABLED)
             border_color_down: (COLOR_BG_DISABLED)
-            color: (COLOR_SECONDARY)
-            color_hover: #D0D0D0
-            color_down: #C0C0C0
+            color: (COLOR_BG_NEUTRAL)
+            color_hover: (COLOR_BG_NEUTRAL_HOVER)
+            color_down: (COLOR_BG_NEUTRAL_DOWN)
         }
         draw_icon.color: (COLOR_TEXT)
         draw_text +: {

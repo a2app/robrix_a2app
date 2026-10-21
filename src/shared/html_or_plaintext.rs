@@ -6,10 +6,7 @@ use matrix_sdk::{ruma::{matrix_uri::MatrixId, RoomOrAliasId}, OwnedServerName};
 
 use crate::{avatar_cache::{self, AvatarCacheEntry}, profile::user_profile_cache, room_preview_cache::{self, CachedRoomPreview}, sliding_sync::current_user_id, utils};
 
-use super::avatar::{AvatarImage, AvatarState, AvatarWidgetExt};
-
-/// The color of the text used to print the spoiler reason before the hidden text.
-const COLOR_SPOILER_REASON: Vec4 = vec4(0.6, 0.6, 0.6, 1.0);
+use super::{avatar::{AvatarImage, AvatarState, AvatarWidgetExt}, styles::set_view_bg_color};
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -24,6 +21,8 @@ script_mod! {
     mod.widgets.MatrixLinkPill = #(MatrixLinkPill::register_widget(vm)) {
         width: Fit, height: Fit,
         cursor: MouseCursor.Hand,
+        bg_color: (COLOR_LINK_PILL_BG)
+        bg_color_mention: (COLOR_LINK_PILL_BG_MENTION)
 
         pill_bg := RoundedView {
             width: Fit, height: Fit,
@@ -35,7 +34,7 @@ script_mod! {
 
             show_bg: true,
             draw_bg +: {
-                color: #000
+                color: (COLOR_LINK_PILL_BG)
                 border_radius: 6.0
             }
 
@@ -46,7 +45,7 @@ script_mod! {
                 // pill's black background.
                 img_view +: {
                     show_bg: true,
-                    draw_bg +: { color: #fff }
+                    draw_bg +: { color: (COLOR_LINK_PILL_AVATAR_BG) }
                 }
                 text_view +: {
                     text +: {
@@ -63,7 +62,7 @@ script_mod! {
                 max_lines: 1,
                 text_overflow: Ellipsis,
                 draw_text +: {
-                    color: #f,
+                    color: (COLOR_LINK_PILL_TEXT),
                     text_style: MESSAGE_TEXT_STYLE { font_size: (MESSAGE_FONT_SIZE), line_spacing: 1.0 },
                 }
                 text: "Unknown",
@@ -78,6 +77,7 @@ script_mod! {
         align: Align{ y: 0.5 },
 
         html_link := HtmlLink {
+            color: (COLOR_LINK)
             hover_color: (COLOR_LINK_HOVER)
             grab_key_focus: false,
             padding: Inset{left: 1.0, right: 1.5},
@@ -96,6 +96,7 @@ script_mod! {
     mod.widgets.MatrixHtmlSpan = #(MatrixHtmlSpan::register_widget(vm)) {
         width: Fit, height: Fit,
         align: Align{x: 0., y: 0.}
+        spoiler_reason_color: (COLOR_SPOILER_REASON_TEXT)
     }
 
 
@@ -134,23 +135,29 @@ script_mod! {
             line_color: (MESSAGE_TEXT_COLOR)
             sep_color: (MESSAGE_TEXT_COLOR)
             // #EDEDED atop white, but translucent so it also stands out on a hovered or highlighted message.
-            code_color: (#x00000012)
-            quote_bg_color: (#x00000012)
+            code_color: (COLOR_MESSAGE_CODE_BG)
+            quote_bg_color: (COLOR_MESSAGE_QUOTE_BG)
             quote_fg_color: (MESSAGE_TEXT_COLOR)
+            table_header_bg_color: (COLOR_MESSAGE_TABLE_HEADER_BG)
+            table_border_color: (COLOR_MESSAGE_TABLE_BORDER)
         }
 
+        // Specific all the parts of these sizes/flows/layouts, since they get reset to default upon a reload apply.
         quote_layout: Layout{ flow: Flow.Right{wrap: true, row_align: RowAlign.Baseline}, spacing: 0, padding: Inset{left: 15, top: 10.0, bottom: 10.0}, }
-        quote_walk: Walk{ margin: Inset{ top: 5, bottom: 5, left: 0 } }
+        quote_walk: Walk{ width: Fill, height: Fit, margin: Inset{ top: 5, bottom: 5, left: 0 } }
 
-        sep_walk: Walk{ margin: Inset{ top: 10, bottom: 10 } }
+        sep_walk: Walk{ width: Fill, height: 4.0, margin: Inset{ top: 10, bottom: 10 } }
 
         list_item_layout: Layout{ flow: Flow.Right{wrap: true, row_align: RowAlign.Baseline}, padding: Inset{left: 5.0, top: 1.0, bottom: 1.0}, }
         list_item_marker_pad: 8.0
-        list_item_walk: Walk{ margin: Inset{ left: 0, right: 0, top: 1, bottom: 7 } }
+        list_item_walk: Walk{ width: Fill, height: Fit, margin: Inset{ left: 0, right: 0, top: 1, bottom: 7 } }
+        table_walk: Walk{ width: Fill, height: Fit }
+        table_layout: Layout{ flow: Flow.Down }
+        table_row_walk: Walk{ width: Fill, height: Fit }
         table_row_layout: Layout{ flow: Flow.Right{row_align: RowAlign.Center} }
         table_cell_layout: Layout{ flow: Flow.Right{wrap: true, row_align: RowAlign.Baseline}, padding: Inset{left: 6, right: 6, top: 4, bottom: 4} }
         code_layout: Layout{ flow: Flow.Right{wrap: true, row_align: RowAlign.Baseline}, padding: Inset{top: 15.0, bottom: 15.0, left: 15, right: 5 } }
-        code_walk: Walk{ margin: Inset{ top: 10, bottom: 10, left: 0, right: 0 } }
+        code_walk: Walk{ width: Fill, height: Fit, margin: Inset{ top: 10, bottom: 10, left: 0, right: 0 } }
 
         heading_margin: Inset{ top: 1.0, bottom: 0.1 }
         paragraph_margin: Inset{ top: 1.8, bottom: 1.8 }
@@ -390,6 +397,9 @@ impl RobrixHtmlLink {
 struct MatrixLinkPill {
     #[deref] view: View,
 
+    #[live] bg_color: Vec4f,
+    #[live] bg_color_mention: Vec4f,
+
     #[rust] matrix_id: Option<MatrixId>,
     #[rust] via: Vec<OwnedServerName>,
     #[rust] url: String,
@@ -512,14 +522,8 @@ impl MatrixLinkPill {
         // Reset pill bg to default black, then apply red for mentions.
         // This prevents stale red from persisting if a cached widget is
         // reused for a different (non-mention) link after a message edit.
-        {
-            let mut pill_bg = self.view(cx, ids!(pill_bg));
-            if is_room_mention || is_self_mention {
-                script_apply_eval!(cx, pill_bg, { draw_bg +: { color: #d91b38 } });
-            } else {
-                script_apply_eval!(cx, pill_bg, { draw_bg +: { color: #000 } });
-            }
-        }
+        let pill_bg = self.view(cx, ids!(pill_bg));
+        set_view_bg_color(cx, &pill_bg, if is_room_mention || is_self_mention { self.bg_color_mention } else { self.bg_color });
 
         // Handle a user ID link by querying the user profile cache.
         if let MatrixId::User(user_id) = matrix_id {
@@ -652,6 +656,8 @@ pub struct MatrixHtmlSpan {
     #[live] text: ArcStringMut,
     /// The current display state of the spoiler.
     #[rust] spoiler: SpoilerDisplay,
+    /// The color of the text used to print the spoiler reason before the hidden text.
+    #[live] spoiler_reason_color: Vec4,
     /// Foreground (text) color: the `data-mx-color` or `color` attributes.
     #[rust] fg_color: Option<Vec4>,
     /// Background color: the `data-mx-bg-color` attribute.
@@ -773,7 +779,7 @@ impl Widget for MatrixHtmlSpan {
             SpoilerDisplay::Hidden { reason }
             | SpoilerDisplay::Revealed { reason } => {
                 // Draw the spoiler reason text in an italic gray font.
-                tf.font_colors.push(COLOR_SPOILER_REASON);
+                tf.font_colors.push(self.spoiler_reason_color);
                 tf.italic.push();
                 // tf.push_size_rel_scale(0.8);
                 if reason.is_empty() {

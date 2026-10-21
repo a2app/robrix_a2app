@@ -396,7 +396,7 @@ mod tests {
         let pane = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             super::super::host_set::script_mod(vm);
             vm.bx.captured_errors = Some(Vec::new());
             super::script_mod(vm);

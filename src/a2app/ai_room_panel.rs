@@ -409,7 +409,7 @@ mod tests {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let panel = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             super::super::permission_choices::script_mod(vm);
             super::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.AiRoomPanel {} });

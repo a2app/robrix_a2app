@@ -20,7 +20,7 @@ use crate::{
     profile::{user_profile::{ShowUserProfileAction, UserProfile, UserProfileAndRoomId}, user_profile_cache},
     room::FetchedRoomAvatar,
     room_preview_cache::{self, CachedRoomPreview},
-    shared::styles::COLOR_AVATAR_BG,
+    shared::styles::set_view_bg_color,
     sliding_sync::{submit_async_request, MatrixRequest, TimelineKind},
     utils::{self, RoomNameId},
 };
@@ -45,6 +45,12 @@ script_mod! {
 
         // TODO: use PageFlip to switch between text and image instead of an overlay.
 
+        // The text view's bg color for each kind of `TextAvatarBgColor`.
+        text_bg_color:              (COLOR_AVATAR_BG)
+        text_bg_color_accent:       (COLOR_ROBRIX_PURPLE)
+        text_bg_color_disabled:     (COLOR_FG_DISABLED)
+        text_bg_color_unknown_room: (COLOR_UNKNOWN_ROOM_AVATAR)
+
         text_view := CircleView {
             visible: true,
             align: Align { x: 0.5, y: 0.5 }
@@ -59,7 +65,7 @@ script_mod! {
                 align: Align{ x: 0.5, y: 0.5 }
                 draw_text +: {
                     text_style: TITLE_TEXT { font_size: 15. }
-                    color: #f,
+                    color: (COLOR_TEXT_ON_ACCENT),
                 }
                 text: "?"
             }
@@ -99,24 +105,43 @@ enum AvatarDisplayState {
     Image,
 }
 
+/// The background color behind an avatar's text label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextAvatarBgColor {
+    Default,
+    Accent,
+    Disabled,
+    UnknownRoom,
+}
+
 #[derive(Script, Widget)]
 pub struct Avatar {
     #[source] source: ScriptObjectRef,
     #[deref] view: View,
 
+    #[live] text_bg_color: Vec4f,
+    #[live] text_bg_color_accent: Vec4f,
+    #[live] text_bg_color_disabled: Vec4f,
+    #[live] text_bg_color_unknown_room: Vec4f,
+
     /// Information about the user profile being shown in this Avatar.
     /// If `Some`, this Avatar will respond to clicks/taps.
     #[rust] info: Option<UserProfileAndRoomId>,
     #[rust] display_state: AvatarDisplayState,
+    #[rust] applied_text_bg_color: Option<TextAvatarBgColor>,
 }
 
 impl ScriptHook for Avatar {
     fn on_after_apply(&mut self, vm: &mut ScriptVm, apply: &Apply, _scope: &mut Scope, _value: ScriptValue) {
+        let cx = vm.cx_mut();
+        // A reload resets the text view's bg color, so we re-apply the last one we set.
+        if apply.is_reload() && let Some(bg_color) = self.applied_text_bg_color {
+            self.set_text_bg_color(cx, bg_color);
+        }
         // A reapply (like rotation on mobile) resets the default visibility, so we need to set it again.
         if !apply.is_script_reapply() {
             return;
         }
-        let cx = vm.cx_mut();
         let show_img = self.display_state != AvatarDisplayState::Text
             && self.image(cx, ids!(img_view.img)).has_content();
         self.view(cx, ids!(img_view)).set_visible(cx, show_img);
@@ -193,7 +218,7 @@ impl Avatar {
     pub fn show_text<T: AsRef<str>>(
         &mut self,
         cx: &mut Cx,
-        bg_color: Option<Vec4>,
+        bg_color: Option<TextAvatarBgColor>,
         info: Option<AvatarTextInfo>,
         username: T,
     ) {
@@ -220,11 +245,16 @@ impl Avatar {
         }
     }
 
-    fn set_text_bg_color(&mut self, cx: &mut Cx, color: Vec4) {
-        let mut text_view = self.view(cx, ids!(text_view));
-        script_apply_eval!(cx, text_view, {
-            draw_bg.color: #(color)
-        });
+    fn set_text_bg_color(&mut self, cx: &mut Cx, bg_color: TextAvatarBgColor) {
+        self.applied_text_bg_color = Some(bg_color);
+        let color = match bg_color {
+            TextAvatarBgColor::Default     => self.text_bg_color,
+            TextAvatarBgColor::Accent      => self.text_bg_color_accent,
+            TextAvatarBgColor::Disabled    => self.text_bg_color_disabled,
+            TextAvatarBgColor::UnknownRoom => self.text_bg_color_unknown_room,
+        };
+        let text_view = self.view(cx, ids!(text_view));
+        set_view_bg_color(cx, &text_view, color);
     }
 
     /// Sets the image content of this avatar, making the image visible
@@ -420,19 +450,19 @@ impl Avatar {
                     // (Toggling visibility on every call would redraw the whole window.)
                     if self.display_state == AvatarDisplayState::ImageLoading {
                         self.set_text_label(cx, name);
-                        self.set_text_bg_color(cx, COLOR_AVATAR_BG);
+                        self.set_text_bg_color(cx, TextAvatarBgColor::Default);
                     }
                 } else {
-                    self.show_text(cx, Some(COLOR_AVATAR_BG), None, name);
+                    self.show_text(cx, Some(TextAvatarBgColor::Default), None, name);
                 }
                 true
             }
             Some((_, AvatarCacheEntry::Requested)) => {
-                self.show_text(cx, Some(COLOR_AVATAR_BG), None, name);
+                self.show_text(cx, Some(TextAvatarBgColor::Default), None, name);
                 false
             }
             Some((_, AvatarCacheEntry::Failed)) | None => {
-                self.show_text(cx, Some(COLOR_AVATAR_BG), None, name);
+                self.show_text(cx, Some(TextAvatarBgColor::Default), None, name);
                 true
             }
         }
@@ -465,7 +495,7 @@ impl AvatarRef {
     pub fn show_text<T: AsRef<str>>(
         &self,
         cx: &mut Cx,
-        bg_color: Option<Vec4>,
+        bg_color: Option<TextAvatarBgColor>,
         info: Option<AvatarTextInfo>,
         username: T,
     ) {

@@ -48,9 +48,8 @@ use crate::{
     home::{home_screen::effective_is_desktop, spaces_bar::SpacesBarWidgetExt},
     settings::app_preferences::{AppPreferencesAction, ViewModeOverride},
     shared::{
-        avatar::{AvatarState, AvatarWidgetExt},
+        avatar::{AvatarState, TextAvatarBgColor, AvatarWidgetExt},
         navigation_bar_button::{NavigationBarButton, NavigationBarButtonWidgetExt},
-        styles::*,
         verification_badge::VerificationBadgeWidgetExt
     },
     sliding_sync::{current_user_id, AccountDataAction},
@@ -101,7 +100,7 @@ script_mod! {
                     text +: {
                         draw_text +: {
                             text_style: theme.font_regular { font_size: mod.widgets.NAVIGATION_TAB_BAR_AVATAR_FONT_SIZE },
-                            color: (COLOR_PRIMARY),
+                            color: (COLOR_TEXT_ON_ACCENT),
                         }
                     }
                 }
@@ -405,13 +404,11 @@ impl Widget for ProfileIcon {
                     || String::from("Not logged in (or disconnected).\n\nClick/tap to access all settings."),
                     |p| format!("Logged in {verification_str}as \"{}\".\n\nClick/tap to access all settings.", p.displayable_name()),
                 );
-                let mut options = CalloutTooltipOptions {
+                let options = CalloutTooltipOptions {
                     position: if effective_is_desktop(cx) { TooltipPosition::Right } else { TooltipPosition::Top },
+                    bg_color,
                     ..Default::default()
                 };
-                if let Some(c) = bg_color {
-                    options.bg_color = c;
-                }
                 cx.widget_action(
                     self.widget_uid(),
                     TooltipAction::HoverIn {
@@ -444,7 +441,7 @@ impl Widget for ProfileIcon {
             // If we don't have a profile, default to an unknown avatar.
             our_own_avatar.show_text(
                 cx,
-                Some(COLOR_FG_DISABLED),
+                Some(TextAvatarBgColor::Disabled),
                 None, // don't make this avatar clickable; we handle clicks on this ProfileIcon widget directly.
                 "",
             );
@@ -462,7 +459,7 @@ impl Widget for ProfileIcon {
         if !drew_avatar {
             our_own_avatar.show_text(
                 cx,
-                Some(COLOR_ROBRIX_PURPLE),
+                Some(TextAvatarBgColor::Accent),
                 None, // don't make this avatar clickable; we handle clicks on this ProfileIcon widget directly.
                 own_profile.displayable_name(),
             );

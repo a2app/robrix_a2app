@@ -180,6 +180,12 @@ script_mod! {
         align: Align{y: 0.5}
         padding: Inset{top: 6, bottom: 6, left: 10, right: 10}
 
+        // The state label's color for each permission state.
+        state_color_allowed: (COLOR_FG_ACCEPT_GREEN)
+        state_color_ask: (COLOR_ACTIVE_PRIMARY)
+        state_color_blocked: (COLOR_FG_DANGER_RED)
+        state_color_inactive: (COLOR_FG_DISABLED)
+
         perm_glyph := Label {
             width: 26, height: Fit
             padding: 0, margin: 0
@@ -238,6 +244,12 @@ script_mod! {
         spacing: 8
         align: Align{y: 0.5}
         padding: Inset{top: 3, bottom: 3, left: 26, right: 10}
+
+        // The state label's color for each permission state.
+        state_color_allowed: (COLOR_FG_ACCEPT_GREEN)
+        state_color_ask: (COLOR_ACTIVE_PRIMARY)
+        state_color_blocked: (COLOR_FG_DANGER_RED)
+        state_color_inactive: (COLOR_FG_DISABLED)
 
         View {
             width: Fill, height: Fit
@@ -1976,6 +1988,10 @@ pub(super) fn mini_app_rows(
 #[derive(Script, ScriptHook, Widget)]
 pub struct MiniAppPermissionRow {
     #[deref] view: View,
+    #[live] state_color_allowed: Vec4f,
+    #[live] state_color_ask: Vec4f,
+    #[live] state_color_blocked: Vec4f,
+    #[live] state_color_inactive: Vec4f,
     #[rust] app_id: MiniAppId,
     #[rust] perm: Option<Permission>,
 }
@@ -2006,10 +2022,10 @@ impl MiniAppPermissionRow {
         self.view.label(cx, ids!(perm_title)).set_text(cx, perm.title());
         self.view.label(cx, ids!(perm_blurb)).set_text(cx, perm.blurb());
         let (state_text, color) = match effective {
-            Effective::Granted => ("Allowed", crate::shared::styles::COLOR_FG_ACCEPT_GREEN),
-            Effective::NeedsPrompt => ("Ask first", crate::shared::styles::COLOR_ACTIVE_PRIMARY),
-            Effective::Denied => ("Blocked", crate::shared::styles::COLOR_FG_DANGER_RED),
-            Effective::Undeclared => ("Undeclared", crate::shared::styles::COLOR_FG_DISABLED),
+            Effective::Granted => ("Allowed", self.state_color_allowed),
+            Effective::NeedsPrompt => ("Ask first", self.state_color_ask),
+            Effective::Denied => ("Blocked", self.state_color_blocked),
+            Effective::Undeclared => ("Undeclared", self.state_color_inactive),
         };
         let (scoped, websites, writes_blocked) = with_a2app(|state| (
             state.permissions.scoped_grants(app_id).into_iter()
@@ -2019,13 +2035,13 @@ impl MiniAppPermissionRow {
                 .any(|cap| cap.status == a2app_core::capabilities::Status::RefusedBySwitch),
         )).unwrap_or_default();
         let (state_text, color) = if writes_blocked {
-            ("Room changes are turned off", crate::shared::styles::COLOR_FG_DANGER_RED)
+            ("Room changes are turned off", self.state_color_blocked)
         } else { (state_text, color) };
         let (state_text, color) = if effective != Effective::Denied && !writes_blocked && (!scoped.is_empty() || !websites.is_empty()) {
             let mut choices = scoped.iter().map(|grant| format!("{} · {}{}", scope_label(cx, &grant.scope), duration_label(grant.duration),
                 if grant.capability.is_some() { " · specific ability" } else { "" })).collect::<Vec<_>>();
             choices.extend(websites.iter().map(|grant| format!("{} · {}", network_scope_label(&grant.network), duration_label(grant.duration))));
-            (format!("Allowed: {}", choices.join("; ")), crate::shared::styles::COLOR_FG_ACCEPT_GREEN)
+            (format!("Allowed: {}", choices.join("; ")), self.state_color_allowed)
         } else { (state_text.to_string(), color) };
         let mut state_label = self.view.label(cx, ids!(perm_state));
         script_apply_eval!(cx, state_label, {
@@ -2038,6 +2054,10 @@ impl MiniAppPermissionRow {
 #[derive(Script, ScriptHook, Widget)]
 pub struct MiniAppCapabilityRow {
     #[deref] view: View,
+    #[live] state_color_allowed: Vec4f,
+    #[live] state_color_ask: Vec4f,
+    #[live] state_color_blocked: Vec4f,
+    #[live] state_color_inactive: Vec4f,
     #[rust] app_id: MiniAppId,
     #[rust] cap_id: String,
 }
@@ -2090,11 +2110,11 @@ impl MiniAppCapabilityRow {
         }).unwrap_or_default();
         // Show the enforced result even when a saved individual allowance is overridden.
         let (state_text, color) = match effective {
-            Effective::Denied => (block_reason.unwrap_or_else(|| String::from("Blocked")), crate::shared::styles::COLOR_FG_DANGER_RED),
-            Effective::Undeclared => (String::from("Not declared"), crate::shared::styles::COLOR_FG_DISABLED),
-            Effective::Granted if own == GrantState::Ask => (String::from("Allowed · group"), crate::shared::styles::COLOR_FG_DISABLED),
-            Effective::Granted => (String::from("Allowed"), crate::shared::styles::COLOR_FG_ACCEPT_GREEN),
-            Effective::NeedsPrompt => (String::from("Ask first"), crate::shared::styles::COLOR_ACTIVE_PRIMARY),
+            Effective::Denied => (block_reason.unwrap_or_else(|| String::from("Blocked")), self.state_color_blocked),
+            Effective::Undeclared => (String::from("Not declared"), self.state_color_inactive),
+            Effective::Granted if own == GrantState::Ask => (String::from("Allowed · group"), self.state_color_inactive),
+            Effective::Granted => (String::from("Allowed"), self.state_color_allowed),
+            Effective::NeedsPrompt => (String::from("Ask first"), self.state_color_ask),
         };
         let state_text = if scoped_count > 0 { format!("{state_text} · {scoped_count} saved allowances") } else { state_text };
         let mut state_label = self.view.label(cx, ids!(cap_state));
@@ -3928,7 +3948,7 @@ mod picker_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -3951,7 +3971,7 @@ mod picker_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -3985,7 +4005,7 @@ mod picker_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -4029,7 +4049,7 @@ mod picker_tests {
         let (screen, picker) = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             let screen = WidgetRef::script_from_value(vm, value);
@@ -4734,7 +4754,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppProviderRow {} });
             WidgetRef::script_from_value(vm, value)
@@ -4770,7 +4790,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -4800,7 +4820,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -4839,7 +4859,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppRow {} });
             WidgetRef::script_from_value(vm, value)
@@ -4884,7 +4904,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -4927,7 +4947,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -4951,7 +4971,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppVersionRow {} });
             WidgetRef::script_from_value(vm, value)
@@ -5033,7 +5053,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppCapabilityRow {} });
             WidgetRef::script_from_value(vm, value)
@@ -5050,7 +5070,7 @@ mod access_tests {
         row.populate(&mut cx, app, cap, own, effective);
         let status = row.view.label(&cx, ids!(cap_state));
         assert!(status.text().starts_with("Blocked"));
-        assert_eq!(status.borrow().unwrap().draw_text.color, crate::shared::styles::COLOR_FG_DANGER_RED);
+        assert_eq!(status.borrow().unwrap().draw_text.color, row.state_color_blocked);
 
         permissions.set(app, cap.group.unwrap(), GrantState::Ask);
         let effective = permissions.effective_capability_for(app, |_| true, |_| true, cap);
@@ -5069,7 +5089,7 @@ mod access_tests {
         assert_eq!(effective, Effective::Denied);
         row.populate(&mut cx, app, write, GrantState::Granted, effective);
         assert!(status.text().starts_with("Blocked"));
-        assert_eq!(status.borrow().unwrap().draw_text.color, crate::shared::styles::COLOR_FG_DANGER_RED);
+        assert_eq!(status.borrow().unwrap().draw_text.color, row.state_color_blocked);
     }
 
     #[test]
@@ -5093,7 +5113,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -5119,7 +5139,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -5149,7 +5169,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -5168,7 +5188,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -5225,7 +5245,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -5278,7 +5298,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -5382,7 +5402,7 @@ mod create_card_tests {
         cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)

@@ -1169,7 +1169,7 @@ mod tests {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let card = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             super::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.AiTurnTimelineCard {} });
             WidgetRef::script_from_value(vm, value).as_ai_turn_timeline_card()

@@ -4,7 +4,7 @@ use std::{borrow::Cow, ops::{Deref, DerefMut}};
 use makepad_widgets::*;
 use matrix_sdk::{room::{RoomMember, RoomMemberRole}, ruma::{events::room::member::MembershipState, OwnedRoomId, OwnedUserId}};
 use crate::{
-    block_user_modal::{BlockUserModalAction, BlockUserRequest}, shared::{avatar::{AvatarState, AvatarWidgetExt}, popup_list::{PopupKind, enqueue_popup_notification}}, sliding_sync::{MatrixRequest, current_user_id, is_user_blocked, submit_async_request}, utils
+    block_user_modal::{BlockUserModalAction, BlockUserRequest}, shared::{avatar::{AvatarState, AvatarWidgetExt}, popup_list::{PopupKind, enqueue_popup_notification}, styles::set_view_bg_color}, sliding_sync::{MatrixRequest, current_user_id, is_user_blocked, submit_async_request}, utils
 };
 use super::user_profile_cache::{self, UserProfilesUpdated};
 
@@ -102,7 +102,7 @@ script_mod! {
                 align: Align{x: 0.5}
                 flow: Flow.Right{wrap: true}
                 draw_text +: {
-                    color: #000,
+                    color: (COLOR_TEXT_TITLE),
                     text_style: USERNAME_TEXT_STYLE { font_size: 12 },
                 }
                 text: "User Name"
@@ -135,7 +135,7 @@ script_mod! {
                 flow: Flow.Right{wrap: true}
                 draw_text +: {
                     text_style: USERNAME_TEXT_STYLE { font_size: 11.5 },
-                    color: #000
+                    color: (COLOR_TEXT_TITLE)
                 }
                 text: "Membership in this room"
             }
@@ -176,7 +176,7 @@ script_mod! {
                 flow: Flow.Right{wrap: true}
                 draw_text +: {
                     text_style: USERNAME_TEXT_STYLE { font_size: 11.5 },
-                    color: #000
+                    color: (COLOR_TEXT_TITLE)
                 }
                 text: "Actions"
             }
@@ -232,7 +232,7 @@ script_mod! {
             height: Fill
             visible: false,
             show_bg: true
-            draw_bg.color: #000000BB
+            draw_bg.color: (COLOR_OVERLAY_BG)
         }
 
         main_content := SolidView {
@@ -242,7 +242,7 @@ script_mod! {
             align: Align{x: 0}
 
             show_bg: true,
-            draw_bg.color: (COLOR_PRIMARY)
+            draw_bg.color: (COLOR_BG_FLOATING)
 
             user_profile_view := UserProfileView { }
 
@@ -259,6 +259,7 @@ script_mod! {
         }
 
         slide: 1.0,
+        overlay_bg_color: (COLOR_OVERLAY_BG)
 
         animator: Animator {
             panel: {
@@ -381,6 +382,7 @@ pub struct UserProfileSlidingPane {
     #[deref] view: View,
     #[apply_default] animator: Animator,
     #[live] slide: f32,
+    #[live] overlay_bg_color: Vec4f,
 
     #[rust] info: Option<UserProfilePaneInfo>,
     #[rust] is_animating_out: bool,
@@ -566,19 +568,16 @@ impl Widget for UserProfileSlidingPane {
         // slide=0.0 means fully shown; slide=1.0 means fully hidden (off-screen right).
         let panel_width = 300.0;
         let right_margin = -(self.slide * panel_width);
-        let mut main_content = self.view(cx, ids!(main_content));
-        script_apply_eval!(cx, main_content, {
-            margin.right: #(right_margin)
-        });
+        if let Some(mut main_content) = self.view(cx, ids!(main_content)).borrow_mut() {
+            main_content.walk.margin.right = right_margin as f64;
+        }
         // Also derive the bg_view overlay alpha from `slide`.
         // The animator can only interpolate struct fields, not child view properties,
         // so we compute the bg color here from the smoothly-animated `slide` value.
-        let bg_alpha = (1.0 - self.slide) * 0.733; // 0.733 ≈ 0xBB/0xFF
-        let bg_color = vec4(0.0, 0.0, 0.0, bg_alpha);
-        let mut bg_view = self.view(cx, ids!(bg_view));
-        script_apply_eval!(cx, bg_view, {
-            draw_bg +: { color: #(bg_color) }
-        });
+        let mut bg_color = self.overlay_bg_color;
+        bg_color.w *= 1.0 - self.slide;
+        let bg_view = self.view(cx, ids!(bg_view));
+        set_view_bg_color(cx, &bg_view, bg_color);
 
         // Set the user name, using the user ID as a fallback.
         self.label(cx, ids!(user_name)).set_text(cx, info.displayable_name());

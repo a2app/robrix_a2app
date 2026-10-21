@@ -1,4 +1,5 @@
 use makepad_widgets::ScriptVm;
+use crate::settings::app_preferences::Appearance;
 
 pub mod attachment_download;
 pub mod avatar;
@@ -27,6 +28,7 @@ pub mod slash_commands;
 mod speech_input;
 pub mod speech_text_input;
 pub mod styles;
+pub mod styles_dark;
 pub mod settings_controls;
 pub mod text_or_image;
 pub mod timestamp;
@@ -37,11 +39,14 @@ pub mod restore_status_view;
 pub mod image_viewer;
 
 
-pub fn script_mod(vm: &mut ScriptVm) {
+pub fn script_mod(vm: &mut ScriptVm, appearance: Appearance) {
     // Order matters here, as some widget definitions depend on others.
     styles::script_mod(vm);
-    settings_controls::script_mod(vm);
+    if appearance == Appearance::Dark {
+        styles_dark::script_mod(vm);
+    }
     helpers::script_mod(vm);
+    settings_controls::script_mod(vm);
     icon_button::script_mod(vm);
     password_input::script_mod(vm);
     speech_text_input::script_mod(vm);

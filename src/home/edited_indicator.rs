@@ -19,7 +19,6 @@ script_mod! {
 
 
     mod.widgets.EDITED_INDICATOR_FONT_SIZE = 9.5
-    mod.widgets.EDITED_INDICATOR_FONT_COLOR = #666666
 
     mod.widgets.EditedIndicator = #(EditedIndicator::register_widget(vm)) {
         visible: false, // default to hidden
@@ -38,7 +37,7 @@ script_mod! {
             margin: 0,
 
             font_size: (mod.widgets.EDITED_INDICATOR_FONT_SIZE),
-            font_color: (COLOR_ROBRIX_PURPLE),
+            font_color: (COLOR_TEXT_PURPLE),
             body: "(<u>edited</u>)",
         }
     }

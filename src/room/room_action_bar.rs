@@ -32,10 +32,10 @@ script_mod! {
 
         border_radius: uniform(4.0)
         border_size: uniform(0.0)
-        border_color: instance(#0000)
+        border_color: instance((COLOR_TRANSPARENT))
         border_color_2: instance(vec4(-1))
 
-        shadow_color: instance(#0005)
+        shadow_color: instance((COLOR_HEADER_SHADOW))
         shadow_radius: uniform(12.0)
         shadow_offset: uniform(vec2(0.0, 0.0))
 
@@ -113,9 +113,9 @@ script_mod! {
         icon_walk: Walk{width: 18, height: 18}
         draw_icon.color: ROOM_NAME_TEXT_COLOR
         draw_bg +: {
-            color: #0000
-            color_hover: #0001
-            color_down: #0002
+            color: (COLOR_TRANSPARENT)
+            color_hover: (COLOR_ROOM_ACTION_BUTTON_BG_HOVER)
+            color_down: (COLOR_ROOM_ACTION_BUTTON_BG_DOWN)
         }
         draw_text +: {
             color: ROOM_NAME_TEXT_COLOR
@@ -139,18 +139,20 @@ script_mod! {
         width: Fill, height: Fit
         flow: Overlay
         show_bg: true
-        draw_bg: mod.widgets.RobrixHeaderBackground {shadow_color: #0000}
+        draw_bg: mod.widgets.RobrixHeaderBackground {shadow_color: (COLOR_TRANSPARENT)}
         draw_shadow: mod.widgets.RobrixHeaderBackground {
-            color: #0000
+            color: (COLOR_TRANSPARENT)
         }
+        shadow_color: (COLOR_HEADER_SHADOW)
 
-        room_mini_apps_button       := mod.widgets.RoomActionButton {draw_icon.svg: ICON_SPARKLE, visible: false}
-        // room_info_button            := mod.widgets.RoomActionButton {draw_icon.svg: ICON_INFO}
-        room_threads_button         := mod.widgets.RoomActionButton {draw_icon.svg: ICON_REPLY_IN_THREAD}
-        room_pinned_messages_button := mod.widgets.RoomActionButton {draw_icon.svg: ICON_PIN}
-        room_members_button         := mod.widgets.RoomActionButton {draw_icon.svg: ICON_MEMBERS}
-        // room_settings_button        := mod.widgets.RoomActionButton {draw_icon.svg: ICON_SETTINGS}
-        room_invite_button          := mod.widgets.RoomActionButton {draw_icon.svg: ICON_ADD_USER}
+        // A long press on one of these shows its tooltip.
+        room_mini_apps_button       := mod.widgets.RoomActionButton {enable_long_press: true, draw_icon.svg: ICON_SPARKLE, visible: false}
+        // room_info_button            := mod.widgets.RoomActionButton {enable_long_press: true, draw_icon.svg: ICON_INFO}
+        room_threads_button         := mod.widgets.RoomActionButton {enable_long_press: true, draw_icon.svg: ICON_REPLY_IN_THREAD}
+        room_pinned_messages_button := mod.widgets.RoomActionButton {enable_long_press: true, draw_icon.svg: ICON_PIN}
+        room_members_button         := mod.widgets.RoomActionButton {enable_long_press: true, draw_icon.svg: ICON_MEMBERS}
+        // room_settings_button        := mod.widgets.RoomActionButton {enable_long_press: true, draw_icon.svg: ICON_SETTINGS}
+        room_invite_button          := mod.widgets.RoomActionButton {enable_long_press: true, draw_icon.svg: ICON_ADD_USER}
         expand_room_actions_button  := mod.widgets.RoomActionButton {
             draw_icon.svg: ICON_CHEVRON_DOWN
             icon_walk: Walk{width: 17, height: 17}
@@ -182,8 +184,8 @@ script_mod! {
                     draw_icon.color: (COLOR_FG_ACCEPT_GREEN)
                     draw_bg +: {
                         color: (COLOR_BG_ACCEPT_GREEN)
-                        color_hover: #D4EED4
-                        color_down: #B8E0B8
+                        color_hover: (COLOR_BG_ACCEPT_GREEN_HOVER)
+                        color_down: (COLOR_BG_ACCEPT_GREEN_DOWN)
                     }
                     draw_text +: {
                         color: (COLOR_FG_ACCEPT_GREEN)
@@ -306,6 +308,7 @@ pub struct RoomActionBar {
     #[deref] view: View,
     #[apply_default] animator: Animator,
     #[live] draw_shadow: DrawQuad,
+    #[live] shadow_color: Vec4f,
     /// Whether we're in desktop view mode (`true`) or mobile view mode (`false`).
     #[live(true)] is_desktop_mode: bool,
     /// Whether the full list of buttons is expanded (or is sliding into view).
@@ -344,6 +347,7 @@ impl ScriptHook for RoomActionBar {
         if apply.is_reload() {
             self.expand = if self.is_expanded { 1.0 } else { 0.0 };
             self.needs_animator_resync = true;
+            self.latest_header_height = None;
         }
     }
 }
@@ -491,17 +495,21 @@ impl RoomActionBar {
                             color_hover: (mod.widgets.COLOR_BG_LAVENDER_SELECTED_HOVER)
                             color_down: (mod.widgets.COLOR_BG_LAVENDER_SELECTED_DOWN)
                         }
-                        draw_icon +: { color: (mod.widgets.COLOR_PRIMARY) }
+                        draw_icon +: { color: (mod.widgets.COLOR_TEXT_ON_ACCENT) }
                         draw_text +: {
-                            color: (mod.widgets.COLOR_PRIMARY)
-                            color_hover: (mod.widgets.COLOR_PRIMARY)
-                            color_down: (mod.widgets.COLOR_PRIMARY)
+                            color: (mod.widgets.COLOR_TEXT_ON_ACCENT)
+                            color_hover: (mod.widgets.COLOR_TEXT_ON_ACCENT)
+                            color_down: (mod.widgets.COLOR_TEXT_ON_ACCENT)
                         }
                     });
                 }
             } else {
                 script_apply_eval!(cx, button, {
-                    draw_bg +: { color: #0000, color_hover: #0001, color_down: #0002 }
+                    draw_bg +: {
+                        color: (mod.widgets.COLOR_TRANSPARENT)
+                        color_hover: (mod.widgets.COLOR_ROOM_ACTION_BUTTON_BG_HOVER)
+                        color_down: (mod.widgets.COLOR_ROOM_ACTION_BUTTON_BG_DOWN)
+                    }
                     draw_icon +: { color: (mod.widgets.ROOM_NAME_TEXT_COLOR) }
                 });
                 script_apply_eval!(cx, expanded_button, {
@@ -581,13 +589,13 @@ impl RoomActionBar {
         } else {
             Size::Fixed(if self.is_desktop_mode { 0.0 } else { HEADER_HEIGHT })
         };
-        let mut expanded_clip = self.view.view(cx, ids!(expanded_clip));
+        let expanded_clip = self.view.view(cx, ids!(expanded_clip));
         expanded_clip.set_visible(cx, show_overflow);
         let overflow_y = if self.is_desktop_mode { 0.0 } else { HEADER_HEIGHT };
-        script_apply_eval!(cx, expanded_clip, {
-            width: #(width)
-            margin: mod.prelude.widgets.Inset{top: #(overflow_y)}
-        });
+        if let Some(mut clip) = expanded_clip.borrow_mut() {
+            clip.walk.width = Size::Fixed(width);
+            clip.walk.margin.top = overflow_y;
+        }
         let expanded_room_actions = self.view.view(cx, ids!(expanded_room_actions));
         self.view.view(cx, ids!(button_container)).set_visible(cx, !self.is_desktop_mode);
         self.view.view(cx, ids!(title_container)).set_visible(cx, !self.is_desktop_mode);
@@ -620,8 +628,6 @@ impl RoomActionBar {
                 let slots_after = index + 2;
                 let x = width - HEADER_BUTTON_INSET - slots_after as f64 * (BUTTON_SIZE + HEADER_BUTTON_GAP) + HEADER_BUTTON_GAP;
                 place(cx, &button, x, HEADER_BUTTON_INSET, BUTTON_SIZE, BUTTON_SIZE);
-                let mut button = button;
-                script_apply_eval!(cx, button, {enable_long_press: true});
             }
             if available { index += 1; }
         }
@@ -636,6 +642,14 @@ fn inline_count(width: f64, title_width: f64) -> usize {
 }
 
 fn place(cx: &mut Cx, widget: &WidgetRef, x: f64, y: f64, width: f64, height: f64) {
+    // A button's walk is private, so only a view's walk can be set directly.
+    if let Some(mut view) = widget.as_view().borrow_mut() {
+        view.walk.width = Size::Fixed(width);
+        view.walk.height = Size::Fixed(height);
+        view.walk.margin.left = x;
+        view.walk.margin.top = y;
+        return;
+    }
     let mut widget = widget.clone();
     script_apply_eval!(cx, widget, {
         width: #(width), height: #(height)
@@ -665,8 +679,9 @@ impl RoomActionBarRef {
         {
             let rect = inner.view.area().rect(cx);
             // Fade the shadow in and out along with the slide.
-            let alpha = (0x55 as f32 / 255.0) * inner.expand.clamp(0.0, 1.0);
-            inner.draw_shadow.set_dyn_instance(cx, id!(shadow_color), &[0.0, 0.0, 0.0, alpha]);
+            let color = inner.shadow_color;
+            let alpha = color.w * inner.expand.clamp(0.0, 1.0);
+            inner.draw_shadow.set_dyn_instance(cx, id!(shadow_color), &[color.x, color.y, color.z, alpha]);
             cx.push_clip_rect(room_rect);
             inner.draw_shadow.draw_abs(cx, rect);
             cx.pop_clip_rect();

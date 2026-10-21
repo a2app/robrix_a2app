@@ -861,7 +861,7 @@ mod tests {
         let template = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
             crate::a2app::host_set::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppHost {} });
             vm.bx.heap.new_object_ref(value.as_object().unwrap())

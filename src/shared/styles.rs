@@ -140,12 +140,25 @@ script_mod! {
     mod.widgets.COLOR_DIVIDER_DARK = #00000044
 
     mod.widgets.COLOR_FG_ACCEPT_GREEN = #138808
+    mod.widgets.COLOR_BG_ACCEPT_GREEN_SOLID = #x138808
     mod.widgets.COLOR_BG_ACCEPT_GREEN = #F0FFF0
+    mod.widgets.COLOR_BG_ACCEPT_GREEN_HOVER = #xD4EED4
+    mod.widgets.COLOR_BG_ACCEPT_GREEN_DOWN = #xB8E0B8
     mod.widgets.COLOR_FG_DANGER_RED = #DC0005
+    mod.widgets.COLOR_BG_DANGER_RED_SOLID = #xDC0005
+    mod.widgets.COLOR_BG_DANGER_RED_SOLID_HOVER = #xB00004
+    mod.widgets.COLOR_BG_DANGER_RED_SOLID_DOWN = #x930003
     mod.widgets.COLOR_BG_DANGER_RED = #FFF0F0
+    mod.widgets.COLOR_BG_DANGER_RED_HOVER = #xF0D4D4
+    mod.widgets.COLOR_BG_DANGER_RED_DOWN = #xE0B8B8
+    mod.widgets.COLOR_BG_NEUTRAL = #xE3E3E3
+    mod.widgets.COLOR_BG_NEUTRAL_HOVER = #xD0D0D0
+    mod.widgets.COLOR_BG_NEUTRAL_DOWN = #xC0C0C0
     mod.widgets.COLOR_FG_DISABLED = #B3B3B3
     mod.widgets.COLOR_BG_DISABLED = #E0E0E0
     mod.widgets.COLOR_INFO_BLUE = #0f88fe
+    mod.widgets.COLOR_FG_INFO_BLUE = #x0D67C0
+    mod.widgets.COLOR_BG_INFO_BLUE = #xE8F4FD
     mod.widgets.COLOR_WARNING_YELLOW = #fcdb03
     mod.widgets.COLOR_TEXT_WARNING_NOT_FOUND = #953800
 
@@ -164,17 +177,20 @@ script_mod! {
     mod.widgets.COLOR_SECONDARY = #E3E3E3
     mod.widgets.COLOR_SECONDARY_DARKER = #C8C8C8
 
+    // Modals, menus, popups, and other surfaces that float above the panes.
+    mod.widgets.COLOR_BG_FLOATING = #xFFFFFF
+    mod.widgets.COLOR_FLOATING_ITEM_BG_HOVER = #xEFF3F8
+    mod.widgets.COLOR_FLOATING_ITEM_BG_SELECTED = #xF0F5FF
+
     // What a list item, e.g., a room, message, or menu item, darkens to on hover or press.
     mod.widgets.COLOR_LIST_ITEM_BG_HOVER = #xEFF3F8
-
-    // Every scroll bar uses this styling.
-    mod.widgets.ScrollBar.draw_bg.color = #00000040
-    mod.widgets.ScrollBar.draw_bg.color_hover = #00000060
-    mod.widgets.ScrollBar.draw_bg.color_drag = #00000080
 
     mod.widgets.COLOR_ACTIVE_PRIMARY = #0f88fe
 
     mod.widgets.COLOR_ACTIVE_PRIMARY_DARKER = #106fcc
+
+    mod.widgets.COLOR_ACTIVE_PRIMARY_HOVER = #x106fcc
+    mod.widgets.COLOR_ACTIVE_PRIMARY_DOWN = #x0C5DAA
 
     mod.widgets.COLOR_BG_PREVIEW = #F0F5FF
     // Looks like COLOR_BG_PREVIEW atop white, but it also darkens a hovered or highlighted message behind it.
@@ -192,6 +208,7 @@ script_mod! {
     mod.widgets.COLOR_BG_LAVENDER_SELECTED_DOWN = #x6B46D2
 
     mod.widgets.COLOR_BG_PREVIEW_HOVER = #CDEDDF
+    mod.widgets.COLOR_BG_PREVIEW_DOWN = #xA8DBBF
 
     // A thread's summary beneath its root message, whose reply count color the threads list uses too.
     mod.widgets.COLOR_THREAD_SUMMARY_BG = #FFF4E5
@@ -200,11 +217,12 @@ script_mod! {
     mod.widgets.COLOR_THREAD_SUMMARY_REPLY_COUNT = #A35A00
 
     mod.widgets.COLOR_AVATAR_BG = #52b2ac
+    mod.widgets.COLOR_UNKNOWN_ROOM_AVATAR = #xFF6E00
 
     mod.widgets.COLOR_AVATAR_BG_IDLE = #d8d8d8
 
 
-    mod.widgets.COLOR_UNREAD_BADGE_MENTIONS = #FF0000;
+    mod.widgets.COLOR_UNREAD_BADGE_MENTIONS = #xFF1133;
 
 
     mod.widgets.COLOR_UNREAD_BADGE_MARKED = (mod.widgets.COLOR_ROBRIX_CYAN);
@@ -222,6 +240,254 @@ script_mod! {
     mod.widgets.COLOR_WARNING = #fcdb03
 
     mod.widgets.COLOR_LINK_HOVER = #21B070
+    mod.widgets.COLOR_LINK = #x0000EE
+
+    mod.widgets.COLOR_LINK_PILL_BG = #x000000
+    mod.widgets.COLOR_LINK_PILL_BG_MENTION = #xD91B38
+    mod.widgets.COLOR_SPOILER_REASON_TEXT = #x999999
+
+    // A message that mentions the current user (or @room).
+    mod.widgets.COLOR_MENTION_HIGHLIGHT_BG = #xFFFFD1
+    mod.widgets.COLOR_MENTION_HIGHLIGHT_BG_HOVER = #xFFF9C2
+    mod.widgets.COLOR_MENTION_HIGHLIGHT_BAR = #xFFD54F
+
+    mod.widgets.COLOR_REACTION_BG = #xF7F9FA
+    mod.widgets.COLOR_REACTION_BORDER = #xB6BABF
+    mod.widgets.COLOR_REACTION_BG_INCLUDES_USER = #xE3F7ED
+    mod.widgets.COLOR_REACTION_BORDER_INCLUDES_USER = #x009978
+
+    // The latest message preview in a rooms list entry.
+    mod.widgets.COLOR_ROOM_PREVIEW_TEXT = #x444444
+    mod.widgets.COLOR_ROOM_PREVIEW_CODE_BG = #xEDEDED
+    mod.widgets.COLOR_ROOM_PREVIEW_CODE_BG_SELECTED = #x4D4D4D
+
+    mod.widgets.COLOR_ROOM_TAB_BUTTON_BG_HOVER = #x0000001F
+    mod.widgets.COLOR_ROOM_TAB_BUTTON_BG_DOWN = #x00000033
+    mod.widgets.COLOR_ROOM_TAB_BUTTON_BG_ACTIVE_HOVER = #xFFFFFF33
+    mod.widgets.COLOR_ROOM_TAB_BUTTON_BG_ACTIVE_DOWN = #xFFFFFF4D
+
+    mod.widgets.COLOR_ROOM_ACTION_BUTTON_BG_HOVER = #x00000011
+    mod.widgets.COLOR_ROOM_ACTION_BUTTON_BG_DOWN = #x00000022
+    mod.widgets.COLOR_HEADER_SHADOW = #x00000055
+
+    mod.widgets.COLOR_PANE_DIVIDER = #x4D4D4D
+    mod.widgets.COLOR_PANE_DIVIDER_GRIP = #xE3E3E3
+
+    mod.widgets.COLOR_SPEECH_BUTTON_ICON = #x555555
+    mod.widgets.COLOR_SPEECH_BUTTON_BG_HOVER = #xE0E8F0
+    mod.widgets.COLOR_SPEECH_BUTTON_BG_DOWN = #xD0D8E8
+    mod.widgets.COLOR_SPEECH_BUTTON_BG_RECORDING = #x141414
+    mod.widgets.COLOR_SPEECH_BUTTON_BG_RECORDING_HOVER = #x404040
+
+    mod.widgets.COLOR_OVERLAY_BG = #x000000BB
+
+    mod.widgets.COLOR_TOOLTIP_BG = vec4(0.26, 0.30, 0.333, 1.0)
+    mod.widgets.COLOR_TOOLTIP_TEXT = #xFFFFFF
+
+    // Text tiers, from darkest to lightest: TITLE and BODY, MUTED, SUBTLE, FAINT, HINT.
+    mod.widgets.COLOR_TEXT_TITLE = #x000000
+    mod.widgets.COLOR_TEXT_BODY = #x000000
+    mod.widgets.COLOR_TEXT_MUTED = #x666666
+    mod.widgets.COLOR_TEXT_SUBTLE = #x737373
+    mod.widgets.COLOR_TEXT_FAINT = #x888888
+    mod.widgets.COLOR_TEXT_HINT = #x8C8C8C
+    mod.widgets.COLOR_TEXT_ON_ACCENT = #xFFFFFF
+    mod.widgets.COLOR_TEXT_ON_ACCENT_MUTED = #xFFFFFFD9
+    mod.widgets.COLOR_TEXT_ON_WARNING = #x000000
+    mod.widgets.COLOR_TEXT_PURPLE = #x572DCC
+
+    mod.widgets.COLOR_TEXT_INPUT_PLACEHOLDER = #xBBBBBB
+    mod.widgets.COLOR_TEXT_INPUT_PLACEHOLDER_HOVER = #x999999
+    mod.widgets.COLOR_TEXT_INPUT_PLACEHOLDER_FOCUS = #x999999
+    mod.widgets.COLOR_PASSWORD_EYE_BUTTON_BG = #xEEEEEE
+    mod.widgets.COLOR_MODAL_INPUT_TEXT = #x000000
+
+    mod.widgets.COLOR_SHADOW_SOFT = #x00000033
+    mod.widgets.COLOR_SHADOW = #x00000055
+    mod.widgets.COLOR_SHADOW_STRONG = #x00000066
+    mod.widgets.COLOR_LOADING_PANE_OVERLAY_BG = #x000000B2
+    mod.widgets.COLOR_CONTEXT_MENU_OVERLAY_BG = #x0000004D
+
+    mod.widgets.COLOR_LABELED_DIVIDER = #xC8C8C8
+
+    mod.widgets.COLOR_FLAT_ICON_BUTTON_BG_HOVER = #x00000015
+    mod.widgets.COLOR_FLAT_ICON_BUTTON_BG_DOWN = #x00000025
+    mod.widgets.COLOR_NAV_HISTORY_BUTTON_BG_HOVER = #x00000014
+    mod.widgets.COLOR_NAV_HISTORY_BUTTON_BG_DOWN = #x00000026
+    mod.widgets.COLOR_PREVIEW_TOGGLE_BUTTON_BORDER = #xCCCCCC
+
+    mod.widgets.SEND_STATUS_ICON_COLOR = #8C8C8C
+    mod.widgets.COLOR_VERIFICATION_BADGE_UNKNOWN = #x888888
+
+    mod.widgets.COLOR_LIST_ITEM_BG_FOCUS = #xB6D3F2
+    mod.widgets.COLOR_LIST_ROW_TEXT_MUTED = #x555555
+    mod.widgets.COLOR_CONTEXT_MENU_ITEM_BG_DOWN = #xDCDCDC
+    mod.widgets.COLOR_CONTEXT_MENU_BORDER = #x888888
+    mod.widgets.COLOR_ROOM_INPUT_MENU_ITEM_BG_DOWN = #xD0D8E8
+    mod.widgets.COLOR_MENTION_POPUP_BORDER = #xE3E3E3
+
+    mod.widgets.COLOR_HEADER_FG = #F;
+    mod.widgets.COLOR_HEADER_BG = (mod.widgets.COLOR_ROBRIX_PURPLE); // the purple color from the Robrix logo
+
+    mod.widgets.COLOR_WINDOW_CLEAR = #xFFFFFF00
+    mod.widgets.COLOR_CAPTION_BAR_BG = #xF3F3F3
+    mod.widgets.COLOR_CAPTION_BUTTON_ICON = #x00000099
+    mod.widgets.COLOR_CAPTION_BUTTON_ICON_HOVER = #x000000
+    mod.widgets.COLOR_CAPTION_BUTTON_BG_HOVER = #xE9E9E9
+    mod.widgets.COLOR_CAPTION_BUTTON_BG_DOWN = #xCCCCCC
+    mod.widgets.COLOR_SCROLL_BAR_HANDLE = #x00000040
+    mod.widgets.COLOR_SCROLL_BAR_HANDLE_HOVER = #x00000060
+    mod.widgets.COLOR_SCROLL_BAR_HANDLE_DRAG = #x00000080
+
+    mod.widgets.COLOR_TIMELINE_ITEM_BG_HIGHLIGHT = #xC5D6FA
+    mod.widgets.COLOR_TIMELINE_LOADING_BG = #xDAF5E5F0
+    mod.widgets.COLOR_READ_MARKER = #xeb2733
+    mod.widgets.COLOR_MESSAGE_CODE_BG = #x00000012
+    mod.widgets.COLOR_MESSAGE_QUOTE_BG = #x00000012
+    mod.widgets.COLOR_TYPING_NOTICE_BG = #xE8F4FF
+    mod.widgets.COLOR_FAILED_SEND_BANNER_BORDER = #xE34B4F
+    mod.widgets.COLOR_IMAGE_PLACEHOLDER_BG = #xDDDDDD
+    mod.widgets.COLOR_LINK_PILL_TEXT = #xFFFFFF
+    mod.widgets.COLOR_LINK_PILL_AVATAR_BG = #xFFFFFF
+
+    mod.widgets.COLOR_REACTION_HOVER_TINT = #xFEF65B
+
+    mod.widgets.COLOR_INPUT_BAR_HEADER_TEXT = #x222222
+    mod.widgets.COLOR_INPUT_BAR_ADD_BUTTON_BG_HOVER = #xE0E8F0
+    mod.widgets.COLOR_INPUT_BAR_ADD_BUTTON_BG_DOWN = #xD0D8E8
+    mod.widgets.COLOR_SPEECH_BUTTON_LEVEL_BARS = #xFFFFFF
+
+    mod.widgets.COLOR_UNREAD_BADGE_MENTIONS_FADE = #xFFC8B0
+    mod.widgets.COLOR_JUMP_TO_BOTTOM_BG = #xEDEDEDCE
+    mod.widgets.COLOR_JUMP_TO_BOTTOM_BG_HOVER = #xD0D0D0CE
+
+    mod.widgets.COLOR_POPUP_TEXT = #x000000
+    mod.widgets.COLOR_POPUP_BORDER = #x000000
+    mod.widgets.COLOR_POPUP_PROGRESS_BAR = #x00000080
+    mod.widgets.COLOR_POPUP_CLOSE_BG = #x00000014
+    mod.widgets.COLOR_POPUP_CLOSE_BG_HOVER = #x00000022
+    mod.widgets.COLOR_POPUP_CLOSE_BG_DOWN = #x0000002E
+    mod.widgets.COLOR_POPUP_CLOSE_BORDER = #x00000020
+    mod.widgets.COLOR_POPUP_CLOSE_BORDER_HOVER = #x0000002C
+    mod.widgets.COLOR_POPUP_CLOSE_BORDER_DOWN = #x00000038
+    mod.widgets.COLOR_POPUP_CLOSE_ICON = #x000000D0
+
+    mod.widgets.COLOR_DOCK_TAB_FG = #x000000
+    mod.widgets.COLOR_DOCK_TAB_BG = #xE1EEFA
+    mod.widgets.COLOR_DOCK_TAB_BG_HOVER = #xC8DDEF
+    mod.widgets.COLOR_DOCK_TAB_BG_ACTIVE = #x0660FE
+    mod.widgets.COLOR_DOCK_TAB_BG_ACTIVE_BOTTOM = #x398CFE
+    mod.widgets.COLOR_DOCK_TAB_BAR_BG = #xF4F4F4F4
+    mod.widgets.COLOR_DOCK_TAB_BAR_BG_DRAG = #x000000
+    mod.widgets.COLOR_DOCK_DROP_PREVIEW_MIX = #xFFFFFF00
+    mod.widgets.COLOR_PANE_GRAB_HANDLE_DOTS = vec4(1.0, 1.0, 1.0, 0.92)
+
+    mod.widgets.COLOR_IMAGE_VIEWER_FG = #xFFFFFF
+    mod.widgets.COLOR_IMAGE_VIEWER_FG_MUTED = #xFFFFFFBF
+    mod.widgets.COLOR_IMAGE_VIEWER_BUTTON_BG_HOVER = #xFFFFFF26
+    mod.widgets.COLOR_IMAGE_VIEWER_BUTTON_BG_DOWN = #xFFFFFF40
+    mod.widgets.COLOR_IMAGE_VIEWER_META_BORDER = #xFFFFFF29
+    mod.widgets.COLOR_IMAGE_VIEWER_META_SHADOW = #x00000047
+
+    mod.widgets.COLOR_WELCOME_BG_TOP = #xF3EFFD
+    mod.widgets.COLOR_WELCOME_ROOM_PANEL_BG_RIGHT = #x1F7BF2
+    mod.widgets.COLOR_WELCOME_ROOM_PANEL_SHADOW = #x572DCC40
+    mod.widgets.COLOR_WELCOME_ROOM_PANEL_ICON_BG = #xFFFFFF2E
+    mod.widgets.COLOR_WELCOME_ROOM_PANEL_BUTTON_BG = #xFFFFFF
+    mod.widgets.COLOR_WELCOME_ROOM_PANEL_BUTTON_BG_HOVER = #xE8E1FA
+    mod.widgets.COLOR_WELCOME_ROOM_PANEL_BUTTON_BG_DOWN = #xE1D7F7
+    mod.widgets.COLOR_WELCOME_TIPS_PANEL_BORDER = #x00000010
+    mod.widgets.COLOR_WELCOME_TIPS_PANEL_SHADOW = #x1C274C14
+    mod.widgets.COLOR_WELCOME_TIP_BODY_TEXT = #x5C6478
+    mod.widgets.COLOR_WELCOME_TIP_HINT_BG_WORKSPACE = #xF4F1FE
+    mod.widgets.COLOR_WELCOME_TIP_HINT_TEXT_WORKSPACE = #x4A2BA8
+    mod.widgets.COLOR_WELCOME_TIP_BADGE_BG_SETTINGS = #xE3F0FF
+    mod.widgets.COLOR_WELCOME_TIP_HINT_BG_SETTINGS = #xEEF6FF
+    mod.widgets.COLOR_WELCOME_TIP_HINT_TEXT_SETTINGS = #x0B5CAB
+    mod.widgets.COLOR_WELCOME_TIP_BADGE_BG_NAVIGATION = #xDDF6F5
+    mod.widgets.COLOR_WELCOME_TIP_ICON_NAVIGATION = #x039E99
+    mod.widgets.COLOR_WELCOME_TIP_HINT_BG_NAVIGATION = #xEAF9F8
+    mod.widgets.COLOR_WELCOME_TIP_HINT_TEXT_NAVIGATION = #x02706C
+    mod.widgets.COLOR_WELCOME_FOOTER_TEXT = #x6B7287
+
+    // A lighter version of the main Robrix purple color
+    mod.widgets.COLOR_LOGIN_BG_TOP = #EEEAFA
+    mod.widgets.COLOR_LOGIN_BG_BOTTOM = #FFFFFF
+
+    mod.widgets.COLOR_SPACE_LOBBY_NAME_TEXT = #x1A1A1A
+    mod.widgets.COLOR_SPACE_LOBBY_TREE_LINES = #x888888
+    // Not COLOR_TEXT_ON_ACCENT, since white on the light accent is only 3.5:1.
+    mod.widgets.COLOR_SPACE_LOBBY_ENTRY_TEXT_ACTIVE = #x111830
+
+    mod.widgets.COLOR_INVITE_SCREEN_TOPIC_TEXT = #x444444
+
+    mod.widgets.COLOR_MODAL_TIP_TEXT = #xAAAAAA
+    mod.widgets.COLOR_MODAL_PANEL_BG = #xE3E3E3
+    mod.widgets.COLOR_CODE_BLOCK_BORDER = #xE3E3E3
+    mod.widgets.COLOR_TSP_FIELD_CAPTION_TEXT = #x777777
+    mod.widgets.COLOR_NO_PREVIEW_ICON_DISC = #xD6E6FF
+    mod.widgets.COLOR_NO_PREVIEW_ICON_PAGE = #xFFFFFF
+    mod.widgets.COLOR_NO_PREVIEW_ICON_ACCENT = #x7AA8E8
+
+    mod.widgets.COLOR_SETTINGS_LIST_BG = #xF6F8F9
+
+    // Code view syntax colors, one per kind of code token.
+    mod.widgets.COLOR_CODE_TEXT = #x24292E
+    mod.widgets.COLOR_CODE_WHITESPACE = #x6A737D
+    mod.widgets.COLOR_CODE_DELIMITER = #x24292E
+    mod.widgets.COLOR_CODE_DELIMITER_HIGHLIGHT = #x005CC5
+    mod.widgets.COLOR_CODE_ERROR_DECORATION = #xCB2431
+    mod.widgets.COLOR_CODE_WARNING_DECORATION = #xB08800
+    mod.widgets.COLOR_CODE_BRANCH_KEYWORD = #xD73A49
+    mod.widgets.COLOR_CODE_CONSTANT = #x005CC5
+    mod.widgets.COLOR_CODE_IDENTIFIER = #x24292E
+    mod.widgets.COLOR_CODE_LOOP_KEYWORD = #xD73A49
+    mod.widgets.COLOR_CODE_NUMBER = #x005CC5
+    mod.widgets.COLOR_CODE_OTHER_KEYWORD = #xD73A49
+    mod.widgets.COLOR_CODE_PUNCTUATOR = #x24292E
+    mod.widgets.COLOR_CODE_STRING = #x22863A
+    mod.widgets.COLOR_CODE_FUNCTION = #x6F42C1
+    mod.widgets.COLOR_CODE_MACRO_IDENTIFIER = #x6F42C1
+    mod.widgets.COLOR_CODE_ATTRIBUTE = #x6F42C1
+    mod.widgets.COLOR_CODE_TYPENAME = #xE36209
+    mod.widgets.COLOR_CODE_COMMENT = #x6A737D
+
+    // The close button on an error, info, or success popup's colored background.
+    mod.widgets.COLOR_POPUP_CLOSE_BG_ON_ACCENT = #xFFFFFF22
+    mod.widgets.COLOR_POPUP_CLOSE_BG_ON_ACCENT_HOVER = #xFFFFFF30
+    mod.widgets.COLOR_POPUP_CLOSE_BG_ON_ACCENT_DOWN = #xFFFFFF42
+    mod.widgets.COLOR_POPUP_CLOSE_BORDER_ON_ACCENT = #xFFFFFF2C
+    mod.widgets.COLOR_POPUP_CLOSE_BORDER_ON_ACCENT_HOVER = #xFFFFFF38
+    mod.widgets.COLOR_POPUP_CLOSE_BORDER_ON_ACCENT_DOWN = #xFFFFFF4A
+    mod.widgets.COLOR_POPUP_CLOSE_ICON_ON_ACCENT = #xFFFFFFFA
+    // The close button on a warning popup's yellow background.
+    mod.widgets.COLOR_POPUP_CLOSE_BG_ON_WARNING = #x00000014
+    mod.widgets.COLOR_POPUP_CLOSE_BG_ON_WARNING_HOVER = #x00000022
+    mod.widgets.COLOR_POPUP_CLOSE_BG_ON_WARNING_DOWN = #x0000002E
+    mod.widgets.COLOR_POPUP_CLOSE_BORDER_ON_WARNING = #x00000020
+    mod.widgets.COLOR_POPUP_CLOSE_BORDER_ON_WARNING_HOVER = #x0000002C
+    mod.widgets.COLOR_POPUP_CLOSE_BORDER_ON_WARNING_DOWN = #x00000038
+    mod.widgets.COLOR_POPUP_CLOSE_ICON_ON_WARNING = #x000000D0
+
+    // Toggles, checkboxes, and radio buttons.
+    // The mark is a toggle's knob, a checkbox's check, or a radio button's dot.
+    mod.widgets.COLOR_TOGGLE_BG = #x00000019
+    mod.widgets.COLOR_TOGGLE_BG_DISABLED = #x00000008
+    mod.widgets.COLOR_TOGGLE_BORDER = #x0000001F
+    mod.widgets.COLOR_TOGGLE_BORDER_HOVER = #x0000003F
+    mod.widgets.COLOR_TOGGLE_BORDER_DISABLED = #xB2B2B2
+    mod.widgets.COLOR_TOGGLE_MARK = #x000000BF
+    mod.widgets.COLOR_TOGGLE_MARK_ACTIVE = #x00000099
+    mod.widgets.COLOR_TOGGLE_TEXT = #x000000BF
+    mod.widgets.COLOR_TOGGLE_TEXT_DISABLED = #x0000001F
+
+    mod.widgets.COLOR_LINK_PREVIEW_TITLE_DOWN = #x000000BF
+    mod.widgets.COLOR_LINK_PREVIEW_TITLE_FOCUS = #x00000099
+    mod.widgets.COLOR_LINK_PREVIEW_UNDERLINE = #x00000099
+    mod.widgets.COLOR_LINK_PREVIEW_UNDERLINE_DOWN = #x000000BF
+
+    mod.widgets.COLOR_MESSAGE_TABLE_HEADER_BG = #xFFFFFF0C
+    mod.widgets.COLOR_MESSAGE_TABLE_BORDER = #x0000001F
 
 
     // Use an even value for this, not odd, such that it can be divided in half,
@@ -231,11 +497,9 @@ script_mod! {
     mod.widgets.NAVIGATION_TAB_BAR_AVATAR_FONT_SIZE = (mod.widgets.NAVIGATION_TAB_BAR_AVATAR_SIZE * 0.4)
 
 
-    mod.widgets.COLOR_NAVIGATION_TAB_FG = (mod.widgets.COLOR_TEXT)
-    mod.widgets.COLOR_NAVIGATION_TAB_FG_HOVER = (mod.widgets.COLOR_TEXT)
-    mod.widgets.COLOR_NAVIGATION_TAB_FG_ACTIVE = (mod.widgets.COLOR_TEXT)
-    mod.widgets.COLOR_NAVIGATION_TAB_BG = (mod.widgets.COLOR_SECONDARY)
-    mod.widgets.COLOR_NAVIGATION_TAB_BG_HOVER = (mod.widgets.COLOR_SECONDARY * 0.85)
+    mod.widgets.COLOR_NAVIGATION_TAB_FG = #x1C274C
+    mod.widgets.COLOR_NAVIGATION_TAB_BG = #xE3E3E3
+    mod.widgets.COLOR_NAVIGATION_TAB_BG_HOVER = #xC0C0C0D8
     mod.widgets.COLOR_NAVIGATION_TAB_BG_ACTIVE = #9
 
     mod.widgets.COLOR_IMAGE_VIEWER_BACKGROUND = #333333CC // 80% Opacity
@@ -254,184 +518,10 @@ script_mod! {
     }
 
 
-    // The scroll bar used by all lists (like portallists).
-    mod.widgets.ListScrollBar = ScrollBar { bar_size: 9 }
-
     // Set the position for scroll bars in the multiline text input
     mod.widgets.TEXT_INPUT_SCROLL_BAR_INSET = Inset{top: 3, right: 3, bottom: 3}
-
-    // A text input widget styled for Robrix.
-    mod.widgets.RobrixTextInput = TextInput {
-        width: Fill, height: Fit
-        flow: Flow.Right{wrap: true},
-        align: Align{y: 0.5}
-        margin: 0,
-        padding: 10,
-        scroll_bar_inset: (mod.widgets.TEXT_INPUT_SCROLL_BAR_INSET)
-
-        draw_bg +: {
-            border_radius: 4.0 // was previously 2.0
-            border_size: 1.0
-
-            color: (mod.widgets.COLOR_PRIMARY)
-            color_hover: (mod.widgets.COLOR_PRIMARY)
-            color_focus: (mod.widgets.COLOR_PRIMARY)
-            color_down: (mod.widgets.COLOR_PRIMARY)
-            color_empty: (mod.widgets.COLOR_PRIMARY)
-            color_disabled: (mod.widgets.COLOR_BG_DISABLED)
-
-            border_color: (mod.widgets.COLOR_SECONDARY_DARKER)
-            border_color_hover: (mod.widgets.COLOR_ACTIVE_PRIMARY)
-            border_color_focus: (mod.widgets.COLOR_ACTIVE_PRIMARY_DARKER)
-            border_color_down: (mod.widgets.COLOR_ACTIVE_PRIMARY_DARKER)
-            border_color_empty: (mod.widgets.COLOR_SECONDARY_DARKER)
-            border_color_disabled: (mod.widgets.COLOR_FG_DISABLED)
-
-            color_2: vec4(-1.0, -1.0, -1.0, -1.0) // don't use color_2*
-            border_color_2: vec4(-1.0, -1.0, -1.0, -1.0) // don't use border_color_2*
-        }
-
-        draw_selection +: {
-            color: mod.widgets.COLOR_SELECT_TEXT
-            // color: mix(mod.widgets.COLOR_BG_DISABLED, mod.widgets.COLOR_SELECT_TEXT, 0.5)
-            color_hover:  (mod.widgets.COLOR_SELECT_TEXT)
-            color_focus:  (mod.widgets.COLOR_SELECT_TEXT)
-            color_down:  (mod.widgets.COLOR_SELECT_TEXT)
-            color_empty:  (mod.widgets.COLOR_SELECT_TEXT)
-            color_disabled: (mod.widgets.COLOR_SELECT_TEXT)
-        }
-
-        draw_cursor +: {
-            color: (mod.widgets.MESSAGE_TEXT_COLOR)
-        }
-
-        draw_text +: {
-            color: (mod.widgets.MESSAGE_TEXT_COLOR),
-            color_hover: (mod.widgets.MESSAGE_TEXT_COLOR),
-            color_focus: (mod.widgets.MESSAGE_TEXT_COLOR),
-            color_down: (mod.widgets.MESSAGE_TEXT_COLOR),
-            color_disabled: (mod.widgets.COLOR_FG_DISABLED),
-            color_empty: #B,
-            color_empty_hover: #9,
-            color_empty_focus: #9,
-
-            text_style: mod.widgets.MESSAGE_TEXT_STYLE {},
-        }
-    }
-
-    // A read-only CodeView with our light-theme syntax highlighting colors.
-    mod.widgets.LightCodeView = mod.widgets.CodeView {
-        editor +: {
-            word_wrap: true
-            scroll_bars +: {
-                show_scroll_x: false
-                scroll_bar_y.drag_scrolling: true
-            }
-            draw_bg +: { color: (mod.widgets.COLOR_TRANSPARENT) }
-
-            // Light mode syntax highlighting (inspired by GitHub Light / VS Code Light+)
-            token_colors +: {
-                whitespace: #x6a737d,          // Gray for whitespace markers
-                delimiter: #x24292e,           // Dark gray for punctuation
-                delimiter_highlight: #x005cc5, // Blue for highlighted delimiters
-                error_decoration: #xcb2431,    // Red for errors
-                warning_decoration: #xb08800,  // Dark yellow/amber for warnings
-
-                unknown: #x24292e,             // Default dark text
-                branch_keyword: #xd73a49,      // Red/pink for keywords (if, else, match)
-                constant: #x005cc5,            // Blue for constants
-                identifier: #x24292e,          // Dark gray for variables
-                loop_keyword: #xd73a49,        // Red/pink for loop keywords
-                number: #x005cc5,              // Blue for numbers
-                other_keyword: #xd73a49,       // Red/pink for other keywords
-                punctuator: #x24292e,          // Dark gray for punctuation
-                string: #x22863a,              // Green for strings
-                function: #x6f42c1,            // Purple for functions
-                macro_identifier: #x6f42c1,    // Purple: a macro reads as a call
-                attribute: #x6f42c1,           // Purple for #[derive(..)] and friends
-                typename: #xe36209,            // Orange for types
-                comment: #x6a737d,             // Gray for comments
-            }
-        }
-    }
-
-    // An editable LightCodeView.
-    mod.widgets.LightCodeEditor = mod.widgets.LightCodeView {
-        editor +: {
-            read_only: false
-            show_gutter: true
-        }
-    }
-
-    // A read-only CodeView with light-theme color without any syntax highlighting.
-    mod.widgets.PlainCodeView = mod.widgets.LightCodeView {
-        editor +: {
-            token_colors +: {
-                whitespace: #x24292e,
-                delimiter_highlight: #x24292e,
-                error_decoration: #x24292e,
-                warning_decoration: #x24292e,
-                branch_keyword: #x24292e,
-                constant: #x24292e,
-                loop_keyword: #x24292e,
-                number: #x24292e,
-                other_keyword: #x24292e,
-                string: #x24292e,
-                function: #x24292e,
-                macro_identifier: #x24292e,
-                attribute: #x24292e,
-                typename: #x24292e,
-                comment: #x24292e,
-            }
-        }
-    }
 }
 
-
-/// #FFFFFF
-pub const COLOR_PRIMARY:               Vec4 = vec4(1.0, 1.0, 1.0, 1.0);
-/// #0F88FE
-pub const COLOR_ACTIVE_PRIMARY:        Vec4 = vec4(0.059, 0.533, 0.996, 1.0);
-/// #106FCC
-pub const COLOR_ACTIVE_PRIMARY_DARKER: Vec4 = vec4(0.063, 0.435, 0.682, 1.0);
-/// #138808
-pub const COLOR_FG_ACCEPT_GREEN:       Vec4 = vec4(0.074, 0.533, 0.031, 1.0);
-/// #F0FFF0
-pub const COLOR_BG_ACCEPT_GREEN:       Vec4 = vec4(0.941, 1.0, 0.941, 1.0);
-/// #B3B3B3
-pub const COLOR_FG_DISABLED:           Vec4 = vec4(0.7, 0.7, 0.7, 1.0);
-/// #E0E0E0
-pub const COLOR_BG_DISABLED:           Vec4 = vec4(0.878, 0.878, 0.878, 1.0);
-/// #1C274C
-pub const COLOR_TEXT:                  Vec4 = vec4(0.11, 0.153, 0.298, 1.0);
-/// #DC0005
-pub const COLOR_FG_DANGER_RED:         Vec4 = vec4(0.863, 0.0, 0.02, 1.0);
-/// #FFF0F0
-pub const COLOR_BG_DANGER_RED:         Vec4 = vec4(1.0, 0.941, 0.941, 1.0);
-/// #572DCC
-pub const COLOR_ROBRIX_PURPLE:         Vec4 = vec4(0.341, 0.176, 0.8, 1.0);
-/// #05CDC7
-pub const COLOR_ROBRIX_CYAN:           Vec4 = vec4(0.031, 0.804, 0.78, 1.0);
-/// #FF0000
-pub const COLOR_UNREAD_BADGE_MENTIONS: Vec4 = vec4(1.0, 0.0, 0.0, 1.0);
-/// #572DCC
-pub const COLOR_UNREAD_BADGE_MARKED:   Vec4 = COLOR_ROBRIX_CYAN;
-/// #AAAAAA
-pub const COLOR_UNREAD_BADGE_MESSAGES: Vec4 = vec4(0.667, 0.667, 0.667, 1.0);
-/// #FF6e00
-pub const COLOR_UNKNOWN_ROOM_AVATAR:   Vec4 = vec4(1.0, 0.431, 0.0, 1.0);
-/// The same as `COLOR_AVATAR_BG` in the DSL above: #52B2AC
-pub const COLOR_AVATAR_BG:             Vec4 = vec4(0.322, 0.698, 0.675, 1.0);
-/// #888888
-pub const COLOR_MESSAGE_NOTICE_TEXT:   Vec4 = vec4(0.5, 0.5, 0.5, 1.0);
-/// #953800
-pub const COLOR_TEXT_WARNING_NOT_FOUND: Vec4 = vec4(0.584, 0.219, 0.0, 1.0);
-/// #F0F5FF
-pub const COLOR_BG_PREVIEW:            Vec4 = vec4(0.941, 0.961, 1.0, 1.0);
-/// #CDEDDF
-pub const COLOR_BG_PREVIEW_HOVER:      Vec4 = vec4(0.804, 0.929, 0.875, 1.0);
-/// The same as `SMALL_STATE_TEXT_COLOR` in the DSL above: #888888
-pub const SMALL_STATE_TEXT_COLOR:      Vec4 = vec4(0.533, 0.533, 0.533, 1.0);
 
 /// Applies positive (green) button styling to the given button.
 pub fn apply_positive_button_style(cx: &mut Cx, button: &mut ButtonRef) {
@@ -439,8 +529,8 @@ pub fn apply_positive_button_style(cx: &mut Cx, button: &mut ButtonRef) {
         draw_bg +: {
             border_color: mod.widgets.COLOR_FG_ACCEPT_GREEN,
             color: mod.widgets.COLOR_BG_ACCEPT_GREEN,
-            color_hover: #D4EED4,
-            color_down: #B8E0B8,
+            color_hover: mod.widgets.COLOR_BG_ACCEPT_GREEN_HOVER,
+            color_down: mod.widgets.COLOR_BG_ACCEPT_GREEN_DOWN,
         }
         draw_text +: {
             color: mod.widgets.COLOR_FG_ACCEPT_GREEN,
@@ -459,8 +549,8 @@ pub fn apply_negative_button_style(cx: &mut Cx, button: &mut ButtonRef) {
         draw_bg +: {
             border_color: mod.widgets.COLOR_FG_DANGER_RED,
             color: mod.widgets.COLOR_BG_DANGER_RED,
-            color_hover: #F0D4D4,
-            color_down: #E0B8B8,
+            color_hover: mod.widgets.COLOR_BG_DANGER_RED_HOVER,
+            color_down: mod.widgets.COLOR_BG_DANGER_RED_DOWN,
         }
         draw_text +: {
             color: mod.widgets.COLOR_FG_DANGER_RED,
@@ -478,9 +568,9 @@ pub fn apply_neutral_button_style(cx: &mut Cx, button: &mut ButtonRef) {
     script_apply_eval!(cx, button, {
         draw_bg +: {
             border_color: mod.widgets.COLOR_BG_DISABLED,
-            color: mod.widgets.COLOR_SECONDARY,
-            color_hover: #D0D0D0,
-            color_down: #C0C0C0,
+            color: mod.widgets.COLOR_BG_NEUTRAL,
+            color_hover: mod.widgets.COLOR_BG_NEUTRAL_HOVER,
+            color_down: mod.widgets.COLOR_BG_NEUTRAL_DOWN,
         }
         draw_text +: {
             color: mod.widgets.COLOR_TEXT,
@@ -498,19 +588,46 @@ pub fn apply_primary_button_style(cx: &mut Cx, button: &mut ButtonRef) {
     script_apply_eval!(cx, button, {
         draw_bg +: {
             color: mod.widgets.COLOR_ACTIVE_PRIMARY,
-            color_hover: mod.widgets.COLOR_ACTIVE_PRIMARY_DARKER,
-            color_down: #0C5DAA,
-            border_color: #0000,
-            border_color_hover: #0000,
-            border_color_down: #0000,
+            color_hover: mod.widgets.COLOR_ACTIVE_PRIMARY_HOVER,
+            color_down: mod.widgets.COLOR_ACTIVE_PRIMARY_DOWN,
+            border_color: mod.widgets.COLOR_TRANSPARENT,
+            border_color_hover: mod.widgets.COLOR_TRANSPARENT,
+            border_color_down: mod.widgets.COLOR_TRANSPARENT,
         }
         draw_text +: {
-            color: mod.widgets.COLOR_PRIMARY,
-            color_hover: mod.widgets.COLOR_PRIMARY,
-            color_down: mod.widgets.COLOR_PRIMARY,
+            color: mod.widgets.COLOR_TEXT_ON_ACCENT,
+            color_hover: mod.widgets.COLOR_TEXT_ON_ACCENT,
+            color_down: mod.widgets.COLOR_TEXT_ON_ACCENT,
         }
         draw_icon +: {
-            color: mod.widgets.COLOR_PRIMARY,
+            color: mod.widgets.COLOR_TEXT_ON_ACCENT,
         }
     });
+}
+
+/// Applies danger (solid red) button styling to the given button.
+pub fn apply_danger_button_style(cx: &mut Cx, button: &mut ButtonRef) {
+    script_apply_eval!(cx, button, {
+        draw_bg +: {
+            border_color: mod.widgets.COLOR_BG_DANGER_RED_SOLID,
+            color: mod.widgets.COLOR_BG_DANGER_RED_SOLID,
+            color_hover: mod.widgets.COLOR_BG_DANGER_RED_SOLID_HOVER,
+            color_down: mod.widgets.COLOR_BG_DANGER_RED_SOLID_DOWN,
+        }
+        draw_text +: {
+            color: mod.widgets.COLOR_TEXT_ON_ACCENT,
+            color_hover: mod.widgets.COLOR_TEXT_ON_ACCENT,
+            color_down: mod.widgets.COLOR_TEXT_ON_ACCENT,
+        }
+        draw_icon +: {
+            color: mod.widgets.COLOR_TEXT_ON_ACCENT,
+        }
+    });
+}
+
+/// Sets the background color of the given view, updating it in place if it's already drawn.
+pub fn set_view_bg_color(cx: &mut Cx, view: &ViewRef, color: Vec4f) {
+    let Some(mut view) = view.borrow_mut() else { return };
+    view.draw_bg.set_dyn_instance(cx, id!(color), &[color.x, color.y, color.z, color.w]);
+    view.draw_bg.update_instance_area_value(cx, ids!(color));
 }
