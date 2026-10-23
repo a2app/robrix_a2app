@@ -262,6 +262,34 @@ be downloaded and prepared as media. It does not post anything into Matrix.
   See [Background mini-apps](BACKGROUND_TASKS.md) for setup, examples, and recovery
   semantics. Tasks run only while Robrix is running and signed in.
 
+## Interactive A2UI messages
+
+Agents can send [A2UI](https://a2ui.org) surfaces, such as forms and cards, which
+Robrix translates into Splash and draws inside the message
+(`a2app/core/src/a2ui.rs`):
+
+- **Messages**: an `m.room.message` with msgtype `io.element.a2ui` carries A2UI
+  v0.9 messages in `messages`. Its `body` is a fallback, shown only when the
+  surface can't be drawn. Later `io.element.a2ui.update` events from the same
+  sender, related by `m.reference`, are applied in order and never shown. A2UI
+  blocks in text messages (fenced, or in `<a2ui-json>` tags) and AI replies are
+  drawn too; v0.8 and v1.0 payloads translate as well.
+- **Answers**: a button press sends an `io.element.a2ui.action` event that
+  references the message, with `dataModel` when the surface asked for it.
+  Function-call buttons (`openUrl`) run locally and send nothing.
+- **Permissions**: every surface runs as the built-in **A2UI Messages** app in its
+  room. Answering needs its "Answer an interactive message" ability
+  (`matrix-room-send`) and opening links needs Open Links, both prompted,
+  revocable, and subject to room rules, the write switch and flow review.
+- **Catalog**: Text (with `formatString` and its functions), Image (`mxc` drawn
+  inline; web images open in the browser), Icon (emoji, or a `svgPath`), Row,
+  Column, List, Card, Tabs, Modal (inline), Divider, Button, TextField, CheckBox,
+  ChoicePicker, Slider and DateTimeInput, with `checks` and `validationRegexp`.
+  Anything else shows "Unsupported component". Edits survive an agent's updates
+  unless the update writes the same data.
+- **Testing**: `/sendraw <event-type> <json-content>` sends any event; while
+  replying, it adds an `m.reference` to the replied-to message.
+
 ## Managing access
 
 The Mini Apps screen keeps **Allow apps to send or change rooms** at the top. Turning it off

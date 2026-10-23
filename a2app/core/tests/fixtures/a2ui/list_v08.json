@@ -1,0 +1,30 @@
+[
+  {"beginRendering": {"surfaceId": "finder", "root": "root"}},
+  {"surfaceUpdate": {"surfaceId": "finder", "components": [
+    {"id": "root", "component": {"Column": {"children": {"explicitList": ["heading", "list", "tabs"]}}}},
+    {"id": "heading", "component": {"Text": {"usageHint": "h2", "text": {"literalString": "Top restaurants"}}}},
+    {"id": "list", "component": {"List": {"direction": "vertical", "children": {"template": {"componentId": "item", "dataBinding": "/restaurants"}}}}},
+    {"id": "item", "component": {"Card": {"child": "item_row"}}},
+    {"id": "item_row", "component": {"Row": {"alignment": "center", "children": {"explicitList": ["item_icon", "item_name", "item_rating", "item_pick"]}}}},
+    {"id": "item_icon", "component": {"Icon": {"name": {"literalString": "restaurant"}}}},
+    {"id": "item_name", "weight": 1, "component": {"Text": {"text": {"path": "name"}}}},
+    {"id": "item_rating", "component": {"Text": {"usageHint": "caption", "text": {"path": "rating"}}}},
+    {"id": "item_pick", "component": {"Button": {"child": "item_pick_text", "action": {"name": "select", "context": [{"key": "id", "value": {"path": "id"}}]}}}},
+    {"id": "item_pick_text", "component": {"Text": {"text": {"literalString": "Pick"}}}},
+    {"id": "tabs", "component": {"Tabs": {"tabItems": [
+      {"title": {"literalString": "Map"}, "child": "map_img"},
+      {"title": {"literalString": "Details"}, "child": "details"}
+    ]}}},
+    {"id": "map_img", "component": {"Image": {"url": {"literalString": "https://example.com/map.png"}, "usageHint": "mediumFeature"}}},
+    {"id": "details", "component": {"Modal": {"entryPointChild": "open_btn", "contentChild": "details_text"}}},
+    {"id": "open_btn", "component": {"Button": {"child": "open_text", "action": {"name": "noop"}}}},
+    {"id": "open_text", "component": {"Text": {"text": {"literalString": "More info"}}}},
+    {"id": "details_text", "component": {"Text": {"text": {"literalString": "Open daily\nfrom 11:00."}}}}
+  ]}},
+  {"dataModelUpdate": {"surfaceId": "finder", "contents": [
+    {"key": "restaurants", "valueMap": [
+      {"key": "0", "valueMap": [{"key": "id", "valueString": "r1"}, {"key": "name", "valueString": "Luigi's"}, {"key": "rating", "valueNumber": 4.5}]},
+      {"key": "1", "valueMap": [{"key": "id", "valueString": "r2"}, {"key": "name", "valueString": "Sushi Go"}, {"key": "rating", "valueNumber": 4}]}
+    ]}
+  ]}}
+]

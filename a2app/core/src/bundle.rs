@@ -183,6 +183,12 @@ pub fn parse_with_history(text: &str) -> Result<ImportedBundle, String> {
     if trimmed.is_empty() {
         return Err("nothing to import".to_string());
     }
+    if let Some(a2ui) = crate::a2ui::find_block(trimmed) {
+        let source = crate::a2ui::to_splash(&a2ui)?;
+        return parse_bare_source(&source).map(|manifest| ImportedBundle {
+            manifest, history: Vec::new(), current_version: None,
+        });
+    }
     if trimmed.starts_with('{') {
         return parse_bundle(trimmed);
     }

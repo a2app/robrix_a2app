@@ -4427,6 +4427,10 @@ fn matrix_permission_review(request: &SplashHostRequest, context: &a2app_core::i
             let media = super::ai::media::PreparedMedia::from_base64(&request)?;
             sensitive(room, media.post_payload(&room_id))?
         }
+        services::MatrixServiceCall::A2uiAction { content, .. } => {
+            let room = permission_context.target_room.ok_or("Missing answer destination.")?;
+            sensitive(room, serde_json::from_str(&content).map_err(|_| "Cannot review the answer.")?)?
+        }
         services::MatrixServiceCall::SendMessage { body }
         | services::MatrixServiceCall::RoomsSend { body, .. } => {
             let room = permission_context.target_room.ok_or("Missing message destination.")?;

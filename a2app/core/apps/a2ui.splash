@@ -1,0 +1,19 @@
+// name: A2UI Messages
+// icon: 🧩
+// tint: #4A90D9
+// description: Interactive A2UI messages in your rooms act as this app. Its permissions decide what they may do.
+// permissions: matrix-room-send, open-url, matrix.room.a2ui.respond, device.url.open
+// why-matrix-room-send: Sends your answer to an interactive message when you press one of its buttons.
+// why-open-url: Opens a link or picture from an interactive message when you tap it.
+
+View{
+    width: Fill height: Fill flow: Down
+    ScrollYView{
+        width: Fill height: Fill flow: Down spacing: 10 padding: 14
+        Label{ width: Fill padding: 0 margin: 0 text: "Interactive messages"
+            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 14} } }
+        Label{ width: Fill padding: 0 margin: 0
+            text: "Agents can send interactive A2UI messages, such as forms and cards, that Robrix draws in the timeline. When you press a button on one, it answers the agent by sending an event to the room. Every interactive message acts as this app, so the permissions you give it here apply to all of them."
+            draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+    }
+}

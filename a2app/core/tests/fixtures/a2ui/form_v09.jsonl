@@ -1,0 +1,11 @@
+{"version": "v0.9", "createSurface": {"surfaceId": "signup", "catalogId": "https://a2ui.org/specification/v0_9/basic_catalog.json"}}
+{"version": "v0.9", "updateComponents": {"surfaceId": "signup", "components": [
+  {"id": "root", "component": "Column", "children": ["title", "email", "news", "volume", "submit"]},
+  {"id": "title", "component": "Text", "text": "Join the beta", "variant": "h2"},
+  {"id": "email", "component": "TextField", "label": "Email", "value": {"path": "/form/email"}},
+  {"id": "news", "component": "CheckBox", "label": "Send me news", "value": {"path": "/form/news"}},
+  {"id": "volume", "component": "Slider", "label": "Volume", "min": 0, "max": 10, "value": {"path": "/form/volume"}},
+  {"id": "submit", "component": "Button", "child": "submit_label", "variant": "primary", "action": {"event": {"name": "signup", "context": {"email": {"path": "/form/email"}, "news": {"path": "/form/news"}, "volume": {"path": "/form/volume"}}}}},
+  {"id": "submit_label", "component": "Text", "text": "Sign up"}
+]}}
+{"version": "v0.9", "updateDataModel": {"surfaceId": "signup", "path": "/form", "value": {"email": "", "news": true, "volume": 3}}}

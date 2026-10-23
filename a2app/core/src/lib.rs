@@ -23,6 +23,8 @@ pub mod manifest;
 pub mod layout;
 /// The `.splashapp` bundle format for exporting/importing/sharing apps.
 pub mod bundle;
+/// A2UI (agent-to-user interface) payloads translated into Splash mini-apps.
+pub mod a2ui;
 /// Version history snapshots for modified apps.
 pub mod versions;
 /// Line diffs between two versions of an app's source.

@@ -89,10 +89,28 @@ impl Drop for MiniAppInstance {
     }
 }
 
+/// An A2UI surface drawn in a timeline message. Its isolate is owned by that
+/// message's widget, but it runs as the A2UI app in the message's room, so the
+/// broker, prompts and flow reviews treat it like any other instance.
+struct InlineSurface {
+    key: InstanceKey,
+    flow_context: a2app_core::information_flow::ContextId,
+    flow_epoch: u64,
+    alive: Arc<AtomicBool>,
+}
+
+impl Drop for InlineSurface {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+    }
+}
+
 #[derive(Default)]
 struct Registry {
     host_template: Option<ScriptObjectRef>,
     instances: HashMap<InstanceKey, MiniAppInstance>,
+    /// Inline A2UI surfaces by isolate heap key.
+    inline: HashMap<usize, InlineSurface>,
     needs_anchor: bool,
     has_pending_resize: bool,
     /// Surface and focus hooks owed to instances; payloads are built at
@@ -159,6 +177,15 @@ fn splash_of(cx: &mut Cx, host: &WidgetRef) -> WidgetRef {
 /// Instantiates a host and evals the app into a fresh isolate, parked
 /// under the tree root. All isolate config lands BEFORE the source evals.
 fn spawn(cx: &mut Cx, manifest: &MiniAppManifest, _grants: &[String], key: &InstanceKey, public: bool, background: bool) -> Option<(WidgetRef, Option<usize>, a2app_core::information_flow::ContextId)> {
+    // Inline surfaces share this app's flow context, which an instance's teardown would remove.
+    if manifest.id == a2app_core::a2ui::APP_ID {
+        crate::shared::popup_list::enqueue_popup_notification(
+            "Interactive messages run in the timeline; there is nothing to open.",
+            crate::shared::popup_list::PopupKind::Info,
+            Some(5.0),
+        );
+        return None;
+    }
     let context = if public {
         super::information_flow::account().map(|account| a2app_core::information_flow::ContextId::PublicApp { account, app: manifest.id.clone() })
     } else {
@@ -261,7 +288,8 @@ pub fn is_foreground(app_id: &str) -> bool {
 pub fn context_can_prompt(context: &a2app_core::information_flow::ContextId, epoch: u64) -> bool {
     with_registry(|registry| registry.instances.values().any(|instance|
         &instance.flow_context == context && instance.flow_epoch == epoch
-            && instance.foreground() && !instance.background_running))
+            && instance.foreground() && !instance.background_running)
+        || registry.inline.values().any(|surface| &surface.flow_context == context && surface.flow_epoch == epoch))
 }
 
 fn refresh_prompt_state(cx: &mut Cx, key: &InstanceKey) {
@@ -390,10 +418,46 @@ pub fn surface_of(key: &InstanceKey) -> Option<Surface> {
     with_registry(|r| r.instances.get(key).and_then(|i| i.surface))
 }
 
+/// Registers an inline A2UI surface's isolate as an instance of the A2UI app
+/// in `room`: from then on its requests are checked like any app's.
+pub fn register_inline(heap_key: usize, room: &RoomId) -> Result<(), String> {
+    let app = a2app_core::a2ui::APP_ID;
+    let flow_context = super::information_flow::app_context(app, Some(room.as_str()))?;
+    a2app_core::information_flow::register_context(&flow_context)?;
+    let flow_epoch = a2app_core::information_flow::context_epoch(&flow_context)?;
+    with_registry(|r| r.inline.insert(heap_key, InlineSurface {
+        key: (app.to_string(), Some(room.to_owned())), flow_context, flow_epoch, alive: Arc::new(AtomicBool::new(true)),
+    }));
+    Ok(())
+}
+
+/// Registers an inline surface again if a session or permission reset removed
+/// its information-flow context, so its buttons can still ask for permission.
+pub fn refresh_inline(heap_key: usize) {
+    let Some((key, context, epoch)) = with_registry(|r| r.inline.get(&heap_key)
+        .map(|surface| (surface.key.clone(), surface.flow_context.clone(), surface.flow_epoch)))
+    else { return };
+    if a2app_core::information_flow::context_epoch(&context).is_ok_and(|now| now == epoch) { return; }
+    if let Some(room) = key.1.as_deref()
+        && let Err(e) = register_inline(heap_key, room)
+    {
+        warning!("Couldn't restore an A2UI surface's context in {room}: {e}");
+    }
+}
+
+/// Forgets an inline surface whose isolate was rebuilt or cleared.
+pub fn forget_inline(heap_key: usize) {
+    with_registry(|r| r.inline.remove(&heap_key));
+}
+
 /// The pane of the isolate with `heap_key`, for `env` and `ui.pane.read`.
 pub fn pane_state(heap_key: usize) -> Option<PaneState> {
     with_registry(|r| {
-        let inst = r.instances.values().find(|i| i.heap_key == Some(heap_key))?;
+        let Some(inst) = r.instances.values().find(|i| i.heap_key == Some(heap_key)) else {
+            // An inline surface is on screen whenever its buttons can be pressed.
+            return r.inline.contains_key(&heap_key)
+                .then_some(PaneState { surface: "timeline", side: None, foreground: true, width: 0.0, height: 0.0 });
+        };
         Some(PaneState {
             surface: inst.surface.map_or("parked", Surface::as_str),
             side: (inst.surface == Some(Surface::Dock)).then_some(inst.side),
@@ -421,11 +485,13 @@ pub fn key_of_heap(heap_key: usize) -> Option<InstanceKey> {
         r.instances.iter()
             .find(|(_, i)| i.heap_key == Some(heap_key))
             .map(|(k, _)| k.clone())
+            .or_else(|| r.inline.get(&heap_key).map(|surface| surface.key.clone()))
     })
 }
 
 pub fn context_of_heap(heap_key: usize) -> Option<a2app_core::information_flow::ContextId> {
-    with_registry(|r| r.instances.values().find(|i| i.heap_key == Some(heap_key)).map(|i| i.flow_context.clone()))
+    with_registry(|r| r.instances.values().find(|i| i.heap_key == Some(heap_key)).map(|i| i.flow_context.clone())
+        .or_else(|| r.inline.get(&heap_key).map(|surface| surface.flow_context.clone())))
 }
 
 pub fn context_of_host(host: &WidgetRef) -> Option<a2app_core::information_flow::ContextId> {
@@ -434,7 +500,8 @@ pub fn context_of_host(host: &WidgetRef) -> Option<a2app_core::information_flow:
 }
 
 pub fn lifetime_of_heap(heap_key: usize) -> Option<Arc<AtomicBool>> {
-    with_registry(|r| r.instances.values().find(|i| i.heap_key == Some(heap_key)).map(|i| i.alive.clone()))
+    with_registry(|r| r.instances.values().find(|i| i.heap_key == Some(heap_key)).map(|i| i.alive.clone())
+        .or_else(|| r.inline.get(&heap_key).map(|surface| surface.alive.clone())))
 }
 
 pub fn context_of_key(key: &InstanceKey) -> Option<a2app_core::information_flow::ContextId> {

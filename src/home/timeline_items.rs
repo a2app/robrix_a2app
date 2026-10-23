@@ -505,6 +505,9 @@ pub(super) fn item_display_kind<'a>(item: &'a TimelineItem, timeline_kind: &Time
                 MsgLikeKind::Other(other) if other.event_type().to_string() == crate::a2app::timeline_card::A2APP_EVENT_TYPE => {
                     return ItemDisplayKind::CustomCard(event_tl_item);
                 }
+                MsgLikeKind::Other(other) if other.event_type().to_string() == crate::utils::A2UI_UPDATE_EVENT_TYPE => {
+                    return ItemDisplayKind::Hidden;
+                }
                 MsgLikeKind::Other(other) => SmallStateContent::OtherMessageLike(other),
             }
         }

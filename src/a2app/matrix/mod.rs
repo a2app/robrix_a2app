@@ -41,6 +41,7 @@ pub enum A2AppMatrixRequest {
     /// `preview` is `matrix.media_preview`'s longest edge; `None` reads the whole file.
     DownloadMedia { room_id: OwnedRoomId, event_id: OwnedEventId, preview: Option<u32>, reply: Reply },
     SendMessage { room_id: OwnedRoomId, body: String, reply: Reply },
+    SendA2uiAction { room_id: OwnedRoomId, event_id: OwnedEventId, content: String, reply: Reply },
     SendMedia { room_id: OwnedRoomId, media: Arc<super::ai::media::PreparedMedia>, upload_authorization: Option<MatrixAuthorization>, reply: Reply },
     Profile { reply: Reply },
     Members { room_id: OwnedRoomId, limit: u32, reply: Reply },
@@ -179,6 +180,7 @@ impl A2AppMatrixRequest {
         use A2AppMatrixRequest::*;
         match self {
             RoomInfo { reply, .. } | ReadMessages { reply, .. } | DownloadMedia { reply, .. } | SendMessage { reply, .. } | SendMedia { reply, .. }
+            | SendA2uiAction { reply, .. }
             | Profile { reply } | Members { reply, .. } | PinnedEvents { reply, .. }
             | Threads { reply, .. } | RoomsList { reply } | Search { reply, .. }
             | ThreadReplies { reply, .. } | OlderMessages { reply, .. } | Event { reply, .. }
@@ -212,6 +214,7 @@ impl A2AppMatrixRequest {
             | RoomsMessages { room_id, reply, .. } => (room_id, RoomAccess::Read, Some(*reply)),
             SpaceInfo { space_id, reply } => (space_id, RoomAccess::Read, Some(*reply)),
             SendMessage { room_id, reply, .. } | SendMedia { room_id, reply, .. } | Reply { room_id, reply, .. }
+            | SendA2uiAction { room_id, reply, .. }
             | React { room_id, reply, .. } | Typing { room_id, reply, .. }
             | ReadReceipt { room_id, reply, .. } | Pin { room_id, reply, .. }
             | RoomFlag { room_id, reply, .. } | Invite { room_id, reply, .. }
@@ -310,6 +313,9 @@ pub fn request_for(
         },
         (MatrixServiceCall::SendMessage { body }, Some(room_id)) =>
             A2AppMatrixRequest::SendMessage { room_id, body, reply },
+        (MatrixServiceCall::A2uiAction { event_id, content }, Some(room_id)) => A2AppMatrixRequest::SendA2uiAction {
+            room_id, event_id: event_id.try_into().map_err(|_| "Invalid Matrix event ID.")?, content, reply,
+        },
         (MatrixServiceCall::SendMedia { data_base64, filename, mime_type, caption }, Some(room_id)) => {
             let request = super::ai::tools::MediaDraftRequest {
                 source: super::ai::tools::MediaSource::Base64(data_base64), filename, mime_type, caption,
@@ -502,6 +508,8 @@ async fn run_matrix_request(request: A2AppMatrixRequest, authorization: Option<M
         }
         A2AppMatrixRequest::SendMessage { room_id, body, reply } =>
             (reply, send::message(room_id, body).await),
+        A2AppMatrixRequest::SendA2uiAction { room_id, event_id, content, reply } =>
+            (reply, send::a2ui_action(room_id, event_id, content).await),
         A2AppMatrixRequest::SendMedia { room_id, media, upload_authorization, reply } =>
             (reply, send::media(room_id, media, authorization.as_ref(), upload_authorization.as_ref()).await),
         A2AppMatrixRequest::Members { room_id, limit, reply } => {

@@ -7052,7 +7052,8 @@ pub async fn clear_app_state(config: &LogoutConfig) -> Result<()> {
     }
 }
 
-/// The SDK's default filter, which drops custom types, plus A2UI messages.
+/// The SDK's default filter, which drops custom types, plus A2UI messages and (with
+/// `a2app`) shared mini-apps and the hidden updates to A2UI surfaces.
 fn timeline_event_filter(event: &AnySyncTimelineEvent, rules: &ruma::room_version_rules::RoomVersionRules) -> bool {
     let event_type = event.event_type().to_string();
     // The default filter keeps redacted events, which would show as "message deleted".
@@ -7061,7 +7062,12 @@ fn timeline_event_filter(event: &AnySyncTimelineEvent, rules: &ruma::room_versio
     {
         return false;
     }
+    #[cfg(feature = "a2app")]
+    if event_type == crate::a2app::timeline_card::A2APP_EVENT_TYPE {
+        return true;
+    }
     matrix_sdk_ui::timeline::default_event_filter(event, rules) || is_a2ui_message(event)
+        || (cfg!(feature = "a2app") && event_type == crate::utils::A2UI_UPDATE_EVENT_TYPE)
 }
 
 fn is_a2ui_message(event: &AnySyncTimelineEvent) -> bool {

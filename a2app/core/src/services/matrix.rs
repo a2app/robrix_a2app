@@ -18,6 +18,9 @@ pub enum MatrixServiceCall {
     DownloadMedia { event_id: String, preview: Option<u32> },
     /// Send a plain text message to the attached room as the user.
     SendMessage { body: String },
+    /// Answer an A2UI message in the attached room: `content` (a JSON object)
+    /// becomes an `io.element.a2ui.action` event referencing `event_id`.
+    A2uiAction { event_id: String, content: String },
     /// Upload and post inline media to the attached room as the user.
     /// Upload/send grants are separate from local composer drafting.
     SendMedia { data_base64: String, filename: String, mime_type: String, caption: Option<String> },
@@ -201,6 +204,10 @@ fn text_body(service: &str, args: &serde_json::Value) -> Result<String, String> 
     }
     Ok(body)}
 
+/// The most an A2UI action's content may take: events max out at 64 KiB, and
+/// encryption grows content by about a third.
+const MAX_A2UI_ACTION_BYTES: usize = 44 * 1024;
+
 /// Validates and clamps a call's arguments. Runs AFTER the permission gate,
 /// so a first-use prompt still reads sensibly before an argument error.
 pub fn parse(service: &str, args: &serde_json::Value, has_room: bool) -> Result<MatrixServiceCall, String> {
@@ -251,6 +258,15 @@ pub fn parse(service: &str, args: &serde_json::Value, has_room: bool) -> Result<
             limit: args["limit"].as_u64().unwrap_or(20).clamp(1, 50) as u32,
         },
         "matrix.send_message" => MatrixServiceCall::SendMessage { body: text_body(service, args)? },
+        "matrix.a2ui_action" => {
+            let event_id = args["event_id"].as_str().filter(|id| id.starts_with('$'))
+                .ok_or("matrix.a2ui_action needs {event_id}")?;
+            let content = args["content"].as_str()
+                .filter(|content| content.len() <= MAX_A2UI_ACTION_BYTES)
+                .filter(|content| serde_json::from_str::<serde_json::Value>(content).is_ok_and(|v| v.is_object()))
+                .ok_or("matrix.a2ui_action needs {content}: a JSON object of at most 44 KiB")?;
+            MatrixServiceCall::A2uiAction { event_id: event_id.into(), content: content.into() }
+        }
         "matrix.send_media" => {
             if args.get("room_id").is_some() {
                 return Err("matrix.send_media only posts to the attached room; room_id is not accepted".into());
@@ -426,7 +442,7 @@ pub fn cost(service: &str) -> f64 {
         "matrix.device" | "matrix.account_info" | "matrix.ignored_users" | "matrix.dm_find" => 1.0,
         "matrix.user_profile" => 5.0,
         // ----- send: speaks as the user -----
-        "matrix.send_message" => 5.0,
+        "matrix.send_message" | "matrix.a2ui_action" => 5.0,
         "matrix.send_media" => 8.0,
         "matrix.typing" => 1.0,
         "matrix.favorite" | "matrix.low_priority" | "matrix.mark_unread" => 5.0,
@@ -766,6 +782,29 @@ mod send_tests {
             parse_ok("matrix.reply", json!({"event_id": "$e", "body": "x".repeat(4096)})),
             MatrixServiceCall::Reply { .. }
         ));
+    }
+
+    #[test]
+    fn a2ui_action_needs_a_message_and_a_json_object_of_at_most_44_kib() {
+        // A JSON object of exactly `len` bytes.
+        let object_of = |len: usize| format!(r#"{{"data":"{}"}}"#, "x".repeat(len - 11));
+        let action = |content: String| json!({"event_id": "$surface:test", "content": content});
+        let MatrixServiceCall::A2uiAction { event_id, content } =
+            parse_ok("matrix.a2ui_action", action(object_of(MAX_A2UI_ACTION_BYTES))) else { panic!() };
+        assert_eq!(event_id, "$surface:test");
+        assert_eq!(content.len(), 44 * 1024, "the bound itself is accepted");
+        assert!(matches!(parse_ok("matrix.a2ui_action", action(object_of(16 * 1024 + 1))), MatrixServiceCall::A2uiAction { .. }),
+            "a sendDataModel answer bigger than the old 16 KiB cap fits");
+        assert_eq!(
+            parse_err("matrix.a2ui_action", action(object_of(MAX_A2UI_ACTION_BYTES + 1))),
+            "matrix.a2ui_action needs {content}: a JSON object of at most 44 KiB",
+        );
+        for content in ["", "[1]", "\"text\"", "{\"open\":"] {
+            assert!(parse_err("matrix.a2ui_action", action(content.into())).contains("{content}"), "{content}");
+        }
+        assert_eq!(parse_err("matrix.a2ui_action", json!({"content": "{}"})), "matrix.a2ui_action needs {event_id}");
+        assert_eq!(parse_err("matrix.a2ui_action", json!({"event_id": "surface", "content": "{}"})), "matrix.a2ui_action needs {event_id}");
+        assert!(matches!(parse("matrix.a2ui_action", &action("{}".into()), false), Err(error) if error.contains("not attached to a room")));
     }
 
     #[test]

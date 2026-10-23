@@ -307,6 +307,7 @@ fn permissions_for(id: &str) -> Vec<String> {
         "keyword-alert" => &["matrix-room-watch", "notifications"],
         "room-peek" => &["matrix-room-info", "matrix-room-read", "matrix-room-send", "robrix-composer", "files", "matrix-media", "robrix-navigation", "matrix-room-watch"],
         "roll-call" => &["robrix-composer", "matrix-room-send"],
+        "a2ui" => &["matrix-room-send", "open-url"],
         "room-info" => &["matrix-room-info"],
         "room-members" | "room-threads" => &["matrix-room-read", "robrix-navigation", "matrix-room-watch"],
         "search" => &["matrix-room-read", "matrix-rooms-list", "matrix-rooms-read", "robrix-navigation"],
@@ -354,6 +355,10 @@ fn reasons_for(id: &str) -> std::collections::BTreeMap<String, String> {
             ("matrix-media", "Uploads and posts the file only when you press Send file now. Local attachment drafts need no media-send grant."),
             ("robrix-navigation", "Jumps to a message you tap."),
             ("matrix-room-watch", "Shows new messages, typing, edits and reactions as they arrive."),
+        ],
+        "a2ui" => &[
+            ("matrix-room-send", "Sends your answer to an interactive message when you press one of its buttons."),
+            ("open-url", "Opens a link or picture from an interactive message when you tap it."),
         ],
         "roll-call" => &[
             ("matrix-room-send", "Posts your roll into this room only when you press Post to room."),
@@ -497,6 +502,7 @@ pub fn builtin_apps() -> Vec<MiniAppManifest> {
         app("link-library", "Link Library", "🔗", 0x2F6FDE, app_source!("link_library.splash")),
         app("translator", "Translator", "🌍", 0x2B8A3E, app_source!("translator.splash")),
         app("room-gallery", "Room Gallery", "🖼", 0xC2255C, app_source!("room_gallery.splash")),
+        app(crate::a2ui::APP_ID, "A2UI Messages", "🧩", 0x4A90D9, app_source!("a2ui.splash")),
     ]
 }
 
@@ -747,7 +753,7 @@ mod tests {
     #[test]
     fn catalog_matches_the_splash_headers() {
         let apps = builtin_apps();
-        assert_eq!(apps.len(), 23);
+        assert_eq!(apps.len(), 24);
         for m in &apps {
             assert!(m.builtin);
             assert!(m.widget.is_none());
@@ -774,12 +780,15 @@ mod tests {
         let composers = ["website-watch", "room-peek", "roll-call", "simple-watcher", "watcher"];
         // These only prepare drafts; they never post.
         let drafters = ["translator", "room-gallery"];
+        // A2UI messages only answer the message they belong to; they never draft.
+        let answerers = [crate::a2ui::APP_ID];
         let context = PermissionContext { origin_room: Some("!room:test"), target_room: Some("!room:test") };
         for manifest in builtin_apps() {
             let composes = composers.contains(&manifest.id.as_str());
             let drafts = composes || drafters.contains(&manifest.id.as_str());
             assert_eq!(manifest.declares(Permission::RobrixComposer), drafts, "{}", manifest.id);
-            assert_eq!(manifest.declares(Permission::MatrixRoomSend), composes, "{}", manifest.id);
+            assert_eq!(manifest.declares(Permission::MatrixRoomSend),
+                composes || answerers.contains(&manifest.id.as_str()), "{}", manifest.id);
             if !drafts { continue; }
             let mut permissions = PermissionStore::default();
             permissions.set(&manifest.id, Permission::MatrixRoomSend, GrantState::Denied);

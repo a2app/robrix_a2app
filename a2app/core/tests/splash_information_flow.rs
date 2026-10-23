@@ -47,8 +47,9 @@ fn every_stock_app_finishes_its_primary_action_with_strict_permissions() {
 
 fn run_every_stock_app(strict: bool) {
     let stock = a2app_core::builtin::builtin_apps();
-    assert_eq!(stock.len(), 23);
-    for manifest in stock {
+    assert_eq!(stock.len(), 24);
+    // The A2UI app has no UI of its own; a2ui_runtime.rs drives its surfaces.
+    for manifest in stock.into_iter().filter(|manifest| manifest.id != a2app_core::a2ui::APP_ID) {
         let mut host = Harness::new();
         host.permissions.set_strict(strict);
         // load_splash checks the real evaluator's source errors with its

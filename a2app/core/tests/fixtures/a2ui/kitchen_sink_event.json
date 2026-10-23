@@ -1,0 +1,52 @@
+{
+  "type": "m.room.message",
+  "content": {
+    "msgtype": "io.element.a2ui",
+    "body": "Kitchen sink",
+    "messages": [
+      {"version": "v0.9", "createSurface": {"surfaceId": "sink", "catalogId": "https://a2ui.org/specification/v0_9/catalogs/basic/catalog.json", "sendDataModel": true, "theme": {"primaryColor": "#7C3AED"}}},
+      {"version": "v0.9", "updateComponents": {"surfaceId": "sink", "components": [
+        {"id": "root", "component": "Column", "children": ["heading", "greeting", "price", "when", "count", "tabs"]},
+        {"id": "heading", "component": "Text", "text": "# Kitchen sink"},
+        {"id": "greeting", "component": "Text", "text": {"call": "formatString", "args": {"value": "Hello, ${/user/name}! You have ${/user/count} items."}}},
+        {"id": "price", "component": "Text", "text": {"call": "formatString", "args": {"value": "Total: ${formatCurrency(value: ${/order/total}, currency: 'EUR')}"}}},
+        {"id": "when", "component": "Text", "text": {"call": "formatString", "args": {"value": "Ships ${formatDate(value: ${/order/date}, format: 'EEE, MMM d')}"}}},
+        {"id": "count", "component": "Text", "text": {"call": "formatString", "args": {"value": "${pluralize(value: ${/user/count}, one: 'one item', other: 'many items')}"}}},
+        {"id": "tabs", "component": "Tabs", "tabs": [{"title": "Profile", "child": "profile"}, {"title": "Options", "child": "options"}, {"title": "Media", "child": "media"}]},
+        {"id": "profile", "component": "Column", "children": ["name", "email", "age", "submit"]},
+        {"id": "name", "component": "TextField", "label": "Name", "value": {"path": "/user/name"},
+          "checks": [{"condition": {"call": "required", "args": {"value": {"path": "/user/name"}}}, "message": "Name is required."}]},
+        {"id": "email", "component": "TextField", "label": "Email", "value": {"path": "/user/email"},
+          "checks": [{"condition": {"call": "email", "args": {"value": {"path": "/user/email"}}}, "message": "Enter a valid email."}]},
+        {"id": "age", "component": "TextField", "label": "Age", "variant": "number", "value": {"path": "/user/age"},
+          "checks": [{"condition": {"call": "numeric", "args": {"value": {"path": "/user/age"}, "min": 18, "max": 130}}, "message": "Age must be 18 to 130."}]},
+        {"id": "submit", "component": "Button", "child": "submit_label", "variant": "primary",
+          "action": {"event": {"name": "save", "context": {"user": {"path": "/user"}}}},
+          "checks": [{"condition": {"call": "length", "args": {"value": {"path": "/user/name"}, "min": 2}}, "message": "Name is too short."}]},
+        {"id": "submit_label", "component": "Text", "text": "Save"},
+        {"id": "options", "component": "Column", "children": ["size", "toppings", "delivery", "spice", "pickup"]},
+        {"id": "size", "component": "ChoicePicker", "label": "Size", "displayStyle": "chips",
+          "options": [{"label": "Small", "value": "s"}, {"label": "Large", "value": "l"}], "value": {"path": "/order/size"}},
+        {"id": "toppings", "component": "ChoicePicker", "label": "Toppings", "variant": "multipleSelection", "filterable": true,
+          "options": [{"label": "Cheese", "value": "cheese"}, {"label": "Basil", "value": "basil"}, {"label": "Chili", "value": "chili"}], "value": {"path": "/order/toppings"}},
+        {"id": "delivery", "component": "ChoicePicker", "label": "Delivery",
+          "options": [{"label": "Pickup", "value": "pickup"}, {"label": "Courier", "value": "courier"}], "value": {"path": "/order/delivery"}},
+        {"id": "spice", "component": "Slider", "label": "Spice", "min": 0, "max": 10, "steps": 10, "value": {"path": "/order/spice"}},
+        {"id": "pickup", "component": "DateTimeInput", "label": "Pickup time", "enableDate": true, "enableTime": true, "value": {"path": "/order/pickup"}},
+        {"id": "media", "component": "Column", "children": ["photo", "web_photo", "icons", "list"]},
+        {"id": "photo", "component": "Image", "url": "mxc://example.org/abcDEF123", "variant": "mediumFeature"},
+        {"id": "web_photo", "component": "Image", "url": "https://example.org/photo.png", "description": "A web photo"},
+        {"id": "icons", "component": "Row", "children": ["play", "pause"]},
+        {"id": "play", "component": "Icon", "name": "play"},
+        {"id": "pause", "component": "Icon", "name": "pause"},
+        {"id": "list", "component": "List", "children": {"componentId": "row", "path": "/items"}},
+        {"id": "row", "component": "Text", "text": {"call": "formatString", "args": {"value": "${@index(offset: 1)}. ${name}"}}}
+      ]}},
+      {"version": "v0.9", "updateDataModel": {"surfaceId": "sink", "path": "/", "value": {
+        "user": {"name": "Ada", "email": "", "age": "36", "count": 3},
+        "order": {"total": 1234.5, "date": "2026-10-24", "size": ["s"], "toppings": [], "delivery": ["pickup"], "spice": 5, "pickup": ""},
+        "items": [{"name": "First"}, {"name": "Second"}]
+      }}}
+    ]
+  }
+}

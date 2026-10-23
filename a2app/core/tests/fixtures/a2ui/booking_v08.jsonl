@@ -1,0 +1,31 @@
+{"surfaceUpdate": {"surfaceId": "booking", "components": [
+  {"id": "root", "component": {"Column": {"children": {"explicitList": ["title", "card"]}}}},
+  {"id": "title", "component": {"Text": {"usageHint": "h1", "text": {"literalString": "Book a table"}}}},
+  {"id": "card", "component": {"Card": {"child": "form"}}},
+  {"id": "form", "component": {"Column": {"children": {"explicitList": ["name", "guests", "date", "summary", "veg", "seating", "actions"]}}}},
+  {"id": "name", "component": {"TextField": {"label": {"literalString": "Your name"}, "text": {"path": "/reservation/name"}}}},
+  {"id": "guests", "component": {"TextField": {"label": {"literalString": "Guests"}, "text": {"path": "/reservation/guests"}, "textFieldType": "number"}}},
+  {"id": "date", "component": {"DateTimeInput": {"value": {"path": "/reservation/date"}, "enableDate": true, "enableTime": true}}},
+  {"id": "summary", "component": {"Text": {"usageHint": "caption", "text": {"path": "/reservation/name"}}}},
+  {"id": "veg", "component": {"CheckBox": {"label": {"literalString": "Vegetarian \"only\""}, "value": {"path": "/reservation/vegetarian"}}}},
+  {"id": "seating", "component": {"MultipleChoice": {"selections": {"path": "/reservation/seating"}, "maxAllowedSelections": 1, "options": [{"label": {"literalString": "Inside"}, "value": "inside"}, {"label": {"literalString": "Patio"}, "value": "patio"}]}}},
+  {"id": "actions", "component": {"Row": {"distribution": "spaceBetween", "children": {"explicitList": ["cancel", "book"]}}}},
+  {"id": "cancel", "component": {"Button": {"child": "cancel_text", "action": {"name": "cancel"}}}},
+  {"id": "cancel_text", "component": {"Text": {"text": {"literalString": "Cancel"}}}},
+  {"id": "book", "component": {"Button": {"child": "book_text", "primary": true, "action": {"name": "book_table", "context": [
+    {"key": "restaurant", "value": {"literalString": "Luigi's"}},
+    {"key": "reservation", "value": {"path": "/reservation"}},
+    {"key": "guests", "value": {"path": "/reservation/guests"}}
+  ]}}}},
+  {"id": "book_text", "component": {"Text": {"text": {"literalString": "Book now"}}}}
+]}}
+{"dataModelUpdate": {"surfaceId": "booking", "path": "/", "contents": [
+  {"key": "reservation", "valueMap": [
+    {"key": "name", "valueString": "Ada"},
+    {"key": "guests", "valueString": "2"},
+    {"key": "date", "valueString": "2026-10-24"},
+    {"key": "vegetarian", "valueBoolean": false},
+    {"key": "seating", "valueMap": []}
+  ]}
+]}}
+{"beginRendering": {"surfaceId": "booking", "root": "root", "styles": {"primaryColor": "#E05D2F"}}}

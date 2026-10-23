@@ -264,6 +264,7 @@ pub const CATALOG: &[Capability] = &[
     // ----- matrix-room-send -----
     cap!("matrix.room.message.send", "Send a message", "Post text to the attached room as you; one per user action; format beyond plain is planned via the slash-command content builders.", Write, Outgoing, Room, Some(P::MatrixRoomSend), RefusedBySwitch, High, ["matrix.send_message"]),
     cap!("matrix.room.message.reply", "Reply to a message", "Post a reply to a specific event.", Write, Outgoing, Room, Some(P::MatrixRoomSend), RefusedBySwitch, High, ["matrix.reply"]),
+    cap!("matrix.room.a2ui.respond", "Answer an interactive message", "Report a button press on an A2UI message as an io.element.a2ui.action event that references it.", Write, Outgoing, Room, Some(P::MatrixRoomSend), RefusedBySwitch, High, ["matrix.a2ui_action"]),
     cap!("matrix.room.thread.reply", "Reply in a thread", "Post into a thread.", Write, Outgoing, Room, Some(P::MatrixRoomSend), RefusedBySwitch, High, ["matrix.thread_reply"]),
     cap!("matrix.room.message.edit", "Edit its own message", "Change the text of an event THIS APP sent; the host keeps a per-instance sent-event set and refuses everything else.", Write, Outgoing, Room, Some(P::MatrixRoomSend), PlannedNewPlumbing, High, []),
     cap!("matrix.room.message.redact", "Delete its own message", "Redact an event THIS APP sent; never the user's other messages, never others'.", Write, Outgoing, Room, Some(P::MatrixRoomSend), PlannedNewPlumbing, Critical, []),

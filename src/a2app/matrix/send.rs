@@ -56,6 +56,24 @@ pub(super) async fn message(room_id: OwnedRoomId, body: String) -> Result<String
     Ok(String::from("{}"))
 }
 
+/// Answers an A2UI message: `content` becomes an `io.element.a2ui.action`
+/// event that references the message by `m.reference`.
+pub(super) async fn a2ui_action(room_id: OwnedRoomId, event_id: OwnedEventId, content: String) -> Result<String, String> {
+    super::policy::ensure_room_access(room_id.as_str(), a2app_core::permissions::RoomAccess::Write)?;
+    let client = get_client().ok_or("not logged in")?;
+    let room = client.get_room(&room_id).ok_or("room not found")?;
+    let Ok(serde_json::Value::Object(mut content)) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return Err("the action is malformed".into());
+    };
+    // The reviewed payload is the action itself, without the host-added relation.
+    super::policy::commit_sensitive_target(room_id.as_str(), &serde_json::Value::Object(content.clone())).await?;
+    content.insert("m.relates_to".into(), serde_json::json!({"rel_type": "m.reference", "event_id": event_id}));
+    let raw = serde_json::value::to_raw_value(&content).map_err(|e| e.to_string())?;
+    super::policy::audit_room_operation(room_id.as_str(), room.send_raw(crate::utils::A2UI_ACTION_EVENT_TYPE, raw)).await
+        .map_err(|e| format!("couldn't send the answer: {e}"))?;
+    Ok(String::from("{}"))
+}
+
 pub(super) async fn reply(
     room_id: OwnedRoomId,
     event_id: OwnedEventId,

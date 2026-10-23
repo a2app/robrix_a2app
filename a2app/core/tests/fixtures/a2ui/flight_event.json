@@ -1,0 +1,42 @@
+{
+  "content": {
+    "body": "Please fill in the contact form.",
+    "messages": [
+      {"createSurface": {"catalogId": "https://a2ui.org/specification/v0_9/catalogs/basic/catalog.json", "sendDataModel": true, "surfaceId": "showcase-01-flight"}, "version": "v0.9"},
+      {"updateComponents": {"components": [
+        {"child": "content", "component": "Card", "id": "root"},
+        {"children": ["header", "route", "divider", "timing"], "component": "Column", "id": "content"},
+        {"align": "center", "children": ["heading", "status"], "component": "Row", "id": "header", "justify": "spaceBetween"},
+        {"align": "center", "children": ["plane", "title"], "component": "Row", "id": "heading"},
+        {"component": "Icon", "id": "plane", "name": {"svgPath": "M2 21 23 12 2 3 2 10 17 12 2 14Z"}},
+        {"component": "Text", "id": "title", "text": "OS 87 · Vienna to New York", "variant": "h3"},
+        {"component": "Text", "id": "status", "text": "On time", "variant": "caption"},
+        {"align": "center", "children": ["origin", "arrow", "destination"], "component": "Row", "id": "route", "justify": "spaceBetween"},
+        {"align": "start", "children": ["origin-code", "origin-name"], "component": "Column", "id": "origin"},
+        {"component": "Text", "id": "origin-code", "text": "VIE", "variant": "h1"},
+        {"component": "Text", "id": "origin-name", "text": "Vienna", "variant": "caption"},
+        {"component": "Text", "id": "arrow", "text": "→", "variant": "h2"},
+        {"align": "end", "children": ["destination-code", "destination-name"], "component": "Column", "id": "destination"},
+        {"component": "Text", "id": "destination-code", "text": "JFK", "variant": "h1"},
+        {"component": "Text", "id": "destination-name", "text": "New York", "variant": "caption"},
+        {"component": "Divider", "id": "divider"},
+        {"children": ["departs", "gate", "arrives"], "component": "Row", "id": "timing", "justify": "spaceBetween"},
+        {"align": "start", "children": ["departs-label", "departs-value"], "component": "Column", "id": "departs"},
+        {"component": "Text", "id": "departs-label", "text": "Departs", "variant": "caption"},
+        {"component": "Text", "id": "departs-value", "text": "10:15 AM", "variant": "h3"},
+        {"align": "center", "children": ["gate-label", "gate-value"], "component": "Column", "id": "gate"},
+        {"component": "Text", "id": "gate-label", "text": "Gate", "variant": "caption"},
+        {"component": "Text", "id": "gate-value", "text": {"path": "/gate"}, "variant": "h3"},
+        {"align": "end", "children": ["arrives-label", "arrives-value"], "component": "Column", "id": "arrives"},
+        {"component": "Text", "id": "arrives-label", "text": "Arrives", "variant": "caption"},
+        {"component": "Text", "id": "arrives-value", "text": "2:30 PM", "variant": "h3"}
+      ], "surfaceId": "showcase-01-flight"}, "version": "v0.9"},
+      {"updateDataModel": {"surfaceId": "showcase-01-flight", "value": {"gate": "F12"}}, "version": "v0.9"}
+    ],
+    "msgtype": "io.element.a2ui"
+  },
+  "event_id": "$pKawQ5HWDeoagEv9aw0TjUlP-XNA0W8S0KaI6anbAxo",
+  "origin_server_ts": 1792768919862,
+  "sender": "@hughns:element.io",
+  "type": "m.room.message"
+}

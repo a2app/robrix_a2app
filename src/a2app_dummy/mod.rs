@@ -17,6 +17,7 @@ script_mod! {
     mod.widgets.AiRoomPanel = View { visible: false }
     mod.widgets.MiniAppTimelineCard = View { visible: false }
     mod.widgets.MiniAppAttachmentAction = View { visible: false }
+    mod.widgets.A2uiMessageAction = View { visible: false }
     mod.widgets.AiReplyTimelineCard = View { visible: false }
     mod.widgets.AiEventTimelineCard = View { visible: false }
     mod.widgets.AiTurnTimelineCard = View { visible: false }

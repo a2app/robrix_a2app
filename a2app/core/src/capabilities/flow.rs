@@ -102,7 +102,7 @@ pub fn contract(id: &str) -> Option<FlowContract> {
         "matrix.room.messages.paginate" => (S::TargetRoom, O::MatrixPagination, true, false),
         "matrix.room.messages.search" => (S::TargetRoom, O::MatrixSearch, true, false),
         "matrix.rooms.messages.search" => (S::Account, O::MatrixSearch, true, false),
-        "matrix.room.message.send" | "matrix.room.message.reply" | "matrix.room.thread.reply"
+        "matrix.room.message.send" | "matrix.room.message.reply" | "matrix.room.thread.reply" | "matrix.room.a2ui.respond"
         | "matrix.rooms.message.send" | "matrix.room.typing.send" | "matrix.room.receipt.send"
         | "matrix.room.pin.set" | "matrix.room.favorite.set" | "matrix.room.low_priority.set"
         | "matrix.room.unread.set" | "matrix.room.invite.send" | "matrix.invites.respond"

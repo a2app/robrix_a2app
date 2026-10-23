@@ -408,6 +408,7 @@ script_mod! {
                 padding: 0.0
 
                 message := HtmlOrPlaintext { }
+                a2ui_action := mod.widgets.A2uiMessageAction {}
                 link_preview_view := mod.widgets.LinkPreview {}
                 download_section := mod.widgets.MessageDownloadSection {}
                 View {
@@ -706,7 +707,9 @@ script_mod! {
             // A mini-app shared into the room (an invisible stub without `a2app`).
             MiniAppTimelineCard := mod.widgets.MiniAppTimelineCard {}
             // An AI room's agent turn (an invisible stub without `a2app`).
-            AiReplyTimelineCard := mod.widgets.AiReplyTimelineCard {}
+            AiReplyTimelineCard := mod.widgets.AiReplyTimelineCard {
+                a2ui_action := mod.widgets.A2uiMessageAction {}
+            }
             // An AI room's live activity rows (thinking/error markers, tool
             // calls) — invisible stubs without `a2app`.
             AiEventTimelineCard := mod.widgets.AiEventTimelineCard {}
@@ -1842,6 +1845,8 @@ impl Widget for RoomScreen {
                                 tl_state.is_encrypted,
                                 item_drawn_status,
                                 room_screen_widget_uid,
+                                tl_items,
+                                tl_idx,
                             )
                         }
                         #[cfg(feature = "a2app")]
@@ -1851,6 +1856,7 @@ impl Widget for RoomScreen {
                             ),
                             TimelineItemContent::OtherState(other) => populate_other_state_event(
                                 cx, list, item_id, &tl_state.kind, event, other, item_drawn_status, tl_items, tl_idx,
+                                &mut tl_state.media_cache,
                             ),
                             _ => (list.item(cx, item_id, id!(ZeroHeightItem)), ItemDrawnStatus::both_drawn()),
                         },
@@ -5116,6 +5122,10 @@ fn populate_message_view(
     is_room_encrypted: bool,
     item_drawn_status: ItemDrawnStatus,
     room_screen_widget_uid: WidgetUid,
+    #[cfg_attr(not(feature = "a2app"), allow(unused_variables))]
+    tl_items: &Vector<Arc<TimelineItem>>,
+    #[cfg_attr(not(feature = "a2app"), allow(unused_variables))]
+    tl_idx: usize,
 ) -> (WidgetRef, ItemDrawnStatus) {
     let mut new_drawn_status = item_drawn_status;
     let ts_millis = event_tl_item.timestamp();
@@ -5450,7 +5460,8 @@ fn populate_message_view(
                         (item, false)
                     }
                 }
-                // An A2UI message, shown as its plain-text fallback body.
+                // An A2UI surface: the fallback body here, the surface itself
+                // drawn below it by the `a2ui_action` widget (a2app builds).
                 other if other.msgtype() == crate::utils::A2UI_MSGTYPE => {
                     has_html_body = false;
                     let template = if use_compact_view { id!(CondensedMessage) } else { id!(Message) };
@@ -5669,6 +5680,31 @@ fn populate_message_view(
             None
         };
         item.mini_app_attachment_action(cx, ids!(content.download_section.mini_app_attachment)).populate(cx, context);
+
+        use crate::a2app::timeline_card::{A2uiMessageActionWidgetRefExt, A2uiMessageContext};
+        let a2ui = match &msg_like_content.kind {
+            MsgLikeKind::Message(message) => match message.msgtype() {
+                MessageType::Text(text) => a2app_core::a2ui::find_block(&text.body),
+                MessageType::Notice(notice) => a2app_core::a2ui::find_block(&notice.body),
+                // The surface widget translates it once per new payload and stays hidden if it can't.
+                other if other.msgtype() == crate::utils::A2UI_MSGTYPE => other.data().get("messages")
+                    .map(|messages| a2ui_payload_with_updates(messages, tl_items, tl_idx, event_tl_item)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let a2ui_context = a2ui.map(|a2ui| A2uiMessageContext {
+            a2ui,
+            room_id: timeline_kind.room_id().clone(),
+            event_id: event_tl_item.event_id().map(ToOwned::to_owned),
+        });
+        let a2ui_action = item.a2ui_message_action(cx, ids!(content.a2ui_action));
+        a2ui_action.populate(cx, a2ui_context, Some(&mut *media_cache));
+        // An A2UI message's body is only a fallback for when its surface can't be drawn.
+        let is_a2ui_message = matches!(&msg_like_content.kind,
+            MsgLikeKind::Message(message) if message.msgtype().msgtype() == crate::utils::A2UI_MSGTYPE);
+        let is_surface_drawn = !a2ui_action.is_empty() && a2ui_action.visible();
+        item.widget(cx, ids!(content.message)).set_visible(cx, !(is_a2ui_message && is_surface_drawn));
     }
 
 
@@ -6669,6 +6705,85 @@ fn ai_turn_is_latest(items: &Vector<Arc<TimelineItem>>, idx: usize, turn: &str) 
     true
 }
 
+/// The most updates one A2UI surface applies; any later ones are ignored.
+#[cfg(feature = "a2app")]
+const MAX_A2UI_UPDATES: usize = 200;
+/// The most bytes of update messages one A2UI surface applies.
+#[cfg(feature = "a2app")]
+const MAX_A2UI_UPDATE_BYTES: usize = 1024 * 1024;
+/// Past this many parsed updates, the cache starts over.
+#[cfg(feature = "a2app")]
+const MAX_CACHED_A2UI_UPDATES: usize = 4096;
+
+/// Parsed `io.element.a2ui.update`s by event id: the event each references and its
+/// `messages` as JSON, or `None` if it isn't a valid `m.reference` update.
+#[cfg(feature = "a2app")]
+type A2uiUpdates = HashMap<OwnedEventId, Option<(OwnedEventId, String)>>;
+
+#[cfg(feature = "a2app")]
+thread_local! {
+    /// Updates are re-scanned on every draw, so each is parsed only once.
+    static A2UI_UPDATES: RefCell<A2uiUpdates> = RefCell::new(HashMap::new());
+}
+
+/// An A2UI surface's messages followed by the `io.element.a2ui.update`s its
+/// sender has related to it since, in timeline order and up to the caps above.
+#[cfg(feature = "a2app")]
+fn a2ui_payload_with_updates(
+    messages: &serde_json::Value,
+    tl_items: &Vector<Arc<TimelineItem>>,
+    tl_idx: usize,
+    surface: &EventTimelineItem,
+) -> String {
+    let mut payload = format!("[{messages}");
+    if let Some(event_id) = surface.event_id() {
+        A2UI_UPDATES.with_borrow_mut(|updates| {
+            let (mut count, mut bytes) = (0, 0);
+            for event in tl_items.iter().skip(tl_idx + 1).filter_map(|item| item.as_event()) {
+                let TimelineItemContent::MsgLike(MsgLikeContent { kind: MsgLikeKind::Other(other), .. }) = event.content() else { continue };
+                if event.sender() != surface.sender() || other.event_type().to_string() != crate::utils::A2UI_UPDATE_EVENT_TYPE {
+                    continue;
+                }
+                let Some((target, update)) = parsed_a2ui_update(updates, event) else { continue };
+                if target != event_id {
+                    continue;
+                }
+                if count == MAX_A2UI_UPDATES || bytes + update.len() > MAX_A2UI_UPDATE_BYTES {
+                    break;
+                }
+                count += 1;
+                bytes += update.len();
+                payload.push(',');
+                payload.push_str(update);
+            }
+        });
+    }
+    payload.push(']');
+    payload
+}
+
+/// The given update's entry in `updates`, parsing it first if it's new.
+#[cfg(feature = "a2app")]
+fn parsed_a2ui_update<'a>(updates: &'a mut A2uiUpdates, event: &EventTimelineItem) -> Option<&'a (OwnedEventId, String)> {
+    let event_id = event.event_id()?;
+    if !updates.contains_key(event_id) {
+        let content = event.latest_json()?.get_field::<serde_json::Value>("content").ok().flatten();
+        let update = content.as_ref().and_then(|content| {
+            let relation = content.get("m.relates_to")?;
+            if relation.get("rel_type")?.as_str()? != "m.reference" {
+                return None;
+            }
+            let target = OwnedEventId::try_from(relation.get("event_id")?.as_str()?).ok()?;
+            Some((target, content.get("messages")?.to_string()))
+        });
+        if updates.len() >= MAX_CACHED_A2UI_UPDATES {
+            updates.clear();
+        }
+        updates.insert(event_id.to_owned(), update);
+    }
+    updates.get(event_id)?.as_ref()
+}
+
 /// Routes a custom state event: an AI room's `ai_reply` turns get their own
 /// timeline card, its live `ai_activity` markers ("thinking…" / errors /
 /// stopped) and `ai_tool_call` rows get the small live-activity card, and
@@ -6684,6 +6799,7 @@ fn populate_other_state_event(
     item_drawn_status: ItemDrawnStatus,
     tl_items: &Vector<Arc<TimelineItem>>,
     tl_idx: usize,
+    media_cache: &mut MediaCache,
 ) -> (WidgetRef, ItemDrawnStatus) {
     #[cfg(feature = "a2app")]
     if let timeline::AnyOtherStateEventContentChange::_Custom { event_type } = other.content() {
@@ -6700,12 +6816,24 @@ fn populate_other_state_event(
                 .and_then(|v| v.get("content").cloned())
         };
         if event_type == AI_REPLY_EVENT_TYPE {
+            use crate::a2app::timeline_card::{A2uiMessageActionWidgetRefExt, A2uiMessageContext};
             let (item, existed) = list.item_with_existed(cx, item_id, id!(AiReplyTimelineCard));
+            let a2ui_action = item.a2ui_message_action(cx, ids!(a2ui_action));
             if !(existed && item_drawn_status.content_drawn) {
                 let content =
                     raw_content().and_then(|c| serde_json::from_value::<AiReplyContent>(c).ok());
                 item.as_ai_reply_timeline_card().populate(cx, content.as_ref());
+                let a2ui_context = content.as_ref()
+                    .and_then(|c| a2app_core::a2ui::find_block(&c.text))
+                    .map(|a2ui| A2uiMessageContext {
+                        a2ui,
+                        room_id: timeline_kind.room_id().clone(),
+                        event_id: event_tl_item.event_id().map(ToOwned::to_owned),
+                    });
+                a2ui_action.populate(cx, a2ui_context, None);
             }
+            // The surface's `mxc` images arrive after its first draw.
+            a2ui_action.load_pending_images(cx, media_cache);
             return (item, ItemDrawnStatus::both_drawn());
         }
         if event_type == AI_TURN_EVENT_TYPE {

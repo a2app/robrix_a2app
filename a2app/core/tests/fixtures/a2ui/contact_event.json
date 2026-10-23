@@ -1,0 +1,53 @@
+{
+    "type": "m.room.message",
+    "content": {
+        "msgtype": "io.element.a2ui",
+        "body": "Please fill in the contact form.",
+        "messages": [
+            { "version": "v0.9", "createSurface": { "surfaceId": "main" } },
+            {
+                "version": "v0.9",
+                "updateComponents": {
+                    "surfaceId": "main",
+                    "components": [
+                        { "id": "root", "component": "Column", "children": ["title", "name", "subscribe", "submit"] },
+                        { "id": "title", "component": "Text", "text": "Contact us", "variant": "h2" },
+                        {
+                            "id": "name",
+                            "component": "TextField",
+                            "label": "Name",
+                            "value": { "path": "/contact/name" }
+                        },
+                        {
+                            "id": "subscribe",
+                            "component": "CheckBox",
+                            "label": "Subscribe to the newsletter",
+                            "value": { "path": "/contact/subscribe" }
+                        },
+                        {
+                            "id": "submit",
+                            "component": "Button",
+                            "child": "submitLabel",
+                            "variant": "primary",
+                            "action": {
+                                "event": {
+                                    "name": "submitContactForm",
+                                    "context": { "formId": "contact_form_1", "contact": { "path": "/contact" } }
+                                }
+                            }
+                        },
+                        { "id": "submitLabel", "component": "Text", "text": "Send" }
+                    ]
+                }
+            },
+            {
+                "version": "v0.9",
+                "updateDataModel": {
+                    "surfaceId": "main",
+                    "path": "/",
+                    "value": { "contact": { "name": "", "subscribe": false } }
+                }
+            }
+        ]
+    }
+}
