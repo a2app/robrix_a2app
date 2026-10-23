@@ -611,6 +611,8 @@ impl MainDesktopUI {
             Some(selected_room) => self.focus_or_create_tab(cx, selected_room),
             None => self.most_recently_selected_room = None,
         }
+        // Loading the dock clears its focused tab, so we focus it again.
+        dock.select_tab(cx, self.most_recently_selected_room.as_ref().map_or(id!(home_tab), SelectedRoom::tab_id));
         // The previous dock's selection isn't in this dock.
         self.previously_selected_tab = None;
         app_state.selected_room = selected_room;
@@ -739,8 +741,14 @@ impl WidgetMatchEvent for MainDesktopUI {
 
             if let Some(GoBackAction { steps }) = action.downcast_ref() {
                 let app_state = scope.data.get_mut::<AppState>().unwrap();
-                if let Some(previous_place) = app_state.nav_history.previous_place(self.most_recently_selected_room.as_ref(), *steps, can_show(cx)) {
-                    self.go_back_to(cx, &mut app_state.nav_history, *steps, previous_place);
+                let mut steps = *steps;
+                // The first step back from the AddRoom screen just closes it.
+                if matches!(app_state.selected_tab, SelectedTab::AddRoom) {
+                    cx.action(NavigationBarAction::CloseAddRoom);
+                    steps -= 1;
+                }
+                if let Some(previous_place) = app_state.nav_history.previous_place(self.most_recently_selected_room.as_ref(), steps, can_show(cx)) {
+                    self.go_back_to(cx, &mut app_state.nav_history, steps, previous_place);
                 }
                 continue;
             }
@@ -861,7 +869,7 @@ impl WidgetMatchEvent for MainDesktopUI {
                                 )
                                 .or_else(|| self.room_order.iter().rev().map(SelectedRoom::tab_id).find(was_left_behind));
                             if let Some(tab_to_select) = tab_to_select {
-                                dock.select_tab(cx, tab_to_select);
+                                dock.bring_tab_to_front(cx, tab_to_select);
                             }
                         }
                         // Unlike a mouse press, a touch drag doesn't select the dragged tab,

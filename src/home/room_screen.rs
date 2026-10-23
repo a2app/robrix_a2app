@@ -345,10 +345,13 @@ script_mod! {
         // A preview of the earlier message that this message was in reply to.
         replied_to_message := mod.widgets.RepliedToMessage {
             flow: Down
-            margin: Inset{ bottom: 3, top: 10 }
+            margin: Inset{ bottom: 0, top: 10 }
+            // The left bar hangs down to 4px above the sender's avatar.
+            left_bar_overhang: 3.5
             preview_content +: {
                 margin +: { left: 20 }
-                padding +: { bottom: 10 }
+                // Lines up the reply's text with this message's text.
+                padding +: { left: 32.5 }
             }
         }
 
@@ -425,8 +428,11 @@ script_mod! {
     mod.widgets.CondensedMessage = mod.widgets.Message {
         padding: Inset{ top: 2.0, bottom: 2.0 }
         replied_to_message +: {
+            left_bar_overhang: 0.0
+            reply_left_bar +: { draw_bg +: { arc_radius: 5.0 } }
             preview_content +: {
                 margin: Inset{ left: 55, bottom: 5.0 }
+                padding +: { left: 22 }
             }
         }
         header +: { visible: false }
@@ -1067,10 +1073,7 @@ impl ScriptHook for RoomScreen {
         // A script reload changes the RoomScreen's children; invalidate the ones we cached.
         self.cached_refs = None;
         vm.with_cx_mut(|cx| {
-            if let Some(tl_state) = &mut self.tl_state.as_mut() {
-                // Clear the timeline's drawn items caches and redraw it.
-                tl_state.content_drawn_since_last_update.clear();
-                tl_state.profile_drawn_since_last_update.clear();
+            if let Some(tl_state) = self.tl_state.as_ref() {
                 // The reapply also resets the RoomInputBar, so we need to re-update its state.
                 let room_input_bar = self.view.room_input_bar(cx, ids!(room_input_bar));
                 room_input_bar.update_room_state(
@@ -1745,6 +1748,13 @@ impl Widget for RoomScreen {
             let Some(tl_state) = self.tl_state.as_mut() else {
                 return DrawStep::done();
             };
+            // Re-populate all items after a reload, since it resets their widgets,
+            // even if it happened while this timeline state was parked.
+            if tl_state.drawn_reload_generation != cx.reload_generation {
+                tl_state.drawn_reload_generation = cx.reload_generation;
+                tl_state.content_drawn_since_last_update.clear();
+                tl_state.profile_drawn_since_last_update.clear();
+            }
 
             // Set the portal list's range based on the number of timeline items.
             let tl_items = &tl_state.items;
@@ -3113,8 +3123,13 @@ impl RoomScreen {
                 MessageAction::CopyLink(details) => {
                     let Some(tl) = self.tl_state.as_ref() else { return };
                     if let Some(event_id) = details.event_id() {
-                        let matrix_to_uri = tl.kind.room_id().matrix_to_event_uri(event_id.clone());
-                        cx.copy_to_clipboard(&matrix_to_uri.to_string());
+                        submit_async_request(MatrixRequest::GenerateMatrixLink {
+                            room_id: tl.kind.room_id().clone(),
+                            event_id: Some(event_id.clone()),
+                            use_matrix_scheme: false,
+                            join_on_click: false,
+                            copy_to_clipboard: true,
+                        });
                     } else {
                         enqueue_popup_notification(
                             "Couldn't create permalink to message. Please try again.",
@@ -3612,7 +3627,7 @@ impl RoomScreen {
                     submit_async_request(MatrixRequest::GetSuccessorRoomDetails {
                         tombstoned_room_id: room_id.clone(),
                     });
-                    Some(SuccessorRoomDetails::Basic(sr))
+                    Some(SuccessorRoomDetails::Basic { successor_room: sr, via: Vec::new() })
                 } else {
                     None
                 };
@@ -3633,6 +3648,7 @@ impl RoomScreen {
                     index_of_first_own_failed: None,
                     content_drawn_since_last_update: RangeSet::new(),
                     profile_drawn_since_last_update: RangeSet::new(),
+                    drawn_reload_generation: cx.reload_generation,
                     update_receiver,
                     request_sender,
                     media_cache: MediaCache::new(Some(update_sender.clone())),
@@ -3823,7 +3839,7 @@ impl RoomScreen {
             submit_async_request(MatrixRequest::GetSuccessorRoomDetails {
                 tombstoned_room_id: tl.kind.room_id().clone(),
             });
-            tl.tombstone_info = Some(SuccessorRoomDetails::Basic(successor_room));
+            tl.tombstone_info = Some(SuccessorRoomDetails::Basic { successor_room, via: Vec::new() });
         }
         // If `tl_state` was Some here, it means the timeline is being shown (it's visible),
         // so inform the subscribers of that status.
@@ -4795,6 +4811,9 @@ struct TimelineUiState {
 
     /// Same as `content_drawn_since_last_update`, but for the event **profiles** (avatar, username).
     profile_drawn_since_last_update: RangeSet<usize>,
+
+    /// The `cx.reload_generation` that the above drawn-item caches were filled in.
+    drawn_reload_generation: u64,
 
     /// The channel receiver for timeline updates for this room.
     ///

@@ -7,6 +7,7 @@ use crate::{
     home::{
         nav_history::{GoBackAction, GoForwardAction, can_navigate_history, can_show, current_place},
         nav_history_menu::{LongPressWatcher, NavHistoryDirection, NavHistoryMenuWidgetRefExt, request_nav_history_menu},
+        navigation_tab_bar::SelectedTab,
     },
     room::room_action_bar::RoomActionTooltip,
 };
@@ -172,11 +173,12 @@ pub fn enable_nav_history_buttons(cx: &mut Cx, ui: &WidgetRef, app_state: &AppSt
     }
     let (can_go_back, can_go_forward) = if can_navigate_history(cx, ui, app_state) {
         let can_show = can_show(cx);
-        let nav_history = &app_state.nav_history;
         let current = current_place(cx, ui, app_state);
         (
-            nav_history.previous_place(current, 1, &can_show).is_some(),
-            nav_history.next_place(current, 1, &can_show).is_some(),
+            // Going back from the AddRoom screen always closes it, even if there's no place to list.
+            matches!(app_state.selected_tab, SelectedTab::AddRoom)
+                || NavHistoryDirection::Back.places(app_state, current, &can_show).next().is_some(),
+            NavHistoryDirection::Forward.places(app_state, current, &can_show).next().is_some(),
         )
     } else {
         (false, false)
