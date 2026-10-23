@@ -766,6 +766,12 @@ pub enum MatrixRequest {
         #[cfg(feature = "tsp")]
         sign_with_tsp: bool,
     },
+    /// Sends a message-like event of any type, e.g. for the `/sendraw` command.
+    SendRawEvent {
+        room_id: OwnedRoomId,
+        event_type: String,
+        content: serde_json::Value,
+    },
     /// Request to send a file attachment to the given room.
     SendAttachment {
         upload_id: FileUploadAttemptId,
@@ -1215,6 +1221,7 @@ async fn matrix_worker_task(
                     log!("Creating thread-focused timeline for room {room_id}, thread {thread_root_event_id}...");
                     let build_result = main_room_timeline.room()
                         .timeline_builder()
+                        .event_filter(timeline_event_filter)
                         .with_focus(TimelineFocus::Thread {
                             thread_id: thread_root_event_id.clone(),
                         })
@@ -2269,6 +2276,24 @@ async fn matrix_worker_task(
                     // Upon the next sync, the blocked user list will be updated, which will cause
                     // the matrix SDK to clear each timeline, at which point the visible timelines
                     // will re-paginate themselves.
+                });
+            }
+
+            MatrixRequest::SendRawEvent { room_id, event_type, content } => {
+                let Some(main_room_timeline) = get_room_timeline(&room_id) else {
+                    log!("BUG: skipping send raw event request for not-yet-known room {room_id}");
+                    continue;
+                };
+                let _send_task = Handle::current().spawn(async move {
+                    let result = match serde_json::value::to_raw_value(&content) {
+                        Ok(raw) => main_room_timeline.room().send_raw(&event_type, raw).await
+                            .map(|_| ()).map_err(|e| e.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    };
+                    if let Err(e) = result {
+                        error!("Failed to send {event_type} event to room {room_id}: {e}");
+                        enqueue_popup_notification(format!("Failed to send the {event_type} event: {e}"), PopupKind::Error, Some(5.0));
+                    }
                 });
             }
 
@@ -4819,6 +4844,7 @@ async fn add_new_room(
 
     let timeline = Arc::new(
         new_room.room.timeline_builder()
+            .event_filter(timeline_event_filter)
             .with_focus(TimelineFocus::Live {
                 // we show threads as separate timelines in their own RoomScreen
                 hide_threaded_events: true,
@@ -5832,6 +5858,7 @@ async fn pinned_messages_subscriber_handler(
 ) {
     let room_id = room.room_id().to_owned();
     let timeline = match room.timeline_builder()
+        .event_filter(timeline_event_filter)
         .with_focus(TimelineFocus::PinnedEvents)
         .track_read_marker_and_receipts(TimelineReadReceiptTracking::Disabled)
         .build()
@@ -7023,4 +7050,23 @@ pub async fn clear_app_state(config: &LogoutConfig) -> Result<()> {
         }
         Err(_) => Err(anyhow!("Timed out waiting for UI-side app state cleanup")),
     }
+}
+
+/// The SDK's default filter, which drops custom types, plus A2UI messages.
+fn timeline_event_filter(event: &AnySyncTimelineEvent, rules: &ruma::room_version_rules::RoomVersionRules) -> bool {
+    let event_type = event.event_type().to_string();
+    // The default filter keeps redacted events, which would show as "message deleted".
+    if event.is_redacted()
+        && (event_type == crate::utils::A2UI_UPDATE_EVENT_TYPE || event_type == crate::utils::A2UI_ACTION_EVENT_TYPE)
+    {
+        return false;
+    }
+    matrix_sdk_ui::timeline::default_event_filter(event, rules) || is_a2ui_message(event)
+}
+
+fn is_a2ui_message(event: &AnySyncTimelineEvent) -> bool {
+    let AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(message)) = event else { return false };
+    message.as_original().is_some_and(|original| original.content.msgtype.msgtype() == crate::utils::A2UI_MSGTYPE
+        // Edits update their original's item instead of getting their own.
+        && !matches!(original.content.relates_to, Some(ruma::events::room::message::Relation::Replacement(_))))
 }

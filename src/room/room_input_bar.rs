@@ -588,6 +588,18 @@ impl RoomInputBar {
             }
             #[cfg(not(all(feature = "a2app", unix)))]
             SlashCommandAction::AiRoomSettings(_) => {}
+            SlashCommandAction::SendRawEvent { event_type, mut content } => {
+                // While replying, the event references the replied-to message,
+                // e.g. an `io.element.a2ui.update` for an A2UI surface.
+                if let Some(event_id) = self.replying_to.as_ref().and_then(|(item, _)| item.event_id())
+                    && let Some(fields) = content.as_object_mut()
+                    && !fields.contains_key("m.relates_to")
+                {
+                    fields.insert("m.relates_to".into(), serde_json::json!({"rel_type": "m.reference", "event_id": event_id.as_str()}));
+                }
+                submit_async_request(MatrixRequest::SendRawEvent { room_id: room_id.clone(), event_type, content });
+                self.clear_replying_to(cx);
+            }
         }
     }
 
