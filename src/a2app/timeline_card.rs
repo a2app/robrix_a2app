@@ -8,6 +8,7 @@ use a2app_core::{bundle, manifest::{MiniAppManifest, RunsIn}};
 use crate::a2app::runtime::{imported_room_app, is_room_import_pending, A2AppOp};
 use crate::shared::attachment_download::media_source_mxc;
 use crate::media_cache::{MediaCache, MediaCacheEntry};
+use crate::settings::app_preferences::AppPreferencesGlobal;
 use crate::shared::popup_list::{enqueue_popup_notification, PopupKind};
 
 /// The custom Matrix event type carrying a shared mini-app bundle.
@@ -183,6 +184,8 @@ impl A2uiMessageActionRef {
     /// images from `media_cache` as they arrive.
     pub fn populate(&self, cx: &mut Cx, context: Option<A2uiMessageContext>, media_cache: Option<&mut MediaCache>) {
         let Some(mut inner) = self.borrow_mut() else { return };
+        // With interactive messages turned off in App Settings, only the message body shows.
+        let context = context.filter(|_| cx.global::<AppPreferencesGlobal>().0.are_interactive_messages_enabled);
         let shown = context.as_ref().map(|context| (context.event_id.clone(), context.a2ui.clone()));
         if shown != inner.shown {
             let account = crate::sliding_sync::current_user_id().map(|id| id.to_string()).unwrap_or_default();
@@ -633,5 +636,27 @@ mod tests {
         widget.as_a2ui_message_action().populate(&mut cx, None, None);
         assert!(!widget.visible() && !has_text(&widget.widget(&cx, ids!(a2ui_splash)), "Contact us"),
             "a recycled ordinary message drops the previous surface");
+
+        let message = || A2uiMessageContext {
+            a2ui: payload.into(),
+            room_id: "!room:example.org".try_into().unwrap(),
+            event_id: Some("$a2ui:example.org".try_into().unwrap()),
+        };
+        // Signed in, a shown surface is registered as an A2UI app instance.
+        let previous_account = crate::a2app::information_flow::TEST_ACCOUNT
+            .with(|account| account.replace(Some("@timeline-card-test:example.org".into())));
+        widget.as_a2ui_message_action().populate(&mut cx, Some(message()), None);
+        let shown_heap = widget.borrow::<A2uiMessageAction>().unwrap().heap.expect("a shown surface is an instance");
+        assert!(crate::a2app::instances::key_of_heap(shown_heap).is_some());
+        cx.global::<AppPreferencesGlobal>().0.are_interactive_messages_enabled = false;
+        widget.as_a2ui_message_action().populate(&mut cx, Some(message()), None);
+        assert!(!widget.visible() && !has_text(&widget.widget(&cx, ids!(a2ui_splash)), "Contact us"),
+            "turning interactive messages off drops a drawn surface");
+        assert!(crate::a2app::instances::key_of_heap(shown_heap).is_none(), "and its isolate is no longer an instance");
+        cx.global::<AppPreferencesGlobal>().0.are_interactive_messages_enabled = true;
+        widget.as_a2ui_message_action().populate(&mut cx, Some(message()), None);
+        assert!(widget.visible() && has_text(&widget.widget(&cx, ids!(a2ui_splash)), "Contact us"),
+            "turning them back on draws the surface again");
+        crate::a2app::information_flow::TEST_ACCOUNT.with(|account| account.replace(previous_account));
     }
 }

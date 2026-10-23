@@ -1758,6 +1758,15 @@ impl Widget for RoomScreen {
                 tl_state.content_drawn_since_last_update.clear();
                 tl_state.profile_drawn_since_last_update.clear();
             }
+            // Likewise after interactive messages were turned on or off, which cached AI reply cards don't re-check.
+            #[cfg(feature = "a2app")]
+            {
+                let is_interactive = cx.global::<AppPreferencesGlobal>().0.are_interactive_messages_enabled;
+                if tl_state.was_drawn_interactive != is_interactive {
+                    tl_state.was_drawn_interactive = is_interactive;
+                    tl_state.content_drawn_since_last_update.clear();
+                }
+            }
 
             // Set the portal list's range based on the number of timeline items.
             let tl_items = &tl_state.items;
@@ -3655,6 +3664,8 @@ impl RoomScreen {
                     content_drawn_since_last_update: RangeSet::new(),
                     profile_drawn_since_last_update: RangeSet::new(),
                     drawn_reload_generation: cx.reload_generation,
+                    #[cfg(feature = "a2app")]
+                    was_drawn_interactive: cx.global::<AppPreferencesGlobal>().0.are_interactive_messages_enabled,
                     update_receiver,
                     request_sender,
                     media_cache: MediaCache::new(Some(update_sender.clone())),
@@ -4820,6 +4831,10 @@ struct TimelineUiState {
 
     /// The `cx.reload_generation` that the above drawn-item caches were filled in.
     drawn_reload_generation: u64,
+
+    /// Whether interactive (A2UI) messages were enabled when the above caches were filled.
+    #[cfg(feature = "a2app")]
+    was_drawn_interactive: bool,
 
     /// The channel receiver for timeline updates for this room.
     ///

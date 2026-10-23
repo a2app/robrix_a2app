@@ -270,7 +270,7 @@ Robrix translates into Splash and draws inside the message
 
 - **Messages**: an `m.room.message` with msgtype `io.element.a2ui` carries A2UI
   v0.9 messages in `messages`. Its `body` is a fallback, shown only when the
-  surface can't be drawn. Later `io.element.a2ui.update` events from the same
+  surface isn't drawn. Later `io.element.a2ui.update` events from the same
   sender, related by `m.reference`, are applied in order and never shown. A2UI
   blocks in text messages (fenced, or in `<a2ui-json>` tags) and AI replies are
   drawn too; v0.8 and v1.0 payloads translate as well.
@@ -281,6 +281,8 @@ Robrix translates into Splash and draws inside the message
   room. Answering needs its "Answer an interactive message" ability
   (`matrix-room-send`) and opening links needs Open Links, both prompted,
   revocable, and subject to room rules, the write switch and flow review.
+- **Turning it off**: with "Show interactive messages" off (App Settings, under
+  Mini Apps), no surface is drawn or run, and these messages show only their text.
 - **Catalog**: Text (with `formatString` and its functions), Image (`mxc` drawn
   inline; web images open in the browser), Icon (emoji, or a `svgPath`), Row,
   Column, List, Card, Tabs, Modal (inline), Divider, Button, TextField, CheckBox,

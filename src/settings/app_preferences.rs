@@ -38,6 +38,10 @@ pub struct AppPreferences {
     /// Only relevant when the `a2app` feature is enabled.
     #[serde(default = "default_true", deserialize_with = "deserialize_or_true")]
     pub show_mini_apps_button: bool,
+    /// Whether to draw interactive (A2UI) messages, or only show their plain-text body.
+    /// Only relevant when the `a2app` feature is enabled.
+    #[serde(default = "default_true", deserialize_with = "deserialize_or_true")]
+    pub are_interactive_messages_enabled: bool,
     /// Whether to show a notice in a room when other users are typing.
     #[serde(default = "default_true", deserialize_with = "deserialize_or_true")]
     pub show_typing_notices: bool,
@@ -60,6 +64,7 @@ impl Default for AppPreferences {
             mark_as_read_behavior: MarkAsReadBehavior::default(),
             show_read_receipts: true,
             show_mini_apps_button: true,
+            are_interactive_messages_enabled: true,
             show_typing_notices: true,
             send_typing_notices: true,
         }
@@ -173,6 +178,13 @@ impl AppPreferences {
         cx.action(AppPreferencesAction::ShowMiniAppsButtonChanged(self.show_mini_apps_button));
     }
 
+    /// Applies the current `are_interactive_messages_enabled` value.
+    pub fn on_interactive_messages_changed(&self, cx: &mut Cx) {
+        cx.global::<AppPreferencesGlobal>().0.are_interactive_messages_enabled = self.are_interactive_messages_enabled;
+        // Timelines check this pref at draw time, so redraw everything.
+        cx.redraw_all();
+    }
+
     /// Applies the current `show_typing_notices` value.
     pub fn on_show_typing_notices_changed(&self, cx: &mut Cx) {
         cx.global::<AppPreferencesGlobal>().0.show_typing_notices = self.show_typing_notices;
@@ -201,6 +213,7 @@ impl AppPreferences {
         self.on_mark_as_read_behavior_changed(cx);
         self.on_show_read_receipts_changed(cx);
         self.on_show_mini_apps_button_changed(cx);
+        self.on_interactive_messages_changed(cx);
         self.on_show_typing_notices_changed(cx);
         self.on_send_typing_notices_changed(cx);
     }

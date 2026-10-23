@@ -348,6 +348,14 @@ script_mod! {
                 mod.widgets.SettingsSectionDescription {
                     body: "The Mini Apps view lets you create, run, and manage sandboxed Splash mini-apps. Hiding the button does not stop any running mini-apps."
                 }
+
+                interactive_messages_toggle := mod.widgets.RobrixSettingsToggle {
+                    active: true,
+                    text: "Show interactive messages"
+                }
+                mod.widgets.SettingsSectionDescription {
+                    body: "Agents can send interactive (A2UI) messages, such as forms and cards, which are drawn right in the timeline. When off, these messages show only their plain-text version."
+                }
             }
         }
     }
@@ -626,6 +634,19 @@ impl AppSettings {
             }
         }
 
+        if is_shown
+            && let Some(is_enabled) = self.view.check_box(cx, ids!(interactive_messages_toggle)).changed(actions)
+            && is_enabled != app_state.app_prefs.are_interactive_messages_enabled
+        {
+            app_state.app_prefs.are_interactive_messages_enabled = is_enabled;
+            app_state.app_prefs.on_interactive_messages_changed(cx);
+            enqueue_popup_notification(
+                "Updated interactive message setting.",
+                PopupKind::Success,
+                Some(3.0),
+            );
+        }
+
         // Only process the custom thumbnail input when the user presses Enter
         // or moves key focus away from the input, not on every keypress.
         if custom_input.returned(actions).is_some() || custom_input.key_focus_lost(actions) {
@@ -685,6 +706,8 @@ impl AppSettings {
 
         self.view.check_box(cx, ids!(show_mini_apps_button_toggle))
             .set_active(cx, prefs.show_mini_apps_button, Animate::No);
+        self.view.check_box(cx, ids!(interactive_messages_toggle))
+            .set_active(cx, prefs.are_interactive_messages_enabled, Animate::No);
 
         let (small, medium, large, custom, custom_text) = match prefs.thumbnail_max_height {
             ThumbnailMaxHeight::Small => (true, false, false, false, String::new()),
