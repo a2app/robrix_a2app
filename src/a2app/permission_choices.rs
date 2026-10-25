@@ -65,15 +65,21 @@ pub struct PermissionChoices {
     #[live] horizontal: bool,
     #[live] tabs: bool,
     #[rust] disabled: bool,
+    /// Rows built during a script apply show their state at the next draw.
+    #[rust] is_state_pending: bool,
 }
 
 impl ScriptHook for PermissionChoices {
     fn on_after_apply(&mut self, vm: &mut ScriptVm, _apply: &Apply, _scope: &mut Scope, _value: ScriptValue) {
         self.rebuild(vm);
+        self.is_state_pending = true;
     }
 }
 
 impl PermissionChoices {
+    /// Creates the rows. Their state is shown by `show_state` once the script
+    /// VM is free: an animator change made while it is held is replayed a
+    /// frame later and would override a choice made in between.
     fn rebuild(&mut self, vm: &mut ScriptVm) {
         self.view.children.clear();
         self.view.layout.flow = if self.horizontal || self.tabs { Flow::right_wrap() } else { Flow::Down };
@@ -87,20 +93,24 @@ impl PermissionChoices {
             };
             let row = WidgetRef::script_from_value(vm, value);
             row.set_text(vm.cx_mut(), label);
-            row.as_radio_button().set_active(vm.cx_mut(), index == self.selected_item, Animate::No);
-            row.set_disabled(vm.cx_mut(), self.disabled);
             self.view.children.push((LiveId(index as u64 + 1), row));
         }
     }
 
-    fn select(&mut self, cx: &mut Cx, index: usize) {
-        // Keep an invalid index invalid. Silently selecting the first item could broaden access.
-        if self.selected_item == index { return }
-        self.selected_item = index;
-        for (row_index, (_, row)) in self.view.children.iter().enumerate() {
-            row.as_radio_button().set_active(cx, row_index == index, Animate::No);
+    fn show_state(&mut self, cx: &mut Cx) {
+        self.is_state_pending = false;
+        for (index, (_, row)) in self.view.children.iter().enumerate() {
+            row.as_radio_button().set_active(cx, index == self.selected_item, Animate::No);
+            row.set_disabled(cx, self.disabled);
         }
         self.view.redraw(cx);
+    }
+
+    fn select(&mut self, cx: &mut Cx, index: usize) {
+        // Keep an invalid index invalid. Silently selecting the first item could broaden access.
+        if self.selected_item == index && !self.is_state_pending { return }
+        self.selected_item = index;
+        self.show_state(cx);
     }
 }
 
@@ -126,6 +136,7 @@ impl Widget for PermissionChoices {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        if self.is_state_pending { self.show_state(cx); }
         self.view.draw_walk(cx, scope, walk)
     }
 }
@@ -144,7 +155,7 @@ impl PermissionChoicesRef {
             if inner.labels == labels { return }
             inner.labels = labels;
             cx.with_vm(|vm| inner.rebuild(vm));
-            inner.view.redraw(cx);
+            inner.show_state(cx);
         }
     }
 
@@ -161,6 +172,27 @@ impl PermissionChoicesRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clearing_a_choice_right_after_new_labels_leaves_no_row_selected() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let choices = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            super::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.PermissionChoices {} });
+            WidgetRef::script_from_value(vm, value).as_permission_choices()
+        });
+        // The editors fill a list (built with the old selection), then clear it.
+        choices.set_selected_item(&mut cx, 0);
+        choices.set_labels(&mut cx, vec!["Network".into(), "Read room content".into()]);
+        choices.set_selected_item(&mut cx, usize::MAX);
+        let rows: Vec<bool> = choices.borrow().unwrap().view.children.iter().map(|(_, row)| row.as_radio_button().active(&cx)).collect();
+        assert_eq!(rows, [false, false], "no option may look chosen before the user picks one");
+        choices.set_selected_item(&mut cx, 1);
+        let rows: Vec<bool> = choices.borrow().unwrap().view.children.iter().map(|(_, row)| row.as_radio_button().active(&cx)).collect();
+        assert_eq!(rows, [false, true]);
+    }
 
     #[test]
     fn navigation_tabs_keep_choice_actions_scoped_and_select_one_page() {

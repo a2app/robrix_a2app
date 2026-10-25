@@ -3,13 +3,17 @@
 //! Changes go through the runtime so revocation also cancels active agents.
 
 use makepad_widgets::*;
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use a2app_core::information_flow::{
     self as flow, ActionAuthority, ActionDecision, AuthoritySession, ContextId, ContextSnapshot,
     EffectAuthority, FlowDecision, Influence, ReaderScope, Recipient, SharingDuration, SharingGrant, Source,
 };
 use a2app_agent::model_transport::ModelRecipient;
+use crate::app::ConfirmDeleteAction;
 use crate::home::rooms_list::RoomsListRef;
 use crate::shared::collapsible_header::CollapsibleHeaderWidgetExt;
+use crate::shared::confirmation_modal::ConfirmationModalContent;
 use crate::shared::popup_list::{enqueue_popup_notification, PopupKind};
 use super::runtime::{with_a2app, A2AppOp};
 use super::permission_choices::PermissionChoicesWidgetExt;
@@ -60,6 +64,11 @@ script_mod! {
                 saved_identifiers := PermissionOptionLabel { visible: false }
                 remove_button := RobrixNegativeIconButton { text: "Remove this permission", padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0} }
                 PermissionOptionLabel { text: "Removing this approval stops affected work. Reopen the app or repeat your agent request to continue. Other approvals may still apply; Block this permission in the app's Permissions panel turns the feature off. Your saved data is kept; data already sent cannot be recalled." }
+                rule_restore_section := View {
+                    visible: false, width: Fill, height: Fit, flow: Down, spacing: 8
+                    PermissionOptionLabel { text: "An AI room needs its default rules to read its room and reply. Restoring them keeps your other choices." }
+                    rule_restore := TextButton { text: "Restore this AI room's defaults" }
+                }
             }
             wizard := View {
                 visible: false, width: Fill, height: Fit, flow: Down, spacing: 12
@@ -87,7 +96,7 @@ script_mod! {
                 }
                 destination_step := View {
                     visible: false, width: Fill, height: Fit, flow: Down, spacing: 10
-                    recipient_kind := PermissionChoices { labels: ["My configured AI service", "A website", "Another room", "The system clipboard"] }
+                    recipient_kind := PermissionChoices { labels: ["My configured AI service", "A website", "Another room", "The system clipboard", "My Matrix homeserver"] }
                     model_section := View {
                         width: Fill, height: Fit, flow: Down, spacing: 8
                         model_description := PermissionOptionLabel {}
@@ -107,6 +116,11 @@ script_mod! {
                     clipboard_section := View {
                         visible: false, width: Fill, height: Fit, flow: Down
                         PermissionOptionLabel { text: "Other apps on this device may read data copied to the system clipboard." }
+                    }
+                    homeserver_section := View {
+                        visible: false, width: Fill, height: Fit, flow: Down, spacing: 8
+                        homeserver_description := PermissionOptionLabel {}
+                        PermissionOptionLabel { text: "AI room replies and activity cards are stored there unencrypted." }
                     }
                 }
                 review_step := View {
@@ -161,6 +175,18 @@ script_mod! {
                             review_button := TextButton { text: "Review sharing rule" }
                             review_problem := PermissionOptionLabel { visible: false }
                         }
+                        allow_all_section := View {
+                            visible: false, width: Fill, height: Fit, flow: Down, spacing: 8
+                            PermissionOptionLabel { text: "Or allow all listed data for this destination. How long should these rules last?" }
+                            allow_all_lifetime := PermissionChoices { labels: ["Until Robrix closes", "Until its room closes", "Until I remove these rules"] }
+                            allow_all_preview := PermissionOptionLabel {}
+                            allow_all_button := RobrixPositiveIconButton { text: "Allow all listed data", padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0} }
+                        }
+                        decision_restore_section := View {
+                            visible: false, width: Fill, height: Fit, flow: Down, spacing: 8
+                            decision_restore_text := PermissionOptionLabel {}
+                            decision_restore := TextButton { text: "Restore this AI room's defaults" }
+                        }
                     }
                     action_review := View {
                         visible: false, width: Fill, height: Fit, flow: Down, spacing: 12
@@ -195,6 +221,7 @@ script_mod! {
                     visible: false, width: Fill, height: Fit, flow: Down, spacing: 12
                     history_back := TextButton { text: "Back to history" }
                     activity_details := PermissionOptionLabel {}
+                    history_review := TextButton { visible: false, text: "Review in Needs attention" }
                     PermissionOptionLabel { text: "An allowed check does not prove data was sent. Failed or interrupted requests may already have sent data. Older records eventually expire." }
                 }
                 activity_warning := PermissionOptionLabel { visible: false, draw_text +: { color: (COLOR_FG_DANGER_RED) } }
@@ -256,7 +283,7 @@ pub struct DataSharing {
     #[rust] decision_identifiers_open: bool,
     #[rust] history_filters_open: bool,
     #[rust] saved_selection: SharingCardTarget,
-    #[rust] decision_selection: usize,
+    #[rust] decision_selection: Option<DecisionKey>,
     #[rust] action_selection: usize,
     #[rust] activity_selection: Option<u64>,
     #[rust] attention_expanded: bool,
@@ -265,10 +292,18 @@ pub struct DataSharing {
     #[rust] sources: Vec<(Source, String)>,
     #[rust] rooms: Vec<(String, String)>,
     #[rust] model: Option<ModelRecipient>,
+    #[rust] model_error: String,
+    #[rust] homeserver: Option<Recipient>,
+    /// Sharing rules held by an agent's current turn; they end when it replies.
+    #[rust] turn_rules: BTreeSet<u64>,
     #[rust] apps: Vec<(String, String)>,
     #[rust] snapshots: Vec<ContextSnapshot>,
     #[rust] grants: Vec<SharingGrant>,
     #[rust] decisions: Vec<FlowDecision>,
+    /// Blocked requests reopened from History, listed until they are resolved.
+    #[rust] recalled_decisions: Vec<FlowDecision>,
+    /// Open requests that stopped blocking only because their context no longer holds the data.
+    #[rust] no_longer_held: BTreeSet<DecisionKey>,
     #[rust] blocked_sources: Vec<Source>,
     #[rust] action_decisions: Vec<ActionDecision>,
     #[rust] authorities: Vec<ActionAuthority>,
@@ -284,14 +319,14 @@ impl Widget for DataSharing {
         let Event::Actions(actions) = event else { return };
         let page = self.view.permission_choices(cx, ids!(page_choice)).selected_item();
         if !self.wizard_open && self.view.permission_choices(cx, ids!(page_choice)).changed(actions).is_some() {
-            self.decision_selection = 0;
+            self.decision_selection = None;
             self.action_selection = 0;
             self.activity_selection = None;
             self.saved_selection = SharingCardTarget::None;
             self.update_page(cx);
             return;
         }
-        if page == 1 && !self.wizard_open && self.decision_selection == 0 && self.action_selection == 0
+        if page == 1 && !self.wizard_open && self.decision_selection.is_none() && self.action_selection == 0
             && self.view.widget(cx, ids!(attention_more)).visible()
             && let Some(expanded) = self.view.collapsible_header(cx, ids!(attention_more)).expansion_changed(actions)
         {
@@ -317,7 +352,7 @@ impl Widget for DataSharing {
                 && self.card_is_visible(&action.target)
                 && match &action.target {
                     SharingCardTarget::Rule(_) | SharingCardTarget::Authority(_) | SharingCardTarget::EffectAuthority(_) => page == 0 && matches!(self.saved_selection, SharingCardTarget::None),
-                    SharingCardTarget::Decision(_) | SharingCardTarget::Action(_) => page == 1 && self.decision_selection == 0 && self.action_selection == 0,
+                    SharingCardTarget::Decision(_) | SharingCardTarget::Action(_) => page == 1 && self.decision_selection.is_none() && self.action_selection == 0,
                     SharingCardTarget::Activity(_) => page == 2 && self.activity_selection.is_none(),
                     SharingCardTarget::None => false,
                 }
@@ -347,6 +382,8 @@ impl Widget for DataSharing {
             && self.view.button(cx, ids!(wizard_next)).clicked(actions) && self.wizard_step_valid(cx).is_ok()
         {
             self.wizard_step = (self.wizard_step + 1).min(2);
+            // The AI service can change while the pane is open.
+            if self.wizard_step == 1 { self.refresh_model(cx); }
             self.update_page(cx);
             return;
         }
@@ -378,12 +415,12 @@ impl Widget for DataSharing {
             return;
         }
         if page == 1 && !self.wizard_open && self.view.button(cx, ids!(attention_back)).clicked(actions) {
-            self.decision_selection = 0;
+            self.decision_selection = None;
             self.action_selection = 0;
             self.update_page(cx);
             return;
         }
-        if page == 1 && !self.wizard_open && self.decision_selection != 0
+        if page == 1 && !self.wizard_open && self.decision_selection.is_some()
             && self.view.widget(cx, ids!(decision_identifiers_toggle)).visible()
             && let Some(expanded) = self.view.collapsible_header(cx, ids!(decision_identifiers_toggle)).expansion_changed(actions)
         {
@@ -394,6 +431,12 @@ impl Widget for DataSharing {
         if page == 2 && !self.wizard_open && self.view.button(cx, ids!(history_back)).clicked(actions) {
             self.activity_selection = None;
             self.update_page(cx);
+            return;
+        }
+        if page == 2 && !self.wizard_open && self.view.button(cx, ids!(history_review)).clicked(actions)
+            && let Some(request) = self.selected_history_request()
+        {
+            self.review_history_request(cx, request);
             return;
         }
         if page == 2 && !self.wizard_open && self.activity_selection.is_none()
@@ -411,6 +454,9 @@ impl Widget for DataSharing {
             self.view.collapsible_header(cx, ids!(history_more)).set_expanded(cx, false, Animate::No);
             self.view.widget(cx, ids!(history_more_section)).set_visible(cx, false);
         }
+        if self.wizard_open && self.view.permission_choices(cx, ids!(recipient_kind)).changed(actions) == Some(0) {
+            self.refresh_model(cx);
+        }
         if self.view.drop_down2(cx, ids!(source_choice)).changed(actions).is_some()
             || self.view.drop_down2(cx, ids!(context_choice)).changed(actions).is_some()
             || self.view.drop_down2(cx, ids!(reader_app)).changed(actions).is_some()
@@ -422,19 +468,58 @@ impl Widget for DataSharing {
             || self.view.permission_choices(cx, ids!(sharing_lifetime)).changed(actions).is_some()
             || self.view.permission_choices(cx, ids!(action_session)).changed(actions).is_some()
             || self.view.permission_choices(cx, ids!(blocked_source_choice)).changed(actions).is_some()
+            || self.view.permission_choices(cx, ids!(allow_all_lifetime)).changed(actions).is_some()
         {
             self.update_diagnostic_details(cx);
             self.update_recipient_form(cx);
         }
-        if page == 1 && !self.wizard_open && self.decision_selection != 0 && self.view.button(cx, ids!(review_button)).clicked(actions) {
+        if page == 1 && !self.wizard_open && self.decision_selection.is_some() && self.view.button(cx, ids!(review_button)).clicked(actions) {
             if let Err(error) = self.review_decision(cx) { self.show_error(error); }
             return;
+        }
+        if page == 1 && !self.wizard_open && self.decision_selection.is_some() && self.view.button(cx, ids!(allow_all_button)).clicked(actions) {
+            self.refresh_model(cx);
+            match self.allow_all_grants(cx) {
+                Ok(grants) => for grant in grants { cx.action(grant); },
+                Err(error) => self.show_error(error),
+            }
+            self.view.redraw(cx);
+            return;
+        }
+        #[cfg(unix)]
+        {
+            let room = match page {
+                0 if self.view.button(cx, ids!(rule_restore)).clicked(actions) => self.saved_rule_agent_room(),
+                1 if self.view.button(cx, ids!(decision_restore)).clicked(actions) => self.selected_decision(cx).and_then(|decision| self.decision_agent_room(decision)),
+                _ => None,
+            };
+            if !self.wizard_open && let Some(room) = room.and_then(|room| matrix_sdk::ruma::OwnedRoomId::try_from(room).ok()) {
+                cx.action(A2AppOp::RestoreAgentDefaults(room));
+                return;
+            }
         }
         if self.view.button(cx, ids!(add_button)).clicked(actions) && self.wizard_open && self.wizard_step == 2 {
             let result = self.sharing_action(cx);
             self.submit(cx, result);
         }
         if page == 0 && !self.wizard_open && self.view.button(cx, ids!(remove_button)).clicked(actions) {
+            if let SharingCardTarget::Rule(id) = self.saved_selection
+                && let Some((title, body)) = self.grants.iter().find(|grant| grant.id == id).and_then(|grant| self.removal_warning(grant))
+            {
+                let account = self.account.clone();
+                cx.action(ConfirmDeleteAction::Show(RefCell::new(Some(ConfirmationModalContent {
+                    title_text: title.into(),
+                    body_text: body.into(),
+                    accept_button_text: Some("Remove rule".into()),
+                    on_accept_clicked: Some(Box::new(move |cx| {
+                        if super::information_flow::account().is_ok_and(|current| current == account) {
+                            cx.action(A2AppOp::RevokeFlowSharing(id));
+                        }
+                    })),
+                    ..Default::default()
+                }))));
+                return;
+            }
             let result = match self.saved_selection {
                 SharingCardTarget::Rule(id) if self.grants.iter().any(|grant| grant.id == id) => Ok(A2AppOp::RevokeFlowSharing(id)),
                 SharingCardTarget::Authority(id) if self.authorities.iter().any(|grant| grant.id == id) => Ok(A2AppOp::RevokeFlowAuthority(id)),
@@ -479,7 +564,7 @@ impl DataSharing {
     fn card_is_visible(&self, target: &SharingCardTarget) -> bool {
         match target {
             SharingCardTarget::Decision(decision) => self.decisions.iter().filter(|current| !current.allowed)
-                .position(|current| current == decision).is_some_and(|index| index < 20 || self.attention_expanded),
+                .position(|current| is_decision_for(current, &decision_key(decision))).is_some_and(|index| index < 20 || self.attention_expanded),
             SharingCardTarget::Action(decision) => self.action_decisions.iter().position(|current| current == decision)
                 .is_some_and(|index| self.attention_expanded
                     || self.decisions.iter().filter(|current| !current.allowed).count() + index < 20),
@@ -517,8 +602,8 @@ impl DataSharing {
         } else {
             match self.view.permission_choices(cx, ids!(page_choice)).selected_item() {
                 0 if !matches!(self.saved_selection, SharingCardTarget::None) => self.saved_selection = SharingCardTarget::None,
-                1 if self.decision_selection != 0 || self.action_selection != 0 => {
-                    self.decision_selection = 0;
+                1 if self.decision_selection.is_some() || self.action_selection != 0 => {
+                    self.decision_selection = None;
                     self.action_selection = 0;
                 }
                 2 if self.activity_selection.is_some() => self.activity_selection = None,
@@ -545,10 +630,10 @@ impl DataSharing {
         self.view.widget(cx, ids!(wizard)).set_visible(cx, self.wizard_open);
         self.view.widget(cx, ids!(review_page)).set_visible(cx, page == 1 && !self.wizard_open);
         self.view.widget(cx, ids!(activity_page)).set_visible(cx, page == 2 && !self.wizard_open);
-        let reviewing = self.decision_selection != 0 || self.action_selection != 0;
+        let reviewing = self.decision_selection.is_some() || self.action_selection != 0;
         self.view.widget(cx, ids!(attention_overview)).set_visible(cx, !reviewing);
         self.view.widget(cx, ids!(attention_details)).set_visible(cx, reviewing);
-        self.view.widget(cx, ids!(sharing_details)).set_visible(cx, self.decision_selection != 0);
+        self.view.widget(cx, ids!(sharing_details)).set_visible(cx, self.decision_selection.is_some());
         self.view.widget(cx, ids!(action_review)).set_visible(cx, self.action_selection != 0);
         self.view.widget(cx, ids!(history_overview)).set_visible(cx, self.activity_selection.is_none());
         self.view.widget(cx, ids!(history_details)).set_visible(cx, self.activity_selection.is_some());
@@ -585,7 +670,7 @@ impl DataSharing {
         if context.account() != self.account { return false; }
         self.wizard_open = false;
         self.saved_selection = SharingCardTarget::None;
-        self.decision_selection = 0;
+        self.decision_selection = None;
         self.action_selection = 0;
         self.view.permission_choices(cx, ids!(page_choice)).set_selected_item(cx, 1);
         let target = self.action_decisions.iter().find(|decision| &decision.context == context)
@@ -619,14 +704,17 @@ impl DataSharing {
             SharingCardTarget::Authority(id) if self.authorities.iter().any(|grant| grant.id == *id) => self.saved_selection = target.clone(),
             SharingCardTarget::EffectAuthority(id) if self.effect_authorities.iter().any(|grant| grant.id == *id) => self.saved_selection = target.clone(),
             SharingCardTarget::Decision(decision) => {
-                let Some(index) = self.decisions.iter().position(|current| current == decision) else { return };
-                self.decision_selection = index + 1;
+                let key = decision_key(decision);
+                if !self.decisions.iter().any(|current| is_decision_for(current, &key)) { return; }
+                self.decision_selection = Some(key);
                 self.action_selection = 0;
+                self.view.permission_choices(cx, ids!(allow_all_lifetime)).set_selected_item(cx, 0);
+                self.refresh_model(cx);
             }
             SharingCardTarget::Action(decision) => {
                 let Some(index) = self.action_decisions.iter().position(|current| current == decision) else { return };
                 self.action_selection = index + 1;
-                self.decision_selection = 0;
+                self.decision_selection = None;
                 self.view.permission_choices(cx, ids!(action_session)).set_selected_item(cx, 0);
             }
             SharingCardTarget::Activity(id) if self.activities.iter().any(|entry| entry.id == *id) => self.activity_selection = Some(*id),
@@ -641,9 +729,13 @@ impl DataSharing {
 
     fn update_saved_details(&mut self, cx: &mut Cx) {
         let details = match self.saved_selection {
-            SharingCardTarget::Rule(id) => self.grants.iter().find(|grant| grant.id == id).map(|grant| (
-                self.sharing_rule_summary(&grant.source, &grant.reader, &grant.recipient, &grant.duration),
-                format!("Data: {}\n\nWho can share it: {}\n\nDestination: {}\n\nFor how long: {}", self.source_label(&grant.source), self.reader_label(&grant.reader), self.recipient_label(&grant.recipient), self.duration_label(&grant.duration)))),
+            SharingCardTarget::Rule(id) => self.grants.iter().find(|grant| grant.id == id).map(|grant| {
+                let is_turn_rule = self.turn_rules.contains(&grant.id);
+                let duration = if is_turn_rule { "This turn only. It ends when the agent replies.".into() } else { self.short_duration_label(&grant.duration) };
+                (self.sharing_rule_summary(&grant.source, &grant.reader, &grant.recipient, &duration),
+                format!("Data: {}\n\nWho can share it: {}\n\nDestination: {}\n\nFor how long: {}{}", self.source_label(&grant.source), self.reader_label(&grant.reader), self.recipient_label(&grant.recipient),
+                    if is_turn_rule { "This turn only · " } else { "" }, self.duration_label(&grant.duration)))
+            }),
             SharingCardTarget::Authority(id) => self.authorities.iter().find(|grant| grant.id == id).map(|grant| (
                 format!("{}\n{}\n{}\n\nAccount: {}", self.context_choice_label(&grant.context), self.action_choice_label(&grant.action), match &grant.session {
                     AuthoritySession::RoomSession { room, .. } => format!("Until {} closes", self.room_name(room)),
@@ -679,18 +771,65 @@ impl DataSharing {
         self.view.widget(cx, ids!(saved_identifiers_toggle)).set_visible(cx, details.is_some());
         self.view.widget(cx, ids!(saved_identifiers)).set_visible(cx, details.is_some() && self.saved_identifiers_open);
         self.view.button(cx, ids!(remove_button)).set_enabled(cx, details.is_some());
+        self.view.widget(cx, ids!(rule_restore_section)).set_visible(cx, cfg!(unix) && self.saved_rule_agent_room().is_some());
     }
 
-    fn sharing_rule_summary(&self, source: &Source, reader: &ReaderScope, recipient: &Recipient, duration: &SharingDuration) -> String {
+    fn sharing_rule_summary(&self, source: &Source, reader: &ReaderScope, recipient: &Recipient, duration: &str) -> String {
         let destination = match recipient {
             Recipient::MatrixRoom { .. } => self.recipient_choice_label(recipient),
             _ => self.recipient_label(recipient),
         };
-        let duration = match duration {
+        format!("{} can share\n{}\n\nWith: {destination}\nFor how long: {duration}\n\nAccount: {}", self.reader_choice_label(reader), self.source_choice_label(source), self.account)
+    }
+
+    fn short_duration_label(&self, duration: &SharingDuration) -> String {
+        match duration {
             SharingDuration::RoomSession { room, .. } => format!("Until {} closes", self.room_name(room)),
             duration => self.duration_label(duration),
+        }
+    }
+
+    /// Task rules borrow a room-session duration, so name them for what they are.
+    fn grant_duration_label(&self, grant: &SharingGrant) -> String {
+        if self.turn_rules.contains(&grant.id) { "This turn only".into() } else { self.duration_label(&grant.duration) }
+    }
+
+    /// The AI room whose agent the selected rule belongs to.
+    fn saved_rule_agent_room(&self) -> Option<&str> {
+        let SharingCardTarget::Rule(id) = self.saved_selection else { return None };
+        match &self.grants.iter().find(|grant| grant.id == id)?.reader {
+            ReaderScope::Context(ContextId::Agent { account, room }) if account == &self.account => Some(room),
+            _ => None,
+        }
+    }
+
+    /// Whether `source` -> `recipient` is one of the defaults an AI room in `room` gets. An
+    /// unknown AI service can't rule out a model rule.
+    fn is_agent_default_pair(&self, room: &str, source: &Source, recipient: &Recipient) -> bool {
+        let is_default_source = match source {
+            Source::Room { account, room: source_room } => account == &self.account && source_room == room,
+            Source::RoomDirectory { account } => account == &self.account,
+            _ => false,
         };
-        format!("{} can share\n{}\n\nWith: {destination}\nFor how long: {duration}\n\nAccount: {}", self.reader_choice_label(reader), self.source_choice_label(source), self.account)
+        is_default_source && match recipient {
+            Recipient::MatrixRoom { account, room: target } => account == &self.account && target == room,
+            Recipient::NetworkOrigin(_) => self.homeserver.as_ref() == Some(recipient),
+            Recipient::ModelProvider(id) => self.model.as_ref().is_none_or(|model| &model.id == id),
+            _ => false,
+        }
+    }
+
+    /// The confirmation shown before removing a rule other contexts or an AI room depend on.
+    fn removal_warning(&self, grant: &SharingGrant) -> Option<(&'static str, String)> {
+        if grant.reader == ReaderScope::AllReaders {
+            return Some(("Remove this shared rule?", "This sharing rule is shared by all mini-apps and agents. Removing it affects all of them and stops their private-data work. Your data is kept; apps can ask again when needed.".into()));
+        }
+        match &grant.reader {
+            ReaderScope::Context(ContextId::Agent { account, room }) if account == &self.account && grant.duration == SharingDuration::Permanent
+                && !self.turn_rules.contains(&grant.id) && self.is_agent_default_pair(room, &grant.source, &grant.recipient) =>
+                Some(("Remove this AI room default?", format!("{}'s agent needs this rule to read its room and reply. Removing it blocks those replies until you restore the room's defaults.", self.room_name(room)))),
+            _ => None,
+        }
     }
 
     fn draw_cards(&mut self, cx: &mut Cx2d, list: &mut FlatList, kind: usize, additional: bool) {
@@ -699,7 +838,7 @@ impl DataSharing {
             0 => {
                 rows.extend(self.grants.iter().map(|grant| (
                     format!("{} → {}", self.source_choice_label(&grant.source), self.recipient_choice_label(&grant.recipient)),
-                    format!("{}\n{}", self.reader_choice_label(&grant.reader), self.duration_label(&grant.duration)), SharingCardTarget::Rule(grant.id), "View rule")));
+                    format!("{}\n{}", self.reader_choice_label(&grant.reader), self.grant_duration_label(grant)), SharingCardTarget::Rule(grant.id), "View rule")));
                 rows.extend(self.authorities.iter().map(|grant| (
                     self.action_choice_label(&grant.action), format!("{}\n{}", self.context_choice_label(&grant.context), self.authority_duration_label(&grant.session)),
                     SharingCardTarget::Authority(grant.id), "View approval")));
@@ -713,7 +852,7 @@ impl DataSharing {
             1 => {
                 rows.extend(self.decisions.iter().filter(|decision| !decision.allowed).map(|decision| (
                     format!("Sharing with {}", self.recipient_choice_label(&decision.recipient)),
-                    format!("{}\nBlocked at its last check. Review the destination and data before allowing sharing.", self.context_choice_label(&decision.context)),
+                    format!("{}\nStill needs a sharing rule. Review the destination and data before allowing sharing.", self.context_choice_label(&decision.context)),
                     SharingCardTarget::Decision(decision.clone()), "Review sharing")));
                 rows.extend(self.action_decisions.iter().map(|decision| (
                     self.action_choice_label(&decision.action), format!("{}\nNeeds approval before retrying.", self.context_choice_label(&decision.context)),
@@ -745,6 +884,7 @@ impl DataSharing {
         self.activity_key = None;
         self.view.permission_choices(cx, ids!(action_session)).set_selected_item(cx, 0);
         let previous_source = self.selected_source(cx).ok();
+        let previous_draft = if self.wizard_open { self.sharing_draft(cx) } else { None };
         let previous_app = self.apps.get(self.view.drop_down2(cx, ids!(reader_app)).selected_item()).map(|(id, _)| id.clone());
         let previous_target = self.rooms.get(self.view.drop_down2(cx, ids!(target_room)).selected_item()).map(|(id, _)| id.clone());
         let previous_expiry = self.rooms.get(self.view.drop_down2(cx, ids!(lifetime_room)).selected_item()).map(|(id, _)| id.clone());
@@ -762,10 +902,11 @@ impl DataSharing {
             self.attention_expanded = false;
             self.history_expanded = false;
             self.saved_selection = SharingCardTarget::None;
-            self.decision_selection = 0;
+            self.decision_selection = None;
+            self.recalled_decisions.clear();
             self.action_selection = 0;
             self.activity_selection = None;
-            for id in [ids!(reader_kind), ids!(sharing_lifetime), ids!(recipient_kind), ids!(page_choice)] {
+            for id in [ids!(reader_kind), ids!(sharing_lifetime), ids!(recipient_kind), ids!(page_choice), ids!(allow_all_lifetime)] {
                 self.view.permission_choices(cx, id).set_selected_item(cx, 0);
             }
             self.view.text_input(cx, ids!(network_url)).set_text(cx, "");
@@ -781,46 +922,57 @@ impl DataSharing {
         self.view.drop_down2(cx, ids!(lifetime_room)).set_labels(cx, self.rooms.iter().map(|(_, name)| name.clone()).collect());
         self.view.drop_down2(cx, ids!(lifetime_room)).set_selected_item(cx,
             previous_expiry.filter(|_| !account_changed).and_then(|room| self.rooms.iter().position(|(id, _)| id == &room)).unwrap_or(0));
-        self.sources.clear();
-        if !self.account.is_empty() {
-            self.sources.push((Source::Account { account: self.account.clone() }, format!("Account data · {}", self.account)));
-            self.sources.extend(self.rooms.iter().map(|(room, name)| (
-                Source::Room { account: self.account.clone(), room: room.clone() }, format!("Room · {name} ({room})"),
-            )));
-            // Previously configured sources remain revocable after leaving a room.
-            if let Ok(grants) = flow::sharing_grants() {
-                for source in grants.into_iter().map(|grant| grant.source) {
-                    if let Source::Room { account, room } = &source
-                        && account == &self.account && !self.sources.iter().any(|(candidate, _)| candidate == &source)
-                    {
-                        self.sources.push((source.clone(), format!("Earlier room · {room}")));
-                    }
-                }
-            }
-        }
+        let previous_source = previous_source.filter(|_| !account_changed);
+        let saved = flow::sharing_grants().unwrap_or_default().into_iter().map(|grant| grant.source);
+        self.sources = source_options(&self.account, &self.rooms, saved, previous_source.as_ref());
         self.view.drop_down2(cx, ids!(source_choice)).set_labels(cx, self.sources.iter().map(|(source, _)| self.source_choice_label(source)).collect());
         self.view.drop_down2(cx, ids!(source_choice)).set_selected_item(cx,
-            previous_source.filter(|_| !account_changed).and_then(|source| self.sources.iter().position(|(candidate, _)| candidate == &source)).unwrap_or(0));
+            previous_source.and_then(|source| self.sources.iter().position(|(candidate, _)| candidate == &source)).unwrap_or(0));
         self.view.drop_down2(cx, ids!(target_room)).set_labels(cx, self.rooms.iter().map(|(_, name)| name.clone()).collect());
         self.view.drop_down2(cx, ids!(target_room)).set_selected_item(cx,
             previous_target.filter(|_| !account_changed).and_then(|room| self.rooms.iter().position(|(id, _)| id == &room)).unwrap_or(0));
-        let prefs = with_a2app(|state| state.agent_prefs.clone()).unwrap_or_else(a2app_agent::prefs::load_agent_prefs);
-        match a2app_agent::model_transport::current_recipient(&prefs) {
-            Ok(model) => {
-                let location = if model.local { "Local endpoint" } else { "Online service" };
-                self.view.label(cx, ids!(model_description)).set_text(cx, &format!("{}\n{location}: {}", model.label, model.endpoint));
-                self.model = Some(model);
-            }
-            Err(error) => {
-                self.model = None;
-                self.view.label(cx, ids!(model_description)).set_text(cx, &format!("{error}\nConfigure a supported provider in Setup AI Providers."));
-            }
-        }
+        self.refresh_model(cx);
+        self.homeserver = homeserver_recipient();
+        self.view.label(cx, ids!(homeserver_description)).set_text(cx, &match &self.homeserver {
+            Some(Recipient::NetworkOrigin(origin)) => format!("Your account's homeserver: {origin}"),
+            _ => "Sign in to Matrix to see your homeserver.".into(),
+        });
         self.refresh_diagnostics(cx);
+        // A rebuilt list must never change what an open rule would allow; close it instead.
+        if previous_draft.is_some() && self.wizard_open && self.sharing_draft(cx) != previous_draft {
+            self.wizard_open = false;
+            self.view.permission_choices(cx, ids!(page_choice)).set_selected_item(cx, self.wizard_return_page);
+            enqueue_popup_notification("The sharing rule you were reviewing changed, so it was closed. Review it again before allowing sharing.", PopupKind::Warning, Some(6.0));
+        }
         self.update_recipient_form(cx);
         self.refresh_rules(cx);
         self.update_page(cx);
         self.view.redraw(cx);
+    }
+
+    /// Re-reads the configured AI service, which can change while the pane is open.
+    fn refresh_model(&mut self, cx: &mut Cx) {
+        let prefs = with_a2app(|state| state.agent_prefs.clone()).unwrap_or_else(a2app_agent::prefs::load_agent_prefs);
+        match current_model(&prefs) {
+            Ok(model) => {
+                let location = if model.local { "Local endpoint" } else { "Online service" };
+                self.view.label(cx, ids!(model_description)).set_text(cx, &format!("{}\n{location}: {}", model.label, model.endpoint));
+                self.model = Some(model);
+                self.model_error.clear();
+            }
+            Err(error) => {
+                self.view.label(cx, ids!(model_description)).set_text(cx, &format!("{error}\nConfigure a supported provider in Setup AI Providers."));
+                self.model = None;
+                self.model_error = error;
+            }
+        }
+    }
+
+    fn sharing_draft(&self, cx: &Cx) -> Option<(Source, Recipient, ReaderScope, SharingDuration)> {
+        match self.sharing_action(cx) {
+            Ok(A2AppOp::GrantFlowSharing { source, recipient, reader, duration }) => Some((source, recipient, reader, duration)),
+            _ => None,
+        }
     }
 
     fn selected_source(&self, cx: &Cx) -> Result<Source, String> {
@@ -837,6 +989,7 @@ impl DataSharing {
                 .map(|(room, _)| Recipient::MatrixRoom { account: self.account.clone(), room: room.clone() })
                 .ok_or_else(|| "Select a joined destination room.".into()),
             3 => Ok(Recipient::Clipboard),
+            4 => self.homeserver.clone().ok_or_else(|| "Sign in to Matrix to share with your homeserver.".into()),
             _ => Err("Select a recipient type.".into()),
         }
     }
@@ -847,6 +1000,7 @@ impl DataSharing {
         self.view.widget(cx, ids!(network_section)).set_visible(cx, kind == 1);
         self.view.widget(cx, ids!(room_section)).set_visible(cx, kind == 2);
         self.view.widget(cx, ids!(clipboard_section)).set_visible(cx, kind == 3);
+        self.view.widget(cx, ids!(homeserver_section)).set_visible(cx, kind == 4);
         if kind == 1 {
             let preview = match self.selected_recipient(cx) {
                 Ok(Recipient::NetworkOrigin(origin)) => format!("Recipient: {origin}"),
@@ -865,12 +1019,18 @@ impl DataSharing {
         self.view.label(cx, ids!(reader_preview)).set_text(cx, &preview);
         let (preview, identifiers, can_allow, already_saved) = match self.sharing_action(cx) {
             Ok(A2AppOp::GrantFlowSharing { source, recipient, reader, duration }) => {
-                let saved = self.grants.iter().any(|grant| grant.source == source && grant.recipient == recipient
+                let existing = self.grants.iter().find(|grant| grant.source == source && grant.recipient == recipient
                     && grant.reader == reader && grant.duration == duration);
-                (format!("{}\n{}", if saved { "This rule already allows:" } else { "You will allow:" }, self.sharing_rule_summary(&source, &reader, &recipient, &duration)),
-                format!("{}\n{}\n\nTo share:\n{}\n\nWith:\n{}\n\nFor how long: {}",
-                    if saved { "This rule already allows:" } else { "You will allow:" }, self.reader_label(&reader),
-                    self.source_label(&source), self.recipient_label(&recipient), self.duration_label(&duration)), !saved, saved)
+                // Saving a copy of a turn rule would only return that rule, which ends with the turn.
+                let is_turn_rule = existing.is_some_and(|grant| self.turn_rules.contains(&grant.id));
+                let saved = existing.is_some() && !is_turn_rule;
+                let heading = if saved { "This rule already allows:" } else { "You will allow:" };
+                let summary = self.sharing_rule_summary(&source, &reader, &recipient, &self.short_duration_label(&duration));
+                (if is_turn_rule {
+                    format!("This turn only: the agent's current request holds this rule, and it ends when the agent replies. Choose another duration to keep this sharing.\n\n{summary}")
+                } else { format!("{heading}\n{summary}") },
+                format!("{heading}\n{}\n\nTo share:\n{}\n\nWith:\n{}\n\nFor how long: {}", self.reader_label(&reader),
+                    self.source_label(&source), self.recipient_label(&recipient), self.duration_label(&duration)), !saved && !is_turn_rule, saved)
             }
             Err(error) => (error, String::new(), false, false),
             _ => unreachable!("sharing_action only creates a sharing grant"),
@@ -890,6 +1050,7 @@ impl DataSharing {
     }
 
     fn refresh_rules(&mut self, cx: &mut Cx) {
+        self.turn_rules = turn_rule_ids();
         match flow::sharing_grants() {
             Ok(grants) => {
                 self.grants = grants.into_iter().filter(|grant| match &grant.source {
@@ -911,6 +1072,7 @@ impl DataSharing {
         let source = self.selected_source(cx);
         let hint = match &source {
             Ok(Source::Room { .. }) => "Data may return to its original room by default. Other rooms and services need a rule.",
+            Ok(Source::RoomDirectory { .. }) => "Names, topics and member counts of your rooms and spaces. AI rooms share it with your AI service, your homeserver and their own room by default.",
             Ok(Source::UnknownPrivate) => "Data with unknown private sources cannot be shared.",
             _ => "Account data stays in Robrix by default. Choose exactly who can share it and where it can go.",
         };
@@ -919,6 +1081,7 @@ impl DataSharing {
 
     fn recipient_label(&self, recipient: &Recipient) -> String {
         match recipient {
+            Recipient::NetworkOrigin(origin) if self.homeserver.as_ref() == Some(recipient) => format!("My Matrix homeserver: {origin}"),
             Recipient::NetworkOrigin(origin) => format!("Website: {origin}"),
             Recipient::ModelProvider(id) => match self.model.as_ref().filter(|model| &model.id == id) {
                 Some(model) => format!("AI model: {} · {}", model.label, model.endpoint),
@@ -947,9 +1110,62 @@ impl DataSharing {
 
 }
 
+/// The wizard's data sources: account data, the room and space directory, joined rooms, then
+/// sources of saved rules and `keep` (an open rule's source), so neither vanishes after leaving a room.
+fn source_options(account: &str, rooms: &[(String, String)], saved: impl IntoIterator<Item = Source>, keep: Option<&Source>) -> Vec<(Source, String)> {
+    if account.is_empty() { return Vec::new(); }
+    let mut sources = vec![
+        (Source::Account { account: account.into() }, format!("Account data · {account}")),
+        (Source::RoomDirectory { account: account.into() }, "Room and space directory".into()),
+    ];
+    sources.extend(rooms.iter().map(|(room, name)| (Source::Room { account: account.into(), room: room.clone() }, format!("Room · {name} ({room})"))));
+    for source in saved.into_iter().chain(keep.cloned()) {
+        let is_owned = match &source {
+            Source::Account { account: owner } | Source::Room { account: owner, .. } | Source::RoomDirectory { account: owner } => owner == account,
+            Source::UnknownPrivate => false,
+        };
+        if is_owned && !sources.iter().any(|(candidate, _)| candidate == &source) {
+            let label = if let Source::Room { room, .. } = &source { format!("Earlier room · {room}") } else { String::new() };
+            sources.push((source, label));
+        }
+    }
+    sources
+}
+
+/// Sharing rules held by AI rooms' current turns; each turn's end revokes its own.
+#[cfg(unix)]
+fn turn_rule_ids() -> BTreeSet<u64> {
+    with_a2app(|state| state.task_ledger.tasks().flat_map(|task| task.grants.iter()).filter_map(|grant| match grant {
+        a2app_core::task_grants::GrantRef::Flow(id) => Some(*id),
+        _ => None,
+    }).collect()).unwrap_or_default()
+}
+
+#[cfg(not(unix))]
+fn turn_rule_ids() -> BTreeSet<u64> { BTreeSet::new() }
+
+#[cfg(test)]
+thread_local! {
+    static TEST_MODEL: RefCell<Option<Result<ModelRecipient, String>>> = const { RefCell::new(None) };
+    static TEST_HOMESERVER: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+fn current_model(prefs: &a2app_agent::prefs::AgentPrefs) -> Result<ModelRecipient, String> {
+    #[cfg(test)]
+    if let Some(model) = TEST_MODEL.with(|model| model.borrow().clone()) { return model; }
+    a2app_agent::model_transport::current_recipient(prefs)
+}
+
+/// The homeserver origin that AI reply and activity cards are written to.
+fn homeserver_recipient() -> Option<Recipient> {
+    #[cfg(test)]
+    if let Some(url) = TEST_HOMESERVER.with(|url| url.borrow().clone()) { return Recipient::network_origin(&url).ok(); }
+    crate::sliding_sync::get_client().and_then(|client| Recipient::network_origin(client.homeserver().as_str()).ok())
+}
+
 mod diagnostics;
 mod activity;
-use diagnostics::bullets;
+use diagnostics::{bullets, decision_key, is_decision_for, DecisionKey};
 
 impl DataSharingRef {
     pub fn configure(&self, cx: &mut Cx) {
@@ -1004,6 +1220,59 @@ mod tests {
         let event = cx.capture_actions(|cx| cx.widget_action(uid,
             crate::shared::collapsible_header::CollapsibleHeaderAction::ExpansionChanged(expanded)));
         cx.capture_actions(|cx| editor.handle_event(cx, &Event::Actions(event), &mut Scope::empty()))
+    }
+
+    fn select_first(editor: &mut DataSharing) {
+        editor.decision_selection = editor.decisions.first().map(decision_key);
+    }
+
+    fn press(editor: &mut DataSharing, cx: &mut Cx, button: &[LiveId]) -> ActionsBuf {
+        let uid = editor.view.button(cx, button).widget_uid();
+        let event = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+        cx.capture_actions(|cx| editor.handle_event(cx, &Event::Actions(event), &mut Scope::empty()))
+    }
+
+    fn unique_account(name: &str) -> String {
+        format!("@{name}-{}:example.org", std::process::id())
+    }
+
+    fn test_model(id: &str) -> ModelRecipient {
+        ModelRecipient { id: id.into(), label: format!("Model {id}"), endpoint: "https://model.example".into(), local: false }
+    }
+
+    struct TestModel(Option<Result<ModelRecipient, String>>);
+
+    impl TestModel {
+        fn set(model: Result<ModelRecipient, String>) -> Self {
+            Self(TEST_MODEL.with(|current| current.replace(Some(model))))
+        }
+    }
+
+    impl Drop for TestModel {
+        fn drop(&mut self) {
+            TEST_MODEL.with(|current| current.replace(self.0.take()));
+        }
+    }
+
+    struct TestHomeserver(Option<String>);
+
+    impl TestHomeserver {
+        fn set(url: &str) -> Self {
+            Self(TEST_HOMESERVER.with(|current| current.replace(Some(url.into()))))
+        }
+    }
+
+    impl Drop for TestHomeserver {
+        fn drop(&mut self) {
+            TEST_HOMESERVER.with(|current| current.replace(self.0.take()));
+        }
+    }
+
+    fn granted(actions: &ActionsBuf) -> Vec<(Source, Recipient, ReaderScope, SharingDuration)> {
+        actions.iter().filter_map(|action| match action.downcast_ref::<A2AppOp>() {
+            Some(A2AppOp::GrantFlowSharing { source, recipient, reader, duration }) => Some((source.clone(), recipient.clone(), reader.clone(), duration.clone())),
+            _ => None,
+        }).collect()
     }
 
     #[test]
@@ -1104,12 +1373,12 @@ mod tests {
         });
         editor.handle_event(&mut cx, &Event::Actions(events), &mut Scope::empty());
         assert!(!editor.attention_expanded);
-        assert_eq!(editor.decision_selection, 0, "collapse must discard a cached card action in the same batch");
+        assert!(editor.decision_selection.is_none(), "collapse must discard a cached card action in the same batch");
         assert!(editor.card_is_visible(&first));
         assert!(!editor.card_is_visible(&extra));
         let events = cx.capture_actions(|cx| cx.action(stale));
         editor.handle_event(&mut cx, &Event::Actions(events), &mut Scope::empty());
-        assert_eq!(editor.decision_selection, 0, "an extra row cannot open while its section is hidden");
+        assert!(editor.decision_selection.is_none(), "an extra row cannot open while its section is hidden");
         editor.view.permission_choices(&cx, ids!(page_choice)).set_selected_item(&mut cx, 2);
         editor.view.widget(&cx, ids!(history_more)).set_visible(&mut cx, true);
         expand(&mut editor, &mut cx, ids!(history_more), true);
@@ -1428,7 +1697,7 @@ mod tests {
             sources: snapshot.label.clone(), denied_sources: snapshot.label, allowed: false,
         });
 
-        editor.decision_selection = 1;
+        select_first(&mut editor);
         editor.update_diagnostic_details(&mut cx);
         editor.view.permission_choices(&cx, ids!(page_choice)).set_selected_item(&mut cx, 1);
         editor.update_page(&mut cx);
@@ -1438,8 +1707,10 @@ mod tests {
         assert_eq!(editor.selected_reader(&cx).unwrap(), ReaderScope::Context(snapshot.context));
         assert_eq!(editor.selected_recipient(&cx).unwrap(), Recipient::NetworkOrigin("https://blocked.example:8443".into()));
         editor.decisions[0].recipient = Recipient::ModelProvider("stale-model-identity".into());
+        select_first(&mut editor);
         assert!(editor.review_decision(&mut cx).is_err());
         editor.decisions[0].recipient = Recipient::Clipboard;
+        select_first(&mut editor);
         editor.review_decision(&mut cx).unwrap();
         assert_eq!(editor.selected_recipient(&cx).unwrap(), Recipient::Clipboard);
         assert!(editor.view.widget(&cx, ids!(clipboard_section)).visible());
@@ -1462,7 +1733,7 @@ mod tests {
             snapshot.epoch = epoch;
             editor.snapshots.push(snapshot);
             editor.view.drop_down2(&cx, ids!(context_choice)).set_labels(&mut cx, vec!["Select context".into(), "Fixture context".into()]);
-            editor.decision_selection = 1;
+            select_first(&mut editor);
             editor.update_diagnostic_details(&mut cx);
             assert!(!editor.view.widget(&cx, ids!(review_button)).disabled(&cx));
             editor.review_decision(&mut cx).unwrap();
@@ -1492,10 +1763,12 @@ mod tests {
             recipient: Recipient::NetworkOrigin("https://blocked.example".into()),
             sources: [Source::UnknownPrivate].into(), denied_sources: [Source::UnknownPrivate].into(), allowed: false,
         });
-        editor.decision_selection = 1;
+        select_first(&mut editor);
         editor.update_diagnostic_details(&mut cx);
         assert!(editor.view.widget(&cx, ids!(review_button)).disabled(&cx));
         assert!(editor.view.label(&cx, ids!(review_problem)).text().contains("cannot identify"));
+        assert!(!editor.view.widget(&cx, ids!(allow_all_section)).visible(), "no rule can release it, so there is nothing to allow");
+        assert!(editor.allow_all_grants(&cx).is_err());
         assert!(editor.review_decision(&mut cx).is_err());
         assert!(!editor.wizard_open);
         let summary = editor.view.label(&cx, ids!(decision_details)).text();
@@ -1633,7 +1906,8 @@ mod tests {
         editor.wizard_open = true;
         editor.wizard_step = 2;
         editor.wizard_return_page = 1;
-        editor.decision_selection = 1;
+        let request = (context_fixture().context, Recipient::Clipboard);
+        editor.decision_selection = Some(request.clone());
         for step in [1, 0] {
             assert!(editor.back(&mut cx));
             assert_eq!(editor.wizard_step, step);
@@ -1642,9 +1916,9 @@ mod tests {
         assert!(editor.back(&mut cx));
         assert!(!editor.wizard_open);
         assert_eq!(editor.view.permission_choices(&cx, ids!(page_choice)).selected_item(), 1);
-        assert_eq!(editor.decision_selection, 1, "leaving a rule returns to the request that opened it");
+        assert_eq!(editor.decision_selection, Some(request), "leaving a rule returns to the request that opened it");
         assert!(editor.back(&mut cx));
-        assert_eq!(editor.decision_selection, 0);
+        assert!(editor.decision_selection.is_none());
         assert!(!editor.back(&mut cx));
         editor.view.permission_choices(&cx, ids!(page_choice)).set_selected_item(&mut cx, 0);
         editor.saved_selection = SharingCardTarget::Rule(1);
@@ -1669,6 +1943,556 @@ mod tests {
         assert!(text.contains("Review sharing rule"));
         assert!(text.contains("Allow sharing"));
         assert!(editor.sharing_remedy(&[Source::UnknownPrivate].into(), &recipient).contains("No sharing rule"));
+        let several = [Source::Account { account: editor.account.clone() }, Source::RoomDirectory { account: editor.account.clone() }].into();
+        assert!(editor.sharing_remedy(&several, &recipient).contains("Allow all listed data"));
+    }
+
+    #[test]
+    fn source_options_list_the_directory_after_account_data_and_keep_a_reviewed_source() {
+        assert!(source_options("", &[], [], None).is_empty());
+        let account = "@alice:example.org";
+        let room = |id: &str| Source::Room { account: account.into(), room: id.into() };
+        let directory = Source::RoomDirectory { account: account.into() };
+        let foreign = Source::Room { account: "@bob:example.org".into(), room: "!bob:example.org".into() };
+        let rooms = vec![("!joined:example.org".to_string(), "Joined".to_string())];
+        let options = source_options(account, &rooms, [room("!left:example.org"), foreign.clone(), directory.clone()], Some(&room("!reviewed:example.org")));
+        assert_eq!(options.iter().map(|(source, _)| source.clone()).collect::<Vec<_>>(), vec![
+            Source::Account { account: account.into() }, directory, room("!joined:example.org"),
+            room("!left:example.org"), room("!reviewed:example.org"),
+        ]);
+        assert_eq!(options[1].1, "Room and space directory");
+        for kept in [foreign, Source::UnknownPrivate] {
+            assert!(!source_options(account, &rooms, [], Some(&kept)).iter().any(|(source, _)| source == &kept), "only the account's own data can be kept");
+        }
+    }
+
+    #[test]
+    fn directory_source_builds_the_agent_rule_for_its_own_room() {
+        let account = unique_account("directory-rule");
+        let _account = TestAccount::set(&account);
+        let room = "!directory-rule-ai:example.org";
+        let context = crate::a2app::information_flow::prepare_agent(room).unwrap();
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+        editor.configure(&mut cx);
+        let directory = Source::RoomDirectory { account: account.clone() };
+        assert_eq!(editor.sources.iter().position(|(source, _)| source == &directory), Some(1), "listed right after account data");
+        editor.view.drop_down2(&cx, ids!(source_choice)).set_selected_item(&mut cx, 1);
+        let index = editor.snapshots.iter().position(|snapshot| snapshot.context == context).unwrap();
+        editor.view.drop_down2(&cx, ids!(context_choice)).set_selected_item(&mut cx, index + 1);
+        editor.rooms.push((room.into(), "AI room".into()));
+        editor.view.permission_choices(&cx, ids!(recipient_kind)).set_selected_item(&mut cx, 2);
+        editor.view.permission_choices(&cx, ids!(sharing_lifetime)).set_selected_item(&mut cx, 2);
+        assert_eq!(editor.sharing_draft(&cx), Some((directory, Recipient::MatrixRoom { account: account.clone(), room: room.into() },
+            ReaderScope::Context(context), SharingDuration::Permanent)));
+        editor.refresh_rules(&mut cx);
+        assert!(editor.view.label(&cx, ids!(source_default)).text().contains("AI rooms share it"));
+    }
+
+    #[test]
+    fn homeserver_destination_is_the_origin_ai_cards_are_checked_against() {
+        let account = unique_account("homeserver-destination");
+        let _account = TestAccount::set(&account);
+        let _model = TestModel::set(Err("No AI service in this test.".into()));
+        let _homeserver = TestHomeserver::set("https://matrix-client.example.org/");
+        let room = "!homeserver-destination-ai:example.org";
+        let context = crate::a2app::information_flow::prepare_agent(room).unwrap();
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+        editor.configure(&mut cx);
+        // The same expression the AI room worker checks its cards against.
+        let homeserver = Recipient::network_origin("https://matrix-client.example.org/").unwrap();
+        editor.view.permission_choices(&cx, ids!(recipient_kind)).set_selected_item(&mut cx, 4);
+        editor.update_recipient_form(&mut cx);
+        assert_eq!(editor.selected_recipient(&cx).unwrap(), homeserver);
+        assert!(editor.view.widget(&cx, ids!(homeserver_section)).visible());
+        assert!(editor.view.label(&cx, ids!(homeserver_description)).text().contains("https://matrix-client.example.org"));
+        assert_eq!(editor.recipient_choice_label(&homeserver), "My Matrix homeserver");
+        assert!(editor.recipient_label(&homeserver).contains("https://matrix-client.example.org"));
+        // A blocked check against that origin is reviewed as the homeserver, not as a typed website.
+        assert!(!flow::decision(&context, &homeserver).unwrap().allowed);
+        editor.view.permission_choices(&cx, ids!(recipient_kind)).set_selected_item(&mut cx, 0);
+        editor.refresh_diagnostics(&mut cx);
+        select_first(&mut editor);
+        editor.update_diagnostic_details(&mut cx);
+        editor.review_decision(&mut cx).unwrap();
+        assert_eq!(editor.view.permission_choices(&cx, ids!(recipient_kind)).selected_item(), 4);
+        assert_eq!(editor.selected_recipient(&cx).unwrap(), homeserver);
+        assert!(editor.view.text_input(&cx, ids!(network_url)).text().is_empty());
+    }
+
+    #[test]
+    fn needs_attention_drops_approved_data_and_says_once_to_try_again() {
+        let account = unique_account("attention-resolved");
+        let _account = TestAccount::set(&account);
+        let _model = TestModel::set(Err("No AI service in this test.".into()));
+        let room = "!attention-resolved-ai:example.org";
+        let context = crate::a2app::information_flow::prepare_agent(room).unwrap();
+        let own = Source::Room { account: account.clone(), room: room.into() };
+        let directory = Source::RoomDirectory { account: account.clone() };
+        flow::add_sources(&context, [directory.clone()]).unwrap();
+        let website = Recipient::NetworkOrigin("https://attention-resolved.example".into());
+        assert!(!flow::decision(&context, &website).unwrap().allowed);
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+        editor.configure(&mut cx);
+        editor.view.permission_choices(&cx, ids!(page_choice)).set_selected_item(&mut cx, 1);
+        assert_eq!(editor.decisions.len(), 1);
+        let card = SharingCardTarget::Decision(editor.decisions[0].clone());
+        editor.open_card(&mut cx, &card);
+        assert_eq!(editor.blocked_sources, vec![own.clone(), directory.clone()]);
+        editor.view.permission_choices(&cx, ids!(blocked_source_choice)).set_selected_item(&mut cx, 1);
+        let reader = ReaderScope::Context(context.clone());
+        flow::grant_sharing(own, website.clone(), reader.clone(), SharingDuration::RobrixSession).unwrap();
+        editor.refresh_diagnostics(&mut cx);
+        assert_eq!(editor.decision_selection, Some((context.clone(), website.clone())), "the open request survives the change");
+        assert_eq!(editor.blocked_sources, vec![directory.clone()], "an allowed source is no longer listed");
+        assert_eq!(editor.view.permission_choices(&cx, ids!(blocked_source_choice)).selected_item(), 0, "the chosen source stays chosen");
+        assert!(!editor.view.label(&cx, ids!(decision_details)).text().contains("Allowed now"));
+        flow::grant_sharing(directory, website.clone(), reader, SharingDuration::RobrixSession).unwrap();
+        editor.refresh_diagnostics(&mut cx);
+        assert!(editor.view.label(&cx, ids!(decision_details)).text().contains("Allowed now. Send your message again."));
+        assert!(!editor.view.widget(&cx, ids!(review_section)).visible());
+        assert!(!editor.view.widget(&cx, ids!(allow_all_section)).visible());
+        assert!(!editor.card_is_visible(&card), "a resolved request has no card");
+        assert!(editor.back(&mut cx));
+        editor.refresh_diagnostics(&mut cx);
+        assert!(editor.decisions.is_empty(), "it is shown only once");
+        assert!(editor.view.label(&cx, ids!(attention_summary)).text().starts_with("Nothing needs your attention"));
+    }
+
+    #[test]
+    fn needs_attention_drops_data_a_new_session_no_longer_holds() {
+        let account = unique_account("attention-relabelled");
+        let _account = TestAccount::set(&account);
+        let room = "!attention-relabelled-ai:example.org";
+        let context = crate::a2app::information_flow::prepare_agent(room).unwrap();
+        let other = Source::Room { account: account.clone(), room: "!attention-relabelled-other:example.org".into() };
+        flow::add_sources(&context, [other]).unwrap();
+        let website = Recipient::NetworkOrigin("https://attention-relabelled.example".into());
+        flow::decision(&context, &website).unwrap();
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+        editor.configure(&mut cx);
+        assert_eq!(editor.decisions.len(), 1);
+        assert_eq!(editor.decisions[0].denied_sources.len(), 2);
+        crate::a2app::information_flow::begin_agent_session(room).unwrap();
+        editor.refresh_diagnostics(&mut cx);
+        assert_eq!(editor.decisions[0].denied_sources, [Source::Room { account: account.clone(), room: room.into() }].into(),
+            "only the data the agent still holds needs a rule");
+    }
+
+    #[test]
+    fn an_open_request_whose_data_left_the_label_is_not_called_allowed() {
+        let account = unique_account("attention-unheld");
+        let _account = TestAccount::set(&account);
+        let _model = TestModel::set(Err("No AI service in this test.".into()));
+        let room = "!attention-unheld-ai:example.org";
+        let context = crate::a2app::information_flow::prepare_agent(room).unwrap();
+        let own = Source::Room { account: account.clone(), room: room.into() };
+        let other = Source::Room { account: account.clone(), room: "!attention-unheld-other:example.org".into() };
+        let website = Recipient::NetworkOrigin("https://attention-unheld.example".into());
+        flow::grant_sharing(own, website.clone(), ReaderScope::Context(context.clone()), SharingDuration::RobrixSession).unwrap();
+        flow::add_sources(&context, [other.clone()]).unwrap();
+        assert_eq!(flow::decision(&context, &website).unwrap().denied_sources, [other].into());
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+        editor.configure(&mut cx);
+        editor.view.permission_choices(&cx, ids!(page_choice)).set_selected_item(&mut cx, 1);
+        let card = SharingCardTarget::Decision(editor.decisions[0].clone());
+        editor.open_card(&mut cx, &card);
+        // A new session drops the other room from the label, but no rule allows it.
+        crate::a2app::information_flow::begin_agent_session(room).unwrap();
+        editor.refresh_diagnostics(&mut cx);
+        let details = editor.view.label(&cx, ids!(decision_details)).text();
+        assert!(details.contains("The agent no longer holds this data") && !details.contains("Allowed now"), "{details}");
+        assert!(!editor.view.widget(&cx, ids!(review_section)).visible());
+        assert!(!editor.card_is_visible(&card), "it no longer blocks anything");
+        assert!(editor.back(&mut cx));
+        editor.refresh_diagnostics(&mut cx);
+        assert!(editor.decisions.is_empty(), "it is shown only once");
+    }
+
+    #[test]
+    fn allow_all_listed_data_grants_each_still_blocked_source_once() {
+        let account = unique_account("allow-all");
+        let _account = TestAccount::set(&account);
+        let _model = TestModel::set(Err("No AI service in this test.".into()));
+        let room = "!allow-all-ai:example.org";
+        let context = crate::a2app::information_flow::prepare_agent(room).unwrap();
+        let own = Source::Room { account: account.clone(), room: room.into() };
+        let other = Source::Room { account: account.clone(), room: "!allow-all-other:example.org".into() };
+        let directory = Source::RoomDirectory { account: account.clone() };
+        flow::add_sources(&context, [other.clone(), directory.clone()]).unwrap();
+        let website = Recipient::NetworkOrigin("https://allow-all.example".into());
+        flow::decision(&context, &website).unwrap();
+        let reader = ReaderScope::Context(context.clone());
+        flow::grant_sharing(own, website.clone(), reader.clone(), SharingDuration::RobrixSession).unwrap();
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+        editor.configure(&mut cx);
+        editor.view.permission_choices(&cx, ids!(page_choice)).set_selected_item(&mut cx, 1);
+        let card = SharingCardTarget::Decision(editor.decisions[0].clone());
+        editor.open_card(&mut cx, &card);
+        assert!(editor.view.widget(&cx, ids!(allow_all_section)).visible());
+        assert!(!editor.view.widget(&cx, ids!(allow_all_button)).disabled(&cx));
+        assert_eq!(editor.view.permission_choices(&cx, ids!(allow_all_lifetime)).selected_item(), 0, "the narrow duration is the default");
+        editor.view.permission_choices(&cx, ids!(allow_all_lifetime)).set_selected_item(&mut cx, 2);
+        let actions = press(&mut editor, &mut cx, ids!(allow_all_button));
+        assert_eq!(granted(&actions), vec![
+            (other.clone(), website.clone(), reader.clone(), SharingDuration::Permanent),
+            (directory.clone(), website.clone(), reader.clone(), SharingDuration::Permanent),
+        ], "one rule per blocked source, none for the already allowed room");
+        // A source allowed after the list was drawn gets no second rule.
+        flow::grant_sharing(other, website.clone(), reader.clone(), SharingDuration::RobrixSession).unwrap();
+        editor.view.permission_choices(&cx, ids!(allow_all_lifetime)).set_selected_item(&mut cx, 1);
+        let actions = press(&mut editor, &mut cx, ids!(allow_all_button));
+        assert_eq!(granted(&actions), vec![(directory, website, reader,
+            SharingDuration::RoomSession { account: account.clone(), room: room.into() })]);
+    }
+
+    #[test]
+    fn reopening_the_pane_keeps_an_open_review_and_never_switches_its_source() {
+        let account = unique_account("review-survives");
+        let _account = TestAccount::set(&account);
+        let _model = TestModel::set(Ok(test_model("model-one")));
+        let _homeserver = TestHomeserver::set("https://hs.review-survives.example");
+        let room = "!review-survives-ai:example.org";
+        let context = crate::a2app::information_flow::prepare_agent(room).unwrap();
+        let left = Source::Room { account: account.clone(), room: "!review-survives-left:example.org".into() };
+        let directory = Source::RoomDirectory { account: account.clone() };
+        flow::add_sources(&context, [left.clone(), directory.clone()]).unwrap();
+        let homeserver = Recipient::network_origin("https://hs.review-survives.example").unwrap();
+        flow::decision(&context, &homeserver).unwrap();
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+        editor.configure(&mut cx);
+        editor.view.permission_choices(&cx, ids!(page_choice)).set_selected_item(&mut cx, 1);
+        let card = SharingCardTarget::Decision(editor.decisions[0].clone());
+        editor.open_card(&mut cx, &card);
+        // The directory is always listed; a room left since then is kept for the open review.
+        for source in [directory, left] {
+            let index = editor.blocked_sources.iter().position(|candidate| candidate == &source).unwrap();
+            editor.view.permission_choices(&cx, ids!(blocked_source_choice)).set_selected_item(&mut cx, index);
+            editor.review_decision(&mut cx).unwrap();
+            editor.configure(&mut cx);
+            assert!(editor.wizard_open, "reopening the pane keeps the review open");
+            assert_eq!(editor.selected_source(&cx).unwrap(), source, "and keeps its data source");
+            assert_eq!(editor.selected_recipient(&cx).unwrap(), homeserver);
+            assert_eq!(editor.decision_selection, Some((context.clone(), homeserver.clone())));
+            press(&mut editor, &mut cx, ids!(wizard_cancel));
+            assert_eq!(editor.view.permission_choices(&cx, ids!(page_choice)).selected_item(), 1);
+        }
+        // A rule whose destination changed underneath it is closed, not retargeted.
+        editor.view.permission_choices(&cx, ids!(page_choice)).set_selected_item(&mut cx, 0);
+        editor.decision_selection = None;
+        editor.begin_rule(&mut cx);
+        let index = editor.snapshots.iter().position(|snapshot| snapshot.context == context).unwrap();
+        editor.view.drop_down2(&cx, ids!(context_choice)).set_selected_item(&mut cx, index + 1);
+        editor.view.permission_choices(&cx, ids!(recipient_kind)).set_selected_item(&mut cx, 0);
+        editor.wizard_step = 2;
+        assert!(matches!(editor.sharing_draft(&cx), Some((_, Recipient::ModelProvider(id), ..)) if id == "model-one"));
+        editor.configure(&mut cx);
+        assert!(editor.wizard_open, "an unchanged service keeps the rule open");
+        TEST_MODEL.with(|current| current.replace(Some(Ok(test_model("model-two")))));
+        editor.configure(&mut cx);
+        assert_eq!(editor.model.as_ref().map(|model| model.id.as_str()), Some("model-two"), "every configure re-reads the AI service");
+        assert!(!editor.wizard_open, "a changed AI service closes the rule instead of switching it");
+    }
+
+    #[test]
+    fn model_requests_wait_for_a_checking_service_instead_of_calling_it_changed() {
+        let _model = TestModel::set(Err("Checking Claude Code sign-in. Try again shortly.".into()));
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+        editor.account = "@alice:example.org".into();
+        let snapshot = context_fixture();
+        editor.snapshots.push(snapshot.clone());
+        editor.view.drop_down2(&cx, ids!(context_choice)).set_labels(&mut cx, vec!["Select context".into(), "Fixture context".into()]);
+        editor.decisions.push(FlowDecision {
+            context: snapshot.context.clone(), epoch: snapshot.epoch, recipient: Recipient::ModelProvider("model-one".into()),
+            sources: snapshot.label.clone(), denied_sources: snapshot.label.clone(), allowed: false,
+        });
+        select_first(&mut editor);
+        editor.refresh_model(&mut cx);
+        editor.update_diagnostic_details(&mut cx);
+        let problem = editor.view.label(&cx, ids!(review_problem)).text();
+        assert!(problem.contains("Checking Claude Code sign-in") && !problem.contains("changed"), "{problem}");
+        assert!(!editor.view.widget(&cx, ids!(review_button)).disabled(&cx), "pressing it again reads the service again");
+        assert!(!editor.view.widget(&cx, ids!(allow_all_button)).disabled(&cx));
+        assert!(editor.review_decision(&mut cx).is_err());
+        TEST_MODEL.with(|current| current.replace(Some(Ok(test_model("model-one")))));
+        editor.review_decision(&mut cx).unwrap();
+        assert_eq!(editor.selected_recipient(&cx).unwrap(), Recipient::ModelProvider("model-one".into()), "the review re-reads the service");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ai_room_requests_and_rules_offer_to_restore_the_room_defaults() {
+        let account = "@alice:example.org";
+        let _account = TestAccount::set(account);
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+        editor.account = account.into();
+        let snapshot = context_fixture();
+        let room = "!source:example.org";
+        let directory = Source::RoomDirectory { account: account.into() };
+        let own_room = Recipient::MatrixRoom { account: account.into(), room: room.into() };
+        editor.snapshots.push(snapshot.clone());
+        editor.rooms.push((room.into(), "AI room".into()));
+        for recipient in [own_room.clone(), Recipient::NetworkOrigin("https://example.org".into())] {
+            editor.decisions.push(FlowDecision { context: snapshot.context.clone(), epoch: snapshot.epoch, recipient,
+                sources: [directory.clone()].into(), denied_sources: [directory.clone()].into(), allowed: false });
+        }
+        editor.view.permission_choices(&cx, ids!(page_choice)).set_selected_item(&mut cx, 1);
+        let was_restored = |actions: &ActionsBuf| actions.iter().any(|action|
+            matches!(action.downcast_ref::<A2AppOp>(), Some(A2AppOp::RestoreAgentDefaults(id)) if id.as_str() == room));
+        for (index, is_covered) in [(0, true), (1, false)] {
+            editor.decision_selection = Some(decision_key(&editor.decisions[index]));
+            editor.update_diagnostic_details(&mut cx);
+            assert!(editor.view.widget(&cx, ids!(decision_restore_section)).visible(), "every blocked agent request offers it");
+            let text = editor.view.label(&cx, ids!(decision_restore_text)).text();
+            assert_eq!(!text.contains("don't cover the data listed above"), is_covered, "the defaults can't unblock a website: {text}");
+            assert!(was_restored(&press(&mut editor, &mut cx, ids!(decision_restore))));
+        }
+        // A mini-app's request, or one allowed since, has nothing to restore.
+        editor.decisions[1].context = ContextId::App { account: account.into(), app: "weather".into(), room: Some(room.into()) };
+        editor.decisions[0].allowed = true;
+        editor.decisions[0].denied_sources.clear();
+        for index in [1, 0] {
+            editor.decision_selection = Some(decision_key(&editor.decisions[index]));
+            editor.update_diagnostic_details(&mut cx);
+            assert!(!editor.view.widget(&cx, ids!(decision_restore_section)).visible());
+            assert!(!was_restored(&press(&mut editor, &mut cx, ids!(decision_restore))));
+        }
+        editor.grants.push(SharingGrant { id: 81, source: directory.clone(), recipient: own_room.clone(),
+            reader: ReaderScope::Context(snapshot.context.clone()), duration: SharingDuration::Permanent });
+        editor.grants.push(SharingGrant { id: 82, source: directory, recipient: own_room,
+            reader: ReaderScope::App { account: account.into(), app: "weather".into() }, duration: SharingDuration::Permanent });
+        editor.decision_selection = None;
+        editor.view.permission_choices(&cx, ids!(page_choice)).set_selected_item(&mut cx, 0);
+        editor.open_card(&mut cx, &SharingCardTarget::Rule(81));
+        assert!(editor.view.widget(&cx, ids!(rule_restore_section)).visible());
+        assert!(was_restored(&press(&mut editor, &mut cx, ids!(rule_restore))));
+        editor.open_card(&mut cx, &SharingCardTarget::Rule(82));
+        assert!(!editor.view.widget(&cx, ids!(rule_restore_section)).visible(), "a mini-app's rule has no AI room defaults");
+    }
+
+    #[test]
+    fn removing_a_rule_everyone_shares_or_an_ai_room_default_asks_first() {
+        let account = "@alice:example.org";
+        let _account = TestAccount::set(account);
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+        editor.account = account.into();
+        let agent = ReaderScope::Context(context_fixture().context);
+        let own = Source::Room { account: account.into(), room: "!source:example.org".into() };
+        let directory = Source::RoomDirectory { account: account.into() };
+        let own_room = Recipient::MatrixRoom { account: account.into(), room: "!source:example.org".into() };
+        editor.grants = vec![
+            SharingGrant { id: 91, source: Source::Account { account: account.into() }, recipient: Recipient::NetworkOrigin("https://example.org".into()),
+                reader: ReaderScope::AllReaders, duration: SharingDuration::Permanent },
+            SharingGrant { id: 92, source: directory.clone(), recipient: own_room.clone(), reader: agent.clone(), duration: SharingDuration::Permanent },
+            SharingGrant { id: 93, source: directory, recipient: own_room, reader: agent.clone(), duration: SharingDuration::RobrixSession },
+            SharingGrant { id: 94, source: own, recipient: Recipient::ModelProvider("model-one".into()), reader: agent, duration: SharingDuration::Permanent },
+        ];
+        let remove = |editor: &mut DataSharing, cx: &mut Cx, id: u64| {
+            editor.saved_selection = SharingCardTarget::None;
+            editor.open_card(cx, &SharingCardTarget::Rule(id));
+            press(editor, cx, ids!(remove_button))
+        };
+        let revoked = |actions: &ActionsBuf| actions.iter().filter_map(|action| match action.downcast_ref::<A2AppOp>() {
+            Some(A2AppOp::RevokeFlowSharing(id)) => Some(*id),
+            _ => None,
+        }).collect::<Vec<_>>();
+        let confirmation = |actions: &ActionsBuf| actions.iter().find_map(|action| {
+            let Some(ConfirmDeleteAction::Show(content)) = action.downcast_ref() else { return None };
+            content.borrow_mut().take()
+        });
+        // While the AI service is unknown, any model rule may be the room's default.
+        assert!(editor.model.is_none());
+        for (id, title) in [(91, "Remove this shared rule?"), (92, "Remove this AI room default?"), (94, "Remove this AI room default?")] {
+            let actions = remove(&mut editor, &mut cx, id);
+            assert!(revoked(&actions).is_empty(), "rule {id} must be confirmed first");
+            let content = confirmation(&actions).unwrap_or_else(|| panic!("rule {id} asks first"));
+            assert_eq!(content.title_text, title);
+            let accept = content.on_accept_clicked.unwrap();
+            assert_eq!(revoked(&cx.capture_actions(|cx| accept(cx))), vec![id], "accepting removes exactly that rule");
+        }
+        let accept = confirmation(&remove(&mut editor, &mut cx, 91)).unwrap().on_accept_clicked.unwrap();
+        {
+            let _other = TestAccount::set("@bob:example.org");
+            assert!(revoked(&cx.capture_actions(|cx| accept(cx))).is_empty(), "accepting after switching accounts removes nothing");
+        }
+        editor.model = Some(test_model("model-two"));
+        for id in [93, 94] {
+            assert_eq!(revoked(&remove(&mut editor, &mut cx, id)), vec![id], "rule {id} is removed at once");
+        }
+    }
+
+    #[test]
+    fn turn_rules_read_this_turn_only_and_never_pass_for_saved_rules() {
+        let account = "@alice:example.org";
+        let _account = TestAccount::set(account);
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+        editor.account = account.into();
+        let snapshot = context_fixture();
+        let room = "!source:example.org";
+        let source = snapshot.label.first().unwrap().clone();
+        editor.sources.push((source.clone(), "Private room".into()));
+        editor.rooms.push((room.into(), "AI room".into()));
+        editor.snapshots.push(snapshot.clone());
+        editor.view.drop_down2(&cx, ids!(context_choice)).set_labels(&mut cx, vec!["Select context".into(), "Agent".into()]);
+        editor.view.drop_down2(&cx, ids!(context_choice)).set_selected_item(&mut cx, 1);
+        editor.grants.push(SharingGrant { id: 101, source, recipient: Recipient::NetworkOrigin("https://example.org".into()),
+            reader: ReaderScope::Context(snapshot.context), duration: SharingDuration::RoomSession { account: account.into(), room: room.into() } });
+        editor.turn_rules.insert(101);
+        assert_eq!(editor.grant_duration_label(&editor.grants[0]), "This turn only");
+        editor.open_card(&mut cx, &SharingCardTarget::Rule(101));
+        assert!(editor.view.label(&cx, ids!(saved_rule_details)).text().contains("This turn only"));
+        assert!(editor.removal_warning(&editor.grants[0]).is_none());
+        // Building the same rule by hand would only hand back the turn's rule.
+        editor.saved_selection = SharingCardTarget::None;
+        editor.begin_rule(&mut cx);
+        editor.view.permission_choices(&cx, ids!(recipient_kind)).set_selected_item(&mut cx, 1);
+        editor.view.text_input(&cx, ids!(network_url)).set_text(&mut cx, "https://example.org");
+        editor.view.permission_choices(&cx, ids!(sharing_lifetime)).set_selected_item(&mut cx, 1);
+        editor.wizard_step = 2;
+        editor.update_recipient_form(&mut cx);
+        assert!(editor.view.label(&cx, ids!(rule_preview)).text().starts_with("This turn only"));
+        assert!(!editor.view.button(&cx, ids!(add_button)).borrow().unwrap().enabled());
+        assert_eq!(editor.view.button(&cx, ids!(add_button)).text(), "Allow sharing");
+        editor.turn_rules.clear();
+        editor.update_recipient_form(&mut cx);
+        assert!(editor.view.label(&cx, ids!(rule_preview)).text().starts_with("This rule already allows:"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn turn_rules_are_the_sharing_rules_in_the_task_ledger() {
+        use a2app_core::task_grants::{AppliedTask, GrantRef};
+        let account = unique_account("turn-ledger");
+        let _account = TestAccount::set(&account);
+        let _model = TestModel::set(Err("No AI service in this test.".into()));
+        super::super::runtime::initialize_background_test(a2app_core::builtin::stock("account").unwrap());
+        let room = "!turn-ledger-ai:example.org";
+        let context = crate::a2app::information_flow::prepare_agent(room).unwrap();
+        let source = Source::Room { account: account.clone(), room: room.into() };
+        let website = Recipient::NetworkOrigin("https://turn-ledger.example".into());
+        let reader = ReaderScope::Context(context.clone());
+        let turn = flow::grant_sharing(source.clone(), website.clone(), reader.clone(),
+            SharingDuration::RoomSession { account: account.clone(), room: room.into() }).unwrap();
+        let kept = flow::grant_sharing(source, website, reader, SharingDuration::RobrixSession).unwrap();
+        // The turn's other grants may reuse a sharing rule's id; only its Flow grants are sharing rules.
+        with_a2app(|state| state.task_ledger.insert(AppliedTask {
+            task_id: 1, subject: a2app_core::permissions::agent_subject(room), context, epoch: 0, title: "Summarize".into(), plan_hash: [0; 32],
+            grants: vec![GrantRef::Scoped(kept), GrantRef::Flow(turn), GrantRef::Network(kept), GrantRef::Tool(kept)], item_states: Default::default(),
+        })).unwrap();
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+        editor.configure(&mut cx);
+        assert_eq!(editor.turn_rules, [turn].into());
+        let label = |editor: &DataSharing, id: u64| editor.grants.iter().find(|grant| grant.id == id).map(|grant| editor.grant_duration_label(grant)).unwrap();
+        assert_eq!(label(&editor, turn), "This turn only");
+        assert_eq!(label(&editor, kept), "Until Robrix closes");
+        with_a2app(|state| state.task_ledger.remove(1)).unwrap();
+        editor.refresh_rules(&mut cx);
+        assert!(editor.turn_rules.is_empty(), "the label ends with the turn");
+        assert!(label(&editor, turn).starts_with("Until "), "{}", label(&editor, turn));
+        flow::revoke_sharing(turn).unwrap();
+        flow::revoke_sharing(kept).unwrap();
+    }
+
+    #[test]
+    fn history_points_blocked_checks_to_needs_attention_and_can_reopen_them() {
+        use a2app_core::protection_audit::{self, Activity, ActivityKind, ActivityOutcome};
+        let account = unique_account("history-route");
+        let _account = TestAccount::set(&account);
+        let _model = TestModel::set(Err("No AI service in this test.".into()));
+        let room = "!history-route-ai:example.org";
+        let context = crate::a2app::information_flow::prepare_agent(room).unwrap();
+        let own = Source::Room { account: account.clone(), room: room.into() };
+        let directory = Source::RoomDirectory { account: account.clone() };
+        flow::add_sources(&context, [directory.clone()]).unwrap();
+        let website = Recipient::NetworkOrigin("https://history-route.example".into());
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+        editor.configure(&mut cx);
+        assert!(editor.decisions.is_empty(), "an earlier run's check is only in History");
+        editor.activities = vec![Activity { id: 7, timestamp_ms: 1, account: account.clone(), context: Some(context.clone()),
+            recipient: Some(website.clone()), sources: [own.clone(), directory.clone()].into(), blocked_sources: [own.clone(), directory.clone()].into(),
+            kind: ActivityKind::SharingCheck, outcome: ActivityOutcome::Blocked }];
+        editor.activity_key = Some((protection_audit::revision(), 0, None, None, None));
+        editor.view.permission_choices(&cx, ids!(page_choice)).set_selected_item(&mut cx, 2);
+        editor.activity_selection = Some(7);
+        editor.refresh_activity(&mut cx);
+        let details = editor.view.label(&cx, ids!(activity_details)).text();
+        assert!(details.contains("Review in Needs attention"));
+        assert!(!details.contains("Review sharing rule") && !details.contains("Allow sharing"), "History has neither button: {details}");
+        assert!(editor.view.widget(&cx, ids!(history_review)).visible());
+        let actions = press(&mut editor, &mut cx, ids!(history_review));
+        assert!(!actions.iter().any(|action| action.downcast_ref::<A2AppOp>().is_some()), "opening a request approves nothing");
+        assert_eq!(editor.view.permission_choices(&cx, ids!(page_choice)).selected_item(), 1);
+        assert_eq!(editor.decision_selection, Some((context.clone(), website.clone())));
+        assert_eq!(editor.blocked_sources, vec![own.clone(), directory.clone()]);
+        editor.refresh_diagnostics(&mut cx);
+        assert!(editor.selected_decision(&cx).is_some(), "it stays listed until it is resolved");
+        let reader = ReaderScope::Context(context);
+        for source in [own, directory] {
+            flow::grant_sharing(source, website.clone(), reader.clone(), SharingDuration::RobrixSession).unwrap();
+        }
+        editor.activity_selection = Some(7);
+        editor.refresh_activity(&mut cx);
+        assert!(editor.view.label(&cx, ids!(activity_details)).text().contains("Allowed now. Send your message again."));
+        assert!(!editor.view.widget(&cx, ids!(history_review)).visible());
+    }
+
+    #[test]
+    fn history_can_allow_data_the_agent_no_longer_holds_without_calling_it_allowed() {
+        use a2app_core::protection_audit::{self, Activity, ActivityKind, ActivityOutcome};
+        let account = unique_account("history-unheld");
+        let _account = TestAccount::set(&account);
+        let _model = TestModel::set(Err("No AI service in this test.".into()));
+        let room = "!history-unheld-ai:example.org";
+        // As after a restart: the new session's label holds only the agent's own room.
+        let context = crate::a2app::information_flow::prepare_agent(room).unwrap();
+        let other = Source::Room { account: account.clone(), room: "!history-unheld-other:example.org".into() };
+        let third = Source::Room { account: account.clone(), room: "!history-unheld-third:example.org".into() };
+        let website = Recipient::NetworkOrigin("https://history-unheld.example".into());
+        let (mut cx, widget) = editor();
+        let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+        editor.configure(&mut cx);
+        let record = |id: u64, source: &Source| Activity { id, timestamp_ms: id, account: account.clone(), context: Some(context.clone()),
+            recipient: Some(website.clone()), sources: [source.clone()].into(), blocked_sources: [source.clone()].into(),
+            kind: ActivityKind::SharingCheck, outcome: ActivityOutcome::Blocked };
+        editor.activities = vec![record(9, &other), record(10, &third)];
+        editor.activity_key = Some((protection_audit::revision(), 0, None, None, None));
+        editor.view.permission_choices(&cx, ids!(page_choice)).set_selected_item(&mut cx, 2);
+        editor.activity_selection = Some(9);
+        editor.refresh_activity(&mut cx);
+        let details = editor.view.label(&cx, ids!(activity_details)).text();
+        assert!(details.contains("The agent no longer holds this data") && details.contains("choose Review in Needs attention"), "{details}");
+        assert!(!details.contains("Allowed now"), "no rule allows it yet: {details}");
+        assert!(editor.view.widget(&cx, ids!(history_review)).visible(), "it can still be allowed ahead of time");
+        press(&mut editor, &mut cx, ids!(history_review));
+        assert_eq!(editor.decision_selection, Some((context.clone(), website.clone())));
+        editor.refresh_diagnostics(&mut cx);
+        assert_eq!(editor.blocked_sources, vec![other.clone()], "a reopened request keeps data the agent no longer holds");
+        assert!(editor.view.widget(&cx, ids!(review_section)).visible());
+        assert!(editor.view.widget(&cx, ids!(allow_all_section)).visible());
+        // Reopening another record of the same request adds its data.
+        editor.decision_selection = None;
+        editor.view.permission_choices(&cx, ids!(page_choice)).set_selected_item(&mut cx, 2);
+        editor.activity_selection = Some(10);
+        editor.refresh_activity(&mut cx);
+        press(&mut editor, &mut cx, ids!(history_review));
+        assert_eq!(editor.blocked_sources, vec![other.clone(), third.clone()]);
+        for source in [other, third] {
+            flow::grant_sharing(source, website.clone(), ReaderScope::Context(context.clone()), SharingDuration::RobrixSession).unwrap();
+        }
+        editor.refresh_diagnostics(&mut cx);
+        assert!(editor.view.label(&cx, ids!(decision_details)).text().contains("Allowed now. Send your message again."));
     }
 
 }

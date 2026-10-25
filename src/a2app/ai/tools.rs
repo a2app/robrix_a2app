@@ -190,9 +190,8 @@ pub enum ReadToolKind {
     /// `room_info` → `matrix.room.info.read`.
     Info,
     /// `read_other_room_messages` → `matrix.rooms.messages.read`: recent
-    /// messages of another JOINED room the model names. Gated like any other
-    /// read: the user is asked the first time the AI reads a room outside
-    /// this one.
+    /// messages of another JOINED room the model names, gated per room. A room
+    /// the agent did not request is reviewed with the sharing it needs.
     OtherRoom { room: String, limit: u32 },
     /// `list_rooms` → `matrix.rooms.list`: the joined rooms and DMs the
     /// model may offer to read, with names and ids.
@@ -465,9 +464,8 @@ impl Tool for RoomInfoTool {
 }
 
 /// `read_other_room_messages` — read a JOINED room the model names. Gated by
-/// `matrix.rooms.messages.read`; the user is asked the first time the AI
-/// reads a room outside this one, and a granted answer lets it read any
-/// joined room it names.
+/// `matrix.rooms.messages.read` per room; a room the agent did not request up
+/// front is reviewed together with the sharing rules the read needs.
 pub struct ReadOtherRoomMessagesTool {
     host: Arc<dyn AiHost>,
 }
@@ -487,11 +485,12 @@ impl Tool for ReadOtherRoomMessagesTool {
         "Returns the recent messages of another joined room you name, as \
          JSON rows with the sender, sender_id, event_id, the row's own \
          room_id, body, and an unread flag (true when the user hasn't read it \
-         yet). The user is asked to allow each room the first time you read \
-         from it. Attachment rows include media metadata without keys; pass \
-         their event_id and room_id as source_room in inspect_media to see actual contents; draft_media prepares a separate local draft. Once \
-         allowed that one room stays allowed, but a different \
-         room is a fresh ask. Use list_rooms to see which rooms exist."
+         yet). Attachment rows include media metadata without keys; pass \
+         their event_id and room_id as source_room in inspect_media to see actual contents; draft_media prepares a separate local draft. \
+         List every room a task reads in request_task_permissions first. A room you did not request \
+         makes the host ask the user before the read runs; if they decline, make no other unrequested reads this turn \
+         and request rooms you still need with request_task_permissions. \
+         Use list_rooms to find room ids."
     }
 
     fn input_schema(&self) -> Value {

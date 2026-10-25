@@ -1536,6 +1536,22 @@ impl PermissionScopeEditorRef {
         inner.view.permission_choices(cx, ids!(duration_choice)).set_selected_item(cx, 1);
     }
 
+    /// Preselects how long the permission lasts; a room session needs a room that ends it.
+    pub(crate) fn set_duration(&self, cx: &mut Cx, duration: GrantDuration) {
+        let Some(mut inner) = self.borrow_mut() else { return };
+        let has_room = usize::from(inner.origin_room.is_some() || inner.choose_origin);
+        let index = match duration {
+            GrantDuration::RoomSession if has_room == 1 => 0,
+            GrantDuration::RoomSession => return,
+            GrantDuration::RobrixSession => has_room,
+            GrantDuration::Always => has_room + 1,
+        };
+        inner.duration = index;
+        inner.view.permission_choices(cx, ids!(duration_choice)).set_selected_item(cx, index);
+        let is_origin_visible = inner.choose_origin && index == 0;
+        inner.view.widget(cx, ids!(session_origin_section)).set_visible(cx, is_origin_visible);
+    }
+
     pub(crate) fn set_scope(&self, cx: &mut Cx, scope: &RoomScope) {
         let Some(mut inner) = self.borrow_mut() else { return };
         inner.all_rooms = matches!(scope, RoomScope::AllRooms);
@@ -1623,6 +1639,24 @@ mod tests {
         assert_eq!(selection.duration, GrantDuration::RoomSession);
         editor.set_scope(&mut cx, &RoomScope::Selection { rooms: Vec::new(), spaces: Vec::new() });
         assert!(editor.selection().is_err(), "an empty checklist must never broaden to all rooms");
+    }
+
+    #[test]
+    fn preselected_duration_keeps_the_session_room_and_skips_a_room_session_without_one() {
+        let (mut cx, editor) = editor();
+        editor.configure(&mut cx, None, Some("!source:example.org"), None, false, false);
+        for (duration, index) in [(GrantDuration::RobrixSession, 1), (GrantDuration::Always, 2), (GrantDuration::RoomSession, 0)] {
+            editor.set_duration(&mut cx, duration);
+            let selection = editor.selection().unwrap();
+            assert_eq!(selection.duration, duration);
+            assert_eq!(selection.origin_room.as_deref(), Some("!source:example.org"));
+            assert_eq!(editor.borrow().unwrap().view.permission_choices(&cx, ids!(duration_choice)).selected_item(), index);
+        }
+        editor.configure(&mut cx, None, None, None, false, false);
+        editor.set_duration(&mut cx, GrantDuration::RoomSession);
+        assert_eq!(editor.selection().unwrap().duration, GrantDuration::RobrixSession, "no room can end a room session here");
+        editor.set_duration(&mut cx, GrantDuration::Always);
+        assert_eq!(editor.selection().unwrap().duration, GrantDuration::Always);
     }
 
     #[test]

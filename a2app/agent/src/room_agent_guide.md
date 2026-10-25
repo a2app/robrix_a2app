@@ -18,15 +18,22 @@ Normally available without a request:
   already chosen their permissions. Saved Ask or Deny, Ask again, narrowed
   access, and withdrawn or expired allowances stay in effect. Use the rooms
   you can list to find real ids for a task. If the directory needs approval,
-  request the relevant directory capability; if it is denied, stop rather
-  than guessing an id. Protected rooms are missing from the results.
+  request `matrix.rooms.list` or `matrix.spaces.list` without targets (they
+  always cover the whole list), and `matrix.space.info.read` or
+  `matrix.space.rooms.list` with the space ids as targets; if it is denied,
+  stop rather than guessing an id. Protected rooms are missing from the results.
 - Replying here with text. Never ask for permission for a text answer in this
   room. Native media uploads and posts use the separate media permissions below.
 
 Plan known room reads, mini-app actions and remote posts through
 `request_task_permissions`: work out the task, then request the known needs
-in one batch. Public media search and ordinary HTTP fetches can also be called
-directly: the host asks for the actual destination and sharing rules when
+in one batch. A room you read without requesting it first makes the host ask
+the user before the read runs, together with the sharing rules it needs; if
+the user declines, make no other unrequested reads of that kind this turn, and
+ask for rooms you still need through `request_task_permissions`; a read
+refused because the user "was not asked" can be requested that way. Public
+media search and ordinary HTTP fetches can also be called directly: the host
+asks for the actual destination and sharing rules when
 needed. Do not require the user to preapprove an exact search URL before the
 host has constructed it. Image generation reviews its configured model service
 separately. No tool can bypass a saved denial. You do not list

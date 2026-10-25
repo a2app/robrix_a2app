@@ -494,6 +494,16 @@ impl PermissionStore {
         result(global, GlobalDefault)
     }
 
+    /// Whether a block set on this room, or on a space that contains it,
+    /// denies `access`, ignoring the global defaults and the write switch.
+    /// An unresolved space hierarchy fails closed, as in the full evaluation.
+    pub fn is_blocked_by_room_rule(&self, room: &str, access: RoomAccess) -> bool {
+        if self.room_rules().get(room).is_some_and(|policy| policy.get(access) == PolicyDecision::Deny) { return true; }
+        let ancestors = self.room_spaces.get(room);
+        self.space_rules().iter().any(|(space, policy)| policy.get(access) == PolicyDecision::Deny
+            && (space == room || ancestors.is_none_or(|set| set.contains(space))))
+    }
+
     pub fn capability_room_policy(&self, cap: &Capability, context: PermissionContext<'_>) -> PolicyDecision {
         self.capability_room_evaluation(cap, context).map(|(_, evaluation)| evaluation.decision).unwrap_or(PolicyDecision::Ask)
     }
@@ -723,6 +733,22 @@ impl PermissionStore {
         }) || (group == Permission::MatrixRoomsRead && self.read_rooms.get(subject).is_some_and(|rooms| !rooms.is_empty()))
     }
 
+    /// Whether the user asked to review `permission` for `subject` even where a
+    /// room rule or default would allow it.
+    pub fn is_explicit_review_needed(&self, subject: &str, permission: Permission) -> bool {
+        self.needs_explicit_review(subject, permission)
+    }
+
+    /// Whether consent to a room or space list covers every row, not just the
+    /// selected rooms a narrower allowance would let through.
+    pub fn is_whole_directory_allowed(&self, subject: &str, cap: &Capability, context: PermissionContext<'_>) -> bool {
+        let Some(group) = cap.group else { return true };
+        self.capability_state(subject, cap.id) == GrantState::Granted
+            || self.state(subject, group) == GrantState::Granted
+            || (self.global_policy(RoomAccess::Read) == PolicyDecision::Allow && !self.needs_explicit_review(subject, group))
+            || self.has_all_room_collection_consent(subject, cap, context)
+    }
+
     /// Aggregate account totals require an explicit all-rooms grant.
     /// A selected room or space can authorize rows, never unfiltered totals.
     pub fn has_all_room_collection_consent(&self, subject: &str, cap: &Capability, context: PermissionContext<'_>) -> bool {
@@ -859,6 +885,24 @@ mod tests {
         assert!(!store.has_all_room_collection_consent("app", list, owner));
         store.remove_scoped_grant(id);
         assert!(!store.has_all_room_collection_consent("app", cap, owner));
+    }
+
+    #[test]
+    fn explicit_room_and_space_blocks_apply_even_with_writes_off() {
+        let mut store = PermissionStore::default();
+        assert!(!store.matrix_write());
+        assert_eq!(store.room_policy(Some("!ai:s"), RoomAccess::Write), PolicyDecision::Deny);
+        assert!(!store.is_blocked_by_room_rule("!ai:s", RoomAccess::Write), "the write switch is not a room block");
+        store.set_room_policy("!ai:s", RoomAccess::Write, PolicyDecision::Deny);
+        assert!(store.is_blocked_by_room_rule("!ai:s", RoomAccess::Write));
+        assert!(!store.is_blocked_by_room_rule("!ai:s", RoomAccess::Read));
+        let mut store = PermissionStore::default();
+        store.set_space_policy("!space:s", RoomAccess::Write, PolicyDecision::Deny);
+        assert!(store.is_blocked_by_room_rule("!ai:s", RoomAccess::Write), "an unresolved hierarchy fails closed");
+        store.set_room_spaces("!ai:s", Vec::new());
+        assert!(!store.is_blocked_by_room_rule("!ai:s", RoomAccess::Write));
+        store.set_room_spaces("!ai:s", vec!["!space:s".into()]);
+        assert!(store.is_blocked_by_room_rule("!ai:s", RoomAccess::Write));
     }
 
     fn context<'a>(origin: &'a str, target: &'a str) -> PermissionContext<'a> {

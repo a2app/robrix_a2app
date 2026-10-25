@@ -1,4 +1,5 @@
 use super::*;
+use super::diagnostics::{allowed_now_text, is_allowed_now, no_longer_held_text, remaining_denials};
 use a2app_core::{information_flow::Label, protection_audit::{self, ActivityKind, ActivityOutcome}};
 
 impl DataSharing {
@@ -12,17 +13,74 @@ impl DataSharing {
         let mut text = if blocked.len() == 1 {
             "Sharing needs your approval. Choose Review sharing rule, check the destination and duration, then choose Allow sharing. Return to the app and try again."
         } else {
-            "Sharing rules need your approval. In Needs attention, select a data source and choose Review sharing rule. Check the destination and duration before choosing Allow sharing. Repeat for each source, then return to the app and try again."
+            "Sharing rules need your approval. Choose Allow all listed data, or select one data source and choose Review sharing rule. Then return to the app and try again."
         }.to_string();
         if blocked.iter().any(|source| match source { Source::Room { account, .. } | Source::Account { account } | Source::RoomDirectory { account } => account != &self.account, Source::UnknownPrivate => false }) {
             text.push_str("\nSome data belongs to another account. Sign in to that account to review its sharing permission.");
         }
-        if let Recipient::ModelProvider(id) = recipient
-            && self.model.as_ref().is_none_or(|model| &model.id != id)
-        {
-            text.push_str("\nYour AI service has changed. Restart the agent and review its new request.");
+        if let Recipient::ModelProvider(id) = recipient {
+            if self.model.is_none() {
+                text.push('\n');
+                text.push_str(&self.model_unavailable_text());
+            } else if self.model.as_ref().is_some_and(|model| &model.id != id) {
+                text.push_str("\nYour AI service has changed. Restart the agent and review its new request.");
+            }
         }
         text
+    }
+
+    /// A blocked History record as a request Needs attention can review: the data today's rules still
+    /// don't allow, even data its context no longer holds, so it can be allowed ahead of time.
+    fn history_request(&self, entry: &protection_audit::Activity) -> Option<FlowDecision> {
+        if entry.kind != ActivityKind::SharingCheck || entry.outcome != ActivityOutcome::Blocked
+            || entry.blocked_sources.contains(&Source::UnknownPrivate) || entry.recipient == Some(Recipient::External)
+        { return None; }
+        let (context, recipient) = (entry.context.clone()?, entry.recipient.clone()?);
+        if context.account() != self.account || !self.snapshots.iter().any(|snapshot| snapshot.context == context) { return None; }
+        let mut request = FlowDecision { context, epoch: 0, recipient, sources: entry.sources.clone(), denied_sources: Label::new(), allowed: false };
+        request.denied_sources = remaining_denials(&entry.blocked_sources, None, |source| is_allowed_now(source, &request)).0;
+        request.allowed = request.denied_sources.is_empty();
+        Some(request)
+    }
+
+    /// Whether the request's context no longer holds any of its blocked data.
+    fn is_no_longer_held(&self, request: &FlowDecision) -> bool {
+        self.snapshots.iter().find(|snapshot| snapshot.context == request.context)
+            .is_some_and(|snapshot| !request.denied_sources.iter().any(|source| snapshot.label.contains(source)))
+    }
+
+    pub(super) fn selected_history_request(&self) -> Option<FlowDecision> {
+        let entry = self.activities.iter().find(|entry| Some(entry.id) == self.activity_selection)?;
+        self.history_request(entry).filter(|request| !request.allowed)
+    }
+
+    /// Opens a History record in Needs attention, which lists it until it is resolved.
+    pub(super) fn review_history_request(&mut self, cx: &mut Cx, request: FlowDecision) {
+        match self.recalled_decisions.iter_mut().find(|recalled| is_decision_for(recalled, &decision_key(&request))) {
+            Some(recalled) => recalled.denied_sources.extend(request.denied_sources.iter().cloned()),
+            None => self.recalled_decisions.push(request.clone()),
+        }
+        self.activity_selection = None;
+        self.view.permission_choices(cx, ids!(page_choice)).set_selected_item(cx, 1);
+        self.refresh_diagnostics(cx);
+        self.open_card(cx, &SharingCardTarget::Decision(request));
+        self.update_page(cx);
+    }
+
+    /// History has no review controls, so its advice points to Needs attention.
+    fn history_remedy(&self, entry: &protection_audit::Activity) -> String {
+        let Some(recipient) = entry.recipient.as_ref().filter(|_| !entry.blocked_sources.is_empty()) else { return String::new() };
+        // These explanations name no controls.
+        if entry.blocked_sources.contains(&Source::UnknownPrivate) || *recipient == Recipient::External {
+            return self.sharing_remedy(&entry.blocked_sources, recipient);
+        }
+        match self.history_request(entry) {
+            Some(request) if request.allowed => allowed_now_text(&request.context).into(),
+            Some(request) if self.is_no_longer_held(&request) =>
+                format!("{} To allow it now, choose Review in Needs attention.", no_longer_held_text(&request.context)),
+            Some(_) => "To allow this sharing, choose Review in Needs attention.".into(),
+            None => "This request can't be reviewed from here. Run the app or send your message again; if it is blocked again, it appears in Needs attention.".into(),
+        }
     }
 
     pub(super) fn refresh_activity(&mut self, cx: &mut Cx) {
@@ -61,14 +119,15 @@ impl DataSharing {
             let context = entry.context.as_ref().map(|context| self.context_label(context)).unwrap_or_else(|| "Account protection settings".into());
             let recipient = entry.recipient.as_ref().map(|recipient| self.recipient_label(recipient)).unwrap_or_else(|| "No external recipient".into());
             let sources = entry.sources.iter().map(|source| self.source_label(source)).collect::<Vec<_>>();
-            let remedy = if !entry.blocked_sources.is_empty() {
-                entry.recipient.as_ref().map(|recipient| format!("\n\n{}", self.sharing_remedy(&entry.blocked_sources, recipient))).unwrap_or_default()
-            } else { String::new() };
-            format!("{}\n{context}\n{}\n{}\nRecipient: {recipient}\nSources:\n{}{remedy}",
+            let remedy = self.history_remedy(entry);
+            format!("{}\n{context}\n{}\n{}\nRecipient: {recipient}\nSources:\n{}{}",
                 activity_time(entry.timestamp_ms), activity_kind(entry.kind), entry.outcome.label(),
-                if sources.is_empty() { "None recorded".into() } else { bullets(&sources) })
+                if sources.is_empty() { "None recorded".into() } else { bullets(&sources) },
+                if remedy.is_empty() { remedy } else { format!("\n\n{remedy}") })
         }).unwrap_or_else(|| "This activity record is no longer available.".into());
         self.view.label(cx, ids!(activity_details)).set_text(cx, &details);
+        let is_reviewable = self.selected_history_request().is_some();
+        self.view.widget(cx, ids!(history_review)).set_visible(cx, is_reviewable);
     }
 }
 

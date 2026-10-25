@@ -439,6 +439,16 @@ pub fn ensure_room_access(room: &str, access: RoomAccess) -> Result<(), String> 
     })
 }
 
+/// An AI room's own reply, status rows and cursor are its conversation with
+/// the user, not a room change: a block on the room or a parent space stops
+/// them, while the write switch and the write default do not.
+pub fn ensure_agent_room_output_access(room: &str) -> Result<(), String> {
+    ensure_live_activation()?;
+    with_current_policy(|store| {
+        if store.is_blocked_by_room_rule(room, RoomAccess::Write) { Err(ROOM_ACCESS_DENIED.to_string()) } else { Ok(()) }
+    })
+}
+
 /// Recheck a host-defined sensitive target immediately before its effect.
 pub async fn commit_sensitive_target(target: &str, payload: &serde_json::Value) -> Result<(), String> {
     ensure_live_activation()?;

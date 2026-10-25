@@ -47,10 +47,13 @@ pub fn begin_agent_session(room: &str) -> Result<ContextId, String> {
     Ok(context)
 }
 
+/// The sharing check's refusal, as it reaches the agent and its error rows.
+pub const SHARING_REFUSED: &str = "Your permission is needed before this data can be sent.";
+
 /// Appends task-permission guidance to a missing sharing permission without
 /// assuming whether the source was already held or newly read.
 pub fn with_task_reask_hint(error: String) -> String {
-    if error.contains("Information flow blocked") || error == "Your permission is needed before this data can be sent." {
+    if error.contains("Information flow blocked") || error.contains(SHARING_REFUSED) {
         format!("{error} Call request_task_permissions with any additional room, URL or mini-app tool this task needs so its sharing rules can be reviewed; a need already declined this turn must not be requested again.")
     } else {
         error
@@ -110,17 +113,17 @@ pub fn ensure_agent_default_sharing(
         by_recipient.entry(recipient).or_default().push(source);
     }
     for (recipient, sources) in by_recipient {
-        let marker = format!("{room}|{}", serde_json::to_string(&recipient).unwrap_or_default());
-        if !applied.insert(marker) {
+        let marker = default_sharing_marker(room, &recipient);
+        if applied.contains(&marker) {
             // This recipient's defaults were already applied once; a revoked
             // rule stays revoked.
             continue;
         }
-        changed = true;
+        let mut stored = true;
         for source in sources {
-            // The same-room source/recipient pair is implicitly allowed, so it
-            // needs no stored grant; skip anything already covered.
-            if flow::sharing_allows_for_reader(&source, &recipient, context).unwrap_or(false) {
+            // Only a saved rule counts: a turn-scoped rule covering the pair
+            // now is gone when the turn ends, and the default with it.
+            if flow::is_durably_allowed_for_reader(&source, &recipient, context).unwrap_or(false) {
                 continue;
             }
             // A grant can only fail on a registry write; surface it, since the
@@ -132,10 +135,69 @@ pub fn ensure_agent_default_sharing(
                 SharingDuration::Permanent,
             ) {
                 makepad_widgets::log!("AI Rooms: couldn't grant the default sharing rule {source:?} -> {recipient:?}: {error}");
+                stored = false;
             }
+        }
+        // Mark the default only once it is saved, so a failed write is retried
+        // on the next session start.
+        if stored {
+            applied.insert(marker);
+            changed = true;
         }
     }
     changed
+}
+
+fn default_sharing_marker(room: &str, recipient: &Recipient) -> String {
+    format!("{room}|{}", serde_json::to_string(recipient).unwrap_or_default())
+}
+
+/// Forgets the default markers for exactly the current recipients, so a
+/// restore applies them again while another AI service's revoked rules stay
+/// revoked.
+pub fn forget_agent_sharing_defaults(
+    context: &ContextId,
+    room: &str,
+    model: Option<&str>,
+    homeserver: Option<&str>,
+    sharing_defaults: &mut std::collections::BTreeSet<String>,
+) {
+    for recipient in default_recipients(context, room, model, homeserver) {
+        sharing_defaults.remove(&default_sharing_marker(room, &recipient));
+    }
+}
+
+/// Whether the defaults for every current recipient are recorded as saved.
+pub fn are_agent_sharing_defaults_applied(
+    context: &ContextId,
+    room: &str,
+    model: Option<&str>,
+    homeserver: Option<&str>,
+    sharing_defaults: &std::collections::BTreeSet<String>,
+) -> bool {
+    default_recipients(context, room, model, homeserver).iter()
+        .all(|recipient| sharing_defaults.contains(&default_sharing_marker(room, recipient)))
+}
+
+/// The recipients an AI room's baseline rules cover: the room itself, the
+/// current AI service and the homeserver.
+fn default_recipients(context: &ContextId, room: &str, model: Option<&str>, homeserver: Option<&str>) -> Vec<Recipient> {
+    let mut recipients = vec![Recipient::MatrixRoom { account: context_account(context).into(), room: room.into() }];
+    recipients.extend(model.filter(|model| !model.is_empty()).map(|model| Recipient::ModelProvider(model.to_string())));
+    recipients.extend(homeserver.and_then(|homeserver| Recipient::network_origin(homeserver).ok()));
+    recipients
+}
+
+/// Forgets that an AI room's one-time defaults were applied, so its next
+/// session start (or an explicit restore) applies them again.
+pub fn forget_agent_defaults(
+    room: &str,
+    capability_defaults: &mut std::collections::BTreeSet<String>,
+    sharing_defaults: &mut std::collections::BTreeSet<String>,
+) {
+    capability_defaults.remove(room);
+    let prefix = format!("{room}|");
+    sharing_defaults.retain(|marker| !marker.starts_with(&prefix));
 }
 
 /// User-supplied source is private account input, including future versions.
@@ -212,6 +274,18 @@ pub fn ensure_room_output(context: &ContextId, room: &str) -> Result<(), String>
     flow::ensure_allowed(context, &Recipient::MatrixRoom {
         account: context_account(context).into(), room: room.into(),
     })
+}
+
+/// An AI room's reply and status rows are unencrypted Matrix state, so their
+/// sources must also reach the homeserver that stores them, as the worker checks.
+pub fn ensure_agent_room_output(context: &ContextId, room: &str) -> Result<(), String> {
+    ensure_room_output(context, room)?;
+    let homeserver = crate::sliding_sync::get_client()
+        .and_then(|client| Recipient::network_origin(client.homeserver().as_str()).ok());
+    match homeserver {
+        Some(homeserver) => flow::ensure_allowed(context, &homeserver),
+        None => Ok(()),
+    }
 }
 
 /// Remember explicit room identifiers in a host response before exposing it.

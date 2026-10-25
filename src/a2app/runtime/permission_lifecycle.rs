@@ -77,6 +77,11 @@ fn save_reset(cx: &mut Cx, ui: &WidgetRef, account: &str, result: Result<(), Str
     let saved = with_a2app(|state| {
         let saved = persistence::save_permissions(&state.permissions).map_err(|error| error.to_string());
         state.perms_dirty = saved.is_err();
+        if state.registry_dirty {
+            let markers = persistence::save_registry_state(&state.persisted).map_err(|error| error.to_string());
+            state.registry_dirty = markers.is_err();
+            return saved.and(markers);
+        }
         saved
     }).unwrap_or_else(|| Err("Mini Apps is unavailable.".into()));
     a2app_core::protection_audit::record_policy_change(account);
@@ -95,6 +100,12 @@ pub(super) fn reset_app_permissions(cx: &mut Cx, ui: &WidgetRef, subject: &str) 
     with_a2app(|state| {
         state.permissions.reset_subject(subject);
         state.perms_dirty = true;
+        // An agent's reset restores its room's defaults on the next session.
+        if let Some(room) = agent_room_of(subject) {
+            information_flow::forget_agent_defaults(room,
+                &mut state.persisted.permission_defaults_applied, &mut state.persisted.default_sharing_applied);
+            state.registry_dirty = true;
+        }
         state.dismissed_prompts.retain(|(owner, _)| owner != subject);
         state.dismissed_net_hosts.retain(|(owner, _)| owner != subject);
         state.dismissed_effects.retain(|(context, _)| !context_matches_subject(context, &account, subject));
@@ -104,7 +115,10 @@ pub(super) fn reset_app_permissions(cx: &mut Cx, ui: &WidgetRef, subject: &str) 
     let result = revoke_flow_permissions(&account, subject, None);
     super::cancel_subject_permission_prompts(cx, ui, subject);
     let retired = retire_subject(cx, ui, subject);
-    save_reset(cx, ui, &account, result.and(retired), "Permissions reset. Reopen the app to review new requests. Its saved data is kept.");
+    let message = if agent_room_of(subject).is_some() {
+        "Permissions reset. This AI room's default access returns when you next send it a message."
+    } else { "Permissions reset. Reopen the app to review new requests. Its saved data is kept." };
+    save_reset(cx, ui, &account, result.and(retired), message);
 }
 
 pub(super) fn ask_again(cx: &mut Cx, ui: &WidgetRef, subject: &str, permission: Permission) {

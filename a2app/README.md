@@ -296,7 +296,9 @@ Robrix translates into Splash and draws inside the message
 
 The Mini Apps screen keeps **Allow apps to send or change rooms** at the top. Turning it off
 blocks every mini-app and agent from writing to rooms and disables their room
-write controls, while keeping saved rules. **Room and space access** starts with
+write controls, while keeping saved rules. An AI room's own replies and activity
+cards in that room are its conversation with you, not a room change, so the
+switch does not stop them; a block on that room or a parent space still does. **Room and space access** starts with
 the current reading and writing settings and saved rules. Choose **Change** to
 edit one default, or **Add room or space…** to choose targets and then set their
 read/write access. A block always wins. **Check access** explains which control
@@ -306,7 +308,9 @@ Open a mini-app's settings and choose a permission to see its current state and
 saved allowances. **Add an allowance…** opens room, website and duration choices;
 Expand **Individual abilities** for narrower controls. **AI room permissions**
 asks for the agent's room and then the permission to edit. Opening or cancelling
-an editor does not grant access.
+an editor does not grant access. Its **Restore default access**, also in the
+room's **/ai** panel, puts back the room and space list and the sharing rules
+the agent needs to reply, without changing other permissions.
 
 The regular **Permissions** panel also lists saved action and sharing approvals.
 Each approval summarizes its destination, duration and data sources. **Details…**
@@ -320,7 +324,9 @@ data stays intact, and other apps' permissions and room protection stay intact.
 **Reset all permissions…** in the Mini Apps screen restores default access,
 clears saved approvals and blocks, stops active apps and agents, and pauses
 background tasks. App data and provenance are retained. Apps ask again when
-opened; background tasks must be enabled again.
+opened; background tasks must be enabled again. Each AI room applies its
+default access again before its next turn, as does an agent whose own
+permissions were reset.
 
 Request popups show the app, task and captured rooms or website. Choose **One
 time**, **Until this room closes**, **Until you quit Robrix**, or **Forever** under
@@ -651,11 +657,20 @@ per-task ledger once the last of those writes lands. The grants are in-memory se
 never written to disk, and the runtime also revokes the exact applied batch
 from its per-task ledger once the turn's final writes have landed, the session
 stops, or the room closes. "Not now" is remembered for the turn by
-what the plan needs, independent of the agent's own need labels: a later
-request with the same needs, or a subset, is declined without a modal, while a
-request that adds a new need is shown. A turn may make at most three requests,
-so a looping agent cannot re-ask forever. The per-call prompts remain the
-fallback for anything the agent did not list. The plan model, resolver and
+the needs the user was asked to allow, independent of the agent's own need
+labels: a later request whose needs were all declined, or a subset (rooms
+declined in separate requests add up), is declined without a modal, while a
+request that adds a new need is shown. Rows that were already allowed, blocked
+or not offered are not part of a decline. A turn may make at most three requests,
+so a looping agent cannot re-ask forever. A room read the agent did not list
+raises the same kind of review by itself, with the sharing rules that read
+needs, so approving it is enough for the reply to arrive; the read joins the
+agent's label only once it runs. Such reviews have their own cap of eight per
+turn, so approved reads don't use up the three requests. "Not now" on one also
+refuses the agent's other unrequested reads of that kind for the turn without
+showing them; their answer says the user was not asked, so the agent can still
+list those rooms in a request. Other per-call prompts remain the fallback for
+anything else the agent did not list. The plan model, resolver and
 atomic apply live in `a2app/core/src/task_grants.rs`; the prompt is
 `src/a2app/task_permission_prompt.rs`. The modal can wait behind other
 prompts, so every grantable item is re-checked against the live permission
@@ -675,7 +690,11 @@ or expired allowances are preserved even on an upgrade before the defaults
 first run. Each default is a durable all-rooms grant for the exact directory
 capability; it does not enable other capabilities in the same group. A
 persisted per-room marker means the defaults are never re-applied: once the
-user changes or withdraws one, that choice sticks across sessions. The room's own
+user changes or withdraws one, that choice sticks across sessions. A reset
+clears the marker, so the defaults return before the room's next turn, and
+**Restore default access** brings them back on request. A
+`request_task_permissions` need for `matrix.rooms.list` or `matrix.spaces.list`
+takes no targets and always covers the whole list. The room's own
 messages, its info, and the installed-app list are **not** defaulted; they go
 through `request_task_permissions` like any other need. Directory results carry
 no message content but are still other people's words, so they are labelled
@@ -713,7 +732,8 @@ own content. Nothing account-level, such as the installed-app list, is shared
 by default. Every rule is `Permanent` and visible in the Data Sharing editor;
 the once-per-room and once-per-recipient markers mean a rule the user revokes
 there stays revoked, and a newly selected model provider gets only its own
-rules.
+rules. A marker is recorded only once its rule is saved, and a turn-scoped rule
+covering the same pair never counts as the saved default.
 
 **Exact-action review.** Only an agent's own-room `ai.reply.write` and
 `ai.activity.write` rows skip the exact-action review: they are the assistant's
@@ -730,18 +750,31 @@ untrusted content therefore pauses for a per-action review; that is intended.
 **Carried-over sources between turns.** The agent's conversation memory
 persists for a session, so its information-flow label does too, but the
 permission and sharing rules a turn applied are turn-scoped and revoked when
-the turn closes. At the start of each turn, if the label still holds a source
-from an earlier turn (another room, account data) that the current model
-provider may no longer see, Robrix raises one prompt on the agent's behalf
-before the first model call. It lists `Let <source> reach <provider>` rows
+the turn closes. At the start of each turn, if the label holds a source that
+the current model provider, the homeserver origin or the room itself may not
+receive, Robrix raises one prompt on the agent's behalf before the first model
+call. That includes the room's own conversation and the room directory when
+their default rules were revoked; the prompt then says those rules are off and
+points to **Restore default access**. It lists `Let <source> reach <provider>` rows
 plus the homeserver-origin and own-room rows (so the turn's reply and activity
 rows can be written), and explains: "Earlier in this conversation the
 assistant read <room names>. Allow it to keep using that information for this
 turn." Approval applies the rows through the same task-apply path and the
 same ledger, so the turn's close revokes them again and the next turn prompts
 again. Declining still delivers the message: the turn runs, the model call is
-refused the standard way ("Information flow blocked"), and the room shows the
-error row.
+refused the standard way ("Your permission is needed before this data can be
+sent."), and Robrix shows a popup saying the AI stopped and that sending the
+message again reviews the sharing; the room shows the error row when its own
+rules allow it. Data of unknown origin (from an older mini-app) is never
+shared, so while the AI holds it no review is raised and the popup says to turn
+the room's AI off and on in `/ai`, which starts a fresh session.
+
+**Held replies.** A finished reply that a sharing rule would refuse is not
+dropped silently. Robrix holds it, shows one review of exactly the missing rules
+for the room and the homeserver, and posts it when approved; the turn's card
+waits with it, and the turn's other grants stay until it lands. When that review
+was already declined this turn, or the reply holds data of unknown origin that no
+rule can release, the reply is not posted and a popup says why and what to do.
 
 **Re-asking.** A gated read, fetch or post refused because the label grew
 returns an error telling the agent to ask again with the new need. The agent
@@ -749,7 +782,14 @@ may make at most three requests per turn, and each after the first must contain
 a need not already declined. "Not now" is remembered by the plan's needs, so a
 re-labeled request with the same needs, or a subset, is refused without a modal
 and combining needs from earlier declined plans is also refused. A request
-must contain at least one new need to raise another prompt.
+must contain at least one new need to raise another prompt. An agent's "Not
+now" on a single per-call prompt, or on a reviewed read, also lasts only until
+its turn ends; allowing the same permission in Mini Apps clears it at once.
+When a turn ends, its requests, reviews and permission prompts still open are
+withdrawn and its tool calls still waiting to run are refused, so a late answer
+can't apply to the next turn.
+An AI room's own replies also ignore the write default **Only in rooms I allow**:
+only a block on that room or a parent space stops them.
 
 `launch_splash_app` is create-only: it never rewrites an installed app. Running
 an app that already exists is `launch_app`'s job — list the ids with
@@ -823,7 +863,8 @@ approvals retain their original exact scope until replaced or removed.
 
 Global, room and ancestor-space blocks always override allowlists and app
 grants. Read and write are independent. The **Allow apps to send or change rooms** master switch
-pauses all room writes and disables individual write editors, retaining their
+pauses all room writes by mini-apps and agents, except an AI room's own replies
+and cards in that room, and disables individual write editors, retaining their
 saved rules and the previous write default for when the switch is enabled again.
 Read and write defaults each support **Only in rooms I allow**:
 selected room/space allowances work, unlisted rooms are denied, and explicit

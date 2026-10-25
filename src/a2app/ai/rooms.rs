@@ -184,7 +184,7 @@ async fn send_ai_state_event(
     content: serde_json::Value,
     flow_context: &ContextId,
 ) -> Result<(), String> {
-    policy::ensure_room_access(room.room_id().as_str(), RoomAccess::Write)?;
+    policy::ensure_agent_room_output_access(room.room_id().as_str())?;
     use matrix_sdk::ruma::api::client::state::send_state_event;
     use matrix_sdk::utils::IntoRawStateEventContent;
     let config = room.client().request_config().disable_retry();
@@ -775,14 +775,14 @@ async fn read_cursor(room: &Room) -> Option<AiSessionCursorContent> {
 
 /// Persists the last-forwarded event id as room account data.
 async fn save_cursor(room: &Room, cursor: &OwnedEventId, flow_context: &ContextId) -> Result<(), String> {
-    policy::ensure_room_access(room.room_id().as_str(), RoomAccess::Write)?;
+    policy::ensure_agent_room_output_access(room.room_id().as_str())?;
     policy::ensure_room_flow_output(flow_context, room.room_id().as_str())?;
     write_cursor_account_data(room, cursor).await
 }
 
 fn ensure_host_cursor_access(account: &str, current_account: Option<&str>, room_id: &OwnedRoomId) -> Result<(), String> {
     if current_account != Some(account) { return Err("The cursor's account is no longer active.".into()); }
-    policy::ensure_room_access(room_id.as_str(), RoomAccess::Write)
+    policy::ensure_agent_room_output_access(room_id.as_str())
 }
 
 /// Cursor requests share one ordered writer per account and room. Requests
@@ -859,7 +859,7 @@ fn friendly_state_post_error(e: &matrix_sdk::Error) -> String {
 /// Writes one agent turn as an `ai_reply` state event with a fresh state key
 /// (so it never overwrites a previous turn's reply).
 async fn post_reply(room: &Room, content: &AiReplyContent, flow_context: &ContextId) -> Result<(), String> {
-    policy::ensure_room_access(room.room_id().as_str(), RoomAccess::Write)?;
+    policy::ensure_agent_room_output_access(room.room_id().as_str())?;
     let json = serde_json::to_value(content).map_err(|e| e.to_string())?;
     let key = next_reply_state_key();
     use matrix_sdk::ruma::api::client::state::send_state_event;
@@ -1100,6 +1100,8 @@ mod cursor_write_tests {
         policy::publish_permission_policy(&store);
         assert!(ensure_host_cursor_access(&captured, Some(&account), &room_id).is_err());
         policy::publish_permission_policy(&a2app_core::permissions::PermissionStore::default());
+        assert!(ensure_host_cursor_access(&captured, Some(&account), &room_id).is_ok(),
+            "the write switch alone does not stop an AI room's own cursor");
         crate::a2app::information_flow::TEST_ACCOUNT.with(|a| { a.replace(previous_account); });
     }
 

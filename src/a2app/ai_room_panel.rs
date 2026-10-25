@@ -136,6 +136,14 @@ script_mod! {
                 }
             }
             usage_label := ModalBody {}
+            restore_row := View {
+                width: Fill, height: Fit, flow: Down, spacing: 8
+                ModalBody { text: "If this room's AI stopped answering after a reset, restore its default access: it can list your rooms and spaces and share this conversation with your AI service. Other permissions are unchanged." }
+                restore_defaults_button := RobrixNeutralIconButton {
+                    text: "Restore default access"
+                    icon_walk: Walk{width: 0, height: 0, margin: 0}
+                }
+            }
             restrict_row := View {
                 width: Fill, height: Fit, flow: Down, spacing: 8
                 restrict_notice := ModalBody {}
@@ -170,6 +178,8 @@ pub enum AiRoomPanelCommand {
     Unrestrict,
     /// Forget the individual rooms, sites and tools this AI was allowed.
     ForgetExtras,
+    /// Put back the room's default directory access and sharing rules.
+    RestoreDefaults,
     /// Turn the session power on.
     PowerOn,
     /// Turn the session power off (stops the agent).
@@ -277,6 +287,9 @@ impl Widget for AiRoomPanel {
         if self.view.button(cx, ids!(forget_extras_button)).clicked(actions) {
             emit_panel_action(cx, &room_id, None, AiRoomPanelCommand::ForgetExtras);
         }
+        if self.view.button(cx, ids!(restore_defaults_button)).clicked(actions) {
+            emit_panel_action(cx, &room_id, None, AiRoomPanelCommand::RestoreDefaults);
+        }
         if self.view.button(cx, ids!(unrestrict_button)).clicked(actions) {
             emit_panel_action(cx, &room_id, None, AiRoomPanelCommand::Unrestrict);
         }
@@ -331,6 +344,7 @@ impl AiRoomPanel {
         self.view.widget(cx, ids!(power_row)).set_visible(cx, !editing);
         self.view.widget(cx, ids!(extras_row)).set_visible(cx, !editing && self.has_extras);
         self.view.widget(cx, ids!(usage_label)).set_visible(cx, !editing);
+        self.view.widget(cx, ids!(restore_row)).set_visible(cx, !editing);
         if let Some(index) = self.selected_group {
             let (perm, _, _, _) = panel_groups()[index];
             self.view.label(cx, ids!(editor_title)).set_text(cx, match perm {

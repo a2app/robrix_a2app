@@ -380,6 +380,13 @@ pub enum TaskResume {
     /// Deliver the held user messages; the turn then runs with whatever the
     /// user approved (on a decline, the model call is refused as usual).
     UserPrompt { texts: Vec<(OwnedEventId, String)> },
+    /// A tool read the host reviewed on the agent's behalf: the read runs once
+    /// approved, or is refused.
+    Read { kind: ReadToolKind, answer: Sender<Result<String, String>> },
+    /// A finished reply the sharing check refused. It is posted once approved.
+    /// `answer_id` is a parked `send_message`; `token` holds a closed turn's
+    /// final writes open while the user decides.
+    Reply { text: String, answer_id: Option<u64>, token: Option<u64> },
 }
 
 /// A parked agent effect waiting on the exact-action review. The same modal
@@ -644,6 +651,9 @@ pub struct AiRoomInfo {
     /// Whether a dead session's teardown is waiting for its final writes to
     /// land before it removes the flow context (`Gone`).
     retire_after_final_writes: bool,
+    /// A reply refused for a missing sharing rule waits behind its review, and
+    /// the turn card's snapshots wait with it so neither is lost.
+    is_reply_held: bool,
 }
 
 #[cfg(unix)]
@@ -673,6 +683,7 @@ impl AiRoomInfo {
             pending_final_turns: BTreeSet::new(),
             final_writes_deadline: None,
             retire_after_final_writes: false,
+            is_reply_held: false,
         }
     }
 
@@ -693,6 +704,7 @@ impl AiRoomInfo {
         self.pending_final_turns.clear();
         self.final_writes_deadline = None;
         self.retire_after_final_writes = false;
+        self.is_reply_held = false;
     }
 }
 
@@ -758,6 +770,15 @@ impl Drop for PendingGeneratedApp {
     }
 }
 
+/// A task plan the user declined this turn: the needs they were asked to allow,
+/// and every permission the plan was about, so allowing one clears it.
+#[cfg(unix)]
+#[derive(Clone, Debug, Default)]
+struct DeclinedPlan {
+    needs: BTreeSet<String>,
+    permissions: BTreeSet<Permission>,
+}
+
 /// All a2app state, owned by the UI thread.
 pub struct A2AppState {
     pub registry: AppRegistry,
@@ -772,6 +793,8 @@ pub struct A2AppState {
     pub active_prompt: Option<PermissionPrompt>,
     active_prompt_batch: Vec<PermissionPrompt>,
     permission_batch_busy: bool,
+    /// The shown permission prompt was withdrawn without a UI handle; the next pass closes its modal.
+    is_permission_modal_stale: bool,
     /// Blocks captured popup answers between native room close and its queued cleanup.
     closing_room_sessions: HashSet<(String, OwnedRoomId)>,
     permission_setups: HashMap<(usize, u64), permission_batch::PermissionSetup>,
@@ -797,14 +820,17 @@ pub struct A2AppState {
     #[cfg(unix)]
     next_task_id: u64,
     /// The user's per-room "Not now" memory for task plans, keyed by
-    /// `(room id, needs fingerprint)`: the exact set of need keys dismissed.
-    /// Cleared when the turn closes, so a later request can ask again.
+    /// `(room id, needs fingerprint)`. Cleared when the turn closes, so a later request can ask again.
     #[cfg(unix)]
-    dismissed_task_plans: HashMap<(String, [u8; 32]), BTreeSet<String>>,
+    dismissed_task_plans: HashMap<(String, [u8; 32]), DeclinedPlan>,
     /// How many `request_task_permissions` calls a room has made this turn.
     /// Capped so a looping agent cannot re-ask forever; cleared on turn close.
     #[cfg(unix)]
     task_request_counts: HashMap<String, u32>,
+    /// How many unrequested reads a room's turn has asked the user about. Kept
+    /// apart from the request cap, so approving reads doesn't use it up.
+    #[cfg(unix)]
+    read_review_counts: HashMap<String, u32>,
     /// (app, permission) pairs the user said "Not Now" to this session.
     /// The key is the subject: an app id or an AI room's agent key.
     pub dismissed_prompts: HashSet<(String, Permission)>,
@@ -1006,6 +1032,7 @@ fn initialize_state(registry: AppRegistry, permissions: PermissionStore, persist
             active_prompt: None,
             active_prompt_batch: Vec::new(),
             permission_batch_busy: false,
+            is_permission_modal_stale: false,
             closing_room_sessions: HashSet::new(),
             permission_setups: HashMap::new(),
             permission_gestures: BTreeMap::new(),
@@ -1026,6 +1053,8 @@ fn initialize_state(registry: AppRegistry, permissions: PermissionStore, persist
             dismissed_task_plans: HashMap::new(),
             #[cfg(unix)]
             task_request_counts: HashMap::new(),
+            #[cfg(unix)]
+            read_review_counts: HashMap::new(),
             dismissed_prompts: HashSet::new(),
             dismissed_net_hosts: HashSet::new(),
             generation: None,
@@ -1206,6 +1235,10 @@ pub enum A2AppOp {
     /// its `launch_splash_app` tool is waiting on), leaving the session idle.
     #[cfg(unix)]
     AbortAiRoom(OwnedRoomId),
+    /// Puts back an AI room's default access: its room and space directory
+    /// and the sharing rules its replies need. Other choices are kept.
+    #[cfg(unix)]
+    RestoreAgentDefaults(OwnedRoomId),
 }
 
 
@@ -2528,6 +2561,8 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             with_a2app(|state| {
                 state.permissions.set(&app_id, perm, new_state);
                 state.perms_dirty = true;
+                // An explicit Allow replaces an earlier "Not now" for this group.
+                if new_state == GrantState::Granted { clear_dismissals_for_grant(state, &app_id, perm); }
             });
             publish_grants(cx);
             apply_permission_to_running(cx, ui, &app_id, perm);
@@ -2544,6 +2579,9 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
             with_a2app(|state| {
                 state.permissions.set_capability(&app_id, cap.id, new_state);
                 state.perms_dirty = true;
+                if new_state == GrantState::Granted && let Some(group) = cap.group {
+                    clear_dismissals_for_grant(state, &app_id, group);
+                }
             });
             publish_grants(cx);
             if let Some(group) = cap.group {
@@ -2556,8 +2594,20 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 if cap_id.is_some() && state.permissions.state(&app_id, perm) == GrantState::Denied {
                     return Err("This permission group is blocked. Change the group to Ask before allowing one ability.".to_string());
                 }
+                // Narrowing one ability must not take back the others: a saved
+                // Allow for the group becomes all-rooms allowances for them first.
+                if let Some(narrowed) = cap_id.as_deref()
+                    && state.permissions.state(&app_id, perm) == GrantState::Granted
+                {
+                    for sibling in declared_group_capabilities(state, &app_id, perm) {
+                        if sibling != narrowed {
+                            state.permissions.grant_scoped(&app_id, perm, Some(sibling), RoomScope::AllRooms, GrantDuration::Always, None)?;
+                        }
+                    }
+                }
                 let result = state.permissions.grant_scoped(&app_id, perm, cap_id.as_deref(), scope, duration, origin_room.as_deref());
                 if result.is_ok() {
+                    clear_dismissals_for_grant(state, &app_id, perm);
                     // A scoped choice replaces a previous blanket Allow.
                     state.permissions.set(&app_id, perm, GrantState::Ask);
                     if let Some(cap) = cap_id.as_deref() {
@@ -2586,6 +2636,8 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
                 if result.is_ok() {
                     state.permissions.set(&app_id, Permission::Network, GrantState::Ask);
                     state.permissions.set_capability(&app_id, "network.http", GrantState::Ask);
+                    clear_dismissals_for_grant(state, &app_id, Permission::Network);
+                    state.dismissed_net_hosts.retain(|(owner, _)| owner != &app_id);
                 }
                 state.perms_dirty = true;
                 result
@@ -2842,7 +2894,34 @@ fn apply_op(cx: &mut Cx, ui: &WidgetRef, op: A2AppOp) {
         A2AppOp::AbortAiRoom(room_id) => {
             abort_ai_room_work(cx, ui, &room_id);
         }
+        #[cfg(unix)]
+        A2AppOp::RestoreAgentDefaults(room_id) => restore_agent_defaults(cx, ui, &room_id),
     }
+}
+
+/// An explicit allowance replaces an earlier "Not now" for that group and, for
+/// an AI room's agent, the reviews it declined this turn that asked for it.
+fn clear_dismissals_for_grant(state: &mut A2AppState, subject: &str, perm: Permission) {
+    state.dismissed_prompts.remove(&(subject.to_string(), perm));
+    #[cfg(unix)]
+    if let Some(room) = agent_room_of(subject) {
+        state.dismissed_task_plans.retain(|(owner, _), declined| owner != room || !declined.permissions.contains(&perm));
+    }
+}
+
+/// The capabilities of one group that this app or AI room's agent declares.
+fn declared_group_capabilities(state: &A2AppState, subject: &str, perm: Permission) -> Vec<&'static str> {
+    a2app_core::capabilities::CATALOG.iter()
+        .filter(|cap| cap.group == Some(perm))
+        .filter(|cap| match agent_room_of(subject) {
+            #[cfg(unix)]
+            Some(_) => AI_ROOM_SESSION_CAP_IDS.contains(&cap.id),
+            #[cfg(not(unix))]
+            Some(_) => false,
+            None => state.registry.get(subject).is_some_and(|manifest| manifest.declares_capability(cap)),
+        })
+        .map(|cap| cap.id)
+        .collect()
 }
 
 fn ensure_source_owner(source: &a2app_core::information_flow::Source) -> Result<(), String> {
@@ -4828,6 +4907,15 @@ fn show_next_permission_prompt(cx: &mut Cx, ui: &WidgetRef) {
     if with_a2app(|state| permission_modal_is_open(state)).unwrap_or(true) {
         return;
     }
+    // A teardown can take the shown task without a UI handle; never leave its
+    // modal up with nothing behind it.
+    #[cfg(unix)]
+    if ui.modal(cx, ids!(task_permission_modal)).is_open() {
+        ui.modal(cx, ids!(task_permission_modal)).close(cx);
+    }
+    if with_a2app(|state| std::mem::take(&mut state.is_permission_modal_stale)).unwrap_or(false) {
+        ui.modal(cx, ids!(a2app_permission_modal)).close(cx);
+    }
     // Exact-action reviews and task prompts show ahead of single-permission
     // prompts, one modal at a time; reviews come first.
     #[cfg(unix)]
@@ -6027,49 +6115,7 @@ fn run_request_task_permissions(    cx: &mut Cx,
         Ok(request) => request,
         Err(error) => { let _ = answer.send(Err(error)); return; }
     };
-    let account = context.account().to_string();
-    let subject = agent_subject(room_id.as_str());
-    let epoch = match a2app_core::information_flow::context_epoch(&context) {
-        Ok(epoch) => epoch,
-        Err(error) => { let _ = answer.send(Err(error)); return; }
-    };
-    let (store, model_recipient, task_id) = with_a2app(|state| {
-        state.next_task_id = state.next_task_id.saturating_add(1);
-        let recipient = a2app_agent::model_transport::current_recipient(&state.agent_prefs)
-            .ok()
-            .map(|recipient| Recipient::ModelProvider(recipient.id));
-        (state.permissions.clone(), recipient, state.next_task_id)
-    })
-    .unwrap_or_else(|| (PermissionStore::default(), None, 0));
-    // The AI room's own reply/activity rows are unencrypted Matrix state, so
-    // every source the task reads must also be allowed to this origin.
-    let homeserver_recipient = crate::sliding_sync::get_client()
-        .and_then(|client| Recipient::network_origin(client.homeserver().as_str()).ok());
-    let joined = |id: &str| {
-        let Some(client) = crate::sliding_sync::get_client() else { return false };
-        let Ok(room) = OwnedRoomId::try_from(id) else { return false };
-        client.get_room(&room).is_some()
-    };
-    // Seal the same room-local, unambiguous name the invocation will check.
-    let app_tool_name = |tool: &str| {
-        with_a2app(|state| canonical_app_tool_name(state, room_id, tool)).flatten()
-    };
-    let inputs = ResolveInputs {
-        task_id,
-        subject: &subject,
-        account: &account,
-        room: room_id.as_str(),
-        context: &context,
-        epoch,
-        model_recipient,
-        homeserver_recipient,
-        joined: &joined,
-        declared_capabilities: AI_ROOM_SESSION_CAP_IDS,
-        app_tool_name: &app_tool_name,
-        store: &store,
-        flow: &task_grants::GlobalFlow,
-    };
-    let plan = match task_grants::resolve(&request, &inputs) {
+    let plan = match resolve_agent_task(room_id, &context, &request) {
         Ok(plan) => plan,
         Err(error) => { let _ = answer.send(Err(error)); return; }
     };
@@ -6082,8 +6128,14 @@ fn run_request_task_permissions(    cx: &mut Cx,
         let _ = answer.send(Ok(declined(&plan)));
         return;
     }
+    // No approval can release data of unknown origin, so none is asked for.
+    if is_holding_unknown_data(&context) {
+        note_ai_tool_call(room_id, "request_task_permissions", false, "Holds data of unknown origin");
+        let _ = answer.send(Err(AI_UNKNOWN_DATA.into()));
+        return;
+    }
     let dismissed = with_a2app(|state| {
-        task_plan_is_dismissed(&state.dismissed_task_plans, room_id.as_str(), &plan.need_keys())
+        task_plan_is_dismissed(&state.dismissed_task_plans, room_id.as_str(), &plan.grantable_need_keys())
     })
     .unwrap_or(false);
     if dismissed {
@@ -6095,6 +6147,50 @@ fn run_request_task_permissions(    cx: &mut Cx,
         state.task_prompts.push_back(TaskPrompt { room_id: room_id.clone(), plan, resume: TaskResume::AgentTool(answer) });
     });
     show_next_permission_prompt(cx, ui);
+}
+
+/// Resolves an agent's task request against the live permissions, sharing
+/// rules, joined rooms and this room's mini-app tools.
+#[cfg(unix)]
+fn resolve_agent_task(
+    room_id: &OwnedRoomId,
+    context: &a2app_core::information_flow::ContextId,
+    request: &task_grants::TaskRequest,
+) -> Result<TaskPlan, String> {
+    let account = context.account().to_string();
+    let subject = agent_subject(room_id.as_str());
+    let epoch = a2app_core::information_flow::context_epoch(context)?;
+    let (store, model_recipient, task_id) = with_a2app(|state| {
+        state.next_task_id = state.next_task_id.saturating_add(1);
+        let recipient = agent_model_id(&state.agent_prefs).map(Recipient::ModelProvider);
+        (state.permissions.clone(), recipient, state.next_task_id)
+    })
+    .unwrap_or_else(|| (PermissionStore::default(), None, 0));
+    // The AI room's own reply/activity rows are unencrypted Matrix state, so
+    // every source the task reads must also be allowed to this origin.
+    let homeserver_recipient = crate::sliding_sync::get_client()
+        .and_then(|client| Recipient::network_origin(client.homeserver().as_str()).ok());
+    let joined = |id: &str| joined_room(id).unwrap_or(false);
+    // Seal the same room-local, unambiguous name the invocation will check.
+    let app_tool_name = |tool: &str| {
+        with_a2app(|state| canonical_app_tool_name(state, room_id, tool)).flatten()
+    };
+    let inputs = ResolveInputs {
+        task_id,
+        subject: &subject,
+        account: &account,
+        room: room_id.as_str(),
+        context,
+        epoch,
+        model_recipient,
+        homeserver_recipient,
+        joined: &joined,
+        declared_capabilities: AI_ROOM_SESSION_CAP_IDS,
+        app_tool_name: &app_tool_name,
+        store: &store,
+        flow: &task_grants::GlobalFlow,
+    };
+    task_grants::resolve(request, &inputs)
 }
 
 /// The tool-call receipt for a plan that needed no prompt: success only when
@@ -6126,20 +6222,20 @@ fn count_task_request(counts: &mut HashMap<String, u32>, room: &str) -> bool {
     *count <= 3
 }
 
-/// Whether every need was already declined in this room during the turn.
-/// Combining earlier declined requests must not open another permission modal.
+/// Whether every need was already declined in this room during the turn, alone
+/// or within wider needs. Combining declined requests must not open another modal.
 #[cfg(unix)]
 fn task_plan_is_dismissed(
-    dismissed: &HashMap<(String, [u8; 32]), BTreeSet<String>>,
+    dismissed: &HashMap<(String, [u8; 32]), DeclinedPlan>,
     room: &str,
     needs: &BTreeSet<String>,
 ) -> bool {
-    let previous: Vec<_> = dismissed
+    let declined: Vec<&str> = dismissed
         .iter()
         .filter(|((dismissed_room, _), _)| dismissed_room == room)
-        .map(|(_, dismissed_needs)| dismissed_needs)
+        .flat_map(|(_, declined)| declined.needs.iter().map(String::as_str))
         .collect();
-    !previous.is_empty() && needs.iter().all(|need| previous.iter().any(|declined| declined.contains(need)))
+    !declined.is_empty() && !needs.is_empty() && needs.iter().all(|need| task_grants::is_need_key_covered(&declined, need))
 }
 
 /// Shows the next task prompt, if none is already open. Task prompts are
@@ -6435,12 +6531,14 @@ fn answer_task_prompt(cx: &mut Cx, ui: &WidgetRef, action: TaskPermissionAction)
     let mut guard = PermissionStoreGuard::take();
     let result = task_grants::apply(&plan, &approved, guard.store(), &task_grants::GlobalFlowApply);
     let mut applied = None;
+    let mut is_granted = false;
     let outcome = match result {
         Ok(task) => {
             // Report the states re-checked at apply time, then keep the task in
             // the ledger for the turn's close to revoke.
             let outcome = task_grants::outcome_of(&plan, &approved, &task);
             applied = Some(task);
+            is_granted = outcome["status"] == "granted";
             if agent_tool {
                 let fully_allowed = outcome["status"] == "granted";
                 let note = if fully_allowed { format!("Approved: {}", plan.title) }
@@ -6478,6 +6576,25 @@ fn answer_task_prompt(cx: &mut Cx, ui: &WidgetRef, action: TaskPermissionAction)
             // answered, so it must not raise the same prompt again.
             forward_ai_room_texts_inner(&room_id, texts, false);
         }
+        // The reviewed read runs once, without asking again; a decline or a
+        // partial approval refuses it, and the model is told not to retry.
+        TaskResume::Reply { text, answer_id, token } => release_held_reply(&room_id, text, answer_id, token, is_granted),
+        TaskResume::Read { kind, answer } => match outcome {
+            Ok(_) if is_granted => run_ai_read_tool(cx, ui, &room_id, kind, answer, true),
+            Ok(_) => {
+                // "Not now" declines unrequested reads of this kind for the
+                // turn, so the agent cannot ask again room by room.
+                if matches!(action, TaskPermissionAction::NotNow) && let Some(group) = kind.capability().and_then(|cap| cap.group) {
+                    decline_read_reviews(&room_id, group);
+                }
+                note_ai_tool_call(&room_id, read_tool_name(&kind), false, "Declined");
+                let _ = answer.send(Err(AI_READ_DECLINED.into()));
+            }
+            Err(error) => {
+                note_ai_tool_call(&room_id, read_tool_name(&kind), false, &error);
+                let _ = answer.send(Err(error));
+            }
+        },
     }
     show_next_permission_prompt(cx, ui);
     ui.redraw(cx);
@@ -6535,11 +6652,15 @@ fn task_answer_approval(
     room_id: &OwnedRoomId,
     plan: &TaskPlan,
     action: &TaskPermissionAction,
-    dismissed: &mut HashMap<(String, [u8; 32]), BTreeSet<String>>,
+    dismissed: &mut HashMap<(String, [u8; 32]), DeclinedPlan>,
 ) -> BTreeSet<String> {
     match action {
         TaskPermissionAction::NotNow => {
-            dismissed.insert((room_id.to_string(), plan.needs_fingerprint), plan.need_keys());
+            // Only what the user was asked about is declined.
+            dismissed.insert((room_id.to_string(), plan.needs_fingerprint), DeclinedPlan {
+                needs: plan.grantable_need_keys(),
+                permissions: plan.need_keys().iter().filter_map(|key| task_grants::need_key_permission(key)).collect(),
+            });
             BTreeSet::new()
         }
         TaskPermissionAction::Allow(ids) => task_grants::dependent_approval(plan, ids.clone()),
@@ -6573,6 +6694,12 @@ fn revoke_task_grants(room_id: &OwnedRoomId) {
     let tasks: Vec<task_grants::AppliedTask> = with_a2app(|state| {
         state.dismissed_task_plans.retain(|(room, _), _| room != room_id.as_str());
         state.task_request_counts.remove(room_id.as_str());
+        state.read_review_counts.remove(room_id.as_str());
+        // An agent's "Not now" on a single request lasts for its turn too, so a
+        // later message can ask again instead of being refused silently.
+        let subject = agent_subject(room_id.as_str());
+        state.dismissed_prompts.retain(|(owner, _)| owner != &subject);
+        state.dismissed_net_hosts.retain(|(owner, _)| owner != &subject);
         // Grants are gone, so no final write still needs them; forget any
         // outstanding write bookkeeping so a later turn's tokens are clean.
         if let Some(info) = state.ai_rooms.get_mut(room_id) {
@@ -6635,6 +6762,32 @@ fn take_room_tasks(room_id: &OwnedRoomId) -> Vec<TaskPrompt> {
     .unwrap_or_default()
 }
 
+/// Answers the caller of a task prompt that will never be shown, so no tool
+/// call hangs: an agent's request is answered declined, a reviewed read refused.
+#[cfg(unix)]
+fn withdraw_task_prompt(prompt: TaskPrompt) {
+    match prompt.resume {
+        TaskResume::AgentTool(answer) => {
+            let _ = answer.send(Ok(task_grants::outcome(&prompt.plan, &BTreeSet::new()).to_string()));
+        }
+        TaskResume::Read { answer, .. } => {
+            let _ = answer.send(Err("The request was cancelled before it was reviewed.".into()));
+        }
+        TaskResume::Reply { answer_id, token, .. } => {
+            with_a2app(|state| {
+                if let Some(info) = state.ai_rooms.get_mut(&prompt.room_id) { info.is_reply_held = false; }
+            });
+            if let Some(id) = answer_id
+                && let Some((_, _, answer, _)) = with_a2app(|state| state.ai_replies.remove(&id)).flatten()
+            {
+                let _ = answer.send(Err("The request was cancelled before it was reviewed.".into()));
+            }
+            if let Some(token) = token { final_write_landed(&prompt.room_id, token); }
+        }
+        TaskResume::UserPrompt { .. } => {}
+    }
+}
+
 /// Withdraws a room's pending task prompts (turn cancelled or session gone):
 /// the parked tool calls are refused and the modal moves on, so a serve thread
 /// never hangs.
@@ -6659,10 +6812,7 @@ fn refuse_room_tasks(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
     })
     .unwrap_or_default();
     for prompt in pending {
-        if let TaskResume::AgentTool(answer) = prompt.resume {
-            let message = task_grants::outcome(&prompt.plan, &std::collections::BTreeSet::new()).to_string();
-            let _ = answer.send(Ok(message));
-        }
+        withdraw_task_prompt(prompt);
     }
     let (reviews, review_was_active) = with_a2app(|state| {
         let (mine, rest): (Vec<_>, Vec<_>) = state.exact_reviews.drain(..).partition(|review| &review.room_id == room_id);
@@ -6893,6 +7043,14 @@ fn room_policy_allows(room: &str, access: RoomAccess) -> bool {
         .unwrap_or(false)
 }
 
+/// An AI room's own reply and status rows: a block on the room or a parent
+/// space stops them, the write switch does not (see
+/// [`matrix::policy::ensure_agent_room_output_access`]).
+#[cfg(unix)]
+fn is_agent_room_output_allowed(room: &str) -> bool {
+    with_a2app(|state| !state.permissions.is_blocked_by_room_rule(room, RoomAccess::Write)).unwrap_or(false)
+}
+
 fn retire_flow_context(cx: &mut Cx, ui: &WidgetRef, context: &a2app_core::information_flow::ContextId) {
     if !super::information_flow::account().is_ok_and(|account| context.account() == account) { return; }
     match context {
@@ -6915,6 +7073,14 @@ fn stop_private_contexts(cx: &mut Cx, ui: &WidgetRef) {
     for app in apps { stop_app_everywhere(cx, ui, &app); }
 }
 
+/// Resetting restores the defaults, so every AI room applies its directory
+/// access and baseline sharing rules again before its next turn.
+fn forget_applied_agent_defaults(state: &mut A2AppState) {
+    state.persisted.permission_defaults_applied.clear();
+    state.persisted.default_sharing_applied.clear();
+    state.registry_dirty = true;
+}
+
 fn reset_all_permissions(cx: &mut Cx, ui: &WidgetRef) {
     let Some((prompts, cancel_generation)) = with_a2app(|state| {
         let mut prompts = state.prompts.drain(..).collect::<Vec<_>>();
@@ -6922,6 +7088,7 @@ fn reset_all_permissions(cx: &mut Cx, ui: &WidgetRef) {
         prompts.append(&mut state.active_prompt_batch);
         state.permissions.reset_to_defaults();
         state.perms_dirty = true;
+        forget_applied_agent_defaults(state);
         state.dismissed_prompts.clear();
         state.dismissed_net_hosts.clear();
         state.dismissed_effects.clear();
@@ -6963,7 +7130,9 @@ fn reset_all_permissions(cx: &mut Cx, ui: &WidgetRef) {
     let save_result = with_a2app(|state| {
         let result = persistence::save_permissions(&state.permissions);
         state.perms_dirty = result.is_err();
-        result.map_err(|error| error.to_string())
+        let markers = persistence::save_registry_state(&state.persisted);
+        state.registry_dirty = markers.is_err();
+        result.and(markers).map_err(|error| error.to_string())
     }).unwrap_or_else(|| Err("Mini Apps is unavailable.".into()));
     if let Ok(account) = super::information_flow::account() {
         a2app_core::protection_audit::record_policy_change(&account);
@@ -7420,7 +7589,7 @@ fn apply_ai_room_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomAction) {
                 if !matches!(kind, ReadToolKind::Memory { .. }) {
                     push_ai_tool_receipt(&room_id, read_tool_name(&kind), detail, ok, &summary);
                 }
-                let _ = answer.send(result);
+                let _ = answer.send(result.map_err(super::information_flow::with_task_reask_hint));
             }
         }
         AiRoomAction::StateEventPosted { room_id, event_type, write_id, success } => {
@@ -7494,11 +7663,13 @@ fn stop_ai_session(room_id: &OwnedRoomId) {
         // Task grants are turn-scoped; the session stopping ends them, and a
         // pending task prompt is answered declined so its caller never hangs.
         revoke_task_grants(room_id);
-        for prompt in take_room_tasks(room_id) {
-            if let TaskResume::AgentTool(answer) = prompt.resume {
-                let message = task_grants::outcome(&prompt.plan, &std::collections::BTreeSet::new()).to_string();
-                let _ = answer.send(Ok(message));
-            }
+        let withdrawn = take_room_tasks(room_id);
+        if !withdrawn.is_empty() {
+            // The next pass closes a withdrawn review's modal and shows the next one.
+            makepad_widgets::SignalToUI::set_ui_signal();
+        }
+        for prompt in withdrawn {
+            withdraw_task_prompt(prompt);
         }
     }
     cancel_ai_fetches(room_id);
@@ -7671,20 +7842,29 @@ fn refresh_ai_room_panel(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
     let subject = agent_subject(room_id.as_str());
     let Some(info) = with_a2app(|state| {
         let info = state.ai_rooms.get(room_id)?;
-        let perm_word = |perm: Permission| match state
-            .permissions
-            .effective_for_in_context(&subject, ai_room_declares_perm, perm, PermissionContext {
-                origin_room: Some(room_id.as_str()), target_room: Some(room_id.as_str()),
-            })
-        {
+        let context = PermissionContext { origin_room: Some(room_id.as_str()), target_room: Some(room_id.as_str()) };
+        let perm_word = |perm: Permission| match state.permissions.effective_for_in_context(&subject, ai_room_declares_perm, perm, context) {
             // These groups only ever act as a kill switch: what the AI may
             // actually do is decided per room, per tool or per site, so a
             // group grant must not read as blanket permission.
             Effective::Granted if ai_panel_is_kill_switch(perm) => "ask each time",
-            Effective::Granted => "allowed",
             Effective::Denied => "don't allow",
-            Effective::NeedsPrompt => "ask each time",
             Effective::Undeclared => "not offered",
+            // Otherwise say what the gate decides for each ability: the room
+            // list, for one, is allowed by default without the group.
+            _ => {
+                let caps = AI_ROOM_SESSION_CAP_IDS.iter().filter_map(|id| a2app_core::capabilities::by_id(id))
+                    .filter(|cap| cap.group == Some(perm)).collect::<Vec<_>>();
+                let allowed = caps.iter().filter(|cap| {
+                    let verdict = if services::is_room_collection(cap) {
+                        state.permissions.effective_collection_capability_for_in_context(&subject, ai_room_declares_perm, ai_room_declares_cap, cap, context)
+                    } else {
+                        state.permissions.effective_capability_for_in_context(&subject, ai_room_declares_perm, ai_room_declares_cap, cap, context)
+                    };
+                    verdict == Effective::Granted
+                }).count();
+                if allowed > 0 && allowed == caps.len() { "allowed" } else if allowed > 0 { "partly allowed" } else { "ask each time" }
+            }
         };
         let line = |perm: Permission| {
             let count = state.permissions.use_count(&subject, perm);
@@ -7850,7 +8030,12 @@ fn apply_ai_room_panel_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomPanelAc
                     store.disallow_host(&subject, &host);
                 }
                 store.clear_tool_grants_for(&subject);
-                let grants: Vec<_> = store.scoped_grants(&subject).iter().map(|g| g.id).collect();
+                // The room and space directory defaults are not approvals the
+                // user gave one at a time; keep them, or the AI cannot find rooms.
+                let grants: Vec<_> = store.scoped_grants(&subject).iter()
+                    .filter(|g| !(g.scope == RoomScope::AllRooms && g.duration == GrantDuration::Always
+                        && g.capability.as_deref().is_some_and(|id| a2app_core::task_grants::DIRECTORY_CAP_IDS.contains(&id))))
+                    .map(|g| g.id).collect();
                 for id in grants { store.remove_scoped_grant(id); }
                 let grants: Vec<_> = store.network_grants(&subject).iter().map(|g| g.id).collect();
                 for id in grants { store.remove_network_grant(id); }
@@ -7867,6 +8052,7 @@ fn apply_ai_room_panel_action(cx: &mut Cx, ui: &WidgetRef, action: AiRoomPanelAc
                 Some(4.0),
             );
         }
+        (None, AiRoomPanelCommand::RestoreDefaults) => restore_agent_defaults(cx, ui, &room_id),
         (None, AiRoomPanelCommand::Unrestrict) => {
             with_a2app(|state| {
                 state.permissions.unrestrict(&subject);
@@ -7903,15 +8089,16 @@ fn is_directory_kind(kind: &ReadToolKind) -> bool {
 /// session. The room's own transcript and metadata, and the installed-app
 /// list, are not defaulted: they go through `request_task_permissions`.
 #[cfg(unix)]
-fn apply_ai_room_capability_defaults(state: &mut A2AppState, room_id: &OwnedRoomId) {
+fn apply_ai_room_capability_defaults(state: &mut A2AppState, room_id: &OwnedRoomId) -> bool {
     if !state.persisted.permission_defaults_applied.insert(room_id.to_string()) {
-        return;
+        return false;
     }
     state.registry_dirty = true;
     let changed = apply_directory_capability_defaults(&mut state.permissions, room_id);
     if changed {
         state.mark_perms_dirty();
     }
+    changed
 }
 
 /// Applies the one-time directory defaults to a permission store. Returns
@@ -7956,6 +8143,95 @@ fn apply_directory_capability_defaults(permissions: &mut PermissionStore, room_i
     changed
 }
 
+/// Applies whichever one-time defaults an AI room has not recorded yet: the
+/// room and space directory, and the baseline sharing rules its first model
+/// call and its own reply rows need. Runs at session start and before each
+/// turn, so a reset or a newly selected AI service applies them again.
+#[cfg(unix)]
+fn ensure_agent_defaults(
+    state: &mut A2AppState,
+    room_id: &OwnedRoomId,
+    context: &a2app_core::information_flow::ContextId,
+    prefs: &AgentPrefs,
+) -> bool {
+    let granted = apply_ai_room_capability_defaults(state, room_id);
+    let model = agent_model_id(prefs);
+    let homeserver = crate::sliding_sync::get_client().map(|client| client.homeserver().to_string());
+    if super::information_flow::ensure_agent_default_sharing(
+        context, room_id.as_str(), model.as_deref(), homeserver.as_deref(),
+        &mut state.persisted.default_sharing_applied,
+    ) {
+        state.registry_dirty = true;
+    }
+    granted
+}
+
+/// The user's explicit request to restore defaults: unlike the one-time
+/// defaults, this replaces a block or Ask on the directory abilities.
+#[cfg(unix)]
+fn restore_directory_capability_defaults(permissions: &mut PermissionStore, room_id: &OwnedRoomId) -> Result<(), String> {
+    let subject = agent_subject(room_id.as_str());
+    for cap_id in a2app_core::task_grants::DIRECTORY_CAP_IDS {
+        let Some(cap) = a2app_core::capabilities::by_id(cap_id) else { continue };
+        let Some(group) = cap.group else { continue };
+        if permissions.state(&subject, group) == GrantState::Denied {
+            permissions.set(&subject, group, GrantState::Ask);
+        }
+        if permissions.capability_state(&subject, cap.id) != GrantState::Ask {
+            permissions.set_capability(&subject, cap.id, GrantState::Ask);
+        }
+        let present = permissions.scoped_grants(&subject).iter().any(|grant| {
+            grant.capability.as_deref() == Some(*cap_id) && grant.scope == RoomScope::AllRooms
+                && grant.duration == GrantDuration::Always
+        });
+        if !present {
+            permissions.grant_scoped(&subject, group, Some(cap_id), RoomScope::AllRooms, GrantDuration::Always, None)?;
+        }
+    }
+    Ok(())
+}
+
+/// Restores an AI room's default access and saves it at once.
+#[cfg(unix)]
+fn restore_agent_defaults(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId) {
+    let context = match super::information_flow::agent_context(room_id.as_str()) {
+        Ok(context) => context,
+        Err(error) => { enqueue_popup_notification(error, PopupKind::Error, Some(6.0)); return; }
+    };
+    let prefs = with_a2app(|state| state.agent_prefs.clone()).unwrap_or_else(a2app_agent::prefs::load_agent_prefs);
+    let model = agent_model_id(&prefs);
+    let homeserver = crate::sliding_sync::get_client().map(|client| client.homeserver().to_string());
+    let result = with_a2app(|state| {
+        let subject = agent_subject(room_id.as_str());
+        super::information_flow::forget_agent_sharing_defaults(&context, room_id.as_str(),
+            model.as_deref(), homeserver.as_deref(), &mut state.persisted.default_sharing_applied);
+        let granted = restore_directory_capability_defaults(&mut state.permissions, room_id);
+        state.persisted.permission_defaults_applied.insert(room_id.to_string());
+        super::information_flow::ensure_agent_default_sharing(&context, room_id.as_str(),
+            model.as_deref(), homeserver.as_deref(), &mut state.persisted.default_sharing_applied);
+        // A declined prompt must not keep refusing what was just restored.
+        state.dismissed_prompts.retain(|(owner, _)| owner != &subject);
+        state.dismissed_task_plans.retain(|(room, _), _| room != room_id.as_str());
+        let saved = persistence::save_permissions(&state.permissions).map_err(|error| error.to_string())
+            .and(persistence::save_registry_state(&state.persisted).map_err(|error| error.to_string()));
+        state.perms_dirty = saved.is_err();
+        state.registry_dirty = saved.is_err();
+        let is_saved = super::information_flow::are_agent_sharing_defaults_applied(&context, room_id.as_str(),
+            model.as_deref(), homeserver.as_deref(), &state.persisted.default_sharing_applied);
+        let sharing = if is_saved { Ok(()) } else { Err("Some default sharing rules could not be saved.".to_string()) };
+        granted.and(sharing).and(saved)
+    }).unwrap_or_else(|| Err("Mini Apps is unavailable.".into()));
+    publish_grants(cx);
+    if let Ok(account) = super::information_flow::account() {
+        a2app_core::protection_audit::record_policy_change(&account);
+    }
+    match result {
+        Ok(()) => enqueue_popup_notification("Restored this AI room's default access. Its other permissions are unchanged.", PopupKind::Success, Some(5.0)),
+        Err(error) => enqueue_popup_notification(format!("Couldn't restore this AI room's defaults: {error}"), PopupKind::Error, Some(8.0)),
+    }
+    ui.redraw(cx);
+}
+
 /// Starts an AI room's session if it isn't already running. Started idle
 /// (no prompt sent yet) — the first forwarded message primes it with the
 /// replayed transcript and sends it as one prompt.
@@ -7994,6 +8270,9 @@ fn attach_ai_session(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, _name: 
         );
     } else {
         log!("AI Rooms: started the agent session for AI room {room_id}.");
+        // Workers recheck consent against the published snapshot, which must
+        // include any directory defaults the start just granted.
+        publish_current_grants();
     }
     ui.redraw(cx);
 }
@@ -8004,30 +8283,8 @@ fn attach_ai_session(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, _name: 
 fn start_ai_session(state: &mut A2AppState, room_id: &OwnedRoomId, prefs: AgentPrefs) -> Result<AiSession, String> {
     let context = super::information_flow::begin_agent_session(room_id.as_str())?;
     let epoch = a2app_core::information_flow::context_epoch(&context)?;
-    // A fresh room must not have to prompt for the room/space directory. The
-    // other directory-adjacent capabilities (its own transcript, the installed
-    // mini-app list) still go through `request_task_permissions`. Applied here
-    // (not only on the marker-check attach path) so a lazily started session —
-    // the first message in a newly created room — gets the directory defaults
-    // too.
-    apply_ai_room_capability_defaults(state, room_id);
+    ensure_agent_defaults(state, room_id, &context, &prefs);
     let result = (|| {
-        // A freshly created AI room has no sharing rules yet, so its first
-        // model call and its own activity/reply cards would be refused with
-        // "Information flow blocked". Grant the baseline it cannot work
-        // without, so an AI room works out of the box (the user can still
-        // revoke these in the Data Sharing editor).
-        let model = a2app_agent::model_transport::current_recipient(&prefs)
-            .ok()
-            .map(|recipient| recipient.id);
-        let homeserver = crate::sliding_sync::get_client()
-            .map(|client| client.homeserver().to_string());
-        if super::information_flow::ensure_agent_default_sharing(
-            &context, room_id.as_str(), model.as_deref(), homeserver.as_deref(),
-            &mut state.persisted.default_sharing_applied,
-        ) {
-            state.registry_dirty = true;
-        }
         for reg in state.app_tools.values().filter(|reg| &reg.room_id == room_id) {
             transfer_app_tool_provenance(state, &reg.app_id, reg.heap_key, room_id)?;
         }
@@ -8303,6 +8560,14 @@ fn forward_ai_room_texts_inner(
         Some(texts)
     }).flatten();
     let Some(texts) = texts.filter(|texts| !texts.is_empty()) else { return };
+    if let Ok(context) = super::information_flow::agent_context(room_id.as_str())
+        && with_a2app(|state| {
+            let prefs = state.agent_prefs.clone();
+            ensure_agent_defaults(state, room_id, &context, &prefs)
+        }).unwrap_or(false)
+    {
+        publish_current_grants();
+    }
     if check_carried && raise_carried_permission_prompt(room_id, &texts) {
         log!("AI Rooms: holding {} message(s) for room {room_id} behind a carried-over permission prompt.", texts.len());
         return;
@@ -8362,42 +8627,66 @@ fn ensure_ai_session(room_id: &OwnedRoomId) -> Result<(), String> {
         Ok(())
     })
     .unwrap_or_else(|| Err("AI state is unavailable.".into()))
+    .inspect(|()| publish_current_grants())
 }
 
-/// The rows a host-raised carried-over prompt shows: every source beyond the
-/// baseline that has no rule to the model provider, to the homeserver origin
-/// or back into the room. The explanation names what was read.
+/// The recipients every agent turn writes to: the AI service, the homeserver
+/// that stores its unencrypted reply rows, and the AI room itself.
+#[cfg(unix)]
+fn agent_turn_recipients(
+    room_id: &OwnedRoomId,
+    context: &a2app_core::information_flow::ContextId,
+    provider: Option<&Recipient>,
+    homeserver: Option<&Recipient>,
+) -> Vec<Recipient> {
+    let own_room = Recipient::MatrixRoom { account: context.account().to_string(), room: room_id.to_string() };
+    provider.into_iter().chain(homeserver).cloned().chain([own_room]).collect()
+}
+
+/// What a host-raised sharing prompt says: the rooms read earlier, and
+/// separately the room's own default rules when those are what is missing.
+#[cfg(unix)]
+fn carried_explanation(room_id: &OwnedRoomId, sources: &BTreeSet<Source>) -> (String, String) {
+    let mut read = Vec::new();
+    let mut defaults = Vec::new();
+    for source in sources {
+        let label = match source {
+            Source::Room { room, .. } if room == room_id.as_str() => { defaults.push("this conversation"); continue; }
+            Source::RoomDirectory { .. } => { defaults.push("your list of rooms and spaces"); continue; }
+            Source::Room { room, .. } => resolve_room_label(None, room),
+            Source::Account { .. } => "your account data".to_string(),
+            Source::UnknownPrivate => "stored data".to_string(),
+        };
+        if !read.contains(&label) {
+            read.push(label);
+        }
+    }
+    let mut parts = Vec::new();
+    if !read.is_empty() {
+        parts.push(format!("Earlier in this conversation the assistant read {}. Allow it to keep using that information for this turn.", read.join(", ")));
+    }
+    if !defaults.is_empty() {
+        parts.push(format!("To answer, this room's assistant needs to share {} with your AI service and post its reply here, but those sharing rules are off. Allow them for this turn, or choose Restore default access in Mini Apps → AI room permissions to turn them back on.", defaults.join(" and ")));
+    }
+    let title = if read.is_empty() { "Let this room's AI reply" } else { "Keep using earlier context" };
+    (title.to_string(), parts.join(" "))
+}
+
+/// The rows a host-raised sharing prompt shows: each held source that has no
+/// rule to one of `recipients`, plus the pairs already allowed for context.
 #[cfg(unix)]
 fn build_carried_task_plan(
     room_id: &OwnedRoomId,
     context: &a2app_core::information_flow::ContextId,
     sources: &BTreeSet<Source>,
-    provider: &Recipient,
-    homeserver: Option<&Recipient>,
+    recipients: &[Recipient],
     task_id: u64,
 ) -> TaskPlan {
     use a2app_core::capabilities::Risk;
     use a2app_core::task_grants::{ItemOrigin, PlanAction, PlanItem};
-    let account = context.account().to_string();
-    let own_room = Recipient::MatrixRoom { account, room: room_id.to_string() };
-    let mut recipients = vec![provider.clone()];
-    if let Some(homeserver) = homeserver {
-        recipients.push(homeserver.clone());
-    }
-    recipients.push(own_room);
     let mut items = Vec::new();
-    let mut labels = Vec::new();
     for source in sources {
-        let label = match source {
-            Source::Room { room, .. } => resolve_room_label(None, room),
-            Source::Account { .. } => "account data".to_string(),
-            Source::RoomDirectory { .. } => "the room directory".to_string(),
-            Source::UnknownPrivate => "stored data".to_string(),
-        };
-        if !labels.contains(&label) {
-            labels.push(label);
-        }
-        for recipient in &recipients {
+        for recipient in recipients {
             let already = a2app_core::information_flow::sharing_allows_for_reader(source, recipient, context)
                 .unwrap_or(false);
             items.push(PlanItem {
@@ -8411,16 +8700,13 @@ fn build_carried_task_plan(
             });
         }
     }
-    let explanation = format!(
-        "Earlier in this conversation the assistant read {}. Allow it to keep using that information for this turn.",
-        labels.join(", ")
-    );
+    let (title, explanation) = carried_explanation(room_id, sources);
     let mut plan = TaskPlan {
         task_id,
         subject: agent_subject(room_id.as_str()),
         context: context.clone(),
         epoch: a2app_core::information_flow::context_epoch(context).unwrap_or(0),
-        title: "Keep using earlier context".to_string(),
+        title,
         explanation,
         items,
         flow_dependencies: BTreeMap::new(),
@@ -8439,9 +8725,7 @@ fn build_carried_task_plan(
 fn raise_carried_permission_prompt(room_id: &OwnedRoomId, texts: &[(OwnedEventId, String)]) -> bool {
     let Ok(context) = super::information_flow::agent_context(room_id.as_str()) else { return false };
     let (provider, homeserver, task_id) = with_a2app(|state| {
-        let provider = a2app_agent::model_transport::current_recipient(&state.agent_prefs)
-            .ok()
-            .map(|recipient| Recipient::ModelProvider(recipient.id));
+        let provider = agent_model_id(&state.agent_prefs).map(Recipient::ModelProvider);
         let homeserver = crate::sliding_sync::get_client()
             .and_then(|client| Recipient::network_origin(client.homeserver().as_str()).ok());
         (provider, homeserver, state.next_task_id.saturating_add(1))
@@ -8460,12 +8744,12 @@ fn hold_carried_permission_prompt(
     homeserver: Option<&Recipient>,
     task_id: u64,
 ) -> bool {
+    // No review can let data of unknown origin through; the refused turn's popup explains.
+    if is_holding_unknown_data(context) { return false; }
     let texts = &texts[texts.len().saturating_sub(super::ai::session::MAX_QUEUED_PROMPTS)..];
-    let own_room = Recipient::MatrixRoom { account: context.account().into(), room: room_id.to_string() };
-    let mut recipients = vec![provider, &own_room];
-    if let Some(homeserver) = homeserver { recipients.push(homeserver); }
+    let recipients = agent_turn_recipients(room_id, context, Some(provider), homeserver);
     let mut carried = BTreeSet::new();
-    for recipient in recipients {
+    for recipient in &recipients {
         match a2app_core::information_flow::carried_over_sources(context, recipient) {
             Ok(sources) => carried.extend(sources),
             Err(_) => return false,
@@ -8479,11 +8763,11 @@ fn hold_carried_permission_prompt(
     if appended {
         return true;
     }
-    let plan = build_carried_task_plan(room_id, context, &carried, provider, homeserver, task_id);
+    let plan = build_carried_task_plan(room_id, context, &carried, &recipients, task_id);
     // A decline is remembered for the turn by the plan's needs, exactly as an
     // agent-requested plan is: do not raise the same carried prompt twice.
     let dismissed = with_a2app(|state| {
-        task_plan_is_dismissed(&state.dismissed_task_plans, room_id.as_str(), &plan.need_keys())
+        task_plan_is_dismissed(&state.dismissed_task_plans, room_id.as_str(), &plan.grantable_need_keys())
     })
     .unwrap_or(false);
     if dismissed {
@@ -8502,6 +8786,13 @@ fn hold_carried_permission_prompt(
     // carried-over modal appears without waiting for another event.
     makepad_widgets::SignalToUI::set_ui_signal();
     true
+}
+
+/// Whether the agent holds data of unknown origin, which no sharing rule can
+/// release: only a fresh session lets its model calls and replies through.
+#[cfg(unix)]
+fn is_holding_unknown_data(context: &a2app_core::information_flow::ContextId) -> bool {
+    a2app_core::information_flow::labels(context).is_ok_and(|label| label.contains(&Source::UnknownPrivate))
 }
 
 #[cfg(unix)]
@@ -8666,7 +8957,7 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
 
     // 2. Agent events since the last pass.
     let mut to_post: Vec<(OwnedRoomId, String)> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors: Vec<(OwnedRoomId, String)> = Vec::new();
     let mut deaths: Vec<(OwnedRoomId, String)> = Vec::new();
     {
         let updates: Vec<(OwnedRoomId, Vec<SessionUpdate>)> = with_a2app(|state| {
@@ -8781,7 +9072,7 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
                         log!("AI Rooms: room {room_id}'s agent session reported an error: {msg}");
                         post_ai_activity(&room_id, AiActivityKind::Error, Some(&msg));
                         settle_closed_turn(&room_id);
-                        errors.push(msg)
+                        errors.push((room_id.clone(), msg))
                     }
                     SessionUpdate::Gone(msg) => {
                         log!("AI Rooms: room {room_id}'s agent session is GONE: {msg}");
@@ -8803,9 +9094,22 @@ fn advance_ai_sessions(cx: &mut Cx, ui: &WidgetRef) {
         // it is queued before any subsequent member turn is released.
         settle_closed_turn(&room_id);
     }
-    for msg in errors {
+    for (room_id, msg) in errors {
         log!("AI Rooms: showing session error popup: {msg}");
-        enqueue_popup_notification(format!("AI session error: {msg}"), PopupKind::Error, Some(6.0));
+        // A sharing refusal's error row is usually refused too, so the popup
+        // has to say what happened and how to continue.
+        if msg.contains(super::information_flow::SHARING_REFUSED) {
+            enqueue_popup_notification(
+                if super::information_flow::agent_context(room_id.as_str()).is_ok_and(|context| is_holding_unknown_data(&context)) {
+                    "This room's AI stopped: it holds data whose origin Robrix can't tell, which is never shared with your AI service. To start fresh, type /ai and turn Allow this room's AI to run off and on."
+                } else {
+                    "This room's AI stopped: it needs your permission to share what it read with your AI service. Send your message again to review it."
+                },
+                PopupKind::Error, Some(10.0),
+            );
+        } else {
+            enqueue_popup_notification(format!("AI session error: {msg}"), PopupKind::Error, Some(6.0));
+        }
     }
     for (room_id, msg) in deaths {
         enqueue_popup_notification(
@@ -8954,6 +9258,106 @@ fn ai_read_authorization(
     Some(auth)
 }
 
+#[cfg(all(test, unix))]
+thread_local! {
+    /// Pins the AI service the agent gates check, independent of this machine's setup.
+    static TEST_MODEL_ID: RefCell<Option<Option<String>>> = const { RefCell::new(None) };
+    /// The rooms treated as joined; unit tests have no Matrix client.
+    pub(super) static TEST_JOINED_ROOMS: RefCell<Option<BTreeSet<String>>> = const { RefCell::new(None) };
+}
+
+/// Whether the signed-in account has joined `room`; `None` without a client.
+#[cfg(unix)]
+pub(super) fn joined_room(room: &str) -> Option<bool> {
+    #[cfg(test)]
+    if let Some(is_joined) = TEST_JOINED_ROOMS.with(|rooms| rooms.borrow().as_ref().map(|rooms| rooms.contains(room))) {
+        return Some(is_joined);
+    }
+    let client = crate::sliding_sync::get_client()?;
+    Some(OwnedRoomId::try_from(room).is_ok_and(|room| client.get_room(&room).is_some()))
+}
+
+/// The id of the AI service the agent's model calls go to, if one is configured.
+#[cfg(unix)]
+fn agent_model_id(prefs: &AgentPrefs) -> Option<String> {
+    #[cfg(test)]
+    if let Some(id) = TEST_MODEL_ID.with(|id| id.borrow().clone()) { return id; }
+    a2app_agent::model_transport::current_recipient(prefs).ok().map(|recipient| recipient.id)
+}
+
+/// The AI service and homeserver the agent's turns currently write to.
+#[cfg(unix)]
+fn agent_output_recipients() -> (Option<Recipient>, Option<Recipient>) {
+    let provider = with_a2app(|state| agent_model_id(&state.agent_prefs)).flatten().map(Recipient::ModelProvider);
+    let homeserver = crate::sliding_sync::get_client()
+        .and_then(|client| Recipient::network_origin(client.homeserver().as_str()).ok());
+    (provider, homeserver)
+}
+
+/// What a read adds to the agent's label: the directory, or the room it reads.
+#[cfg(unix)]
+fn ai_read_source(context: &a2app_core::information_flow::ContextId, kind: &ReadToolKind, target: &str) -> Source {
+    if is_directory_kind(kind) { super::information_flow::directory_source(context) }
+    else { super::information_flow::room_source(context, target) }
+}
+
+/// Labels the agent with what an authorized read introduces. Reading cached
+/// data sends nothing to room members; a remote fallback checks the actual
+/// homeserver before the SDK call. The directory tools carry one
+/// `RoomDirectory` source, so one provider rule covers the whole directory.
+#[cfg(unix)]
+fn label_ai_read(context: &a2app_core::information_flow::ContextId, kind: &ReadToolKind, target: &str) -> Result<(), String> {
+    if is_directory_kind(kind) {
+        return super::information_flow::record_directory_response(context);
+    }
+    a2app_core::information_flow::add_sources(context, [super::information_flow::room_source(context, target)])?;
+    a2app_core::information_flow::add_influences(context, [a2app_core::information_flow::Influence::RoomContent {
+        account: super::information_flow::context_account(context).into(), room: target.into(),
+    }])
+}
+
+/// Whether what this read adds may not reach the AI service, the homeserver or
+/// this room, so the reply that uses it would be refused. Sources the agent
+/// already holds are the turn-start review's concern, not this read's.
+#[cfg(unix)]
+fn is_ai_read_missing_sharing(room_id: &OwnedRoomId, context: &a2app_core::information_flow::ContextId, added: &Source) -> bool {
+    let (provider, homeserver) = agent_output_recipients();
+    agent_turn_recipients(room_id, context, provider.as_ref(), homeserver.as_ref()).iter().any(|recipient|
+        !a2app_core::information_flow::sharing_allows_for_reader(added, recipient, context).unwrap_or(false))
+}
+
+/// How many unrequested reads one turn may ask the user about.
+#[cfg(unix)]
+const MAX_READ_REVIEWS: u32 = 8;
+
+/// The answer to a read the user declined in its review this turn.
+#[cfg(unix)]
+const AI_READ_DECLINED: &str = "The user did not allow this read for this turn. Do not ask for it again; tell the user what you could not read.";
+
+/// The answer to a request or read review that no permission could let through.
+#[cfg(unix)]
+const AI_UNKNOWN_DATA: &str = "This session holds data whose origin Robrix can't tell, which is never shared with your AI service, so no permission can let it continue. The user can type /ai and turn Allow this room's AI to run off and on to start fresh.";
+
+/// The answer to a read refused unseen because the user declined another
+/// unrequested read of its kind this turn.
+#[cfg(unix)]
+const AI_READ_NOT_ASKED: &str = "The user was not asked about this read: they declined another unrequested read of this kind this turn. If you still need it, include it in request_task_permissions; otherwise tell the user what you could not read.";
+
+/// Why a read review is answered without being shown, if it is: the user
+/// declined this read this turn, or another unrequested read of its kind.
+#[cfg(unix)]
+fn read_review_refusal(state: &A2AppState, room_id: &OwnedRoomId, plan: &TaskPlan, group: Option<Permission>) -> Option<(&'static str, &'static str)> {
+    let is_declined = |needs: &BTreeSet<String>| task_plan_is_dismissed(&state.dismissed_task_plans, room_id.as_str(), needs);
+    // Its own need decides, whatever sharing rows a grown label adds.
+    if is_declined(&plan.grantable_need_keys()) || is_declined(&plan.requested_grantable_need_keys()) {
+        Some(("Declined this turn", AI_READ_DECLINED))
+    } else if group.is_some_and(|group| state.dismissed_prompts.contains(&(agent_subject(room_id.as_str()), group))) {
+        Some(("Not asked: another read was declined", AI_READ_NOT_ASKED))
+    } else {
+        None
+    }
+}
+
 #[cfg(unix)]
 fn run_ai_read_tool(
     cx: &mut Cx,
@@ -8961,35 +9365,37 @@ fn run_ai_read_tool(
     room_id: &OwnedRoomId,
     kind: ReadToolKind,
     answer: Sender<Result<String, String>>,
+    is_reviewed: bool,
 ) {
     let target = match &kind {
-        ReadToolKind::OtherRoom { room, .. } => room.as_str(),
-        ReadToolKind::SpaceInfo { space } | ReadToolKind::SpaceRooms { space } => space.as_str(),
-        _ => room_id.as_str(),
+        ReadToolKind::OtherRoom { room, .. } => room.clone(),
+        ReadToolKind::SpaceInfo { space } | ReadToolKind::SpaceRooms { space } => space.clone(),
+        _ => room_id.to_string(),
     };
-    let flow_context = match super::information_flow::prepare_agent(room_id.as_str()).and_then(|context| {
-        // Reading cached data sends nothing to room members. Any remote
-        // fallback checks the actual homeserver immediately before the SDK call.
-        // The directory tools carry one `RoomDirectory` source (and its
-        // untrusted influence) instead of one source per listed room, so one
-        // provider rule covers the whole directory and other recipients do not
-        // inherit every listed room. Everything else labels its target room.
-        if is_directory_kind(&kind) {
-            super::information_flow::record_directory_response(&context)?;
-        } else {
-            let source = super::information_flow::room_source(&context, target);
-            a2app_core::information_flow::add_sources(&context, [source])?;
-            a2app_core::information_flow::add_influences(&context, [a2app_core::information_flow::Influence::RoomContent {
-                account: super::information_flow::context_account(&context).into(), room: target.into(),
-            }])?;
-        }
-        Ok(context)
-    }) {
+    let flow_context = match super::information_flow::prepare_agent(room_id.as_str()) {
         Ok(context) => context,
         Err(error) => { let _ = answer.send(Err(super::information_flow::with_task_reask_hint(error))); return; }
     };
-    if !room_policy_allows(target, RoomAccess::Read) {
-        let _ = answer.send(Err("Reading this room is blocked in Mini Apps permissions.".into()));
+    // A named room is checked before it can reach policy, a prompt or the
+    // label: nothing about a malformed or refused read is recorded as read.
+    let target_room = match &kind {
+        ReadToolKind::OtherRoom { room, .. }
+        | ReadToolKind::SpaceInfo { space: room }
+        | ReadToolKind::SpaceRooms { space: room } => match OwnedRoomId::try_from(room.as_str()) {
+            Ok(target) => Some(target),
+            Err(_) => {
+                let err = format!("`{room}` is not a valid matrix room id. Use list_rooms or list_spaces to find its id.");
+                note_ai_tool_call(room_id, read_tool_name(&kind), false, &err);
+                let _ = answer.send(Err(err));
+                return;
+            }
+        },
+        _ => None,
+    };
+    if !room_policy_allows(&target, RoomAccess::Read) {
+        let text = String::from("Reading this room is blocked in Mini Apps permissions.");
+        note_ai_tool_call(room_id, read_tool_name(&kind), false, &text);
+        let _ = answer.send(Err(text));
         return;
     }
     // `read_room_memory` is ungated room plumbing — the agent recalling its
@@ -9016,8 +9422,9 @@ fn run_ai_read_tool(
         return;
     };
     // Flood guard first: refuse a read loop before it spends worker time. A
-    // fresh window starts once the last one ages out.
-    let over_budget = with_a2app(|state| {
+    // fresh window starts once the last one ages out. A read the user just
+    // approved has already been counted.
+    let over_budget = !is_reviewed && with_a2app(|state| {
         state.ai_rooms.get_mut(room_id).map(|info| {
             let now = Instant::now();
             if info
@@ -9045,32 +9452,22 @@ fn run_ai_read_tool(
     // the `matrix.rooms.messages.read` group is the kill switch and the prompt
     // unit, but a group `Granted` alone must not unlock every room the agent
     // names. Only the agent's own-room reads keep the ordinary group gate.
-    let target_room = match &kind {
-        ReadToolKind::OtherRoom { room, .. }
-        | ReadToolKind::SpaceInfo { space: room }
-        | ReadToolKind::SpaceRooms { space: room } => match OwnedRoomId::try_from(room.as_str()) {
-            Ok(target) => Some(target),
-            Err(_) => {
-                let err = format!("`{room}` is not a valid matrix room id");
-                note_ai_tool_call(room_id, read_tool_name(&kind), false, &err);
-                let _ = answer.send(Err(err));
-                return;
-            }
-        },
-        _ => None,
-    };
     let verdict = with_a2app(|state| {
         let target = target_room.as_deref().map(|r| r.as_str()).unwrap_or(room_id.as_str());
         let context = PermissionContext { origin_room: Some(room_id.as_str()), target_room: Some(target) };
+        let per_target = || state.permissions.effective_capability_for_in_context(
+            &subject, ai_room_declares_perm, ai_room_declares_cap, cap, context,
+        );
         let verdict = if services::is_room_collection(cap) {
             state.permissions.effective_collection_capability_for_in_context(
                 &subject, ai_room_declares_perm, ai_room_declares_cap, cap, context,
             )
-        } else {
-            state.permissions.effective_capability_for_in_context(
-                &subject, ai_room_declares_perm, ai_room_declares_cap, cap, context,
-            )
-        };
+        } else { per_target() };
+        // A space's rooms are allowed per space, as its plan asks for them, so
+        // a space outside the allowance is reviewed instead of listing nothing.
+        let verdict = if verdict == Effective::Granted && matches!(kind, ReadToolKind::SpaceRooms { .. }) {
+            per_target()
+        } else { verdict };
         if verdict == Effective::NeedsPrompt && target_room.is_some()
             && (state.permissions.is_room_read_allowed(&subject, target)
                 || cap.group.is_some_and(|group| state.once_rooms.contains(&(subject.clone(), group, target.to_string()))))
@@ -9084,61 +9481,157 @@ fn run_ai_read_tool(
         read_tool_name(&kind),
         verdict
     );
-    match verdict {
-        Effective::Granted => {
-            // A granted read records that the session actually used it — the
-            // same "Used" record a mini-app's granted call leaves, so the
-            // room's AI panel can show what it has been doing. (A cross-room
-            // read's allowance is the per-room entry the prompt wrote, not a
-            // blanket group grant.)
-            if let Some(group) = cap.group {
-                with_a2app(|state| {
-                    state.permissions.record_access(&subject, group, versions::now_unix());
-                    state.perms_dirty = true;
-                });
-            }
-            let id = NEXT_AI_TOOL_ID.fetch_add(1, Ordering::Relaxed);
-            with_a2app(|state| {
-                state.ai_reads.insert(id, (room_id.clone(), kind.clone(), answer));
-            });
-            // Collection consent starts the read; its authorization still
-            // filters every directory row and rechecks current user consent.
-            let authorization = with_a2app(|state| {
-                ai_read_authorization(room_id, &kind, &flow_context, &state.permissions)
-            }).flatten();
-            submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::ToolRead {
-                id,
-                room_id: room_id.clone(),
-                tool: kind,
-                authorization,
-                flow_epoch: a2app_core::information_flow::context_epoch(&flow_context).unwrap_or(0),
-                flow_context,
-            }));
+    if matches!(verdict, Effective::Denied | Effective::Undeclared) {
+        let text = match cap.group {
+            Some(group) => ai_tool_refused_text(group),
+            None => String::from("The user has not allowed the AI in this room to do that."),
+        };
+        note_ai_tool_call(room_id, read_tool_name(&kind), false, &text);
+        let _ = answer.send(Err(text));
+        return;
+    }
+    // A read the agent did not plan for is reviewed with the sharing rules it
+    // needs, so an approval is enough for the reply to reach the user. Once
+    // reviewed it is never asked again; later checks still refuse it if needed.
+    if !is_reviewed
+        && (verdict == Effective::NeedsPrompt
+            || is_ai_read_missing_sharing(room_id, &flow_context, &ai_read_source(&flow_context, &kind, &target)))
+    {
+        queue_ai_read_review(cx, ui, room_id, &flow_context, cap, kind, answer);
+        return;
+    }
+    if verdict != Effective::Granted {
+        note_ai_tool_call(room_id, read_tool_name(&kind), false, AI_READ_DECLINED);
+        let _ = answer.send(Err(AI_READ_DECLINED.into()));
+        return;
+    }
+    if let Err(error) = label_ai_read(&flow_context, &kind, &target) {
+        let _ = answer.send(Err(super::information_flow::with_task_reask_hint(error)));
+        return;
+    }
+    // The call's row names its target only now that the read is labelled.
+    let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
+    record_tool_call_detail(room_id, read_tool_name(&kind), read_kind_detail(&kind, &|id| resolve_room_label(rooms.as_ref(), id)));
+    // A granted read records that the session actually used it — the same
+    // "Used" record a mini-app's granted call leaves, so the room's AI panel
+    // can show what it has been doing.
+    if let Some(group) = cap.group {
+        with_a2app(|state| {
+            state.permissions.record_access(&subject, group, versions::now_unix());
+            state.perms_dirty = true;
+        });
+    }
+    let id = NEXT_AI_TOOL_ID.fetch_add(1, Ordering::Relaxed);
+    with_a2app(|state| {
+        state.ai_reads.insert(id, (room_id.clone(), kind.clone(), answer));
+    });
+    // Collection consent starts the read; its authorization still filters
+    // every directory row and rechecks current user consent.
+    let authorization = with_a2app(|state| {
+        ai_read_authorization(room_id, &kind, &flow_context, &state.permissions)
+    }).flatten();
+    submit_async_request(MatrixRequest::AiRoom(AiRoomRequest::ToolRead {
+        id,
+        room_id: room_id.clone(),
+        tool: kind,
+        authorization,
+        flow_epoch: a2app_core::information_flow::context_epoch(&flow_context).unwrap_or(0),
+        flow_context,
+    }));
+}
+
+/// Raises one review for a read the agent did not request up front: the
+/// ability and every sharing rule it needs, approved together for this turn.
+#[cfg(unix)]
+fn queue_ai_read_review(
+    cx: &mut Cx,
+    ui: &WidgetRef,
+    room_id: &OwnedRoomId,
+    context: &a2app_core::information_flow::ContextId,
+    cap: &'static a2app_core::capabilities::Capability,
+    kind: ReadToolKind,
+    answer: Sender<Result<String, String>>,
+) {
+    let targets = match &kind {
+        ReadToolKind::OtherRoom { room, .. } => vec![room.clone()],
+        ReadToolKind::SpaceInfo { space } | ReadToolKind::SpaceRooms { space } => vec![space.clone()],
+        _ => Vec::new(),
+    };
+    let detail = read_kind_detail(&kind, &|id| resolve_room_label(None, id));
+    let request = task_grants::TaskRequest {
+        task: match detail {
+            Some(detail) => format!("{} {detail}", crate::a2app::ai_room_events::ai_tool_display_name(read_tool_name(&kind))),
+            None => crate::a2app::ai_room_events::ai_tool_display_name(read_tool_name(&kind)),
+        },
+        explanation: String::from("The assistant wants to read this to answer you. Allowing it also lets what it reads reach your AI service and its reply be posted here, until this turn ends."),
+        needs: vec![task_grants::TaskNeed::Capability { id: "read".into(), capability: cap.id.into(), targets, why: None }],
+    };
+    let plan = match resolve_agent_task(room_id, context, &request) {
+        Ok(plan) => plan,
+        Err(error) => { let _ = answer.send(Err(error)); return; }
+    };
+    if !plan.needs_prompt() {
+        // Nothing left to ask: either it is allowed now, or it cannot be.
+        let outcome = task_grants::outcome(&plan, &BTreeSet::new());
+        if outcome["status"] == "granted" {
+            run_ai_read_tool(cx, ui, room_id, kind, answer, true);
+            return;
         }
-        Effective::Denied | Effective::Undeclared => {
-            let text = match cap.group {
-                Some(group) => ai_tool_refused_text(group),
-                None => String::from("The user has not allowed the AI in this room to do that."),
-            };
-            note_ai_tool_call(room_id, read_tool_name(&kind), false, &text);
-            let _ = answer.send(Err(text));
-        }
-        Effective::NeedsPrompt => {
-            // First use of a runtime-tier group: park the call and ask, exactly
-            // as a mini-app's first use does. The tool call is left unanswered
-            // — its serve thread blocks until the prompt resolves it.
-            let Some(group) = cap.group else { return };
-            queue_permission_prompt(
-                cx,
-                ui,
-                subject,
-                group,
-                ParkedRequest::AiTool {
-                    room_id: room_id.clone(),
-                    job: SessionJob::ReadTool { kind, answer },
-                },
-                None,
-            );
+        let text = match outcome["not_granted"][0]["reason"].as_str() {
+            Some("invalid_target") => String::from("That room is not one of the user's joined rooms. Use list_rooms to find a room to read."),
+            Some("blocked_by_room_policy") => String::from("Reading this room is blocked in Mini Apps permissions."),
+            _ => cap.group.map(ai_tool_refused_text).unwrap_or_else(|| AI_READ_DECLINED.into()),
+        };
+        note_ai_tool_call(room_id, read_tool_name(&kind), false, &text);
+        let _ = answer.send(Err(text));
+        return;
+    }
+    if is_holding_unknown_data(context) {
+        note_ai_tool_call(room_id, read_tool_name(&kind), false, "Holds data of unknown origin");
+        let _ = answer.send(Err(AI_UNKNOWN_DATA.into()));
+        return;
+    }
+    if let Some((note, text)) = with_a2app(|state| read_review_refusal(state, room_id, &plan, cap.group)).flatten() {
+        note_ai_tool_call(room_id, read_tool_name(&kind), false, note);
+        let _ = answer.send(Err(text.into()));
+        return;
+    }
+    // Reviews have their own cap, so a looping agent cannot raise them forever.
+    let is_over_limit = with_a2app(|state| {
+        let count = state.read_review_counts.entry(room_id.to_string()).or_insert(0);
+        *count += 1;
+        *count > MAX_READ_REVIEWS
+    }).unwrap_or(true);
+    if is_over_limit {
+        note_ai_tool_call(room_id, read_tool_name(&kind), false, "Review limit reached");
+        let _ = answer.send(Err(format!(
+            "This turn has already asked the user about {MAX_READ_REVIEWS} unrequested reads, so no more will be shown. \
+             List the rooms you still need in request_task_permissions, or tell the user what you could not read.",
+        )));
+        return;
+    }
+    with_a2app(|state| {
+        state.task_prompts.push_back(TaskPrompt { room_id: room_id.clone(), plan, resume: TaskResume::Read { kind, answer } });
+    });
+    show_next_permission_prompt(cx, ui);
+}
+
+/// Declines the agent's unrequested reads of one kind for the rest of its
+/// turn, answering any review of that kind still waiting to be shown.
+#[cfg(unix)]
+fn decline_read_reviews(room_id: &OwnedRoomId, group: Permission) {
+    let subject = agent_subject(room_id.as_str());
+    let queued: Vec<((&'static str, &'static str), TaskPrompt)> = with_a2app(|state| {
+        state.dismissed_prompts.insert((subject.clone(), group));
+        let (same, rest): (Vec<_>, Vec<_>) = state.task_prompts.drain(..).partition(|prompt| &prompt.room_id == room_id
+            && matches!(&prompt.resume, TaskResume::Read { kind, .. } if kind.capability().and_then(|cap| cap.group) == Some(group)));
+        state.task_prompts = rest.into_iter().collect();
+        same.into_iter().filter_map(|prompt| Some((read_review_refusal(state, room_id, &prompt.plan, Some(group))?, prompt))).collect()
+    }).unwrap_or_default();
+    for ((note, text), prompt) in queued {
+        if let TaskResume::Read { kind, answer } = prompt.resume {
+            note_ai_tool_call(room_id, read_tool_name(&kind), false, note);
+            let _ = answer.send(Err(text.into()));
         }
     }
 }
@@ -9205,6 +9698,14 @@ fn run_ai_room_post(
             post_ai_room_message(session_room, &target_room, job);
         }
         Effective::Denied | Effective::Undeclared => {
+            // Refused only by the write switch: ask, offering to turn it on,
+            // exactly as a media post does, instead of failing silently.
+            let can_enable_writes = with_a2app(|state| ai_media::can_enable_writes(state, &subject, cap, session_room, &target_room))
+                .unwrap_or(false);
+            if can_enable_writes {
+                queue_permission_prompt(cx, ui, subject, group, ParkedRequest::AiTool { room_id: session_room.clone(), job }, None);
+                return;
+            }
             let text = ai_tool_refused_text(group);
             note_ai_tool_call(session_room, "post_room_message", false, &text);
             answer_session_job(job, Err(text));
@@ -9417,6 +9918,12 @@ fn run_ai_launch_app_granted(
         OtherContext(MiniAppId),
         Restricted(MiniAppId),
     }
+    // Every answer below depends on the installed apps, which are account data.
+    let labeled = super::information_flow::agent_context(room_id.as_str()).and_then(|context| {
+        super::information_flow::current_context(&context)?;
+        a2app_core::information_flow::add_sources(&context, [super::information_flow::account_source(&context)])
+    });
+    if let Err(error) = labeled { let _ = answer.send(Err(super::information_flow::with_task_reask_hint(error))); return; }
     let outcome: Result<MiniAppManifest, Refusal> = with_a2app(|state| {
         let Some(manifest) = state.registry.get(&app_id).cloned() else {
             return Err(Refusal::Unknown);
@@ -9433,6 +9940,12 @@ fn run_ai_launch_app_granted(
 
     match outcome {
         Ok(manifest) => {
+            // Launching reads the app's code too: label it only now that the
+            // launch is allowed, then name the app on the call's row.
+            let labeled = super::information_flow::agent_context(room_id.as_str())
+                .and_then(|context| join_manifest_code(&manifest, &context));
+            if let Err(error) = labeled { let _ = answer.send(Err(super::information_flow::with_task_reask_hint(error))); return; }
+            record_tool_call_detail(room_id, "launch_app", Some(format!("\u{201c}{}\u{201d}", manifest.name)));
             let transfer = super::information_flow::agent_context(room_id.as_str()).and_then(|from| {
                 let to = super::information_flow::app_context(&manifest.id, Some(room_id.as_str()))?;
                 a2app_core::information_flow::register_context_with_legacy_data(&to, super::information_flow::manifest_has_private_source(&manifest))?;
@@ -9712,13 +10225,11 @@ fn resume_exact(cx: &mut Cx, ui: &WidgetRef, room_id: OwnedRoomId, resume: Exact
 fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: SessionJob) {
     if let Err(error) = ai_media::restore_provenance(room_id, &job) { answer_session_job(job, Err(error)); return; }
     // Deriving tool-card details reads host metadata too. Label that input
-    // before any description or result can be written back to the room.
+    // before any description or result can be written back to the room. A
+    // read labels itself only once it is authorized (see `run_ai_read_tool`).
     let recorded = super::information_flow::agent_context(room_id.as_str()).and_then(|context| {
         super::information_flow::current_context(&context)?;
         match &job {
-            SessionJob::ReadTool { kind, .. } if is_directory_kind(kind) => {
-                super::information_flow::record_directory_response(&context)?;
-            }
             SessionJob::PostRoomMedia { room_id: Some(target), .. } if target != room_id.as_str() => {
                 super::information_flow::record_directory_response(&context)?;
             }
@@ -9729,16 +10240,6 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
             }
             SessionJob::InspectMedia { request: super::ai::tools::InspectMediaRequest::Event { source_room: Some(source), .. }, .. } if source != room_id.as_str() => {
                 super::information_flow::record_directory_response(&context)?;
-            }
-            SessionJob::ReadTool { kind: ReadToolKind::OtherRoom { room, .. }, .. } => {
-                a2app_core::information_flow::add_sources(&context, [super::information_flow::room_source(&context, room)])?;
-            }
-            SessionJob::LaunchApp { app_id, .. } => {
-                let manifest = with_a2app(|state| state.registry.get(app_id).cloned()).flatten();
-                a2app_core::information_flow::add_sources(&context, [super::information_flow::account_source(&context)])?;
-                if let Some(manifest) = manifest {
-                    join_manifest_code(&manifest, &context)?;
-                }
             }
             SessionJob::CallMiniAppTool { tool, .. } | SessionJob::InvokeMiniAppTool { tool, .. } => {
                 with_a2app(|state| {
@@ -9761,9 +10262,13 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
     // The job is the only place the call's arguments exist, so this is where
     // the human-readable target detail is computed and pinned to the call's
     // live row (reposted with it) and, later, its receipt chip.
-    let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
-    let detail = session_job_detail(rooms.as_ref(), &job);
-    record_tool_call_detail(room_id, &ai_job_tool_name(&job), detail);
+    // A read or launch pins its target once authorized, so a refused one
+    // names nothing (see `run_ai_read_tool`, `run_ai_launch_app_granted`).
+    if !matches!(job, SessionJob::ReadTool { .. } | SessionJob::LaunchApp { .. }) {
+        let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
+        let detail = session_job_detail(rooms.as_ref(), &job);
+        record_tool_call_detail(room_id, &ai_job_tool_name(&job), detail);
+    }
     match job {
         job @ (SessionJob::DraftMessage { .. } | SessionJob::DraftMedia { .. } | SessionJob::InspectMedia { .. } | SessionJob::GenerateImage { .. } | SessionJob::AttachMedia { .. } | SessionJob::PostRoomMedia { .. }) => ai_media::run(cx, ui, room_id, job),
         SessionJob::SendRoomMessage { text, answer } => {
@@ -9798,7 +10303,7 @@ fn execute_session_job(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, job: 
             run_ai_launch_app(cx, ui, room_id, app_id, answer);
         }
         SessionJob::ReadTool { kind, answer } => {
-            run_ai_read_tool(cx, ui, room_id, kind, answer);
+            run_ai_read_tool(cx, ui, room_id, kind, answer, false);
         }
         SessionJob::RequestTaskPermissions { request, answer } => {
             run_request_task_permissions(cx, ui, room_id, request, answer);
@@ -9872,7 +10377,11 @@ fn run_mini_app_tool_call(
     let display_name = if via_bridge { "call_mini_app_tool".to_string() } else { tool.clone() };
     let subject = agent_subject(room_id.as_str());
     let decided = with_a2app(|state| {
-        if state.permissions.state(&subject, Permission::McpTools) == GrantState::Denied {
+        // The group and its "The AI called a tool" ability are both off switches.
+        if state.permissions.state(&subject, Permission::McpTools) == GrantState::Denied
+            || state.permissions.capability_state(&subject, "on_tool_call") == GrantState::Denied
+            || state.permissions.is_restricted(&subject)
+        {
             return Effective::Denied;
         }
         if state.permissions.has_scoped_tool_grant(&subject, &tool, "", PermissionContext {
@@ -9935,6 +10444,7 @@ fn run_ai_list_mini_app_tools(
     let subject = agent_subject(room_id.as_str());
     let denied = with_a2app(|state| {
         state.permissions.state(&subject, Permission::McpTools) == GrantState::Denied
+            || state.permissions.capability_state(&subject, "on_tool_call") == GrantState::Denied
     })
     .unwrap_or(false);
     if denied {
@@ -10111,13 +10621,16 @@ fn run_ai_fetch(cx: &mut Cx, ui: &WidgetRef, room_id: &OwnedRoomId, url: String,
         let permissions = &state.permissions;
         let denied = permissions.is_restricted(&subject)
             || permissions.state(&subject, Permission::Network) == GrantState::Denied
-            || permissions.capability_state(&subject, "network.http") == GrantState::Denied
-            || url::Url::parse(&url).ok().and_then(|url| url.host_str().map(str::to_owned))
-                .is_some_and(|host| state.dismissed_net_hosts.contains(&(subject.clone(), host)));
+            || permissions.capability_state(&subject, "network.http") == GrantState::Denied;
         if denied { return Err("Internet permission is blocked for this agent."); }
-        Ok(permissions.is_url_allowed(&subject, &url, PermissionContext {
+        // An allowance the user saved since wins over an earlier "Not now".
+        if permissions.is_url_allowed(&subject, &url, PermissionContext {
             origin_room: Some(room_id.as_str()), target_room: Some(room_id.as_str()),
-        }).then(|| permissions.clone()))
+        }) { return Ok(Some(permissions.clone())); }
+        let was_dismissed = url::Url::parse(&url).ok().and_then(|url| url.host_str().map(str::to_owned))
+            .is_some_and(|host| state.dismissed_net_hosts.contains(&(subject.clone(), host)));
+        if was_dismissed { return Err("The user declined this website earlier in this turn. Do not ask again; tell the user what you could not open."); }
+        Ok(None)
     }).unwrap_or(Err("Permissions are unavailable."));
     let consent = match consent {
         Ok(Some(consent)) => consent,
@@ -10562,6 +11075,58 @@ fn final_write_landed(room_id: &OwnedRoomId, token: u64) {
     settle_closed_turn(room_id);
 }
 
+/// The answer to a closed turn's tool call that never ran or was never approved.
+#[cfg(unix)]
+const AI_TURN_ENDED: &str = "The turn ended before this call ran. Retry it if it is still needed.";
+
+/// Ends what a closed turn still has waiting, so a late answer can't reach the
+/// next turn: tool calls queued behind its prompts, and its requests and prompts.
+#[cfg(unix)]
+fn end_turn_requests(room_id: &OwnedRoomId) {
+    let subject = agent_subject(room_id.as_str());
+    // Only prompts whose every parked call is this room's agent tool call can be answered here.
+    let is_turn_prompt = |prompt: &PermissionPrompt| prompt.subject == subject && prompt.flow.is_none()
+        && prompt.setup.is_none() && !prompt.parked.is_empty() && prompt.parked.iter().all(|parked| matches!(parked,
+            ParkedRequest::AiTool { room_id: room, .. } | ParkedRequest::NetworkAccess { room_id: room, .. } if room == room_id));
+    // Turn-start prompts belong to the next turn; a held natural reply holds this one open.
+    let is_turn_task = |prompt: &TaskPrompt| &prompt.room_id == room_id
+        && matches!(prompt.resume, TaskResume::AgentTool(_) | TaskResume::Read { .. } | TaskResume::Reply { token: None, .. });
+    let (jobs, tasks, prompts) = with_a2app(|state| {
+        let mut jobs = Vec::new();
+        if let Some(session) = state.ai_sessions.get_mut(room_id) {
+            while let Some(job) = session.try_recv_job() { jobs.push(job); }
+        }
+        let mut tasks = Vec::new();
+        if state.active_task.as_ref().is_some_and(is_turn_task) && let Some(prompt) = state.active_task.take() {
+            tasks.push(prompt);
+        }
+        let (mine, rest): (Vec<_>, Vec<_>) = state.task_prompts.drain(..).partition(is_turn_task);
+        state.task_prompts = rest.into_iter().collect();
+        tasks.extend(mine);
+        let (prompts, was_shown) = permission_batch::take_matching(state, is_turn_prompt);
+        state.is_permission_modal_stale |= was_shown;
+        (jobs, tasks, prompts)
+    })
+    .unwrap_or_default();
+    if !tasks.is_empty() || !prompts.is_empty() {
+        // The next pass closes a withdrawn prompt's modal and shows the next one.
+        makepad_widgets::SignalToUI::set_ui_signal();
+    }
+    for job in jobs {
+        answer_session_job(job, Err(AI_TURN_ENDED.into()));
+    }
+    for prompt in tasks {
+        withdraw_task_prompt(prompt);
+    }
+    for parked in prompts.into_iter().flat_map(|prompt| prompt.parked) {
+        match parked {
+            ParkedRequest::AiTool { job, .. } => answer_session_job(job, Err(AI_TURN_ENDED.into())),
+            ParkedRequest::NetworkAccess { answer, .. } => { let _ = answer.send(Err(AI_TURN_ENDED.into())); }
+            ParkedRequest::Bridge(_) | ParkedRequest::AppMedia(_) => {}
+        }
+    }
+}
+
 /// Revokes a closed turn's grants once its `Done` snapshot is no longer queued,
 /// every outstanding final-write token has landed. The host holds the next
 /// member turn until this rollback completes, so a late activity notification
@@ -10586,6 +11151,7 @@ fn settle_closed_turn(room_id: &OwnedRoomId) {
     .flatten()
     .unwrap_or((false, false));
     if revoke {
+        end_turn_requests(room_id);
         revoke_task_grants(room_id);
     }
     if retire {
@@ -10643,10 +11209,14 @@ fn close_active_turn(room_id: &OwnedRoomId, revoke_grants: bool) {
         Some((key, content)) => {
             post_ai_turn(room_id, &key, &content);
             if revoke_grants {
+                end_turn_requests(room_id);
                 revoke_task_grants(room_id);
             }
         }
-        None if revoke_grants => revoke_task_grants(room_id),
+        None if revoke_grants => {
+            end_turn_requests(room_id);
+            revoke_task_grants(room_id);
+        }
         None => {
             // No turn card was open, so there is no Done snapshot. The caller
             // still has to queue the error/stopped row or the reply, then
@@ -10745,8 +11315,12 @@ fn flush_pending_ai_turns(cx: &mut Cx) {
         for (room_id, info) in state.ai_rooms.iter_mut() {
             // Keep the timer armed while a closed turn still has final writes
             // outstanding, so its failsafe deadline can fire on an idle app.
-            if info.final_writes_pending_revoke {
+            if info.final_writes_pending_revoke && !info.is_reply_held {
                 needs_timer = true;
+            }
+            // A held reply's card waits with it, so its snapshots are not refused.
+            if info.is_reply_held {
+                continue;
             }
             if info.ai_turn_in_flight {
                 needs_timer = true;
@@ -10823,36 +11397,37 @@ fn post_ai_state_event(
     state_key: &str,
     content: &impl serde::Serialize,
 ) -> Option<u64> {
-    if !room_policy_allows(room_id.as_str(), RoomAccess::Write) {
-        with_a2app(|state| {
-            if let Some(info) = state.ai_rooms.get_mut(room_id) {
-                info.ai_turn_in_flight = false;
-                info.ai_turn_write_id = None;
-                info.pending_ai_turns.clear();
-                info.pending_final_turns.clear();
-                info.anchor_in_flight = None;
-            }
-        });
-        return None;
-    }
-    let flow_context = match super::information_flow::agent_context(room_id.as_str()).and_then(|context| {
-        super::information_flow::ensure_room_output(&context, room_id.as_str())?;
-        Ok(context)
-    }) {
-        Ok(context) => context,
-        Err(_) => {
+    let refused = if !is_agent_room_output_allowed(room_id.as_str()) {
+        Some(String::from("writing to this room is blocked by its Mini Apps policy"))
+    } else {
+        super::information_flow::agent_context(room_id.as_str())
+            .and_then(|context| super::information_flow::ensure_agent_room_output(&context, room_id.as_str()))
+            .err()
+    };
+    if let Some(reason) = refused {
+        log!("AI Rooms: refusing to post an {event_type} row to {room_id}: {reason}");
+        // Only a refused card snapshot releases the card's in-flight state; an
+        // activity row must not let a second snapshot start beside one in flight.
+        if event_type == AI_TURN_EVENT_TYPE {
             with_a2app(|state| {
                 if let Some(info) = state.ai_rooms.get_mut(room_id) {
+                    // A refused first snapshot must not leave later ones hidden
+                    // as continuations of a card that was never written.
+                    if let Some(key) = info.anchor_in_flight.take()
+                        && info.first_posted_turn.as_deref() == Some(key.as_str())
+                    {
+                        info.first_posted_turn = None;
+                    }
                     info.ai_turn_in_flight = false;
                     info.ai_turn_write_id = None;
                     info.pending_ai_turns.clear();
                     info.pending_final_turns.clear();
-                    info.anchor_in_flight = None;
                 }
             });
-            return None;
         }
-    };
+        return None;
+    }
+    let Ok(flow_context) = super::information_flow::agent_context(room_id.as_str()) else { return None };
     let json = match serde_json::to_value(content) {
         Ok(json) => json,
         Err(e) => {
@@ -10893,6 +11468,128 @@ fn post_ai_state_event(
     Some(write_id)
 }
 
+/// The words a sharing review uses for the sources an agent holds.
+#[cfg(unix)]
+fn held_source_labels(room_id: &OwnedRoomId, sources: &BTreeSet<Source>) -> String {
+    let mut labels: Vec<String> = Vec::new();
+    for source in sources {
+        let label = match source {
+            Source::Room { room, .. } if room == room_id.as_str() => "this conversation".to_string(),
+            Source::RoomDirectory { .. } => "your list of rooms and spaces".to_string(),
+            Source::Room { room, .. } => format!("\u{201c}{}\u{201d}", resolve_room_label(None, room)),
+            Source::Account { .. } => "your account data".to_string(),
+            Source::UnknownPrivate => "stored data".to_string(),
+        };
+        if !labels.contains(&label) { labels.push(label); }
+    }
+    labels.join(", ")
+}
+
+/// Holds a finished reply the sharing check refused behind one review of the
+/// rules it needs, so the user decides instead of the reply silently
+/// disappearing. Returns false when no review could release it; a dropped
+/// natural reply then gets a popup saying why.
+#[cfg(unix)]
+fn hold_refused_reply(room_id: &OwnedRoomId, text: &str, answer_id: Option<u64>) -> bool {
+    let Ok(context) = super::information_flow::agent_context(room_id.as_str()) else { return false };
+    let (_, homeserver) = agent_output_recipients();
+    let recipients = agent_turn_recipients(room_id, &context, None, homeserver.as_ref());
+    let mut denied = BTreeSet::new();
+    for recipient in &recipients {
+        match a2app_core::information_flow::decision(&context, recipient) {
+            Ok(decision) => denied.extend(decision.denied_sources),
+            Err(_) => return false,
+        }
+    }
+    let note_dropped = |text: &'static str| if answer_id.is_none() { enqueue_popup_notification(text, PopupKind::Warning, Some(10.0)); };
+    if denied.is_empty() { return false; }
+    // Stored data of unknown origin can never be released by a rule.
+    if denied.contains(&Source::UnknownPrivate) {
+        note_dropped("This room's AI answered, but its reply holds data whose origin Robrix can't tell, so it can't be posted here. To start fresh, type /ai and turn Allow this room's AI to run off and on.");
+        return false;
+    }
+    let task_id = with_a2app(|state| {
+        state.next_task_id = state.next_task_id.saturating_add(1);
+        state.next_task_id
+    }).unwrap_or(0);
+    let mut plan = build_carried_task_plan(room_id, &context, &denied, &recipients, task_id);
+    plan.title = String::from("Post this room's AI reply");
+    plan.explanation = format!(
+        "The assistant finished its reply, but it includes information from {} that may not be posted here yet. \
+         AI replies are stored on your homeserver without encryption. Allow it for this turn to see the reply.",
+        held_source_labels(room_id, &denied),
+    );
+    plan.seal();
+    let is_dismissed = with_a2app(|state| {
+        task_plan_is_dismissed(&state.dismissed_task_plans, room_id.as_str(), &plan.grantable_need_keys())
+    }).unwrap_or(false);
+    if is_dismissed {
+        note_dropped("This room's AI answered, but you didn't allow its reply to be posted here this turn. Send your message again to review it.");
+        return false;
+    }
+    let token = answer_id.is_none().then(|| NEXT_AI_WRITE_ID.fetch_add(1, Ordering::Relaxed));
+    with_a2app(|state| {
+        if let Some(info) = state.ai_rooms.get_mut(room_id) {
+            info.is_reply_held = true;
+            if let Some(token) = token {
+                info.pending_final_writes.insert(token);
+                // The closed turn's failsafe waits for the user's answer.
+                info.final_writes_deadline = None;
+            }
+        }
+        state.task_prompts.push_back(TaskPrompt {
+            room_id: room_id.clone(), plan,
+            resume: TaskResume::Reply { text: text.to_string(), answer_id, token },
+        });
+    });
+    makepad_widgets::SignalToUI::set_ui_signal();
+    true
+}
+
+/// A reply that will not be posted: its receipts must not ride the next turn's
+/// card, and a parked `send_message` loses its optimistic receipt.
+#[cfg(unix)]
+fn drop_reply_receipts(room_id: &OwnedRoomId, answer_id: Option<u64>, reason: &str) {
+    with_a2app(|state| {
+        let Some(info) = state.ai_rooms.get_mut(room_id) else { return };
+        if answer_id.is_none() {
+            info.pending_tool_calls.clear();
+        } else if let Some(index) = info.pending_tool_calls.iter().rposition(|call| call.name == "send_message") {
+            info.pending_tool_calls.remove(index);
+        }
+    });
+    if answer_id.is_some() {
+        note_ai_tool_call(room_id, "send_message", false, reason);
+    }
+}
+
+/// Releases a held reply after its review: posts it when approved, otherwise
+/// answers a parked `send_message`. Either way the closed turn may settle.
+#[cfg(unix)]
+fn release_held_reply(room_id: &OwnedRoomId, text: String, answer_id: Option<u64>, token: Option<u64>, is_approved: bool) {
+    with_a2app(|state| {
+        if let Some(info) = state.ai_rooms.get_mut(room_id) {
+            info.is_reply_held = false;
+            if token.is_some() && info.final_writes_pending_revoke {
+                info.final_writes_deadline = Some(Instant::now() + FINAL_WRITE_FAILSAFE);
+            }
+        }
+    });
+    if is_approved {
+        post_ai_reply(room_id, text, answer_id);
+    } else {
+        drop_reply_receipts(room_id, answer_id, "Not posted: the user did not allow it");
+        if let Some(id) = answer_id
+            && let Some((_, _, answer, _)) = with_a2app(|state| state.ai_replies.remove(&id)).flatten()
+        {
+            let _ = answer.send(Err("The user did not allow this reply to be posted here. Tell the user what you could not share.".into()));
+        }
+    }
+    if let Some(token) = token {
+        final_write_landed(room_id, token);
+    }
+}
+
 /// Writes `text` as an `ai_reply` state event — the agent's only output
 /// channel (never `m.room.message`, so it can't loop back into the
 /// forwarder as input). This is how both a completed turn's natural reply
@@ -10901,25 +11598,35 @@ fn post_ai_state_event(
 #[cfg(unix)]
 fn post_ai_reply(room_id: &OwnedRoomId, text: String, answer_id: Option<u64>) {
     let flow_context = super::information_flow::agent_context(room_id.as_str()).and_then(|context| {
-        super::information_flow::ensure_room_output(&context, room_id.as_str())?;
+        super::information_flow::ensure_agent_room_output(&context, room_id.as_str())?;
         Ok(context)
     });
-    if flow_context.is_err() || !room_policy_allows(room_id.as_str(), RoomAccess::Write) {
+    let is_blocked = !is_agent_room_output_allowed(room_id.as_str());
+    if flow_context.is_err() || is_blocked {
         let reason = match &flow_context {
-            Err(error) => error.clone(),
-            Ok(_) => String::from("writing to this room is blocked by its Mini Apps policy"),
+            Err(error) if !is_blocked => error.clone(),
+            _ => String::from("writing to this room is blocked by its Mini Apps policy"),
         };
         log!("AI Rooms: refusing to post an ai_reply to {room_id}: {reason}");
+        // A reply refused only for a missing sharing rule waits for the user's
+        // review instead of disappearing.
+        if !is_blocked && hold_refused_reply(room_id, &text, answer_id) {
+            log!("AI Rooms: holding the reply for {room_id} behind a sharing review.");
+            return;
+        }
         // The reply could not even be queued. A natural reply has no worker
         // result to release a token. Settle the other final writes; a
         // parked `send_message` is answered below and its turn keeps them.
+        drop_reply_receipts(room_id, answer_id, &reason);
         if answer_id.is_none() {
             settle_closed_turn(room_id);
         }
         if let Some(id) = answer_id
             && let Some((_, _, answer, _)) = with_a2app(|state| state.ai_replies.remove(&id)).flatten()
         {
-            let _ = answer.send(Err("Writing to this room is blocked in Mini Apps permissions.".into()));
+            let message = if is_blocked { String::from("Writing to this room is blocked in Mini Apps permissions.") }
+                else { super::information_flow::with_task_reask_hint(reason) };
+            let _ = answer.send(Err(message));
         }
         return;
     }
@@ -11913,6 +12620,22 @@ View{note := Label{text:"waiting"}}
         }
     }
 
+    /// Pins the AI service id the agent gates see for one test.
+    #[cfg(unix)]
+    struct ModelIdGuard(Option<Option<String>>);
+
+    #[cfg(unix)]
+    impl ModelIdGuard {
+        fn pin(id: Option<&str>) -> Self {
+            Self(TEST_MODEL_ID.with(|current| current.replace(Some(id.map(str::to_owned)))))
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ModelIdGuard {
+        fn drop(&mut self) { TEST_MODEL_ID.with(|current| { current.replace(self.0.take()); }); }
+    }
+
     #[cfg(unix)]
     #[test]
     fn space_directory_dispatch_keeps_only_directory_provenance_and_query_authorization() {
@@ -11923,7 +12646,9 @@ View{note := Label{text:"waiting"}}
         initialize_state(AppRegistry::new(Vec::new()), PermissionStore::default(), A2AppPersistedState::default(), Default::default());
         let room: OwnedRoomId = SOURCE.try_into().unwrap();
         let context = super::super::information_flow::begin_agent_session(SOURCE).unwrap();
-        let provider = flow::Recipient::ModelProvider(format!("space-directory-provider-{}", std::process::id()));
+        let provider_id = format!("space-directory-provider-{}", std::process::id());
+        let _model = ModelIdGuard::pin(Some(&provider_id));
+        let provider = flow::Recipient::ModelProvider(provider_id);
         super::super::information_flow::ensure_agent_default_sharing(
             &context, SOURCE, Some(match &provider { flow::Recipient::ModelProvider(id) => id, _ => unreachable!() }),
             None, &mut BTreeSet::new(),
@@ -12266,7 +12991,7 @@ View{note := Label{text:"waiting"}}
 
         let original: BTreeSet<String> = ["needs:a", "needs:b"].into_iter().map(String::from).collect();
         let mut dismissed = HashMap::new();
-        dismissed.insert((SOURCE.to_string(), [7; 32]), original.clone());
+        dismissed.insert((SOURCE.to_string(), [7; 32]), DeclinedPlan { needs: original.clone(), ..Default::default() });
         // The same needs renamed (different fingerprint) are still covered.
         assert!(task_plan_is_dismissed(&dismissed, SOURCE, &original));
         assert!(task_plan_is_dismissed(&dismissed, SOURCE, &["needs:a".to_string()].into_iter().collect()));
@@ -12280,9 +13005,10 @@ View{note := Label{text:"waiting"}}
     #[test]
     fn combining_separately_declined_needs_does_not_reopen_the_prompt() {
         let mut dismissed = HashMap::new();
-        dismissed.insert((SOURCE.to_string(), [1; 32]), BTreeSet::from(["needs:a".into()]));
-        dismissed.insert((SOURCE.to_string(), [2; 32]), BTreeSet::from(["needs:b".into()]));
-        dismissed.insert((TARGET.to_string(), [3; 32]), BTreeSet::from(["needs:c".into()]));
+        let declined = |need: &str| DeclinedPlan { needs: BTreeSet::from([need.to_string()]), ..Default::default() };
+        dismissed.insert((SOURCE.to_string(), [1; 32]), declined("needs:a"));
+        dismissed.insert((SOURCE.to_string(), [2; 32]), declined("needs:b"));
+        dismissed.insert((TARGET.to_string(), [3; 32]), declined("needs:c"));
         let combined = BTreeSet::from(["needs:a".into(), "needs:b".into()]);
         assert!(task_plan_is_dismissed(&dismissed, SOURCE, &combined));
         assert!(!task_plan_is_dismissed(&dismissed, TARGET, &combined));
@@ -12364,7 +13090,7 @@ View{note := Label{text:"waiting"}}
                 grants: Vec::new(),
                 item_states: BTreeMap::new(),
             });
-            state.dismissed_task_plans.insert((SOURCE.to_string(), [3; 32]), BTreeSet::new());
+            state.dismissed_task_plans.insert((SOURCE.to_string(), [3; 32]), DeclinedPlan::default());
             state.task_request_counts.insert(SOURCE.to_string(), 2);
             state.task_request_counts.insert(TARGET.to_string(), 1);
         })
@@ -12476,7 +13202,8 @@ View{note := Label{text:"waiting"}}
         let carried = a2app_core::information_flow::carried_over_sources(&context, &provider).unwrap();
         assert!(carried.contains(&carried_room));
         let room_id: OwnedRoomId = SOURCE.try_into().unwrap();
-        let plan = build_carried_task_plan(&room_id, &context, &carried, &provider, None, 1);
+        let plan = build_carried_task_plan(&room_id, &context, &carried,
+            &agent_turn_recipients(&room_id, &context, Some(&provider), None), 1);
         assert!(plan.explanation.contains("Earlier in this conversation"), "the host writes the explanation");
         assert!(plan.items.iter().any(|item| item.state.is_grantable()), "the carried source needs a row");
         let approved: BTreeSet<String> = plan.items.iter().filter(|item| item.state.is_grantable())
@@ -12730,7 +13457,7 @@ View{note := Label{text:"waiting"}}
         );
         flow::add_sources(&context, [room_b.clone()]).unwrap();
         let plan = build_carried_task_plan(&room_id, &context, &[room_b.clone()].into_iter().collect(),
-            &provider, Some(&homeserver), 7);
+            &agent_turn_recipients(&room_id, &context, Some(&provider), Some(&homeserver)), 7);
         let approved: BTreeSet<String> = plan.items.iter().map(|item| item.id.clone()).collect();
         let mut store = PermissionStore::default();
         let applied = task_grants::apply(&plan, &approved, &mut store, &task_grants::GlobalFlowApply).unwrap();
@@ -13076,7 +13803,7 @@ View{note := Label{text:"waiting"}}
         let private = Source::Room { account: fixture.context.account().into(), room: TARGET.into() };
         flow::add_sources(&fixture.context, [private.clone()]).unwrap();
         let plan = build_carried_task_plan(&fixture.room, &fixture.context, &BTreeSet::from([private.clone()]),
-            &provider, None, 2);
+            &agent_turn_recipients(&fixture.room, &fixture.context, Some(&provider), None), 2);
         let approved = plan.items.iter().map(|item| item.id.clone()).collect();
         let applied = task_grants::apply(&plan, &approved, &mut PermissionStore::default(), &task_grants::GlobalFlowApply).unwrap();
         with_a2app(|state| state.task_ledger.insert(applied));
@@ -13210,7 +13937,7 @@ View{note := Label{text:"waiting"}}
             &mut BTreeSet::new(),
         );
         let private = Source::Room { account: fixture.context.account().into(), room: TARGET.into() };
-        flow::add_sources(&fixture.context, [private.clone(), Source::UnknownPrivate]).unwrap();
+        flow::add_sources(&fixture.context, [private.clone()]).unwrap();
         let texts = vec![("$carried-reply:test".try_into().unwrap(), "next turn".into())];
         for (missing, present) in [(&own_room, &homeserver), (&homeserver, &own_room)] {
             let provider_grant = flow::grant_sharing(private.clone(), provider.clone(),
@@ -13224,7 +13951,7 @@ View{note := Label{text:"waiting"}}
             assert!(hold_carried_permission_prompt(&fixture.room, &texts, &fixture.context, &provider, Some(&homeserver), 11));
             with_a2app(|state| {
                 let prompt = state.task_prompts.pop_front().unwrap();
-                assert_eq!(prompt.plan.items.len(), 3, "baseline and unknown sources keep their existing filtering");
+                assert_eq!(prompt.plan.items.len(), 3, "baseline sources with their rules are not asked about");
                 assert!(prompt.plan.items.iter().any(|item| matches!(&item.action,
                     task_grants::PlanAction::Flow { source, recipient } if source == &private && recipient == missing)
                     && item.state == ItemState::NeedsGrant));
@@ -13237,5 +13964,726 @@ View{note := Label{text:"waiting"}}
             flow::revoke_sharing(provider_grant).unwrap();
             flow::revoke_sharing(reply_grant).unwrap();
         }
+    }
+
+    /// The rooms task plans treat as joined for one test.
+    #[cfg(unix)]
+    struct JoinedRoomsGuard(Option<BTreeSet<String>>);
+
+    #[cfg(unix)]
+    impl JoinedRoomsGuard {
+        fn new(rooms: &[&str]) -> Self {
+            Self(TEST_JOINED_ROOMS.with(|current| current.replace(Some(rooms.iter().map(|room| room.to_string()).collect()))))
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for JoinedRoomsGuard {
+        fn drop(&mut self) { TEST_JOINED_ROOMS.with(|current| { current.replace(self.0.take()); }); }
+    }
+
+    #[cfg(unix)]
+    fn apply_agent_defaults(fixture: &FinalWriteTestState) {
+        with_a2app(|state| {
+            let prefs = state.agent_prefs.clone();
+            ensure_agent_defaults(state, &fixture.room, &fixture.context, &prefs);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resets_restore_an_ai_rooms_default_access() {
+        use a2app_core::information_flow as flow;
+        let fixture = FinalWriteTestState::new("reset-restores-defaults");
+        let _model = ModelIdGuard::pin(Some("reset-defaults-provider"));
+        let provider = Recipient::ModelProvider("reset-defaults-provider".into());
+        let own_room = Recipient::MatrixRoom { account: fixture.context.account().into(), room: SOURCE.into() };
+        let directory = super::super::information_flow::directory_source(&fixture.context);
+        let subject = agent_subject(SOURCE);
+        let are_defaults_present = || {
+            let directory_grants = with_a2app(|state| state.permissions.scoped_grants(&subject).iter()
+                .filter(|grant| grant.scope == RoomScope::AllRooms && grant.capability.as_deref()
+                    .is_some_and(|id| a2app_core::task_grants::DIRECTORY_CAP_IDS.contains(&id)))
+                .count()).unwrap();
+            directory_grants == a2app_core::task_grants::DIRECTORY_CAP_IDS.len()
+                && flow::is_durably_allowed_for_reader(&directory, &provider, &fixture.context).unwrap()
+                && flow::is_durably_allowed_for_reader(&directory, &own_room, &fixture.context).unwrap()
+        };
+        apply_agent_defaults(&fixture);
+        assert!(are_defaults_present());
+        // What Reset all does, limited to this fixture: the process-wide flow
+        // reset would remove other tests' rules while they run in parallel.
+        with_a2app(|state| { state.permissions.reset_to_defaults(); forget_applied_agent_defaults(state); });
+        let reader = flow::ReaderScope::Context(fixture.context.clone());
+        for grant in flow::sharing_grants().unwrap().into_iter().filter(|grant| grant.reader == reader) {
+            flow::revoke_sharing(grant.id).unwrap();
+        }
+        assert!(!are_defaults_present(), "a reset clears the defaults with every other approval");
+        assert!(with_a2app(|state| state.persisted.permission_defaults_applied.is_empty()
+            && state.persisted.default_sharing_applied.is_empty()).unwrap(), "and forgets that they were applied");
+        apply_agent_defaults(&fixture);
+        assert!(are_defaults_present(), "so the next turn applies them again");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_reset_forgets_only_its_own_rooms_default_markers() {
+        let fixture = FinalWriteTestState::new("agent-reset-markers");
+        with_a2app(|state| {
+            for room in [SOURCE, TARGET] {
+                state.persisted.permission_defaults_applied.insert(room.to_string());
+                state.persisted.default_sharing_applied.insert(format!("{room}|{{\"ModelProvider\":\"p\"}}"));
+            }
+        });
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        permission_lifecycle::reset_app_permissions(&mut cx, &WidgetRef::empty(), &agent_subject(SOURCE));
+        with_a2app(|state| {
+            let applied = &state.persisted;
+            assert!(!applied.permission_defaults_applied.contains(SOURCE));
+            assert!(applied.permission_defaults_applied.contains(TARGET), "another AI room keeps its defaults");
+            assert!(!applied.default_sharing_applied.iter().any(|marker| marker.starts_with(&format!("{SOURCE}|"))));
+            assert!(applied.default_sharing_applied.iter().any(|marker| marker.starts_with(&format!("{TARGET}|"))));
+        });
+        let _ = fixture;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restoring_defaults_replaces_a_directory_block_and_recreates_reply_sharing() {
+        use a2app_core::information_flow as flow;
+        let fixture = FinalWriteTestState::new("restore-defaults");
+        let _model = ModelIdGuard::pin(Some("restore-defaults-provider"));
+        let provider = Recipient::ModelProvider("restore-defaults-provider".into());
+        let own_room = Recipient::MatrixRoom { account: fixture.context.account().into(), room: SOURCE.into() };
+        let directory = super::super::information_flow::directory_source(&fixture.context);
+        let subject = agent_subject(SOURCE);
+        with_a2app(|state| {
+            // Applied once, then blocked and revoked by hand: the markers stay.
+            state.persisted.permission_defaults_applied.insert(SOURCE.into());
+            state.persisted.default_sharing_applied.insert(format!("{SOURCE}|{}", serde_json::to_string(&provider).unwrap()));
+            state.persisted.default_sharing_applied.insert(format!("{SOURCE}|{}", serde_json::to_string(&own_room).unwrap()));
+            state.permissions.set(&subject, Permission::MatrixRoomsList, GrantState::Denied);
+        });
+        let list = a2app_core::capabilities::by_id("matrix.rooms.list").unwrap();
+        let verdict = || with_a2app(|state| state.permissions.effective_collection_capability_for_in_context(
+            &subject, ai_room_declares_perm, ai_room_declares_cap, list,
+            PermissionContext { origin_room: Some(SOURCE), target_room: Some(SOURCE) })).unwrap();
+        apply_agent_defaults(&fixture);
+        assert_eq!(verdict(), Effective::Denied, "the one-time defaults never override a block");
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        restore_agent_defaults(&mut cx, &WidgetRef::empty(), &fixture.room);
+        assert_eq!(verdict(), Effective::Granted);
+        assert!(flow::is_durably_allowed_for_reader(&directory, &provider, &fixture.context).unwrap());
+        assert!(flow::is_durably_allowed_for_reader(&directory, &own_room, &fixture.context).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_turn_scoped_rule_does_not_stand_in_for_a_saved_default() {
+        use a2app_core::information_flow as flow;
+        let fixture = FinalWriteTestState::new("turn-rule-default");
+        let directory = super::super::information_flow::directory_source(&fixture.context);
+        let provider = Recipient::ModelProvider("turn-rule-provider".into());
+        let turn_rule = flow::grant_sharing(directory.clone(), provider.clone(), flow::ReaderScope::Context(fixture.context.clone()),
+            flow::SharingDuration::RoomSession { account: fixture.context.account().into(), room: SOURCE.into() }).unwrap();
+        let mut applied = BTreeSet::new();
+        super::super::information_flow::ensure_agent_default_sharing(&fixture.context, SOURCE, Some("turn-rule-provider"), None, &mut applied);
+        flow::revoke_sharing(turn_rule).unwrap();
+        assert!(flow::sharing_allows_for_reader(&directory, &provider, &fixture.context).unwrap(),
+            "the saved default remains once the turn's rule is gone");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ai_rooms_own_output_ignores_the_write_switch_but_not_a_room_block() {
+        let fixture = FinalWriteTestState::new("own-output-write-switch");
+        with_a2app(|state| state.permissions.set_matrix_write(false));
+        assert!(!room_policy_allows(SOURCE, RoomAccess::Write));
+        assert!(is_agent_room_output_allowed(SOURCE), "the switch is about apps changing rooms, not the AI's replies");
+        with_a2app(|state| state.permissions.set_room_policy(SOURCE, RoomAccess::Write, PolicyDecision::Deny));
+        assert!(!is_agent_room_output_allowed(SOURCE), "a block on the room still stops them");
+        let _ = fixture;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unplanned_read_is_reviewed_with_its_sharing_and_runs_once_approved() {
+        use a2app_core::information_flow as flow;
+        let fixture = FinalWriteTestState::new("read-review");
+        let _model = ModelIdGuard::pin(Some("read-review-provider"));
+        let _joined = JoinedRoomsGuard::new(&[SOURCE, TARGET]);
+        let provider = Recipient::ModelProvider("read-review-provider".into());
+        let own_room = Recipient::MatrixRoom { account: fixture.context.account().into(), room: SOURCE.into() };
+        let target = Source::Room { account: fixture.context.account().into(), room: TARGET.into() };
+        apply_agent_defaults(&fixture);
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let ui = WidgetRef::empty();
+        let read = |cx: &mut Cx| {
+            let (answer, reply) = std::sync::mpsc::channel();
+            execute_session_job(cx, &ui, &fixture.room, SessionJob::ReadTool {
+                kind: ReadToolKind::OtherRoom { room: TARGET.into(), limit: 5 }, answer,
+            });
+            reply
+        };
+        let reviewed_plan = || with_a2app(|state| {
+            let prompt = state.active_task.as_ref().expect("the read is reviewed");
+            assert!(matches!(prompt.resume, TaskResume::Read { .. }));
+            prompt.plan.clone()
+        }).unwrap();
+        // Declined: nothing is read or labelled, and the read is not asked again this turn.
+        let reply = read(&mut cx);
+        let plan = reviewed_plan();
+        assert!(plan.items.iter().any(|item| item.state.is_grantable() && matches!(&item.action,
+            task_grants::PlanAction::Scoped { capability, scope: RoomScope::Selection { rooms, .. }, .. }
+                if capability == "matrix.rooms.messages.read" && rooms == &[TARGET.to_string()])));
+        for recipient in [&provider, &own_room] {
+            assert!(plan.items.iter().any(|item| item.state.is_grantable() && matches!(&item.action,
+                task_grants::PlanAction::Flow { source, recipient: to } if source == &target && to == recipient)),
+                "the review includes the sharing the read needs");
+        }
+        answer_task_prompt(&mut cx, &ui, TaskPermissionAction::NotNow);
+        assert_eq!(reply.try_recv().unwrap().unwrap_err(), AI_READ_DECLINED);
+        assert!(!flow::labels(&fixture.context).unwrap().contains(&target));
+        assert_eq!(read(&mut cx).try_recv().unwrap().unwrap_err(), AI_READ_DECLINED, "no second review this turn");
+        assert!(with_a2app(|state| state.active_task.is_none()).unwrap());
+        // A later turn asks again; approving runs the read with its sharing.
+        revoke_task_grants(&fixture.room);
+        let reply = read(&mut cx);
+        let ids = reviewed_plan().grantable().map(|item| item.id.clone()).collect();
+        answer_task_prompt(&mut cx, &ui, TaskPermissionAction::Allow(ids));
+        assert!(matches!(reply.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)), "the read is running, not refused");
+        assert!(with_a2app(|state| state.ai_reads.values().any(|(room, kind, _)| room == &fixture.room
+            && matches!(kind, ReadToolKind::OtherRoom { room, .. } if room == TARGET))).unwrap());
+        assert!(flow::labels(&fixture.context).unwrap().contains(&target));
+        assert!(flow::sharing_allows_for_reader(&target, &provider, &fixture.context).unwrap());
+        assert!(flow::sharing_allows_for_reader(&target, &own_room, &fixture.context).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_allowed_read_without_its_sharing_is_reviewed_and_a_partial_approval_refuses_it() {
+        use a2app_core::information_flow as flow;
+        let fixture = FinalWriteTestState::new("granted-read-review");
+        let _model = ModelIdGuard::pin(Some("granted-read-provider"));
+        let _joined = JoinedRoomsGuard::new(&[SOURCE, TARGET]);
+        let own_room = Recipient::MatrixRoom { account: fixture.context.account().into(), room: SOURCE.into() };
+        let target = Source::Room { account: fixture.context.account().into(), room: TARGET.into() };
+        apply_agent_defaults(&fixture);
+        with_a2app(|state| state.permissions.grant_scoped(&agent_subject(SOURCE), Permission::MatrixRoomsRead,
+            Some("matrix.rooms.messages.read"), RoomScope::room(TARGET), GrantDuration::Always, None).unwrap());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let ui = WidgetRef::empty();
+        let (answer, reply) = std::sync::mpsc::channel();
+        execute_session_job(&mut cx, &ui, &fixture.room, SessionJob::ReadTool {
+            kind: ReadToolKind::OtherRoom { room: TARGET.into(), limit: 5 }, answer,
+        });
+        let plan = with_a2app(|state| state.active_task.as_ref().expect("only the missing sharing raised this review").plan.clone()).unwrap();
+        assert!(plan.items.iter().any(|item| item.state == ItemState::AlreadyAllowed && matches!(&item.action,
+            task_grants::PlanAction::Scoped { capability, .. } if capability == "matrix.rooms.messages.read")));
+        assert!(with_a2app(|state| state.ai_reads.is_empty()).unwrap());
+        // Leaving the read's own reply row unchecked cannot let it through.
+        let ids = plan.grantable().filter(|item| !matches!(&item.action,
+            task_grants::PlanAction::Flow { source, recipient } if source == &target && recipient == &own_room))
+            .map(|item| item.id.clone()).collect();
+        answer_task_prompt(&mut cx, &ui, TaskPermissionAction::Allow(ids));
+        assert_eq!(reply.try_recv().unwrap().unwrap_err(), AI_READ_DECLINED);
+        assert!(with_a2app(|state| state.ai_reads.is_empty()).unwrap());
+        assert!(!flow::labels(&fixture.context).unwrap().contains(&target));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_of_an_unjoined_room_is_refused_without_a_review() {
+        let fixture = FinalWriteTestState::new("unjoined-read");
+        let _model = ModelIdGuard::pin(Some("unjoined-read-provider"));
+        let _joined = JoinedRoomsGuard::new(&[SOURCE]);
+        apply_agent_defaults(&fixture);
+        let (answer, reply) = std::sync::mpsc::channel();
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        execute_session_job(&mut cx, &WidgetRef::empty(), &fixture.room, SessionJob::ReadTool {
+            kind: ReadToolKind::OtherRoom { room: TARGET.into(), limit: 5 }, answer,
+        });
+        assert!(reply.try_recv().unwrap().unwrap_err().contains("not one of the user's joined rooms"));
+        assert!(with_a2app(|state| state.active_task.is_none() && state.task_prompts.is_empty()).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn declining_one_read_review_declines_the_next_rooms_too_this_turn() {
+        let fixture = FinalWriteTestState::new("decline-read-kind");
+        let _model = ModelIdGuard::pin(Some("decline-read-provider"));
+        let third = "!third:example.org";
+        let _joined = JoinedRoomsGuard::new(&[SOURCE, TARGET, third]);
+        apply_agent_defaults(&fixture);
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let ui = WidgetRef::empty();
+        let read = |cx: &mut Cx, room: &str| {
+            let (answer, reply) = std::sync::mpsc::channel();
+            execute_session_job(cx, &ui, &fixture.room, SessionJob::ReadTool {
+                kind: ReadToolKind::OtherRoom { room: room.into(), limit: 5 }, answer,
+            });
+            reply
+        };
+        let first = read(&mut cx, TARGET);
+        let queued = read(&mut cx, third);
+        assert!(with_a2app(|state| state.active_task.is_some() && state.task_prompts.len() == 1).unwrap());
+        answer_task_prompt(&mut cx, &ui, TaskPermissionAction::NotNow);
+        assert_eq!(first.try_recv().unwrap().unwrap_err(), AI_READ_DECLINED);
+        assert_eq!(queued.try_recv().unwrap().unwrap_err(), AI_READ_NOT_ASKED, "a review never shown is not reported as declined");
+        assert_eq!(read(&mut cx, third).try_recv().unwrap().unwrap_err(), AI_READ_NOT_ASKED,
+            "another room is not asked about room by room after Not now");
+        assert_eq!(read(&mut cx, TARGET).try_recv().unwrap().unwrap_err(), AI_READ_DECLINED);
+        assert!(with_a2app(|state| state.active_task.is_none() && state.task_prompts.is_empty()).unwrap());
+        let (answer, _reply) = std::sync::mpsc::channel();
+        run_request_task_permissions(&mut cx, &ui, &fixture.room, serde_json::json!({
+            "task": "Read the third room",
+            "needs": [{"kind": "capability", "id": "n1", "capability": "matrix.rooms.messages.read", "targets": [third]}],
+        }), answer);
+        assert!(with_a2app(|state| state.active_task.is_some()).unwrap(), "a room it was not asked about can still be requested");
+        answer_task_prompt(&mut cx, &ui, TaskPermissionAction::NotNow);
+        revoke_task_grants(&fixture.room);
+        let _next_turn = read(&mut cx, third);
+        assert!(with_a2app(|state| state.active_task.is_some()).unwrap(), "the next turn may ask again");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_of_unknown_origin_raises_no_review_that_cannot_help() {
+        use a2app_core::information_flow as flow;
+        let fixture = FinalWriteTestState::new("unknown-origin");
+        let _model = ModelIdGuard::pin(Some("unknown-origin-provider"));
+        let _joined = JoinedRoomsGuard::new(&[SOURCE, TARGET]);
+        let provider = Recipient::ModelProvider("unknown-origin-provider".into());
+        let texts = vec![("$unknown-origin:example.org".try_into().unwrap(), String::from("summarize"))];
+        flow::add_sources(&fixture.context, [Source::Account { account: fixture.context.account().into() }]).unwrap();
+        assert!(!is_holding_unknown_data(&fixture.context));
+        assert!(hold_carried_permission_prompt(&fixture.room, &texts, &fixture.context, &provider, None, 1),
+            "account data without a rule is reviewed");
+        with_a2app(|state| state.task_prompts.clear());
+        flow::add_sources(&fixture.context, [Source::UnknownPrivate]).unwrap();
+        assert!(is_holding_unknown_data(&fixture.context));
+        assert!(!hold_carried_permission_prompt(&fixture.room, &texts, &fixture.context, &provider, None, 2),
+            "no rule can release data of unknown origin");
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let ui = WidgetRef::empty();
+        let (answer, read) = std::sync::mpsc::channel();
+        execute_session_job(&mut cx, &ui, &fixture.room, SessionJob::ReadTool {
+            kind: ReadToolKind::OtherRoom { room: TARGET.into(), limit: 5 }, answer,
+        });
+        assert_eq!(read.try_recv().unwrap().unwrap_err(), AI_UNKNOWN_DATA);
+        let (answer, request) = std::sync::mpsc::channel();
+        run_request_task_permissions(&mut cx, &ui, &fixture.room, serde_json::json!({
+            "task": "Read a room",
+            "needs": [{"kind": "capability", "id": "n1", "capability": "matrix.rooms.messages.read", "targets": [TARGET]}],
+        }), answer);
+        assert_eq!(request.try_recv().unwrap().unwrap_err(), AI_UNKNOWN_DATA);
+        assert!(with_a2app(|state| state.task_prompts.is_empty() && state.active_task.is_none()).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_room_declined_in_a_multi_room_request_stays_declined_on_its_own() {
+        let fixture = FinalWriteTestState::new("multi-room-decline");
+        let _model = ModelIdGuard::pin(Some("multi-room-provider"));
+        let (first, second, other) = (TARGET, "!second:example.org", "!other:example.org");
+        let _joined = JoinedRoomsGuard::new(&[SOURCE, first, second, other]);
+        apply_agent_defaults(&fixture);
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let ui = WidgetRef::empty();
+        let request = |cx: &mut Cx, rooms: &[&str]| {
+            let (answer, reply) = std::sync::mpsc::channel();
+            run_request_task_permissions(cx, &ui, &fixture.room, serde_json::json!({
+                "task": "Summarize rooms",
+                "needs": [{"kind": "capability", "id": "n1", "capability": "matrix.rooms.messages.read", "targets": rooms}],
+            }), answer);
+            reply
+        };
+        let read = |cx: &mut Cx, room: &str| {
+            let (answer, reply) = std::sync::mpsc::channel();
+            execute_session_job(cx, &ui, &fixture.room, SessionJob::ReadTool {
+                kind: ReadToolKind::OtherRoom { room: room.into(), limit: 5 }, answer,
+            });
+            reply
+        };
+        let _declined = request(&mut cx, &[first, second]);
+        answer_task_prompt(&mut cx, &ui, TaskPermissionAction::NotNow);
+        assert_eq!(read(&mut cx, first).try_recv().unwrap().unwrap_err(), AI_READ_DECLINED, "a declined room is not asked about again");
+        assert!(request(&mut cx, &[second]).try_recv().unwrap().is_ok());
+        assert!(with_a2app(|state| state.active_task.is_none() && state.task_prompts.is_empty()).unwrap(),
+            "part of a declined request is answered without a modal");
+        let _other = read(&mut cx, other);
+        answer_task_prompt(&mut cx, &ui, TaskPermissionAction::NotNow);
+        assert_eq!(read(&mut cx, second).try_recv().unwrap().unwrap_err(), AI_READ_DECLINED,
+            "a room the user declined is not reported as never asked");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn allowing_a_read_in_mini_apps_reopens_its_declined_sharing_review() {
+        let fixture = FinalWriteTestState::new("reopened-sharing-review");
+        let _model = ModelIdGuard::pin(Some("reopened-review-provider"));
+        let _joined = JoinedRoomsGuard::new(&[SOURCE, TARGET]);
+        apply_agent_defaults(&fixture);
+        let subject = agent_subject(SOURCE);
+        with_a2app(|state| state.permissions.grant_scoped(&subject, Permission::MatrixRoomsRead,
+            Some("matrix.rooms.messages.read"), RoomScope::room(TARGET), GrantDuration::Always, None).unwrap());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let ui = WidgetRef::empty();
+        let read = |cx: &mut Cx| {
+            let (answer, reply) = std::sync::mpsc::channel();
+            execute_session_job(cx, &ui, &fixture.room, SessionJob::ReadTool {
+                kind: ReadToolKind::OtherRoom { room: TARGET.into(), limit: 5 }, answer,
+            });
+            reply
+        };
+        let _first = read(&mut cx);
+        assert!(with_a2app(|state| state.active_task.is_some()).unwrap(), "only the sharing is reviewed");
+        answer_task_prompt(&mut cx, &ui, TaskPermissionAction::NotNow);
+        assert_eq!(read(&mut cx).try_recv().unwrap().unwrap_err(), AI_READ_DECLINED);
+        apply_op(&mut cx, &ui, A2AppOp::GrantScoped {
+            app_id: subject.clone(), perm: Permission::MatrixRoomsRead, cap_id: None,
+            scope: RoomScope::AllRooms, duration: GrantDuration::RobrixSession, origin_room: Some(SOURCE.into()),
+        });
+        let _again = read(&mut cx);
+        assert!(with_a2app(|state| state.active_task.is_some()).unwrap(), "an allowance saved in Mini Apps lets it ask again");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_what_the_user_was_asked_about_counts_as_declined() {
+        use a2app_core::information_flow as flow;
+        let fixture = FinalWriteTestState::new("asked-declines");
+        let _model = ModelIdGuard::pin(Some("asked-declines-provider"));
+        let (first, second) = (TARGET, "!second:example.org");
+        let _joined = JoinedRoomsGuard::new(&[SOURCE, first, second]);
+        apply_agent_defaults(&fixture);
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let ui = WidgetRef::empty();
+        let reads = |rooms: &[&str]| serde_json::json!({"kind": "capability", "id": "rooms", "capability": "matrix.rooms.messages.read", "targets": rooms});
+        let request = |cx: &mut Cx, needs: serde_json::Value| {
+            let (answer, reply) = std::sync::mpsc::channel();
+            run_request_task_permissions(cx, &ui, &fixture.room, serde_json::json!({"task": "Summarize rooms", "needs": needs}), answer);
+            reply
+        };
+        let is_asking = || with_a2app(|state| state.active_task.is_some()).unwrap();
+        // A need it could not offer (one room isn't joined) is not part of the decline.
+        let _mixed = request(&mut cx, serde_json::json!([reads(&[first, "!not-joined:example.org"]),
+            {"kind": "website", "id": "site", "url": "https://status.example.com/"}]));
+        assert!(is_asking());
+        answer_task_prompt(&mut cx, &ui, TaskPermissionAction::NotNow);
+        let (answer, _read) = std::sync::mpsc::channel();
+        execute_session_job(&mut cx, &ui, &fixture.room, SessionJob::ReadTool {
+            kind: ReadToolKind::OtherRoom { room: first.into(), limit: 5 }, answer,
+        });
+        assert!(is_asking(), "a room the user was never asked about is reviewed");
+        answer_task_prompt(&mut cx, &ui, TaskPermissionAction::NotNow);
+        revoke_task_grants(&fixture.room);
+        // Rooms declined one request at a time add up.
+        for rooms in [&[first][..], &[second][..]] {
+            let _declined = request(&mut cx, serde_json::json!([reads(rooms)]));
+            assert!(is_asking());
+            answer_task_prompt(&mut cx, &ui, TaskPermissionAction::NotNow);
+        }
+        // Rows for what the AI already holds and may share aren't asked about, so they don't reopen it.
+        let held = Source::Room { account: fixture.context.account().into(), room: "!held:example.org".into() };
+        flow::add_sources(&fixture.context, [held.clone()]).unwrap();
+        let own_room = Recipient::MatrixRoom { account: fixture.context.account().into(), room: SOURCE.into() };
+        let rules: Vec<u64> = [Recipient::ModelProvider("asked-declines-provider".into()), own_room].into_iter().map(|recipient|
+            flow::grant_sharing(held.clone(), recipient, flow::ReaderScope::Context(fixture.context.clone()),
+                flow::SharingDuration::Permanent).unwrap()).collect();
+        assert!(request(&mut cx, serde_json::json!([reads(&[first, second])])).try_recv().unwrap().is_ok());
+        assert!(!is_asking(), "both rooms were declined");
+        for id in rules { flow::revoke_sharing(id).unwrap(); }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_space_outside_the_allowance_is_reviewed_instead_of_listing_nothing() {
+        let fixture = FinalWriteTestState::new("space-rooms-review");
+        let _model = ModelIdGuard::pin(Some("space-rooms-provider"));
+        let (allowed, other) = ("!space-one:example.org", "!space-two:example.org");
+        let _joined = JoinedRoomsGuard::new(&[SOURCE, allowed, other]);
+        apply_agent_defaults(&fixture);
+        let cap = a2app_core::capabilities::by_id("matrix.space.rooms.list").unwrap();
+        let subject = agent_subject(SOURCE);
+        with_a2app(|state| {
+            let defaults: Vec<u64> = state.permissions.scoped_grants(&subject).iter()
+                .filter(|grant| grant.capability.as_deref() == Some(cap.id)).map(|grant| grant.id).collect();
+            for id in defaults { state.permissions.remove_scoped_grant(id); }
+            state.permissions.grant_scoped(&subject, cap.group.unwrap(), Some(cap.id),
+                RoomScope::Selection { rooms: Vec::new(), spaces: vec![allowed.into()] }, GrantDuration::RobrixSession, None).unwrap();
+        });
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let ui = WidgetRef::empty();
+        let list = |cx: &mut Cx, space: &str| {
+            let (answer, reply) = std::sync::mpsc::channel();
+            execute_session_job(cx, &ui, &fixture.room, SessionJob::ReadTool { kind: ReadToolKind::SpaceRooms { space: space.into() }, answer });
+            reply
+        };
+        let _other = list(&mut cx, other);
+        with_a2app(|state| {
+            let prompt = state.active_task.as_ref().expect("a space outside the allowance is reviewed");
+            assert!(matches!(prompt.resume, TaskResume::Read { .. }));
+            assert!(prompt.plan.grantable().any(|item| matches!(&item.action,
+                task_grants::PlanAction::Scoped { capability, scope: RoomScope::Selection { spaces, .. }, .. }
+                    if capability == cap.id && spaces == &[other.to_string()])));
+            assert!(state.ai_reads.is_empty());
+        });
+        answer_task_prompt(&mut cx, &ui, TaskPermissionAction::NotNow);
+        let _allowed = list(&mut cx, allowed);
+        assert!(with_a2app(|state| state.active_task.is_none() && state.ai_reads.values().any(|(_, kind, _)|
+            matches!(kind, ReadToolKind::SpaceRooms { space } if space == allowed))).unwrap(),
+            "the allowed space is listed without a review");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn what_a_turn_leaves_open_is_withdrawn_when_it_ends() {
+        let fixture = FinalWriteTestState::new("stale-turn-requests");
+        let _model = ModelIdGuard::pin(Some("stale-review-provider"));
+        let _joined = JoinedRoomsGuard::new(&[SOURCE, TARGET]);
+        apply_agent_defaults(&fixture);
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let ui = WidgetRef::empty();
+        let (answer, read) = std::sync::mpsc::channel();
+        execute_session_job(&mut cx, &ui, &fixture.room, SessionJob::ReadTool {
+            kind: ReadToolKind::OtherRoom { room: TARGET.into(), limit: 5 }, answer,
+        });
+        let (answer, post) = std::sync::mpsc::channel();
+        run_ai_room_post(&mut cx, &ui, &fixture.room, TARGET.into(), "hello".into(), answer);
+        let is_post_parked = || with_a2app(|state| state.prompts.iter().chain(state.active_prompt.iter())
+            .any(|prompt| prompt_parks_room_tool(prompt, &fixture.room))).unwrap();
+        assert!(with_a2app(|state| state.active_task.is_some()).unwrap() && is_post_parked());
+        // A room tab closing mid-turn leaves them for the user to answer.
+        revoke_task_grants(&fixture.room);
+        assert!(with_a2app(|state| state.active_task.is_some()).unwrap() && is_post_parked());
+        fixture.close("stale-turn");
+        with_a2app(|state| {
+            let info = state.ai_rooms.get_mut(&fixture.room).unwrap();
+            info.pending_final_turns.clear();
+            info.pending_final_writes.clear();
+        });
+        settle_closed_turn(&fixture.room);
+        assert!(read.try_recv().unwrap().is_err(), "the read is answered, not left waiting");
+        assert_eq!(post.try_recv().unwrap().unwrap_err(), AI_TURN_ENDED);
+        assert!(with_a2app(|state| state.active_task.is_none() && state.task_prompts.is_empty()).unwrap() && !is_post_parked());
+        answer_task_prompt(&mut cx, &ui, TaskPermissionAction::NotNow);
+        assert!(!with_a2app(|state| state.dismissed_prompts.contains(&(agent_subject(SOURCE), Permission::MatrixRoomsRead))).unwrap(),
+            "a late answer declines nothing in the next turn");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ai_reply_posts_with_writes_off() {
+        let fixture = FinalWriteTestState::new("reply-writes-off");
+        with_a2app(|state| state.permissions.set_matrix_write(false));
+        fixture.close("writes-off-turn");
+        post_ai_reply(&fixture.room, "hello".into(), None);
+        with_a2app(|state| {
+            let info = &state.ai_rooms[&fixture.room];
+            assert!(!info.is_reply_held && state.task_prompts.is_empty());
+            assert!(!info.pending_final_writes.is_empty(), "the reply was submitted and holds the turn until it lands");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn declining_a_held_reply_releases_the_turn_and_drops_its_receipts() {
+        use a2app_core::information_flow as flow;
+        let fixture = FinalWriteTestState::new("declined-held-reply");
+        flow::add_sources(&fixture.context, [super::super::information_flow::directory_source(&fixture.context)]).unwrap();
+        with_a2app(|state| state.ai_rooms.get_mut(&fixture.room).unwrap().pending_tool_calls.push(AiReplyToolCall {
+            name: "read_other_room_messages".into(), ok: true, summary: String::new(), detail: None,
+        }));
+        fixture.close("declined-turn");
+        post_ai_reply(&fixture.room, "the summary".into(), None);
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let ui = WidgetRef::empty();
+        show_next_permission_prompt(&mut cx, &ui);
+        answer_task_prompt(&mut cx, &ui, TaskPermissionAction::NotNow);
+        with_a2app(|state| {
+            let info = &state.ai_rooms[&fixture.room];
+            assert!(!info.is_reply_held);
+            assert!(info.pending_final_writes.is_empty(), "nothing holds the closed turn any more");
+            assert!(info.pending_tool_calls.is_empty(), "the next reply's card must not show this turn's calls");
+            assert!(info.final_writes_deadline.is_some() || !info.final_writes_pending_revoke);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cross_room_post_with_writes_off_asks_to_turn_them_on() {
+        let fixture = FinalWriteTestState::new("post-writes-off");
+        with_a2app(|state| state.permissions.set_matrix_write(false));
+        let (answer, reply) = std::sync::mpsc::channel();
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        run_ai_room_post(&mut cx, &WidgetRef::empty(), &fixture.room, TARGET.into(), "hello".into(), answer);
+        assert!(matches!(reply.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)), "the post waits for the user");
+        assert!(with_a2app(|state| state.prompts.iter().chain(state.active_prompt.iter()).any(|prompt| prompt.enable_writes)).unwrap(),
+            "the prompt offers to turn on room writes");
+        with_a2app(|state| state.permissions.set_room_policy(TARGET, RoomAccess::Write, PolicyDecision::Deny));
+        let (answer, reply) = std::sync::mpsc::channel();
+        run_ai_room_post(&mut cx, &WidgetRef::empty(), &fixture.room, TARGET.into(), "hello".into(), answer);
+        assert!(reply.try_recv().unwrap().is_err(), "a block on the target room is refused without an offer");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_of_a_malformed_room_is_refused_without_labelling_anything() {
+        let fixture = FinalWriteTestState::new("malformed-read");
+        let before = a2app_core::information_flow::labels(&fixture.context).unwrap();
+        let (answer, reply) = std::sync::mpsc::channel();
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        execute_session_job(&mut cx, &WidgetRef::empty(), &fixture.room, SessionJob::ReadTool {
+            kind: ReadToolKind::OtherRoom { room: "General".into(), limit: 5 }, answer,
+        });
+        assert!(reply.try_recv().unwrap().unwrap_err().contains("not a valid matrix room id"));
+        assert_eq!(a2app_core::information_flow::labels(&fixture.context).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reply_refused_for_sharing_waits_for_review_and_posts_once_allowed() {
+        use a2app_core::information_flow as flow;
+        let fixture = FinalWriteTestState::new("held-reply");
+        let directory = super::super::information_flow::directory_source(&fixture.context);
+        flow::add_sources(&fixture.context, [directory.clone()]).unwrap();
+        fixture.close("held-turn");
+        post_ai_reply(&fixture.room, "the summary".into(), None);
+        let token = with_a2app(|state| {
+            let info = &state.ai_rooms[&fixture.room];
+            assert!(info.is_reply_held && info.final_writes_pending_revoke && info.final_writes_deadline.is_none(),
+                "the closed turn waits for the user's answer");
+            let prompt = state.task_prompts.back().expect("the refused reply is reviewed");
+            let TaskResume::Reply { text, answer_id: None, token: Some(token) } = &prompt.resume else { panic!("held reply") };
+            assert_eq!(text, "the summary");
+            assert!(prompt.plan.items.iter().any(|item| item.state.is_grantable()
+                && matches!(&item.action, task_grants::PlanAction::Flow { source, .. } if source == &directory)));
+            *token
+        }).unwrap();
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        flush_pending_ai_turns(&mut cx);
+        assert!(with_a2app(|state| !state.ai_rooms[&fixture.room].pending_ai_turns.is_empty()).unwrap(),
+            "the card's final snapshot waits with the reply");
+        let ui = WidgetRef::empty();
+        show_next_permission_prompt(&mut cx, &ui);
+        let ids = with_a2app(|state| state.active_task.as_ref().unwrap().plan.grantable().map(|item| item.id.clone()).collect()).unwrap();
+        answer_task_prompt(&mut cx, &ui, TaskPermissionAction::Allow(ids));
+        with_a2app(|state| {
+            let info = &state.ai_rooms[&fixture.room];
+            assert!(!info.is_reply_held && !info.pending_final_writes.contains(&token));
+            assert!(!info.pending_final_writes.is_empty(), "the posted reply holds the turn until it lands");
+        });
+        assert!(super::super::information_flow::ensure_agent_room_output(&fixture.context, SOURCE).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_agents_not_now_lasts_for_its_turn_and_an_allowance_replaces_it() {
+        let fixture = FinalWriteTestState::new("turn-dismissals");
+        let subject = agent_subject(SOURCE);
+        with_a2app(|state| {
+            state.dismissed_prompts.insert((subject.clone(), Permission::MatrixRoomsSend));
+            state.dismissed_net_hosts.insert((subject.clone(), "example.com".into()));
+        });
+        revoke_task_grants(&fixture.room);
+        assert!(with_a2app(|state| state.dismissed_prompts.is_empty() && state.dismissed_net_hosts.is_empty()).unwrap());
+        let key = |action: task_grants::PlanAction| format!("{}|requested", serde_json::to_string(&action).unwrap());
+        let post = key(task_grants::PlanAction::Scoped { permission: Permission::MatrixRoomsSend.as_str().into(),
+            capability: "matrix.rooms.message.send".into(), scope: RoomScope::room(TARGET) });
+        let website = key(task_grants::PlanAction::Network { url: "https://example.com/".into(), scope: RoomScope::room(SOURCE) });
+        let (post_plan, website_plan) = ((SOURCE.to_string(), [1; 32]), (SOURCE.to_string(), [2; 32]));
+        with_a2app(|state| {
+            state.dismissed_prompts.insert((subject.clone(), Permission::MatrixRoomsSend));
+            let declined = |key: String, permission| DeclinedPlan { needs: BTreeSet::from([key]), permissions: BTreeSet::from([permission]) };
+            state.dismissed_task_plans.insert(post_plan.clone(), declined(post, Permission::MatrixRoomsSend));
+            state.dismissed_task_plans.insert(website_plan.clone(), declined(website, Permission::Network));
+        });
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        apply_op(&mut cx, &WidgetRef::empty(), A2AppOp::GrantScoped {
+            app_id: subject.clone(), perm: Permission::MatrixRoomsSend, cap_id: None,
+            scope: RoomScope::room(TARGET), duration: GrantDuration::RobrixSession, origin_room: Some(SOURCE.into()),
+        });
+        with_a2app(|state| {
+            assert!(!state.dismissed_prompts.contains(&(subject.clone(), Permission::MatrixRoomsSend)));
+            assert!(!state.dismissed_task_plans.contains_key(&post_plan), "a declined request for this permission may ask again");
+            assert!(state.dismissed_task_plans.contains_key(&website_plan), "other declined requests stay declined");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn narrowing_one_ability_keeps_the_groups_other_abilities_allowed() {
+        let fixture = FinalWriteTestState::new("narrow-one-ability");
+        let subject = agent_subject(SOURCE);
+        with_a2app(|state| state.permissions.set(&subject, Permission::MatrixRoomRead, GrantState::Granted));
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        apply_op(&mut cx, &WidgetRef::empty(), A2AppOp::GrantScoped {
+            app_id: subject.clone(), perm: Permission::MatrixRoomRead, cap_id: Some("matrix.room.messages.paginate".into()),
+            scope: RoomScope::room(SOURCE), duration: GrantDuration::RobrixSession, origin_room: Some(SOURCE.into()),
+        });
+        let read = a2app_core::capabilities::by_id("matrix.room.messages.read").unwrap();
+        let verdict = with_a2app(|state| state.permissions.effective_capability_for_in_context(
+            &subject, ai_room_declares_perm, ai_room_declares_cap, read,
+            PermissionContext { origin_room: Some(SOURCE), target_room: Some(SOURCE) })).unwrap();
+        assert_eq!(verdict, Effective::Granted, "reading this room stays allowed");
+        let _ = fixture;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forgetting_an_ai_rooms_extras_keeps_its_directory_defaults() {
+        let fixture = FinalWriteTestState::new("forget-extras");
+        let subject = agent_subject(SOURCE);
+        with_a2app(|state| {
+            apply_directory_capability_defaults(&mut state.permissions, &fixture.room);
+            state.permissions.grant_scoped(&subject, Permission::MatrixRoomsRead, Some("matrix.rooms.messages.read"),
+                RoomScope::room(TARGET), GrantDuration::Always, None).unwrap();
+        });
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        apply_ai_room_panel_action(&mut cx, &WidgetRef::empty(), AiRoomPanelAction {
+            room_id: SOURCE.into(), perm: None, command: AiRoomPanelCommand::ForgetExtras,
+        });
+        with_a2app(|state| {
+            let grants = state.permissions.scoped_grants(&subject);
+            assert_eq!(grants.len(), a2app_core::task_grants::DIRECTORY_CAP_IDS.len(), "only the cross-room read is forgotten");
+            assert!(grants.iter().all(|grant| grant.scope == RoomScope::AllRooms));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocking_the_tool_call_ability_turns_off_mini_app_tools() {
+        let fixture = FinalWriteTestState::new("tool-call-block");
+        with_a2app(|state| state.permissions.set_capability(&agent_subject(SOURCE), "on_tool_call", GrantState::Denied));
+        let (answer, reply) = std::sync::mpsc::channel();
+        run_ai_list_mini_app_tools(&fixture.room, answer);
+        assert!(reply.try_recv().unwrap().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_default_rule_explains_how_to_restore_it() {
+        let room: OwnedRoomId = SOURCE.try_into().unwrap();
+        let account = String::from("explain");
+        let defaults = BTreeSet::from([
+            Source::RoomDirectory { account: account.clone() },
+            Source::Room { account: account.clone(), room: SOURCE.into() },
+        ]);
+        let (title, explanation) = carried_explanation(&room, &defaults);
+        assert_eq!(title, "Let this room's AI reply");
+        assert!(explanation.contains("Restore default access") && !explanation.contains("Earlier in this conversation"));
+        let mut read = defaults.clone();
+        read.insert(Source::Room { account, room: TARGET.into() });
+        let (title, explanation) = carried_explanation(&room, &read);
+        assert_eq!(title, "Keep using earlier context");
+        assert!(explanation.contains("Earlier in this conversation") && explanation.contains("Restore default access"));
+    }
+
+    #[test]
+    fn the_reask_hint_reaches_prefixed_sharing_refusals() {
+        let hinted = super::super::information_flow::with_task_reask_hint(
+            format!("couldn't read messages: {}", super::super::information_flow::SHARING_REFUSED));
+        assert!(hinted.contains("request_task_permissions"));
     }
 }

@@ -193,6 +193,14 @@ script_mod! {
                             content := MiniAppHostPane {}
                         }
 
+                        // The "AI in this room" management panel (an invisible
+                        // stub in builds without `a2app` / on non-unix). Declared
+                        // before the prompts so a prompt it raises draws on top.
+                        ai_room_panel_modal := Modal {
+                            can_dismiss: true,
+                            content := AiRoomPanel {}
+                        }
+
                         // Mini-app permission prompts. No scrim dismissal:
                         // "Deny" is the explicit escape, so a looping
                         // script can't nag its way to an accidental Allow.
@@ -206,13 +214,6 @@ script_mod! {
                         task_permission_modal := Modal {
                             can_dismiss: false,
                             content := TaskPermissionPrompt {}
-                        }
-
-                        // The "AI in this room" management panel (an invisible
-                        // stub in builds without `a2app` / on non-unix).
-                        ai_room_panel_modal := Modal {
-                            can_dismiss: true,
-                            content := AiRoomPanel {}
                         }
 
                         PopupList {}

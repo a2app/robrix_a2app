@@ -366,8 +366,24 @@ impl TaskPlan {
     /// requested or implied. Implied `because` ids are intentionally excluded
     /// so a renamed need does not defeat a dismissal.
     pub fn need_keys(&self) -> BTreeSet<String> {
+        self.need_keys_where(|_| true)
+    }
+
+    /// The [`Self::need_keys`] of the items the user is asked to allow.
+    pub fn grantable_need_keys(&self) -> BTreeSet<String> {
+        self.need_keys_where(|item| item.state.is_grantable())
+    }
+
+    /// The [`Self::grantable_need_keys`] of the needs the request named, without
+    /// the rows they imply.
+    pub fn requested_grantable_need_keys(&self) -> BTreeSet<String> {
+        self.need_keys_where(|item| item.state.is_grantable() && matches!(item.origin, ItemOrigin::Requested))
+    }
+
+    fn need_keys_where(&self, is_kept: impl Fn(&PlanItem) -> bool) -> BTreeSet<String> {
         self.items
             .iter()
+            .filter(|item| is_kept(item))
             .map(|item| format!("{}|{}", item_key(&item.action), match &item.origin {
                 ItemOrigin::Requested => "requested",
                 ItemOrigin::Implied { .. } => "implied",
@@ -487,7 +503,19 @@ fn capability_state_at_all(
         {
             return ItemState::Blocked(TaskReason::BlockedByRoomPolicy);
         }
-        match store.effective_capability_for_in_context(subject, declares_perm, declares_cap, cap, context) {
+        // The whole room or space list is consented as a collection, as the
+        // agent's read gate decides it, but only an all-rooms consent covers
+        // every row. A space's room list is approved per space: its children
+        // are kept only when the space itself passes the ordinary check.
+        let effective = if is_whole_directory(cap) {
+            match store.effective_collection_capability_for_in_context(subject, declares_perm, declares_cap, cap, context) {
+                Effective::Granted if !store.is_whole_directory_allowed(subject, cap, context) => Effective::NeedsPrompt,
+                effective => effective,
+            }
+        } else {
+            store.effective_capability_for_in_context(subject, declares_perm, declares_cap, cap, context)
+        };
+        match effective {
             Effective::Granted => {}
             Effective::NeedsPrompt => needs_grant = true,
             Effective::Denied => return ItemState::Blocked(TaskReason::BlockedByPermission),
@@ -732,6 +760,50 @@ fn item_key(value: &impl Serialize) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
 
+/// Whether the need key `key` was declined among `declined`: the same need, or
+/// the same ability for rooms and spaces the declined needs named between them.
+pub fn is_need_key_covered(declined: &[&str], key: &str) -> bool {
+    if declined.contains(&key) { return true; }
+    let Some((ability, key_scope)) = scoped_need(key) else { return false };
+    let (mut is_ability_declined, mut rooms, mut spaces) = (false, BTreeSet::new(), BTreeSet::new());
+    for (other, scope) in declined.iter().filter_map(|declined| scoped_need(declined)) {
+        if other != ability { continue; }
+        is_ability_declined = true;
+        match scope {
+            RoomScope::AllRooms => return true,
+            RoomScope::Selection { rooms: declined_rooms, spaces: declined_spaces } => {
+                rooms.extend(declined_rooms);
+                spaces.extend(declined_spaces);
+            }
+        }
+    }
+    is_ability_declined && match key_scope {
+        RoomScope::AllRooms => false,
+        RoomScope::Selection { rooms: key_rooms, spaces: key_spaces } =>
+            key_rooms.iter().all(|room| rooms.contains(room)) && key_spaces.iter().all(|space| spaces.contains(space)),
+    }
+}
+
+/// A scoped need key's ability (permission, capability and origin) and its rooms.
+fn scoped_need(key: &str) -> Option<((String, String, String), RoomScope)> {
+    let (action, origin) = key.rsplit_once('|')?;
+    match serde_json::from_str::<PlanAction>(action).ok()? {
+        PlanAction::Scoped { permission, capability, scope } => Some(((permission, capability, origin.to_string()), scope)),
+        _ => None,
+    }
+}
+
+/// The permission group a [`TaskPlan::need_keys`] entry asks for, if any.
+pub fn need_key_permission(key: &str) -> Option<Permission> {
+    let (action, _) = key.rsplit_once('|')?;
+    match serde_json::from_str::<PlanAction>(action).ok()? {
+        PlanAction::Scoped { permission, .. } => Permission::from_str(&permission),
+        PlanAction::Network { .. } => Some(Permission::Network),
+        PlanAction::Tool { .. } => Some(Permission::McpTools),
+        PlanAction::Flow { .. } => None,
+    }
+}
+
 fn item(id: &str, why: Option<String>, risk: Risk, state: ItemState, action: PlanAction) -> PlanItem {
     PlanItem { id: id.to_string(), origin: ItemOrigin::Requested, action, state, why, risk }
 }
@@ -792,12 +864,14 @@ fn clip(text: &str, max: usize) -> String {
 }
 
 /// The room/space selection a capability need resolves to. Attached-room
-/// capabilities with no targets mean this AI room; multi-room and space
-/// capabilities need at least one target.
+/// capabilities with no targets mean this AI room; the room and space lists
+/// mean every room; other multi-room and space capabilities need a target.
 struct Selection {
     rooms: Vec<String>,
     spaces: Vec<String>,
     all: Vec<String>,
+    /// The whole room and space directory, evaluated from this AI room.
+    all_rooms: bool,
 }
 
 impl Selection {
@@ -806,11 +880,22 @@ impl Selection {
     }
 
     fn room_scope(&self) -> RoomScope {
+        if self.all_rooms { return RoomScope::AllRooms; }
         RoomScope::Selection { rooms: self.rooms.clone(), spaces: self.spaces.clone() }
     }
 }
 
+/// The account-wide room and space lists, which a plan always asks for whole.
+fn is_whole_directory(cap: &Capability) -> bool {
+    matches!(cap.id, "matrix.rooms.list" | "matrix.spaces.list")
+}
+
 fn capability_selection(cap: &Capability, targets: &[String], room: &str) -> Result<Selection, TaskReason> {
+    // The room and space lists are account-wide directories. A target would
+    // only hide the rooms the agent is trying to find, so it is ignored.
+    if is_whole_directory(cap) {
+        return Ok(Selection { rooms: Vec::new(), spaces: Vec::new(), all: vec![room.to_string()], all_rooms: true });
+    }
     // Upload is an account-side effect of this AI room's agent. The room
     // selected for the eventual post has its separate media-send grant.
     if cap.id == "matrix.media.upload" && targets.iter().any(|target| {
@@ -845,7 +930,7 @@ fn capability_selection(cap: &Capability, targets: &[String], room: &str) -> Res
     spaces.dedup();
     let mut all = rooms.clone();
     all.extend(spaces.iter().cloned());
-    Ok(Selection { rooms, spaces, all })
+    Ok(Selection { rooms, spaces, all, all_rooms: false })
 }
 
 /// Records the implied flow caused by one capability: its source(s) for reads
@@ -2220,6 +2305,97 @@ mod tests {
         ]), &inputs(&store, &joined, &lookup)).unwrap();
         assert_eq!(plan.items.iter().find(|i| i.id == "n1").unwrap().state, ItemState::NotOffered(TaskReason::InvalidTarget));
         assert_eq!(plan.items.iter().find(|i| i.id == "n2").unwrap().state, ItemState::NotOffered(TaskReason::NotOffered));
+    }
+
+    #[test]
+    fn directory_needs_ask_for_the_whole_room_and_space_list() {
+        let mut store = PermissionStore::default();
+        let joined = |room: &str| room == "!ai:example.org";
+        let lookup = FakeLookup { allowed: Default::default() };
+        let directory = Source::RoomDirectory { account: "alice".into() };
+        let need = |targets: Vec<String>| TaskNeed::Capability { id: "rooms".into(), capability: "matrix.rooms.list".into(), targets, why: None };
+        // A guessed target must not narrow the list the agent is searching.
+        for targets in [vec![], vec!["!elsewhere:example.org".to_string()]] {
+            let plan = resolve(&request(vec![need(targets)]), &inputs(&store, &joined, &lookup)).unwrap();
+            let rooms = plan.items.iter().find(|item| item.id == "rooms").unwrap();
+            assert_eq!(rooms.state, ItemState::NeedsGrant);
+            assert_eq!(rooms.action.scope(), Some(&RoomScope::AllRooms));
+            assert!(plan.items.iter().any(|item| matches!(&item.action,
+                PlanAction::Flow { source, recipient: Recipient::ModelProvider(_) } if source == &directory)));
+            assert!(plan.needs_prompt());
+        }
+        let plan = resolve(&request(vec![need(Vec::new())]), &inputs(&store, &joined, &lookup)).unwrap();
+        apply(&plan, &dependent_approval(&plan, checked(&plan)), &mut store, &FakeFlow::new()).unwrap();
+        let cap = capabilities::by_id("matrix.rooms.list").unwrap();
+        let declares_perm = |permission: Permission| DECLARED.iter().any(|id| capabilities::by_id(id).and_then(|c| c.group) == Some(permission));
+        let declares_cap = |cap: &Capability| DECLARED.contains(&cap.id);
+        for target in ["!ai:example.org", "!other:example.org"] {
+            assert_eq!(store.effective_collection_capability_for_in_context(&plan.subject, declares_perm, declares_cap, cap,
+                PermissionContext { origin_room: Some("!ai:example.org"), target_room: Some(target) }), Effective::Granted);
+        }
+        let again = resolve(&request(vec![need(Vec::new())]), &inputs(&store, &joined, &lookup)).unwrap();
+        assert_eq!(again.items.iter().find(|item| item.id == "rooms").unwrap().state, ItemState::AlreadyAllowed);
+    }
+
+    #[test]
+    fn a_partial_directory_allowance_still_asks_for_the_whole_list() {
+        let mut store = PermissionStore::default();
+        let joined = |room: &str| room == "!ai:example.org";
+        let lookup = FakeLookup { allowed: Default::default() };
+        store.grant_scoped("ai-room:!ai:example.org", Permission::MatrixRoomsList, Some("matrix.rooms.list"),
+            RoomScope::room("!one:example.org"), GrantDuration::RobrixSession, Some("!ai:example.org")).unwrap();
+        let plan = resolve(&request(vec![TaskNeed::Capability { id: "rooms".into(), capability: "matrix.rooms.list".into(),
+            targets: Vec::new(), why: None }]), &inputs(&store, &joined, &lookup)).unwrap();
+        assert_eq!(plan.items.iter().find(|item| item.id == "rooms").unwrap().state, ItemState::NeedsGrant,
+            "one allowed room must not stand in for the whole room list");
+    }
+
+    #[test]
+    fn a_space_room_list_is_asked_for_per_space() {
+        let space = |target: &str| TaskNeed::Capability { id: "space".into(), capability: "matrix.space.rooms.list".into(),
+            targets: vec![target.into()], why: None };
+        let joined = |_: &str| true;
+        let lookup = FakeLookup { allowed: Default::default() };
+        let state_of = |store: &PermissionStore, target: &str| resolve(&request(vec![space(target)]), &inputs(store, &joined, &lookup))
+            .unwrap().items.into_iter().find(|item| item.id == "space").unwrap();
+        let mut store = PermissionStore::default();
+        store.grant_scoped("ai-room:!ai:example.org", Permission::MatrixSpaces, Some("matrix.space.rooms.list"),
+            RoomScope::Selection { rooms: Vec::new(), spaces: vec!["!s1:example.org".into()] },
+            GrantDuration::RobrixSession, Some("!ai:example.org")).unwrap();
+        assert_eq!(state_of(&store, "!s1:example.org").state, ItemState::AlreadyAllowed);
+        let other = state_of(&store, "!s2:example.org");
+        assert_eq!(other.state, ItemState::NeedsGrant, "another space's allowance must not cover this one");
+        assert_eq!(other.action.scope(), Some(&RoomScope::Selection { rooms: Vec::new(), spaces: vec!["!s2:example.org".into()] }));
+        let mut store = PermissionStore::default();
+        store.set_room_policy("!unrelated:example.org", crate::permissions::RoomAccess::Read, crate::permissions::PolicyDecision::Allow);
+        assert_eq!(state_of(&store, "!s2:example.org").state, ItemState::NeedsGrant, "an unrelated read rule does not either");
+    }
+
+    #[test]
+    fn need_keys_name_their_permission_and_requested_ones_are_kept_apart() {
+        let store = PermissionStore::default();
+        let joined = |_: &str| true;
+        let lookup = FakeLookup { allowed: Default::default() };
+        let plan = resolve(&request(vec![TaskNeed::Website { id: "w1".into(),
+            url: "https://status.example.com/page".into(), why: None }]), &inputs(&store, &joined, &lookup)).unwrap();
+        let requested = plan.requested_grantable_need_keys();
+        assert_eq!(requested.len(), 1, "the implied flow row is not a requested need");
+        assert!(requested.is_subset(&plan.grantable_need_keys()) && plan.grantable_need_keys().is_subset(&plan.need_keys()));
+        let permissions: Vec<_> = plan.need_keys().iter().map(|key| need_key_permission(key)).collect();
+        assert!(permissions.contains(&Some(Permission::Network)));
+        assert!(permissions.contains(&None), "a sharing row asks for no permission group");
+        let piped = format!("{}|requested", item_key(&PlanAction::Network { url: "https://a.example/x|y".into(), scope: RoomScope::AllRooms }));
+        assert_eq!(need_key_permission(&piped), Some(Permission::Network), "a `|` inside the action doesn't break the key");
+        assert_eq!(need_key_permission("not a key"), None);
+        let reads = |rooms: &[&str]| format!("{}|requested", item_key(&PlanAction::Scoped {
+            permission: Permission::MatrixRoomsRead.as_str().into(), capability: "matrix.rooms.messages.read".into(),
+            scope: RoomScope::Selection { rooms: rooms.iter().map(|room| room.to_string()).collect(), spaces: Vec::new() } }));
+        let (both, first, second) = (reads(&["!a:s", "!b:s"]), reads(&["!a:s"]), reads(&["!b:s"]));
+        assert!(is_need_key_covered(&[&both], &second), "declining two rooms declines each");
+        assert!(!is_need_key_covered(&[&first], &both), "an added room is a new need");
+        assert!(is_need_key_covered(&[&first, &second], &both), "rooms declined one by one add up");
+        assert!(!is_need_key_covered(&[&first], &piped));
+        assert!(!is_need_key_covered(&[&piped], &reads(&[])), "an empty selection needs a decline of its own ability");
     }
 
     #[test]

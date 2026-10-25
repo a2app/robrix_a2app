@@ -15,8 +15,10 @@ use matrix_sdk::ruma::OwnedRoomId;
 
 use a2app_core::diff::{line_diff, DiffLine};
 use a2app_core::manifest::{A2AppScope, MiniAppId, MiniAppManifest, RunsIn};
-use a2app_core::permissions::{Effective, GrantState, Permission, RoomScope, RoomAccess, RoomPolicyMode, PolicyDecision, agent_subject, agent_room_of};
+use a2app_core::permissions::{Effective, GrantDuration, GrantState, Permission, PermissionContext, PermissionStore, RoomScope, RoomAccess, RoomPolicyMode, PolicyDecision, agent_subject, agent_room_of};
 use a2app_core::information_flow::{self as flow, AuthoritySession, ContextId, ReaderScope, Recipient, SharingDuration};
+use a2app_core::capabilities::Capability;
+use a2app_core::task_grants::GrantRef;
 use crate::a2app::permission_choices::PermissionChoicesWidgetExt;
 use crate::a2app::permission_prompt::{PermissionScopeEditorWidgetExt, duration_label, network_scope_label};
 use crate::a2app::data_sharing::DataSharingWidgetExt;
@@ -27,7 +29,7 @@ use crate::a2app::background_tasks::{BackgroundTasksAction, BackgroundTasksWidge
 use a2app_core::persistence;
 use a2app_core::versions::AppVersion;
 
-use crate::a2app::runtime::{room_display_name, with_a2app, A2AppOp, A2AppRuntimeAction};
+use crate::a2app::runtime::{room_display_name, with_a2app, A2AppOp, A2AppRuntimeAction, A2AppState};
 use crate::home::rooms_list::RoomsListRef;
 use crate::home::navigation_tab_bar::NavigationBarAction;
 use crate::app::ConfirmDeleteAction;
@@ -1365,6 +1367,18 @@ script_mod! {
                     mod.widgets.PermissionOptionLabel { text: "Choose what you want this agent to do." }
                     agent_details := RobrixSettingsCollapsibleHeader { title: "Individual abilities" }
                     agent_ability := PermissionChoices {}
+                    View {
+                        width: Fill, height: Fit, flow: Flow.Right{wrap: true}, spacing: 8
+                        agent_restore := RobrixNeutralIconButton {
+                            padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Restore default access"
+                        }
+                        agent_sharing := RobrixNeutralIconButton {
+                            padding: 10, icon_walk: Walk{width: 0, height: 0, margin: 0}, text: "Data sharing…"
+                        }
+                    }
+                    agent_restore_hint := mod.widgets.PermissionOptionLabel {
+                        text: "Restore default access lets this room's AI list your rooms and spaces again and share this conversation with your AI service so it can reply. Other permissions are unchanged."
+                    }
                 }
                 protection_overview := View {
                     visible: false, width: Fill, height: Fit, flow: Down, spacing: 16
@@ -2610,6 +2624,8 @@ pub struct MiniAppsScreen {
     #[rust] agent_details: bool,
     #[rust] agent_rooms: Vec<String>,
     #[rust] agent_abilities: Vec<(Permission, Option<String>, String)>,
+    /// The AI service and homeserver an edited AI room's turns write to, resolved when its editor opens.
+    #[rust] agent_outputs: Vec<Recipient>,
     #[rust] approval_details_key: Option<AccessRuleKey>,
 }
 
@@ -2760,9 +2776,19 @@ impl Widget for MiniAppsScreen {
         if self.view.button(cx, ids!(background_back)).clicked(actions) {
             self.go_back(cx);
         }
-        if self.view.button(cx, ids!(sharing_button)).clicked(actions) {
+        let is_agent_picker = self.pane == Pane::Access && self.access_view == AccessView::AgentPermissions;
+        if self.view.button(cx, ids!(sharing_button)).clicked(actions)
+            || (is_agent_picker && self.view.button(cx, ids!(agent_sharing)).clicked(actions))
+        {
             self.view.data_sharing(cx, ids!(sharing_editor)).configure(cx);
             self.set_pane(cx, Pane::Sharing);
+        }
+        #[cfg(unix)]
+        if is_agent_picker && self.view.button(cx, ids!(agent_restore)).clicked(actions) {
+            let room = self.view.permission_choices(cx, ids!(agent_choice)).selected_item();
+            if let Some(room_id) = self.agent_rooms.get(room).and_then(|room| OwnedRoomId::try_from(room.as_str()).ok()) {
+                cx.action(A2AppOp::RestoreAgentDefaults(room_id));
+            }
         }
         if self.view.button(cx, ids!(sharing_back_button)).clicked(actions) {
             self.go_back(cx);
@@ -2829,8 +2855,11 @@ impl Widget for MiniAppsScreen {
                         self.show_access_editor(cx, AccessEditor::App {
                             app_id: subject.clone(), perm: *permission, cap_id: capability.clone(),
                         });
-                        self.view.permission_scope_editor(cx, ids!(access_scope)).set_scope(cx, scope);
-                        self.set_access_view(cx, AccessView::Allowance);
+                        // Without an allowance to add, the overview says how the ability is approved.
+                        if self.view.widget(cx, ids!(access_add)).visible() {
+                            self.view.permission_scope_editor(cx, ids!(access_scope)).set_scope(cx, scope);
+                            self.set_access_view(cx, AccessView::Allowance);
+                        }
                     }
                     ProtectionInspectorAction::SubjectInfo(subject) => {
                         if let Some(room) = agent_room_of(subject) {
@@ -3695,31 +3724,7 @@ impl MiniAppsScreen {
                 self.set_write_controls_enabled(cx, write_enabled);
                 let empty = self.access_rows(cx).is_empty();
                 self.view.widget(cx, ids!(access_empty)).set_visible(cx, empty);
-                if let Some(AccessEditor::App { app_id, perm, cap_id }) = &self.access_editor {
-                    let (state, group, effective) = with_a2app(|runtime| (
-                        cap_id.as_deref().map(|id| runtime.permissions.capability_state(app_id, id))
-                            .unwrap_or_else(|| runtime.permissions.state(app_id, *perm)),
-                        runtime.permissions.state(app_id, *perm),
-                        runtime.permissions.effective_for_in_context(app_id, |_| true, *perm, Default::default()),
-                    )).unwrap_or((GrantState::Ask, GrantState::Ask, Effective::NeedsPrompt));
-                    let group_blocked = cap_id.is_some() && *perm != Permission::Network && group == GrantState::Denied;
-                    let baseline = if group_blocked {
-                        "Blocked by its permission group. Open that group and choose Ask again before allowing this ability."
-                    } else { match state {
-                        GrantState::Granted => "Default for this permission: allowed everywhere.",
-                        GrantState::Denied => "Blocked everywhere. Saving an allowance below removes this permission block.",
-                        GrantState::Ask if cap_id.is_some() && group == GrantState::Granted => "Uses its permission group, which allows access everywhere.",
-                        GrantState::Ask if effective == Effective::NeedsPrompt => "Will ask before using this permission. Saved allowances below may apply in selected rooms or websites.",
-                        GrantState::Ask => "Uses the default for this permission and the saved allowances below.",
-                    }};
-                    self.view.button(cx, ids!(access_add)).set_enabled(cx, !group_blocked);
-                    self.view.widget(cx, ids!(access_add)).set_disabled(cx, group_blocked);
-                    if group_blocked {
-                        self.view.button(cx, ids!(access_save)).set_enabled(cx, false);
-                        self.view.widget(cx, ids!(access_save)).set_disabled(cx, true);
-                    }
-                    self.view.label(cx, ids!(access_baseline)).set_text(cx, baseline);
-                }
+                self.refresh_access_baseline(cx);
                 let approvals_visible = self.access_view == AccessView::Overview
                     && matches!(self.access_editor, Some(AccessEditor::App { .. }))
                     && !self.saved_approval_rows(cx).is_empty();
@@ -4229,6 +4234,294 @@ fn approval_duration_label(cx: &mut Cx, duration: &SharingDuration) -> String {
     }
 }
 
+/// A new allowance's targets when they are not the subject's own room: every room for
+/// the room and space lists, and rooms the user picks for reading or posting elsewhere.
+fn group_default_scope(perm: Permission) -> Option<RoomScope> {
+    match perm {
+        Permission::MatrixRoomsList | Permission::MatrixSpaces => Some(RoomScope::AllRooms),
+        Permission::MatrixRoomsRead | Permission::MatrixRoomsSend => Some(RoomScope::Selection { rooms: Vec::new(), spaces: Vec::new() }),
+        _ => None,
+    }
+}
+
+const TURN_ONLY: &str = "This turn only";
+
+/// Grants applied for AI rooms' current turns; each turn's end revokes its own.
+#[cfg(unix)]
+fn turn_grants() -> Vec<GrantRef> {
+    with_a2app(|state| state.task_ledger.tasks().flat_map(|task| task.grants.iter().copied()).collect()).unwrap_or_default()
+}
+
+#[cfg(not(unix))]
+fn turn_grants() -> Vec<GrantRef> { Vec::new() }
+
+/// Whether a sharing rule is one of the defaults an AI room needs to reply (see
+/// `information_flow::ensure_agent_default_sharing`). An unknown AI service matches any.
+fn is_agent_default_rule(grant: &flow::SharingGrant, model: Option<&str>, homeserver: Option<&Recipient>) -> bool {
+    let ReaderScope::Context(ContextId::Agent { account, room }) = &grant.reader else { return false };
+    let is_default_source = match &grant.source {
+        flow::Source::Room { account: owner, room: source } => owner == account && source == room,
+        flow::Source::RoomDirectory { account: owner } => owner == account,
+        _ => false,
+    };
+    grant.duration == SharingDuration::Permanent && is_default_source && match &grant.recipient {
+        Recipient::MatrixRoom { account: owner, room: target } => owner == account && target == room,
+        Recipient::ModelProvider(id) => model.is_none_or(|model| model == id),
+        recipient => homeserver == Some(recipient),
+    }
+}
+
+/// The AI service and homeserver an AI room's turns write to, when they are known.
+fn agent_outputs() -> Vec<Recipient> {
+    let model = with_a2app(|state| state.agent_prefs.clone())
+        .and_then(|prefs| a2app_agent::model_transport::current_recipient(&prefs).ok())
+        .map(|model| Recipient::ModelProvider(model.id));
+    let homeserver = crate::sliding_sync::get_client()
+        .and_then(|client| Recipient::network_origin(client.homeserver().as_str()).ok());
+    model.into_iter().chain(homeserver).collect()
+}
+
+/// Whether a saved sharing rule is an AI room default for the current AI service and homeserver.
+fn is_agent_default_sharing(id: u64) -> bool {
+    let Some(grant) = flow::sharing_grants().unwrap_or_default().into_iter().find(|grant| grant.id == id) else { return false };
+    let outputs = agent_outputs();
+    let model = outputs.iter().find_map(|output| match output { Recipient::ModelProvider(id) => Some(id.as_str()), _ => None });
+    is_agent_default_rule(&grant, model, outputs.iter().find(|output| matches!(output, Recipient::NetworkOrigin(_))))
+}
+
+/// What an AI room's gate decides for one of its abilities, judged in its own room.
+#[derive(Clone, Debug, PartialEq)]
+enum AgentAccess {
+    Allowed,
+    /// Allowed, but what it reads or posts still needs data-sharing approval, as this text says.
+    AllowedNeedsSharing(&'static str),
+    /// A room or space list cut down to what a selection or room rule covers.
+    ListsSome,
+    Asks,
+    AsksPerTool,
+    AsksToEnableWrites,
+    /// Every read asks, because a default sharing rule it needs is gone.
+    MissingDefaultSharing,
+    /// Asks on its own, and a default sharing rule it needs is gone too.
+    AsksAndMissingSharing,
+    /// Other rooms only where Room and space access allows them, plus a note.
+    OnlyAllowedRooms(&'static str),
+    Declined,
+    /// Declined while room writes are off, which a task request can't turn on.
+    DeclinedWritesOff,
+    WritesOff,
+    RuleBlocks { id: String, is_space: bool },
+    Blocked(&'static str),
+}
+
+fn agent_access(store: &PermissionStore, subject: &str, room: &str, cap: &Capability, was_declined: bool) -> AgentAccess {
+    use a2app_core::capabilities::Scope;
+    use a2app_core::permissions::{CapabilityDecisionReason as Reason, RoomPolicyReason as Rule};
+    let declared = crate::a2app::ai::tools::AI_ROOM_SESSION_CAP_IDS;
+    let declares_perm = |perm: Permission| declared.iter().any(|id| a2app_core::capabilities::by_id(id).and_then(|cap| cap.group) == Some(perm));
+    let declares_cap = |cap: &Capability| declared.contains(&cap.id);
+    let context = PermissionContext { origin_room: Some(room), target_room: Some(room) };
+    let rule_block = |reason: Rule<'_>| match reason {
+        Rule::WriteMasterOff => AgentAccess::WritesOff,
+        Rule::RoomRule { room } => AgentAccess::RuleBlocks { id: room.into(), is_space: false },
+        Rule::SpaceRule { space, .. } => AgentAccess::RuleBlocks { id: space.into(), is_space: true },
+        Rule::UnresolvedSpaceHierarchy { .. } => AgentAccess::Blocked("Robrix hasn't finished checking which spaces this AI's room is in"),
+        Rule::GlobalBlock => AgentAccess::Blocked("Room and space access blocks every room"),
+        Rule::WhitelistRequired => AgentAccess::Blocked("this AI's room isn't one of the rooms you allow in Room and space access"),
+        Rule::GlobalDefault => AgentAccess::Blocked("Room and space access blocks it"),
+    };
+    let asks = if was_declined { AgentAccess::Declined } else { AgentAccess::Asks };
+    // The AI doesn't run while its own room can't be read.
+    let own_read = store.room_policy_evaluation(Some(room), RoomAccess::Read);
+    if own_read.decision == PolicyDecision::Deny { return rule_block(own_read.reason); }
+    // The tool gate approves each mini-app tool on its own and never reads the group's allowances.
+    if cap.group == Some(Permission::McpTools) {
+        return if store.is_restricted(subject) { AgentAccess::Blocked("Robrix stopped this AI after a security problem") }
+            else if store.state(subject, Permission::McpTools) == GrantState::Denied { AgentAccess::Blocked("this permission is blocked") }
+            else if store.capability_state(subject, cap.id) == GrantState::Denied { AgentAccess::Blocked("this ability is blocked") }
+            else if was_declined { AgentAccess::Declined } else { AgentAccess::AsksPerTool };
+    }
+    let evaluation = store.capability_evaluation_for_in_context(subject, declares_perm, declares_cap, cap, context);
+    let is_collection = a2app_core::services::is_room_collection(cap);
+    // A space's room list is allowed space by space, as the gate checks it.
+    let is_per_space = cap.id == "matrix.space.rooms.list";
+    let is_cross_room = (!is_collection || is_per_space) && matches!(cap.scope, Scope::MultiRoom | Scope::Space);
+    let is_room_rule = |reason: Rule<'_>| !matches!(reason, Rule::WriteMasterOff | Rule::GlobalBlock | Rule::GlobalDefault);
+    // Other rooms have their own rules and allowances, which this room's don't speak for.
+    let is_room_specific = match evaluation.reason {
+        Reason::RoomGrant => true,
+        Reason::ScopedGrant => !store.has_all_room_collection_consent(subject, cap, context),
+        Reason::RoomPolicy { reason, .. } => is_room_rule(reason),
+        _ => false,
+    };
+    // Under "Only in rooms I allow", room rules alone admit other rooms.
+    let room_access = a2app_core::permissions::capability_room_access(cap);
+    let is_whitelist = room_access.is_some_and(|access| store.policy_mode(access) == RoomPolicyMode::WhitelistOnly);
+    if is_cross_room && (is_room_specific || is_whitelist) {
+        let group = cap.group.map(|group| store.state(subject, group));
+        let own = store.capability_state(subject, cap.id);
+        let is_writes_off = room_access == Some(RoomAccess::Write) && !store.matrix_write();
+        // A room with no rules of its own follows the default in Room and space access.
+        let is_unruled_room_allowed = match room_access {
+            Some(RoomAccess::Write) => store.matrix_write() && store.global_policy(RoomAccess::Write) == PolicyDecision::Allow
+                && cap.group.is_some_and(|group| !store.is_explicit_review_needed(subject, group)),
+            _ => store.is_whole_directory_allowed(subject, cap, context),
+        };
+        return if store.is_restricted(subject) { AgentAccess::Blocked("Robrix stopped this AI after a security problem") }
+            else if group == Some(GrantState::Denied) { AgentAccess::Blocked("this permission is blocked") }
+            else if own == GrantState::Denied { AgentAccess::Blocked("this ability is blocked") }
+            else if is_whitelist && is_writes_off && was_declined { AgentAccess::DeclinedWritesOff }
+            else if is_whitelist && is_writes_off { AgentAccess::OnlyAllowedRooms(" It asks first to turn on Allow apps to send or change rooms.") }
+            else if is_whitelist { AgentAccess::OnlyAllowedRooms("") }
+            else if group == Some(GrantState::Granted) || own == GrantState::Granted
+                || store.has_all_room_collection_consent(subject, cap, context) || is_unruled_room_allowed { AgentAccess::Allowed }
+            else { asks };
+    }
+    let effective = if is_collection {
+        store.effective_collection_capability_for_in_context(subject, declares_perm, declares_cap, cap, context)
+    } else { evaluation.effective };
+    let is_read_whitelist = store.policy_mode(RoomAccess::Read) == RoomPolicyMode::WhitelistOnly;
+    // Each listed row is checked again, so only these allow the whole list.
+    let is_every_room = || !is_read_whitelist
+        && (store.capability_state(subject, cap.id) == GrantState::Granted
+        || cap.group.is_some_and(|group| store.effective_for(subject, declares_perm, group) == Effective::Granted)
+        || store.global_policy(RoomAccess::Read) == PolicyDecision::Allow
+        || store.has_all_room_collection_consent(subject, cap, context));
+    // The media and cross-room post gates offer to turn room writes on when nothing else would block the post.
+    let is_unblocked_by_writes = || {
+        let mut enabled = store.clone();
+        enabled.set_matrix_write(true);
+        let evaluation = enabled.capability_evaluation_for_in_context(subject, declares_perm, declares_cap, cap, context);
+        // A rule on this room doesn't decide a post to another room.
+        !matches!(evaluation.effective, Effective::Denied | Effective::Undeclared)
+            || (is_cross_room && matches!(evaluation.reason, Reason::RoomPolicy { reason, .. } if is_room_rule(reason)))
+    };
+    match effective {
+        // A website is allowed only by an allowance that covers it, never by the group's state.
+        Effective::Granted if cap.group == Some(Permission::Network) => asks,
+        Effective::Granted if is_collection && !is_every_room() =>
+            if is_per_space { asks } else if is_read_whitelist { AgentAccess::OnlyAllowedRooms("") } else { AgentAccess::ListsSome },
+        Effective::Granted => AgentAccess::Allowed,
+        Effective::NeedsPrompt => asks,
+        Effective::Denied | Effective::Undeclared => match evaluation.reason {
+            Reason::RoomPolicy { reason: Rule::WriteMasterOff, .. }
+                if matches!(cap.group, Some(Permission::MatrixMedia | Permission::MatrixRoomsSend)) && is_unblocked_by_writes() =>
+                if was_declined { AgentAccess::DeclinedWritesOff } else { AgentAccess::AsksToEnableWrites },
+            Reason::RoomPolicy { reason, .. } => rule_block(reason),
+            Reason::SubjectRestricted => AgentAccess::Blocked("Robrix stopped this AI after a security problem"),
+            Reason::PermissionDenied { .. } => AgentAccess::Blocked("this permission is blocked"),
+            Reason::CapabilityDenied => AgentAccess::Blocked("this ability is blocked"),
+            _ => AgentAccess::Blocked("this AI can't use it"),
+        },
+    }
+}
+
+/// The gate's decision for each ability an AI room declares in one permission group. `context`
+/// is its data-sharing reader and `outputs` the AI service and homeserver its turns write to.
+fn agent_accesses(state: &A2AppState, subject: &str, room: &str, perm: Permission, cap_id: Option<&str>,
+    context: Option<&ContextId>, outputs: &[Recipient]) -> Vec<(&'static str, AgentAccess)>
+{
+    use Permission::*;
+    // "Not now" on a call's review refuses the group's reviewed calls until the turn ends.
+    let was_declined = state.dismissed_prompts.contains(&(subject.to_string(), perm));
+    // A read asks while what it adds can't reach the AI service, the homeserver and this room.
+    let is_missing_default = context.is_some_and(|context| {
+        let source = match perm {
+            MatrixRoomRead | MatrixRoomInfo => flow::Source::Room { account: context.account().into(), room: room.into() },
+            MatrixRoomsList | MatrixSpaces => flow::Source::RoomDirectory { account: context.account().into() },
+            _ => return false,
+        };
+        let own_room = Recipient::MatrixRoom { account: context.account().into(), room: room.into() };
+        outputs.iter().chain([&own_room]).any(|recipient| !flow::sharing_allows_for_reader(&source, recipient, context).unwrap_or(false))
+    });
+    a2app_core::capabilities::in_group(perm)
+        .filter(|cap| cap_id.map_or(crate::a2app::ai::tools::AI_ROOM_SESSION_CAP_IDS.contains(&cap.id), |id| cap.id == id))
+        .map(|cap| (cap.title, match agent_access(&state.permissions, subject, room, cap, was_declined) {
+            // These reads are reviewed, so a decline refuses them too.
+            // Restore default access puts back the rule, and the directory's allowance but not this room's.
+            AgentAccess::Asks if is_missing_default && matches!(perm, MatrixRoomRead | MatrixRoomInfo) => AgentAccess::AsksAndMissingSharing,
+            AgentAccess::Allowed | AgentAccess::ListsSome | AgentAccess::OnlyAllowedRooms(_) | AgentAccess::Asks if is_missing_default =>
+                if was_declined { AgentAccess::Declined } else { AgentAccess::MissingDefaultSharing },
+            AgentAccess::Allowed if perm == MatrixRoomsRead => if was_declined { AgentAccess::Declined }
+                else { AgentAccess::AllowedNeedsSharing("Allowed. Sharing what it reads with your AI service is asked when needed.") },
+            AgentAccess::OnlyAllowedRooms(_) if perm == MatrixRoomsRead => if was_declined { AgentAccess::Declined }
+                else { AgentAccess::OnlyAllowedRooms(" Sharing what it reads with your AI service is asked when needed.") },
+            AgentAccess::OnlyAllowedRooms("") if perm == MatrixRoomsSend =>
+                AgentAccess::OnlyAllowedRooms(" Sharing this conversation with that room also needs your approval."),
+            AgentAccess::Allowed if perm == MatrixRoomsSend =>
+                AgentAccess::AllowedNeedsSharing("Allowed. Sharing this conversation with that room also needs your approval."),
+            access => access,
+        }))
+        .collect()
+}
+
+fn agent_access_text(cx: &mut Cx, accesses: &[(&str, AgentAccess)]) -> String {
+    let text = |cx: &mut Cx, access: &AgentAccess| match access {
+        AgentAccess::Allowed => "Allowed without asking.".to_string(),
+        AgentAccess::AllowedNeedsSharing(text) => text.to_string(),
+        AgentAccess::ListsSome => "Lists only the rooms and spaces chosen below or allowed in Room and space access.".into(),
+        AgentAccess::Asks => "Asks first. Saved allowances below skip the question where they apply.".into(),
+        AgentAccess::AsksPerTool => "Asks the first time the AI calls each mini-app tool.".into(),
+        AgentAccess::AsksToEnableWrites => "Asks first, and offers to turn on Allow apps to send or change rooms.".into(),
+        AgentAccess::MissingDefaultSharing => "Asks first, because a default sharing rule it needs is missing. Restore default access in AI room permissions puts it back.".into(),
+        AgentAccess::AsksAndMissingSharing => "Asks first. A default sharing rule it needs is also missing, so a saved allowance can't skip the question until Restore default access in AI room permissions puts the rule back.".into(),
+        AgentAccess::OnlyAllowedRooms(note) => format!("Only in rooms you allow in Room and space access.{note} Saved allowances below can't add other rooms."),
+        AgentAccess::Declined => "You declined this during the AI's current turn, so it won't ask again for single calls until that turn ends. It can still ask once for everything a task needs.".into(),
+        AgentAccess::DeclinedWritesOff => "You declined this during the AI's current turn, so it won't ask again until that turn ends. Turn on Allow apps to send or change rooms on the Mini Apps page to let it post.".into(),
+        AgentAccess::WritesOff => "Blocked because Allow apps to send or change rooms is off on the Mini Apps page.".into(),
+        AgentAccess::RuleBlocks { id, is_space } => format!("Blocked because Room and space access blocks {}{}.",
+            if *is_space { "the space " } else { "" }, room_label(cx, id)),
+        AgentAccess::Blocked(why) => format!("Blocked because {why}."),
+    };
+    match accesses {
+        [] => "This AI doesn't use this permission.".into(),
+        [(_, first), rest @ ..] if rest.iter().all(|(_, access)| access == first) => text(cx, first),
+        _ => accesses.iter().map(|(title, access)| format!("{title}: {}", text(cx, access))).collect::<Vec<_>>().join("\n"),
+    }
+}
+
+/// Every AI room this device knows for the signed-in account: joined rooms seen this
+/// run, started before or holding saved permissions, and rooms with its data-sharing state.
+#[cfg(unix)]
+fn known_ai_rooms() -> Vec<String> {
+    let mut rooms = with_a2app(|state| {
+        let mut rooms: std::collections::BTreeSet<String> = state.ai_rooms.keys().map(ToString::to_string).collect();
+        rooms.extend(state.persisted.permission_defaults_applied.iter().cloned());
+        if let Ok(store) = serde_json::to_value(&state.permissions) { agent_rooms_in(&store, &mut rooms); }
+        rooms
+    }).unwrap_or_default();
+    // Saved permissions aren't kept per account, so another account's rooms aren't joined here.
+    rooms.retain(|room| super::runtime::joined_room(room).unwrap_or(true));
+    if let Ok(account) = super::information_flow::account() {
+        let readers = flow::sharing_grants().unwrap_or_default().into_iter().filter_map(|grant| match grant.reader {
+            ReaderScope::Context(context) => Some(context),
+            _ => None,
+        });
+        let contexts = flow::retained_contexts().unwrap_or_default().into_iter().map(|snapshot| snapshot.context).chain(readers);
+        rooms.extend(contexts.filter_map(|context| match context {
+            ContextId::Agent { account: owner, room } if owner == account => Some(room),
+            _ => None,
+        }));
+    }
+    rooms.into_iter().filter(|room| OwnedRoomId::try_from(room.as_str()).is_ok()).collect()
+}
+
+/// Collects the room of every agent subject in a serialized permission store.
+#[cfg(unix)]
+fn agent_rooms_in(value: &serde_json::Value, rooms: &mut std::collections::BTreeSet<String>) {
+    match value {
+        serde_json::Value::String(text) => rooms.extend(agent_room_of(text).map(str::to_owned)),
+        serde_json::Value::Array(values) => { for value in values { agent_rooms_in(value, rooms); } }
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                rooms.extend(agent_room_of(key).map(str::to_owned));
+                agent_rooms_in(value, rooms);
+            }
+        }
+        _ => {}
+    }
+}
+
 struct SavedApprovalRow {
     key: AccessRuleKey,
     summary: String,
@@ -4298,9 +4591,12 @@ impl MiniAppsScreen {
         self.view.widget(cx, ids!(access_save)).set_visible(cx, matches!(view, AccessView::Rule | AccessView::Allowance));
         self.view.widget(cx, ids!(access_subject)).set_visible(cx, !protection && view != AccessView::AgentRooms);
         self.view.label(cx, ids!(access_rules_title)).set_text(cx, if protection { "Your room and space rules" } else { "Saved allowances" });
+        let is_agent_tools = matches!(&self.access_editor, Some(AccessEditor::App { app_id, perm: Permission::McpTools, .. })
+            if agent_room_of(app_id).is_some());
         self.view.label(cx, ids!(access_empty)).set_text(cx, if protection {
             "No custom rules yet. Rooms use the access settings above."
-        } else { "No saved allowances. Add one to remember your choice for selected rooms or websites." });
+        } else if is_agent_tools { "No approved tools yet." }
+        else { "No saved allowances. Add one to remember your choice for selected rooms or websites." });
         let title = match view {
             AccessView::AgentRooms => Some("AI room permissions"),
             AccessView::AgentPermissions => Some("Choose a permission"),
@@ -4344,6 +4640,48 @@ impl MiniAppsScreen {
         true
     }
 
+    /// Says what the permission decides before its saved allowances. For an AI room,
+    /// that is its gate's decision in its own room.
+    fn refresh_access_baseline(&self, cx: &mut Cx) {
+        let Some(AccessEditor::App { app_id, perm, cap_id }) = &self.access_editor else { return };
+        let room = agent_room_of(app_id);
+        let context = room.and_then(|room| super::information_flow::agent_context(room).ok());
+        let (state, group, effective, agent) = with_a2app(|runtime| (
+            cap_id.as_deref().map(|id| runtime.permissions.capability_state(app_id, id))
+                .unwrap_or_else(|| runtime.permissions.state(app_id, *perm)),
+            runtime.permissions.state(app_id, *perm),
+            runtime.permissions.effective_for_in_context(app_id, |_| true, *perm, Default::default()),
+            room.map(|room| agent_accesses(runtime, app_id, room, *perm, cap_id.as_deref(), context.as_ref(), &self.agent_outputs)),
+        )).unwrap_or((GrantState::Ask, GrantState::Ask, Effective::NeedsPrompt, None));
+        // An AI's mini-app tools are approved one by one when it calls them, so an allowance changes nothing.
+        let is_add_offered = !(room.is_some() && *perm == Permission::McpTools);
+        let group_blocked = cap_id.is_some() && *perm != Permission::Network && group == GrantState::Denied;
+        let baseline: String = if group_blocked {
+            "Blocked by its permission group. Open that group and choose Ask again before allowing this ability.".into()
+        } else if state == GrantState::Denied && !is_add_offered {
+            "Blocked everywhere. Choose Ask again to let the AI ask for each tool.".into()
+        } else if let Some(accesses) = agent.filter(|_| state != GrantState::Denied) {
+            agent_access_text(cx, &accesses)
+        } else {
+            let text = match state {
+                GrantState::Granted => "Default for this permission: allowed everywhere.",
+                GrantState::Denied => "Blocked everywhere. Saving an allowance below removes this permission block.",
+                GrantState::Ask if cap_id.is_some() && group == GrantState::Granted => "Uses its permission group, which allows access everywhere.",
+                GrantState::Ask if effective == Effective::NeedsPrompt => "Will ask before using this permission. Saved allowances below may apply in selected rooms or websites.",
+                GrantState::Ask => "Uses the default for this permission and the saved allowances below.",
+            };
+            text.into()
+        };
+        self.view.widget(cx, ids!(access_add)).set_visible(cx, is_add_offered);
+        self.view.button(cx, ids!(access_add)).set_enabled(cx, !group_blocked);
+        self.view.widget(cx, ids!(access_add)).set_disabled(cx, group_blocked);
+        if group_blocked {
+            self.view.button(cx, ids!(access_save)).set_enabled(cx, false);
+            self.view.widget(cx, ids!(access_save)).set_disabled(cx, true);
+        }
+        self.view.label(cx, ids!(access_baseline)).set_text(cx, &baseline);
+    }
+
     fn set_write_controls_enabled(&mut self, cx: &mut Cx, enabled: bool) {
         self.view.check_box(cx, ids!(global_write_enabled)).set_active(cx, enabled, Animate::No);
         self.view.check_box(cx, ids!(protection_write_enabled)).set_active(cx, enabled, Animate::No);
@@ -4376,6 +4714,14 @@ impl MiniAppsScreen {
                 if *perm == Permission::Network {
                     hint = format!("Internet access may send local data off this device. Data-sharing rules still apply.\n\n{hint}");
                 }
+                let agent_hint = match perm {
+                    Permission::MatrixRoomsRead => "Choose the other rooms this AI may read. Sharing what it reads with your AI service is asked when needed.",
+                    Permission::MatrixRoomsSend => "Choose the other rooms this AI may post to as you. Sharing this conversation with them also needs your approval.",
+                    _ => "",
+                };
+                if agent_room_of(app_id).is_some() && !agent_hint.is_empty() {
+                    hint = format!("{agent_hint}\n\n{hint}");
+                }
                 (title, hint, room, false)
             }
         };
@@ -4390,12 +4736,15 @@ impl MiniAppsScreen {
         self.view.label(cx, ids!(access_title)).set_text(cx, &title);
         self.view.label(cx, ids!(access_hint)).set_text(cx, &hint);
         let network = matches!(&editor, AccessEditor::App { perm: Permission::Network, .. });
-        self.view.permission_scope_editor(cx, ids!(access_scope)).configure(
-            cx, room.as_deref(), room.as_deref(), None, network, protection,
-        );
-        if !protection {
-            self.view.permission_scope_editor(cx, ids!(access_scope)).enable_room_session_picker(cx);
-        }
+        // The attached room still ends a room session when the group's targets are other rooms.
+        let group_scope = match &editor { AccessEditor::App { perm, .. } => group_default_scope(*perm), AccessEditor::Protection => None };
+        let scope_editor = self.view.permission_scope_editor(cx, ids!(access_scope));
+        scope_editor.configure(cx, room.as_deref().filter(|_| group_scope.is_none()), room.as_deref(), None, network, protection);
+        if let Some(scope) = &group_scope { scope_editor.set_scope(cx, scope); }
+        if !protection { scope_editor.enable_room_session_picker(cx); }
+        let is_agent = matches!(&editor, AccessEditor::App { app_id, .. } if agent_room_of(app_id).is_some());
+        if is_agent { scope_editor.set_duration(cx, GrantDuration::RobrixSession); }
+        self.agent_outputs = if is_agent { agent_outputs() } else { Vec::new() };
         self.managing_agents = false;
         self.view.button(cx, ids!(access_ask)).set_text(cx, if matches!(&editor, AccessEditor::App { cap_id: Some(_), .. }) {
             "Ask again for this permission group"
@@ -4407,6 +4756,7 @@ impl MiniAppsScreen {
         self.access_editor = Some(editor);
         self.set_write_controls_enabled(cx, with_a2app(|state| state.permissions.matrix_write()).unwrap_or(false));
         self.set_access_view(cx, AccessView::Overview);
+        self.refresh_access_baseline(cx);
         self.set_pane(cx, Pane::Access);
     }
 
@@ -4431,7 +4781,9 @@ impl MiniAppsScreen {
             self.view.permission_choices(cx, ids!(policy_write)).set_selected_item(cx, 0);
             self.set_access_view(cx, AccessView::Targets);
         }
-        if self.access_view == AccessView::Overview && self.view.button(cx, ids!(access_add)).clicked(actions) {
+        if self.access_view == AccessView::Overview && self.view.button(cx, ids!(access_add)).clicked(actions)
+            && self.view.widget(cx, ids!(access_add)).visible()
+        {
             self.set_access_view(cx, AccessView::Allowance);
         }
         if self.view.button(cx, ids!(change_rule_targets)).clicked(actions) {
@@ -4539,16 +4891,19 @@ impl MiniAppsScreen {
             AccessRuleKey::Effect { id, .. } => cx.action(A2AppOp::RevokeEffectAuthority(*id)),
             AccessRuleKey::Action { id, .. } => cx.action(A2AppOp::RevokeFlowAuthority(*id)),
             AccessRuleKey::Sharing { id, account, shared } => {
-                if *shared {
+                let confirm = if *shared {
+                    Some(("Remove this shared approval?", "This data approval is shared by all mini-apps and agents. Removing it affects all of them and stops active private-data work. Your data is kept; apps can ask again when needed."))
+                } else if is_agent_default_sharing(*id) {
+                    Some(("Remove a default sharing rule?", "This room's AI needs this rule to reply. Removing it may stop the AI from replying. Restore default access in AI room permissions puts it back."))
+                } else { None };
+                if let Some((title, body)) = confirm {
                     let id = *id;
                     let account = account.clone();
-                    self.confirm_delete(cx, "Remove this shared approval?".into(),
-                        "This data approval is shared by all mini-apps and agents. Removing it affects all of them and stops active private-data work. Your data is kept; apps can ask again when needed.".into(),
-                        "Remove approval", move |cx| {
-                            if super::information_flow::account().is_ok_and(|current| current == account) {
-                                cx.action(A2AppOp::RevokeFlowSharing(id));
-                            }
-                        });
+                    self.confirm_delete(cx, title.into(), body.into(), "Remove approval", move |cx| {
+                        if super::information_flow::account().is_ok_and(|current| current == account) {
+                            cx.action(A2AppOp::RevokeFlowSharing(id));
+                        }
+                    });
                 } else { cx.action(A2AppOp::RevokeFlowSharing(*id)); }
             }
         }
@@ -4576,20 +4931,24 @@ impl MiniAppsScreen {
                         .cloned().collect::<Vec<_>>(),
                     state.permissions.network_grants(app_id).into_iter().cloned().collect::<Vec<_>>(),
                 )).unwrap_or_default();
+                let turn = turn_grants();
                 let mut rows = grants.into_iter().map(|grant| {
                     let ability = grant.capability.as_deref().map(|id| {
                         a2app_core::capabilities::by_id(id).map(|cap| cap.title.to_string())
                             .or_else(|| id.strip_prefix("tool:").and_then(|key| serde_json::from_str::<(String, String)>(key).ok()).map(|(name, _)| format!("Tool: {name}")))
                             .unwrap_or_else(|| id.to_string())
                     }).unwrap_or_else(|| "Entire permission group".to_string());
-                    let mut label = format!("Allow: {ability} · {}\n{}", scope_label(cx, &grant.scope), duration_label(grant.duration));
+                    let duration = if turn.contains(&GrantRef::Scoped(grant.id)) || turn.contains(&GrantRef::Tool(grant.id)) { TURN_ONLY }
+                        else { duration_label(grant.duration) };
+                    let mut label = format!("Allow: {ability} · {}\n{duration}", scope_label(cx, &grant.scope));
                     if let Some(origin) = grant.origin_room { label.push_str(&format!(" · source: {}", room_label(cx, &origin))); }
                     (AccessRuleKey::Grant(grant.id), label)
                 }).collect::<Vec<_>>();
                 if *perm == Permission::Network {
                     rows.extend(network.into_iter().map(|grant| (
                         AccessRuleKey::Network(grant.id),
-                        format!("{}\n{} · {}", network_scope_label(&grant.network), scope_label(cx, &grant.scope), duration_label(grant.duration)),
+                        format!("{}\n{} · {}", network_scope_label(&grant.network), scope_label(cx, &grant.scope),
+                            if turn.contains(&GrantRef::Network(grant.id)) { TURN_ONLY } else { duration_label(grant.duration) }),
                     )));
                 }
                 let legacy = with_a2app(|state| match perm {
@@ -4664,6 +5023,7 @@ impl MiniAppsScreen {
             let details = format!("{summary}\nAction: {}\nTarget: {}", grant.action.kind, grant.action.target);
             rows.push(SavedApprovalRow { key: AccessRuleKey::Action { account: account.clone(), id: grant.id }, summary, details, sources: Vec::new() });
         }
+        let turn = turn_grants();
         for grant in flow::sharing_grants().unwrap_or_default() {
             if !sharing_matches_subject(&grant, &account, subject, true) { continue; }
             let shared = matches!(grant.reader, ReaderScope::AllReaders);
@@ -4673,8 +5033,8 @@ impl MiniAppsScreen {
                 ReaderScope::Context(context) => approval_context_label(cx, context),
             };
             let sources = resolve_approval_sources(cx, &flow::Label::from([grant.source.clone()]));
-            let summary = format!("{}\n{}\n{scope} · {}", source_summary(&sources),
-                approval_recipient_label(cx, &grant.recipient), approval_duration_label(cx, &grant.duration));
+            let duration = if turn.contains(&GrantRef::Flow(grant.id)) { TURN_ONLY.into() } else { approval_duration_label(cx, &grant.duration) };
+            let summary = format!("{}\n{}\n{scope} · {duration}", source_summary(&sources), approval_recipient_label(cx, &grant.recipient));
             rows.push(SavedApprovalRow { key: AccessRuleKey::Sharing { account: account.clone(), id: grant.id, shared }, details: summary.clone(), summary, sources });
         }
         rows
@@ -4684,7 +5044,7 @@ impl MiniAppsScreen {
 impl MiniAppsScreen {
     fn show_agent_permissions(&mut self, cx: &mut Cx) {
         #[cfg(unix)]
-        { self.agent_rooms = with_a2app(|state| state.ai_rooms.keys().map(ToString::to_string).collect()).unwrap_or_default(); }
+        { self.agent_rooms = known_ai_rooms(); }
         #[cfg(not(unix))]
         { self.agent_rooms.clear(); }
         self.agent_rooms.sort_by_key(|id| room_label(cx, id).to_lowercase());
@@ -5334,6 +5694,505 @@ mod access_tests {
         assert!(ops.iter().any(|op| matches!(op, A2AppOp::SetRoomPolicy { access: RoomAccess::Write, decision: PolicyDecision::Deny, .. })));
         assert!(ops.iter().any(|op| matches!(op, A2AppOp::SetSpacePolicy { access: RoomAccess::Write, decision: PolicyDecision::Deny, .. })));
         assert!(!ops.iter().any(|op| matches!(op, A2AppOp::SetGlobalPolicy { .. } | A2AppOp::SetPolicyMode { .. })));
+    }
+
+    fn screen_widget(cx: &mut Cx) -> WidgetRef {
+        cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::a2app::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
+            WidgetRef::script_from_value(vm, value)
+        })
+    }
+
+    fn press(cx: &mut Cx, screen: &mut MiniAppsScreen, path: &[LiveId]) -> ActionsBuf {
+        let uid = screen.view.button(cx, path).widget_uid();
+        let click = cx.capture_actions(|cx| cx.widget_action(uid, ButtonAction::Clicked(Default::default())));
+        cx.capture_actions(|cx| screen.handle_event(cx, &Event::Actions(click), &mut Scope::empty()))
+    }
+
+    fn choose(cx: &mut Cx, screen: &mut MiniAppsScreen, path: &[LiveId], index: usize) {
+        let choices = screen.view.permission_choices(cx, path);
+        choices.set_selected_item(cx, index);
+        let change = cx.capture_actions(|cx| cx.widget_action(choices.widget_uid(), crate::a2app::permission_choices::PermissionChoicesAction::Changed(index)));
+        screen.handle_event(cx, &Event::Actions(change), &mut Scope::empty());
+    }
+
+    fn ops(actions: &Actions) -> Vec<&A2AppOp> {
+        actions.iter().filter_map(|action| action.downcast_ref::<A2AppOp>()).collect()
+    }
+
+    struct TestAccount(Option<String>);
+
+    impl TestAccount {
+        fn set(account: &str) -> Self {
+            Self(super::super::information_flow::TEST_ACCOUNT.with(|current| current.replace(Some(account.into()))))
+        }
+    }
+
+    impl Drop for TestAccount {
+        fn drop(&mut self) { super::super::information_flow::TEST_ACCOUNT.with(|current| { current.replace(self.0.take()); }); }
+    }
+
+    #[test]
+    fn agent_allowances_default_their_rooms_by_group_and_last_until_robrix_closes() {
+        super::super::runtime::initialize_background_test(a2app_core::builtin::stock("account").unwrap());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = screen_widget(&mut cx);
+        let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
+        let room = "!ai-defaults:example.org";
+        let subject = agent_subject(room);
+        let defaults = |cx: &mut Cx, screen: &mut MiniAppsScreen, perm: Permission| {
+            screen.show_access_editor(cx, AccessEditor::App { app_id: subject.clone(), perm, cap_id: None });
+            screen.view.permission_scope_editor(cx, ids!(access_scope)).selection()
+        };
+        for perm in [Permission::MatrixRoomsList, Permission::MatrixSpaces] {
+            let selection = defaults(&mut cx, &mut screen, perm).unwrap();
+            assert_eq!(selection.scope, RoomScope::AllRooms, "{perm:?} must list every room, not only the AI's own");
+            assert_eq!(selection.duration, GrantDuration::RobrixSession);
+            assert_eq!(selection.origin_room.as_deref(), Some(room), "the AI room still ends a room session");
+        }
+        let own = defaults(&mut cx, &mut screen, Permission::MatrixRoomRead).unwrap();
+        assert_eq!((own.scope, own.duration), (RoomScope::room(room), GrantDuration::RobrixSession));
+        assert!(!screen.view.label(&cx, ids!(access_hint)).text().contains("other rooms"));
+        for perm in [Permission::MatrixRoomsSend, Permission::MatrixRoomsRead] {
+            assert!(defaults(&mut cx, &mut screen, perm).is_err(), "{perm:?} starts with no room chosen");
+            assert!(screen.view.widget(&cx, ids!(access_scope.selected_targets)).visible(), "the room checklist starts open");
+        }
+        assert!(screen.view.label(&cx, ids!(access_hint)).text()
+            .starts_with("Choose the other rooms this AI may read. Sharing what it reads with your AI service is asked when needed."));
+
+        press(&mut cx, &mut screen, ids!(access_add));
+        assert_eq!(screen.access_view, AccessView::Allowance);
+        assert!(ops(&press(&mut cx, &mut screen, ids!(access_save))).is_empty(), "Allow selected waits for a room choice");
+        assert_eq!(screen.access_view, AccessView::Allowance);
+        let other = "!other:example.org";
+        screen.view.permission_scope_editor(&cx, ids!(access_scope)).set_scope(&mut cx, &RoomScope::room(other));
+        let saved = press(&mut cx, &mut screen, ids!(access_save));
+        assert!(matches!(ops(&saved).as_slice(), [A2AppOp::GrantScoped {
+            app_id, perm: Permission::MatrixRoomsRead, cap_id: None, scope, duration: GrantDuration::RobrixSession, origin_room,
+        }] if app_id == &subject && scope == &RoomScope::room(other) && origin_room.as_deref() == Some(room)));
+        assert_eq!(screen.access_view, AccessView::Overview);
+    }
+
+    #[test]
+    fn room_apps_list_every_room_and_choose_rooms_for_cross_room_groups() {
+        let app_room = "!app-room:example.org";
+        let mut manifest = a2app_core::builtin::stock("roll-call").unwrap();
+        manifest.id = "room-target-defaults-test".into();
+        manifest.scope = A2AppScope::Room { room_id: app_room.into() };
+        super::super::runtime::initialize_background_test(manifest.clone());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = screen_widget(&mut cx);
+        let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
+        let defaults = |cx: &mut Cx, screen: &mut MiniAppsScreen, perm: Permission| {
+            screen.show_access_editor(cx, AccessEditor::App { app_id: manifest.id.clone(), perm, cap_id: None });
+            screen.view.permission_scope_editor(cx, ids!(access_scope)).selection()
+        };
+        let list = defaults(&mut cx, &mut screen, Permission::MatrixRoomsList).unwrap();
+        assert_eq!(list.scope, RoomScope::AllRooms);
+        assert_eq!((list.duration, list.origin_room.as_deref()), (GrantDuration::RoomSession, Some(app_room)),
+            "a room app keeps its room's session as the default duration");
+        let own = defaults(&mut cx, &mut screen, Permission::MatrixRoomRead).unwrap();
+        assert_eq!((own.scope, own.duration), (RoomScope::room(app_room), GrantDuration::RoomSession));
+        assert!(defaults(&mut cx, &mut screen, Permission::MatrixRoomsRead).is_err());
+        assert!(!screen.view.label(&cx, ids!(access_hint)).text().contains("this AI"), "the AI hint is only for AI rooms");
+    }
+
+    #[test]
+    fn agent_baseline_says_what_its_gate_decides_and_why() {
+        super::super::runtime::initialize_background_test(a2app_core::builtin::stock("account").unwrap());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = screen_widget(&mut cx);
+        let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
+        let room = "!ai-baseline:example.org";
+        let subject = agent_subject(room);
+        let baseline = |cx: &mut Cx, screen: &mut MiniAppsScreen, perm: Permission| {
+            screen.show_access_editor(cx, AccessEditor::App { app_id: subject.clone(), perm, cap_id: None });
+            screen.refresh_access_baseline(cx);
+            screen.view.label(cx, ids!(access_baseline)).text()
+        };
+        const ASKS: &str = "Asks first. Saved allowances below skip the question where they apply.";
+        const LISTS_SOME: &str = "Lists only the rooms and spaces chosen below or allowed in Room and space access.";
+        const OFFERS_WRITES: &str = "Asks first, and offers to turn on Allow apps to send or change rooms.";
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomsSend), OFFERS_WRITES,
+            "a cross-room post offers to turn writes on, as its gate does");
+        with_a2app(|state| state.permissions.set_room_policy(room, RoomAccess::Write, PolicyDecision::Deny));
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomsSend), OFFERS_WRITES,
+            "a post to another room is judged by that room's rules, not the AI's own");
+        with_a2app(|state| state.permissions.set_room_policy(room, RoomAccess::Write, PolicyDecision::Ask));
+        with_a2app(|state| state.permissions.set_matrix_write(true));
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomsSend), ASKS);
+        const ONLY_ALLOWED: &str = "Only in rooms you allow in Room and space access. Saved allowances below can't add other rooms.";
+        with_a2app(|state| state.permissions.set_policy_mode(RoomAccess::Write, RoomPolicyMode::WhitelistOnly));
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomsSend), "Only in rooms you allow in Room and space access. \
+            Sharing this conversation with that room also needs your approval. Saved allowances below can't add other rooms.",
+            "allowances can't add rooms under Only in rooms I allow");
+        with_a2app(|state| state.permissions.set_matrix_write(false));
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomsSend), "Only in rooms you allow in Room and space access. \
+            It asks first to turn on Allow apps to send or change rooms. Saved allowances below can't add other rooms.");
+        with_a2app(|state| state.permissions.set_matrix_write(true));
+        with_a2app(|state| state.permissions.set_policy_mode(RoomAccess::Write, RoomPolicyMode::Standard));
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomsSend), ASKS);
+        const DECLINED: &str = "You declined this during the AI's current turn, so it won't ask again for single calls until that turn ends. It can still ask once for everything a task needs.";
+        with_a2app(|state| state.dismissed_prompts.insert((subject.clone(), Permission::MatrixRoomsSend)));
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomsSend), DECLINED);
+        with_a2app(|state| state.permissions.grant_scoped(&subject, Permission::MatrixRoomsSend, None, RoomScope::AllRooms,
+            GrantDuration::RobrixSession, None).unwrap());
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomsSend),
+            "Allowed. Sharing this conversation with that room also needs your approval.");
+        with_a2app(|state| state.permissions.set_room_policy(room, RoomAccess::Write, PolicyDecision::Allow));
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomsSend),
+            "Allowed. Sharing this conversation with that room also needs your approval.",
+            "a rule on the AI's own room doesn't narrow an allowance for every room");
+        with_a2app(|state| state.permissions.set_room_policy(room, RoomAccess::Write, PolicyDecision::Ask));
+
+        // An allowance for only the AI's own room does not let it read other rooms.
+        with_a2app(|state| state.permissions.grant_scoped(&subject, Permission::MatrixRoomsRead, None, RoomScope::room(room),
+            GrantDuration::RoomSession, Some(room)).unwrap());
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomsRead), ASKS);
+        with_a2app(|state| state.dismissed_prompts.insert((subject.clone(), Permission::MatrixRoomsRead)));
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomsRead), DECLINED,
+            "a declined read review refuses the turn's other unrequested reads");
+        // An allowance saved here clears that decline, as `clear_dismissals_for_grant` does.
+        with_a2app(|state| state.dismissed_prompts.remove(&(subject.clone(), Permission::MatrixRoomsRead)));
+        with_a2app(|state| state.permissions.grant_scoped(&subject, Permission::MatrixRoomsRead, None, RoomScope::AllRooms,
+            GrantDuration::RobrixSession, None).unwrap());
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomsRead),
+            "Allowed. Sharing what it reads with your AI service is asked when needed.");
+
+        // A list allowed for some rooms returns only those rooms.
+        with_a2app(|state| state.permissions.grant_scoped(&subject, Permission::MatrixSpaces, Some("matrix.spaces.list"),
+            RoomScope::room(room), GrantDuration::Always, None).unwrap());
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixSpaces),
+            format!("Your spaces: {LISTS_SOME}\nSpace details: {ASKS}\nRooms in a space: {ASKS}"));
+        with_a2app(|state| state.permissions.grant_scoped(&subject, Permission::MatrixSpaces, Some("matrix.spaces.list"),
+            RoomScope::AllRooms, GrantDuration::Always, None).unwrap());
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixSpaces),
+            format!("Your spaces: Allowed without asking.\nSpace details: {ASKS}\nRooms in a space: {ASKS}"));
+        with_a2app(|state| state.permissions.grant_scoped(&subject, Permission::MatrixSpaces, Some("matrix.space.rooms.list"),
+            RoomScope::Selection { rooms: Vec::new(), spaces: vec!["!chosen-space:example.org".into()] }, GrantDuration::Always, None).unwrap());
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixSpaces),
+            format!("Your spaces: Allowed without asking.\nSpace details: {ASKS}\nRooms in a space: {ASKS}"),
+            "other spaces are asked for, as the gate checks each space");
+        with_a2app(|state| state.permissions.set_room_policy("!allowed:example.org", RoomAccess::Read, PolicyDecision::Allow));
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomsList), LISTS_SOME, "a room Allow rule admits only that room");
+        with_a2app(|state| state.permissions.set(&subject, Permission::MatrixRoomsList, GrantState::Granted));
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomsList), "Allowed without asking.");
+        // Under "Only in rooms I allow", room rules decide every row and every room named.
+        with_a2app(|state| {
+            state.permissions.set_policy_mode(RoomAccess::Read, RoomPolicyMode::WhitelistOnly);
+            state.permissions.set_room_policy(room, RoomAccess::Read, PolicyDecision::Allow);
+        });
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomsList), ONLY_ALLOWED, "allowances add no rows");
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixSpaces), ONLY_ALLOWED);
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomsRead), "Only in rooms you allow in Room and space access. \
+            Sharing what it reads with your AI service is asked when needed. Saved allowances below can't add other rooms.");
+        with_a2app(|state| state.permissions.set_policy_mode(RoomAccess::Read, RoomPolicyMode::Standard));
+        // With reads allowed by default, a rule on the AI's own room doesn't make other rooms ask.
+        with_a2app(|state| state.permissions.set_global_policy(RoomAccess::Read, PolicyDecision::Allow));
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixSpaces), "Allowed without asking.");
+        with_a2app(|state| state.permissions.set_global_policy(RoomAccess::Read, PolicyDecision::Ask));
+
+        with_a2app(|state| state.permissions.set_room_policy(room, RoomAccess::Read, PolicyDecision::Deny));
+        for perm in [Permission::MatrixRoomRead, Permission::MatrixRoomsList] {
+            assert_eq!(baseline(&mut cx, &mut screen, perm), format!("Blocked because Room and space access blocks {room}."),
+                "the AI doesn't run while its own room is blocked");
+        }
+    }
+
+    #[test]
+    fn agent_tools_websites_and_media_say_what_their_own_gates_decide() {
+        super::super::runtime::initialize_background_test(a2app_core::builtin::stock("account").unwrap());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = screen_widget(&mut cx);
+        let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
+        let subject = agent_subject("!ai-gates:example.org");
+        let baseline = |cx: &mut Cx, screen: &mut MiniAppsScreen, perm: Permission| {
+            screen.show_access_editor(cx, AccessEditor::App { app_id: subject.clone(), perm, cap_id: None });
+            screen.view.label(cx, ids!(access_baseline)).text()
+        };
+        const ASKS: &str = "Asks first. Saved allowances below skip the question where they apply.";
+        const PER_TOOL: &str = "Asks the first time the AI calls each mini-app tool.";
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::McpTools), PER_TOOL);
+        assert!(!screen.view.widget(&cx, ids!(access_add)).visible(), "an allowance can't approve an AI's tools");
+        assert_eq!(screen.view.label(&cx, ids!(access_empty)).text(), "No approved tools yet.");
+        press(&mut cx, &mut screen, ids!(access_add));
+        assert_eq!(screen.access_view, AccessView::Overview);
+        // The tool gate ignores group allowances and a group Allow; each tool is still approved on its own.
+        with_a2app(|state| {
+            state.permissions.grant_scoped(&subject, Permission::McpTools, None, RoomScope::AllRooms, GrantDuration::Always, None).unwrap();
+            state.permissions.set(&subject, Permission::McpTools, GrantState::Granted);
+        });
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::McpTools), PER_TOOL);
+        with_a2app(|state| state.permissions.set_capability(&subject, "on_tool_call", GrantState::Denied));
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::McpTools), "Blocked because this ability is blocked.");
+        with_a2app(|state| state.permissions.set(&subject, Permission::McpTools, GrantState::Denied));
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::McpTools), "Blocked everywhere. Choose Ask again to let the AI ask for each tool.");
+
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::Network), ASKS);
+        assert!(screen.view.widget(&cx, ids!(access_add)).visible(), "websites are allowed with allowances");
+        assert!(screen.view.label(&cx, ids!(access_empty)).text().starts_with("No saved allowances."));
+        with_a2app(|state| state.permissions.set(&subject, Permission::Network, GrantState::Granted));
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::Network), ASKS, "only an allowance for a website skips its question");
+        // The protection inspector's ability link opens the allowance form only where one can apply.
+        let inspect = |cx: &mut Cx, screen: &mut MiniAppsScreen, permission: Permission, capability: &str| {
+            let actions = cx.capture_actions(|cx| cx.action(ProtectionInspectorAction::Ability {
+                subject: subject.clone(), permission, capability: Some(capability.into()), scope: RoomScope::AllRooms,
+            }));
+            screen.handle_event(cx, &Event::Actions(actions), &mut Scope::empty());
+            screen.access_view
+        };
+        assert_eq!(inspect(&mut cx, &mut screen, Permission::McpTools, "on_tool_call"), AccessView::Overview);
+        assert_eq!(inspect(&mut cx, &mut screen, Permission::Network, "network.http"), AccessView::Allowance);
+
+        // With room writes off, posting media asks and offers to turn them on.
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixMedia), format!("Read an attachment: {ASKS}\nUpload media: {ASKS}\n\
+            Post media: Asks first, and offers to turn on Allow apps to send or change rooms."));
+        with_a2app(|state| state.dismissed_prompts.insert((subject.clone(), Permission::MatrixMedia)));
+        const DECLINED: &str = "You declined this during the AI's current turn, so it won't ask again for single calls until that turn ends. It can still ask once for everything a task needs.";
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixMedia), format!("Read an attachment: {DECLINED}\nUpload media: {DECLINED}\n\
+            Post media: You declined this during the AI's current turn, so it won't ask again until that turn ends. \
+            Turn on Allow apps to send or change rooms on the Mini Apps page to let it post."),
+            "a task request can't post while room writes are off");
+    }
+
+    #[test]
+    fn agent_reads_ask_while_a_default_sharing_rule_is_missing() {
+        let account = "@baseline-sharing:mini-apps-test";
+        let _account = TestAccount::set(account);
+        super::super::runtime::initialize_background_test(a2app_core::builtin::stock("account").unwrap());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = screen_widget(&mut cx);
+        let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
+        let room = "!baseline-sharing:mini-apps-test";
+        let subject = agent_subject(room);
+        let model = Recipient::ModelProvider("baseline-sharing-model".into());
+        let baseline = |cx: &mut Cx, screen: &mut MiniAppsScreen, perm: Permission| {
+            screen.show_access_editor(cx, AccessEditor::App { app_id: subject.clone(), perm, cap_id: None });
+            screen.agent_outputs = vec![model.clone()];
+            screen.refresh_access_baseline(cx);
+            screen.view.label(cx, ids!(access_baseline)).text()
+        };
+        const MISSING: &str = "Asks first, because a default sharing rule it needs is missing. Restore default access in AI room permissions puts it back.";
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomRead), "Asks first. A default sharing rule it needs is also missing, \
+            so a saved allowance can't skip the question until Restore default access in AI room permissions puts the rule back.",
+            "restoring the rule doesn't stop this room's own reads from asking");
+        with_a2app(|state| for perm in [Permission::MatrixRoomRead, Permission::MatrixRoomsList] {
+            state.permissions.set(&subject, perm, GrantState::Granted);
+        });
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomRead), MISSING);
+        assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomsList), MISSING);
+        let reader = ReaderScope::Context(ContextId::Agent { account: account.into(), room: room.into() });
+        let rule = |source: flow::Source, recipient: Recipient| flow::grant_sharing(source, recipient, reader.clone(), SharingDuration::Permanent).unwrap();
+        let directory = flow::Source::RoomDirectory { account: account.into() };
+        let mut rules = vec![rule(flow::Source::Room { account: account.into(), room: room.into() }, model.clone())];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomRead), "Allowed without asking.",
+                "this conversation reaches its own room without a rule");
+            assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomsList), MISSING);
+            rules.push(rule(directory.clone(), model.clone()));
+            assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomsList), MISSING, "replies also post the list in this room");
+            with_a2app(|state| state.permissions.grant_scoped(&subject, Permission::MatrixSpaces, Some("matrix.space.rooms.list"),
+                RoomScope::Selection { rooms: Vec::new(), spaces: vec!["!chosen:mini-apps-test".into()] }, GrantDuration::Always, None).unwrap());
+            assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixSpaces), MISSING,
+                "an allowance for one space can't skip the review a missing rule raises");
+            rules.push(rule(directory.clone(), Recipient::MatrixRoom { account: account.into(), room: room.into() }));
+            assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixRoomsList), "Allowed without asking.");
+            assert_eq!(baseline(&mut cx, &mut screen, Permission::MatrixSpaces),
+                "Asks first. Saved allowances below skip the question where they apply.", "other spaces are still asked for");
+        }));
+        for id in rules { flow::revoke_sharing(id).unwrap(); }
+        if let Err(error) = result { std::panic::resume_unwind(error); }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ai_room_permissions_lists_every_known_ai_room_once() {
+        let account = "@ai-room-list:mini-apps-test";
+        let _account = TestAccount::set(account);
+        super::super::runtime::initialize_background_test(a2app_core::builtin::stock("account").unwrap());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = screen_widget(&mut cx);
+        let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
+        let foreign_account = "@someone-else:mini-apps-test";
+        let agent = |account: &str, room: &str| ContextId::Agent { account: account.into(), room: room.into() };
+        // Each room below is known from one source only.
+        let (own, foreign) = (agent(account, "!flow:mini-apps-test"), agent(foreign_account, "!foreign:mini-apps-test"));
+        flow::register_context(&own).unwrap();
+        flow::register_context(&foreign).unwrap();
+        let reader_rule = |reader: ContextId| flow::grant_sharing(flow::Source::Account { account: reader.account().into() },
+            Recipient::Clipboard, ReaderScope::Context(reader), SharingDuration::RobrixSession).unwrap();
+        let rules = [reader_rule(agent(account, "!reader:mini-apps-test")), reader_rule(agent(foreign_account, "!foreign-reader:mini-apps-test"))];
+        with_a2app(|state| {
+            state.persisted.permission_defaults_applied.insert("!defaults:mini-apps-test".to_string());
+            state.permissions.grant_scoped(&agent_subject("!stored:mini-apps-test"), Permission::MatrixRoomsList, None,
+                RoomScope::AllRooms, GrantDuration::Always, None).unwrap();
+            state.permissions.set(&agent_subject("!blocked:mini-apps-test"), Permission::Network, GrantState::Denied);
+            state.permissions.set(&agent_subject("!defaults:mini-apps-test"), Permission::Network, GrantState::Denied);
+            state.permissions.set(&agent_subject("!not-joined:mini-apps-test"), Permission::Network, GrantState::Denied);
+        });
+        // Saved permissions are device-wide, so only rooms this account joined count.
+        let joined = ["!blocked:mini-apps-test", "!defaults:mini-apps-test", "!stored:mini-apps-test"];
+        let previous = super::super::runtime::TEST_JOINED_ROOMS.with(|rooms| rooms.replace(Some(joined.iter().map(|room| room.to_string()).collect())));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            press(&mut cx, &mut screen, ids!(agent_permissions_button));
+            assert_eq!(screen.agent_rooms, ["!blocked:mini-apps-test", "!defaults:mini-apps-test", "!flow:mini-apps-test",
+                "!reader:mini-apps-test", "!stored:mini-apps-test"], "rooms seen in earlier runs are listed once, and another account's are not");
+            assert_eq!((screen.pane, screen.access_view), (Pane::Access, AccessView::AgentRooms));
+            assert!(screen.view.widget(&cx, ids!(agent_picker)).visible());
+        }));
+        super::super::runtime::TEST_JOINED_ROOMS.with(|rooms| rooms.replace(previous));
+        flow::remove_context(&own).unwrap();
+        flow::remove_context(&foreign).unwrap();
+        for id in rules { flow::revoke_sharing(id).unwrap(); }
+        if let Err(error) = result { std::panic::resume_unwind(error); }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_picker_restores_default_access_and_opens_data_sharing() {
+        super::super::runtime::initialize_background_test(a2app_core::builtin::stock("account").unwrap());
+        let room = "!ai-restore:example.org";
+        with_a2app(|state| state.persisted.permission_defaults_applied.insert(room.into()));
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = screen_widget(&mut cx);
+        let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
+        press(&mut cx, &mut screen, ids!(agent_permissions_button));
+        choose(&mut cx, &mut screen, ids!(agent_choice), 0);
+        assert_eq!(screen.access_view, AccessView::AgentPermissions);
+        assert!(screen.view.widget(&cx, ids!(agent_permissions)).visible());
+        assert!(screen.view.label(&cx, ids!(agent_restore_hint)).text().ends_with("Other permissions are unchanged."));
+        let restored = press(&mut cx, &mut screen, ids!(agent_restore));
+        assert!(matches!(ops(&restored).as_slice(), [A2AppOp::RestoreAgentDefaults(id)] if id.as_str() == room));
+        assert_eq!(screen.access_view, AccessView::AgentPermissions, "restoring keeps the picker open");
+
+        assert!(ops(&press(&mut cx, &mut screen, ids!(agent_sharing))).is_empty());
+        assert_eq!(screen.pane, Pane::Sharing);
+        assert!(screen.view.widget(&cx, ids!(sharing_pane)).visible());
+        screen.go_back(&mut cx);
+        assert_eq!((screen.pane, screen.access_view), (Pane::Access, AccessView::AgentPermissions));
+
+        choose(&mut cx, &mut screen, ids!(agent_ability), 0);
+        assert_eq!(screen.access_view, AccessView::Overview);
+        assert!(ops(&press(&mut cx, &mut screen, ids!(agent_restore))).is_empty(), "a hidden picker can't restore defaults");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn turn_scoped_task_grants_read_as_this_turn_only() {
+        let account = "@turn-rules:mini-apps-test";
+        let _account = TestAccount::set(account);
+        super::super::runtime::initialize_background_test(a2app_core::builtin::stock("account").unwrap());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = screen_widget(&mut cx);
+        let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
+        let room = "!turn-rules:mini-apps-test";
+        let other = "!read-this-turn:mini-apps-test";
+        let subject = agent_subject(room);
+        let context = ContextId::Agent { account: account.into(), room: room.into() };
+        let (turn_scoped, kept_scoped) = with_a2app(|state| (
+            state.permissions.grant_scoped(&subject, Permission::MatrixRoomsRead, Some("matrix.rooms.messages.read"),
+                RoomScope::room(other), GrantDuration::RobrixSession, Some(room)).unwrap(),
+            state.permissions.grant_scoped(&subject, Permission::MatrixRoomsRead, None, RoomScope::room("!kept:mini-apps-test"),
+                GrantDuration::Always, None).unwrap(),
+        )).unwrap();
+        let source = flow::Source::Room { account: account.into(), room: other.into() };
+        let model = Recipient::ModelProvider("turn-rules-model".into());
+        let turn_flow = flow::grant_sharing(source.clone(), model.clone(), ReaderScope::Context(context.clone()),
+            SharingDuration::RoomSession { account: account.into(), room: room.into() }).unwrap();
+        let kept_flow = flow::grant_sharing(source, model, ReaderScope::Context(context.clone()), SharingDuration::RobrixSession).unwrap();
+        with_a2app(|state| state.task_ledger.insert(a2app_core::task_grants::AppliedTask {
+            task_id: 1, subject: subject.clone(), context, epoch: 0, title: "Summarize".into(), plan_hash: [0; 32],
+            grants: vec![GrantRef::Scoped(turn_scoped), GrantRef::Flow(turn_flow)], item_states: Default::default(),
+        }));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            screen.show_access_editor(&mut cx, AccessEditor::App { app_id: subject.clone(), perm: Permission::MatrixRoomsRead, cap_id: None });
+            let rows = screen.access_rows(&mut cx);
+            let label = |id| rows.iter().find(|(key, _)| key == &AccessRuleKey::Grant(id)).map(|(_, label)| label.clone()).unwrap();
+            assert!(label(turn_scoped).ends_with("\nThis turn only"), "{}", label(turn_scoped));
+            assert!(label(kept_scoped).ends_with("\nUntil you change it"));
+            let approvals = screen.saved_approval_rows(&mut cx);
+            let summary = |id| approvals.iter().find(|row| matches!(row.key, AccessRuleKey::Sharing { id: row_id, .. } if row_id == id))
+                .map(|row| row.summary.clone()).unwrap();
+            assert!(summary(turn_flow).ends_with(" · This turn only"), "{}", summary(turn_flow));
+            assert!(summary(kept_flow).ends_with(" · Until you quit Robrix"));
+        }));
+        flow::revoke_sharing(turn_flow).unwrap();
+        flow::revoke_sharing(kept_flow).unwrap();
+        if let Err(error) = result { std::panic::resume_unwind(error); }
+    }
+
+    #[test]
+    fn removing_an_ai_room_default_sharing_rule_asks_first() {
+        let account = "@default-rules:mini-apps-test";
+        let _account = TestAccount::set(account);
+        super::super::runtime::initialize_background_test(a2app_core::builtin::stock("account").unwrap());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = screen_widget(&mut cx);
+        let mut screen = widget.borrow_mut::<MiniAppsScreen>().unwrap();
+        let room = "!default-rules:mini-apps-test";
+        let reader = ReaderScope::Context(ContextId::Agent { account: account.into(), room: room.into() });
+        let own_room = Recipient::MatrixRoom { account: account.into(), room: room.into() };
+        let default_rule = flow::grant_sharing(flow::Source::RoomDirectory { account: account.into() }, own_room.clone(),
+            reader.clone(), SharingDuration::Permanent).unwrap();
+        let other_rule = flow::grant_sharing(flow::Source::Room { account: account.into(), room: "!elsewhere:mini-apps-test".into() },
+            own_room, reader, SharingDuration::Permanent).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            screen.show_access_editor(&mut cx, AccessEditor::App { app_id: agent_subject(room), perm: Permission::MatrixRoomRead, cap_id: None });
+            let key = |id| AccessRuleKey::Sharing { account: account.into(), id, shared: false };
+            let removed = cx.capture_actions(|cx| screen.remove_access_rule(cx, &key(default_rule)));
+            assert!(ops(&removed).is_empty(), "a default rule is removed only after confirming");
+            let accept = removed.iter().find_map(|action| {
+                let Some(ConfirmDeleteAction::Show(content)) = action.downcast_ref() else { return None };
+                let content = content.borrow_mut().take()?;
+                assert_eq!(content.title_text, "Remove a default sharing rule?");
+                assert!(content.body_text.contains("may stop the AI from replying") && content.body_text.contains("Restore default access"));
+                content.on_accept_clicked
+            }).expect("removing a default rule asks first");
+            let confirmed = cx.capture_actions(|cx| accept(cx));
+            assert!(matches!(ops(&confirmed).as_slice(), [A2AppOp::RevokeFlowSharing(id)] if *id == default_rule));
+            let removed = cx.capture_actions(|cx| screen.remove_access_rule(cx, &key(other_rule)));
+            assert!(matches!(ops(&removed).as_slice(), [A2AppOp::RevokeFlowSharing(id)] if *id == other_rule), "other rules are removed at once");
+        }));
+        flow::revoke_sharing(default_rule).unwrap();
+        flow::revoke_sharing(other_rule).unwrap();
+        if let Err(error) = result { std::panic::resume_unwind(error); }
+    }
+
+    #[test]
+    fn ai_room_default_rules_match_only_its_room_service_and_homeserver() {
+        let (account, room) = ("@alice:example.org", "!ai:example.org");
+        let reader = ReaderScope::Context(ContextId::Agent { account: account.into(), room: room.into() });
+        let homeserver = Recipient::network_origin("https://matrix-client.example.org").unwrap();
+        let own_room = flow::Source::Room { account: account.into(), room: room.into() };
+        let directory = flow::Source::RoomDirectory { account: account.into() };
+        let rule = |source: &flow::Source, recipient: Recipient| flow::SharingGrant {
+            id: 1, source: source.clone(), recipient, reader: reader.clone(), duration: SharingDuration::Permanent,
+        };
+        let is_default = |grant: &flow::SharingGrant| is_agent_default_rule(grant, Some("model"), Some(&homeserver));
+        for source in [&own_room, &directory] {
+            assert!(is_default(&rule(source, Recipient::ModelProvider("model".into()))));
+            assert!(is_default(&rule(source, homeserver.clone())));
+            assert!(!is_default(&rule(source, Recipient::ModelProvider("earlier-model".into()))), "an earlier AI service's rule isn't needed");
+            assert!(!is_default(&rule(source, Recipient::network_origin("https://example.com").unwrap())));
+            assert!(!is_default(&rule(source, Recipient::Clipboard)));
+        }
+        assert!(is_default(&rule(&directory, Recipient::MatrixRoom { account: account.into(), room: room.into() })));
+        assert!(!is_default(&rule(&directory, Recipient::MatrixRoom { account: account.into(), room: "!other:example.org".into() })));
+        let elsewhere = flow::Source::Room { account: account.into(), room: "!other:example.org".into() };
+        assert!(!is_default(&rule(&elsewhere, Recipient::ModelProvider("model".into()))));
+        let mut session = rule(&directory, Recipient::ModelProvider("model".into()));
+        session.duration = SharingDuration::RobrixSession;
+        assert!(!is_default(&session), "only saved rules are defaults");
+        let mut shared = rule(&directory, Recipient::ModelProvider("model".into()));
+        shared.reader = ReaderScope::AllReaders;
+        assert!(!is_default(&shared));
+        assert!(is_agent_default_rule(&rule(&own_room, Recipient::ModelProvider("any".into())), None, None),
+            "an unknown AI service can't rule out a provider rule");
+        assert!(!is_agent_default_rule(&rule(&own_room, homeserver.clone()), None, None));
     }
 }
 

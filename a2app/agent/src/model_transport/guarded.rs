@@ -345,7 +345,7 @@ impl GuardedProvider {
         let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
             .no_proxy().referer(false).retry(reqwest::retry::never()).http1_only()
             .no_gzip().no_brotli().no_deflate().no_zstd()
-            .timeout(Duration::from_secs(180)).build()
+            .timeout(Duration::from_secs(600)).build()
             .map_err(|_| "Cannot initialize the guarded model transport.")?;
         Ok(Self { config, client, approve, check_config: None, on_response: None, audit_context: None, outputs: Arc::default(), preview: Default::default(),
             is_stream_refused: AtomicBool::new(false) })

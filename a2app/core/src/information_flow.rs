@@ -270,30 +270,27 @@ impl Registry {
         Ok(label)
     }
 
-    /// The sources a still-live agent context carries into a new turn: every
-    /// source beyond the baseline (the context's own room and the room
-    /// directory) that has no sharing rule to `provider`. The label persists
-    /// across turns, but a turn-scoped provider rule does not, so the next
-    /// model call would otherwise be refused. The host uses this at the start
-    /// of a turn to raise one prompt for the carried-over sources.
-    pub fn carried_over_sources(&self, context: &ContextId, provider: &Recipient) -> Result<Label, String> {
+    /// The sources a still-live agent context carries into a new turn that have
+    /// no sharing rule to `recipient`. The label persists across turns, but a
+    /// turn-scoped rule does not, so the next model call or reply would
+    /// otherwise be refused. The host uses this at the start of a turn to raise
+    /// one prompt. The room's own source and the room directory are included:
+    /// their default rules can be revoked or reset, and the turn would then
+    /// fail without asking.
+    pub fn carried_over_sources(&self, context: &ContextId, recipient: &Recipient) -> Result<Label, String> {
         self.check_context(context)?;
         self.check_healthy()?;
-        provider.validate()?;
-        let own_room = context.room();
+        recipient.validate()?;
         let label = self.labels(context)?;
         Ok(label
             .into_iter()
             .filter(|source| {
-                let baseline = matches!(source, Source::RoomDirectory { .. })
-                    || matches!(source, Source::Room { room, .. } if Some(room.as_str()) == own_room);
                 // `UnknownPrivate` can never be released by a sharing rule, so
                 // it must never raise an unactionable carried-over prompt (a
                 // legacy agent memory that reset on session start would
                 // otherwise prompt on every restart).
-                !baseline
-                    && !matches!(source, Source::UnknownPrivate)
-                    && !self.source_allowed(source, provider, Some(context))
+                !matches!(source, Source::UnknownPrivate)
+                    && !self.source_allowed(source, recipient, Some(context))
             })
             .collect())
     }
@@ -935,6 +932,18 @@ pub fn sharing_allows_for_reader(source: &Source, recipient: &Recipient, reader:
     })
 }
 
+/// Whether a saved rule (not a session or turn-scoped one) lets `source` reach
+/// `recipient` for this reader. One-time defaults use this to decide whether
+/// their rule still has to be stored.
+pub fn is_durably_allowed_for_reader(source: &Source, recipient: &Recipient, reader: &ContextId) -> Result<bool, String> {
+    with_registry(|registry| {
+        registry.check_healthy()?;
+        recipient.validate()?;
+        validate_source(source)?;
+        Ok(registry.is_source_allowed_durably(source, recipient, Some(reader)))
+    })
+}
+
 /// The sources a still-live agent context carries into a new turn without a
 /// provider rule; see [`Registry::carried_over_sources`].
 pub fn carried_over_sources(context: &ContextId, provider: &Recipient) -> Result<Label, String> {
@@ -1486,12 +1495,55 @@ mod tests {
         // persists), but the provider rule is gone, so the first model call is
         // refused until the user re-allows the carried source.
         assert!(registry.labels(&context).unwrap().contains(&room_b));
-        assert_eq!(registry.carried_over_sources(&context, &provider).unwrap(), [room_b].into_iter().collect());
+        assert_eq!(registry.carried_over_sources(&context, &provider).unwrap(), [room_b.clone()].into_iter().collect());
         assert!(registry.ensure_allowed(&context, &provider).is_err(),
             "the carried-over room is refused until the user re-allows it");
-        // The own room and the directory are the baseline, never carried over.
-        registry.add_sources(&context, [Source::RoomDirectory { account: "alice".into() }]).unwrap();
-        assert_eq!(registry.carried_over_sources(&context, &provider).unwrap().len(), 1);
+        // The own room's default rule covers it. A directory without its rule is
+        // carried too, so a revoked or reset default asks instead of failing.
+        let directory = Source::RoomDirectory { account: "alice".into() };
+        registry.add_sources(&context, [directory.clone()]).unwrap();
+        assert_eq!(registry.carried_over_sources(&context, &provider).unwrap(), [room_b.clone(), directory.clone()].into_iter().collect());
+        registry.grant_sharing(directory, provider.clone(), ReaderScope::Context(context.clone()), SharingDuration::Permanent).unwrap();
+        assert_eq!(registry.carried_over_sources(&context, &provider).unwrap(), [room_b].into_iter().collect());
+    }
+
+    #[test]
+    fn a_missing_baseline_rule_is_carried_over_for_every_recipient() {
+        let root = TestRoot::new();
+        let mut registry = root.registry();
+        let context = agent("alice", "!ai:example.org");
+        let provider = Recipient::ModelProvider("provider".into());
+        let own_room = room_recipient("alice", "!ai:example.org");
+        registry.register_context(&context).unwrap();
+        registry.begin_agent_session(&context).unwrap();
+        let own = room_source("alice", "!ai:example.org");
+        let directory = Source::RoomDirectory { account: "alice".into() };
+        registry.add_sources(&context, [directory.clone()]).unwrap();
+        // After a reset nothing is shared: both baseline sources ask before the
+        // model call, and only the directory before the room's own reply.
+        assert_eq!(registry.carried_over_sources(&context, &provider).unwrap(), [own.clone(), directory.clone()].into_iter().collect());
+        assert_eq!(registry.carried_over_sources(&context, &own_room).unwrap(), [directory.clone()].into_iter().collect());
+        registry.grant_sharing(directory, own_room.clone(), ReaderScope::Context(context.clone()), SharingDuration::Permanent).unwrap();
+        assert!(registry.carried_over_sources(&context, &own_room).unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_saved_rules_count_as_durable() {
+        let root = TestRoot::new();
+        let mut registry = root.registry();
+        let context = agent("alice", "!ai:example.org");
+        let provider = Recipient::ModelProvider("provider".into());
+        let directory = Source::RoomDirectory { account: "alice".into() };
+        registry.register_context(&context).unwrap();
+        registry.grant_sharing(directory.clone(), provider.clone(), ReaderScope::Context(context.clone()),
+            SharingDuration::RoomSession { account: "alice".into(), room: "!ai:example.org".into() }).unwrap();
+        assert!(registry.source_allowed(&directory, &provider, Some(&context)));
+        assert!(!registry.is_source_allowed_durably(&directory, &provider, Some(&context)),
+            "a turn-scoped rule must not satisfy a one-time default");
+        registry.grant_sharing(directory.clone(), provider.clone(), ReaderScope::Context(context.clone()), SharingDuration::Permanent).unwrap();
+        assert!(registry.is_source_allowed_durably(&directory, &provider, Some(&context)));
+        assert!(registry.is_source_allowed_durably(&room_source("alice", "!ai:example.org"), &room_recipient("alice", "!ai:example.org"), Some(&context)),
+            "the room's own data may always be written back to it");
     }
 
     #[test]

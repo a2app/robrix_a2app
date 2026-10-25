@@ -56,6 +56,18 @@ impl Registry {
             &grant.source == source && &grant.recipient == recipient && grant.reader.matches(context))
     }
 
+    /// Like [`Self::source_allowed`], but only saved rules count: a session or
+    /// turn-scoped rule that happens to cover the pair now will not last.
+    pub(super) fn is_source_allowed_durably(&self, source: &Source, recipient: &Recipient, context: Option<&ContextId>) -> bool {
+        if *source == Source::UnknownPrivate { return false; }
+        if matches!((source, recipient),
+            (Source::Room { account, room }, Recipient::MatrixRoom { account: target_account, room: target_room })
+            if account == target_account && room == target_room)
+        { return true; }
+        self.metadata.grants.iter().any(|grant|
+            &grant.source == source && &grant.recipient == recipient && grant.reader.matches(context))
+    }
+
     pub fn decision(&self, context: &ContextId, recipient: &Recipient) -> Result<FlowDecision, String> {
         let sources = self.labels(context)?;
         recipient.validate()?;

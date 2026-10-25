@@ -358,34 +358,38 @@ pub(super) fn cancel_subject(cx: &mut Cx, ui: &WidgetRef, subject: &str) {
     if closed { ui.modal(cx, ids!(a2app_permission_modal)).close(cx); }
 }
 
-/// Retire only the initiating room, including its queued setup and effect reviews.
+/// Takes every shown or queued prompt `matches` selects, and whether one was shown.
 /// A changed grouped display receives fresh IDs so a late answer cannot target survivors.
-pub(super) fn cancel_room(cx: &mut Cx, ui: &WidgetRef, account: &str, room: &str) {
-    let (prompts, closed) = with_a2app(|state| {
-        let matches = |prompt: &PermissionPrompt| room_session::prompt_originates_in(prompt, account, room);
-        let closed = state.active_prompt.iter().chain(state.active_prompt_batch.iter()).any(&matches);
-        let mut mine = Vec::new();
-        if closed {
-            let mut displayed = state.active_prompt.take().into_iter().collect::<Vec<_>>();
-            displayed.append(&mut state.active_prompt_batch);
-            for mut prompt in displayed {
-                if matches(&prompt) { mine.push(prompt); }
-                else {
-                    let old_id = prompt.id;
-                    prompt.id = next_permission_prompt_id();
-                    // Setup completion keys also capture the displayed member ID.
-                    if let Some(key) = prompt.setup
-                        && let Some(setup) = state.permission_setups.get_mut(&key)
-                        && let Some(permission) = setup.pending.remove(&old_id)
-                    { setup.pending.insert(prompt.id, permission); }
-                    state.prompts.push_front(prompt);
-                }
+pub(super) fn take_matching(state: &mut A2AppState, matches: impl Fn(&PermissionPrompt) -> bool) -> (Vec<PermissionPrompt>, bool) {
+    let closed = state.active_prompt.iter().chain(state.active_prompt_batch.iter()).any(&matches);
+    let mut mine = Vec::new();
+    if closed {
+        let mut displayed = state.active_prompt.take().into_iter().collect::<Vec<_>>();
+        displayed.append(&mut state.active_prompt_batch);
+        for mut prompt in displayed {
+            if matches(&prompt) { mine.push(prompt); }
+            else {
+                let old_id = prompt.id;
+                prompt.id = next_permission_prompt_id();
+                // Setup completion keys also capture the displayed member ID.
+                if let Some(key) = prompt.setup
+                    && let Some(setup) = state.permission_setups.get_mut(&key)
+                    && let Some(permission) = setup.pending.remove(&old_id)
+                { setup.pending.insert(prompt.id, permission); }
+                state.prompts.push_front(prompt);
             }
         }
-        let (queued, rest): (Vec<_>, Vec<_>) = state.prompts.drain(..).partition(matches);
-        mine.extend(queued);
-        state.prompts = rest.into();
-        (mine, closed)
+    }
+    let (queued, rest): (Vec<_>, Vec<_>) = state.prompts.drain(..).partition(&matches);
+    mine.extend(queued);
+    state.prompts = rest.into();
+    (mine, closed)
+}
+
+/// Retire only the initiating room, including its queued setup and effect reviews.
+pub(super) fn cancel_room(cx: &mut Cx, ui: &WidgetRef, account: &str, room: &str) {
+    let (prompts, closed) = with_a2app(|state| {
+        take_matching(state, |prompt| room_session::prompt_originates_in(prompt, account, room))
     }).unwrap_or_default();
     for prompt in prompts { refuse_prompt(cx, prompt, "The initiating room closed before this request was approved."); }
     if closed { ui.modal(cx, ids!(a2app_permission_modal)).close(cx); }
