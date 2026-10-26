@@ -13,25 +13,25 @@ let PrimaryButton = Button{
     padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
     draw_bg +: {
         border_size: 0.0 border_radius: 4.0
-        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color: theme.palette.accent color_hover: theme.palette.accent_hover color_down: theme.palette.accent_down color_focus: theme.palette.accent
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+    draw_text +: { color: theme.palette.on_accent color_hover: theme.palette.on_accent color_down: theme.palette.on_accent color_focus: theme.palette.on_accent text_style: theme.font_regular{font_size: 10} }
 }
 let NeutralButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
-        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.neutral_border border_color_hover: theme.palette.neutral_border border_color_down: theme.palette.neutral_border border_color_focus: theme.palette.neutral_border
+        color: theme.palette.neutral color_hover: theme.palette.neutral_hover color_down: theme.palette.neutral_down color_focus: theme.palette.neutral }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title }
 }
 let Field = TextInput{
     width: Fill height: Fit padding: 10
     draw_bg +: {
         border_radius: 4.0 border_size: 1.0
-        color: #xFFFFFF color_hover: #xFFFFFF color_focus: #xFFFFFF color_down: #xFFFFFF color_empty: #xFFFFFF
-        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_focus: #x106fcc border_color_down: #x106fcc border_color_empty: #xC8C8C8
+        color: theme.palette.surface color_hover: theme.palette.surface color_focus: theme.palette.surface color_down: theme.palette.surface color_empty: theme.palette.surface
+        border_color: theme.palette.border border_color_hover: theme.palette.accent border_color_focus: theme.palette.focus border_color_down: theme.palette.focus border_color_empty: theme.palette.border
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #x333333 color_hover: #x333333 color_focus: #x333333 color_down: #x333333 color_empty: #xBBBBBB color_empty_hover: #x999999 color_empty_focus: #x999999 text_style: theme.font_regular{font_size: 11} }
+    draw_text +: { color: theme.palette.body color_hover: theme.palette.body color_focus: theme.palette.body color_down: theme.palette.body color_empty: theme.palette.placeholder color_empty_hover: theme.palette.placeholder_hover color_empty_focus: theme.palette.placeholder_hover text_style: theme.font_regular{font_size: 11} }
 }
 
 let profile_loading = false
@@ -43,21 +43,18 @@ let account_loaded = false
 let ignored_loading = false
 let ignored_loaded = false
 
-let ignored = []
-let ignored_rows = []
-let device_rows = [{k: "Name" v: "Loading…" c: #x66708F}]
-let manage_url = nil
-let dm_room = nil
 let lookup_request = 0
 let setup_pending = false
-// Each account-read item is "loading", "ok", "denied" or "error".
-let device_state = "loading"
-let server_state = "loading"
-let ignored_state = "loading"
-let is_narrow = false
 let has_me = false
 // Set when the current lookup found no such user, so its DM line stays hidden.
 let lookup_missing = false
+// What the pane shows, which survives the re-run a theme switch does. Each account-read item
+// is "loading", "ok", "denied" or "error"; a device row names its value's palette color.
+mod.state = {
+    ignored: [] ignored_rows: [] device_rows: [{k: "Name" v: "Loading…" tone: "muted"}]
+    manage_url: nil dm_room: nil is_narrow: false is_looking_up: false
+    device_state: "loading" server_state: "loading" ignored_state: "loading"
+}
 
 let upper_map = {a: "A" b: "B" c: "C" d: "D" e: "E" f: "F" g: "G" h: "H" i: "I" j: "J" k: "K" l: "L" m: "M"
     n: "N" o: "O" p: "P" q: "Q" r: "R" s: "S" t: "T" u: "U" v: "V" w: "W" x: "X" y: "Y" z: "Z"}
@@ -97,6 +94,9 @@ fn initial(name){
 }
 
 fn show_account(){
+    let device_state = mod.state.device_state
+    let server_state = mod.state.server_state
+    let ignored_state = mod.state.ignored_state
     let is_all_denied = device_state == "denied" && server_state == "denied" && ignored_state == "denied"
     // One spinner until the first account read answers, instead of a "Loading…" per card.
     let is_booting = device_state == "loading" && server_state == "loading" && ignored_state == "loading"
@@ -104,15 +104,15 @@ fn show_account(){
     ui.acct_denied_wrap.set_visible(is_all_denied)
     ui.details_wrap.set_visible(!is_all_denied && !is_booting)
     ui.ignored_section.set_visible(!is_all_denied && !is_booting)
-    ui.manage_wrap.set_visible(server_state == "ok" && manage_url != nil)
-    let has_rows = ignored_state == "ok" && ignored.len() > 0
+    ui.manage_wrap.set_visible(server_state == "ok" && mod.state.manage_url != nil)
+    let has_rows = ignored_state == "ok" && mod.state.ignored.len() > 0
     ui.ignored_list_wrap.set_visible(has_rows)
     if has_rows { show_ignored_note("", "") }
-    ui.ignored_head.set_text(if ignored_state == "ok" && ignored.len() > 0 {"IGNORED USERS · " + ignored.len()} else {"IGNORED USERS"})
+    ui.ignored_head.set_text(if has_rows {"IGNORED USERS · " + mod.state.ignored.len()} else {"IGNORED USERS"})
 }
 
 fn show_device(rows){
-    device_rows = rows
+    mod.state.device_rows = rows
     ui.device_kv.render()
 }
 
@@ -122,7 +122,7 @@ fn show_me(name, id, note){
     ui.me_note.set_text(note)
     ui.me_id_wrap.set_visible(id != "")
     ui.me_note_wrap.set_visible(note != "")
-    ui.me_avatar_wrap.set_visible(has_me && !is_narrow)
+    ui.me_avatar_wrap.set_visible(has_me && !mod.state.is_narrow)
 }
 
 // The homeserver card shows the address, a gray note, or a red error.
@@ -168,16 +168,16 @@ fn load_device(){
         device_loading = false
         device_loaded = r.is_ok
         if !r.is_ok {
-            device_state = if host.has("matrix.account.device.read") {"error"} else {"denied"}
-            show_device([{k: "Device" v: sentence(r.error) c: #xDC0005}])
+            mod.state.device_state = if host.has("matrix.account.device.read") {"error"} else {"denied"}
+            show_device([{k: "Device" v: sentence(r.error) tone: "danger"}])
             show_account()
             return nil
         }
-        device_state = "ok"
-        let status = {k: "Status" v: "Not verified" c: #xDC0005}
-        if r.data.verified { status = {k: "Status" v: "Verified" c: #x138808} }
-        show_device([{k: "Name" v: or_blank(r.data["name"], "Unnamed device") c: #x333333},
-            {k: "Device ID" v: r.data.device_id c: #x333333}, status])
+        mod.state.device_state = "ok"
+        let status = {k: "Status" v: "Not verified" tone: "danger"}
+        if r.data.verified { status = {k: "Status" v: "Verified" tone: "success"} }
+        show_device([{k: "Name" v: or_blank(r.data["name"], "Unnamed device") tone: "body"},
+            {k: "Device ID" v: r.data.device_id tone: "body"}, status])
         show_account()
         return nil
     })
@@ -190,24 +190,24 @@ fn load_account(){
         account_loading = false
         account_loaded = r.is_ok
         if !r.is_ok {
-            server_state = if host.has("matrix.account.info.read") {"error"} else {"denied"}
-            show_server(if server_state == "error" {"err"} else {"note"}, sentence(r.error))
-            manage_url = nil
+            mod.state.server_state = if host.has("matrix.account.info.read") {"error"} else {"denied"}
+            show_server(if mod.state.server_state == "error" {"err"} else {"note"}, sentence(r.error))
+            mod.state.manage_url = nil
             show_account()
             return nil
         }
-        server_state = "ok"
+        mod.state.server_state = "ok"
         show_server("ok", r.data.homeserver)
-        manage_url = r.data.account_management_url
+        mod.state.manage_url = r.data.account_management_url
         show_account()
         return nil
     })
 }
 
 fn build_ignored_rows(){
-    ignored_rows = []
-    for id in ignored {
-        ignored_rows.push({id: id initial: initial(id)})
+    mod.state.ignored_rows = []
+    for id in mod.state.ignored {
+        mod.state.ignored_rows.push({id: id initial: initial(id)})
     }
 }
 
@@ -218,13 +218,13 @@ fn load_ignored(){
         ignored_loading = false
         ignored_loaded = r.is_ok
         if r.is_ok {
-            ignored = r.data.users
-            ignored_state = "ok"
+            mod.state.ignored = r.data.users
+            mod.state.ignored_state = "ok"
             show_ignored_note("note", "You haven't ignored anyone.")
         } else {
-            ignored = []
-            ignored_state = if host.has("matrix.account.ignored.read") {"error"} else {"denied"}
-            show_ignored_note(if ignored_state == "error" {"err"} else {"note"}, sentence(r.error))
+            mod.state.ignored = []
+            mod.state.ignored_state = if host.has("matrix.account.ignored.read") {"error"} else {"denied"}
+            show_ignored_note(if mod.state.ignored_state == "error" {"err"} else {"note"}, sentence(r.error))
         }
         build_ignored_rows()
         ui.ignored_list.render()
@@ -241,9 +241,9 @@ fn load(){
 }
 
 fn open_manage(){
-    if manage_url == nil { return nil }
+    if mod.state.manage_url == nil { return nil }
     ui.manage_note_wrap.set_visible(false)
-    host.request("url.open", {url: manage_url}, fn(r){
+    host.request("url.open", {url: mod.state.manage_url}, fn(r){
         if !r.is_ok {
             ui.manage_note.set_text("Couldn't open the page: " + sentence(r.error))
             ui.manage_note_wrap.set_visible(true)
@@ -274,16 +274,18 @@ fn lookup(t){
         return nil
     }
     lookup_say("wait", "Looking up " + id + "…")
+    mod.state.is_looking_up = true
     ui.result_wrap.set_visible(false)
     ui.profile_wrap.set_visible(false)
     ui.dm_row.set_visible(false)
     ui.dm_wrap.set_visible(false)
-    dm_room = nil
+    mod.state.dm_room = nil
     lookup_missing = false
     lookup_request += 1
     let request_id = lookup_request
     host.request("matrix.user_profile", {user_id: id}, fn(r){
         if request_id != lookup_request { return nil }
+        mod.state.is_looking_up = false
         if !r.is_ok {
             lookup_say("err", friendly(r.error))
             // No such user: a "no DM yet" line would only add noise.
@@ -321,16 +323,16 @@ fn lookup(t){
             return nil
         }
         ui.dm_line.set_text("Direct message: " + or_blank(r.data.name, id))
-        dm_room = r.data.room_id
+        mod.state.dm_room = r.data.room_id
         ui.dm_wrap.set_visible(true)
         return nil
     })
 }
 
 fn open_dm(){
-    if dm_room == nil { return nil }
+    if mod.state.dm_room == nil { return nil }
     ui.dm_err_wrap.set_visible(false)
-    host.request("nav.room", {room_id: dm_room}, fn(r){
+    host.request("nav.room", {room_id: mod.state.dm_room}, fn(r){
         if !r.is_ok {
             ui.dm_err.set_text("Couldn't open the DM: " + sentence(r.error))
             ui.dm_err_wrap.set_visible(true)
@@ -341,15 +343,15 @@ fn open_dm(){
 
 // Filling the field from its own on_return fails, so only a tapped row fills it.
 fn lookup_ignored(i){
-    if i >= ignored.len() { return nil }
-    ui.user_input.set_text(ignored[i])
-    lookup(ignored[i])
+    if i >= mod.state.ignored.len() { return nil }
+    ui.user_input.set_text(mod.state.ignored[i])
+    lookup(mod.state.ignored[i])
 }
 
 fn on_app_resize(w, h){
     let narrow = w < 300
-    if narrow == is_narrow { return nil }
-    is_narrow = narrow
+    if narrow == mod.state.is_narrow { return nil }
+    mod.state.is_narrow = narrow
     ui.refresh_btn.set_text(if narrow {"↻"} else {"Refresh"})
     // Narrow panes give the field the whole row and put Look up below it.
     ui.lookup_btn_wrap.set_visible(!narrow)
@@ -388,17 +390,23 @@ fn setup(retry){
         if r.data.permissions["matrix-profile"] == true && host.has("matrix.profile.read") { load_profile() }
         else { has_me = false show_me("Signed in", "", "Your name isn't shared with this app.") }
         if is_account && host.has("matrix.account.device.read") { load_device() }
-        else { device_state = "denied" show_device([{k: "Device" v: "Not shared" c: #x66708F}]) }
+        else { mod.state.device_state = "denied" show_device([{k: "Device" v: "Not shared" tone: "muted"}]) }
         if is_account && host.has("matrix.account.info.read") { load_account() }
-        else { server_state = "denied" manage_url = nil show_server("note", "Not shared") }
+        else { mod.state.server_state = "denied" mod.state.manage_url = nil show_server("note", "Not shared") }
         if is_account && host.has("matrix.account.ignored.read") { load_ignored() }
-        else { ignored_state = "denied" ignored = [] show_ignored_note("note", "Not shared") build_ignored_rows() ui.ignored_list.render() }
+        else { mod.state.ignored_state = "denied" mod.state.ignored = [] show_ignored_note("note", "Not shared") build_ignored_rows() ui.ignored_list.render() }
         show_account()
         return nil
     })
 }
 
 let _boot = start_timeout(0.05, || {
+    // A theme switch drops the reply a lookup was waiting for, so let it be retried.
+    if mod.state.is_looking_up {
+        mod.state.is_looking_up = false
+        lookup_say("", "")
+        ui.lookup_hint_wrap.set_visible(true)
+    }
     ui.device_kv.render()
     setup(false)
 })
@@ -413,42 +421,42 @@ View{
                 width: Fit height: Fit visible: false
                 RoundedView{
                     width: 40 height: 40 align: Align{x: 0.5 y: 0.5}
-                    show_bg: true draw_bg +: { color: #x52b2ac border_radius: 20.0 }
-                    me_initial := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 15} } }
+                    show_bg: true draw_bg +: { color: theme.palette.avatar border_radius: 20.0 }
+                    me_initial := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: theme.palette.on_accent text_style: theme.font_bold{font_size: 15} } }
                 }
             }
             View{
                 width: Fill height: Fit flow: Down spacing: 3
-                me_name := Label{ text: "Your account" width: Fill max_lines: 2 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
+                me_name := Label{ text: "Your account" width: Fill max_lines: 2 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} } }
                 me_id_wrap := View{
                     width: Fill height: Fit visible: false
-                    me_id := Label{ text: "" width: Fill max_lines: 1 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                    me_id := Label{ text: "" width: Fill max_lines: 1 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                 }
                 me_note_wrap := View{
                     width: Fill height: Fit visible: false
-                    me_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                    me_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                 }
             }
             refresh_btn := NeutralButton{ text: "Refresh" on_click: || setup(true) }
         }
         setup_err_wrap := View{
             width: Fill height: Fit visible: false
-            setup_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} } }
+            setup_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.danger text_style: theme.font_regular{font_size: 10} } }
         }
         loading_wrap := View{
             width: Fill height: Fit flow: Right spacing: 10 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24}
-            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
-            Label{ text: "Loading your account…" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: theme.palette.accent_text } }
+            Label{ text: "Loading your account…" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
         }
         acct_denied_wrap := View{
             width: Fill height: Fit visible: false
             RoundedView{
                 width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5}
                 padding: Inset{top: 20 bottom: 20 left: 16 right: 16}
-                show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                show_bg: true draw_bg +: { color: theme.palette.card_subtle border_radius: 8.0 }
                 Label{ text: "🔒" padding: 0 margin: 0 draw_text +: { text_style: theme.font_regular{font_size: 28} } }
-                Label{ text: "Can't see your account" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} } }
-                Label{ text: "Allow Account to see this device, your homeserver and who you ignore." width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                Label{ text: "Can't see your account" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 12.5} } }
+                Label{ text: "Allow Account to see this device, your homeserver and who you ignore." width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
                 View{
                     width: Fit height: Fit margin: Inset{top: 6}
                     PrimaryButton{ text: "Ask again" on_click: || setup(true) }
@@ -459,26 +467,26 @@ View{
             width: Fill height: Fit flow: Down spacing: 12 visible: false
             View{
                 width: Fill height: Fit flow: Down spacing: 8
-                Label{ text: "THIS DEVICE" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+                Label{ text: "THIS DEVICE" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} } }
                 RoundedView{
                     width: Fill height: Fit flow: Down spacing: 8 padding: 12
-                    show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                    show_bg: true draw_bg +: { color: theme.palette.card border_radius: 8.0 }
                     device_kv := View{
                         width: Fill height: Fit flow: Down spacing: 8
                         on_render: || {
-                            for kv in device_rows {
-                                if is_narrow {
+                            for kv in mod.state.device_rows {
+                                if mod.state.is_narrow {
                                     View{
                                         width: Fill height: Fit flow: Down spacing: 2
-                                        Label{ text: kv.k padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
-                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                        Label{ text: kv.k padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
+                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette[kv.tone] text_style: theme.font_regular{font_size: 11} } }
                                     }
                                 }
-                                if !is_narrow {
+                                if !mod.state.is_narrow {
                                     View{
                                         width: Fill height: Fit flow: Right spacing: 8
-                                        Label{ text: kv.k width: 84 padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
-                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                        Label{ text: kv.k width: 84 padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
+                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette[kv.tone] text_style: theme.font_regular{font_size: 11} } }
                                     }
                                 }
                             }
@@ -488,21 +496,21 @@ View{
             }
             View{
                 width: Fill height: Fit flow: Down spacing: 8
-                Label{ text: "HOMESERVER" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+                Label{ text: "HOMESERVER" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} } }
                 RoundedView{
                     width: Fill height: Fit flow: Down spacing: 10 padding: 12
-                    show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                    show_bg: true draw_bg +: { color: theme.palette.card border_radius: 8.0 }
                     server_line_wrap := View{
                         width: Fill height: Fit visible: false
-                        server_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
+                        server_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.body text_style: theme.font_regular{font_size: 11} } }
                     }
                     server_note_wrap := View{
                         width: Fill height: Fit
-                        server_note := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                        server_note := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
                     }
                     server_err_wrap := View{
                         width: Fill height: Fit visible: false
-                        server_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10.5} } }
+                        server_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.danger text_style: theme.font_regular{font_size: 10.5} } }
                     }
                     manage_wrap := View{
                         width: Fit height: Fit visible: false
@@ -510,14 +518,14 @@ View{
                     }
                     manage_note_wrap := View{
                         width: Fill height: Fit visible: false
-                        manage_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} } }
+                        manage_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.danger text_style: theme.font_regular{font_size: 10} } }
                     }
                 }
             }
         }
         View{
             width: Fill height: Fit flow: Down spacing: 8
-            Label{ text: "LOOK UP SOMEONE" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+            Label{ text: "LOOK UP SOMEONE" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} } }
             View{
                 width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
                 user_input := Field{ empty_text: "@user:server" on_return: |t| lookup(t) }
@@ -533,42 +541,42 @@ View{
             }
             lookup_hint_wrap := View{
                 width: Fill height: Fit
-                Label{ text: "See their profile and whether you already have a DM with them." width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                Label{ text: "See their profile and whether you already have a DM with them." width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
             }
             lookup_wait_wrap := View{
                 width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5} visible: false
-                LoadingSpinner{ width: 16 height: 16 draw_bg +: { color: #x0f88fe } }
-                lookup_wait := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                LoadingSpinner{ width: 16 height: 16 draw_bg +: { color: theme.palette.accent_text } }
+                lookup_wait := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
             }
             lookup_err_wrap := View{
                 width: Fill height: Fit visible: false
-                lookup_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} } }
+                lookup_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.danger text_style: theme.font_regular{font_size: 10} } }
             }
             result_wrap := View{
                 width: Fill height: Fit visible: false
                 RoundedView{
                     width: Fill height: Fit flow: Down spacing: 10 padding: 12
-                    show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                    show_bg: true draw_bg +: { color: theme.palette.card border_radius: 8.0 }
                     profile_wrap := View{
                         width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5} visible: false
                         RoundedView{
                             width: 36 height: 36 align: Align{x: 0.5 y: 0.5}
-                            show_bg: true draw_bg +: { color: #x52b2ac border_radius: 18.0 }
-                            result_initial := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 14} } }
+                            show_bg: true draw_bg +: { color: theme.palette.avatar border_radius: 18.0 }
+                            result_initial := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: theme.palette.on_accent text_style: theme.font_bold{font_size: 14} } }
                         }
                         View{
                             width: Fill height: Fit flow: Down spacing: 2
-                            result_name := Label{ text: "" width: Fill max_lines: 1 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
-                            result_id := Label{ text: "" width: Fill max_lines: 1 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                            result_name := Label{ text: "" width: Fill max_lines: 1 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} } }
+                            result_id := Label{ text: "" width: Fill max_lines: 1 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                             View{
                                 width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 6 align: Align{y: 0.5}
-                                result_tags := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                                result_tags := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                                 result_ignored_wrap := View{
                                     width: Fit height: Fit visible: false
                                     RoundedView{
                                         width: Fit height: Fit padding: Inset{top: 2 bottom: 2 left: 7 right: 7}
-                                        show_bg: true draw_bg +: { color: #xFFF0F0 border_size: 1.0 border_color: #xDC0005 border_radius: 9.0 }
-                                        Label{ text: "Ignored by you" padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 9.5} } }
+                                        show_bg: true draw_bg +: { color: theme.palette.danger_bg border_size: 1.0 border_color: theme.palette.danger border_radius: 9.0 }
+                                        Label{ text: "Ignored by you" padding: 0 margin: 0 draw_text +: { color: theme.palette.danger text_style: theme.font_regular{font_size: 9.5} } }
                                     }
                                 }
                             }
@@ -576,7 +584,7 @@ View{
                     }
                     dm_row := View{
                         width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5} visible: false
-                        dm_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
+                        dm_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.body text_style: theme.font_regular{font_size: 11} } }
                         dm_wrap := View{
                             width: Fit height: Fit visible: false
                             NeutralButton{ text: "Open DM" on_click: || open_dm() }
@@ -584,21 +592,21 @@ View{
                     }
                     dm_err_wrap := View{
                         width: Fill height: Fit visible: false
-                        dm_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} } }
+                        dm_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.danger text_style: theme.font_regular{font_size: 10} } }
                     }
                 }
             }
         }
         ignored_section := View{
             width: Fill height: Fill{min: 80} flow: Down spacing: 8 visible: false
-            ignored_head := Label{ text: "IGNORED USERS" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+            ignored_head := Label{ text: "IGNORED USERS" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} } }
             ignored_note_wrap := View{
                 width: Fill height: Fit
-                ignored_note := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                ignored_note := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
             }
             ignored_err_wrap := View{
                 width: Fill height: Fit visible: false
-                ignored_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} } }
+                ignored_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.danger text_style: theme.font_regular{font_size: 10} } }
             }
             ignored_list_wrap := View{
                 width: Fill height: Fill visible: false
@@ -606,21 +614,21 @@ View{
                     width: Fill height: Fill flow: Down spacing: 8
                     on_item_tap: |i| lookup_ignored(i)
                     on_render: || {
-                        if ignored_rows.len() == 0 { ignored_spacer := View{ width: Fill height: 1 } }
-                        for r in ignored_rows {
+                        if mod.state.ignored_rows.len() == 0 { ignored_spacer := View{ width: Fill height: 1 } }
+                        for r in mod.state.ignored_rows {
                             RoundedView{
                                 width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
                                 padding: Inset{top: 8 bottom: 8 left: 10 right: 12}
-                                show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                                show_bg: true draw_bg +: { color: theme.palette.card_subtle border_radius: 8.0 }
                                 // Gray, not teal: these are people you've muted.
-                                if !is_narrow {
+                                if !mod.state.is_narrow {
                                     RoundedView{
                                         width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
-                                        show_bg: true draw_bg +: { color: #xAAAAAA border_radius: 16.0 }
-                                        Label{ text: r.initial padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
+                                        show_bg: true draw_bg +: { color: if theme.palette.is_dark {#x6E6E6E} else {#xAAAAAA} border_radius: 16.0 }
+                                        Label{ text: r.initial padding: 0 margin: 0 draw_text +: { color: theme.palette.on_accent text_style: theme.font_bold{font_size: 12} } }
                                     }
                                 }
-                                Label{ text: r.id width: Fill max_lines: 1 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
+                                Label{ text: r.id width: Fill max_lines: 1 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: theme.palette.body text_style: theme.font_regular{font_size: 11} } }
                             }
                         }
                     }

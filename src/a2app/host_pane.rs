@@ -7,6 +7,7 @@ use makepad_widgets::*;
 use a2app_core::manifest::{MiniAppId, MiniAppManifest};
 use crate::a2app::host_set::{MiniAppHostAreaWidgetExt, Templates};
 use crate::a2app::instances::{self, InstanceKey, Surface};
+use crate::settings::app_preferences::AppearanceGlobal;
 use matrix_sdk::ruma::OwnedRoomId;
 
 script_mod! {
@@ -24,7 +25,7 @@ script_mod! {
 
         show_bg: true
         draw_bg +: {
-            color: (COLOR_PRIMARY)
+            color: (COLOR_BG_FLOATING)
             border_radius: 6.0
             border_size: 0.0
         }
@@ -41,7 +42,7 @@ script_mod! {
                 padding: 0, margin: 0
                 draw_text +: {
                     text_style: TITLE_TEXT {font_size: 18},
-                    color: #000
+                    color: (COLOR_TEXT_TITLE)
                 }
             }
             app_title := Label {
@@ -51,7 +52,7 @@ script_mod! {
                 text_overflow: Ellipsis
                 draw_text +: {
                     text_style: TITLE_TEXT {font_size: 16},
-                    color: #000
+                    color: (COLOR_TEXT_TITLE)
                 }
             }
 
@@ -62,12 +63,12 @@ script_mod! {
                 align: Align{x: 0.5, y: 0.5}
                 icon_walk: Walk{width: 18, height: 18, margin: 0}
                 draw_icon.svg: (ICON_CLOSE)
-                draw_icon.color: #666
+                draw_icon.color: (COLOR_TEXT_MUTED)
                 draw_bg +: {
                     border_size: 0
-                    color: #0000
-                    color_hover: #00000015
-                    color_down: #00000025
+                    color: (COLOR_TRANSPARENT)
+                    color_hover: (COLOR_FLAT_ICON_BUTTON_BG_HOVER)
+                    color_down: (COLOR_FLAT_ICON_BUTTON_BG_DOWN)
                 }
             }
         }
@@ -98,7 +99,7 @@ script_mod! {
                 text: "Drag corner to resize"
                 draw_text +: {
                     text_style: REGULAR_TEXT {font_size: 10}
-                    color: #666
+                    color: (COLOR_TEXT_MUTED)
                 }
             }
 
@@ -113,6 +114,7 @@ script_mod! {
                 cursor: MouseCursor.NwseResize
                 show_bg: true
                 draw_bg +: {
+                    color: instance((COLOR_TEXT_FAINT))
                     pixel: fn() {
                         let sdf = Sdf2d.viewport(self.pos * self.rect_size)
                         sdf.move_to(8.0, 22.0)
@@ -121,7 +123,7 @@ script_mod! {
                         sdf.line_to(22.0, 14.0)
                         sdf.move_to(20.0, 22.0)
                         sdf.line_to(22.0, 20.0)
-                        return sdf.stroke(#888, 1.0)
+                        return sdf.stroke(self.color, 1.0)
                     }
                 }
             }
@@ -183,6 +185,14 @@ impl ScriptHook for MiniAppHostPane {
         self.templates.capture(vm, apply, value);
         if let Some(template) = self.templates.get(live_id!(AppHost)) {
             instances::set_host_template(template);
+            if apply.is_new() || apply.is_reload() {
+                let appearance = vm.cx_mut().global::<AppearanceGlobal>().0;
+                instances::restyle_hosts(vm, appearance, apply.is_live_edit_reload());
+            }
+        }
+        // A reload resets the margin that fits the card to the window.
+        if apply.is_reload() {
+            vm.with_cx_mut(|cx| self.fit_window(cx));
         }
         vm.cx_mut().widget_tree_mark_dirty(self.widget_uid());
     }

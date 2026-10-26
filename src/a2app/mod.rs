@@ -58,6 +58,8 @@ pub mod room_watch;
 pub mod account_watch;
 /// The timeline card for `rs.robius.a2app` events (apps shared into rooms).
 pub mod timeline_card;
+/// Robrix's theme for mini-app isolates.
+pub mod splash_theme;
 
 pub fn script_mod(vm: &mut ScriptVm) {
     host_set::script_mod(vm);

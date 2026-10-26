@@ -46,6 +46,11 @@ pub fn script_mod(vm: &mut ScriptVm, appearance: Appearance) {
         styles_dark::script_mod(vm);
     }
     helpers::script_mod(vm);
+    // Mini-app isolates take Robrix's theme too, helpers' widget colors included.
+    #[cfg(feature = "a2app")]
+    crate::a2app::splash_theme::set(vm, appearance);
+    #[cfg(not(feature = "a2app"))]
+    crate::a2app_dummy::splash_theme::set(vm, appearance);
     settings_controls::script_mod(vm);
     icon_button::script_mod(vm);
     password_input::script_mod(vm);

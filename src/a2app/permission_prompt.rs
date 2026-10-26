@@ -500,7 +500,7 @@ fn shared_origin_room(requests: &[&PermissionPromptInfo]) -> Option<String> {
         .then(|| origin.to_owned())
 }
 
-#[derive(Script, ScriptHook, Widget)]
+#[derive(Script, Widget)]
 pub struct MiniAppPermissionPrompt {
     #[deref] view: View,
     #[rust] prompt_id: u64,
@@ -525,6 +525,13 @@ pub struct MiniAppPermissionPrompt {
     #[rust] space_membership_ready: bool,
     #[rust] network: Option<NetworkScope>,
     #[rust] request_valid: bool,
+}
+
+impl ScriptHook for MiniAppPermissionPrompt {
+    /// A theme switch resets the dropdowns to their DSL labels and first item.
+    fn on_after_reload(&mut self, vm: &mut ScriptVm) {
+        vm.with_cx_mut(|cx| self.show_dropdown_choices(cx));
+    }
 }
 
 impl Widget for MiniAppPermissionPrompt {
@@ -785,17 +792,9 @@ impl MiniAppPermissionPrompt {
         self.spatial_available = self.captured_scope.is_some();
         self.spatial_mode = usize::from(matches!(self.captured_scope, Some(RoomScope::AllRooms)));
         self.spatial_modes = if self.current_scope.is_some() { vec![0, 1, 2, 3] } else { vec![1, 2, 3] };
-        let labels = self.spatial_modes.iter().map(|mode| match mode {
-            0 => match self.current_scope.as_ref() {
-                Some(RoomScope::Selection { rooms, spaces }) if rooms.len() == 1 && spaces.is_empty() => "Current room",
-                Some(RoomScope::Selection { spaces, .. }) if !spaces.is_empty() => "Current rooms and spaces",
-                _ => "Current rooms",
-            },
-            1 => "All rooms", 2 => "Rooms in a space", _ => "Selected rooms and spaces",
-        }.to_string()).collect();
         let dropdown = self.view.drop_down2(cx, ids!(spatial_scope));
-        dropdown.set_labels(cx, labels);
-        dropdown.set_selected_item(cx, self.spatial_modes.iter().position(|mode| *mode == self.spatial_mode).unwrap_or(0));
+        dropdown.set_labels(cx, self.spatial_labels());
+        dropdown.set_selected_item(cx, self.spatial_index());
         self.view.widget(cx, ids!(spatial_section)).set_visible(cx, self.spatial_available);
         self.view.widget(cx, ids!(spatial_picker)).set_visible(cx, false);
     }
@@ -820,10 +819,7 @@ impl MiniAppPermissionPrompt {
 
     fn refresh_duration(&mut self, cx: &mut Cx) {
         let once = matches!(self.durations.get(self.duration), Some(ApprovalDuration::Once));
-        self.view.drop_down2(cx, ids!(approval_duration)).set_labels(cx, self.duration_labels());
-        self.view.drop_down2(cx, ids!(approval_duration)).set_selected_item(cx, self.duration);
-        self.view.drop_down2(cx, ids!(spatial_scope)).set_selected_item(cx,
-            self.spatial_modes.iter().position(|mode| *mode == self.spatial_mode).unwrap_or(0));
+        self.show_dropdown_choices(cx);
         let selected_scope = if once { self.captured_scope.as_ref() } else { self.scope.as_ref() };
         let waiting_for_space = self.spatial_available && !self.space_membership_ready
             && matches!(selected_scope, Some(RoomScope::Selection { spaces, .. }) if !spaces.is_empty());
@@ -883,6 +879,31 @@ impl MiniAppPermissionPrompt {
             ApprovalDuration::Once => "One time", ApprovalDuration::RoomSession => "Until this room closes",
             ApprovalDuration::Session => "Until you quit Robrix", ApprovalDuration::Forever => "Forever",
         }.into()).collect()
+    }
+
+    fn spatial_labels(&self) -> Vec<String> {
+        self.spatial_modes.iter().map(|mode| match mode {
+            0 => match self.current_scope.as_ref() {
+                Some(RoomScope::Selection { rooms, spaces }) if rooms.len() == 1 && spaces.is_empty() => "Current room",
+                Some(RoomScope::Selection { spaces, .. }) if !spaces.is_empty() => "Current rooms and spaces",
+                _ => "Current rooms",
+            },
+            1 => "All rooms", 2 => "Rooms in a space", _ => "Selected rooms and spaces",
+        }.to_string()).collect()
+    }
+
+    fn spatial_index(&self) -> usize {
+        self.spatial_modes.iter().position(|mode| *mode == self.spatial_mode).unwrap_or(0)
+    }
+
+    /// Shows the pending duration and room scope in their dropdowns.
+    fn show_dropdown_choices(&self, cx: &mut Cx) {
+        let duration = self.view.drop_down2(cx, ids!(approval_duration));
+        duration.set_labels(cx, self.duration_labels());
+        duration.set_selected_item(cx, self.duration);
+        let spatial = self.view.drop_down2(cx, ids!(spatial_scope));
+        spatial.set_labels(cx, self.spatial_labels());
+        spatial.set_selected_item(cx, self.spatial_index());
     }
 }
 
@@ -2324,6 +2345,28 @@ mod tests {
         assert_eq!(prompt.borrow().unwrap().spatial_modes, [1, 2, 3]);
         assert!(matches!(answer_for_duration(&prompt, &mut cx, ApprovalDuration::Session).answer,
             PermissionPromptAction::AllowScoped { scope: RoomScope::AllRooms, .. }));
+    }
+
+    #[test]
+    fn theme_switch_keeps_the_approval_the_dropdowns_show() {
+        let (mut cx, prompt) = prompt();
+        let mut info = ordinary_info();
+        info.collection = true;
+        info.scope = Some(RoomScope::AllRooms);
+        info.room_id = None;
+        prompt.show(&mut cx, &info);
+        prompt.borrow_mut().unwrap().select_spatial_scope(&mut cx, 3);
+        let shown = |cx: &Cx| [ids!(approval_duration), ids!(spatial_scope)].map(|id| {
+            let dropdown = prompt.borrow().unwrap().view.drop_down2(cx, id);
+            (dropdown.selected_item(), dropdown.selected_label())
+        });
+        let before = shown(&cx);
+        assert_eq!(before, [(2, "Until you quit Robrix".into()), (2, "Selected rooms and spaces".into())]);
+        cx.with_vm(|vm| {
+            let value = script_eval!(vm, { mod.widgets.MiniAppPermissionPrompt {} });
+            (*prompt).clone().script_apply(vm, &Apply::ScriptReapply, &mut Scope::empty(), value);
+        });
+        assert_eq!(shown(&cx), before, "Approve must grant what the dropdowns show after a theme switch");
     }
 
     #[test]

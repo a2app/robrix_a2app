@@ -19,6 +19,7 @@ use a2app_core::layout::PaneSide;
 use a2app_core::manifest::{instance_tag, MiniAppId, MiniAppManifest};
 use a2app_core::services::PaneState;
 use crate::room::room_pane::{self, RoomPaneKind, RoomPaneOp};
+use crate::settings::app_preferences::Appearance;
 
 /// `(app, room)`; `None` is a room-less app in the host modal.
 pub type InstanceKey = (MiniAppId, Option<OwnedRoomId>);
@@ -64,6 +65,8 @@ struct MiniAppInstance {
     was_closed_by_user: bool,
     /// What the app last asked for its pane while nothing showed it.
     pane_request: Option<PaneRequest>,
+    /// Whether its script colors itself for Robrix's light theme only, which it then keeps.
+    is_light_only: bool,
 }
 
 /// A request from a hidden app about its pane; the latest one wins.
@@ -108,6 +111,8 @@ impl Drop for InlineSurface {
 #[derive(Default)]
 struct Registry {
     host_template: Option<ScriptObjectRef>,
+    /// The appearance live hosts were last styled for, once a host surface said.
+    host_appearance: Option<Appearance>,
     instances: HashMap<InstanceKey, MiniAppInstance>,
     /// Inline A2UI surfaces by isolate heap key.
     inline: HashMap<usize, InlineSurface>,
@@ -164,10 +169,61 @@ pub fn set_host_template(obj: ScriptObjectRef) {
     super::background::changed();
 }
 
+/// Re-applies the current template to live hosts, which a reload's walk doesn't reach, but only for a new
+/// `appearance` or DSL: it re-binds an app's root View to Robrix's template until the app restyles.
+pub fn restyle_hosts(vm: &mut ScriptVm, appearance: Appearance, is_template_changed: bool) {
+    let Some((template, styled_for)) = with_registry(|r| {
+        Some((r.host_template.clone()?, r.host_appearance.replace(appearance)))
+    }) else { return };
+    if styled_for == Some(appearance) && !is_template_changed { return; }
+    // A light-only host looks the same in either appearance, and its pinned app never restyles.
+    let hosts: Vec<(WidgetRef, bool)> = with_registry(|r| r.instances.values()
+        .filter(|instance| is_template_changed || !instance.is_light_only)
+        .map(|instance| (instance.host.clone(), instance.is_light_only))
+        .collect());
+    for (mut host, is_light_only) in hosts {
+        let value = host_template(vm, &template, is_light_only);
+        host.script_apply(vm, &Apply::ScriptReapply, &mut Scope::empty(), value);
+    }
+}
+
+/// The template for an app's host. A light-only app's host keeps the light
+/// surface, border and scroll bar its colors were made for.
+fn host_template(vm: &mut ScriptVm, template: &ScriptObjectRef, is_light_only: bool) -> ScriptValue {
+    let template: ScriptValue = template.as_object().into();
+    if !is_light_only {
+        return template;
+    }
+    script_eval!(vm, {
+        #(template) {
+            content_bg +: {
+                draw_bg +: {
+                    color: mod.widgets.COLOR_MINI_APP_LIGHT_ONLY_BG
+                    border_color: mod.widgets.COLOR_MINI_APP_LIGHT_ONLY_BORDER
+                }
+                content +: {
+                    scroll_bars +: {
+                        scroll_bar_y +: {
+                            draw_bg +: {
+                                color: mod.widgets.COLOR_MINI_APP_LIGHT_ONLY_SCROLL_BAR_HANDLE
+                                color_hover: mod.widgets.COLOR_MINI_APP_LIGHT_ONLY_SCROLL_BAR_HANDLE_HOVER
+                                color_drag: mod.widgets.COLOR_MINI_APP_LIGHT_ONLY_SCROLL_BAR_HANDLE_DRAG
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
 pub fn host_template_ready() -> bool { with_registry(|r| r.host_template.is_some()) }
 
 pub fn clear_host_template() {
-    with_registry(|r| r.host_template = None);
+    with_registry(|r| {
+        r.host_template = None;
+        r.host_appearance = None;
+    });
 }
 
 fn splash_of(cx: &mut Cx, host: &WidgetRef) -> WidgetRef {
@@ -176,7 +232,7 @@ fn splash_of(cx: &mut Cx, host: &WidgetRef) -> WidgetRef {
 
 /// Instantiates a host and evals the app into a fresh isolate, parked
 /// under the tree root. All isolate config lands BEFORE the source evals.
-fn spawn(cx: &mut Cx, manifest: &MiniAppManifest, _grants: &[String], key: &InstanceKey, public: bool, background: bool) -> Option<(WidgetRef, Option<usize>, a2app_core::information_flow::ContextId)> {
+fn spawn(cx: &mut Cx, manifest: &MiniAppManifest, _grants: &[String], key: &InstanceKey, public: bool, background: bool, is_light_only: bool) -> Option<(WidgetRef, Option<usize>, a2app_core::information_flow::ContextId)> {
     // Inline surfaces share this app's flow context, which an instance's teardown would remove.
     if manifest.id == a2app_core::a2ui::APP_ID {
         crate::shared::popup_list::enqueue_popup_notification(
@@ -221,8 +277,10 @@ fn spawn(cx: &mut Cx, manifest: &MiniAppManifest, _grants: &[String], key: &Inst
         error!("BUG: no mini-app host template registered");
         return None;
     };
-    let template_value: ScriptValue = template.as_object().into();
-    let host = cx.with_vm(|vm| WidgetRef::script_from_value(vm, template_value));
+    let host = cx.with_vm(|vm| {
+        let value = host_template(vm, &template, is_light_only);
+        WidgetRef::script_from_value(vm, value)
+    });
     host.set_visible(cx, true);
     let root = cx.widget_tree().root_uid();
     cx.widget_tree_insert_child_deep(root, tree_name(key), host.clone());
@@ -236,6 +294,9 @@ fn spawn(cx: &mut Cx, manifest: &MiniAppManifest, _grants: &[String], key: &Inst
         splash.set_host_caps(cx, grants.to_vec());
         splash.set_host_prompts(cx, !background);
         splash.set_debug_name(&manifest.id);
+        if is_light_only {
+            splash.set_theme(cx, Some(SplashTheme::Light));
+        }
     }
     splash_of(cx, &host).set_text(cx, &manifest.source);
     let heap_key = splash_of(cx, &host).borrow_mut::<Splash>()
@@ -301,7 +362,8 @@ fn ensure_mode(cx: &mut Cx, key: &InstanceKey, manifest: &MiniAppManifest, grant
     if let Some(host) = host_of(key) {
         return Some(host);
     }
-    let (host, heap_key, flow_context) = spawn(cx, manifest, grants, key, public, background)?;
+    let is_light_only = !a2app_core::palette::is_theme_aware(&manifest.source);
+    let (host, heap_key, flow_context) = spawn(cx, manifest, grants, key, public, background, is_light_only)?;
     let flow_epoch = a2app_core::information_flow::context_epoch(&flow_context).ok()?;
     with_registry(|r| {
         r.instances.insert(key.clone(), MiniAppInstance {
@@ -320,6 +382,7 @@ fn ensure_mode(cx: &mut Cx, key: &InstanceKey, manifest: &MiniAppManifest, grant
             is_run_only: background,
             was_closed_by_user: false,
             pane_request: None,
+            is_light_only,
         });
         r.note_changed();
     });
@@ -854,4 +917,114 @@ pub fn call_hook(cx: &mut Cx, key: &InstanceKey, hook: LiveId, args: &[&str]) ->
 pub fn call_hook_by_heap(cx: &mut Cx, heap_key: usize, hook: LiveId, args: &[&str]) -> bool {
     let Some(key) = key_of_heap(heap_key) else { return false };
     call_hook(cx, &key, hook, args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs Robrix's styles for `appearance`, as a style reload does, and returns their host template.
+    fn styled_host_template(vm: &mut ScriptVm, appearance: Appearance) -> ScriptObjectRef {
+        crate::shared::script_mod(vm, appearance);
+        super::super::host_set::script_mod(vm);
+        let value = script_eval!(vm, { mod.widgets.MiniAppHost {} });
+        vm.bx.heap.new_object_ref(value.as_object().unwrap())
+    }
+
+    fn token(cx: &mut Cx, name: &str) -> Vec4f {
+        cx.with_vm(|vm| {
+            let widgets = vm.module(id!(widgets));
+            Vec4f::from_u32(vm.bx.heap.value(widgets, LiveId::from_str(name).into(), NoTrap).as_color().unwrap())
+        })
+    }
+
+    /// The host's surface color (`id!(color)`) or border color (`id!(border_color)`).
+    fn surface(cx: &mut Cx, host: &WidgetRef, field: LiveId) -> Vec4f {
+        let content_bg = host.view(cx, ids!(content_bg));
+        let mut color = [0.0; 4];
+        content_bg.borrow().unwrap().draw_bg.get_instance(cx, field, &mut color);
+        vec4(color[0], color[1], color[2], color[3])
+    }
+
+    /// The handle color of the host's own scroll bar.
+    fn scroll_bar(cx: &mut Cx, host: &WidgetRef) -> Vec4f {
+        let mut obj = host.view(cx, ids!(content)).borrow().unwrap().source.as_object();
+        cx.with_vm(|vm| {
+            for key in [id!(scroll_bars), id!(scroll_bar_y), id!(draw_bg)] {
+                obj = vm.bx.heap.value(obj, key.into(), NoTrap).as_object().unwrap();
+            }
+            Vec4f::from_u32(vm.bx.heap.value(obj, id!(color).into(), NoTrap).as_color().unwrap())
+        })
+    }
+
+    #[test]
+    fn hosts_follow_a_new_appearance_but_light_only_ones_stay_light() {
+        let previous_account = super::super::information_flow::TEST_ACCOUNT
+            .with(|account| account.replace(Some("@restyle-hosts:example.org".into())));
+        let manifest = |id: &str, source: &str| {
+            let mut manifest = a2app_core::builtin::stock("reminder").unwrap();
+            manifest.id = id.into();
+            manifest.source = source.into();
+            manifest.permissions.clear();
+            manifest.capabilities.clear();
+            manifest
+        };
+        let themed = manifest("restyle-themed", "View{width: Fill height: Fill}");
+        let light_only_source = "SolidView{width: Fill height: Fill draw_bg +: {color: #xF0E0D0}}";
+        let light_only = manifest("restyle-light-only", light_only_source);
+        super::super::runtime::initialize_background_test(themed.clone());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let template = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            styled_host_template(vm, Appearance::Light)
+        });
+        set_host_template(template);
+        cx.with_vm(|vm| restyle_hosts(vm, Appearance::Light, false));
+        let themed_host = ensure(&mut cx, &(themed.id.clone(), None), &themed, &[]).unwrap();
+        let light_only_host = ensure(&mut cx, &(light_only.id.clone(), None), &light_only, &[]).unwrap();
+        let look = |cx: &mut Cx, host: &WidgetRef| [surface(cx, host, id!(color)), surface(cx, host, id!(border_color)), scroll_bar(cx, host)];
+        // A light-only host's look, which in light mode is how hosts always looked.
+        let light_only_look = [
+            token(&mut cx, "COLOR_MINI_APP_LIGHT_ONLY_BG"), token(&mut cx, "COLOR_SECONDARY"), token(&mut cx, "COLOR_SCROLL_BAR_HANDLE"),
+        ];
+        assert_eq!(surface(&mut cx, &themed_host, id!(color)), token(&mut cx, "COLOR_PRIMARY"));
+        assert_eq!(look(&mut cx, &light_only_host), light_only_look);
+        let isolate = |cx: &mut Cx, host: &WidgetRef| splash_of(cx, host).borrow_mut::<Splash>().and_then(|mut splash| splash.isolate_heap_key(cx));
+        let isolates = [isolate(&mut cx, &themed_host), isolate(&mut cx, &light_only_host)];
+        assert!(isolates.iter().all(Option::is_some));
+
+        // A reload that keeps the appearance (a rotation, a changed preference) leaves hosts
+        // alone: a re-applied host would lose this mark on its surface.
+        let marked = vec4(0.25, 0.5, 0.75, 1.0);
+        let mark = |cx: &mut Cx, host: &WidgetRef| {
+            let mut content_bg = host.widget(cx, ids!(content_bg));
+            script_apply_eval!(cx, content_bg, { draw_bg +: { color: #(marked) } });
+        };
+        mark(&mut cx, &themed_host);
+        mark(&mut cx, &light_only_host);
+        let template = cx.with_vm(|vm| vm.with_reload(|vm| styled_host_template(vm, Appearance::Light)));
+        set_host_template(template);
+        cx.with_vm(|vm| restyle_hosts(vm, Appearance::Light, false));
+        assert_eq!([surface(&mut cx, &themed_host, id!(color)), surface(&mut cx, &light_only_host, id!(color))], [marked, marked]);
+
+        let template = cx.with_vm(|vm| vm.with_reload(|vm| styled_host_template(vm, Appearance::Dark)));
+        set_host_template(template);
+        cx.with_vm(|vm| restyle_hosts(vm, Appearance::Dark, false));
+        let dark_surface = token(&mut cx, "COLOR_PRIMARY");
+        assert_ne!(dark_surface, light_only_look[0]);
+        assert_eq!(surface(&mut cx, &themed_host, id!(color)), dark_surface, "a host must follow a new appearance");
+        assert_eq!(scroll_bar(&mut cx, &themed_host), token(&mut cx, "COLOR_SCROLL_BAR_HANDLE"));
+        assert_eq!(surface(&mut cx, &light_only_host, id!(color)), marked, "a light-only host is left alone");
+        let late = manifest("restyle-light-only-late", light_only_source);
+        let late_host = ensure(&mut cx, &(late.id.clone(), None), &late, &[]).unwrap();
+        assert_eq!(look(&mut cx, &late_host), light_only_look, "since it looks the same in either appearance");
+        assert_eq!([isolate(&mut cx, &themed_host), isolate(&mut cx, &light_only_host)], isolates, "apps restyle in place");
+        assert_eq!(splash_of(&mut cx, &themed_host).text(), themed.source, "and keep their source");
+
+        quit_everything(&mut cx);
+        clear_host_template();
+        cx.with_vm(|vm| crate::shared::script_mod(vm, Appearance::Light));
+        super::super::information_flow::TEST_ACCOUNT.with(|account| account.replace(previous_account));
+    }
 }

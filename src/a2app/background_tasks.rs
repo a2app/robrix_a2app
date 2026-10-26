@@ -259,7 +259,7 @@ struct ContextChoice {
     available: bool,
 }
 
-#[derive(Script, ScriptHook, Widget)]
+#[derive(Script, Widget)]
 pub struct BackgroundTasks {
     #[deref] view: View,
     #[rust] account: String,
@@ -275,6 +275,13 @@ pub struct BackgroundTasks {
     #[rust] selected_app_id: Option<String>,
     #[rust] selected_context_id: Option<JobContext>,
     #[rust] showing_details: bool,
+}
+
+impl ScriptHook for BackgroundTasks {
+    /// A reload resets the context dropdown to its DSL labels and first item, so list the contexts again.
+    fn on_after_reload(&mut self, vm: &mut ScriptVm) {
+        vm.with_cx_mut(|cx| self.show_contexts(cx));
+    }
 }
 
 impl Widget for BackgroundTasks {
@@ -623,11 +630,18 @@ impl BackgroundTasks {
         if let Some(selected) = selected && !self.contexts.iter().any(|choice| &choice.context == selected) {
             self.contexts.push(ContextChoice { context: selected.clone(), label: format!("Unavailable: {}", self.context_label(selected)), available: false });
         }
-        self.view.drop_down2(cx, ids!(context_choice)).set_labels(cx, std::iter::once("Choose where this task runs…".into()).chain(self.contexts.iter().map(|choice| choice.label.clone())).collect());
         let index = selected.and_then(|selected| self.contexts.iter().position(|choice| &choice.context == selected)).map(|index| index + 1)
             .unwrap_or_else(|| usize::from(self.contexts.len() == 1));
-        self.view.drop_down2(cx, ids!(context_choice)).set_selected_item(cx, index);
         self.selected_context_id = index.checked_sub(1).and_then(|index| self.contexts.get(index)).map(|choice| choice.context.clone());
+        self.show_contexts(cx);
+    }
+
+    /// Lists the contexts in the dropdown, with the chosen one selected.
+    fn show_contexts(&self, cx: &mut Cx) {
+        let drop_down = self.view.drop_down2(cx, ids!(context_choice));
+        drop_down.set_labels(cx, std::iter::once("Choose where this task runs…".into()).chain(self.contexts.iter().map(|choice| choice.label.clone())).collect());
+        drop_down.set_selected_item(cx, self.selected_context_id.as_ref()
+            .and_then(|selected| self.contexts.iter().position(|choice| &choice.context == selected)).map_or(0, |index| index + 1));
     }
 
     fn context_label(&self, context: &JobContext) -> String {
@@ -933,6 +947,23 @@ mod tests {
             editor.update_form(&mut cx);
             assert_eq!(editor.view.widget(&cx, ids!(task_help)).visible(), expanded);
         }
+    }
+
+    #[test]
+    fn theme_switch_keeps_the_chosen_context() {
+        let (mut cx, widget) = editor();
+        {
+            let mut editor = widget.borrow_mut::<BackgroundTasks>().unwrap();
+            set_form(&mut editor, &mut cx);
+            editor.contexts.insert(0, ContextChoice { context: JobContext::Account, label: "This account (no room)".into(), available: true });
+            editor.show_contexts(&mut cx);
+        }
+        crate::a2app::data_sharing::switch_to_dark(&mut cx, &widget, |vm| {
+            super::script_mod(vm);
+            script_eval!(vm, { mod.widgets.BackgroundTasks {} })
+        });
+        let editor = widget.borrow::<BackgroundTasks>().unwrap();
+        assert_eq!(editor.view.drop_down2(&cx, ids!(context_choice)).selected_label(), "Room: Test");
     }
 
     fn binding() -> JobBinding {

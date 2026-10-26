@@ -46,16 +46,17 @@ fn user_request(prompt: &str) -> &str {
     prompt
 }
 
-// Explicit indentation: a `\` line continuation would strip it.
+// Explicit indentation: a `\` line continuation would strip it. Colored from the
+// host's palette, as the guide teaches, so validating it needs the host's theme.
 const GOOD_APP: &str = "// name: Pomodoro\n// icon: 🍅\n// tint: #E84D3D\n\
-let secs = 1500\n\
-fn show(){ ui.time.set_text(\"\" + secs) }\n\
+mod.state = {secs: 1500}\n\
+fn show(){ ui.time.set_text(\"\" + mod.state.secs) }\n\
 View{\n\
 \u{20}   width: Fill height: Fit flow: Down spacing: 12 padding: 16\n\
 \u{20}   align: Align{x: 0.5}\n\
-\u{20}   glass.H1{text: \"Pomodoro\"}\n\
-\u{20}   time := Label{text: \"1500\"}\n\
-\u{20}   glass.GlassButton{text: \"Tick\" width: 90 height: 44 on_click: || { secs -= 1 show() }}\n\
+\u{20}   Label{text: \"Pomodoro\" draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} }}\n\
+\u{20}   time := Label{text: \"1500\" draw_text +: { color: theme.palette.accent_text }}\n\
+\u{20}   Button{text: \"Tick\" width: 90 on_click: || { mod.state.secs -= 1 show() }}\n\
 }";
 
 const BROKEN_APP: &str = "// name: Pomodoro\n// icon: 🍅\n// tint: #E84D3D\n\
@@ -66,15 +67,15 @@ DefinitelyNotAWidget{ &&& this does not parse }";
 const REFINED_APP: &str = "// name: Pomodoro Pro\n// icon: 🍅\n// tint: #E84D3D\n\
 // permissions: files\n\
 // why-files: Saves your session log where you choose.\n\
-let secs = 1500\n\
-fn show(){ ui.time.set_text(\"\" + secs) }\n\
+mod.state = {secs: 1500}\n\
+fn show(){ ui.time.set_text(\"\" + mod.state.secs) }\n\
 View{\n\
 \u{20}   width: Fill height: Fit flow: Down spacing: 12 padding: 16\n\
 \u{20}   align: Align{x: 0.5}\n\
-\u{20}   glass.H1{text: \"Pomodoro Pro\"}\n\
-\u{20}   time := Label{text: \"1500\"}\n\
-\u{20}   glass.GlassButton{text: \"Tick\" width: 90 height: 44 on_click: || { secs -= 1 show() }}\n\
-\u{20}   glass.GlassButton{text: \"Reset\" width: 90 height: 44 on_click: || { secs = 1500 show() }}\n\
+\u{20}   Label{text: \"Pomodoro Pro\" draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} }}\n\
+\u{20}   time := Label{text: \"1500\" draw_text +: { color: theme.palette.accent_text }}\n\
+\u{20}   Button{text: \"Tick\" width: 90 on_click: || { mod.state.secs -= 1 show() }}\n\
+\u{20}   Button{text: \"Reset\" width: 90 on_click: || { mod.state.secs = 1500 show() }}\n\
 }";
 
 fn send(out: &mut impl Write, v: Value) {

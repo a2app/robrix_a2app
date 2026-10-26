@@ -149,7 +149,10 @@ struct Explanation {
     control: Option<ProtectionInspectorAction>,
 }
 
-#[derive(Script, ScriptHook, Widget)]
+/// The inspector's dropdowns, whose choices a reload resets to their DSL defaults.
+const DROP_DOWNS: [&[LiveId]; 3] = [ids!(target), ids!(subject), ids!(capability)];
+
+#[derive(Script, Widget)]
 pub struct ProtectionInspector {
     #[deref] view: View,
     #[rust] account: String,
@@ -168,6 +171,29 @@ pub struct ProtectionInspector {
     #[rust] choosing_subject: bool,
     #[rust] showing_retained: bool,
     #[rust] showing_context: bool,
+    /// The `DROP_DOWNS` choices from before a reload, to restore after it.
+    #[rust] drop_down_choices: [usize; 3],
+}
+
+impl ScriptHook for ProtectionInspector {
+    fn on_before_reload(&mut self, vm: &mut ScriptVm) {
+        self.drop_down_choices = vm.with_cx(|cx| DROP_DOWNS.map(|path| self.view.drop_down2(cx, path).selected_item()));
+    }
+
+    /// The reload walk skips the control buttons made at runtime, so restyle them from their template.
+    fn on_after_reload(&mut self, vm: &mut ScriptVm) {
+        let template = script_eval!(vm, { mod.widgets.ProtectionControlButton {} });
+        for section in [ids!(read_controls_section), ids!(write_controls_section)] {
+            let buttons: Vec<WidgetRef> = vm.with_cx(|cx| self.view.view(cx, section).borrow()
+                .map(|view| view.children.iter().map(|(_, button)| button.clone()).collect()).unwrap_or_default());
+            for mut button in buttons {
+                button.script_apply(vm, &Apply::ScriptReapply, &mut Scope::empty(), template);
+            }
+        }
+        vm.with_cx_mut(|cx| for (path, index) in DROP_DOWNS.into_iter().zip(self.drop_down_choices) {
+            self.view.drop_down2(cx, path).set_selected_item(cx, index);
+        });
+    }
 }
 
 impl Widget for ProtectionInspector {
@@ -780,6 +806,42 @@ mod tests {
         assert!(editor.view.widget(&cx, ids!(target_picker)).visible());
         assert!(!editor.view.widget(&cx, ids!(subject_page)).visible());
         assert_eq!(editor.selected_target(&cx).map(|target| target.0.as_str()), Some("!target:example.org"));
+    }
+
+    #[test]
+    fn theme_switch_restyles_control_buttons_and_keeps_the_checked_ability() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let widget = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::a2app::permission_choices::script_mod(vm);
+            crate::a2app::permission_message_preview::script_mod(vm);
+            crate::a2app::permission_prompt::script_mod(vm);
+            super::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.ProtectionInspector {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let icon_color = |button: &WidgetRef| button.borrow::<Button>().unwrap().draw_icon.color;
+        let light = {
+            let mut editor = widget.borrow_mut::<ProtectionInspector>().unwrap();
+            editor.read_controls = vec![ProtectionInspectorAction::Global];
+            editor.populate_controls(&mut cx);
+            editor.view.drop_down2(&cx, ids!(capability)).set_labels(&mut cx, vec!["Read messages".into(), "Send messages".into()]);
+            editor.view.drop_down2(&cx, ids!(capability)).set_selected_item(&mut cx, 1);
+            icon_color(&editor.view.widget(&cx, ids!(refresh)))
+        };
+        crate::a2app::data_sharing::switch_to_dark(&mut cx, &widget, |vm| {
+            super::script_mod(vm);
+            script_eval!(vm, { mod.widgets.ProtectionInspector {} })
+        });
+        let editor = widget.borrow::<ProtectionInspector>().unwrap();
+        let dark = icon_color(&editor.view.widget(&cx, ids!(refresh)));
+        assert_ne!(dark, light);
+        let control = editor.view.view(&cx, ids!(read_controls_section)).borrow().unwrap().children[0].1.clone();
+        assert_eq!(icon_color(&control), dark, "control buttons made at runtime must follow the theme");
+        assert_eq!(control.text(), "Change default room access");
+        assert_eq!(editor.view.drop_down2(&cx, ids!(capability)).selected_item(), 1, "a theme switch must not change the checked ability");
     }
 
     fn agent() -> SubjectChoice {

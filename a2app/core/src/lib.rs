@@ -25,6 +25,8 @@ pub mod layout;
 pub mod bundle;
 /// A2UI (agent-to-user interface) payloads translated into Splash mini-apps.
 pub mod a2ui;
+/// The colors mini-apps style themselves with, filled from the host's theme.
+pub mod palette;
 /// Version history snapshots for modified apps.
 pub mod versions;
 /// Line diffs between two versions of an app's source.

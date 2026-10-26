@@ -297,7 +297,7 @@ script_mod! {
 
         show_bg: true
         draw_bg +: {
-            color: #xEEF5FF
+            color: (COLOR_BG_PREVIEW)
             border_color: (COLOR_DIVIDER_DARK)
             border_size: 1.0
             border_radius: 4.0
@@ -308,7 +308,7 @@ script_mod! {
             padding: 0, margin: 0
             draw_text +: {
                 text_style: theme.font_bold {font_size: 10},
-                color: (COLOR_ACTIVE_PRIMARY)
+                color: (COLOR_MINI_APP_ACCENT_TEXT)
             }
             text: "AI"
         }
@@ -345,7 +345,7 @@ script_mod! {
 
         show_bg: true
         draw_bg +: {
-            color: #xEEF5FF
+            color: (COLOR_BG_PREVIEW)
             border_color: (COLOR_DIVIDER_DARK)
             border_size: 1.0
             border_radius: 4.0
@@ -373,7 +373,7 @@ script_mod! {
         width: 13, height: 13,
         show_bg: true,
         draw_bg +: {
-            color: uniform(#x0f88fe)
+            color: uniform(COLOR_MINI_APP_ACCENT_TEXT)
             rotation: instance(0.0)
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
@@ -415,10 +415,16 @@ script_mod! {
         padding: Inset{top: 3, bottom: 3, left: 10, right: 10}
         margin: Inset{top: 2, bottom: 2, left: 10, right: 60}
 
+        // `populate` picks the tint from these for the turn's state.
+        color_running: (COLOR_AI_TURN_RUNNING_BG)
+        border_color_running: (COLOR_AI_TURN_RUNNING_BORDER)
+        color_done: (COLOR_MINI_APP_CARD_SUBTLE)
+        border_color_done: (COLOR_AI_TURN_DONE_BORDER)
+
         show_bg: true
         draw_bg +: {
-            color: #xEEF5FF
-            border_color: (COLOR_DIVIDER_DARK)
+            color: (COLOR_MINI_APP_CARD_SUBTLE)
+            border_color: (COLOR_AI_TURN_DONE_BORDER)
             border_size: 1.0
             border_radius: 4.0
         }
@@ -598,9 +604,14 @@ impl AiTurnSpinnerRef {
 /// the body lists each call, one per line. The card's tint and the spinner's
 /// visibility are driven by [`AiTurnContent::status`], so a glance at the
 /// timeline tells a running turn from a finished one.
-#[derive(Script, ScriptHook, Widget)]
+#[derive(Script, Widget)]
 pub struct AiTurnTimelineCard {
     #[deref] view: View,
+    /// The card's fill and border while its turn runs, and once it has settled.
+    #[live] color_running: Vec4f,
+    #[live] border_color_running: Vec4f,
+    #[live] color_done: Vec4f,
+    #[live] border_color_done: Vec4f,
     /// Whether the tool list is expanded. Preserved across repopulates so a
     /// turn card the user opened does not snap shut on the next live update.
     #[rust(true)] is_expanded: bool,
@@ -621,6 +632,13 @@ pub struct AiTurnTimelineCard {
     #[rust] last_running: bool,
     /// Whether the card is currently visible; a hidden card always repopulates.
     #[rust] last_visible: bool,
+}
+
+impl ScriptHook for AiTurnTimelineCard {
+    // A reload puts the DSL tint back, so the next populate (run every draw) must redo the card.
+    fn on_after_reload(&mut self, _vm: &mut ScriptVm) {
+        self.last_visible = false;
+    }
 }
 
 impl Widget for AiTurnTimelineCard {
@@ -933,23 +951,6 @@ impl AiTurnTimelineCardRef {
                 return;
             }
         }
-        // Warm while working, muted once settled. The border follows the same
-        // family so the card reads as one object in either state.
-        let (bg, border) = if running {
-            (vec4(1.0, 0.972, 0.902, 1.0), vec4(0.98, 0.82, 0.45, 1.0))
-        } else {
-            (vec4(0.969, 0.976, 0.988, 1.0), vec4(0.867, 0.89, 0.922, 1.0))
-        };
-        // Applied on the card's own widget ref (not the inner `view`), since
-        // `draw_bg` lives on the widget's script object. Must run before the
-        // `borrow_mut` below, or the script call re-borrows the same RefCell.
-        let mut card = self.clone();
-        script_apply_eval!(cx, card, {
-            draw_bg +: {
-                color: #(bg)
-                border_color: #(border)
-            }
-        });
         // Start/stop the spinner's loop with the turn, so a settled card stops
         // scheduling animation frames. The idempotent `spinning` guard inside
         // `set_spinning` keeps these per-populate calls from restarting the
@@ -958,6 +959,15 @@ impl AiTurnTimelineCardRef {
             .as_ai_turn_spinner()
             .set_spinning(cx, running);
         let Some(mut inner) = self.borrow_mut() else { return };
+        // Warm while working, muted once settled. The border follows the same
+        // family so the card reads as one object in either state.
+        let (bg, border) = if running {
+            (inner.color_running, inner.border_color_running)
+        } else {
+            (inner.color_done, inner.border_color_done)
+        };
+        inner.view.draw_bg.set_dyn_instance(cx, id!(color), &[bg.x, bg.y, bg.z, bg.w]);
+        inner.view.draw_bg.set_dyn_instance(cx, id!(border_color), &[border.x, border.y, border.z, border.w]);
         inner.view.set_visible(cx, true);
         inner.view.collapsible_header(cx, ids!(turn_disclosure)).set_title(cx, &ai_turn_title(content));
         inner.view.widget(cx, ids!(turn_spinner)).set_visible(cx, running);
@@ -1194,6 +1204,70 @@ mod tests {
         card.populate(&mut cx, Some(&content));
         assert!(!card.borrow().unwrap().view.widget(&cx, ids!(turn_body)).visible());
         assert!(!card.borrow().unwrap().view.widget(&cx, ids!(turn_spinner)).visible());
+    }
+
+    /// A turn card's tint and spinner follow a live switch to dark, even when the turn hasn't changed.
+    #[test]
+    fn turn_card_follows_a_live_switch_to_dark() {
+        use crate::settings::app_preferences::Appearance;
+        fn card_template(vm: &mut ScriptVm, appearance: Appearance) -> ScriptValue {
+            makepad_widgets::script_mod(vm);
+            crate::shared::script_mod(vm, appearance);
+            super::script_mod(vm);
+            script_eval!(vm, { mod.widgets.AiTurnTimelineCard {} })
+        }
+        fn tokens<const N: usize>(cx: &mut Cx, names: [LiveId; N]) -> [[f32; 4]; N] {
+            cx.with_vm(|vm| {
+                let widgets = vm.module(id!(widgets));
+                names.map(|name| {
+                    let rgba = vm.bx.heap.value(widgets, name.into(), NoTrap).as_color().unwrap();
+                    [24, 16, 8, 0].map(|shift| ((rgba >> shift) & 0xFF) as f32 / 255.0)
+                })
+            })
+        }
+        let is_close = |a: [f32; 4], b: [f32; 4]| a.iter().zip(b).all(|(a, b)| (a - b).abs() < 0.002);
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut widget = cx.with_vm(|vm| {
+            let value = card_template(vm, Appearance::Light);
+            WidgetRef::script_from_value(vm, value)
+        });
+        let card = widget.as_ai_turn_timeline_card();
+        let fill = |cx: &mut Cx| {
+            let mut color = [0.0; 4];
+            card.borrow().unwrap().view.draw_bg.get_instance(cx, id!(color), &mut color);
+            color
+        };
+        let spinner = |cx: &mut Cx| {
+            let mut color = [0.0; 4];
+            let spinner = card.borrow().unwrap().view.widget(cx, ids!(turn_spinner));
+            spinner.borrow::<AiTurnSpinner>().unwrap().view.draw_bg.get_uniform(cx, id!(color), &mut color);
+            color
+        };
+        let mut content = AiTurnContent {
+            v: 1, turn: "test-turn".into(), first: Some(true), status: AiTurnStatus::Running,
+            seq: 1, thinking: true, tool_calls: Vec::new(), created_at: 0,
+        };
+        card.populate(&mut cx, Some(&content));
+        let [light_running, light_spinner] = tokens(&mut cx, [id!(COLOR_AI_TURN_RUNNING_BG), id!(COLOR_MINI_APP_ACCENT_TEXT)]);
+        assert!(is_close(fill(&mut cx), light_running), "light running: {:?}", fill(&mut cx));
+        assert!(is_close(spinner(&mut cx), light_spinner), "light spinner: {:?}", spinner(&mut cx));
+
+        // As a live switch does: rerun the scripts in dark, then reapply the card, which resets its tint.
+        cx.with_vm(|vm| {
+            let value = vm.with_reload(|vm| card_template(vm, Appearance::Dark));
+            widget.script_apply(vm, &Apply::ScriptReapply, &mut Scope::empty(), value);
+        });
+        let [dark_running, dark_done, dark_spinner] = tokens(&mut cx,
+            [id!(COLOR_AI_TURN_RUNNING_BG), id!(COLOR_MINI_APP_CARD_SUBTLE), id!(COLOR_MINI_APP_ACCENT_TEXT)]);
+        assert!(!is_close(light_running, dark_running) && !is_close(light_spinner, dark_spinner));
+        // The renderer repopulates every draw, here with the same snapshot.
+        card.populate(&mut cx, Some(&content));
+        assert!(is_close(fill(&mut cx), dark_running), "dark running: {:?}", fill(&mut cx));
+        assert!(is_close(spinner(&mut cx), dark_spinner), "dark spinner: {:?}", spinner(&mut cx));
+        content.status = AiTurnStatus::Done;
+        content.seq += 1;
+        card.populate(&mut cx, Some(&content));
+        assert!(is_close(fill(&mut cx), dark_done), "dark done: {:?}", fill(&mut cx));
     }
 
     /// The chat never shows a raw MCP identifier: every known tool gets a

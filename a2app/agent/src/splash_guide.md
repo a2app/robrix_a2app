@@ -7,8 +7,10 @@ widgets or properties that are not shown here.
 
 ## Script shape
 
-A script is: optional module-level state (`let`), optional functions (`fn`),
-optional timers, then EXACTLY ONE root `View{...}` as the final expression.
+A script is: optional module-level data in `mod.state = {...}` (it survives a
+theme switch), `let`s for values a theme switch may reset (never an action in
+flight; see the theme-switch note below), optional functions (`fn`), optional
+timers, then EXACTLY ONE root `View{...}` as the final expression.
 
 - NO `use` imports (the host injects the prelude), NO `Root{}`, NO `Window{}`,
   NO `live_design!`, NO `sys.*` helpers, NO file access beyond the jailed
@@ -36,26 +38,58 @@ screen. You update the UI imperatively:
   every `ui.` path against your `:=` declarations.
 
 ```splash
-let count = 0
-fn show(){ ui.display.set_text("" + count) }
+mod.state = {count: 0}
+fn show(){ ui.display.set_text("" + mod.state.count) }
 
 View{
     width: Fill height: Fill flow: Down
     ScrollYView{
         width: Fill height: Fill flow: Down spacing: 14 padding: 16 align: Align{x: 0.5}
         RoundedView{ width: Fill height: Fit align: Align{x: 0.5, y: 0.5} padding: 26
-            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 12.0 }
+            show_bg: true draw_bg +: { color: theme.palette.card border_radius: 12.0 }
             display := Label{
                 text: "0"
-                draw_text +: { color: #x0f88fe text_style: theme.font_bold{font_size: 52} }
+                draw_text +: { color: theme.palette.accent_text text_style: theme.font_bold{font_size: 52} }
             }
         }
         View{width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 10 align: Align{x: 0.5}
-            Button{text: "−" width: 90 on_click: || { count -= 1 show() }}
-            Button{text: "+" width: 90 on_click: || { count += 1 show() }}
+            Button{text: "−" width: 90 on_click: || { mod.state.count -= 1 show() }}
+            Button{text: "+" width: 90 on_click: || { mod.state.count += 1 show() }}
         }
     }
 }
+```
+
+A light/dark theme switch runs the script again from the top: widgets keep
+their text and `mod.state` its value, but `let`s restart and timers and
+pending `host.request` callbacks are dropped. So make the top level safe to
+repeat: keep lasting data in `mod.state` (or reload it at top level), restart
+timers and read requests there (a clock: one top-level `start_interval` that
+checks `mod.state.running`), and never send, post or join at top level. A
+write the switch cut off may still have happened, and its "Sending…" line
+stays on screen: mark it in `mod.state` and settle it after a re-run, never
+resending it:
+
+```splash
+mod.state = {is_sending: false}
+fn send(){
+    if mod.state.is_sending { return nil }
+    mod.state.is_sending = true
+    ui.status.set_text("Sending…")
+    host.request("matrix.send_message", {body: ui.draft.text()}, fn(r){
+        mod.state.is_sending = false
+        ui.status.set_text(if r.is_ok {"Sent."} else {r.error})
+        return nil
+    })
+}
+// A re-run gets the last run's `mod.state` back as it ends, so check it after.
+fn settle(){
+    if !mod.state.is_sending { return nil }
+    mod.state.is_sending = false
+    ui.status.set_text("It may have been sent. Check the room before sending again.")
+    return nil
+}
+let _settle = start_timeout(0.05, || settle())
 ```
 
 ## Layout
@@ -69,9 +103,9 @@ View{
   `width: Fill height: Fill`; controls use `height: Fit`, and its main result
   list uses `height: Fill{min: 80}` to consume the remaining height. The minimum
   keeps a usable list viewport in short panes; it is not a height limit.
-- Color literals: `#ffffff`, `#x1C274C` (with alpha: `#xffffff55`).
 - A plain `View{show_bg: true}` paints nothing. For a filled background or a
-  1px divider use `SolidView` (square) or `RoundedView`.
+  1px divider (`theme.palette.divider`) use `SolidView` (square) or
+  `RoundedView`; colors come from `theme.palette` (see "Robrix look").
 
 ## The app runs at ANY size (split screen, resizable windows)
 
@@ -144,12 +178,12 @@ debug:
   silently offsets layouts that assume 0. Set them explicitly whenever exact
   placement matters: `Label{ padding: 0 margin: 0 ... }` (or the values you
   actually want) — never assume a Label contributes no extra space.
-- `Label{ text: "..." draw_text +: { color: #ffffff text_style:
+- `Label{ text: "..." draw_text +: { color: theme.palette.body text_style:
   theme.font_regular{font_size: 15} } }` — fonts: `theme.font_regular`,
   `theme.font_bold`. Note the `+:` when overriding draw_text/draw_bg.
-- Shorthands from the glass kit: `glass.H1{text}`, `glass.H2{text}`,
-  `glass.Body{text}`, `glass.Caption{text}` (small uppercase label),
-  `glass.OptionLabel{text}`.
+- Colors: titles `theme.palette.title` (bold), body text `body`, captions
+  and meta `muted` (sizes in "Robrix look"). Never `glass.H1`, `glass.Body`
+  or other glass labels: their fixed white text vanishes in light mode.
 - Emoji work in any text. Some symbol characters DON'T: the app fonts have
   no ✕ ✗ ➜ glyphs (they render as empty boxes). For icons use emoji
   (🗑 ➕ ▶️), plain words, or these known-good characters: × ○ ● − ▼ ▲ ‹ › ← → ↻
@@ -158,23 +192,44 @@ debug:
 
 ## Robrix look (USE THIS by default)
 
-Apps are hosted inside Robrix panes with a WHITE background and should look
-like Robrix itself: navy text, blue accents, flat buttons with 4px corners.
-The pane header already shows the app's icon and name, so do not repeat
-them as a title; open with content or a short bold summary line.
+Apps are hosted inside Robrix panes and should look like Robrix itself: flat,
+blue accents, buttons with 4px corners. The pane header already shows the
+app's icon and name, so do not repeat them as a title; open with content or a
+short bold summary line. Robrix is light (white pane, navy titles) or dark
+(#262626 pane, off-white titles, lighter blue, green and red), as the user
+picks, so NEVER write a hex color: `theme.palette.<name>` follows the theme.
 
-- Text: titles `#x1C274C` (bold), body `#x333333`, secondary and meta
-  `#x66708F`. Accent `#x0f88fe` for the main button, selected chips, links
-  and values that matter.
-- Status lines are never blue (blue reads as a link): neutral `#x66708F`,
-  success `#x138808`, error `#xDC0005`.
+- Text: `title` (titles, card, chip and neutral-button text), `body` (body,
+  typed text), `muted` (secondary, meta, captions, neutral status lines),
+  `accent_text` (links, values that matter, spinners), `on_accent` (on an
+  `accent` or `avatar` fill only); status lines `success`, `danger`,
+  `warning`, never blue (blue reads as a link). These three turn light in
+  dark mode, so never fill behind text with them: positive and destructive
+  buttons put `success`/`danger` text and border on `success_bg`/`danger_bg`.
+- Fills: `surface` (pane, fields, chips, plain cards), `card` (cards, hovered
+  chips), `card_subtle` (empty, denied, error cards), `pressed`, `accent`
+  (main button, selected chip; `accent_hover`, `accent_down`), `avatar`,
+  `transparent` (fades in to a hover color). Lines: `border` (fields,
+  chips), `card_border` (outlines of cards and framed boxes), `focus`
+  (focused field), `divider`. Buttons: `neutral`, `success_bg`, `danger_bg`
+  (each also `_hover`, `_down`), `neutral_border`. Fields: `placeholder`,
+  `placeholder_hover`. Overlays: `selection`, `shadow`.
+- No role fits (a chart series)? Pick by theme: `if theme.palette.is_dark
+  {#xB79CFF} else {#x7B4FD6}`. Store palette names, not colors, and draw
+  them with `theme.palette[name]`. An app with hex colors and no palette is
+  shown light even in dark mode.
+- SHADERS: inside a shader fn (`pixel: fn()`, `get_color: fn()`, ...) never
+  read `theme.palette` or write a color, since shaders keep the colors of the
+  theme they were first built in. Declare the color on the draw object and use
+  it through `self`: `draw_bg +: { mark_color: instance(theme.palette.accent_text)
+  pixel: fn(){ ... sdf.fill(self.mark_color) ... } }`.
 - Fonts: summary or card title `theme.font_bold{font_size: 13}`, body
   `theme.font_regular{font_size: 11}`, meta `theme.font_regular{font_size:
-  10}`, section caption `theme.font_bold{font_size: 9.5}` `#x66708F` in
+  10}`, section caption `theme.font_bold{font_size: 9.5}` in `muted`
   UPPERCASE.
 - Cards: `RoundedView{ show_bg: true padding: 12 draw_bg +: { color:
-  #xF0F5FF border_radius: 8.0 } }`. Spacing 4 / 8 / 12 / 16; the content
-  column uses `padding: 14 spacing: 12`.
+  theme.palette.card border_radius: 8.0 } }`. Spacing 4 / 8 / 12 / 16; the
+  content column uses `padding: 14 spacing: 12`.
 
 Makepad's default `Button` and gray `TextInput` look foreign in Robrix.
 Start the script with these and use them for every button and input (the
@@ -185,30 +240,30 @@ let PrimaryButton = Button{
     padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
     draw_bg +: {
         border_size: 0.0 border_radius: 4.0
-        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color: theme.palette.accent color_hover: theme.palette.accent_hover color_down: theme.palette.accent_down color_focus: theme.palette.accent
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+    draw_text +: { color: theme.palette.on_accent color_hover: theme.palette.on_accent color_down: theme.palette.on_accent color_focus: theme.palette.on_accent text_style: theme.font_regular{font_size: 10} }
 }
 let NeutralButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
-        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.neutral_border border_color_hover: theme.palette.neutral_border border_color_down: theme.palette.neutral_border border_color_focus: theme.palette.neutral_border
+        color: theme.palette.neutral color_hover: theme.palette.neutral_hover color_down: theme.palette.neutral_down color_focus: theme.palette.neutral }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title }
 }
 let NegativeButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #xDC0005 border_color_hover: #xDC0005 border_color_down: #xDC0005 border_color_focus: #xDC0005
-        color: #xFFF0F0 color_hover: #xF0D4D4 color_down: #xE0B8B8 color_focus: #xFFF0F0 }
-    draw_text +: { color: #xDC0005 color_hover: #xDC0005 color_down: #xDC0005 color_focus: #xDC0005 }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.danger border_color_hover: theme.palette.danger border_color_down: theme.palette.danger border_color_focus: theme.palette.danger
+        color: theme.palette.danger_bg color_hover: theme.palette.danger_bg_hover color_down: theme.palette.danger_bg_down color_focus: theme.palette.danger_bg }
+    draw_text +: { color: theme.palette.danger color_hover: theme.palette.danger color_down: theme.palette.danger color_focus: theme.palette.danger }
 }
 let Field = TextInput{
     width: Fill height: Fit padding: 10
     draw_bg +: {
         border_radius: 4.0 border_size: 1.0
-        color: #xFFFFFF color_hover: #xFFFFFF color_focus: #xFFFFFF color_down: #xFFFFFF color_empty: #xFFFFFF
-        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_focus: #x106fcc border_color_down: #x106fcc border_color_empty: #xC8C8C8
+        color: theme.palette.surface color_hover: theme.palette.surface color_focus: theme.palette.surface color_down: theme.palette.surface color_empty: theme.palette.surface
+        border_color: theme.palette.border border_color_hover: theme.palette.accent border_color_focus: theme.palette.focus border_color_down: theme.palette.focus border_color_empty: theme.palette.border
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #x333333 color_hover: #x333333 color_focus: #x333333 color_down: #x333333 color_empty: #xBBBBBB color_empty_hover: #x999999 color_empty_focus: #x999999 text_style: theme.font_regular{font_size: 11} }
+    draw_text +: { color: theme.palette.body color_hover: theme.palette.body color_focus: theme.palette.body color_down: theme.palette.body color_empty: theme.palette.placeholder color_empty_hover: theme.palette.placeholder_hover color_empty_focus: theme.palette.placeholder_hover text_style: theme.font_regular{font_size: 11} }
 }
 ```
 
@@ -217,18 +272,20 @@ let Field = TextInput{
   (Delete, Clear). Use them like `Button`: `NeutralButton{text: "Refresh"
   on_click: || refresh()}`, and `Field{empty_text: "Search" on_return: |t| go(t)}`.
 - Chips (filters, choices): pill buttons with `border_radius: 12.0` and
-  padding 10 / 5; unselected white with a 1px `#xC8C8C8` border and navy
-  text, selected `#x0f88fe` with white text.
-- Empty, denied and error states: a centered `#xF7F9FC` card (radius 8,
-  padding 16) with an emoji, one bold navy line, one short `#x66708F` line,
+  padding 10 / 5; unselected `surface` with a 1px `border` border and `title`
+  text (`card` and an `accent` border on hover, `pressed` when down),
+  selected `accent` with `on_accent` text.
+- Empty, denied and error states: a centered `card_subtle` card (radius 8,
+  padding 16) with an emoji, one bold `title` line, one short `muted` line,
   and at most one button (Try again, Ask again). Never leave a blank pane.
 - People and rooms in lists get Robrix's fallback avatar, a 32px circle with
   the name's first letter: `RoundedView{ width: 32 height: 32 align:
-  Align{x: 0.5 y: 0.5} show_bg: true draw_bg +: { color: #x52b2ac
+  Align{x: 0.5 y: 0.5} show_bg: true draw_bg +: { color: theme.palette.avatar
   border_radius: 16.0 } Label{ text: "P" padding: 0 margin: 0 draw_text +: {
-  color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } } }`.
-- Loading: `LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }`
-  beside a short gray line such as "Loading members…".
+  color: theme.palette.on_accent text_style: theme.font_bold{font_size: 12} } } }`.
+- Loading: `LoadingSpinner{ width: 18 height: 18 draw_bg +: { color:
+  theme.palette.accent_text } }` beside a short `muted` line such as
+  "Loading members…".
 - Keep copy short. Put rarely needed details behind a collapsed
   "How it works ▼" toggle (this quiet text button, flipping to ▲) over a
   hidden View. Show times as "5m ago" or local times, never raw UTC strings.
@@ -237,15 +294,15 @@ let Field = TextInput{
 let GhostButton = PrimaryButton{
     padding: Inset{left: 6 right: 6 top: 4 bottom: 4}
     margin: Inset{left: -6}
-    draw_bg +: { border_size: 0.0 color: #xFFFFFF00 color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF00 }
-    draw_text +: { color: #x66708F color_hover: #x1C274C color_down: #x1C274C color_focus: #x66708F }
+    draw_bg +: { border_size: 0.0 color: theme.palette.transparent color_hover: theme.palette.card color_down: theme.palette.pressed color_focus: theme.palette.transparent }
+    draw_text +: { color: theme.palette.muted color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.muted }
 }
 ```
 
 ## Glass kit (liquid-glass styled widgets)
 
 CAUTION: do NOT use glass widgets in Robrix apps. Glass surfaces SAMPLE the
-scene behind the app; inside Robrix's white-backed panes they wash out to a
+scene behind the app; inside Robrix's opaque panes they wash out to a
 flat fill that hides text. Use the Robrix look above instead; reach for
 glass only if the user explicitly asks for the translucent style.
 
@@ -281,14 +338,15 @@ Buttons take `width`/`height` numbers, `text`, and `on_click: || {...}`.
 Prefer a named container with `on_render` and explicit re-render calls:
 
 ```splash
-let laps = []
+mod.state = {laps: []}
 lap_list := ScrollYView{
     width: Fill height: Fill{min: 80} flow: Down spacing: 6
     on_render: || {
-        for lap in laps {
-            glass.ListRow{ width: Fill glass.Body{text: lap width: Fill} }
+        for lap in mod.state.laps {
+            View{ width: Fill height: Fit padding: Inset{top: 8 bottom: 8}
+                Label{text: lap width: Fill draw_text +: {color: theme.palette.body}} }
         }
-        if laps.len() == 0 { glass.Body{text: "Nothing yet." width: Fill} }
+        if mod.state.laps.len() == 0 { Label{text: "Nothing yet." draw_text +: {color: theme.palette.muted}} }
     }
 }
 ```
@@ -301,11 +359,11 @@ To make rows tappable put ONE handler on the list itself:
 lap_list := ScrollYView{
     width: Fill height: Fill{min: 80} flow: Down spacing: 6
     on_item_tap: |i| open_lap(i)
-    on_render: || { for lap in laps { glass.ListRow{ ... } } }
+    on_render: || { for lap in mod.state.laps { View{ ... } } }   // rows as above
 }
 fn open_lap(i){
-    if i >= laps.len() { return nil }
-    let lap = laps[i]
+    if i >= mod.state.laps.len() { return nil }
+    let lap = mod.state.laps[i]
     ...
 }
 ```
@@ -1316,3 +1374,9 @@ idempotency where the destination supports it.
    fallback content, `r.is_ok` handled on every callback, `host.has` checked
    at use time, and `on_permissions_changed` re-syncing anything gated. An
    app that breaks without a grant does not pass.
+8. Colors only from `theme.palette`; hex only in `// tint:` and
+   `if theme.palette.is_dark` picks. Inside a shader fn, no `theme.palette`,
+   hex or pick: read a field declared as `instance(theme.palette.x)` through
+   `self`. A theme switch re-runs the script: data that must outlive it goes
+   in `mod.state` or `fs`; never send, post or join at top level; a write in
+   flight is marked in `mod.state`, settled, never resent.

@@ -12,20 +12,20 @@ let PrimaryButton = Button{
     padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
     draw_bg +: {
         border_size: 0.0 border_radius: 4.0
-        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color: theme.palette.accent color_hover: theme.palette.accent_hover color_down: theme.palette.accent_down color_focus: theme.palette.accent
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+    draw_text +: { color: theme.palette.on_accent color_hover: theme.palette.on_accent color_down: theme.palette.on_accent color_focus: theme.palette.on_accent text_style: theme.font_regular{font_size: 10} }
 }
 let NeutralButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
-        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.neutral_border border_color_hover: theme.palette.neutral_border border_color_down: theme.palette.neutral_border border_color_focus: theme.palette.neutral_border
+        color: theme.palette.neutral color_hover: theme.palette.neutral_hover color_down: theme.palette.neutral_down color_focus: theme.palette.neutral }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title }
 }
 let PositiveButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #x138808 border_color_hover: #x138808 border_color_down: #x138808 border_color_focus: #x138808
-        color: #xF0FFF0 color_hover: #xD4EED4 color_down: #xB8E0B8 color_focus: #xF0FFF0 }
-    draw_text +: { color: #x138808 color_hover: #x138808 color_down: #x138808 color_focus: #x138808 }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.success border_color_hover: theme.palette.success border_color_down: theme.palette.success border_color_focus: theme.palette.success
+        color: theme.palette.success_bg color_hover: theme.palette.success_bg_hover color_down: theme.palette.success_bg_down color_focus: theme.palette.success_bg }
+    draw_text +: { color: theme.palette.success color_hover: theme.palette.success color_down: theme.palette.success color_focus: theme.palette.success }
 }
 
 let spaces_loading = false
@@ -39,7 +39,6 @@ let info_loaded = false
 
 let items = []
 let rows = []
-let trail = []
 // "loading", "ready" or "error" for the list at the current level.
 let phase = "loading"
 let fail_text = ""
@@ -50,8 +49,8 @@ let preview_id = ""
 let preview_kind = "ROOM"
 let preview_request = 0
 let joining_room = ""
-let is_narrow = false
-let is_compact = false
+// Where you are and the pane size survive the re-run a theme switch does, which no resize follows.
+mod.state = {trail: [] is_booted: false is_narrow: false is_compact: false}
 
 let upper_map = {a: "A" b: "B" c: "C" d: "D" e: "E" f: "F" g: "G" h: "H" i: "I" j: "J" k: "K" l: "L" m: "M"
     n: "N" o: "O" p: "P" q: "Q" r: "R" s: "S" t: "T" u: "U" v: "V" w: "W" x: "X" y: "Y" z: "Z"}
@@ -148,8 +147,8 @@ fn joined_line(parts){
 fn row_meta(it){
     let parts = []
     // Compact panes fold the "Not joined" pill into this line.
-    if is_compact && !it.joined { parts.push("Not joined") }
-    if trail.len() > 0 && it.is_space { parts.push("Space") }
+    if mod.state.is_compact && !it.joined { parts.push("Not joined") }
+    if mod.state.trail.len() > 0 && it.is_space { parts.push("Space") }
     parts.push(count_text(it["member_count"], "member"))
     if !it["topic"].is_nil() { parts.push(it["topic"]) }
     return joined_line(parts)
@@ -157,16 +156,16 @@ fn row_meta(it){
 
 fn build_rows(){
     rows = []
-    let inside = trail.len() > 0
+    let inside = mod.state.trail.len() > 0
     for it in items {
-        let bg = #xF7F9FC
-        let edge = #xF7F9FC
+        let bg = theme.palette.card_subtle
+        let edge = theme.palette.card_subtle
         if it.room_id == preview_id {
-            bg = #xE4EEFF
-            edge = #x0f88fe
+            bg = theme.palette.pressed
+            edge = theme.palette.accent
         }
         let pill = ""
-        if !it.joined && !is_compact { pill = "Not joined" }
+        if !it.joined && !mod.state.is_compact { pill = "Not joined" }
         let is_chevron = it.joined && (it.is_space || !inside)
         rows.push({name: shown_name(it.name, it.room_id) initial: initial(shown_name(it.name, it.room_id)) meta: row_meta(it)
             bg: bg edge: edge pill: pill is_chevron: is_chevron})
@@ -175,8 +174,8 @@ fn build_rows(){
 
 // The spinner says "Loading…", so the header line stays empty until there's something to count.
 fn level_line(){
-    if trail.len() == 0 {
-        if phase == "ready" && items.len() > 0 && is_compact { return count_text(items.len(), "space") }
+    if mod.state.trail.len() == 0 {
+        if phase == "ready" && items.len() > 0 && mod.state.is_compact { return count_text(items.len(), "space") }
         if phase == "ready" && items.len() > 0 { return count_text(items.len(), "space") + " · tap one to see its rooms" }
         return ""
     }
@@ -198,7 +197,7 @@ fn show_header(){
 }
 
 fn show_empty(){
-    let inside = trail.len() > 0
+    let inside = mod.state.trail.len() > 0
     ui.loading_wrap.set_visible(phase == "loading" && items.len() == 0)
     ui.loading_line.set_text(if inside {"Loading rooms…"} else {"Loading your spaces…"})
     if phase == "error" {
@@ -260,6 +259,7 @@ fn close_preview(){
 }
 
 fn show_level(){
+    let trail = mod.state.trail
     let inside = trail.len() > 0
     ui.back_wrap.set_visible(inside)
     if inside {
@@ -298,7 +298,7 @@ fn load_spaces(){
     host.request("matrix.spaces", nil, fn(r){
         spaces_loading = false
         spaces_loaded = r.is_ok
-        if trail.len() > 0 { return nil }
+        if mod.state.trail.len() > 0 { return nil }
         if r.is_ok {
             items = []
             for s in r.data.spaces {
@@ -314,6 +314,7 @@ fn load_spaces(){
 }
 
 fn load_rooms(){
+    let trail = mod.state.trail
     if trail.len() == 0 { return nil }
     let cur = trail[trail.len() - 1]
     if rooms_loading == cur.space_id { return nil }
@@ -324,6 +325,7 @@ fn load_rooms(){
     host.request("matrix.space_rooms", {space_id: cur.space_id}, fn(r){
         if request_id != rooms_request { return nil }
         rooms_loading = ""
+        let trail = mod.state.trail
         if trail.len() == 0 { return nil }
         if trail[trail.len() - 1].space_id != cur.space_id { return nil }
         rooms_loaded = r.is_ok
@@ -340,6 +342,7 @@ fn load_rooms(){
 }
 
 fn load_info(){
+    let trail = mod.state.trail
     if trail.len() == 0 { return nil }
     let cur = trail[trail.len() - 1]
     if info_loading == cur.space_id { return nil }
@@ -349,6 +352,7 @@ fn load_info(){
     host.request("matrix.space_info", {space_id: cur.space_id}, fn(r){
         if request_id != info_request { return nil }
         info_loading = ""
+        let trail = mod.state.trail
         if trail.len() == 0 { return nil }
         if trail[trail.len() - 1].space_id != cur.space_id { return nil }
         info_loaded = r.is_ok
@@ -377,7 +381,7 @@ fn open_current(){
 }
 
 fn reload(){
-    if trail.len() > 0 {
+    if mod.state.trail.len() > 0 {
         open_current()
         return nil
     }
@@ -385,7 +389,7 @@ fn reload(){
 }
 
 fn go_back(){
-    trail.pop()
+    mod.state.trail.pop()
     rooms_loading = ""
     rooms_request += 1
     info_loading = ""
@@ -397,7 +401,7 @@ fn tap_item(i){
     if i >= items.len() { return nil }
     let it = items[i]
     if it.is_space && it.joined {
-        trail.push({space_id: it.room_id name: shown_name(it.name, it.room_id)})
+        mod.state.trail.push({space_id: it.room_id name: shown_name(it.name, it.room_id)})
         open_current()
         return nil
     }
@@ -476,9 +480,9 @@ fn join_room(){
 fn on_app_resize(w, h){
     let narrow = w < 300
     let compact = w < 400
-    if narrow == is_narrow && compact == is_compact { return nil }
-    is_narrow = narrow
-    is_compact = compact
+    if narrow == mod.state.is_narrow && compact == mod.state.is_compact { return nil }
+    mod.state.is_narrow = narrow
+    mod.state.is_compact = compact
     ui.refresh_btn.set_text(if narrow {"↻"} else {"Refresh"})
     show_list()
     return nil
@@ -488,7 +492,7 @@ fn on_permissions_changed(caps){
     if !host.has("matrix.spaces.list") { spaces_loaded = false }
     if !host.has("matrix.space.info.read") { info_loaded = false }
     if !host.has("matrix.space.rooms.list") { rooms_loaded = false }
-    if trail.len() == 0 {
+    if mod.state.trail.len() == 0 {
         if !spaces_loaded && host.has("matrix.spaces.list") { load_spaces() }
     } else {
         if !info_loaded && host.has("matrix.space.info.read") { load_info() }
@@ -498,10 +502,16 @@ fn on_permissions_changed(caps){
 }
 
 let _boot = start_timeout(0.05, || {
+    // A theme switch's re-run reloads where you are; only the first boot starts at the attached space.
+    if mod.state.is_booted {
+        reload()
+        return nil
+    }
     host.request("env", nil, fn(r){
         if r.is_ok && r.data.room_attached && r.data.room_id != nil {
-            trail.push({space_id: r.data.room_id name: shown_name(r.data.room_name, r.data.room_id)})
+            mod.state.trail.push({space_id: r.data.room_id name: shown_name(r.data.room_name, r.data.room_id)})
         }
+        mod.state.is_booted = true
         reload()
     })
 })
@@ -520,37 +530,37 @@ View{
                 width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
                 View{
                     width: Fill height: Fit flow: Down spacing: 3
-                    head_title := Label{ text: "Your spaces" width: Fill max_lines: 2 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
+                    head_title := Label{ text: "Your spaces" width: Fill max_lines: 2 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} } }
                     status_wrap := View{
                         width: Fill height: Fit visible: false
-                        status := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                        status := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                     }
                 }
                 refresh_btn := NeutralButton{ text: "Refresh" on_click: || reload() }
             }
             topic_wrap := View{
                 width: Fill height: Fit visible: false
-                space_topic := Label{ text: "" width: Fill max_lines: 3 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
+                space_topic := Label{ text: "" width: Fill max_lines: 3 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: theme.palette.body text_style: theme.font_regular{font_size: 11} } }
             }
         }
         alert_wrap := View{
             width: Fill height: Fit visible: false
-            alert := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} } }
+            alert := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.danger text_style: theme.font_regular{font_size: 10} } }
         }
         preview_wrap := View{
             width: Fill height: Fit visible: false
             RoundedView{
                 width: Fill height: Fit flow: Down spacing: 8 padding: 12
-                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                show_bg: true draw_bg +: { color: theme.palette.card border_radius: 8.0 }
                 View{
                     width: Fill height: Fit flow: Down spacing: 3
-                    preview_kind := Label{ text: "ROOM · NOT JOINED" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
-                    preview_title := Label{ text: "" width: Fill max_lines: 2 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
-                    preview_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                    preview_kind := Label{ text: "ROOM · NOT JOINED" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} } }
+                    preview_title := Label{ text: "" width: Fill max_lines: 2 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} } }
+                    preview_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                 }
                 preview_topic_wrap := View{
                     width: Fill height: Fit visible: false
-                    preview_topic := Label{ text: "" width: Fill max_lines: 4 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
+                    preview_topic := Label{ text: "" width: Fill max_lines: 4 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: theme.palette.body text_style: theme.font_regular{font_size: 11} } }
                 }
                 View{
                     width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
@@ -562,32 +572,32 @@ View{
                 }
                 join_wait_wrap := View{
                     width: Fill height: Fit visible: false
-                    join_wait := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                    join_wait := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                 }
                 join_ok_wrap := View{
                     width: Fill height: Fit visible: false
-                    join_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x138808 text_style: theme.font_regular{font_size: 10} } }
+                    join_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.success text_style: theme.font_regular{font_size: 10} } }
                 }
                 preview_err_wrap := View{
                     width: Fill height: Fit visible: false
-                    preview_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} } }
+                    preview_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.danger text_style: theme.font_regular{font_size: 10} } }
                 }
             }
         }
         loading_wrap := View{
             width: Fill height: Fit flow: Right spacing: 10 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24}
-            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
-            loading_line := Label{ text: "Loading your spaces…" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: theme.palette.accent_text } }
+            loading_line := Label{ text: "Loading your spaces…" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
         }
         empty_wrap := View{
             width: Fill height: Fit visible: false
             RoundedView{
                 width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5}
                 padding: Inset{top: 20 bottom: 20 left: 16 right: 16}
-                show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                show_bg: true draw_bg +: { color: theme.palette.card_subtle border_radius: 8.0 }
                 empty_icon := Label{ text: "🪐" padding: 0 margin: 0 draw_text +: { text_style: theme.font_regular{font_size: 28} } }
-                empty_title := Label{ text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} } }
-                empty_text := Label{ text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                empty_title := Label{ text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 12.5} } }
+                empty_text := Label{ text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
                 empty_btn_wrap := View{
                     width: Fit height: Fit visible: false margin: Inset{top: 6}
                     empty_btn := NeutralButton{ text: "Try again" on_click: || reload() }
@@ -611,27 +621,27 @@ View{
                             width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
                             padding: Inset{top: 10 bottom: 10 left: 10 right: 12}
                             show_bg: true draw_bg +: { color: r.bg border_size: 1.0 border_color: r.edge border_radius: 8.0 }
-                            if !is_narrow {
+                            if !mod.state.is_narrow {
                                 RoundedView{
                                     width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
-                                    show_bg: true draw_bg +: { color: #x52b2ac border_radius: 16.0 }
-                                    Label{ text: r.initial padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
+                                    show_bg: true draw_bg +: { color: theme.palette.avatar border_radius: 16.0 }
+                                    Label{ text: r.initial padding: 0 margin: 0 draw_text +: { color: theme.palette.on_accent text_style: theme.font_bold{font_size: 12} } }
                                 }
                             }
                             View{
                                 width: Fill height: Fit flow: Down spacing: 2
-                                Label{ text: r.name width: Fill max_lines: 1 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} } }
-                                Label{ text: r.meta width: Fill max_lines: 2 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                                Label{ text: r.name width: Fill max_lines: 1 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 11} } }
+                                Label{ text: r.meta width: Fill max_lines: 2 text_overflow: Ellipsis padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                             }
                             if r.pill != "" {
                                 RoundedView{
                                     width: Fit height: Fit padding: Inset{top: 3 bottom: 3 left: 8 right: 8}
-                                    show_bg: true draw_bg +: { color: #xFFFFFF border_size: 1.0 border_color: #xC8C8C8 border_radius: 10.0 }
-                                    Label{ text: r.pill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 9.5} } }
+                                    show_bg: true draw_bg +: { color: theme.palette.surface border_size: 1.0 border_color: theme.palette.border border_radius: 10.0 }
+                                    Label{ text: r.pill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 9.5} } }
                                 }
                             }
                             if r.is_chevron {
-                                Label{ text: "›" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 16} } }
+                                Label{ text: "›" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 16} } }
                             }
                         }
                     }

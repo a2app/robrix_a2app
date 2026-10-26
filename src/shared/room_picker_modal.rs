@@ -8,7 +8,7 @@ use makepad_widgets::*;
 use crate::{
     home::rooms_list::{RoomPickerEntry, RoomsListRef},
     room::FetchedRoomAvatar,
-    shared::{avatar::AvatarWidgetRefExt, room_filter_input_bar::RoomFilterInputBarWidgetExt},
+    shared::{avatar::AvatarWidgetRefExt, room_filter_input_bar::RoomFilterInputBarWidgetExt, styles::set_view_bg_color},
     utils::{self, RoomNameId},
 };
 
@@ -16,30 +16,12 @@ script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
 
-    // One joined room in the picker's list.
-    mod.widgets.RoomPickerRow = RoundedView {
-        width: Fill, height: 52, flow: Right, spacing: 9, align: Align{y: 0.5}
-        padding: Inset{left: 10, right: 10}
-        show_bg: true, cursor: MouseCursor.Hand
-        draw_bg +: { color: #00000000, border_radius: 5.0 }
-        avatar := Avatar { width: 30, height: 30 }
-        info := View {
-            width: Fill, height: Fit, flow: Down, spacing: 1
-            title := Label {
-                width: Fill, height: Fit, max_lines: 1, text_overflow: Ellipsis, padding: 0
-                draw_text +: { color: (COLOR_TEXT), text_style: theme.font_bold {font_size: 11, line_spacing: 1.0} }
-            }
-            subtitle := Label {
-                width: Fill, height: Fit, max_lines: 1, text_overflow: Ellipsis, padding: 0
-                draw_text +: { color: #555, text_style: theme.font_regular {font_size: 9.5, line_spacing: 1.0} }
-            }
-        }
-    }
-
     mod.widgets.RoomPickerModal = set_type_default() do #(RoomPickerModal::register_widget(vm)) {
         ..mod.widgets.SmallModal
 
-        color_hover: #xEAEFF5
+        // The background of a room's row, and of a hovered one.
+        color: (COLOR_TRANSPARENT)
+        color_hover: (COLOR_FLOATING_ITEM_BG_HOVER)
 
         title := ModalTitle {}
 
@@ -51,12 +33,12 @@ script_mod! {
             width: Fill, height: 320
             flow: Down
             margin: Inset{top: 10}
-            row := mod.widgets.RoomPickerRow {}
+            row := mod.widgets.AvatarListRow {}
             empty_row := View {
                 width: Fill, height: 52, align: Align{x: 0.5, y: 0.5}
                 Label {
                     height: Fit
-                    draw_text +: { color: #555, text_style: theme.font_regular {font_size: 10.5} }
+                    draw_text +: { color: (COLOR_LIST_ROW_TEXT_MUTED), text_style: theme.font_regular {font_size: 10.5} }
                     text: "No rooms match"
                 }
             }
@@ -105,6 +87,7 @@ pub enum RoomPickerModalAction {
 #[derive(Script, ScriptHook, Widget)]
 pub struct RoomPickerModal {
     #[deref] view: View,
+    #[live] color: Vec4f,
     #[live] color_hover: Vec4f,
     #[rust] content: RoomPickerContent,
     #[rust] rooms: Vec<RoomPickerEntry>,
@@ -130,7 +113,7 @@ impl Widget for RoomPickerModal {
                 }
                 let row = match self.rooms.get(index) {
                     Some(entry) => {
-                        let mut row = list.item(cx, index, id!(row));
+                        let row = list.item(cx, index, id!(row));
                         row.label(cx, ids!(info.title)).set_text(cx, &entry.room_name_id.display());
                         let subtitle = if entry.is_direct {
                             "Direct message"
@@ -145,8 +128,8 @@ impl Widget for RoomPickerModal {
                                 let _ = avatar.show_image(cx, None, |cx, img| utils::load_avatar_image(&img, cx, image));
                             }
                         }
-                        let color = if self.hovered_index == Some(index) { self.color_hover } else { Vec4f::default() };
-                        script_apply_eval!(cx, row, { draw_bg.color: #(color) });
+                        let color = if self.hovered_index == Some(index) { self.color_hover } else { self.color };
+                        set_view_bg_color(cx, &row.as_view(), color);
                         row
                     }
                     None => list.item(cx, index, id!(empty_row)),

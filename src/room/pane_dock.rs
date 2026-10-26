@@ -64,7 +64,7 @@ script_mod! {
             padding: 0, margin: Inset{left: 2, right: 2}
             draw_text +: {
                 text_style: TITLE_TEXT {font_size: 12},
-                color: #000
+                color: (COLOR_TEXT)
             }
         }
         titles := View {
@@ -291,12 +291,12 @@ script_mod! {
             padding: Inset{top: 5, bottom: 5, left: 10, right: 10}
             icon_walk: Walk{width: 0, height: 0, margin: 0}
             draw_bg +: {
-                color: #xF2F4F8E0
-                color_hover: #xE6E9EFF2
-                color_down: #xD8DCE6F2
-                border_color: #x00000022
-                border_color_hover: #x00000033
-                border_color_down: #x00000044
+                color: (COLOR_PANE_CHIP_BG)
+                color_hover: (COLOR_PANE_CHIP_BG_HOVER)
+                color_down: (COLOR_PANE_CHIP_BG_DOWN)
+                border_color: (COLOR_PANE_CHIP_BORDER)
+                border_color_hover: (COLOR_PANE_CHIP_BORDER_HOVER)
+                border_color_down: (COLOR_PANE_CHIP_BORDER_DOWN)
                 border_size: 1.0
             }
         }
@@ -580,6 +580,13 @@ struct MiniAppChip {
     button: WidgetRef,
 }
 
+/// Returns the text of the given mini-app's chip: its glyph and name.
+fn chip_text(app_id: &str) -> String {
+    let glyph = mini_app_panes::app_glyph(app_id).unwrap_or_default();
+    let name = mini_app_panes::app_name(app_id).unwrap_or_else(|| app_id.to_string());
+    format!("{glyph} {name}").trim().to_string()
+}
+
 #[derive(Script, Widget)]
 pub struct RoomPaneDock {
     #[deref] view: View,
@@ -622,6 +629,12 @@ impl ScriptHook for RoomPaneDock {
             }
             self.panes[index].button_cols = 0;
         }
+        // Likewise for our chips, which are built from their own template.
+        if let Some(template) = self.mini_app_chip {
+            for chip in &mut self.chips {
+                chip.button.script_apply(vm, apply, scope, template);
+            }
+        }
         vm.with_cx_mut(|cx| {
             for index in 0..self.panes.len() {
                 set_pane_header(cx, &self.panes[index].frame, &self.panes[index].kind);
@@ -629,6 +642,9 @@ impl ScriptHook for RoomPaneDock {
                 let (title_width, title_two_line_width) = measure_title_widths(cx, &self.panes[index].frame);
                 self.panes[index].title_width = title_width;
                 self.panes[index].title_two_line_width = title_two_line_width;
+            }
+            for chip in &self.chips {
+                chip.button.set_text(cx, &chip_text(&chip.app_id));
             }
         });
     }
@@ -1035,9 +1051,7 @@ impl RoomPaneDock {
                 error!("BUG: missing the mini-app chip template");
                 return;
             }
-            let glyph = mini_app_panes::app_glyph(&app_id).unwrap_or_default();
-            let name = mini_app_panes::app_name(&app_id).unwrap_or_else(|| app_id.clone());
-            button.set_text(cx, format!("{glyph} {name}").trim());
+            button.set_text(cx, &chip_text(&app_id));
             cx.widget_tree_insert_child_deep(
                 self.widget_uid(),
                 LiveId::from_str(&format!("room_pane_chip_{app_id}")),

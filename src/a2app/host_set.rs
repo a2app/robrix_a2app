@@ -17,13 +17,13 @@ script_mod! {
         padding: 0, margin: 0, spacing: 0
         align: Align{x: 0.5, y: 0.5}
         icon_walk: Walk{width: 16, height: 16, margin: 0}
-        draw_icon.color: #666
+        draw_icon.color: (COLOR_TEXT_MUTED)
         draw_bg +: {
             border_size: 0
             border_radius: 6.0
-            color: #0000
-            color_hover: #00000012
-            color_down: #00000022
+            color: (COLOR_TRANSPARENT)
+            color_hover: (COLOR_FLAT_ICON_BUTTON_BG_HOVER)
+            color_down: (COLOR_FLAT_ICON_BUTTON_BG_DOWN)
         }
     }
 
@@ -34,9 +34,8 @@ script_mod! {
         width: Fill, height: Fill
     }
 
-    // A mini-app's chrome-less host: the Splash child owns the isolate.
-    // Splash apps style themselves for a dark backdrop, and the glass kit
-    // samples the scene beneath it, so the dark fill must actually paint.
+    // A mini-app's chrome-less host: the Splash child owns the isolate. Its fill is
+    // the palette's `surface`, which the glass kit samples, so it must actually paint.
     mod.widgets.MiniAppHost = View {
         width: Fill, height: Fill
         flow: Down

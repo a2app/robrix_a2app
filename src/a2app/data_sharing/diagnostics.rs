@@ -225,9 +225,7 @@ impl DataSharing {
             .filter(|snapshot| snapshot.context.account() == self.account).collect::<Vec<_>>();
         let previous = self.selected_context(cx).ok().cloned();
         if self.snapshots != snapshots {
-            let labels = std::iter::once("Choose a mini-app or agent".into())
-                .chain(snapshots.iter().map(|snapshot| format!("{}{}", self.context_choice_label(&snapshot.context), if snapshot.epoch == 0 { " (stopped)" } else { "" }))).collect();
-            self.view.drop_down2(cx, ids!(context_choice)).set_labels(cx, labels);
+            self.view.drop_down2(cx, ids!(context_choice)).set_labels(cx, self.context_choice_labels(&snapshots));
             let index = previous.as_ref().and_then(|context| snapshots.iter().position(|snapshot| &snapshot.context == context)).map(|index| index + 1).unwrap_or(0);
             self.snapshots = snapshots;
             self.view.drop_down2(cx, ids!(context_choice)).set_selected_item(cx, index);
@@ -543,6 +541,12 @@ impl DataSharing {
 
     pub(super) fn room_name<'a>(&'a self, room: &'a str) -> &'a str {
         self.rooms.iter().find(|(id, _)| id == room).map(|(_, name)| name.as_str()).unwrap_or(room)
+    }
+
+    /// The context dropdown's prompt, then one choice per saved context.
+    pub(super) fn context_choice_labels(&self, snapshots: &[ContextSnapshot]) -> Vec<String> {
+        std::iter::once("Choose a mini-app or agent".into())
+            .chain(snapshots.iter().map(|snapshot| format!("{}{}", self.context_choice_label(&snapshot.context), if snapshot.epoch == 0 { " (stopped)" } else { "" }))).collect()
     }
 
     pub(super) fn context_choice_label(&self, context: &ContextId) -> String {

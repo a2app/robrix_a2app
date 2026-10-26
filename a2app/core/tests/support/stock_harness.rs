@@ -82,6 +82,7 @@ impl Harness {
         std::fs::create_dir(&root).unwrap();
         let mut cx = Cx::new(Box::new(|_, _| {}));
         cx.with_vm(makepad_widgets::script_mod);
+        a2app_core::palette::use_light_theme();
         Self {
             cx, broker: Broker::new(), apps: AppRegistry::default(), permissions: PermissionStore::default(),
             flow: RefCell::new(Registry::open(&root).unwrap()), contexts: HashMap::new(), panes: HashMap::new(), foreground_app: None,

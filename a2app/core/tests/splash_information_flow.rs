@@ -1678,6 +1678,7 @@ fn unknown_service_is_refused_before_host_side_effects() {
 fn native_requests_and_resource_aliases_cannot_bypass_the_broker() {
     let mut cx = Cx::new(Box::new(|_, _| {}));
     cx.with_vm(makepad_widgets::script_mod);
+    a2app_core::palette::use_light_theme();
     let isolate = cx.alloc_splash_vm_with_host_io();
     // With a network runtime present, only the host I/O guards can refuse these calls.
     makepad_widgets::widget_async::with_isolate(&mut cx, isolate, |cx| {
@@ -1745,6 +1746,7 @@ fn public_fetch_builtin_runs_with_real_vm_and_host_callback() {
     let stock = a2app_core::builtin::stock("public-web").expect("public worker sample is installed");
     let mut cx = Cx::new(Box::new(|_, _| {}));
     cx.with_vm(makepad_widgets::script_mod);
+    a2app_core::palette::use_light_theme();
     let errors = makepad_widgets::splash::validate_splash_body_with_host_io(&mut cx, &stock.source);
     assert!(errors.is_empty(), "public worker sample failed strict validation: {errors:?}");
     let host = cx.with_vm(|vm| {

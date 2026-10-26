@@ -39,6 +39,7 @@ use crate::shared::speech_text_input::SpeechTextInputWidgetExt;
 use crate::shared::password_input::PasswordTextInputWidgetExt;
 use crate::shared::room_picker_modal::{RoomPickerContent, RoomPickerModalAction};
 use crate::shared::hover_highlight::handle_hover_hit_with_test;
+use crate::settings::app_preferences::{Appearance, AppearanceGlobal};
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -76,7 +77,7 @@ script_mod! {
                 padding: 0, margin: 0
                 draw_text +: {
                     text_style: TITLE_TEXT {font_size: 20},
-                    color: #000
+                    color: (COLOR_TEXT_TITLE)
                 }
             }
         }
@@ -105,7 +106,7 @@ script_mod! {
                     padding: Inset{top: 2, bottom: 2, left: 4, right: 4}, margin: 0
                     draw_text +: {
                         text_style: theme.font_bold {font_size: 9},
-                        color: (COLOR_ACTIVE_PRIMARY)
+                        color: (COLOR_MINI_APP_ACCENT_TEXT)
                     }
                     text: "NEW"
                 }
@@ -184,7 +185,7 @@ script_mod! {
 
         // The state label's color for each permission state.
         state_color_allowed: (COLOR_FG_ACCEPT_GREEN)
-        state_color_ask: (COLOR_ACTIVE_PRIMARY)
+        state_color_ask: (COLOR_MINI_APP_ACCENT_TEXT)
         state_color_blocked: (COLOR_FG_DANGER_RED)
         state_color_inactive: (COLOR_FG_DISABLED)
 
@@ -193,7 +194,7 @@ script_mod! {
             padding: 0, margin: 0
             draw_text +: {
                 text_style: TITLE_TEXT {font_size: 14},
-                color: #000
+                color: (COLOR_TEXT_TITLE)
             }
         }
         View {
@@ -249,7 +250,7 @@ script_mod! {
 
         // The state label's color for each permission state.
         state_color_allowed: (COLOR_FG_ACCEPT_GREEN)
-        state_color_ask: (COLOR_ACTIVE_PRIMARY)
+        state_color_ask: (COLOR_MINI_APP_ACCENT_TEXT)
         state_color_blocked: (COLOR_FG_DANGER_RED)
         state_color_inactive: (COLOR_FG_DISABLED)
 
@@ -429,7 +430,7 @@ script_mod! {
             border_color_active: (COLOR_ACTIVE_PRIMARY_DARKER)
             border_color_focus: (COLOR_ACTIVE_PRIMARY_DARKER)
             border_color_down: (COLOR_ACTIVE_PRIMARY_DARKER)
-            mark_color: vec4(0.0, 0.0, 0.0, 0.0)
+            mark_color: (COLOR_TRANSPARENT)
             mark_color_active: (COLOR_ACTIVE_PRIMARY_DARKER)
         }
     }
@@ -440,7 +441,7 @@ script_mod! {
         flow: Flow.Right{wrap: true}
         padding: 0
         font_size: 10
-        font_color: #666
+        font_color: (COLOR_TEXT_MUTED)
         text_style_normal: MESSAGE_TEXT_STYLE { font_size: 10 }
     }
 
@@ -471,7 +472,10 @@ script_mod! {
         align: Align{y: 0.5}
         padding: Inset{top: 7, bottom: 7, left: 16, right: 12}
         grab_key_focus: false
-        draw_bg +: { color: #0000, border_radius: 5.0 }
+        draw_bg +: { color: (COLOR_TRANSPARENT), border_radius: 5.0 }
+        // The detail's colors for a provider to set up and for the one in use.
+        setup_color: (COLOR_ACTIVE_PRIMARY_DARKER)
+        in_use_color: (COLOR_FG_ACCEPT_GREEN)
 
         View {
             width: Fill, height: Fit
@@ -496,9 +500,9 @@ script_mod! {
                     draw_bg +: {
                         border_radius: 10.0
                         border_size: 0.5
-                        border_color: (COLOR_ACTIVE_PRIMARY_DARKER)
-                        border_color_hover: #0C5DAA
-                        border_color_down: #0C5DAA
+                        border_color: (COLOR_ACTIVE_PRIMARY_HOVER)
+                        border_color_hover: (COLOR_ACTIVE_PRIMARY_DOWN)
+                        border_color_down: (COLOR_ACTIVE_PRIMARY_DOWN)
                     }
                 }
             }
@@ -527,7 +531,7 @@ script_mod! {
                     text_style_normal: REGULAR_TEXT {font_size: 10}
                     text_style_fixed: theme.font_code {font_size: 10}
                     draw_text +: { color: (MESSAGE_TEXT_COLOR) }
-                    draw_block +: { code_color: #xededed }
+                    draw_block +: { code_color: (COLOR_ROOM_PREVIEW_CODE_BG) }
                     inline_code_padding: Inset{left: 3, right: 3, top: 1, bottom: 1}
                     inline_code_margin: 0
                     fixed_font_size_scale: 1.0
@@ -568,7 +572,7 @@ script_mod! {
                 off: AnimatorState {
                     redraw: true
                     from: {all: Snap}
-                    apply: { draw_bg: {color: #0000} }
+                    apply: { draw_bg: {color: (COLOR_TRANSPARENT)} }
                 }
                 on: AnimatorState {
                     redraw: true
@@ -599,7 +603,7 @@ script_mod! {
     mod.widgets.MiniAppStepSpinner = #(StepSpinner::register_widget(vm)) {
         width: 16, height: 16
         draw_bg +: {
-            color: uniform(COLOR_ACTIVE_PRIMARY)
+            color: uniform(COLOR_MINI_APP_ACCENT_TEXT)
             rotation: instance(0.0)
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
@@ -696,7 +700,7 @@ script_mod! {
                     align: Align{y: 0.5}
                     Icon {
                         icon_walk: Walk{width: 16, height: 16, margin: 0}
-                        draw_icon +: { svg: (ICON_SPARKLE), color: (COLOR_ROBRIX_PURPLE) }
+                        draw_icon +: { svg: (ICON_SPARKLE), color: (COLOR_TEXT_PURPLE) }
                     }
                     SubsectionLabel { text: "Create or modify a mini-app", margin: 0 }
                 }
@@ -778,7 +782,7 @@ script_mod! {
                     show_bg: true
                     draw_bg +: {
                         // A tinted strip, so it doesn't read as another text field.
-                        color: #xDFE9FB
+                        color: (COLOR_MINI_APPS_INTENT_HINT_BG)
                         border_size: 0.0
                         border_radius: 6.0
                     }
@@ -786,7 +790,7 @@ script_mod! {
                         width: Fit, height: Fit
                         Icon {
                             icon_walk: Walk{width: 14, height: 14, margin: 0}
-                            draw_icon +: { svg: (ICON_EDIT), color: (COLOR_ACTIVE_PRIMARY) }
+                            draw_icon +: { svg: (ICON_EDIT), color: (COLOR_MINI_APP_ACCENT_TEXT) }
                         }
                     }
                     intent_create_icon := View {
@@ -821,13 +825,13 @@ script_mod! {
                             icon_walk: Walk{width: 0, height: 0, margin: 0}
                             draw_bg +: {
                                 color: (COLOR_TRANSPARENT)
-                                color_hover: #x0F88FE1A
-                                color_down: #x0F88FE33
+                                color_hover: (COLOR_MINI_APPS_INTENT_SWITCH_BG_HOVER)
+                                color_down: (COLOR_MINI_APPS_INTENT_SWITCH_BG_DOWN)
                             }
                             draw_text +: {
-                                color: (COLOR_ACTIVE_PRIMARY)
-                                color_hover: (COLOR_ACTIVE_PRIMARY_DARKER)
-                                color_down: (COLOR_ACTIVE_PRIMARY_DARKER)
+                                color: (COLOR_MINI_APP_ACCENT_TEXT)
+                                color_hover: (COLOR_MINI_APPS_INTENT_SWITCH_TEXT_HOVER)
+                                color_down: (COLOR_MINI_APPS_INTENT_SWITCH_TEXT_HOVER)
                             }
                             text: "Create a new app instead"
                         }
@@ -975,7 +979,7 @@ script_mod! {
                     align: Align{y: 0.5}
                     Icon {
                         icon_walk: Walk{width: 16, height: 16, margin: 0}
-                        draw_icon +: { svg: (ICON_ROTATE_CW), color: (COLOR_ROBRIX_PURPLE) }
+                        draw_icon +: { svg: (ICON_ROTATE_CW), color: (COLOR_TEXT_PURPLE) }
                     }
                     SubsectionLabel { width: Fill, text: "Background mini-apps", margin: 0 }
                 }
@@ -1062,7 +1066,7 @@ script_mod! {
                     padding: 0, margin: 0
                     draw_text +: {
                         text_style: TITLE_TEXT {font_size: 22},
-                        color: #000
+                        color: (COLOR_TEXT_TITLE)
                     }
                 }
                 View {
@@ -1792,28 +1796,28 @@ script_mod! {
                 DiffAdded := View {
                     width: Fill, height: Fit
                     show_bg: true
-                    draw_bg +: { color: #xE6FFEC }
+                    draw_bg +: { color: (COLOR_MINI_APPS_DIFF_ADDED_BG) }
                     line := Label {
                         width: Fill, height: Fit
                         padding: Inset{top: 1, bottom: 1, left: 6, right: 6}
                         margin: 0
                         draw_text +: {
                             text_style: MESSAGE_TEXT_STYLE {font_size: 9.5},
-                            color: #x116329
+                            color: (COLOR_MINI_APPS_DIFF_ADDED_TEXT)
                         }
                     }
                 }
                 DiffRemoved := View {
                     width: Fill, height: Fit
                     show_bg: true
-                    draw_bg +: { color: #xFFEBE9 }
+                    draw_bg +: { color: (COLOR_MINI_APPS_DIFF_REMOVED_BG) }
                     line := Label {
                         width: Fill, height: Fit
                         padding: Inset{top: 1, bottom: 1, left: 6, right: 6}
                         margin: 0
                         draw_text +: {
                             text_style: MESSAGE_TEXT_STYLE {font_size: 9.5},
-                            color: #x82071E
+                            color: (COLOR_MINI_APPS_DIFF_REMOVED_TEXT)
                         }
                     }
                 }
@@ -1901,21 +1905,24 @@ pub(super) enum MiniAppRowAction {
     None,
 }
 
-#[derive(Script, ScriptHook, Widget)]
+#[derive(Script, Widget)]
 pub struct MiniAppRow {
     #[deref] view: View,
     #[rust] app_id: MiniAppId,
-    /// The tint the tile was last given; the screen redraws often while a generation runs.
-    #[rust] tile_tint: Option<u32>,
+    /// The color the tile was last given; the screen redraws often while a generation runs.
+    #[rust] tile_color: Option<Vec4f>,
+}
+
+impl ScriptHook for MiniAppRow {
+    // A reload puts the tile's DSL color back, even in a closed picker that gets no events.
+    fn on_after_reload(&mut self, _vm: &mut ScriptVm) {
+        self.tile_color = None;
+    }
 }
 
 impl Widget for MiniAppRow {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
-        // A reapply puts the tile's DSL color back.
-        if matches!(event, Event::ScriptReapply | Event::LiveEdit) {
-            self.tile_tint = None;
-        }
         if let Event::Actions(actions) = event {
             if self.view.button(cx, ids!(row_open_button)).clicked(actions) {
                 cx.widget_action(self.widget_uid(), MiniAppRowAction::OpenApp(self.app_id.clone()));
@@ -1952,17 +1959,32 @@ impl MiniAppRow {
         self.view.widget(cx, ids!(row_summary)).set_visible(cx, !row.summary.is_empty());
         self.view.widget(cx, ids!(row_update_badge)).set_visible(cx, row.has_update);
         self.view.button(cx, ids!(row_open_button)).set_text(cx, row.open_label);
-        // The tile is the app's tint at a pastel strength.
-        let tint = row.tint;
-        if self.tile_tint == Some(tint) {
+        let is_dark = cx.get_global_ref::<AppearanceGlobal>().is_some_and(|appearance| appearance.0 == Appearance::Dark);
+        let tile = tile_color(row.tint, is_dark);
+        if self.tile_color == Some(tile) {
             return;
         }
-        self.tile_tint = Some(tint);
-        let channel = |shift: u32| ((tint >> shift) & 0xff) as f32 / 255.0;
-        let tile = vec4(channel(16), channel(8), channel(0), 0.16);
+        self.tile_color = Some(tile);
         let mut row_tile = self.view.view(cx, ids!(row_tile));
         script_apply_eval!(cx, row_tile, { draw_bg +: { color: #(tile) } });
     }
+}
+
+/// A dark tile's gray, a step above the pane, and the share of its tint's chroma it keeps.
+const DARK_TILE_LEVEL: f32 = 0.22;
+const DARK_TILE_CHROMA: f32 = 0.3;
+
+/// An app's tile: its tint at a pastel strength, or in dark mode a deep, muted shade of it
+/// at one level, so the glyph stays readable and even a black or white tint shows.
+fn tile_color(tint: u32, is_dark: bool) -> Vec4f {
+    let channel = |shift: u32| ((tint >> shift) & 0xff) as f32 / 255.0;
+    let (red, green, blue) = (channel(16), channel(8), channel(0));
+    if !is_dark {
+        return vec4(red, green, blue, 0.16);
+    }
+    let gray = (red + green + blue) / 3.0;
+    let shade = |value: f32| (DARK_TILE_LEVEL + (value - gray) * DARK_TILE_CHROMA).clamp(0.0, 1.0);
+    vec4(shade(red), shade(green), shade(blue), 1.0)
 }
 
 /// Shared presentation data for the management screen and the room/space picker.
@@ -2239,19 +2261,26 @@ fn claude_code_detail(status: a2app_agent::claude_code::Status) -> &'static str 
     }
 }
 
-fn provider_detail_html(detail: &str, has_key: bool, active: bool) -> String {
+/// `setup_color` and `in_use_color` are HTML colors, such as `#106fcc`.
+fn provider_detail_html(detail: &str, has_key: bool, active: bool, setup_color: &str, in_use_color: &str) -> String {
     if !has_key && let Some(hint) = detail.strip_prefix("Tap to set up · key looks like ") {
-        return format!("<font color=\"#106fcc\">Tap to set up</font> · key looks like <code>{}</code>", htmlize::escape_text(hint));
+        return format!("<font color=\"{setup_color}\">Tap to set up</font> · key looks like <code>{}</code>", htmlize::escape_text(hint));
     }
     if active {
         for status in ["In use now", "In use"] {
             if let Some(rest) = detail.strip_prefix(status).and_then(|rest| rest.strip_prefix(" · ")) {
-                return format!("<font color=\"#138808\">✅ {status}</font> · {}", htmlize::escape_text(rest));
+                return format!("<font color=\"{in_use_color}\">✅ {status}</font> · {}", htmlize::escape_text(rest));
             }
         }
     }
     let detail = htmlize::escape_text(detail);
-    if has_key { detail.into_owned() } else { format!("<font color=\"#106fcc\">{detail}</font>") }
+    if has_key { detail.into_owned() } else { format!("<font color=\"{setup_color}\">{detail}</font>") }
+}
+
+/// A color as `#rrggbb`, for an HTML `color` attribute.
+fn html_color(color: Vec4f) -> String {
+    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", channel(color.x), channel(color.y), channel(color.z))
 }
 
 #[derive(Script, ScriptHook, Widget, Animator)]
@@ -2259,6 +2288,8 @@ pub struct MiniAppProviderRow {
     #[source] source: ScriptObjectRef,
     #[deref] view: View,
     #[apply_default] animator: Animator,
+    #[live] setup_color: Vec4f,
+    #[live] in_use_color: Vec4f,
     #[rust] provider_id: String,
     #[rust] has_key: bool,
     #[rust] editable: bool,
@@ -2378,7 +2409,9 @@ impl MiniAppProviderRow {
         self.editable = editable;
         self.view.label(cx, ids!(provider_name)).set_text(cx, label);
         let mut detail_html = self.view.html(cx, ids!(provider_detail));
-        detail_html.set_text(cx, &provider_detail_html(detail, has_key, active));
+        // Rebuilt on every draw, so a reload's new colors land in the markup too.
+        let html = provider_detail_html(detail, has_key, active, &html_color(self.setup_color), &html_color(self.in_use_color));
+        detail_html.set_text(cx, &html);
         self.view.widget(cx, ids!(provider_pick)).set_visible(cx, has_key);
         self.view.radio_button(cx, ids!(provider_pick)).set_active(cx, has_key && active, Animate::No);
         self.view.widget(cx, ids!(provider_add)).set_visible(cx, !has_key);
@@ -2575,7 +2608,7 @@ enum AccessView {
     AgentPermissions,
 }
 
-#[derive(Script, ScriptHook, Widget)]
+#[derive(Script, Widget)]
 pub struct MiniAppsScreen {
     #[deref] view: View,
     #[rust] pane: Pane,
@@ -2629,6 +2662,14 @@ pub struct MiniAppsScreen {
     #[rust] approval_details_key: Option<AccessRuleKey>,
 }
 
+impl ScriptHook for MiniAppsScreen {
+    // A reload puts back the DSL's console height and hint layout; the next draw redoes both.
+    fn on_after_reload(&mut self, _vm: &mut ScriptVm) {
+        self.console_height = -1.0;
+        self.is_intent_stacked = false;
+    }
+}
+
 impl Widget for MiniAppsScreen {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         if let Event::Actions(actions) = event
@@ -2679,13 +2720,6 @@ impl Widget for MiniAppsScreen {
         {
             self.view.redraw(cx);
         }
-        // A reapply puts back the DSL's console height and hint layout; the next draw redoes both.
-        if matches!(event, Event::ScriptReapply | Event::LiveEdit) {
-            self.console_height = -1.0;
-            self.is_intent_stacked = false;
-            self.view.redraw(cx);
-        }
-
         if self.cancel_scope.as_ref().is_some_and(|scope| cx.owns_cancel(scope))
             && (event.back_pressed()
                 || matches!(event, Event::KeyUp(key) if key.key_code == KeyCode::Escape)
@@ -6314,5 +6348,122 @@ mod create_card_tests {
         assert_eq!(screen.view.widget(&cx, ids!(generate_button)).text(), "Modify app");
         assert!(screen.view.widget(&cx, ids!(intent_hint)).visible());
         assert!(screen.is_card_reveal_pending && screen.is_prompt_focus_pending);
+    }
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+
+    /// Runs Robrix's styles for `appearance` in the app's order, as a start or a switch does.
+    fn styles(vm: &mut ScriptVm, appearance: Appearance) {
+        makepad_widgets::theme_mod(vm);
+        match appearance {
+            Appearance::Light => script_eval!(vm, { mod.theme = mod.themes.light }),
+            Appearance::Dark => script_eval!(vm, { mod.theme = mod.themes.dark }),
+        };
+        makepad_widgets::widgets_mod(vm);
+        makepad_code_editor::script_mod(vm);
+        crate::shared::script_mod(vm, appearance);
+        crate::a2app::script_mod(vm);
+    }
+
+    #[test]
+    fn tiles_are_pastel_in_light_and_deep_in_dark() {
+        let channel = |value: u32| value as f32 / 255.0;
+        assert_eq!(tile_color(0x0F88FE, false), vec4(channel(0x0F), channel(0x88), channel(0xFE), 0.16));
+        // Every dark tile sits one level above the pane, so a black or white tint shows too.
+        assert!(DARK_TILE_LEVEL > channel(0x26));
+        for tint in [0x0F88FE, 0xD9822B, 0xC2255C, 0x546E7A, 0xFFD700, 0x000000, 0xFFFFFF] {
+            let tile = tile_color(tint, true);
+            assert!(((tile.x + tile.y + tile.z) / 3.0 - DARK_TILE_LEVEL).abs() < 1e-5, "{tint:06X}: {tile:?}");
+            assert_eq!(tile.w, 1.0);
+        }
+        // ...and keeps its tint's hue.
+        let blue = tile_color(0x0F88FE, true);
+        assert!(blue.z > blue.y && blue.y > blue.x);
+        let orange = tile_color(0xD9822B, true);
+        assert!(orange.x > orange.y && orange.y > orange.z);
+    }
+
+    #[test]
+    fn switching_appearance_recolors_an_app_tile() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.set_global(AppearanceGlobal(Appearance::Light));
+        let row = cx.with_vm(|vm| {
+            styles(vm, Appearance::Light);
+            let value = script_eval!(vm, { mod.widgets.MiniAppRow {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let data = MiniAppRowData {
+            id: "search".into(), icon: "🔍".into(), name: "Search".into(), detail: String::new(),
+            summary: String::new(), has_update: false, tint: 0x0F88FE, open_label: "Open",
+        };
+        let tile = |cx: &mut Cx| {
+            let mut color = [0.0; 4];
+            row.view(cx, ids!(row_tile)).borrow().unwrap().draw_bg.get_instance(cx, id!(color), &mut color);
+            vec4(color[0], color[1], color[2], color[3])
+        };
+        row.borrow_mut::<MiniAppRow>().unwrap().populate(&mut cx, &data);
+        assert_eq!(tile(&mut cx), tile_color(data.tint, false));
+
+        // A reapply puts the tile's DSL color back, so the next populate must not skip it as cached,
+        // even when the appearance stays the same (as on a rotation's re-bake).
+        for appearance in [Appearance::Dark, Appearance::Dark] {
+            cx.global::<AppearanceGlobal>().0 = appearance;
+            cx.with_vm(|vm| {
+                let value = vm.with_reload(|vm| { styles(vm, appearance); script_eval!(vm, { mod.widgets.MiniAppRow {} }) });
+                row.clone().script_apply(vm, &Apply::ScriptReapply, &mut Scope::empty(), value);
+            });
+            row.borrow_mut::<MiniAppRow>().unwrap().populate(&mut cx, &data);
+            assert_eq!(tile(&mut cx), tile_color(data.tint, true));
+        }
+    }
+
+    #[test]
+    fn a_reload_redoes_the_console_height_and_hint_layout() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let screen = cx.with_vm(|vm| {
+            styles(vm, Appearance::Light);
+            let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        {
+            let mut inner = screen.borrow_mut::<MiniAppsScreen>().unwrap();
+            inner.console_height = 120.0;
+            inner.is_intent_stacked = true;
+        }
+        // Even with the screen's page hidden, which gets no reload event.
+        cx.with_vm(|vm| {
+            let value = vm.with_reload(|vm| { styles(vm, Appearance::Dark); script_eval!(vm, { mod.widgets.MiniAppsScreen {} }) });
+            screen.clone().script_apply(vm, &Apply::ScriptReapply, &mut Scope::empty(), value);
+        });
+        let inner = screen.borrow::<MiniAppsScreen>().unwrap();
+        assert_eq!(inner.console_height, -1.0);
+        assert!(!inner.is_intent_stacked);
+    }
+
+    #[test]
+    fn provider_details_take_the_appearance_colors() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let row = cx.with_vm(|vm| {
+            styles(vm, Appearance::Light);
+            let value = script_eval!(vm, { mod.widgets.MiniAppProviderRow {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let detail = |cx: &mut Cx, is_active: bool| {
+            let text = if is_active { "In use · gpt-5" } else { "Tap to set up · key looks like sk-…" };
+            row.borrow_mut::<MiniAppProviderRow>().unwrap().populate(cx, "openai", "OpenAI", text, is_active, is_active, true);
+            row.widget(cx, ids!(provider_detail)).text()
+        };
+        // Light keeps the colors these details always had.
+        assert!(detail(&mut cx, false).starts_with("<font color=\"#106fcc\">Tap to set up</font>"));
+        assert!(detail(&mut cx, true).starts_with("<font color=\"#138808\">✅ In use</font>"));
+        cx.with_vm(|vm| {
+            let value = vm.with_reload(|vm| { styles(vm, Appearance::Dark); script_eval!(vm, { mod.widgets.MiniAppProviderRow {} }) });
+            row.clone().script_apply(vm, &Apply::ScriptReapply, &mut Scope::empty(), value);
+        });
+        assert!(detail(&mut cx, false).starts_with("<font color=\"#5aabff\">Tap to set up</font>"));
+        assert!(detail(&mut cx, true).starts_with("<font color=\"#4ac25b\">✅ In use</font>"));
     }
 }

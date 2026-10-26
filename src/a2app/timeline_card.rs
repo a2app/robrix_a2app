@@ -32,7 +32,7 @@ script_mod! {
 
         show_bg: true
         draw_bg +: {
-            color: #F6F8F9
+            color: (COLOR_SETTINGS_LIST_BG)
             border_color: (COLOR_DIVIDER_DARK)
             border_size: 1.0
             border_radius: 4.0
@@ -48,7 +48,7 @@ script_mod! {
                 padding: 0, margin: 0
                 draw_text +: {
                     text_style: TITLE_TEXT {font_size: 24},
-                    color: #000
+                    color: (COLOR_TEXT_TITLE)
                 }
             }
             View {
@@ -119,9 +119,10 @@ script_mod! {
             width: Fill, height: Fit
             new_batch: true
             show_bg: true
+            // The palette's `surface` and `card_border`, as the generated content's cards use.
             draw_bg +: {
-                color: #xFFFFFF
-                border_color: #xDDE1EA
+                color: (COLOR_PRIMARY)
+                border_color: (COLOR_MINI_APP_CARD_BORDER)
                 border_size: 1.0
                 border_radius: 6.0
             }

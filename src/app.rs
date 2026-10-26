@@ -917,11 +917,6 @@ impl AppMain for App {
             Appearance::Light => script_eval!(vm, { mod.theme = mod.themes.light }),
             Appearance::Dark => script_eval!(vm, { mod.theme = mod.themes.dark }),
         };
-        // Mini-app isolates boot on the host's theme.
-        makepad_widgets::set_splash_theme(match appearance {
-            Appearance::Light => makepad_widgets::SplashTheme::Light,
-            Appearance::Dark => makepad_widgets::SplashTheme::Dark,
-        });
         makepad_widgets::widgets_mod(vm);
         // Complete an explicitly selected Makepad style before Robrix overrides it.
         makepad_widgets::desktop_style::apply_widgets(vm);
@@ -1697,4 +1692,38 @@ pub enum ConfirmDeleteAction {
     /// and that that one entity can take ownership of the content object,
     /// which avoids having to clone it.
     Show(RefCell<Option<ConfirmationModalContent>>),
+}
+
+#[cfg(test)]
+mod appearance_tests {
+    use super::*;
+
+    thread_local! {
+        static ERRORS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn record_error(message: &str, level: LogLevel) {
+        if level == LogLevel::Error {
+            ERRORS.with(|errors| errors.borrow_mut().push(message.into()));
+        }
+    }
+
+    /// The whole UI evaluates and builds cleanly on either appearance,
+    /// as it must for the user to switch between them.
+    #[test]
+    fn ui_builds_cleanly_on_both_appearances() {
+        set_log_tap(Some(record_error));
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            let mut cx = Cx::new(Box::new(|_, _| {}));
+            cx.init_cx_os();
+            cx.set_global(AppearanceGlobal(appearance));
+            cx.set_global(AppPreferencesGlobal::default());
+            cx.with_vm(|vm| {
+                let value = <App as AppMain>::script_mod(vm);
+                let _app = App::script_from_value(vm, value);
+            });
+            let errors = ERRORS.with(|errors| std::mem::take(&mut *errors.borrow_mut()));
+            assert!(errors.is_empty(), "{appearance:?}:\n{}", errors.join("\n"));
+        }
+    }
 }

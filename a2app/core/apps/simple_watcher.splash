@@ -186,6 +186,8 @@ fn subscribe(){
             show_header()
             render_hits()
         } else { show_status() }
+        // Sends what a theme switch left queued; nothing is queued otherwise.
+        run_next_action()
     })
 }
 
@@ -500,36 +502,36 @@ let PrimaryButton = Button{
     padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
     draw_bg +: {
         border_size: 0.0 border_radius: 4.0
-        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color: theme.palette.accent color_hover: theme.palette.accent_hover color_down: theme.palette.accent_down color_focus: theme.palette.accent
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+    draw_text +: { color: theme.palette.on_accent color_hover: theme.palette.on_accent color_down: theme.palette.on_accent color_focus: theme.palette.on_accent text_style: theme.font_regular{font_size: 10} }
 }
 let NeutralButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
-        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.neutral_border border_color_hover: theme.palette.neutral_border border_color_down: theme.palette.neutral_border border_color_focus: theme.palette.neutral_border
+        color: theme.palette.neutral color_hover: theme.palette.neutral_hover color_down: theme.palette.neutral_down color_focus: theme.palette.neutral }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title }
 }
 let GhostButton = PrimaryButton{
     padding: Inset{left: 6 right: 6 top: 4 bottom: 4}
     margin: Inset{left: -6}
-    draw_bg +: { border_size: 0.0 color: #xFFFFFF00 color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF00 }
-    draw_text +: { color: #x66708F color_hover: #x1C274C color_down: #x1C274C color_focus: #x66708F }
+    draw_bg +: { border_size: 0.0 color: theme.palette.transparent color_hover: theme.palette.card color_down: theme.palette.pressed color_focus: theme.palette.transparent }
+    draw_text +: { color: theme.palette.muted color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.muted }
 }
 let NegativeButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #xDC0005 border_color_hover: #xDC0005 border_color_down: #xDC0005 border_color_focus: #xDC0005
-        color: #xFFF0F0 color_hover: #xF0D4D4 color_down: #xE0B8B8 color_focus: #xFFF0F0 }
-    draw_text +: { color: #xDC0005 color_hover: #xDC0005 color_down: #xDC0005 color_focus: #xDC0005 }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.danger border_color_hover: theme.palette.danger border_color_down: theme.palette.danger border_color_focus: theme.palette.danger
+        color: theme.palette.danger_bg color_hover: theme.palette.danger_bg_hover color_down: theme.palette.danger_bg_down color_focus: theme.palette.danger_bg }
+    draw_text +: { color: theme.palette.danger color_hover: theme.palette.danger color_down: theme.palette.danger color_focus: theme.palette.danger }
 }
 let Field = TextInput{
     width: Fill height: Fit padding: 10
     draw_bg +: {
         border_radius: 4.0 border_size: 1.0
-        color: #xFFFFFF color_hover: #xFFFFFF color_focus: #xFFFFFF color_down: #xFFFFFF color_empty: #xFFFFFF
-        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_focus: #x106fcc border_color_down: #x106fcc border_color_empty: #xC8C8C8
+        color: theme.palette.surface color_hover: theme.palette.surface color_focus: theme.palette.surface color_down: theme.palette.surface color_empty: theme.palette.surface
+        border_color: theme.palette.border border_color_hover: theme.palette.accent border_color_focus: theme.palette.focus border_color_down: theme.palette.focus border_color_empty: theme.palette.border
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #x333333 color_hover: #x333333 color_focus: #x333333 color_down: #x333333 color_empty: #xBBBBBB color_empty_hover: #x999999 color_empty_focus: #x999999 text_style: theme.font_regular{font_size: 11} }
+    draw_text +: { color: theme.palette.body color_hover: theme.palette.body color_focus: theme.palette.body color_down: theme.palette.body color_empty: theme.palette.placeholder color_empty_hover: theme.palette.placeholder_hover color_empty_focus: theme.palette.placeholder_hover text_style: theme.font_regular{font_size: 11} }
 }
 // A pill; `selected` fills it with the accent color.
 let Chip = PrimaryButton{
@@ -538,35 +540,38 @@ let Chip = PrimaryButton{
     draw_bg +: {
         selected: instance(0.0)
         border_size: 1.0
-        color: #xFFFFFF color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF
-        border_color: #xC8C8C8 border_color_hover: #xC8C8C8 border_color_down: #xC8C8C8 border_color_focus: #xC8C8C8
+        color: theme.palette.surface color_hover: theme.palette.card color_down: theme.palette.pressed color_focus: theme.palette.surface
+        border_color: theme.palette.border border_color_hover: theme.palette.border border_color_down: theme.palette.border border_color_focus: theme.palette.border
+        // Shader colors go through `self`: a palette read in the fn is baked at first compile.
+        color_selected: instance(theme.palette.accent)
         pixel: fn(){
             let sdf = Sdf2d.viewport(self.pos * self.rect_size)
             sdf.box(0.5, 0.5, self.rect_size.x - 1.0, self.rect_size.y - 1.0, min(12.0, self.rect_size.y * 0.5 - 0.5))
             let rest = mix(mix(self.color, self.color_hover, self.hover), self.color_down, self.down)
-            sdf.fill_keep(mix(rest, #x0f88fe, self.selected))
-            sdf.stroke(mix(self.border_color, #x0f88fe, self.selected), 1.0)
+            sdf.fill_keep(mix(rest, self.color_selected, self.selected))
+            sdf.stroke(mix(self.border_color, self.color_selected, self.selected), 1.0)
             return sdf.result
         }
     }
     draw_text +: {
         selected: instance(0.0)
-        color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C
-        get_color: fn(){ return mix(self.color, #xFFFFFF, self.selected) }
+        color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title
+        color_selected: instance(theme.palette.on_accent)
+        get_color: fn(){ return mix(self.color, self.color_selected, self.selected) }
     }
 }
-let Caption = Label{ padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
-let Meta = Label{ padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
-let Body = Label{ padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
-let Dot = Label{ text: "•" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+let Caption = Label{ padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} } }
+let Meta = Label{ padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
+let Body = Label{ padding: 0 margin: 0 draw_text +: { color: theme.palette.body text_style: theme.font_regular{font_size: 11} } }
+let Dot = Label{ text: "•" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
 let EmptyCard = RoundedView{
     width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5}
     padding: Inset{left: 16 right: 16 top: 20 bottom: 20}
-    show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+    show_bg: true draw_bg +: { color: theme.palette.card_subtle border_radius: 8.0 }
 }
 let EmptyEmoji = Label{ padding: 0 margin: 0 draw_text +: { text_style: theme.font_regular{font_size: 28} } }
-let EmptyTitle = Label{ width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} } }
-let EmptyText = Label{ width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+let EmptyTitle = Label{ width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 12.5} } }
+let EmptyText = Label{ width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
 
 // Recent matches, newest first. Wide panes show a second copy in their side column.
 let HitList = View{
@@ -576,21 +581,21 @@ let HitList = View{
         if rows.len() > 0 {
             RoundedView{
                 width: Fill height: Fit flow: Down padding: Inset{left: 12 right: 12 top: 2 bottom: 2}
-                show_bg: true draw_bg +: { color: #xFFFFFF border_radius: 8.0 border_size: 1.0 border_color: #xE0E0E0 }
+                show_bg: true draw_bg +: { color: theme.palette.surface border_radius: 8.0 border_size: 1.0 border_color: theme.palette.card_border }
                 for h in rows {
-                    if !h.first { SolidView{ width: Fill height: 1 draw_bg +: { color: #x00000018 } } }
+                    if !h.first { SolidView{ width: Fill height: 1 draw_bg +: { color: theme.palette.divider } } }
                     View{
                         width: Fill height: Fit flow: Right spacing: 10 padding: Inset{top: 10 bottom: 10}
                         RoundedView{
                             visible: !is_compact width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
-                            show_bg: true draw_bg +: { color: #x52b2ac border_radius: 16.0 }
-                            Label{ text: initial(h.who) padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
+                            show_bg: true draw_bg +: { color: theme.palette.avatar border_radius: 16.0 }
+                            Label{ text: initial(h.who) padding: 0 margin: 0 draw_text +: { color: theme.palette.on_accent text_style: theme.font_bold{font_size: 12} } }
                         }
                         View{
                             width: Fill height: Fit flow: Down spacing: 3
                             View{
                                 width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-                                Label{ text: h.who width: Fill max_lines: 1 text_overflow: TextOverflow.Ellipsis padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} } }
+                                Label{ text: h.who width: Fill max_lines: 1 text_overflow: TextOverflow.Ellipsis padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 11} } }
                                 Meta{ text: h.when }
                             }
                             Body{ text: h.body width: Fill max_lines: 3 text_overflow: TextOverflow.Ellipsis }
@@ -619,6 +624,32 @@ let HitList = View{
 }
 
 let _init = load()
+
+// A theme switch runs this script again from the top, and no resize follows;
+// `resume` picks up the last run's state, which the pane still shows.
+fn saved_state(){
+    return {hits: hits is_wide: is_wide is_compact: is_compact how_open: how_open new_notify: new_notify
+        actions_paused: actions_paused action_queue: action_queue confirm_remove: confirm_remove}
+}
+fn resume(){
+    let last_run = ok{mod.state.saved()}
+    if last_run == nil {
+        mod.state = {saved: saved_state}
+        return nil
+    }
+    mod.state.saved = saved_state
+    hits = last_run.hits
+    is_wide = last_run.is_wide
+    is_compact = last_run.is_compact
+    how_open = last_run.how_open
+    new_notify = last_run.new_notify
+    actions_paused = last_run.actions_paused
+    action_queue = last_run.action_queue
+    confirm_remove = last_run.confirm_remove
+    return nil
+}
+let _resume = resume()
+
 let _boot = start_timeout(0.05, || {
     subscribe()
     ui.rule_list.render()
@@ -638,18 +669,18 @@ View{
             width: Fill height: Fit flow: Down spacing: 4
             summary_wrap := View{
                 width: Fill height: Fit visible: false
-                summary := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
+                summary := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} } }
             }
             status_box := View{
                 width: Fill height: Fit
                 on_render: || {
-                    if status_kind == "ok" { status := Meta{ text: status_text width: Fill draw_text +: { color: #x138808 } } }
-                    if status_kind == "err" { status := Meta{ text: status_text width: Fill draw_text +: { color: #xDC0005 } } }
+                    if status_kind == "ok" { status := Meta{ text: status_text width: Fill draw_text +: { color: theme.palette.success } } }
+                    if status_kind == "err" { status := Meta{ text: status_text width: Fill draw_text +: { color: theme.palette.danger } } }
                     if status_kind == "info" { status := Meta{ text: status_text width: Fill } }
                     if status_kind == "busy" {
                         View{
                             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-                            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
+                            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: theme.palette.accent_text } }
                             status := Meta{ text: status_text width: Fill }
                         }
                     }
@@ -662,7 +693,7 @@ View{
             NeutralButton{ text: "Refresh" on_click: || subscribe() }
         }
     }
-    SolidView{ width: Fill height: 1 draw_bg +: { color: #x00000018 } }
+    SolidView{ width: Fill height: 1 draw_bg +: { color: theme.palette.divider } }
     col := ScrollYView{
         width: Fill height: Fill flow: Down spacing: 12 padding: 14
         View{
@@ -671,7 +702,7 @@ View{
                 width: Fill height: Fit flow: Down spacing: 12
                 RoundedView{
                     width: Fill height: Fit flow: Down spacing: 12 padding: 12
-                    show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                    show_bg: true draw_bg +: { color: theme.palette.card border_radius: 8.0 }
                     Caption{ text: "NEW RULE" }
                     keyword_input := Field{ empty_text: "Keyword to watch for" draw_text +: { max_lines: 1 text_overflow: TextOverflow.Ellipsis } on_return: |t| add_rule() }
                     reply_input := Field{ empty_text: "Auto-reply text (optional)" draw_text +: { max_lines: 1 text_overflow: TextOverflow.Ellipsis } on_return: |t| add_rule() }
@@ -709,10 +740,10 @@ View{
                                 if is_compact { test_text = "Test" }
                                 RoundedView{
                                     width: Fill height: Fit flow: Down spacing: 8 padding: 12
-                                    show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                                    show_bg: true draw_bg +: { color: theme.palette.card border_radius: 8.0 }
                                     View{
                                         width: Fill height: Fit flow: Down spacing: 4
-                                        Label{ text: rule.keyword width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
+                                        Label{ text: rule.keyword width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} } }
                                         if is_compact {
                                             View{
                                                 width: Fill height: Fit flow: Down spacing: 2

@@ -144,10 +144,9 @@ let match_total = 0
 let row_limit = 50
 let chips = []
 let selected_key = ""
-let is_wide = false
-let is_narrow = false
-// Tiny panes stack Refresh and the scan button under their text.
-let is_tiny = false
+// The pane size survives the re-run a theme switch does, which no resize follows;
+// tiny panes stack Refresh and the scan button under their text.
+mod.state = {is_booted: false is_wide: false is_narrow: false is_tiny: false}
 // What link_list draws: the rows, or nothing for a frame while its scroll offset resets.
 let list_rows = []
 let is_list_reset_pending = false
@@ -1300,11 +1299,11 @@ fn row_of(l){
     }
     let site = shorten(l.site, 40)
     if l.is_nav { site = site + " · opens in Robrix" }
-    let bg = #xF7F9FC
-    let edge = #xF7F9FC
+    let bg = theme.palette.card_subtle
+    let edge = theme.palette.card_subtle
     if l.key == selected_key {
-        bg = #xE4EEFF
-        edge = #x0f88fe
+        bg = theme.palette.pressed
+        edge = theme.palette.accent
     }
     return {key: l.key site: site path: l.path snippet: l.row_x meta: meta bg: bg edge: edge}
 }
@@ -1325,15 +1324,16 @@ fn build_rows(){
 
 // Pills: white with a gray edge, or accent-filled when chosen.
 fn chip_of(label, site, n){
-    let bg = #xFFFFFF
-    let edge = #xC8C8C8
-    let fg = #x1C274C
-    let fg2 = #x66708F
+    let bg = theme.palette.surface
+    let edge = theme.palette.border
+    let fg = theme.palette.title
+    let fg2 = theme.palette.muted
     if site == site_filter {
-        bg = #x0f88fe
-        edge = #x0f88fe
-        fg = #xFFFFFF
-        fg2 = #xD6E8FF
+        bg = theme.palette.accent
+        edge = theme.palette.accent
+        fg = theme.palette.on_accent
+        // A softer count; on the darker dark accent only white keeps 4.5:1.
+        fg2 = if theme.palette.is_dark {theme.palette.on_accent} else {#xD6E8FF}
     }
     return {label: label site: site n: "" + n bg: bg edge: edge fg: fg fg2: fg2}
 }
@@ -1342,8 +1342,8 @@ fn chip_of(label, site, n){
 fn build_chips(){
     chips = []
     let cap = 5
-    if is_narrow { cap = 3 }
-    if is_wide { cap = 10 }
+    if mod.state.is_narrow { cap = 3 }
+    if mod.state.is_wide { cap = 10 }
     chips.push(chip_of("All", "", links.len()))
     let is_current_shown = site_filter == ""
     for t in top_sites {
@@ -1372,7 +1372,7 @@ fn show_summary(){
     let line = ""
     if links.len() > 0 {
         line = plural(links.len(), "link", "links") + " · " + plural(site_total, "site", "sites")
-        if !is_narrow { line = line + " · " + plural(people_total, "person", "people") }
+        if !mod.state.is_narrow { line = line + " · " + plural(people_total, "person", "people") }
     }
     if !is_unchanged("summary", line) { views.summary.set_text(line) }
     return nil
@@ -1602,7 +1602,7 @@ fn sharers_of(l, cap){
 
 // Each copy of the list redraws only when its people or the pane tier change.
 fn show_people(list, part, people){
-    if is_unchanged(part, people.sig + "|" + is_tiny) { return nil }
+    if is_unchanged(part, people.sig + "|" + mod.state.is_tiny) { return nil }
     sharers = people.rows
     sharers_more = people.more
     list.render()
@@ -1615,8 +1615,8 @@ fn show_detail(){
     bind_ui()
     let l = selected_link()
     let is_open = !l.is_nil()
-    if !is_unchanged("detail", "" + is_open + is_wide) {
-        views.detail_wrap.set_visible(is_open && !is_wide)
+    if !is_unchanged("detail", "" + is_open + mod.state.is_wide) {
+        views.detail_wrap.set_visible(is_open && !mod.state.is_wide)
         views.s_card_wrap.set_visible(is_open)
         views.s_empty_wrap.set_visible(!is_open)
     }
@@ -1627,13 +1627,13 @@ fn show_detail(){
     let snippet = "Just the link"
     if s.x != "" { snippet = "“" + s.x + "”" }
     let cap = 3
-    if is_wide { cap = 6 }
+    if mod.state.is_wide { cap = 6 }
     let head = people_head(l)
     let people = sharers_of(l, cap)
     let title = shorten(l.site, 40)
     let url = shorten(l.url, 100)
-    let sig = title + "|" + url + "|" + snippet + "|" + head + "|" + people.sig + "|" + is_tiny + "|" + open_text + "|" + action_note + "|" + action_tone
-    if is_wide {
+    let sig = title + "|" + url + "|" + snippet + "|" + head + "|" + people.sig + "|" + mod.state.is_tiny + "|" + open_text + "|" + action_note + "|" + action_tone
+    if mod.state.is_wide {
         if is_unchanged("side_card", sig) { return nil }
         views.s_site.set_text(title)
         views.s_url.set_text(url)
@@ -1672,34 +1672,34 @@ fn show_detail(){
 fn show_scan(){
     bind_ui()
     let is_allowed = host.has("matrix.room.messages.paginate")
-    let is_shown = room_state == "attached" && (is_latest_loaded || links.len() > 0) && (is_allowed || host.has("matrix.room.messages.read")) && (selected_key == "" || is_wide || is_scanning)
+    let is_shown = room_state == "attached" && (is_latest_loaded || links.len() > 0) && (is_allowed || host.has("matrix.room.messages.read")) && (selected_key == "" || mod.state.is_wide || is_scanning)
     if !is_shown {
         if !is_unchanged("scan", "hidden") { views.scan_wrap.set_visible(false) }
         return nil
     }
     // Narrow panes leave the link count to the summary above.
     let counts = plural(scanned, "message", "messages")
-    if !is_narrow { counts = counts + " · " + plural(links.len(), "link", "links") }
+    if !mod.state.is_narrow { counts = counts + " · " + plural(links.len(), "link", "links") }
     let line = "Scanned " + counts
     if is_scanning { line = "Scanning… " + counts }
     if is_at_start { line = "Reached the start of the room · " + counts }
-    if is_at_start && is_narrow { line = "Reached the start of the room" }
+    if is_at_start && mod.state.is_narrow { line = "Reached the start of the room" }
     // Reading can be allowed while older history alone is blocked.
     if !is_allowed { line = "Scanning older messages is turned off for Link Library in Mini Apps settings." }
     let label = "Scan older messages"
-    if is_narrow { label = "Scan older" }
-    if is_unchanged("scan", line + "|" + label + "|" + is_allowed + "|" + is_scanning + "|" + is_at_start + "|" + is_tiny + "|" + scan_note + "|" + scan_error) { return nil }
+    if mod.state.is_narrow { label = "Scan older" }
+    if is_unchanged("scan", line + "|" + label + "|" + is_allowed + "|" + is_scanning + "|" + is_at_start + "|" + mod.state.is_tiny + "|" + scan_note + "|" + scan_error) { return nil }
     let is_btn = is_allowed && !is_scanning && !is_at_start
     let is_stop = is_allowed && is_scanning
     views.scan_wrap.set_visible(true)
     views.scan_line.set_text(line)
     views.scan_line_top.set_text(line)
-    views.scan_top_wrap.set_visible(is_tiny)
-    views.scan_line_wrap.set_visible(!is_tiny)
+    views.scan_top_wrap.set_visible(mod.state.is_tiny)
+    views.scan_line_wrap.set_visible(!mod.state.is_tiny)
     views.scan_btn.set_text(label)
     views.scan_btn_wrap.set_visible(is_btn)
     views.stop_wrap.set_visible(is_stop)
-    views.scan_row.set_visible(!is_tiny || is_btn || is_stop)
+    views.scan_row.set_visible(!mod.state.is_tiny || is_btn || is_stop)
     views.scan_note_label.set_text(scan_note)
     views.scan_note_wrap.set_visible(scan_note != "")
     views.scan_err.set_text(scan_error)
@@ -1713,21 +1713,21 @@ fn show_frame(){
     let has_rows = rows.len() > 0
     // In stacked layouts an open link takes the chips' and the scan card's room;
     // tiny panes leave filtering to the search unless a site is picked.
-    let is_chips = has_links && chips.len() > 1 && (selected_key == "" || is_wide) && (!is_tiny || site_filter != "")
+    let is_chips = has_links && chips.len() > 1 && (selected_key == "" || mod.state.is_wide) && (!mod.state.is_tiny || site_filter != "")
     let more = match_total - rows.len()
     let room_line = room_text()
     let head = list_head_text()
-    if !is_unchanged("frame", room_line + "|" + has_links + "|" + has_rows + "|" + is_chips + "|" + is_wide + "|" + is_tiny + "|" + head + "|" + more) {
+    if !is_unchanged("frame", room_line + "|" + has_links + "|" + has_rows + "|" + is_chips + "|" + mod.state.is_wide + "|" + mod.state.is_tiny + "|" + head + "|" + more) {
         views.room_line.set_text(room_line)
         views.head_wrap.set_visible(has_links)
-        views.refresh_wide.set_visible(!is_tiny)
-        views.refresh_narrow.set_visible(has_links && is_tiny)
+        views.refresh_wide.set_visible(!mod.state.is_tiny)
+        views.refresh_narrow.set_visible(has_links && mod.state.is_tiny)
         views.search_wrap.set_visible(has_links)
         views.chip_wrap.set_visible(is_chips)
         views.list_head.set_text(head)
         views.list_head_wrap.set_visible(has_rows)
         views.body.set_visible(has_rows)
-        views.side_wrap.set_visible(is_wide && has_rows)
+        views.side_wrap.set_visible(mod.state.is_wide && has_rows)
         views.empty_wrap.set_visible(!has_rows)
         views.more_btn.set_text("Show " + min(row_step, more) + " more")
         views.more_wrap.set_visible(more > 0)
@@ -2264,15 +2264,21 @@ fn on_app_resize(w, h){
     let wide = w >= 880
     let narrow = w < 360
     let tiny = w < 300
-    if wide == is_wide && narrow == is_narrow && tiny == is_tiny { return nil }
-    is_wide = wide
-    is_narrow = narrow
-    is_tiny = tiny
+    if wide == mod.state.is_wide && narrow == mod.state.is_narrow && tiny == mod.state.is_tiny { return nil }
+    mod.state.is_wide = wide
+    mod.state.is_narrow = narrow
+    mod.state.is_tiny = tiny
     refresh_view()
     return nil
 }
 
 fn boot(){
+    // A theme switch runs the script again, and the search box keeps what was typed in it.
+    if mod.state.is_booted {
+        query = str_of(ui.search.text()).trim()
+        query_terms = compile_terms(query)
+    }
+    mod.state.is_booted = true
     start_restore(read_saved())
     // A restore refreshes the view when it finishes.
     if jobs.len() == 0 { refresh_view() }
@@ -2288,54 +2294,54 @@ let PrimaryButton = Button{
     padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
     draw_bg +: {
         border_size: 0.0 border_radius: 4.0
-        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color: theme.palette.accent color_hover: theme.palette.accent_hover color_down: theme.palette.accent_down color_focus: theme.palette.accent
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+    draw_text +: { color: theme.palette.on_accent color_hover: theme.palette.on_accent color_down: theme.palette.on_accent color_focus: theme.palette.on_accent text_style: theme.font_regular{font_size: 10} }
 }
 let NeutralButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
-        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.neutral_border border_color_hover: theme.palette.neutral_border border_color_down: theme.palette.neutral_border border_color_focus: theme.palette.neutral_border
+        color: theme.palette.neutral color_hover: theme.palette.neutral_hover color_down: theme.palette.neutral_down color_focus: theme.palette.neutral }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title }
 }
 let Field = TextInput{
     width: Fill height: Fit padding: 10
     draw_bg +: {
         border_radius: 4.0 border_size: 1.0
-        color: #xFFFFFF color_hover: #xFFFFFF color_focus: #xFFFFFF color_down: #xFFFFFF color_empty: #xFFFFFF
-        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_focus: #x106fcc border_color_down: #x106fcc border_color_empty: #xC8C8C8
+        color: theme.palette.surface color_hover: theme.palette.surface color_focus: theme.palette.surface color_down: theme.palette.surface color_empty: theme.palette.surface
+        border_color: theme.palette.border border_color_hover: theme.palette.accent border_color_focus: theme.palette.focus border_color_down: theme.palette.focus border_color_empty: theme.palette.border
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #x333333 color_hover: #x333333 color_focus: #x333333 color_down: #x333333 color_empty: #xBBBBBB color_empty_hover: #x999999 color_empty_focus: #x999999 text_style: theme.font_regular{font_size: 11} }
+    draw_text +: { color: theme.palette.body color_hover: theme.palette.body color_focus: theme.palette.body color_down: theme.palette.body color_empty: theme.palette.placeholder color_empty_hover: theme.palette.placeholder_hover color_empty_focus: theme.palette.placeholder_hover text_style: theme.font_regular{font_size: 11} }
 }
-let Meta = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
-let OkText = Meta{ draw_text +: { color: #x138808 } }
-let ErrText = Meta{ draw_text +: { color: #xDC0005 } }
-let Caption = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
-let Body = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
-let CardTitle = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
-let LinkText = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 10} } }
+let Meta = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
+let OkText = Meta{ draw_text +: { color: theme.palette.success } }
+let ErrText = Meta{ draw_text +: { color: theme.palette.danger } }
+let Caption = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} } }
+let Body = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.body text_style: theme.font_regular{font_size: 11} } }
+let CardTitle = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} } }
+let LinkText = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.accent_text text_style: theme.font_regular{font_size: 10} } }
 let Card = RoundedView{
     width: Fill height: Fit flow: Down spacing: 8 padding: 12
-    show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+    show_bg: true draw_bg +: { color: theme.palette.card border_radius: 8.0 }
 }
 let EmptyCard = RoundedView{
     width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5} padding: Inset{top: 20 bottom: 20 left: 16 right: 16}
-    show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+    show_bg: true draw_bg +: { color: theme.palette.card_subtle border_radius: 8.0 }
 }
-let EmptyIcon = Label{ padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 28} } }
-let EmptyTitle = Label{ width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} } }
-let EmptyText = Label{ width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+let EmptyIcon = Label{ padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_regular{font_size: 28} } }
+let EmptyTitle = Label{ width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 12.5} } }
+let EmptyText = Label{ width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
 let Slot = View{ width: Fill height: Fit }
 let ButtonRow = View{ width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8 }
 // A sharer: Robrix's fallback avatar, the name, and when they shared it.
 let PersonRow = View{ width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5} }
 let Avatar = RoundedView{
     width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
-    show_bg: true draw_bg +: { color: #x52b2ac border_radius: 16.0 }
+    show_bg: true draw_bg +: { color: theme.palette.avatar border_radius: 16.0 }
 }
-let AvatarLetter = Label{ padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
-let PersonName = Label{ width: Fill padding: 0 margin: 0 max_lines: 1 text_overflow: TextOverflow.Ellipsis draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} } }
+let AvatarLetter = Label{ padding: 0 margin: 0 draw_text +: { color: theme.palette.on_accent text_style: theme.font_bold{font_size: 12} } }
+let PersonName = Label{ width: Fill padding: 0 margin: 0 max_lines: 1 text_overflow: TextOverflow.Ellipsis draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 11} } }
 // A one-glyph button such as ×, as tall as the others.
 let IconButton = NeutralButton{ padding: Inset{left: 9 right: 9 top: 4 bottom: 5} draw_text +: { text_style: theme.font_regular{font_size: 15} } }
 
@@ -2348,7 +2354,7 @@ View{
             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5} visible: false
             View{
                 width: Fill height: Fit flow: Down spacing: 2
-                summary := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
+                summary := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} } }
                 title_wrap := Slot{
                     room_line := Meta{ text: "Links people share in this room" max_lines: 1 text_overflow: TextOverflow.Ellipsis }
                 }
@@ -2437,9 +2443,9 @@ View{
                     on_render: || {
                         for p in sharers {
                             PersonRow{
-                                Avatar{ visible: !is_tiny AvatarLetter{ text: p.initial } }
+                                Avatar{ visible: !mod.state.is_tiny AvatarLetter{ text: p.initial } }
                                 PersonName{ text: p.name }
-                                Label{ text: p.when padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                                Label{ text: p.when padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                             }
                         }
                         if sharers_more != "" { Meta{ text: sharers_more } }
@@ -2451,8 +2457,8 @@ View{
             width: Fill height: Fit flow: Down visible: false
             loading_wrap := View{
                 width: Fill height: Fit flow: Right spacing: 10 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24} visible: false
-                LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
-                loading_line := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: theme.palette.accent_text } }
+                loading_line := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
             }
             empty_card := EmptyCard{
                 empty_icon := EmptyIcon{ text: "🔗" }
@@ -2494,10 +2500,10 @@ View{
                                 width: Fill height: Fit flow: Down spacing: 3
                                 padding: Inset{top: 10, bottom: 10, left: 12, right: 12}
                                 show_bg: true draw_bg +: { color: row.bg border_color: row.edge border_size: 1.0 border_radius: 8.0 }
-                                Label{ text: row.site width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} } }
-                                Label{ text: row.path width: Fill padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_regular{font_size: 10} } }
-                                Label{ text: row.snippet width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
-                                Label{ text: row.meta width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                                Label{ text: row.site width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 12} } }
+                                Label{ text: row.path width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.accent_text text_style: theme.font_regular{font_size: 10} } }
+                                Label{ text: row.snippet width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.body text_style: theme.font_regular{font_size: 11} } }
+                                Label{ text: row.meta width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                             }
                         }
                     }
@@ -2551,9 +2557,9 @@ View{
                             on_render: || {
                                 for p in sharers {
                                     PersonRow{
-                                        Avatar{ visible: !is_tiny AvatarLetter{ text: p.initial } }
+                                        Avatar{ visible: !mod.state.is_tiny AvatarLetter{ text: p.initial } }
                                         PersonName{ text: p.name }
-                                        Label{ text: p.when padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                                        Label{ text: p.when padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                                     }
                                 }
                                 if sharers_more != "" { Meta{ text: sharers_more } }
@@ -2568,7 +2574,7 @@ View{
             RoundedView{
                 width: Fill height: Fit flow: Down spacing: 4
                 padding: Inset{top: 8, bottom: 8, left: 12, right: 8}
-                show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                show_bg: true draw_bg +: { color: theme.palette.card_subtle border_radius: 8.0 }
                 scan_top_wrap := Slot{
                     visible: false
                     scan_line_top := Meta{ text: "" }

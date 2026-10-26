@@ -475,34 +475,37 @@ impl Generation {
                             };
                             return GenOutcome::Ready { manifest, refine_of };
                         }
-                        TurnVerdict::NeedsRepair(errors) => {
+                        TurnVerdict::NeedsRepair { errors, colors } => {
                             self.repairs += 1;
+                            let problems = errors.len() + colors.len();
                             // Shown even for the last attempt, so the console says why the run failed.
-                            for e in errors.iter().take(3) {
+                            for e in errors.iter().chain(&colors).take(3) {
                                 self.log(format!("⚠ {}", display_error(e)));
                             }
-                            if errors.len() > 3 {
-                                self.log(format!("…and {} more", errors.len() - 3));
+                            if problems > 3 {
+                                self.log(format!("…and {} more", problems - 3));
                             }
                             if self.repairs > MAX_REPAIRS {
-                                return GenOutcome::Failed(
-                                    "The generated app kept failing to compile".to_string(),
-                                );
+                                let reason = if errors.is_empty() {
+                                    "The generated app kept using colors that don't follow the dark theme"
+                                } else {
+                                    "The generated app kept failing to compile"
+                                };
+                                return GenOutcome::Failed(reason.to_string());
                             }
                             makepad_widgets::log!(
-                                "app generation: compile failed with {} error(s) — repair {} \
-                                 (of max {})",
-                                errors.len(),
+                                "app generation: {} problem(s) found — repair {} (of max {})",
+                                problems,
                                 self.repairs,
                                 MAX_REPAIRS
                             );
                             let attempt = self.repairs;
-                            self.client.send_prompt(&build_repair_prompt(&errors));
+                            self.client.send_prompt(&build_repair_prompt(&errors, &colors));
                             self.phase = GenPhase::Generating { attempt };
                             self.status = format!("Fixing the app (try {attempt})…");
                             self.stream.clear();
                             self.thought.clear();
-                            let count = match errors.len() {
+                            let count = match problems {
                                 1 => "1 error".to_string(),
                                 count => format!("{count} errors"),
                             };
@@ -557,26 +560,30 @@ impl Generation {
         let source = block;
 
         if let Some(banned) = forbidden_construct(&source) {
-            return TurnVerdict::NeedsRepair(vec![format!(
+            let error = format!(
                 "the script uses `{banned}`, which is not available in this dialect \
                  — remove it and use only constructs from the guide"
-            )]);
+            );
+            return TurnVerdict::NeedsRepair { errors: vec![error], colors: Vec::new() };
         }
         // Runtime-invisible but user-visible: glyphs the app fonts don't have
         // render as tofu boxes. Caught here (the parser can't) so the repair
         // turn swaps them out.
         if let Some(c) = source.chars().find(|c| TOFU_GLYPHS.contains(c)) {
-            return TurnVerdict::NeedsRepair(vec![format!(
+            let error = format!(
                 "the app font has no glyph for '{c}' (renders as an empty box) — \
                  use an emoji, a plain word, or × (U+00D7) instead"
-            )]);
+            );
+            return TurnVerdict::NeedsRepair { errors: vec![error], colors: Vec::new() };
         }
 
         self.status = "Checking the app…".to_string();
         self.log("Checking the app…");
         let errors = validate_splash(cx, &source);
-        if !errors.is_empty() {
-            return TurnVerdict::NeedsRepair(errors);
+        // Fixed colors compile, but stay light-tuned on the dark theme.
+        let colors = bare_color_errors(&source);
+        if !errors.is_empty() || !colors.is_empty() {
+            return TurnVerdict::NeedsRepair { errors, colors };
         }
         self.log("No errors found");
 
@@ -617,7 +624,8 @@ impl Generation {
 
 enum TurnVerdict {
     Installed(Box<MiniAppManifest>),
-    NeedsRepair(Vec<String>),
+    /// What to send back: compile or construct `errors`, and fixed `colors`.
+    NeedsRepair { errors: Vec<String>, colors: Vec<String> },
     Malformed(String),
 }
 
@@ -728,6 +736,65 @@ const RESPONSIVE_POLICY: &str = "The app MUST lay out well and stay fully usable
      and toggle pre-declared tier Views (see the guide's \"runs at ANY size\" \
      section).";
 
+/// Stated in EVERY prompt: Robrix switches between light and dark live by re-running
+/// the app, and colors it writes itself can't follow.
+const THEME_POLICY: &str = "Robrix has a light and a dark theme, and the user can switch \
+     while the app runs. Take EVERY color from `theme.palette.<name>` (see the guide's \
+     Robrix look); write a hex color only in the `// tint:` header, or inside \
+     `if theme.palette.is_dark {...} else {...}` for a color with no palette role. Inside \
+     a shader fn (`pixel:`, `get_color:`, ...) never read `theme.palette` or write a \
+     color, since shaders keep the colors of the theme they were first built in: declare \
+     it on the draw object (`mark_color: instance(theme.palette.accent_text)`) and use \
+     `self.mark_color`. A theme switch runs the script again from the top, so keep data \
+     that must survive in `mod.state` or the `fs` jail, and make the top level safe to \
+     repeat: its requests only read or set up (permissions, subscriptions), never send, \
+     post or join. Mark an action in flight in `mod.state`; after a re-run, reset its \
+     \"…ing\" status and treat the action as possibly done, never resending it (the \
+     guide shows how).";
+
+/// Refining an app that still writes fixed colors: they become the palette colors
+/// with the same light values, so it keeps its look and gains dark mode.
+const HEX_TO_PALETTE: &str = "This app's code still writes fixed colors, which look the \
+     same on the dark theme. As part of this change, replace EVERY one (any case, `#fff` \
+     = `#xFFFFFF`; a `vec4` of values from 0 to 1 is a color too) with its \
+     `theme.palette` color, which keeps the light look: #x1C274C title, #x333333 body, \
+     #x66708F muted, #xFFFFFF on_accent (text or icons on a colored fill) or surface \
+     (backgrounds), #xFFFFFF00 transparent, #x0F88FE accent (fills, hover borders) or \
+     accent_text (text, icons, spinners), #x106FCC accent_hover (fills) or focus \
+     (field borders), #x0C5DAA accent_down, #xE3E3E3 neutral, #xD0D0D0 neutral_hover, \
+     #xC0C0C0 neutral_down, #xE0E0E0 neutral_border (button borders) or card_border \
+     (outlines of cards and framed boxes), #xC8C8C8 border, #xF0F5FF card, \
+     #xE4EEFF pressed, #xF7F9FC card_subtle, #x138808 success, #xF0FFF0 success_bg, \
+     #xD4EED4 success_bg_hover, #xB8E0B8 success_bg_down, #xDC0005 danger, #xFFF0F0 \
+     danger_bg, #xF0D4D4 danger_bg_hover, #xE0B8B8 danger_bg_down, #xBBBBBB \
+     placeholder, #x999999 placeholder_hover, #x52B2AC avatar, #x00000018 divider. \
+     Any other color, and a #x138808 or #xDC0005 FILL behind text (success and danger \
+     turn light in the dark theme), becomes `if theme.palette.is_dark {<a value that \
+     suits the #262626 dark pane and any text on it>} else {<its old value>}`. A color \
+     inside a shader fn (`pixel:`, `get_color:`, ...) moves onto the draw object, as \
+     `mark_color: instance(theme.palette.title)` used as `self.mark_color`, since shaders \
+     keep their first theme's colors. Leave no fixed color behind: one left over looks \
+     the same on the dark theme.";
+
+/// The conversion a refine asks for, if `source` still writes fixed colors.
+fn theme_conversion(source: &str) -> String {
+    if a2app_core::palette::bare_colors(source).is_empty() {
+        return String::new();
+    }
+    format!("{HEX_TO_PALETTE}\n\n")
+}
+
+/// Each fixed color `source` writes, as a line for the repair turn.
+fn bare_color_errors(source: &str) -> Vec<String> {
+    a2app_core::palette::bare_colors(source).into_iter().map(|color| match color.light_of.as_slice() {
+        [] => format!("Line {}: `{}` won't follow the dark theme", color.line, color.text),
+        names => format!(
+            "Line {}: `{}` won't follow the dark theme; it is the light value of `theme.palette.{}`",
+            color.line, color.text, names.join("` or `theme.palette."),
+        ),
+    }).collect()
+}
+
 /// Stated in EVERY prompt, slim or not: an agent that never sees the full
 /// guide still has to get consent right, and "works only if granted" is the
 /// most likely way a generated app is broken on arrival.
@@ -805,6 +872,8 @@ fn build_initial_prompt(request: &str, slim: bool) -> String {
          \n\
          {RESPONSIVE_POLICY}\n\
          \n\
+         {THEME_POLICY}\n\
+         \n\
          {PERMISSION_POLICY}\n\
          \n\
          {}\n\
@@ -826,6 +895,8 @@ fn build_refine_prompt(request: &str, base: &MiniAppManifest, slim: bool) -> Str
          Keep everything the user didn't ask to change — including its responsive \
          layout: {RESPONSIVE_POLICY}\n\
          \n\
+         {THEME_POLICY}\n\
+         \n\
          {PERMISSION_POLICY}\n\
          \n\
          {}\n\
@@ -834,25 +905,36 @@ fn build_refine_prompt(request: &str, base: &MiniAppManifest, slim: bool) -> Str
          \n\
          ````splash\n{}\n````\n\
          \n\
-         {}\n\
+         {}{}\n\
          \n\
          User's change request: {request}",
         guide_section(slim),
         base.name,
         base.source,
+        theme_conversion(&base.source),
         reply_contract(),
     )
 }
 
-fn build_repair_prompt(errors: &[String]) -> String {
-    let list = errors
-        .iter()
-        .map(|e| format!("- {e}"))
-        .collect::<Vec<_>>()
-        .join("\n");
+/// The repair turn for `errors` (compile and construct problems) and fixed `colors`.
+/// It says "failed to compile" only when there are errors: the fake agent keys on it.
+fn build_repair_prompt(errors: &[String], colors: &[String]) -> String {
+    let list = |items: &[String]| items.iter().map(|item| format!("- {item}\n")).collect::<String>();
+    let mut problems = String::new();
+    if !errors.is_empty() {
+        problems.push_str(&format!("Your script failed to compile. Errors:\n{}\n", list(errors)));
+    }
+    if !colors.is_empty() {
+        problems.push_str(&format!(
+            "Your script writes fixed colors, which look the same on the dark theme:\n{}\
+             Take each from `theme.palette`, or pick it per theme with \
+             `if theme.palette.is_dark {{...}} else {{...}}`; inside a shader fn, declare it \
+             on the draw object as an `instance(...)` and use it through `self`.\n\n",
+            list(colors),
+        ));
+    }
     format!(
-        "Your script failed to compile. Errors:\n{list}\n\n\
-         Re-read the guide's rules and reply again with the corrected COMPLETE \
+        "{problems}Re-read the guide's rules and reply again with the corrected COMPLETE \
          script as EXACTLY ONE ```splash fenced block (same // name/icon/tint \
          header), nothing else. Fix it directly — do not overthink or re-plan; \
          correct what the errors point at and resend the whole script."
@@ -1327,6 +1409,67 @@ mod tests {
     fn unterminated_fence_still_extracts() {
         let reply = "```splash\nView{}";
         assert_eq!(extract_splash_block(reply).unwrap(), "View{}");
+    }
+
+    /// Any app that still writes a fixed color is asked to convert, even a partly converted one.
+    #[test]
+    fn refine_converts_apps_with_fixed_colors() {
+        assert!(theme_conversion("Label{draw_text +: {color: #x1C274C}}").contains("#x1C274C title"));
+        assert!(!theme_conversion("Label{draw_text +: {color: theme.palette.title}} View{draw_bg +: {color: #xF0F5FF}}").is_empty());
+        assert!(theme_conversion("// tint: #E84D3D\nLabel{text: \"Pomodoro\"}").is_empty());
+        assert!(theme_conversion("Label{draw_text +: {color: theme.palette.title}}").is_empty());
+        assert!(theme_conversion("View{draw_bg +: {color: if theme.palette.is_dark {#x2B3240} else {#xF0F5FF}}}").is_empty());
+    }
+
+    /// The guide's examples write no fixed colors, or agents would copy them.
+    #[test]
+    fn the_guide_teaches_no_fixed_colors() {
+        let blocks: Vec<&str> = SPLASH_GUIDE.split("```splash\n").skip(1).map(|rest| rest.split("```").next().unwrap()).collect();
+        assert!(blocks.len() > 10);
+        for block in blocks {
+            assert!(a2app_core::palette::bare_colors(block).is_empty(), "{block}");
+        }
+    }
+
+    /// Only a real compile failure is called one, and fixed colors come with the shader rule.
+    #[test]
+    fn repair_prompts_say_what_failed() {
+        let colors = bare_color_errors("// tint: #E84D3D\nView{\n    draw_bg +: {color: #x7B4FD6 border_color: #xE0E0E0}\n}");
+        assert_eq!(colors, [
+            "Line 3: `#x7B4FD6` won't follow the dark theme",
+            "Line 3: `#xE0E0E0` won't follow the dark theme; it is the light value of `theme.palette.card_border` or `theme.palette.neutral_border`",
+        ]);
+        let only_colors = build_repair_prompt(&[], &colors);
+        assert!(!only_colors.contains("failed to compile"));
+        assert!(only_colors.contains("- Line 3: `#x7B4FD6`") && only_colors.contains("inside a shader fn"));
+        let both = build_repair_prompt(&["splash:validating:2:1: unexpected token".to_string()], &colors);
+        assert!(both.starts_with("Your script failed to compile. Errors:\n- splash:validating:2:1: unexpected token\n\n"));
+        assert!(both.contains("- Line 3: `#xE0E0E0`"));
+    }
+
+    /// An app that compiles but writes a fixed color goes back for repair, and a run that
+    /// never drops it fails saying why.
+    #[test]
+    fn fixed_colors_go_back_for_repair() {
+        a2app_core::palette::use_light_theme();
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(makepad_widgets::script_mod);
+        let app = |color: &str| format!("```splash\n// name: Tip\n// icon: 💰\n// tint: #4A90D9\nView{{\n    Label{{text: \"Tip\" draw_text +: {{color: {color}}}}}\n}}\n```");
+        let done = |text: String| AcpEvent::TurnDone { stop_reason: "end_turn".into(), text };
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(vec![AcpEvent::SessionReady, done(app("#x1C274C"))]));
+        let mut generation = queued(&queue);
+        assert!(matches!(generation.advance(&mut cx), GenOutcome::Working));
+        let console = generation.console();
+        assert!(console.contains("⚠ Line 5: `#x1C274C` won't follow the dark theme; it is the light value of `theme.palette.title`"), "{console}");
+        assert!(console.contains("── Repair 1: 1 error sent back ──"), "{console}");
+        queue.lock().unwrap().push(done(app("theme.palette.title")));
+        assert!(matches!(generation.advance(&mut cx), GenOutcome::Ready { .. }), "{}", generation.console());
+
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(vec![AcpEvent::SessionReady]));
+        let mut generation = queued(&queue);
+        queue.lock().unwrap().extend((0..=MAX_REPAIRS).map(|_| done(app("#x7B4FD6"))));
+        let GenOutcome::Failed(reason) = generation.advance(&mut cx) else { panic!("the run gives up") };
+        assert_eq!(reason, "The generated app kept using colors that don't follow the dark theme");
     }
 
     #[test]

@@ -256,7 +256,7 @@ script_mod! {
             padding: 7
             width: Fill, height: Fit
             font_size: 10.
-            font_color: #3
+            font_color: (MESSAGE_TEXT_COLOR)
             body: "<p>An AI room is a regular room with a Robrix AI agent session: you send messages to drive the agent, and it posts replies back into the room.</p>"
         }
 

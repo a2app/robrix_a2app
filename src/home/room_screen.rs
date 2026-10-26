@@ -779,7 +779,7 @@ script_mod! {
                         align: Align{x: 0.5, y: 0.5}
                         draw_text +: {
                             text_style: REGULAR_TEXT { font_size: 11 },
-                            color: (COLOR_ACTIVE_PRIMARY)
+                            color: (COLOR_MINI_APP_ACCENT_TEXT)
                         }
                     }
                 }

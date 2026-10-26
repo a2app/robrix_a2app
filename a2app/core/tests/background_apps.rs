@@ -17,6 +17,7 @@ impl App {
         for (path, text) in files { std::fs::write(root.join(path), text).unwrap(); }
         let mut cx = Cx::new(Box::new(|_, _| {}));
         cx.with_vm(makepad_widgets::script_mod);
+        a2app_core::palette::use_light_theme();
         let mut app = Self { cx, host: WidgetRef::empty(), root };
         app.reload(id);
         app
@@ -80,6 +81,7 @@ impl Drop for App {
 fn background_examples_pass_real_strict_script_validation() {
     let mut cx = Cx::new(Box::new(|_, _| {}));
     cx.with_vm(makepad_widgets::script_mod);
+    a2app_core::palette::use_light_theme();
     for id in ["website-watch", "reminder", "keyword-alert"] {
         let stock = a2app_core::builtin::stock(id).unwrap();
         assert!(stock.supports_background());

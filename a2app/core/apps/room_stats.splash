@@ -12,50 +12,52 @@ let PrimaryButton = Button{
     padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
     draw_bg +: {
         border_size: 0.0 border_radius: 4.0
-        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color: theme.palette.accent color_hover: theme.palette.accent_hover color_down: theme.palette.accent_down color_focus: theme.palette.accent
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+    draw_text +: { color: theme.palette.on_accent color_hover: theme.palette.on_accent color_down: theme.palette.on_accent color_focus: theme.palette.on_accent text_style: theme.font_regular{font_size: 10} }
 }
 let NeutralButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
-        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.neutral_border border_color_hover: theme.palette.neutral_border border_color_down: theme.palette.neutral_border border_color_focus: theme.palette.neutral_border
+        color: theme.palette.neutral color_hover: theme.palette.neutral_hover color_down: theme.palette.neutral_down color_focus: theme.palette.neutral }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title }
 }
 // Chips: both variants are declared and the matching one is shown.
 let ChipOff = Button{
     padding: Inset{left: 10 right: 10 top: 5 bottom: 5}
     draw_bg +: {
         border_size: 1.0 border_radius: 12.0
-        color: #xFFFFFF color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF
-        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_down: #x0f88fe border_color_focus: #xC8C8C8
+        color: theme.palette.surface color_hover: theme.palette.card color_down: theme.palette.pressed color_focus: theme.palette.surface
+        border_color: theme.palette.border border_color_hover: theme.palette.accent border_color_down: theme.palette.accent border_color_focus: theme.palette.border
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C text_style: theme.font_regular{font_size: 10} }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title text_style: theme.font_regular{font_size: 10} }
 }
 let ChipOn = ChipOff{
     draw_bg +: {
-        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
-        border_color: #x0f88fe border_color_hover: #x106fcc border_color_down: #x0C5DAA border_color_focus: #x0f88fe
+        color: theme.palette.accent color_hover: theme.palette.accent_hover color_down: theme.palette.accent_down color_focus: theme.palette.accent
+        border_color: theme.palette.accent border_color_hover: theme.palette.accent_hover border_color_down: theme.palette.accent_down border_color_focus: theme.palette.accent
     }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF }
+    draw_text +: { color: theme.palette.on_accent color_hover: theme.palette.on_accent color_down: theme.palette.on_accent color_focus: theme.palette.on_accent }
 }
 
-let depth = 300
+// What survives the re-run a theme switch does: the chosen depth, the pane's size class
+// and the counted messages, so a finished count (`is_counted`) is redrawn, not fetched again.
+mod.state = {
+    depth: 300 is_narrow: false is_tiny: false is_counted: false
+    // Keep the newest batch apart so it supplies the first history-page anchor.
+    latest: [] older: []
+    // Minutes from UTC once device.info answers; until then hours count in UTC.
+    utc_offset: nil
+}
 let loading = false
-let loaded = false
 let power_loading = false
 let power_loaded = false
 let setup_pending = false
 let load_error = ""
 let is_denied = false
 let is_no_room = false
-let is_narrow = false
-let is_tiny = false
 let status_kind = ""
-// Keep the newest batch apart so it supplies the first history-page anchor.
-let latest = []
-let older = []
 let senders = []
 let top = []
 let sender_rows = []
@@ -66,8 +68,6 @@ let day_sel = 0
 let first_ts = 0
 let last_ts = 0
 let timed_count = 0
-// Minutes from UTC once device.info answers; until then hours count in UTC.
-let utc_offset = nil
 let device_pending = false
 let day_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 let day_full = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
@@ -113,7 +113,7 @@ fn zeros(n){
 let hours = zeros(24)
 let days = zeros(7)
 
-fn total(){ return latest.len() + older.len() }
+fn total(){ return mod.state.latest.len() + mod.state.older.len() }
 
 fn plural(n, word){
     if "" + n == "1" { return word }
@@ -142,8 +142,8 @@ fn pad(n){
 fn day_of(ts){ return (ts - ts % 86400000) / 86400000 }
 fn hour_of(ts){ return (ts % 86400000 - ts % 3600000) / 3600000 }
 fn local_ts(ts){
-    if utc_offset == nil { return ts }
-    return ts + utc_offset * 60000
+    if mod.state.utc_offset == nil { return ts }
+    return ts + mod.state.utc_offset * 60000
 }
 
 // Civil UTC date from days since 1970 (Howard Hinnant's algorithm).
@@ -176,7 +176,7 @@ fn range_text(){
     let b = date_text(local_ts(last_ts), this_year)
     let text = a
     if a != b { text = a + " – " + b }
-    if utc_offset == nil { text = text + " · times in UTC" }
+    if mod.state.utc_offset == nil { text = text + " · times in UTC" }
     if timed_count < total() { text = text + " · " + grouped(timed_count) + " of " + grouped(total()) + " dated" }
     return text
 }
@@ -253,7 +253,7 @@ fn build_senders(){
         let pct = "" + share + "%"
         if share < 1 { pct = "<1%" }
         let stat = msgs(s.count) + " · " + pct
-        if is_narrow { stat = "" + s.count + " · " + pct }
+        if mod.state.is_narrow { stat = "" + s.count + " · " + pct }
         sender_rows.push({name: "" + s.name initial: initial(s.name) stat: stat on: s.count off: most - s.count})
     }
     return nil
@@ -265,12 +265,12 @@ fn build_bars(){
     let i = 0
     while i < 24 {
         let px = 2
-        let c = #xE3E8F0
+        let c = if theme.palette.is_dark {#x33373F} else {#xE3E8F0}
         if hours[i] > 0 {
             px = max(4, floor(44 * hours[i] / most))
-            c = #x9FCBFF
+            c = if theme.palette.is_dark {#x1D5590} else {#x9FCBFF}
         }
-        if i == hour_sel && hours[i] > 0 { c = #x0f88fe }
+        if i == hour_sel && hours[i] > 0 { c = theme.palette.accent }
         hour_items.push({px: px c: c})
         i += 1
     }
@@ -279,12 +279,12 @@ fn build_bars(){
     let j = 0
     while j < 7 {
         let px = 2
-        let c = #xE3E8F0
+        let c = if theme.palette.is_dark {#x33373F} else {#xE3E8F0}
         if days[j] > 0 {
             px = max(4, floor(44 * days[j] / most_day))
-            c = #x9FCBFF
+            c = if theme.palette.is_dark {#x1D5590} else {#x9FCBFF}
         }
-        if j == day_sel && days[j] > 0 { c = #x0f88fe }
+        if j == day_sel && days[j] > 0 { c = theme.palette.accent }
         day_items.push({name: day_names[j] px: px c: c})
         j += 1
     }
@@ -314,8 +314,8 @@ fn show_state(){
     ui.empty_wrap.set_visible((!has_data || is_no_room) && !is_loading)
     ui.power_wrap.set_visible(!is_no_room)
     // Tiny panes move Refresh below the summary; without data it stays up top.
-    ui.head_refresh.set_visible(!is_tiny || !has_data)
-    ui.tiny_refresh.set_visible(is_tiny && has_data)
+    ui.head_refresh.set_visible(!mod.state.is_tiny || !has_data)
+    ui.tiny_refresh.set_visible(mod.state.is_tiny && has_data)
     let icon = "📭"
     let title = "No messages yet"
     let body = "Once people post here, you'll see who posts and when."
@@ -357,7 +357,7 @@ fn show(){
     } else {
         say("", "")
     }
-    ui.hour_caption.set_text(if utc_offset == nil { "BY HOUR · UTC" } else { "BY HOUR" })
+    ui.hour_caption.set_text(if mod.state.utc_offset == nil { "BY HOUR · UTC" } else { "BY HOUR" })
     hour_sel = peak(hours)
     day_sel = peak(days)
     build_senders()
@@ -390,8 +390,8 @@ fn compute(){
     first_ts = 0
     last_ts = 0
     timed_count = 0
-    for m in latest { count_message(m) }
-    for m in older { count_message(m) }
+    for m in mod.state.latest { count_message(m) }
+    for m in mod.state.older { count_message(m) }
     let n = min(8, senders.len())
     top = []
     let i = 0
@@ -404,31 +404,31 @@ fn compute(){
 
 fn finish(){
     loading = false
-    loaded = load_error == ""
+    mod.state.is_counted = load_error == ""
     compute()
 }
 
 fn loaded_text(){
-    if total() == 0 { return "Counting the last " + grouped(depth) + " messages…" }
-    return "Counted " + grouped(total()) + " of " + grouped(depth) + "…"
+    if total() == 0 { return "Counting the last " + grouped(mod.state.depth) + " messages…" }
+    return "Counted " + grouped(total()) + " of " + grouped(mod.state.depth) + "…"
 }
 
 fn progress(){
-    if top.len() > 0 { say("note", "Counting… " + grouped(total()) + " of " + grouped(depth)) }
+    if top.len() > 0 { say("note", "Counting… " + grouped(total()) + " of " + grouped(mod.state.depth)) }
     ui.loading_line.set_text(loaded_text())
     return nil
 }
 
 fn page(){
-    if total() >= depth {
+    if total() >= mod.state.depth {
         finish()
         return nil
     }
     progress()
     let before = nil
-    if latest.len() > 0 { before = latest[0].event_id }
-    if older.len() > 0 { before = older[0].event_id }
-    host.request("matrix.older_messages", {before: before, limit: min(50, depth - total())}, fn(r){
+    if mod.state.latest.len() > 0 { before = mod.state.latest[0].event_id }
+    if mod.state.older.len() > 0 { before = mod.state.older[0].event_id }
+    host.request("matrix.older_messages", {before: before, limit: min(50, mod.state.depth - total())}, fn(r){
         if !r.is_ok {
             load_error = r.error
             if ("" + r.error).search("not attached to a room") >= 0 { is_no_room = true }
@@ -438,8 +438,8 @@ fn page(){
         let got = r.data.messages
         let merged = []
         for m in got { merged.push(m) }
-        for m in older { merged.push(m) }
-        older = merged
+        for m in mod.state.older { merged.push(m) }
+        mod.state.older = merged
         if r.data.has_more && got.len() > 0 {
             // Each page costs 5 tokens; allow the 6-per-second budget to refill.
             if start_timeout(1.0, || page()).is_nil() {
@@ -460,14 +460,15 @@ fn load(){
     loading = true
     load_error = ""
     is_denied = false
-    latest = []
-    older = []
+    mod.state.is_counted = false
+    mod.state.latest = []
+    mod.state.older = []
     if top.len() > 0 { say("note", "Counting…") }
     ui.loading_line.set_text(loaded_text())
     show_state()
     host.request("matrix.read_messages", {limit: 30}, fn(r){
         if r.is_ok {
-            latest = r.data.messages
+            mod.state.latest = r.data.messages
             page()
             return nil
         }
@@ -570,17 +571,17 @@ fn show_day(i){
 }
 
 fn show_depth(){
-    ui.d100_on.set_visible(depth == 100)
-    ui.d100_off.set_visible(depth != 100)
-    ui.d300_on.set_visible(depth == 300)
-    ui.d300_off.set_visible(depth != 300)
-    ui.d1000_on.set_visible(depth == 1000)
-    ui.d1000_off.set_visible(depth != 1000)
+    ui.d100_on.set_visible(mod.state.depth == 100)
+    ui.d100_off.set_visible(mod.state.depth != 100)
+    ui.d300_on.set_visible(mod.state.depth == 300)
+    ui.d300_off.set_visible(mod.state.depth != 300)
+    ui.d1000_on.set_visible(mod.state.depth == 1000)
+    ui.d1000_off.set_visible(mod.state.depth != 1000)
     return nil
 }
 
 fn set_depth(d){
-    depth = d
+    mod.state.depth = d
     show_depth()
     load()
 }
@@ -591,9 +592,9 @@ fn on_app_resize(w, h){
     ui.sender_hint.set_visible(w >= 300)
     ui.hour_hint.set_visible(w >= 300)
     ui.depth_label.set_visible(w >= 260)
-    if narrow != is_narrow || tiny != is_tiny {
-        is_narrow = narrow
-        is_tiny = tiny
+    if narrow != mod.state.is_narrow || tiny != mod.state.is_tiny {
+        mod.state.is_narrow = narrow
+        mod.state.is_tiny = tiny
         build_senders()
         ui.sender_list.render()
     }
@@ -614,8 +615,8 @@ fn read_device(){
         device_pending = false
         if !r.is_ok { return nil }
         let offset = r.data["utc_offset_minutes"]
-        if offset.is_number() && offset > -1000 && offset < 1000 && offset != utc_offset {
-            utc_offset = offset
+        if offset.is_number() && offset > -1000 && offset < 1000 && offset != mod.state.utc_offset {
+            mod.state.utc_offset = offset
             recount()
         }
         return nil
@@ -624,14 +625,14 @@ fn read_device(){
 
 fn on_permissions_changed(caps){
     if setup_pending { return nil }
-    if !host.has("matrix.room.messages.read") || !host.has("matrix.room.messages.paginate") { loaded = false }
-    elif !loaded { load() }
+    if !host.has("matrix.room.messages.read") || !host.has("matrix.room.messages.paginate") { mod.state.is_counted = false }
+    elif !mod.state.is_counted { load() }
     if !host.has("matrix.room.power_levels.read") { power_loaded = false }
     elif !power_loaded { load_power() }
-    if !host.has("device.info.read") && utc_offset != nil {
-        utc_offset = nil
+    if !host.has("device.info.read") && mod.state.utc_offset != nil {
+        mod.state.utc_offset = nil
         recount()
-    } elif utc_offset == nil { read_device() }
+    } elif mod.state.utc_offset == nil { read_device() }
 }
 
 fn setup(retry){
@@ -641,10 +642,11 @@ fn setup(retry){
         setup_pending = false
         if !r.is_ok { say("err", sentence(r.error)) return nil }
         if r.data.permissions["device-info"] == true { read_device() }
-        if r.data.permissions["matrix-room-read"] == true && host.has("matrix.room.messages.read") && host.has("matrix.room.messages.paginate") { load() }
-        else {
-            latest = []
-            older = []
+        if r.data.permissions["matrix-room-read"] == true && host.has("matrix.room.messages.read") && host.has("matrix.room.messages.paginate") {
+            if retry || !mod.state.is_counted { load() }
+        } else {
+            mod.state.latest = []
+            mod.state.older = []
             load_error = "Permission denied. Tap Refresh to ask again."
             is_denied = true
             finish()
@@ -655,7 +657,11 @@ fn setup(retry){
     })
 }
 
-let _boot = start_timeout(0.05, || setup(false))
+// After a theme switch, redraw a finished count in the new colors; setup then counts only if none finished.
+let _boot = start_timeout(0.05, || {
+    if mod.state.is_counted { compute() }
+    setup(false)
+})
 
 View{
     width: Fill height: Fill flow: Down
@@ -667,16 +673,16 @@ View{
                 width: Fill height: Fit flow: Down spacing: 3
                 summary_wrap := View{
                     width: Fill height: Fit flow: Flow.Right{wrap: true} visible: false
-                    sum_a := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
-                    sum_b := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
+                    sum_a := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} } }
+                    sum_b := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} } }
                 }
                 note_wrap := View{
                     width: Fill height: Fit visible: false
-                    status := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                    status := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                 }
                 err_wrap := View{
                     width: Fill height: Fit visible: false
-                    status_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} } }
+                    status_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.danger text_style: theme.font_regular{font_size: 10} } }
                 }
             }
             head_refresh := View{
@@ -688,7 +694,7 @@ View{
             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5} visible: false
             depth_label := View{
                 width: Fit height: Fit
-                Label{ text: "Count the last" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                Label{ text: "Count the last" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
             }
             View{
                 width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
@@ -707,18 +713,18 @@ View{
         }
         loading_wrap := View{
             width: Fill height: Fit flow: Right spacing: 10 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24}
-            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
-            loading_line := Label{ text: "Counting the last 300 messages…" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: theme.palette.accent_text } }
+            loading_line := Label{ text: "Counting the last 300 messages…" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
         }
         empty_wrap := View{
             width: Fill height: Fit visible: false
             RoundedView{
                 width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5}
                 padding: Inset{left: 16 right: 16 top: 20 bottom: 20}
-                show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                show_bg: true draw_bg +: { color: theme.palette.card_subtle border_radius: 8.0 }
                 empty_icon := Label{ text: "📭" padding: 0 margin: 0 draw_text +: { text_style: theme.font_regular{font_size: 28} } }
-                empty_title := Label{ text: "No messages yet" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} } }
-                empty_body := Label{ text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                empty_title := Label{ text: "No messages yet" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 12.5} } }
+                empty_body := Label{ text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
                 empty_btn_wrap := View{
                     width: Fit height: Fit visible: false margin: Inset{top: 6}
                     empty_btn := NeutralButton{ text: "Try again" on_click: || setup(true) }
@@ -734,10 +740,10 @@ View{
             width: Fill height: Fit flow: Down spacing: 12 visible: false
             View{
                 width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-                Label{ text: "TOP SENDERS" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+                Label{ text: "TOP SENDERS" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} } }
                 sender_hint := View{
                     width: Fit height: Fit
-                    Label{ text: "Tap one for their profile" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                    Label{ text: "Tap one for their profile" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                 }
             }
             sender_list := View{
@@ -748,23 +754,23 @@ View{
                         RoundedView{
                             width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
                             padding: Inset{left: 12 right: 12 top: 10 bottom: 10}
-                            show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                            show_bg: true draw_bg +: { color: theme.palette.card_subtle border_radius: 8.0 }
                             RoundedView{
-                                visible: !is_tiny width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
-                                show_bg: true draw_bg +: { color: #x52b2ac border_radius: 16.0 }
-                                Label{ text: s.initial padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
+                                visible: !mod.state.is_tiny width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
+                                show_bg: true draw_bg +: { color: theme.palette.avatar border_radius: 16.0 }
+                                Label{ text: s.initial padding: 0 margin: 0 draw_text +: { color: theme.palette.on_accent text_style: theme.font_bold{font_size: 12} } }
                             }
                             View{
                                 width: Fill height: Fit flow: Down spacing: 7
                                 View{
                                     width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-                                    Label{ text: s.name width: Fill padding: 0 margin: 0 max_lines: 1 text_overflow: TextOverflow.Ellipsis draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} } }
-                                    Label{ text: s.stat padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                                    Label{ text: s.name width: Fill padding: 0 margin: 0 max_lines: 1 text_overflow: TextOverflow.Ellipsis draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 11} } }
+                                    Label{ text: s.stat padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                                 }
                                 RoundedView{
                                     width: Fill height: 6 flow: Right
-                                    show_bg: true draw_bg +: { color: #xE4EEFF border_radius: 3.0 }
-                                    RoundedView{ width: Fill{weight: s.on} height: 6 show_bg: true draw_bg +: { color: #x0f88fe border_radius: 3.0 } }
+                                    show_bg: true draw_bg +: { color: theme.palette.pressed border_radius: 3.0 }
+                                    RoundedView{ width: Fill{weight: s.on} height: 6 show_bg: true draw_bg +: { color: theme.palette.accent border_radius: 3.0 } }
                                     View{ width: Fill{weight: s.off} height: 6 }
                                 }
                             }
@@ -778,16 +784,16 @@ View{
                     width: Fill height: Fit flow: Down spacing: 8
                     View{
                         width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-                        hour_caption := Label{ text: "BY HOUR · UTC" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+                        hour_caption := Label{ text: "BY HOUR · UTC" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} } }
                         hour_hint := View{
                             width: Fit height: Fit
-                            Label{ text: "Tap a bar for its count" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                            Label{ text: "Tap a bar for its count" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                         }
                     }
                     View{
                         width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-                        hour_big := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_bold{font_size: 22} } }
-                        hour_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                        hour_big := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: theme.palette.accent_text text_style: theme.font_bold{font_size: 22} } }
+                        hour_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
                     }
                     hour_bars := View{
                         width: Fill height: 46 flow: Right spacing: 2
@@ -803,19 +809,19 @@ View{
                     }
                     View{
                         width: Fill height: Fit flow: Right
-                        Label{ text: "00:00" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 9} } }
-                        Label{ text: "06:00" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 9} } }
-                        Label{ text: "12:00" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 9} } }
-                        Label{ text: "18:00" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 9} } }
+                        Label{ text: "00:00" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 9} } }
+                        Label{ text: "06:00" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 9} } }
+                        Label{ text: "12:00" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 9} } }
+                        Label{ text: "18:00" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 9} } }
                     }
                 }
                 View{
                     width: Fill height: Fit flow: Down spacing: 8
-                    Label{ text: "BY WEEKDAY" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+                    Label{ text: "BY WEEKDAY" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} } }
                     View{
                         width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-                        day_big := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_bold{font_size: 22} } }
-                        day_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                        day_big := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: theme.palette.accent_text text_style: theme.font_bold{font_size: 22} } }
+                        day_note := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
                     }
                     day_bars := View{
                         width: Fill height: 64 flow: Right spacing: 6
@@ -825,7 +831,7 @@ View{
                                 View{
                                     width: Fill height: Fill flow: Down spacing: 4 align: Align{x: 0.5, y: 1.0}
                                     RoundedView{ width: Fill height: b.px show_bg: true draw_bg +: { color: b.c border_radius: 3.0 } }
-                                    Label{ text: b.name padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 9} } }
+                                    Label{ text: b.name padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 9} } }
                                 }
                             }
                         }
@@ -835,29 +841,29 @@ View{
         }
         power_wrap := View{
             width: Fill height: Fit flow: Down spacing: 8
-            Label{ text: "YOU IN THIS ROOM" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+            Label{ text: "YOU IN THIS ROOM" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} } }
             RoundedView{
                 width: Fill height: Fit flow: Down spacing: 4 padding: 12
-                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                show_bg: true draw_bg +: { color: theme.palette.card border_radius: 8.0 }
                 role_wrap := View{
                     width: Fill height: Fit visible: false
-                    role_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} } }
+                    role_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 12} } }
                 }
                 can_wrap := View{
                     width: Fill height: Fit visible: false
-                    can_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 10.5} } }
+                    can_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.body text_style: theme.font_regular{font_size: 10.5} } }
                 }
                 cant_wrap := View{
                     width: Fill height: Fit visible: false
-                    cant_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                    cant_line := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                 }
                 power_note_wrap := View{
                     width: Fill height: Fit
-                    power_note := Label{ text: "Loading your role…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                    power_note := Label{ text: "Loading your role…" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
                 }
                 power_err_wrap := View{
                     width: Fill height: Fit visible: false
-                    power_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10.5} } }
+                    power_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.danger text_style: theme.font_regular{font_size: 10.5} } }
                 }
             }
         }

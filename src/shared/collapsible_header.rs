@@ -126,7 +126,8 @@ pub struct CollapsibleHeader {
     #[deref] view: View,
     /// A standalone disclosure title; empty uses the room-category name.
     #[live] title: String,
-    #[live(true)] is_expanded: bool,
+    /// Kept across a theme switch, which would otherwise reset it to its DSL default.
+    #[live(true)] #[apply_state] is_expanded: bool,
     #[rust] category: HeaderCategory,
     #[rust] num_unread_mentions: u64,
     #[rust] num_unread_messages: u64,

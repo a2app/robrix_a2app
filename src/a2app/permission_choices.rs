@@ -58,6 +58,8 @@ pub enum PermissionChoicesAction {
 #[derive(Script, Widget)]
 pub struct PermissionChoices {
     #[deref] view: View,
+    /// Often set by `set_labels`, which a theme reload must not undo.
+    #[imperative]
     #[live] labels: Vec<String>,
     #[imperative]
     #[apply_state]
@@ -237,6 +239,29 @@ mod tests {
             assert_eq!(walk.margin.right, 12.0);
             assert!(matches!(walk.height, Size::Fit { min: Some(FitBound::Abs(40.0)), .. }));
         }
+    }
+
+    #[test]
+    fn theme_switch_keeps_labels_and_choice_set_at_runtime() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let template = |vm: &mut ScriptVm| script_eval!(vm, { mod.widgets.PermissionChoices { labels: ["Ask", "Allow"] } });
+        let widget = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            super::script_mod(vm);
+            let value = template(vm);
+            WidgetRef::script_from_value(vm, value)
+        });
+        let choices = widget.as_permission_choices();
+        choices.set_labels(&mut cx, vec!["Ask".into(), "Allow".into(), "Block".into()]);
+        choices.set_selected_item(&mut cx, 2);
+        cx.with_vm(|vm| {
+            let value = template(vm);
+            widget.clone().script_apply(vm, &Apply::ScriptReapply, &mut Scope::empty(), value);
+        });
+        let inner = choices.borrow().unwrap();
+        assert_eq!(inner.view.children.iter().map(|(_, row)| row.text()).collect::<Vec<_>>(), ["Ask", "Allow", "Block"]);
+        assert_eq!(inner.selected_item, 2);
     }
 
     #[test]

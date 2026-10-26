@@ -13,40 +13,38 @@ let PrimaryButton = Button{
     padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
     draw_bg +: {
         border_size: 0.0 border_radius: 4.0
-        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color: theme.palette.accent color_hover: theme.palette.accent_hover color_down: theme.palette.accent_down color_focus: theme.palette.accent
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+    draw_text +: { color: theme.palette.on_accent color_hover: theme.palette.on_accent color_down: theme.palette.on_accent color_focus: theme.palette.on_accent text_style: theme.font_regular{font_size: 10} }
 }
 let NeutralButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
-        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.neutral_border border_color_hover: theme.palette.neutral_border border_color_down: theme.palette.neutral_border border_color_focus: theme.palette.neutral_border
+        color: theme.palette.neutral color_hover: theme.palette.neutral_hover color_down: theme.palette.neutral_down color_focus: theme.palette.neutral }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title }
 }
 // Chips: both variants are declared and the matching one is shown.
 let ChipOff = Button{
     padding: Inset{left: 10 right: 10 top: 5 bottom: 5}
     draw_bg +: {
         border_size: 1.0 border_radius: 12.0
-        color: #xFFFFFF color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF
-        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_down: #x0f88fe border_color_focus: #xC8C8C8
+        color: theme.palette.surface color_hover: theme.palette.card color_down: theme.palette.pressed color_focus: theme.palette.surface
+        border_color: theme.palette.border border_color_hover: theme.palette.accent border_color_down: theme.palette.accent border_color_focus: theme.palette.border
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C text_style: theme.font_regular{font_size: 10} }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title text_style: theme.font_regular{font_size: 10} }
 }
 let ChipOn = ChipOff{
     draw_bg +: {
-        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
-        border_color: #x0f88fe border_color_hover: #x106fcc border_color_down: #x0C5DAA border_color_focus: #x0f88fe
+        color: theme.palette.accent color_hover: theme.palette.accent_hover color_down: theme.palette.accent_down color_focus: theme.palette.accent
+        border_color: theme.palette.accent border_color_hover: theme.palette.accent_hover border_color_down: theme.palette.accent_down border_color_focus: theme.palette.accent
     }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF }
+    draw_text +: { color: theme.palette.on_accent color_hover: theme.palette.on_accent color_down: theme.palette.on_accent color_focus: theme.palette.on_accent }
 }
 
 // Flags stay unknown until matrix.unread answers or a change succeeds.
 let unread_loading = false
-let unread_loaded = false
 let pins_loading = false
-let pins_loaded = false
 let messages_loading = false
 let messages_loaded = false
 let successor_loading = false
@@ -57,25 +55,19 @@ let flags = [
     {service: "matrix.low_priority", on: nil, pending: false, revision: 0, label: "Low priority", done_on: "Marked low priority.", done_off: "Back to normal priority."},
     {service: "matrix.mark_unread", on: nil, pending: false, revision: 0, label: "Unread", done_on: "Marked unread.", done_off: "Unread flag cleared."}
 ]
-// Newest first, as shown.
-let messages = []
-let rows = []
-let pins = []
 let pending_pins = []
 let pins_revision = 0
 let successor = ""
 let successor_name = ""
-let unread_count = 0
-let mention_count = 0
-// What the message area shows without rows: loading, ready, denied or error.
-let list_state = "loading"
-let list_error = ""
-let is_no_room = false
 let setup_pending = false
 let status_kind = ""
 let has_summary = false
-let is_tiny = false
-let is_narrow = false
+// What the pane shows, kept through the re-run a theme switch does. Messages are newest first,
+// as shown; without rows the message area shows loading, ready, denied or error.
+mod.state = {
+    messages: [] rows: [] pins: [] unread_loaded: false pins_loaded: false unread_count: 0 mention_count: 0
+    list_state: "loading" list_error: "" is_no_room: false is_tiny: false is_narrow: false
+}
 
 let upper = {a: "A" b: "B" c: "C" d: "D" e: "E" f: "F" g: "G" h: "H" i: "I" j: "J" k: "K" l: "L" m: "M" n: "N" o: "O" p: "P" q: "Q" r: "R" s: "S" t: "T" u: "U" v: "V" w: "W" x: "X" y: "Y" z: "Z"}
 
@@ -139,18 +131,18 @@ fn say(kind, text){
 
 // The header waits for a summary or a status, so Refresh never sits alone.
 fn show_head(){
-    ui.head.set_visible(!is_no_room && (has_summary || status_kind != ""))
+    ui.head.set_visible(!mod.state.is_no_room && (has_summary || status_kind != ""))
     return nil
 }
 
 fn show_summary(){
     let parts = []
-    if unread_loaded {
-        if unread_count > 0 { parts.push("" + unread_count + " unread") } else { parts.push("All read") }
-        if mention_count > 0 { parts.push("" + mention_count + " " + plural(mention_count, "mention")) }
+    if mod.state.unread_loaded {
+        if mod.state.unread_count > 0 { parts.push("" + mod.state.unread_count + " unread") } else { parts.push("All read") }
+        if mod.state.mention_count > 0 { parts.push("" + mod.state.mention_count + " " + plural(mod.state.mention_count, "mention")) }
     }
-    if pins_loaded {
-        if pins.len() > 0 { parts.push("" + pins.len() + " pinned") } else { parts.push("No pins") }
+    if mod.state.pins_loaded {
+        if mod.state.pins.len() > 0 { parts.push("" + mod.state.pins.len() + " pinned") } else { parts.push("No pins") }
     }
     // One label per part, so a narrow pane wraps between parts, never inside one.
     let texts = ["", "", ""]
@@ -166,7 +158,7 @@ fn show_summary(){
     ui.sum_b_wrap.set_visible(parts.len() > 1)
     ui.sum_c_wrap.set_visible(parts.len() > 2)
     has_summary = parts.len() > 0
-    ui.summary_wrap.set_visible(has_summary && !is_no_room)
+    ui.summary_wrap.set_visible(has_summary && !mod.state.is_no_room)
     show_head()
     return nil
 }
@@ -190,31 +182,31 @@ fn show_flags(){
 }
 
 fn show_list_state(){
-    let has_rows = rows.len() > 0
-    let is_loading = !has_rows && !is_no_room && list_state == "loading"
+    let has_rows = mod.state.rows.len() > 0
+    let is_loading = !has_rows && !mod.state.is_no_room && mod.state.list_state == "loading"
     show_head()
-    ui.tools_wrap.set_visible(!is_no_room)
-    ui.list_head.set_visible(!is_no_room)
-    ui.list_wrap.set_visible(has_rows && !is_no_room)
+    ui.tools_wrap.set_visible(!mod.state.is_no_room)
+    ui.list_head.set_visible(!mod.state.is_no_room)
+    ui.list_wrap.set_visible(has_rows && !mod.state.is_no_room)
     ui.loading_wrap.set_visible(is_loading)
-    ui.empty_wrap.set_visible((!has_rows || is_no_room) && !is_loading)
+    ui.empty_wrap.set_visible((!has_rows || mod.state.is_no_room) && !is_loading)
     let icon = "📭"
     let title = "No messages yet"
     let body = "Messages you can pin show up here."
     let action = ""
-    if is_no_room {
+    if mod.state.is_no_room {
         icon = "🧭"
         title = "No room attached"
         body = "Open Room Tools from a room to manage it."
-    } elif list_state == "denied" {
+    } elif mod.state.list_state == "denied" {
         icon = "🔒"
         title = "Can't read this room"
         body = "Allow Room Tools to read this room to pin its messages."
         action = "Ask again"
-    } elif list_state == "error" {
+    } elif mod.state.list_state == "error" {
         icon = "😕"
         title = "Couldn't load messages"
-        body = sentence(list_error)
+        body = sentence(mod.state.list_error)
         action = "Try again"
     }
     ui.empty_icon.set_text(icon)
@@ -244,19 +236,16 @@ fn body_of(m){
 }
 
 fn build_rows(){
-    rows = []
-    for m in messages {
-        let bg = #xF7F9FC
-        let edge = #xF7F9FC
+    mod.state.rows = []
+    for m in mod.state.messages {
+        let is_pin = is_pinned(m.event_id)
         let pin = ""
-        if is_pinned(m.event_id) {
-            bg = #xE4EEFF
-            edge = #x0f88fe
+        if is_pin {
             pin = "📌 Pinned"
-            if is_narrow { pin = "📌" }
+            if mod.state.is_narrow { pin = "📌" }
         }
         let who = name_of(m)
-        rows.push({who: who initial: initial(who) when: ago(m["ts"]) body: body_of(m) pin: pin bg: bg edge: edge})
+        mod.state.rows.push({who: who initial: initial(who) when: ago(m["ts"]) body: body_of(m) pin: pin is_pinned: is_pin})
     }
     show_list_state()
     ui.msg_list.render()
@@ -301,15 +290,15 @@ fn load_unread(){
     let unread_revision = flags[2].revision
     host.request("matrix.unread", nil, fn(r){
         unread_loading = false
-        unread_loaded = r.is_ok
+        mod.state.unread_loaded = r.is_ok
         if r.is_ok {
             if !flags[0].pending && flags[0].revision == favorite_revision { flags[0].on = r.data["favorite"] }
             if !flags[1].pending && flags[1].revision == priority_revision { flags[1].on = r.data["low_priority"] }
             if !flags[2].pending && flags[2].revision == unread_revision { flags[2].on = r.data["marked_unread"] }
-            if r.data["unread"].is_number() { unread_count = r.data["unread"] }
-            if r.data["mentions"].is_number() { mention_count = r.data["mentions"] }
+            if r.data["unread"].is_number() { mod.state.unread_count = r.data["unread"] }
+            if r.data["mentions"].is_number() { mod.state.mention_count = r.data["mentions"] }
         } elif is_no_room_error(r.error) {
-            is_no_room = true
+            mod.state.is_no_room = true
         } else {
             say("err", sentence(r.error))
         }
@@ -321,7 +310,7 @@ fn load_unread(){
 }
 
 fn is_pinned(event_id){
-    for p in pins {
+    for p in mod.state.pins {
         if p == event_id { return true }
     }
     return false
@@ -334,14 +323,14 @@ fn load_pins(){
     host.request("matrix.pinned_events", nil, fn(r){
         pins_loading = false
         if revision != pins_revision { return nil }
-        pins_loaded = r.is_ok
-        pins = []
+        mod.state.pins_loaded = r.is_ok
+        mod.state.pins = []
         if r.is_ok {
-            for p in r.data.pinned { pins.push(p.event_id) }
+            for p in r.data.pinned { mod.state.pins.push(p.event_id) }
             // A branch ending in a loop needs an explicit result.
             nil
         } elif is_no_room_error(r.error) {
-            is_no_room = true
+            mod.state.is_no_room = true
         } else {
             say("err", sentence(r.error))
         }
@@ -364,21 +353,21 @@ fn newest_first(list){
 fn load_messages(){
     if messages_loading { return nil }
     messages_loading = true
-    if messages.len() == 0 {
-        list_state = "loading"
+    if mod.state.messages.len() == 0 {
+        mod.state.list_state = "loading"
         show_list_state()
     }
     host.request("matrix.read_messages", {limit: 15}, fn(r){
         messages_loading = false
         messages_loaded = r.is_ok
         if r.is_ok {
-            messages = newest_first(r.data.messages)
-            list_state = "ready"
+            mod.state.messages = newest_first(r.data.messages)
+            mod.state.list_state = "ready"
         } else {
-            messages = []
-            list_state = "error"
-            list_error = r.error
-            if is_no_room_error(r.error) { is_no_room = true }
+            mod.state.messages = []
+            mod.state.list_state = "error"
+            mod.state.list_error = r.error
+            if is_no_room_error(r.error) { mod.state.is_no_room = true }
         }
         build_rows()
         show_summary()
@@ -387,8 +376,8 @@ fn load_messages(){
 }
 
 fn toggle_pin(i){
-    if i >= messages.len() { return nil }
-    let id = messages[i].event_id
+    if i >= mod.state.messages.len() { return nil }
+    let id = mod.state.messages[i].event_id
     for pending in pending_pins { if pending == id { return nil } }
     let want = !is_pinned(id)
     pending_pins.push(id)
@@ -400,10 +389,10 @@ fn toggle_pin(i){
         }
         pins_revision += 1
         if want {
-            if !is_pinned(id) { pins.push(id) }
+            if !is_pinned(id) { mod.state.pins.push(id) }
             say("ok", "Pinned.")
         } else {
-            pins.retain(|p| p != id)
+            mod.state.pins.retain(|p| p != id)
             say("ok", "Unpinned.")
         }
         build_rows()
@@ -435,11 +424,11 @@ fn copy_link(event_id, done){
 }
 
 fn copy_latest(){
-    if messages.len() == 0 {
+    if mod.state.messages.len() == 0 {
         say("note", "No messages to link to yet.")
         return nil
     }
-    copy_link(messages[0].event_id, "Latest message link copied.")
+    copy_link(mod.state.messages[0].event_id, "Latest message link copied.")
 }
 
 fn load_successor(){
@@ -485,9 +474,9 @@ fn on_app_resize(w, h){
     ui.hint_wrap.set_visible(w >= 300)
     ui.head_refresh.set_visible(w >= 260)
     ui.tiny_refresh.set_visible(w < 260)
-    if is_tiny != (w < 260) || is_narrow != (w < 400) {
-        is_tiny = w < 260
-        is_narrow = w < 400
+    if mod.state.is_tiny != (w < 260) || mod.state.is_narrow != (w < 400) {
+        mod.state.is_tiny = w < 260
+        mod.state.is_narrow = w < 400
         build_rows()
     }
     return nil
@@ -495,10 +484,10 @@ fn on_app_resize(w, h){
 
 fn on_permissions_changed(caps){
     if setup_pending { return nil }
-    if !host.has("matrix.room.unread.read") { unread_loaded = false }
-    elif !unread_loaded { load_unread() }
-    if !host.has("matrix.room.pins.read") { pins_loaded = false }
-    elif !pins_loaded { load_pins() }
+    if !host.has("matrix.room.unread.read") { mod.state.unread_loaded = false }
+    elif !mod.state.unread_loaded { load_unread() }
+    if !host.has("matrix.room.pins.read") { mod.state.pins_loaded = false }
+    elif !mod.state.pins_loaded { load_pins() }
     if !host.has("matrix.room.messages.read") { messages_loaded = false }
     elif !messages_loaded { load_messages() }
     if !host.has("matrix.room.successor.read") { successor_loaded = false }
@@ -515,7 +504,7 @@ fn setup(retry){
         if r.data.permissions["matrix-room-info"] == true && host.has("matrix.room.unread.read") { load_unread() } else { denied = true }
         if r.data.permissions["matrix-room-read"] == true && host.has("matrix.room.pins.read") { load_pins() } else { denied = true }
         if r.data.permissions["matrix-room-read"] == true && host.has("matrix.room.messages.read") { load_messages() }
-        else { denied = true messages = [] list_state = "denied" build_rows() }
+        else { denied = true mod.state.messages = [] mod.state.list_state = "denied" build_rows() }
         if r.data.permissions["matrix-room-info"] == true && host.has("matrix.room.successor.read") { load_successor() } else { denied = true }
         if denied { say("note", "Some room details weren't allowed. Tap Refresh to ask again.") }
         return nil
@@ -534,27 +523,27 @@ View{
                 width: Fill height: Fit flow: Down spacing: 3
                 summary_wrap := View{
                     width: Fill height: Fit flow: Flow.Right{wrap: true} visible: false
-                    sum_a := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
+                    sum_a := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} } }
                     sum_b_wrap := View{
                         width: Fit height: Fit
-                        sum_b := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
+                        sum_b := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} } }
                     }
                     sum_c_wrap := View{
                         width: Fit height: Fit
-                        sum_c := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
+                        sum_c := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} } }
                     }
                 }
                 note_wrap := View{
                     width: Fill height: Fit visible: false
-                    status := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                    status := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                 }
                 ok_wrap := View{
                     width: Fill height: Fit visible: false
-                    status_ok := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x138808 text_style: theme.font_regular{font_size: 10} } }
+                    status_ok := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.success text_style: theme.font_regular{font_size: 10} } }
                 }
                 err_wrap := View{
                     width: Fill height: Fit visible: false
-                    status_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} } }
+                    status_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.danger text_style: theme.font_regular{font_size: 10} } }
                 }
             }
             head_refresh := View{
@@ -566,9 +555,9 @@ View{
             width: Fill height: Fit visible: false
             RoundedView{
                 width: Fill height: Fit flow: Down spacing: 4 padding: 12
-                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
-                Label{ text: "This room was upgraded" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12} } }
-                successor_line := Label{ text: "The conversation continues in a new room." width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                show_bg: true draw_bg +: { color: theme.palette.card border_radius: 8.0 }
+                Label{ text: "This room was upgraded" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 12} } }
+                successor_line := Label{ text: "The conversation continues in a new room." width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                 View{
                     width: Fill height: Fit margin: Inset{top: 6}
                     PrimaryButton{ text: "Open the new room" on_click: || open_successor() }
@@ -599,26 +588,26 @@ View{
         }
         list_head := View{
             width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-            Label{ text: "RECENT MESSAGES" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+            Label{ text: "RECENT MESSAGES" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} } }
             hint_wrap := View{
                 width: Fit height: Fit
-                Label{ text: "Tap one to pin it" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                Label{ text: "Tap one to pin it" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
             }
         }
         loading_wrap := View{
             width: Fill height: Fit flow: Right spacing: 10 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24}
-            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
-            Label{ text: "Loading messages…" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: theme.palette.accent_text } }
+            Label{ text: "Loading messages…" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
         }
         empty_wrap := View{
             width: Fill height: Fit visible: false
             RoundedView{
                 width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5}
                 padding: Inset{left: 16 right: 16 top: 20 bottom: 20}
-                show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                show_bg: true draw_bg +: { color: theme.palette.card_subtle border_radius: 8.0 }
                 empty_icon := Label{ text: "📭" padding: 0 margin: 0 draw_text +: { text_style: theme.font_regular{font_size: 28} } }
-                empty_title := Label{ text: "No messages yet" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} } }
-                empty_body := Label{ text: "Messages you can pin show up here." width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                empty_title := Label{ text: "No messages yet" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 12.5} } }
+                empty_body := Label{ text: "Messages you can pin show up here." width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
                 empty_btn_wrap := View{
                     width: Fit height: Fit visible: false margin: Inset{top: 6}
                     empty_btn := NeutralButton{ text: "Try again" on_click: || setup(true) }
@@ -636,25 +625,29 @@ View{
                 width: Fill height: Fill flow: Down spacing: 8
                 on_item_tap: |i| toggle_pin(i)
                 on_render: || {
-                    for r in rows {
+                    for r in mod.state.rows {
+                        // Colors are picked here, so a theme switch recolors the rows it keeps.
                         RoundedView{
                             width: Fill height: Fit flow: Right spacing: 10
                             padding: Inset{left: 12 right: 12 top: 10 bottom: 10}
-                            show_bg: true draw_bg +: { color: r.bg border_size: 1.0 border_color: r.edge border_radius: 8.0 }
+                            show_bg: true draw_bg +: {
+                                color: if r.is_pinned {theme.palette.pressed} else {theme.palette.card_subtle} border_size: 1.0
+                                border_color: if r.is_pinned {theme.palette.accent} else {theme.palette.card_subtle} border_radius: 8.0
+                            }
                             RoundedView{
-                                visible: !is_tiny width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
-                                show_bg: true draw_bg +: { color: #x52b2ac border_radius: 16.0 }
-                                Label{ text: r.initial padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
+                                visible: !mod.state.is_tiny width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
+                                show_bg: true draw_bg +: { color: theme.palette.avatar border_radius: 16.0 }
+                                Label{ text: r.initial padding: 0 margin: 0 draw_text +: { color: theme.palette.on_accent text_style: theme.font_bold{font_size: 12} } }
                             }
                             View{
                                 width: Fill height: Fit flow: Down spacing: 4
                                 View{
                                     width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-                                    Label{ text: r.who width: Fill padding: 0 margin: 0 max_lines: 1 text_overflow: TextOverflow.Ellipsis draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} } }
-                                    Label{ text: r.pin padding: 0 margin: 0 draw_text +: { color: #x0f88fe text_style: theme.font_bold{font_size: 10} } }
-                                    Label{ text: r.when padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                                    Label{ text: r.who width: Fill padding: 0 margin: 0 max_lines: 1 text_overflow: TextOverflow.Ellipsis draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 11} } }
+                                    Label{ text: r.pin padding: 0 margin: 0 draw_text +: { color: theme.palette.accent_text text_style: theme.font_bold{font_size: 10} } }
+                                    Label{ text: r.when padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                                 }
-                                Label{ text: r.body width: Fill padding: 0 margin: 0 max_lines: 3 text_overflow: TextOverflow.Ellipsis draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
+                                Label{ text: r.body width: Fill padding: 0 margin: 0 max_lines: 3 text_overflow: TextOverflow.Ellipsis draw_text +: { color: theme.palette.body text_style: theme.font_regular{font_size: 11} } }
                             }
                         }
                     }

@@ -3,7 +3,7 @@
 //! [A2UI](https://a2ui.org) lets an agent describe a UI as JSON messages: a flat
 //! component list, a data model and a root. [`to_splash`] translates one complete
 //! payload (v0.8, v0.9.x or v1.0 messages) into a static Splash script. Bindings
-//! are resolved at translation time, inputs write back into script variables, and
+//! are resolved at translation time, inputs write back into the script's model, and
 //! button actions are posted to the room as the A2UI client-to-server message,
 //! so the agent that sent the UI receives them. Later updates are not live.
 
@@ -602,10 +602,14 @@ impl ExprParser<'_> {
 // Splash emission
 // ---------------------------------------------------------------------------
 
-const TEXT_COLOR: &str = "#x1C274C";
-const MUTED_COLOR: &str = "#x66708F";
-const ERROR_COLOR: &str = "#xDC0005";
+const TEXT_COLOR: &str = "theme.palette.title";
+const MUTED_COLOR: &str = "theme.palette.muted";
+const ERROR_COLOR: &str = "theme.palette.danger";
+/// The app's icon tint when no surface names a primaryColor (its controls then use the palette's accent).
 const DEFAULT_TINT: u32 = 0x4A90D9;
+/// Where the inputs' values and a send in flight live (`RUNTIME` names it too):
+/// a theme switch runs the script again but keeps what it put on `mod`.
+const MODEL: &str = "mod.a2ui";
 
 /// A resolved value, and the absolute data path it is bound to, if any.
 #[derive(Clone, Debug)]
@@ -637,9 +641,12 @@ struct LiveText {
     pieces: Vec<TextPiece>,
 }
 
-/// A script variable backing one bound data path that an input writes.
+/// The model slot backing one bound data path that an input writes.
 struct Var {
+    /// Its functions' prefix, e.g. `a2ui_v0` for `a2ui_v0_set`.
     name: String,
+    /// Its value's place in the model, e.g. `mod.a2ui.v0`.
+    slot: String,
     kind: VarKind,
     initial: Value,
 }
@@ -869,7 +876,7 @@ fn translate(text: &str, inline_event: Option<&str>, edits: Option<&Edits>) -> R
     let mut drawn = 0;
     for (index, surface) in surfaces.iter().enumerate() {
         let Some(root) = root_of(surface) else { continue };
-        if drawn > 0 { body.push_str("        SolidView{ width: Fill height: 1 draw_bg +: { color: #x00000018 } }\n"); }
+        if drawn > 0 { body.push_str("        SolidView{ width: Fill height: 1 draw_bg +: { color: theme.palette.divider } }\n"); }
         drawn += 1;
         let mut ctx = Ctx { index, surface, data: surface.data.clone(), visiting: Vec::new() };
         emitter.node(&mut ctx, &root, "/", 2, &mut body, Place::default());
@@ -1091,8 +1098,8 @@ impl Emitter {
         if let Some(&var) = self.var_index.get(&key) {
             return var;
         }
-        let name = format!("a2ui_v{}", self.vars.len());
-        self.vars.push(Var { name, kind, initial });
+        let index = self.vars.len();
+        self.vars.push(Var { name: format!("a2ui_v{index}"), slot: format!("{MODEL}.v{index}"), kind, initial });
         self.var_index.insert(key, self.vars.len() - 1);
         self.vars.len() - 1
     }
@@ -1234,9 +1241,9 @@ impl Emitter {
             }
             "Divider" => {
                 if str_prop(p, &["axis"]) == "vertical" {
-                    let _ = writeln!(out, "{pad}SolidView{{ width: 1 height: 24 draw_bg +: {{ color: #x00000018 }} }}");
+                    let _ = writeln!(out, "{pad}SolidView{{ width: 1 height: 24 draw_bg +: {{ color: theme.palette.divider }} }}");
                 } else {
-                    let _ = writeln!(out, "{pad}SolidView{{ width: Fill height: 1 draw_bg +: {{ color: #x00000018 }} }}");
+                    let _ = writeln!(out, "{pad}SolidView{{ width: Fill height: 1 draw_bg +: {{ color: theme.palette.divider }} }}");
                 }
             }
             "Row" | "Column" | "List" => {
@@ -1275,7 +1282,7 @@ impl Emitter {
                     let _ = writeln!(out, "{pad}View{{ width: {width} height: Fit flow: Down spacing: 8 padding: 4");
                 } else {
                     let _ = writeln!(out, "{pad}RoundedView{{ width: {width} height: Fit flow: Down spacing: 8 padding: 12 show_bg: true new_batch: true");
-                    let _ = writeln!(out, "{pad}    draw_bg +: {{ color: #xFFFFFF border_radius: 8.0 border_size: 1.0 border_color: #xDDE1EA }}");
+                    let _ = writeln!(out, "{pad}    draw_bg +: {{ color: theme.palette.surface border_radius: 8.0 border_size: 1.0 border_color: theme.palette.card_border }}");
                 }
                 for (kid, kid_scope) in self.children(ctx, &comp, scope) {
                     self.node(ctx, &kid, &kid_scope, depth + 1, out, Place { parent_fit: is_fit, ..Place::default() });
@@ -1314,7 +1321,7 @@ impl Emitter {
                 let _ = writeln!(out, "{pad}View{{ width: {width} height: Fit flow: Down spacing: 8");
                 let _ = writeln!(out, "{pad}    A2uiButton{{ text: {} on_click: || ui.{pane}.set_visible(true) }}", lit(&label));
                 let _ = writeln!(out, "{pad}    {pane} := RoundedView{{ visible: false width: {width} height: Fit flow: Down spacing: 8 padding: 12 show_bg: true new_batch: true");
-                let _ = writeln!(out, "{pad}        draw_bg +: {{ color: #xF4F6FB border_radius: 8.0 border_size: 1.0 border_color: #xC9CFDC }}");
+                let _ = writeln!(out, "{pad}        draw_bg +: {{ color: theme.palette.card_subtle border_radius: 8.0 border_size: 1.0 border_color: theme.palette.border }}");
                 if let Some(content) = content {
                     self.node(ctx, &content, scope, depth + 2, out, Place { parent_fit: is_fit, ..Place::default() });
                 }
@@ -1602,7 +1609,7 @@ impl Emitter {
 
     fn operand_expr(&self, surface: usize, operand: &Operand) -> String {
         match operand.path.as_ref().and_then(|path| self.var_index.get(&(surface, path.clone()))) {
-            Some(&var) => self.vars[var].name.clone(),
+            Some(&var) => self.vars[var].slot.clone(),
             None => splash_literal(&operand.now),
         }
     }
@@ -1694,8 +1701,7 @@ impl Emitter {
     fn json_expr(&self, surface: usize, path: Option<&str>, value: &Value, out: &mut Vec<Piece>) {
         if let Some(path) = path {
             if let Some(&var) = self.var_index.get(&(surface, path.to_string())) {
-                let name = &self.vars[var].name;
-                out.push(Piece::Expr(format!("{name}.to_json()")));
+                out.push(Piece::Expr(format!("{}.to_json()", self.vars[var].slot)));
                 return;
             }
             let prefix = format!("{}/", path.trim_end_matches('/'));
@@ -1741,10 +1747,10 @@ impl Emitter {
             .or_else(|| surfaces.first().map(|s| s.id.clone()).filter(|id| id != "default"))
             .unwrap_or_else(|| "A2UI App".into());
         let title: String = title.chars().filter(|c| !c.is_control()).take(18).collect();
-        let tint = surfaces.iter().find_map(|s| s.primary_color).unwrap_or(DEFAULT_TINT);
+        let tint = surfaces.iter().find_map(|s| s.primary_color);
         let _ = writeln!(s, "// name: {}", title.trim());
         let _ = writeln!(s, "// icon: 🧩");
-        let _ = writeln!(s, "// tint: #{tint:06X}");
+        let _ = writeln!(s, "// tint: #{:06X}", tint.unwrap_or(DEFAULT_TINT));
         let description: String = description.unwrap_or("An agent's A2UI surface, translated into a Splash mini-app.")
             .chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
         let _ = writeln!(s, "// description: {}", description.trim());
@@ -1762,14 +1768,9 @@ impl Emitter {
             let _ = writeln!(s, "// why-open-url: Opens the agent's links and media in your browser.");
         }
         s.push('\n');
-        let shade = |by: u32| {
-            let channel = |shift: u32| ((tint >> shift) & 0xFF) * (100 - by) / 100;
-            format!("#x{:02X}{:02X}{:02X}", channel(16), channel(8), channel(0))
-        };
-        let (base, hover, down) = (shade(0), shade(12), shade(24));
-        s.push_str(&STYLES.replace("$TINT", &base).replace("$HOVER", &hover).replace("$DOWN", &down));
+        s.push_str(&tint_script(tint));
+        s.push_str(STYLES);
         s.push('\n');
-        let _ = writeln!(s, "let a2ui_sending = false");
         // Inline surfaces answer their message; panes post the action as text.
         match &self.inline_event {
             Some(event_id) => {
@@ -1779,15 +1780,18 @@ impl Emitter {
                 let _ = writeln!(s, "fn a2ui_post(body, done){{ host.request(\"matrix.send_message\", {{body: body}}, done) }}");
             }
         }
-        for var in &self.vars {
-            let _ = writeln!(s, "let {} = {}", var.name, splash_value(&var.initial, var.kind));
-        }
         s.push_str(RUNTIME);
+        // Top-level `let`s start over when a theme switch runs the script again; the model doesn't.
+        let model: Vec<String> = std::iter::once("is_sending: false".to_string())
+            .chain(self.vars.iter().enumerate().map(|(index, var)| format!("v{index}: {}", splash_value(&var.initial, var.kind))))
+            .chain(self.choices.iter().filter(|choice| choice.is_filterable).map(|choice| format!("{}_query: \"\"", choice.fn_name)))
+            .collect();
+        let _ = writeln!(s, "{MODEL} = {{{}}}", model.join(", "));
         // Input setters refresh the labels showing their path.
         for (index, var) in self.vars.iter().enumerate() {
             if var.kind == VarKind::List { continue; }
             let _ = writeln!(s, "fn {}_set(v){{", var.name);
-            let _ = writeln!(s, "    {} = v", var.name);
+            let _ = writeln!(s, "    {} = v;", var.slot);
             self.write_refresh(&mut s, index);
             let _ = writeln!(s, "    a2ui_export()");
             let _ = writeln!(s, "}}");
@@ -1801,7 +1805,7 @@ impl Emitter {
                 .map(|((surface, path), &var)| {
                     let value = match self.sliders.iter().find(|(slider_var, _)| *slider_var == var) {
                         Some((_, widget)) => format!("ui.{widget}.value()"),
-                        None => self.vars[var].name.clone(),
+                        None => self.vars[var].slot.clone(),
                     };
                     format!("[{}, {}, {value}]", lit(&surfaces[*surface].id), lit(path))
                 }).collect();
@@ -1847,25 +1851,25 @@ impl Emitter {
             let _ = writeln!(s, "}}");
         }
         for choice in &self.choices {
-            let name = &self.vars[choice.var].name;
+            let slot = &self.vars[choice.var].slot;
             let f = &choice.fn_name;
             let values: Vec<String> = choice.options.iter().map(|option| lit(&option.value)).collect();
             if choice.is_filterable {
-                let _ = writeln!(s, "let {f}_query = \"\"");
                 let _ = writeln!(s, "fn {f}_filter(t){{");
-                let _ = writeln!(s, "    {f}_query = a2ui_lower(t)");
+                let _ = writeln!(s, "    {MODEL}.{f}_query = a2ui_lower(t);");
                 let _ = writeln!(s, "    {f}_show()");
                 let _ = writeln!(s, "}}");
             }
             let _ = writeln!(s, "fn {f}(i){{");
             let _ = writeln!(s, "    let values = [{}]", values.join(", "));
-            let _ = writeln!(s, "    {name} = a2ui_toggle_pick({name}, values[i], {})", choice.max.unwrap_or(0));
+            let _ = writeln!(s, "    {slot} = a2ui_toggle_pick({slot}, values[i], {});", choice.max.unwrap_or(0));
             let _ = writeln!(s, "    {f}_changed()");
             let _ = writeln!(s, "}}");
             if choice.style == ChoiceStyle::Checks {
                 let _ = writeln!(s, "fn {f}_set(i, c){{");
                 let _ = writeln!(s, "    let values = [{}]", values.join(", "));
-                let _ = writeln!(s, "    if c != a2ui_has({name}, values[i]) {{ {name} = a2ui_toggle_pick({name}, values[i], 0) }}");
+                // No `;` ends an `if` block: the VM would pop a value the block never pushed.
+                let _ = writeln!(s, "    if c != a2ui_has({slot}, values[i]) {{ {slot} = a2ui_toggle_pick({slot}, values[i], 0) }}");
                 let _ = writeln!(s, "    {f}_changed()");
                 let _ = writeln!(s, "}}");
             }
@@ -1880,9 +1884,9 @@ impl Emitter {
             // Each option's state, and only the options matching the filter.
             let _ = writeln!(s, "fn {f}_show(){{");
             for option in &choice.options {
-                let has = format!("a2ui_has({name}, {})", lit(&option.value));
+                let has = format!("a2ui_has({slot}, {})", lit(&option.value));
                 let shown = if choice.is_filterable {
-                    format!("{}.search({f}_query) >= 0", lit(&option.label.to_lowercase()))
+                    format!("{}.search({MODEL}.{f}_query) >= 0", lit(&option.label.to_lowercase()))
                 } else { "true".into() };
                 let w = &option.widget;
                 match choice.style {
@@ -1986,7 +1990,7 @@ impl Emitter {
             let _ = writeln!(s, "        width: Fill height: Fit flow: Down spacing: 10 padding: 10");
         } else {
             let _ = writeln!(s, "SolidView{{");
-            let _ = writeln!(s, "    width: Fill height: Fill flow: Down new_batch: true draw_bg +: {{ color: #xFFFFFF }}");
+            let _ = writeln!(s, "    width: Fill height: Fill flow: Down new_batch: true draw_bg +: {{ color: theme.palette.surface }}");
             let _ = writeln!(s, "    ScrollYView{{");
             let _ = writeln!(s, "        width: Fill height: Fill flow: Down spacing: 10 padding: 14");
         }
@@ -2032,36 +2036,36 @@ impl Emitter {
 
     /// A variable's value as display text.
     fn display_expr(&self, var: usize) -> String {
-        let name = &self.vars[var].name;
+        let slot = &self.vars[var].slot;
         match self.vars[var].kind {
-            VarKind::Text | VarKind::Number => format!("(\"\" + {name})"),
-            VarKind::Bool => format!("(if {name} {{\"true\"}} else {{\"false\"}})"),
-            VarKind::List => format!("a2ui_join({name})"),
+            VarKind::Text | VarKind::Number => format!("(\"\" + {slot})"),
+            VarKind::Bool => format!("(if {slot} {{\"true\"}} else {{\"false\"}})"),
+            VarKind::List => format!("a2ui_join({slot})"),
         }
     }
 }
 
-/// Controls styled for the white surface: the theme defaults draw light text.
+/// Controls in Robrix's look, colored from the palette and the tint `tint_script` defines.
 const STYLES: &str = r#"let A2uiButton = Button{
     padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
     draw_bg +: {
         border_size: 1.0 border_radius: 4.0
-        color: #xFFFFFF color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF
-        border_color: #xC8C8C8 border_color_hover: $TINT border_color_down: $TINT border_color_focus: #xC8C8C8
+        color: theme.palette.surface color_hover: theme.palette.card color_down: theme.palette.pressed color_focus: theme.palette.surface
+        border_color: theme.palette.border border_color_hover: a2ui_tint_line border_color_down: a2ui_tint_line border_color_focus: theme.palette.border
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C text_style: theme.font_regular{font_size: 10} }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title text_style: theme.font_regular{font_size: 10} }
 }
 let A2uiPrimary = A2uiButton{
     draw_bg +: {
         border_size: 0.0
-        color: $TINT color_hover: $HOVER color_down: $DOWN color_focus: $TINT
+        color: a2ui_tint color_hover: a2ui_tint_hover color_down: a2ui_tint_down color_focus: a2ui_tint
     }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF }
+    draw_text +: { color: a2ui_on_tint color_hover: a2ui_on_tint color_down: a2ui_on_tint color_focus: a2ui_on_tint }
 }
 let A2uiFlat = A2uiButton{
-    draw_bg +: { border_size: 0.0 color: #xFFFFFF color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF }
-    draw_text +: { color: $TINT color_hover: $HOVER color_down: $DOWN color_focus: $TINT }
+    draw_bg +: { border_size: 0.0 color: theme.palette.surface color_hover: theme.palette.card color_down: theme.palette.pressed color_focus: theme.palette.surface }
+    draw_text +: { color: a2ui_tint_text color_hover: a2ui_tint_text_hover color_down: a2ui_tint_text_down color_focus: a2ui_tint_text }
 }
 let A2uiChip = A2uiButton{
     padding: Inset{left: 10 right: 10 top: 5 bottom: 5}
@@ -2069,32 +2073,108 @@ let A2uiChip = A2uiButton{
 }
 let A2uiChipOn = A2uiChip{
     draw_bg +: {
-        color: $TINT color_hover: $HOVER color_down: $DOWN color_focus: $TINT
-        border_color: $TINT border_color_hover: $HOVER border_color_down: $DOWN border_color_focus: $TINT
+        color: a2ui_tint color_hover: a2ui_tint_hover color_down: a2ui_tint_down color_focus: a2ui_tint
+        border_color: a2ui_tint_line border_color_hover: a2ui_tint_line_hover border_color_down: a2ui_tint_line_down border_color_focus: a2ui_tint_line
     }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF }
+    draw_text +: { color: a2ui_on_tint color_hover: a2ui_on_tint color_down: a2ui_on_tint color_focus: a2ui_on_tint }
 }
 let A2uiOption = A2uiFlat{
     padding: Inset{left: 4 right: 8 top: 4 bottom: 4}
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title }
 }
 let A2uiSlider = Slider{
-    draw_text +: { color: #x66708F color_hover: #x1C274C color_drag: #x1C274C color_focus: #x1C274C color_disabled: #x66708F }
+    draw_text +: { color: theme.palette.muted color_hover: theme.palette.title color_drag: theme.palette.title color_focus: theme.palette.title color_disabled: theme.palette.muted }
 }
 let A2uiField = TextInput{
     width: Fill height: Fit padding: 10
     draw_bg +: {
         border_radius: 4.0 border_size: 1.0
-        color: #xFFFFFF color_hover: #xFFFFFF color_focus: #xFFFFFF color_down: #xFFFFFF color_empty: #xFFFFFF
-        border_color: #xC8C8C8 border_color_hover: $TINT border_color_focus: $TINT border_color_down: $TINT border_color_empty: #xC8C8C8
+        color: theme.palette.surface color_hover: theme.palette.surface color_focus: theme.palette.surface color_down: theme.palette.surface color_empty: theme.palette.surface
+        border_color: theme.palette.border border_color_hover: a2ui_tint_line border_color_focus: a2ui_focus border_color_down: a2ui_focus border_color_empty: theme.palette.border
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #x333333 color_hover: #x333333 color_focus: #x333333 color_down: #x333333 color_empty: #xBBBBBB color_empty_hover: #x999999 color_empty_focus: #x999999 text_style: theme.font_regular{font_size: 11} }
+    draw_text +: { color: theme.palette.body color_hover: theme.palette.body color_focus: theme.palette.body color_down: theme.palette.body color_empty: theme.palette.placeholder color_empty_hover: theme.palette.placeholder_hover color_empty_focus: theme.palette.placeholder_hover text_style: theme.font_regular{font_size: 11} }
 }
 let A2uiCheck = CheckBox{
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C color_active: #x1C274C color_disabled: #x66708F text_style: theme.font_regular{font_size: 10} }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title color_active: theme.palette.title color_disabled: theme.palette.muted text_style: theme.font_regular{font_size: 10} }
 }
 "#;
+
+/// Robrix's light and dark panes (`theme.palette.surface`), which a custom tint's text must read on.
+const LIGHT_SURFACE: u32 = 0xFFFFFF;
+const DARK_SURFACE: u32 = 0x262626;
+/// Text on a custom tint too light for white text.
+const DARK_INK: u32 = 0x1C274C;
+
+/// The tint the controls use: the palette's accent, or the surface's own primaryColor
+/// with its text and lines (hover, focus and selected-chip borders) readable on either theme's surface.
+fn tint_script(tint: Option<u32>) -> String {
+    let Some(tint) = tint else {
+        return "let a2ui_tint = theme.palette.accent\nlet a2ui_tint_hover = theme.palette.accent_hover\n\
+            let a2ui_tint_down = theme.palette.accent_down\nlet a2ui_on_tint = theme.palette.on_accent\n\
+            let a2ui_tint_text = theme.palette.accent_text\n\
+            let a2ui_tint_text_hover = if theme.palette.is_dark {theme.palette.accent_text} else {theme.palette.accent_hover}\n\
+            let a2ui_tint_text_down = if theme.palette.is_dark {theme.palette.accent_text} else {theme.palette.accent_down}\n\
+            let a2ui_tint_line = theme.palette.accent\n\
+            let a2ui_tint_line_hover = theme.palette.accent_hover\nlet a2ui_tint_line_down = theme.palette.accent_down\n\
+            let a2ui_focus = theme.palette.focus\n".into();
+    };
+    let hex = |color: u32| format!("#x{color:06X}");
+    let by_theme = |light: u32, dark: u32| if light == dark { hex(light) } else { format!("if theme.palette.is_dark {{{}}} else {{{}}}", hex(dark), hex(light)) };
+    let shade = |by: u32| darken(tint, by);
+    // White like Robrix's own accent buttons, unless the tint is too light for it.
+    let white = contrast(0xFFFFFF, tint);
+    let on_tint = if white >= 3.0 || white >= contrast(DARK_INK, tint) { "theme.palette.on_accent".into() } else { hex(DARK_INK) };
+    // Text keeps the 3:1 of Robrix's links on light and reads at 4.5:1 on dark; a 1px line needs 3:1.
+    let (text_light, text_dark) = (readable_on(tint, LIGHT_SURFACE, 3.0), readable_on(tint, DARK_SURFACE, 4.5));
+    // On light, hovered and pressed text darkens like the fill; on dark it keeps its resting color.
+    let text = |by: u32| by_theme(darken(text_light, by), text_dark);
+    let line = |fill: u32| by_theme(fill, readable_on(fill, DARK_SURFACE, 3.0));
+    format!("let a2ui_tint = {}\nlet a2ui_tint_hover = {}\nlet a2ui_tint_down = {}\nlet a2ui_on_tint = {on_tint}\n\
+        let a2ui_tint_text = {}\nlet a2ui_tint_text_hover = {}\nlet a2ui_tint_text_down = {}\n\
+        let a2ui_tint_line = {}\nlet a2ui_tint_line_hover = {}\nlet a2ui_tint_line_down = {}\n\
+        let a2ui_focus = a2ui_tint_line\n",
+        hex(tint), hex(shade(12)), hex(shade(24)), text(0), text(12), text(24),
+        line(tint), line(shade(12)), line(shade(24)))
+}
+
+/// `color` (`0xRRGGBB`) with each channel darkened by `by` percent.
+fn darken(color: u32, by: u32) -> u32 {
+    let channel = |shift: u32| ((color >> shift) & 0xFF) * (100 - by) / 100;
+    channel(16) << 16 | channel(8) << 8 | channel(0)
+}
+
+/// WCAG relative luminance of an `0xRRGGBB` color.
+fn luminance(color: u32) -> f64 {
+    let channel = |shift: u32| {
+        let c = ((color >> shift) & 0xFF) as f64 / 255.0;
+        if c <= 0.03928 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+}
+
+/// WCAG contrast ratio of two `0xRRGGBB` colors.
+fn contrast(a: u32, b: u32) -> f64 {
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// `tint` as text or a line on `surface`: kept if it reads at least `keep`:1,
+/// else darkened or lightened just enough to reach 4.5:1.
+fn readable_on(tint: u32, surface: u32, keep: f64) -> u32 {
+    if contrast(tint, surface) >= keep {
+        return tint;
+    }
+    let target: u32 = if luminance(surface) > 0.18 { 0x000000 } else { 0xFFFFFF };
+    let mix = |amount: f64| {
+        let channel = |shift: u32| {
+            let (from, to) = (((tint >> shift) & 0xFF) as f64, ((target >> shift) & 0xFF) as f64);
+            ((from + (to - from) * amount).round() as u32) << shift
+        };
+        channel(16) | channel(8) | channel(0)
+    };
+    (0..=20).map(|step| mix(step as f64 / 20.0)).find(|color| contrast(*color, surface) >= 4.5).unwrap_or(target)
+}
 
 /// Runtime helpers every translated app carries.
 const RUNTIME: &str = r#"
@@ -2106,11 +2186,11 @@ fn a2ui_note(text, is_error){
 }
 
 fn a2ui_send(body, name){
-    if a2ui_sending { return nil }
-    a2ui_sending = true
+    if mod.a2ui.is_sending { return nil }
+    mod.a2ui.is_sending = true;
     a2ui_note("Sending " + name + "…", false)
     a2ui_post(body, fn(r){
-        a2ui_sending = false
+        mod.a2ui.is_sending = false;
         if r.is_ok {
             a2ui_note("Sent " + name + " to the room.", false)
             return nil
@@ -2231,6 +2311,16 @@ fn a2ui_toggle_pick(items, value, max){
     next.push(value)
     return next
 }
+
+// A theme switch runs the script again, dropping the reply a send awaited. This runs before the
+// model is set, so it sees the last run's; the note waits for `ui`, which works once the run ends.
+fn a2ui_resume(){
+    if mod["a2ui"] == nil || !mod.a2ui.is_sending { return nil }
+    mod.a2ui.is_sending = false;
+    let _note = start_timeout(0.05, || a2ui_note("Handed your answer to Robrix to send.", false))
+    return nil
+}
+a2ui_resume()
 "#;
 
 enum Piece { Lit(String), Expr(String) }

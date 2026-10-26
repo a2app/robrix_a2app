@@ -12,20 +12,20 @@ let PrimaryButton = Button{
     padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
     draw_bg +: {
         border_size: 0.0 border_radius: 4.0
-        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color: theme.palette.accent color_hover: theme.palette.accent_hover color_down: theme.palette.accent_down color_focus: theme.palette.accent
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+    draw_text +: { color: theme.palette.on_accent color_hover: theme.palette.on_accent color_down: theme.palette.on_accent color_focus: theme.palette.on_accent text_style: theme.font_regular{font_size: 10} }
 }
 let NeutralButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
-        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.neutral_border border_color_hover: theme.palette.neutral_border border_color_down: theme.palette.neutral_border border_color_focus: theme.palette.neutral_border
+        color: theme.palette.neutral color_hover: theme.palette.neutral_hover color_down: theme.palette.neutral_down color_focus: theme.palette.neutral }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title }
 }
 let NegativeButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #xDC0005 border_color_hover: #xDC0005 border_color_down: #xDC0005 border_color_focus: #xDC0005
-        color: #xFFF0F0 color_hover: #xF0D4D4 color_down: #xE0B8B8 color_focus: #xFFF0F0 }
-    draw_text +: { color: #xDC0005 color_hover: #xDC0005 color_down: #xDC0005 color_focus: #xDC0005 }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.danger border_color_hover: theme.palette.danger border_color_down: theme.palette.danger border_color_focus: theme.palette.danger
+        color: theme.palette.danger_bg color_hover: theme.palette.danger_bg_hover color_down: theme.palette.danger_bg_down color_focus: theme.palette.danger_bg }
+    draw_text +: { color: theme.palette.danger color_hover: theme.palette.danger color_down: theme.palette.danger color_focus: theme.palette.danger }
 }
 
 let subscribed_events = []
@@ -48,7 +48,8 @@ let pane = nil
 let utc_offset = nil
 let is_narrow = false
 let is_wide = false
-let env_rows = [{k: "Room" v: "…" c: #x66708F}]
+// Rows and events name their text's palette color, so a theme switch recolors them.
+let env_rows = [{k: "Room" v: "…" tone: "muted"}]
 let prefs_rows = []
 let device_rows = []
 
@@ -105,8 +106,8 @@ fn yes_no(b){
     return "no"
 }
 
-fn log_line(line, color){
-    events.push({t: time_now() text: line c: color})
+fn log_line(line, tone){
+    events.push({t: time_now() text: line tone: tone})
     while events.len() > 20 { events.remove(0) }
     ui.event_list.render()
     ui.events_empty_wrap.set_visible(false)
@@ -114,7 +115,7 @@ fn log_line(line, color){
 }
 
 fn log(line){
-    log_line(line, #x333333)
+    log_line(line, "body")
 }
 
 fn pane_say(text){
@@ -170,7 +171,7 @@ fn read_env(){
         env_loading = false
         env_loaded = r.is_ok
         if !r.is_ok {
-            env_rows = [{k: "Context" v: sentence(r.error) c: #xDC0005}]
+            env_rows = [{k: "Context" v: sentence(r.error) tone: "danger"}]
             ui.env_kv.render()
             return nil
         }
@@ -179,9 +180,9 @@ fn read_env(){
             room = r.data["room_name"]
             if room.is_nil() { room = "A room" }
         }
-        env_rows = [{k: "Room" v: room c: #x333333},
-            {k: "Platform" v: platform_name(r.data.platform) c: #x333333},
-            {k: "Layout" v: if r.data.view_mode == "mobile" {"Mobile"} else {"Desktop"} c: #x333333}]
+        env_rows = [{k: "Room" v: room tone: "body"},
+            {k: "Platform" v: platform_name(r.data.platform) tone: "body"},
+            {k: "Layout" v: if r.data.view_mode == "mobile" {"Mobile"} else {"Desktop"} tone: "body"}]
         ui.env_kv.render()
         return nil
     })
@@ -215,11 +216,11 @@ fn show_prefs_note(text){
 fn show_prefs(p){
     let mode = if p.view_mode == "mobile" {"Mobile"} else {"Desktop"}
     let how = if p.view_mode_override == "auto" {" (automatic)"} else {" (set in Settings)"}
-    prefs_rows = [{k: "View mode" v: mode + how c: #x333333},
-        {k: "UI zoom" v: "" + floor(p.ui_zoom * 100 + 0.5) + "%" c: #x333333},
-        {k: "Thumbnails" v: "Up to " + p.thumbnail_max_height + " px tall" c: #x333333},
-        {k: "Send on Enter" v: if p.send_on_enter {"On"} else {"Off"} c: #x333333},
-        {k: "Read receipts" v: if p.show_read_receipts {"Shown"} else {"Hidden"} c: #x333333}]
+    prefs_rows = [{k: "View mode" v: mode + how tone: "body"},
+        {k: "UI zoom" v: "" + floor(p.ui_zoom * 100 + 0.5) + "%" tone: "body"},
+        {k: "Thumbnails" v: "Up to " + p.thumbnail_max_height + " px tall" tone: "body"},
+        {k: "Send on Enter" v: if p.send_on_enter {"On"} else {"Off"} tone: "body"},
+        {k: "Read receipts" v: if p.show_read_receipts {"Shown"} else {"Hidden"} tone: "body"}]
     ui.prefs_note_wrap.set_visible(false)
     ui.prefs_note_wrap_w.set_visible(false)
     ui.prefs_kv.render()
@@ -245,9 +246,9 @@ fn read_device(){
         }
         let locale = r.data["locale"]
         if locale.is_nil() { locale = "Unknown" }
-        device_rows = [{k: "Platform" v: platform_name(r.data.platform) c: #x333333},
-            {k: "Time zone" v: tz c: #x333333},
-            {k: "Locale" v: locale c: #x333333}]
+        device_rows = [{k: "Platform" v: platform_name(r.data.platform) tone: "body"},
+            {k: "Time zone" v: tz tone: "body"},
+            {k: "Locale" v: locale tone: "body"}]
         ui.device_note_wrap.set_visible(false)
         ui.device_note_wrap_w.set_visible(false)
         ui.device_kv.render()
@@ -277,7 +278,7 @@ fn pane_call(service, args){
         if r.is_ok { return nil }
         let verb = failed_verbs[service]
         if verb.is_nil() { verb = "Couldn't change the pane" }
-        log_line(verb + ": " + sentence(r.error), #xDC0005)
+        log_line(verb + ": " + sentence(r.error), "danger")
         pane_say(verb + ": " + sentence(r.error))
     })
 }
@@ -286,7 +287,7 @@ fn minimize_briefly(){
     pane_say("")
     host.request("ui.pane.minimize", nil, fn(r){
         if !r.is_ok {
-            log_line("Couldn't minimize: " + sentence(r.error), #xDC0005)
+            log_line("Couldn't minimize: " + sentence(r.error), "danger")
             pane_say("Couldn't minimize: " + sentence(r.error))
             return nil
         }
@@ -372,7 +373,7 @@ fn subscribe(name){
         if !r.is_ok {
             let what = event_names[name]
             if what.is_nil() { what = "Live updates" }
-            log_line(what + " are off: " + sentence(r.error), #xDC0005)
+            log_line(what + " are off: " + sentence(r.error), "danger")
         }
     })
 }
@@ -431,6 +432,30 @@ fn setup(retry){
     })
 }
 
+// A theme switch runs this script again from the top, and no resize follows;
+// `resume` picks up the last run's rows, event log and layout.
+fn saved_state(){
+    return {events: events utc_offset: utc_offset is_narrow: is_narrow is_wide: is_wide
+        env_rows: env_rows prefs_rows: prefs_rows device_rows: device_rows}
+}
+fn resume(){
+    let last_run = ok{mod.state.saved()}
+    if last_run == nil {
+        mod.state = {saved: saved_state}
+        return nil
+    }
+    mod.state.saved = saved_state
+    events = last_run.events
+    utc_offset = last_run["utc_offset"]
+    is_narrow = last_run.is_narrow
+    is_wide = last_run.is_wide
+    env_rows = last_run.env_rows
+    prefs_rows = last_run.prefs_rows
+    device_rows = last_run.device_rows
+    return nil
+}
+let _resume = resume()
+
 let _boot = start_timeout(0.05, || {
     ui.env_kv.render()
     setup(false)
@@ -444,21 +469,21 @@ View{
             width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}
             View{
                 width: Fill height: Fit flow: Down spacing: 3
-                pane_line := Label{ text: "Reading this pane…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} } }
-                pane_state := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                pane_line := Label{ text: "Reading this pane…" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} } }
+                pane_state := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
             }
             refresh_btn := NeutralButton{ text: "Refresh" on_click: || setup(true) }
         }
         pane_err_wrap := View{
             width: Fill height: Fit visible: false
-            pane_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} } }
+            pane_err := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.danger text_style: theme.font_regular{font_size: 10} } }
         }
         View{
             width: Fill height: Fit flow: Down spacing: 8
-            Label{ text: "THIS PANE" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+            Label{ text: "THIS PANE" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} } }
             RoundedView{
                 width: Fill height: Fit flow: Down spacing: 12 padding: 12
-                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                show_bg: true draw_bg +: { color: theme.palette.card border_radius: 8.0 }
                 env_kv := View{
                     width: Fill height: Fit flow: Down spacing: 8
                     on_render: || {
@@ -466,15 +491,15 @@ View{
                             if is_narrow {
                                 View{
                                     width: Fill height: Fit flow: Down spacing: 2
-                                    Label{ text: kv.k padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
-                                    Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                    Label{ text: kv.k padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
+                                    Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette[kv.tone] text_style: theme.font_regular{font_size: 11} } }
                                 }
                             }
                             if !is_narrow {
                                 View{
                                     width: Fill height: Fit flow: Right spacing: 8
-                                    Label{ text: kv.k width: 96 padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
-                                    Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                    Label{ text: kv.k width: 96 padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
+                                    Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette[kv.tone] text_style: theme.font_regular{font_size: 11} } }
                                 }
                             }
                         }
@@ -482,7 +507,7 @@ View{
                 }
                 dock_controls := View{
                     width: Fill height: Fit flow: Down spacing: 6 visible: false
-                    Label{ text: "Move to" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                    Label{ text: "Move to" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
                     View{
                         width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
                         NeutralButton{ text: "Top" on_click: || pane_call("ui.pane.set_side", {side: "top"}) }
@@ -493,7 +518,7 @@ View{
                 }
                 dock_note := View{
                     width: Fill height: Fit visible: false
-                    Label{ text: "Moving and minimizing work when the app is docked in a room." width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                    Label{ text: "Moving and minimizing work when the app is docked in a room." width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                 }
                 View{
                     width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8
@@ -517,13 +542,13 @@ View{
             width: Fill height: Fit flow: Down spacing: 12
             View{
                 width: Fill height: Fit flow: Down spacing: 8
-                Label{ text: "ROBRIX SETTINGS" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+                Label{ text: "ROBRIX SETTINGS" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} } }
                 RoundedView{
                     width: Fill height: Fit flow: Down padding: 12
-                    show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                    show_bg: true draw_bg +: { color: theme.palette.card border_radius: 8.0 }
                     prefs_note_wrap := View{
                         width: Fill height: Fit
-                        prefs_note := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                        prefs_note := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
                     }
                     prefs_kv := View{
                         width: Fill height: Fit flow: Down spacing: 8
@@ -533,15 +558,15 @@ View{
                                 if is_narrow {
                                     View{
                                         width: Fill height: Fit flow: Down spacing: 2
-                                        Label{ text: kv.k padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
-                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                        Label{ text: kv.k padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
+                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette[kv.tone] text_style: theme.font_regular{font_size: 11} } }
                                     }
                                 }
                                 if !is_narrow {
                                     View{
                                         width: Fill height: Fit flow: Right spacing: 8
-                                        Label{ text: kv.k width: 96 padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
-                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                        Label{ text: kv.k width: 96 padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
+                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette[kv.tone] text_style: theme.font_regular{font_size: 11} } }
                                     }
                                 }
                             }
@@ -551,13 +576,13 @@ View{
             }
             View{
                 width: Fill height: Fit flow: Down spacing: 8
-                Label{ text: "DEVICE" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+                Label{ text: "DEVICE" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} } }
                 RoundedView{
                     width: Fill height: Fit flow: Down padding: 12
-                    show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                    show_bg: true draw_bg +: { color: theme.palette.card border_radius: 8.0 }
                     device_note_wrap := View{
                         width: Fill height: Fit
-                        device_note := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                        device_note := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
                     }
                     device_kv := View{
                         width: Fill height: Fit flow: Down spacing: 8
@@ -567,15 +592,15 @@ View{
                                 if is_narrow {
                                     View{
                                         width: Fill height: Fit flow: Down spacing: 2
-                                        Label{ text: kv.k padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
-                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                        Label{ text: kv.k padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
+                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette[kv.tone] text_style: theme.font_regular{font_size: 11} } }
                                     }
                                 }
                                 if !is_narrow {
                                     View{
                                         width: Fill height: Fit flow: Right spacing: 8
-                                        Label{ text: kv.k width: 96 padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
-                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                        Label{ text: kv.k width: 96 padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
+                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette[kv.tone] text_style: theme.font_regular{font_size: 11} } }
                                     }
                                 }
                             }
@@ -588,13 +613,13 @@ View{
             width: Fill height: Fit flow: Right spacing: 12 visible: false
             View{
                 width: Fill height: Fit flow: Down spacing: 8
-                Label{ text: "ROBRIX SETTINGS" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+                Label{ text: "ROBRIX SETTINGS" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} } }
                 RoundedView{
                     width: Fill height: Fit flow: Down padding: 12
-                    show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                    show_bg: true draw_bg +: { color: theme.palette.card border_radius: 8.0 }
                     prefs_note_wrap_w := View{
                         width: Fill height: Fit
-                        prefs_note_w := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                        prefs_note_w := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
                     }
                     prefs_kv_w := View{
                         width: Fill height: Fit flow: Down spacing: 8
@@ -604,15 +629,15 @@ View{
                                 if is_narrow {
                                     View{
                                         width: Fill height: Fit flow: Down spacing: 2
-                                        Label{ text: kv.k padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
-                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                        Label{ text: kv.k padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
+                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette[kv.tone] text_style: theme.font_regular{font_size: 11} } }
                                     }
                                 }
                                 if !is_narrow {
                                     View{
                                         width: Fill height: Fit flow: Right spacing: 8
-                                        Label{ text: kv.k width: 96 padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
-                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                        Label{ text: kv.k width: 96 padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
+                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette[kv.tone] text_style: theme.font_regular{font_size: 11} } }
                                     }
                                 }
                             }
@@ -622,13 +647,13 @@ View{
             }
             View{
                 width: Fill height: Fit flow: Down spacing: 8
-                Label{ text: "DEVICE" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+                Label{ text: "DEVICE" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} } }
                 RoundedView{
                     width: Fill height: Fit flow: Down padding: 12
-                    show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                    show_bg: true draw_bg +: { color: theme.palette.card border_radius: 8.0 }
                     device_note_wrap_w := View{
                         width: Fill height: Fit
-                        device_note_w := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                        device_note_w := Label{ text: "Loading…" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
                     }
                     device_kv_w := View{
                         width: Fill height: Fit flow: Down spacing: 8
@@ -638,15 +663,15 @@ View{
                                 if is_narrow {
                                     View{
                                         width: Fill height: Fit flow: Down spacing: 2
-                                        Label{ text: kv.k padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
-                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                        Label{ text: kv.k padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
+                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette[kv.tone] text_style: theme.font_regular{font_size: 11} } }
                                     }
                                 }
                                 if !is_narrow {
                                     View{
                                         width: Fill height: Fit flow: Right spacing: 8
-                                        Label{ text: kv.k width: 96 padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
-                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: kv.c text_style: theme.font_regular{font_size: 11} } }
+                                        Label{ text: kv.k width: 96 padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
+                                        Label{ text: kv.v width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette[kv.tone] text_style: theme.font_regular{font_size: 11} } }
                                     }
                                 }
                             }
@@ -657,16 +682,16 @@ View{
         }
         View{
             width: Fill height: Fit flow: Down spacing: 8
-            events_head := Label{ text: "EVENTS · NEWEST FIRST · UTC" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
+            events_head := Label{ text: "EVENTS · NEWEST FIRST · UTC" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} } }
             events_empty_wrap := View{
                 width: Fill height: Fit
                 RoundedView{
                     width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5}
                     padding: Inset{top: 20 bottom: 20 left: 16 right: 16}
-                    show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                    show_bg: true draw_bg +: { color: theme.palette.card_subtle border_radius: 8.0 }
                     Label{ text: "📋" padding: 0 margin: 0 draw_text +: { text_style: theme.font_regular{font_size: 28} } }
-                    Label{ text: "No events yet" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} } }
-                    Label{ text: "Switch rooms, change a setting, or move this pane." width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                    Label{ text: "No events yet" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 12.5} } }
+                    Label{ text: "Switch rooms, change a setting, or move this pane." width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
                 }
             }
             event_list_wrap := View{
@@ -680,8 +705,8 @@ View{
                             i -= 1
                             View{
                                 width: Fill height: Fit flow: Right spacing: 10
-                                Label{ text: clock(events[i].t) width: 36 padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
-                                Label{ text: events[i].text width: Fill padding: 0 margin: 0 draw_text +: { color: events[i].c text_style: theme.font_regular{font_size: 11} } }
+                                Label{ text: clock(events[i].t) width: 36 padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
+                                Label{ text: events[i].text width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette[events[i].tone] text_style: theme.font_regular{font_size: 11} } }
                             }
                         }
                     }

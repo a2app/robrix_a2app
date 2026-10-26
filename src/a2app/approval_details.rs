@@ -13,7 +13,7 @@ script_mod! {
         width: Fill{max: 800}, height: Fill, margin: 20
         flow: Down, spacing: 12, padding: 20
         show_bg: true
-        draw_bg +: { color: (COLOR_PRIMARY), border_radius: 6.0 }
+        draw_bg +: { color: (COLOR_BG_FLOATING), border_radius: 6.0 }
         View {
             width: Fill, height: Fit, flow: Right, spacing: 10
             title := TitleLabel { width: Fill, margin: 0, text: "Approval details" }

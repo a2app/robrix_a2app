@@ -11,6 +11,7 @@ script_mod! {
     mod.widgets.PermissionMessageLink = #(PermissionMessageLink::register_widget(vm)) {
         ..mod.widgets.HtmlLink
         grab_key_focus: false
+        color: (COLOR_LINK)
     }
     mod.widgets.PermissionMessageSpan = #(PermissionMessageSpan::register_widget(vm)) {
         ..mod.widgets.MatrixHtmlSpan

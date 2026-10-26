@@ -10,6 +10,8 @@
 let keyword = "release"
 let initialized = false
 let test_pending = false
+// The background run whose alert is being posted, or 0.
+let active_run = 0
 let how_open = false
 // The status line's text and tone (0 neutral, 1 success, 2 error); drawn once the pane exists.
 let status = ""
@@ -84,7 +86,9 @@ fn on_background(json){
     }
     let matches = "" + count + " new messages"
     if count == 1 { matches = "1 new message" }
+    active_run = trigger.run_id
     host.request("notify.post", {title: "Keyword Alert", body: "'" + keyword + "' matched " + matches + "."}, fn(r){
+        active_run = 0
         if r.is_ok { show_status(matches + " mentioned “" + keyword + "”. Alert shown.", 1) } else { show_status(error_text(r.error), 2) }
         host.request("background.complete", {run_id: trigger.run_id, success: r.is_ok})
     })
@@ -135,40 +139,59 @@ fn on_app_resize(width, height){
 
 let _load = load()
 
+// A theme switch runs this script again from the top, and no resize follows;
+// `resume` picks up the last run's state and ends a background run it cut off.
+fn saved_state(){ return {initialized: initialized how_open: how_open status: status tone: tone active_run: active_run} }
+fn resume(){
+    let last_run = ok{mod.state.saved()}
+    if last_run == nil {
+        mod.state = {saved: saved_state}
+        return nil
+    }
+    mod.state.saved = saved_state
+    initialized = last_run.initialized
+    how_open = last_run.how_open
+    status = last_run.status
+    tone = last_run.tone
+    if last_run.active_run > 0 { host.request("background.complete", {run_id: last_run.active_run, success: false}) }
+    return nil
+}
+let _resume = resume()
+
 let PrimaryButton = Button{
     padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
     draw_bg +: {
         border_size: 0.0 border_radius: 4.0
-        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color: theme.palette.accent color_hover: theme.palette.accent_hover color_down: theme.palette.accent_down color_focus: theme.palette.accent
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+    draw_text +: { color: theme.palette.on_accent color_hover: theme.palette.on_accent color_down: theme.palette.on_accent color_focus: theme.palette.on_accent text_style: theme.font_regular{font_size: 10} }
 }
 let NeutralButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
-        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.neutral_border border_color_hover: theme.palette.neutral_border border_color_down: theme.palette.neutral_border border_color_focus: theme.palette.neutral_border
+        color: theme.palette.neutral color_hover: theme.palette.neutral_hover color_down: theme.palette.neutral_down color_focus: theme.palette.neutral }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title }
 }
 let GhostButton = PrimaryButton{
     padding: Inset{left: 6 right: 6 top: 4 bottom: 4}
     margin: Inset{left: -6}
-    draw_bg +: { border_size: 0.0 color: #xFFFFFF00 color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF00 }
-    draw_text +: { color: #x66708F color_hover: #x1C274C color_down: #x1C274C color_focus: #x66708F }
+    draw_bg +: { border_size: 0.0 color: theme.palette.transparent color_hover: theme.palette.card color_down: theme.palette.pressed color_focus: theme.palette.transparent }
+    draw_text +: { color: theme.palette.muted color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.muted }
 }
 let Field = TextInput{
     width: Fill height: Fit padding: 10
     draw_bg +: {
         border_radius: 4.0 border_size: 1.0
-        color: #xFFFFFF color_hover: #xFFFFFF color_focus: #xFFFFFF color_down: #xFFFFFF color_empty: #xFFFFFF
-        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_focus: #x106fcc border_color_down: #x106fcc border_color_empty: #xC8C8C8
+        color: theme.palette.surface color_hover: theme.palette.surface color_focus: theme.palette.surface color_down: theme.palette.surface color_empty: theme.palette.surface
+        border_color: theme.palette.border border_color_hover: theme.palette.accent border_color_focus: theme.palette.focus border_color_down: theme.palette.focus border_color_empty: theme.palette.border
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #x333333 color_hover: #x333333 color_focus: #x333333 color_down: #x333333 color_empty: #xBBBBBB color_empty_hover: #x999999 color_empty_focus: #x999999 text_style: theme.font_regular{font_size: 11} }
+    draw_text +: { color: theme.palette.body color_hover: theme.palette.body color_focus: theme.palette.body color_down: theme.palette.body color_empty: theme.palette.placeholder color_empty_hover: theme.palette.placeholder_hover color_empty_focus: theme.palette.placeholder_hover text_style: theme.font_regular{font_size: 11} }
 }
-let Caption = Label{padding: 0 margin: 0 draw_text +: {color: #x66708F text_style: theme.font_bold{font_size: 9.5}}}
-let Hint = Label{width: Fill padding: 0 margin: 0 draw_text +: {color: #x66708F text_style: theme.font_regular{font_size: 10}}}
-let Dot = Label{text: "•" padding: 0 margin: 0 draw_text +: {color: #x66708F text_style: theme.font_regular{font_size: 10}}}
-let Divider = SolidView{width: Fill{max: 480} height: 1 draw_bg +: {color: #x00000018}}
+let Caption = Label{padding: 0 margin: 0 draw_text +: {color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5}}}
+let Hint = Label{width: Fill padding: 0 margin: 0 draw_text +: {color: theme.palette.muted text_style: theme.font_regular{font_size: 10}}}
+let Dot = Label{text: "•" padding: 0 margin: 0 draw_text +: {color: theme.palette.muted text_style: theme.font_regular{font_size: 10}}}
+let Divider = SolidView{width: Fill{max: 480} height: 1 draw_bg +: {color: theme.palette.divider}}
 
 View{
     width: Fill height: Fill flow: Down
@@ -192,11 +215,11 @@ View{
         }
         status_ok_wrap := View{
             visible: false width: Fill{max: 480} height: Fit
-            status_ok := Hint{text: "" draw_text +: {color: #x138808}}
+            status_ok := Hint{text: "" draw_text +: {color: theme.palette.success}}
         }
         status_err_wrap := View{
             visible: false width: Fill{max: 480} height: Fit
-            status_err := Hint{text: "" draw_text +: {color: #xDC0005}}
+            status_err := Hint{text: "" draw_text +: {color: theme.palette.danger}}
         }
         Divider{}
         how_button := GhostButton{text: "How it works ▼" on_click: || toggle_how()}

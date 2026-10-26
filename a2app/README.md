@@ -184,6 +184,10 @@ be downloaded and prepared as media. It does not post anything into Matrix.
   fits a narrow or short pane; **Reset size** restores the default size. The
   viewport dimensions are shown beside the grip. Room-bound apps run in their
   room rather than a public instance.
+- **Light and dark**: mini-apps and A2UI surfaces follow Robrix's appearance
+  and restyle in place when it changes. Apps take their colors from
+  `theme.palette`; an app that writes hex colors without it is shown light
+  even in dark mode.
 - A **create bar**: describe an app ("a pomodoro timer") and the
   agent writes it in the Splash dialect, validated with the real parser and
   auto-repaired for up to two turns. Generation uses the guarded model
@@ -1165,6 +1169,12 @@ live provider credentials.
 - `glass.*` widgets and `height: Fill` roots do not render in a mini-app host
   today; built-in demo apps (`a2app/core/apps/*.splash`) show the working
   idioms (natural sizes throughout).
+- The palette's names live in `a2app/core/src/palette.rs`;
+  `src/a2app/splash_theme.rs` fills them from Robrix's `COLOR_*` tokens. A
+  theme switch runs a running app's script again in the same isolate: `mod.*`
+  entries and widget state survive, while `let`s, timers and pending host
+  requests do not. `palette::is_theme_aware` picks the apps kept light, and
+  refining one asks the agent to move its hex colors onto the palette.
 
 ## Not included yet
 

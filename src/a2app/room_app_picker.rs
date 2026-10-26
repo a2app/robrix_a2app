@@ -26,7 +26,7 @@ script_mod! {
 
         show_bg: true
         draw_bg +: {
-            color: (COLOR_PRIMARY)
+            color: (COLOR_BG_FLOATING)
             border_radius: 6.0
             border_size: 0.0
         }
@@ -61,6 +61,8 @@ script_mod! {
 
             app_row := mod.widgets.MiniAppRow {
                 margin: Inset{bottom: 4}
+                // On the modal's surface rather than a pane's.
+                draw_bg +: { color: (COLOR_BG_FLOATING) }
                 row_settings_button +: {visible: false}
             }
             empty_row := View {

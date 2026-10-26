@@ -16,31 +16,31 @@ let PrimaryButton = Button{
     padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
     draw_bg +: {
         border_size: 0.0 border_radius: 4.0
-        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color: theme.palette.accent color_hover: theme.palette.accent_hover color_down: theme.palette.accent_down color_focus: theme.palette.accent
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+    draw_text +: { color: theme.palette.on_accent color_hover: theme.palette.on_accent color_down: theme.palette.on_accent color_focus: theme.palette.on_accent text_style: theme.font_regular{font_size: 10} }
 }
 let NeutralButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
-        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.neutral_border border_color_hover: theme.palette.neutral_border border_color_down: theme.palette.neutral_border border_color_focus: theme.palette.neutral_border
+        color: theme.palette.neutral color_hover: theme.palette.neutral_hover color_down: theme.palette.neutral_down color_focus: theme.palette.neutral }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title }
 }
 let GhostButton = PrimaryButton{
     padding: Inset{left: 6 right: 6 top: 4 bottom: 4}
     margin: Inset{left: -6}
-    draw_bg +: { border_size: 0.0 color: #xFFFFFF00 color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF00 }
-    draw_text +: { color: #x66708F color_hover: #x1C274C color_down: #x1C274C color_focus: #x66708F }
+    draw_bg +: { border_size: 0.0 color: theme.palette.transparent color_hover: theme.palette.card color_down: theme.palette.pressed color_focus: theme.palette.transparent }
+    draw_text +: { color: theme.palette.muted color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.muted }
 }
 let Field = TextInput{
     width: Fill height: Fit padding: 10
     draw_bg +: {
         border_radius: 4.0 border_size: 1.0
-        color: #xFFFFFF color_hover: #xFFFFFF color_focus: #xFFFFFF color_down: #xFFFFFF color_empty: #xFFFFFF
-        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_focus: #x106fcc border_color_down: #x106fcc border_color_empty: #xC8C8C8
+        color: theme.palette.surface color_hover: theme.palette.surface color_focus: theme.palette.surface color_down: theme.palette.surface color_empty: theme.palette.surface
+        border_color: theme.palette.border border_color_hover: theme.palette.accent border_color_focus: theme.palette.focus border_color_down: theme.palette.focus border_color_empty: theme.palette.border
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #x333333 color_hover: #x333333 color_focus: #x333333 color_down: #x333333 color_empty: #xBBBBBB color_empty_hover: #x999999 color_empty_focus: #x999999 text_style: theme.font_regular{font_size: 11} }
+    draw_text +: { color: theme.palette.body color_hover: theme.palette.body color_focus: theme.palette.body color_down: theme.palette.body color_empty: theme.palette.placeholder color_empty_hover: theme.palette.placeholder_hover color_empty_focus: theme.palette.placeholder_hover text_style: theme.font_regular{font_size: 11} }
 }
 
 let subscribed_events = []
@@ -52,31 +52,19 @@ let room_refresh_pending = false
 let messages_loading = false
 let messages_loaded = false
 let messages_reload_pending = false
-let sending = false
-let drafting = false
-let attaching = false
 let setup_pending = false
-
-let room_name = ""
-let room_line = "Loading…"
-let room_line_is_error = false
-let live_note = ""
-// What the list area shows without rows: loading, ready (nothing yet), denied or error.
-let list_state = "loading"
-let list_error = ""
-let messages = []
 let messages_during_read = []
-let rx_queue = []
 let rx_busy = false
 
-// Display rows, newest first.
-let rows = []
-let show_avatars = true
-let is_compact = false
-let is_tiny = false
-let is_no_room = false
-let how_open = false
-let is_foreground = true
+// What the pane shows, kept through the re-run a theme switch does. Without rows the list area
+// shows loading, ready (nothing yet), denied or error; rows are newest first.
+mod.state = {
+    room_name: "" room_line: "Loading…" room_line_is_error: false live_note: "" list_state: "loading" list_error: ""
+    messages: [] rx_queue: [] rows: [] show_avatars: true is_compact: false is_tiny: false is_no_room: false
+    how_open: false is_foreground: true
+    // The compose request awaiting its reply: "pick", "draft", "attach", "send", "file" or "".
+    in_flight: ""
+}
 
 let lower_az = "abcdefghijklmnopqrstuvwxyz"
 let upper_az = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -96,7 +84,7 @@ fn sentence(text){
 }
 
 fn note_no_room(error){
-    if error.search("not attached") >= 0 { is_no_room = true }
+    if error.search("not attached") >= 0 { mod.state.is_no_room = true }
 }
 
 // 1284 -> "1,284"
@@ -124,32 +112,32 @@ fn set_note(kind, text){
 }
 
 fn show_room(){
-    ui.room_title.set_text(room_name)
-    ui.title_wrap.set_visible(room_name != "")
-    let line = room_line
-    if live_note != "" {
+    ui.room_title.set_text(mod.state.room_name)
+    ui.title_wrap.set_visible(mod.state.room_name != "")
+    let line = mod.state.room_line
+    if mod.state.live_note != "" {
         if line != "" { line = line + " · " }
-        line = line + live_note
+        line = line + mod.state.live_note
     }
     ui.room_line.set_text(line)
     ui.room_err.set_text(line)
-    ui.room_line_wrap.set_visible(!room_line_is_error && line != "")
-    ui.room_err_wrap.set_visible(room_line_is_error)
+    ui.room_line_wrap.set_visible(!mod.state.room_line_is_error && line != "")
+    ui.room_err_wrap.set_visible(mod.state.room_line_is_error)
     show_frame()
 }
 
 // Without a room only the explanation shows; narrow panes put Refresh under the title.
 fn show_frame(){
-    ui.head_row.set_visible(!is_no_room)
-    ui.compose_wrap.set_visible(!is_no_room)
-    ui.no_room_wrap.set_visible(is_no_room)
-    if is_no_room {
+    ui.head_row.set_visible(!mod.state.is_no_room)
+    ui.compose_wrap.set_visible(!mod.state.is_no_room)
+    ui.no_room_wrap.set_visible(mod.state.is_no_room)
+    if mod.state.is_no_room {
         ui.list_wrap.set_visible(false)
         ui.list_loading.set_visible(false)
         ui.list_empty.set_visible(false)
     }
-    ui.refresh_wide.set_visible(!is_tiny)
-    ui.refresh_narrow.set_visible(is_tiny && !is_no_room)
+    ui.refresh_wide.set_visible(!mod.state.is_tiny)
+    ui.refresh_narrow.set_visible(mod.state.is_tiny && !mod.state.is_no_room)
 }
 
 fn load_room(){
@@ -159,13 +147,13 @@ fn load_room(){
         room_loading = false
         room_loaded = r.is_ok
         if r.is_ok {
-            room_name = r.data.room_name
-            room_line = member_text(r.data.member_count)
-            room_line_is_error = false
+            mod.state.room_name = r.data.room_name
+            mod.state.room_line = member_text(r.data.member_count)
+            mod.state.room_line_is_error = false
         } else {
             note_no_room(r.error)
-            room_line = "Couldn't load room details. " + sentence(r.error)
-            room_line_is_error = true
+            mod.state.room_line = "Couldn't load room details. " + sentence(r.error)
+            mod.state.room_line_is_error = true
         }
         show_room()
     })
@@ -226,51 +214,47 @@ fn body_text(m){
 
 fn build_rows(){
     let out = []
-    let i = messages.len() - 1
+    let i = mod.state.messages.len() - 1
     while i >= 0 {
-        let m = messages[i]
+        let m = mod.state.messages[i]
         let name = display_name(m)
         let deleted = m["redacted"] == true
         let body = body_text(m)
-        let body_color = #x333333
-        if deleted {
-            body = "Message deleted"
-            body_color = #x66708F
-        }
+        if deleted { body = "Message deleted" }
         let pills = []
         for r in m.reactions {
             pills.push({text: r.key + " " + r.count mine: r.mine == true})
         }
-        out.push({name: name initial: initial_of(name) when: ago(m["ts"]) body: body body_color: body_color pills: pills})
+        out.push({name: name initial: initial_of(name) when: ago(m["ts"]) body: body is_deleted: deleted pills: pills})
         i -= 1
     }
-    rows = out
+    mod.state.rows = out;
 }
 
 // Rows render only when there are some: an emptied list can't clear its old children.
 fn render_list(){
     build_rows()
-    let has_rows = rows.len() > 0 && !is_no_room
+    let has_rows = mod.state.rows.len() > 0 && !mod.state.is_no_room
     if has_rows { ui.msg_list.render() }
     ui.list_wrap.set_visible(has_rows)
-    ui.list_loading.set_visible(!has_rows && list_state == "loading" && !is_no_room)
-    ui.list_empty.set_visible(!has_rows && list_state != "loading" && !is_no_room)
-    ui.no_room_wrap.set_visible(is_no_room)
-    if has_rows || list_state == "loading" { return nil }
+    ui.list_loading.set_visible(!has_rows && mod.state.list_state == "loading" && !mod.state.is_no_room)
+    ui.list_empty.set_visible(!has_rows && mod.state.list_state != "loading" && !mod.state.is_no_room)
+    ui.no_room_wrap.set_visible(mod.state.is_no_room)
+    if has_rows || mod.state.list_state == "loading" { return nil }
     let icon = "📭"
     let title = "No messages yet"
     let detail = "New messages show up here."
     let action = ""
-    if list_state == "denied" {
+    if mod.state.list_state == "denied" {
         icon = "🔒"
         title = "Can't read this room"
         detail = "Allow Room Peek to read this room's latest messages."
         action = "Ask again"
     }
-    if list_state == "error" {
+    if mod.state.list_state == "error" {
         icon = "😕"
         title = "Couldn't load messages"
-        detail = list_error
+        detail = mod.state.list_error
         action = "Try again"
     }
     ui.empty_icon.set_text(icon)
@@ -283,20 +267,20 @@ fn render_list(){
 
 // One matrix.event a second: each costs 5 of a 30 token budget refilling 6 a second.
 fn fetch_reactions(){
-    if rx_queue.len() == 0 {
+    if mod.state.rx_queue.len() == 0 {
         rx_busy = false
         return nil
     }
-    let id = rx_queue[0]
-    rx_queue.remove(0)
+    let id = mod.state.rx_queue[0]
+    mod.state.rx_queue.remove(0)
     host.request("matrix.event", {event_id: id}, fn(r){
-        if !r.is_ok { rx_queue.clear() }
-        let i = index_of(messages, id)
+        if !r.is_ok { mod.state.rx_queue.clear() }
+        let i = index_of(mod.state.messages, id)
         if r.is_ok && i >= 0 {
-            messages[i].reactions = r.data.reactions
+            mod.state.messages[i].reactions = r.data.reactions
             render_list()
         }
-        rx_busy = rx_queue.len() > 0 && start_timeout(1.0, || fetch_reactions()) != nil
+        rx_busy = mod.state.rx_queue.len() > 0 && start_timeout(1.0, || fetch_reactions()) != nil
     })
 }
 
@@ -309,16 +293,16 @@ fn load_messages(){
         messages_loaded = r.is_ok
         let live = messages_during_read
         messages_during_read = []
-        let old = messages
-        let pending = rx_queue
-        messages = []
-        rx_queue = []
+        let old = mod.state.messages
+        let pending = mod.state.rx_queue
+        mod.state.messages = []
+        mod.state.rx_queue = []
         if r.is_ok {
-            list_state = "ready"
+            mod.state.list_state = "ready"
             for m in r.data.messages {
                 let live_index = index_of(live, m.event_id)
                 if live_index >= 0 {
-                    messages.push(live[live_index])
+                    mod.state.messages.push(live[live_index])
                     continue
                 }
                 let i = index_of(old, m.event_id)
@@ -328,33 +312,33 @@ fn load_messages(){
                     m.reactions = []
                     pending.push(m.event_id)
                 }
-                messages.push(m)
+                mod.state.messages.push(m)
             }
             // A branch ending in a loop needs an explicit result.
             nil
         } else {
             note_no_room(r.error)
-            list_state = "error"
-            list_error = sentence(r.error)
+            mod.state.list_state = "error"
+            mod.state.list_error = sentence(r.error)
         }
         for m in live {
-            if index_of(messages, m.event_id) < 0 { messages.push(m) }
+            if index_of(mod.state.messages, m.event_id) < 0 { mod.state.messages.push(m) }
         }
         // Merge only events delivered during this read, ordered oldest first.
         let i = 1
-        while i < messages.len() {
+        while i < mod.state.messages.len() {
             let j = i
-            while j > 0 && messages[j].ts < messages[j - 1].ts {
-                let previous = messages[j - 1]
-                messages[j - 1] = messages[j]
-                messages[j] = previous
+            while j > 0 && mod.state.messages[j].ts < mod.state.messages[j - 1].ts {
+                let previous = mod.state.messages[j - 1]
+                mod.state.messages[j - 1] = mod.state.messages[j]
+                mod.state.messages[j] = previous
                 j -= 1
             }
             i += 1
         }
-        while messages.len() > 15 { messages.remove(0) }
+        while mod.state.messages.len() > 15 { mod.state.messages.remove(0) }
         for id in pending {
-            if index_of(messages, id) >= 0 { rx_queue.push(id) }
+            if index_of(mod.state.messages, id) >= 0 { mod.state.rx_queue.push(id) }
         }
         render_list()
         show_frame()
@@ -362,7 +346,7 @@ fn load_messages(){
             messages_reload_pending = false
             let _reload = start_timeout(1.0, || load_messages())
         }
-        if rx_busy || rx_queue.len() == 0 { return nil }
+        if rx_busy || mod.state.rx_queue.len() == 0 { return nil }
         rx_busy = true
         fetch_reactions()
     })
@@ -370,8 +354,8 @@ fn load_messages(){
 
 // Rows show newest first, so tap i is the i-th newest message.
 fn jump_to_message(i){
-    if i >= messages.len() { return nil }
-    let m = messages[messages.len() - 1 - i]
+    if i >= mod.state.messages.len() { return nil }
+    let m = mod.state.messages[mod.state.messages.len() - 1 - i]
     host.request("nav.event", {event_id: m.event_id}, fn(r){
         if !r.is_ok { set_note("err", "Couldn't jump to that message. " + sentence(r.error)) }
         return nil
@@ -379,16 +363,16 @@ fn jump_to_message(i){
 }
 
 fn draft_msg(){
-    if sending || drafting || attaching { return nil }
+    if mod.state.in_flight != "" { return nil }
     let text = ui.msg_input.text()
     if text.trim() == "" {
         set_note("info", "Type a message first.")
         return nil
     }
-    drafting = true
+    mod.state.in_flight = "draft"
     set_note("info", "Preparing a draft…")
     host.request("composer.insert", {text: text}, fn(r){
-        drafting = false
+        mod.state.in_flight = ""
         if r.is_ok {
             set_note("ok", "Draft ready. Review and send it in Robrix.")
             if ui.msg_input.text() == text { ui.msg_input.set_text("") }
@@ -405,19 +389,20 @@ fn optional_field(obj, key){
 }
 
 fn attach_file(){
-    if sending || drafting || attaching { return nil }
-    attaching = true
+    if mod.state.in_flight != "" { return nil }
+    mod.state.in_flight = "pick"
     let caption = ui.msg_input.text()
     set_note("info", "Choose an image or file to draft…")
     host.request("files.pick", nil, fn(r){
-        if !r.is_ok { attaching = false set_note("err", sentence(r.error)) return nil }
+        if !r.is_ok { mod.state.in_flight = "" set_note("err", sentence(r.error)) return nil }
         if optional_field(r.data, "cancelled") == true {
-            attaching = false
+            mod.state.in_flight = ""
             set_note("info", "No attachment selected.")
             return nil
         }
+        mod.state.in_flight = "attach"
         host.request("composer.attach", {data_base64: r.data.data_base64, filename: r.data.name, mime_type: r.data.mime_type, caption: caption}, fn(out){
-            attaching = false
+            mod.state.in_flight = ""
             if out.is_ok {
                 set_note("ok", "Attachment ready. Review and send it in Robrix.")
                 if ui.msg_input.text() == caption { ui.msg_input.set_text("") }
@@ -427,17 +412,17 @@ fn attach_file(){
 }
 
 fn send_msg(){
-    if sending || drafting || attaching { return nil }
+    if mod.state.in_flight != "" { return nil }
     let draft = ui.msg_input.text()
     let body = draft.trim()
     if body == "" {
         set_note("info", "Type a message first.")
         return nil
     }
-    sending = true
+    mod.state.in_flight = "send"
     set_note("info", "Sending…")
     host.request("matrix.send_message", {body: body}, fn(r){
-        sending = false
+        mod.state.in_flight = ""
         if r.is_ok {
             set_note("ok", "Sent!")
             if ui.msg_input.text() == draft { ui.msg_input.set_text("") }
@@ -449,20 +434,21 @@ fn send_msg(){
 }
 
 fn send_file_now(){
-    if sending || drafting || attaching { return nil }
-    sending = true
+    if mod.state.in_flight != "" { return nil }
+    mod.state.in_flight = "pick"
     let caption = ui.msg_input.text()
     set_note("info", "Choose an image or file to send now…")
     host.request("files.pick", nil, fn(r){
-        if !r.is_ok { sending = false set_note("err", sentence(r.error)) return nil }
+        if !r.is_ok { mod.state.in_flight = "" set_note("err", sentence(r.error)) return nil }
         if optional_field(r.data, "cancelled") == true {
-            sending = false
+            mod.state.in_flight = ""
             set_note("info", "No file sent.")
             return nil
         }
+        mod.state.in_flight = "file"
         set_note("info", "Sending selected file…")
         host.request("matrix.send_media", {data_base64: r.data.data_base64, filename: r.data.name, mime_type: r.data.mime_type, caption: caption}, fn(out){
-            sending = false
+            mod.state.in_flight = ""
             if out.is_ok {
                 set_note("ok", "File sent!")
                 if ui.msg_input.text() == caption { ui.msg_input.set_text("") }
@@ -477,15 +463,15 @@ fn send_file_now(){
 fn on_room_message(json){
     let batch = json.parse_json()
     for m in batch {
-        if index_of(messages, m.event_id) >= 0 { continue }
+        if index_of(mod.state.messages, m.event_id) >= 0 { continue }
         m.reactions = []
-        messages.push(m)
+        mod.state.messages.push(m)
         if messages_loading {
             messages_during_read.push(m)
             while messages_during_read.len() > 15 { messages_during_read.remove(0) }
         }
     }
-    while messages.len() > 15 { messages.remove(0) }
+    while mod.state.messages.len() > 15 { mod.state.messages.remove(0) }
     render_list()
 }
 
@@ -501,9 +487,9 @@ fn on_room_typing(json){
 
 fn on_room_reaction(json){
     let p = json.parse_json()
-    let i = index_of(messages, p.event_id)
+    let i = index_of(mod.state.messages, p.event_id)
     if i < 0 { return nil }
-    let rx = messages[i].reactions
+    let rx = mod.state.messages[i].reactions
     let found = false
     let j = 0
     while j < rx.len() {
@@ -523,14 +509,14 @@ fn on_room_reaction(json){
 
 fn on_room_message_changed(json){
     let p = json.parse_json()
-    let i = index_of(messages, p.event_id)
+    let i = index_of(mod.state.messages, p.event_id)
     if i < 0 { return nil }
     let body = p.body
     if p.redacted {
         body = "(deleted)"
-        messages[i].redacted = true
+        mod.state.messages[i].redacted = true
     }
-    messages[i].body = body
+    mod.state.messages[i].body = body
     render_list()
 }
 
@@ -556,12 +542,12 @@ fn subscribe(name){
         if r.is_ok {
             subscribed_events.push(name)
             if subscribed_events.len() == 5 {
-                live_note = ""
+                mod.state.live_note = ""
                 show_room()
             }
         }
-        if r.is_ok || live_note != "" { return nil }
-        live_note = "Live updates off"
+        if r.is_ok || mod.state.live_note != "" { return nil }
+        mod.state.live_note = "Live updates off"
         show_room()
     })
 }
@@ -576,7 +562,7 @@ fn watch_granted(){
 }
 
 fn watch(){
-    live_note = ""
+    mod.state.live_note = ""
     show_room()
     subscribe("on_room_message")
     subscribe("on_room_members_changed")
@@ -586,40 +572,40 @@ fn watch(){
 }
 
 fn toggle_how(){
-    how_open = !how_open
-    ui.how_wrap.set_visible(how_open)
-    ui.how_btn.set_text(if how_open {"How it works ▲"} else {"How it works ▼"})
+    mod.state.how_open = !mod.state.how_open
+    ui.how_wrap.set_visible(mod.state.how_open)
+    ui.how_btn.set_text(if mod.state.how_open {"How it works ▲"} else {"How it works ▼"})
 }
 
 // Narrow panes move Refresh under the title; very narrow ones shorten labels and drop avatars.
 fn on_app_resize(w, h){
     let tiny = w < 300
-    if tiny != is_tiny {
-        is_tiny = tiny
+    if tiny != mod.state.is_tiny {
+        mod.state.is_tiny = tiny
         show_frame()
     }
     let compact = w < 280
-    if compact != is_compact {
-        is_compact = compact
+    if compact != mod.state.is_compact {
+        mod.state.is_compact = compact
         ui.draft_btn.set_text(if compact {"Draft"} else {"Draft message"})
         ui.attach_btn.set_text(if compact {"Attach"} else {"Attach file"})
         ui.send_btn.set_text(if compact {"Send"} else {"Send now"})
         ui.send_file_btn.set_text(if compact {"Send file"} else {"Send file now"})
     }
     let avatars = w >= 280
-    if avatars == show_avatars { return nil }
-    show_avatars = avatars
-    if rows.len() > 0 { render_list() }
+    if avatars == mod.state.show_avatars { return nil }
+    mod.state.show_avatars = avatars
+    if mod.state.rows.len() > 0 { render_list() }
     return nil
 }
 
 // Relative times ("5m ago") are refreshed once a minute while the pane is visible.
 fn on_focus_changed(json){
-    is_foreground = json.parse_json()["foreground"] != false
+    mod.state.is_foreground = json.parse_json()["foreground"] != false
     return nil
 }
 fn refresh_times(){
-    if !is_foreground || rows.len() == 0 { return nil }
+    if !mod.state.is_foreground || mod.state.rows.len() == 0 { return nil }
     render_list()
     return nil
 }
@@ -641,31 +627,46 @@ fn setup(retry){
         setup_pending = false
         if !r.is_ok {
             note_no_room(r.error)
-            room_line = sentence(r.error)
-            room_line_is_error = true
+            mod.state.room_line = sentence(r.error)
+            mod.state.room_line_is_error = true
             show_room()
-            list_state = "error"
-            list_error = sentence(r.error)
+            mod.state.list_state = "error"
+            mod.state.list_error = sentence(r.error)
             render_list()
             return nil
         }
         if r.data.permissions["matrix-room-info"] == true && host.has("matrix.room.info.read") { load_room() }
         else {
-            room_line = "Room details are off."
-            room_line_is_error = false
+            mod.state.room_line = "Room details are off."
+            mod.state.room_line_is_error = false
             show_room()
         }
         if r.data.permissions["matrix-room-read"] == true && host.has("matrix.room.messages.read") { load_messages() }
         else {
-            messages = []
-            list_state = "denied"
+            mod.state.messages = []
+            mod.state.list_state = "denied"
             render_list()
         }
         if r.data.permissions["matrix-room-watch"] == true { watch_granted() }
     })
 }
 
-let _boot = start_timeout(0.05, || setup(false))
+// A theme switch's re-run drops the reply a compose request awaited; say what became of it.
+fn resume_compose(){
+    let cut = mod.state.in_flight
+    mod.state.in_flight = ""
+    if cut == "pick" { set_note("info", "Interrupted by the theme change. Try again.") }
+    elif cut == "draft" { set_note("info", "Handed your draft to Robrix. Check the message box before drafting again.") }
+    elif cut == "attach" { set_note("info", "Handed your file to Robrix. Check the message box before attaching again.") }
+    elif cut == "send" { set_note("info", "Handed your message to Robrix to send. Check the room before sending again.") }
+    elif cut == "file" { set_note("info", "Handed your file to Robrix to send. Check the room before sending again.") }
+    return nil
+}
+
+let _boot = start_timeout(0.05, || {
+    resume_compose()
+    setup(false)
+})
 
 View{
     width: Fill height: Fill flow: Down
@@ -679,21 +680,21 @@ View{
                     width: Fill height: Fit visible: false
                     room_title := Label{
                         text: "" width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} }
+                        draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} }
                     }
                 }
                 room_line_wrap := View{
                     width: Fill height: Fit
                     room_line := Label{
                         text: "Loading…" width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                        draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} }
                     }
                 }
                 room_err_wrap := View{
                     width: Fill height: Fit visible: false
                     room_err := Label{
                         text: "" width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} }
+                        draw_text +: { color: theme.palette.danger text_style: theme.font_regular{font_size: 10} }
                     }
                 }
             }
@@ -712,15 +713,15 @@ View{
                 width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5}
                 padding: Inset{top: 20 bottom: 20 left: 16 right: 16}
                 show_bg: true
-                draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                draw_bg +: { color: theme.palette.card_subtle border_radius: 8.0 }
                 Label{ text: "🧭" padding: 0 margin: 0 draw_text +: { text_style: theme.font_regular{font_size: 28} } }
                 Label{
                     text: "No room attached" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
-                    draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} }
+                    draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 12.5} }
                 }
                 Label{
                     text: "Open Room Peek from a room to see its messages." width: Fill align: Align{x: 0.5} padding: 0 margin: 0
-                    draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} }
+                    draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} }
                 }
             }
         }
@@ -728,7 +729,7 @@ View{
             width: Fill height: Fit visible: false
             typing := Label{
                 text: "" width: Fill padding: 0 margin: 0
-                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} }
             }
         }
         // render() reapplies its view's declaration, so visibility lives on this wrapper.
@@ -738,28 +739,28 @@ View{
                 width: Fill height: Fill flow: Down spacing: 8
                 on_item_tap: |i| jump_to_message(i)
                 on_render: || {
-                    for row in rows {
+                    for row in mod.state.rows {
                         RoundedView{
                             width: Fill height: Fit flow: Right spacing: 10 padding: 10
                             show_bg: true
-                            draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                            draw_bg +: { color: theme.palette.card_subtle border_radius: 8.0 }
                             View{
-                                width: 32 height: 32 visible: show_avatars
+                                width: 32 height: 32 visible: mod.state.show_avatars
                                 RoundedView{
                                     width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
                                     show_bg: true
-                                    draw_bg +: { color: #x52B2AC border_radius: 16.0 }
-                                    Label{ text: row.initial padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
+                                    draw_bg +: { color: theme.palette.avatar border_radius: 16.0 }
+                                    Label{ text: row.initial padding: 0 margin: 0 draw_text +: { color: theme.palette.on_accent text_style: theme.font_bold{font_size: 12} } }
                                 }
                             }
                             View{
                                 width: Fill height: Fit flow: Down spacing: 3
                                 View{
                                     width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
-                                    Label{ text: row.name width: Fill max_lines: 1 text_overflow: TextOverflow.Ellipsis padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} } }
-                                    Label{ text: row.when padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                                    Label{ text: row.name width: Fill max_lines: 1 text_overflow: TextOverflow.Ellipsis padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 11} } }
+                                    Label{ text: row.when padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                                 }
-                                Label{ text: row.body width: Fill padding: 0 margin: 0 draw_text +: { color: row.body_color text_style: theme.font_regular{font_size: 11} } }
+                                Label{ text: row.body width: Fill padding: 0 margin: 0 draw_text +: { color: if row.is_deleted {theme.palette.muted} else {theme.palette.body} text_style: theme.font_regular{font_size: 11} } }
                                 if row.pills.len() > 0 {
                                     View{
                                         width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 4 margin: Inset{top: 3}
@@ -768,15 +769,15 @@ View{
                                                 RoundedView{
                                                     width: Fit height: Fit padding: Inset{left: 7 right: 7 top: 3 bottom: 3}
                                                     show_bg: true
-                                                    draw_bg +: { color: #xE3F7ED border_radius: 4.0 border_size: 1.0 border_color: #x009978 }
-                                                    Label{ text: p.text padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 9.5} } }
+                                                    draw_bg +: { color: if theme.palette.is_dark {#x273A35} else {#xE3F7ED} border_radius: 4.0 border_size: 1.0 border_color: if theme.palette.is_dark {#x2EB88F} else {#x009978} }
+                                                    Label{ text: p.text padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_regular{font_size: 9.5} } }
                                                 }
                                             } else {
                                                 RoundedView{
                                                     width: Fit height: Fit padding: Inset{left: 7 right: 7 top: 3 bottom: 3}
                                                     show_bg: true
-                                                    draw_bg +: { color: #xFFFFFF border_radius: 4.0 border_size: 1.0 border_color: #xB6BABF }
-                                                    Label{ text: p.text padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 9.5} } }
+                                                    draw_bg +: { color: theme.palette.surface border_radius: 4.0 border_size: 1.0 border_color: if theme.palette.is_dark {theme.palette.border} else {#xB6BABF} }
+                                                    Label{ text: p.text padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_regular{font_size: 9.5} } }
                                                 }
                                             }
                                         }
@@ -792,10 +793,10 @@ View{
             width: Fill height: Fill{min: 80}
             View{
                 width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 10 wrap_spacing: 8 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24}
-                LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
+                LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: theme.palette.accent_text } }
                 Label{
                     text: "Loading messages…" padding: 0 margin: 0
-                    draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} }
+                    draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} }
                 }
             }
         }
@@ -805,18 +806,18 @@ View{
                 width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5}
                 padding: Inset{top: 20 bottom: 20 left: 16 right: 16}
                 show_bg: true
-                draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                draw_bg +: { color: theme.palette.card_subtle border_radius: 8.0 }
                 empty_icon := Label{
                     text: "📭" padding: 0 margin: 0
                     draw_text +: { text_style: theme.font_regular{font_size: 28} }
                 }
                 empty_title := Label{
                     text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
-                    draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} }
+                    draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 12.5} }
                 }
                 empty_detail := Label{
                     text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
-                    draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} }
+                    draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} }
                 }
                 empty_btn_wrap := View{
                     width: Fit height: Fit margin: Inset{top: 6} visible: false
@@ -832,7 +833,7 @@ View{
             width: Fill height: Fit flow: Down spacing: 12
             RoundedView{
                 width: Fill height: 1 show_bg: true
-                draw_bg +: { color: #xE6E9EF border_radius: 0.0 }
+                draw_bg +: { color: if theme.palette.is_dark {theme.palette.divider} else {#xE6E9EF} border_radius: 0.0 }
             }
             View{
                 width: Fill height: Fit flow: Down spacing: 8
@@ -851,30 +852,30 @@ View{
                     width: Fill height: Fit visible: false
                     send_note := Label{
                         text: "" width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                        draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} }
                     }
                 }
                 send_ok_wrap := View{
                     width: Fill height: Fit visible: false
                     send_ok := Label{
                         text: "" width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #x138808 text_style: theme.font_regular{font_size: 10} }
+                        draw_text +: { color: theme.palette.success text_style: theme.font_regular{font_size: 10} }
                     }
                 }
                 send_err_wrap := View{
                     width: Fill height: Fit visible: false
                     send_err := Label{
                         text: "" width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} }
+                        draw_text +: { color: theme.palette.danger text_style: theme.font_regular{font_size: 10} }
                     }
                 }
                 how_btn := GhostButton{ text: "How it works ▼" on_click: || toggle_how() }
                 how_wrap := View{
                     width: Fill height: Fit flow: Down spacing: 4 visible: false
-                    Label{ text: "Draft message and Attach file put text or a file in Robrix's message box. You review and send it." width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
-                    Label{ text: "Send now and Send file now post right away and need permission to send." width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
-                    Label{ text: "Picked files can be up to 1 MiB." width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
-                    Label{ text: "Tap a message to jump to it in the room." width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+                    Label{ text: "Draft message and Attach file put text or a file in Robrix's message box. You review and send it." width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
+                    Label{ text: "Send now and Send file now post right away and need permission to send." width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
+                    Label{ text: "Picked files can be up to 1 MiB." width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
+                    Label{ text: "Tap a message to jump to it in the room." width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
                 }
             }
         }

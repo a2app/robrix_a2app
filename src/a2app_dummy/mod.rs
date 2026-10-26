@@ -25,6 +25,20 @@ script_mod! {
     mod.widgets.MiniAppHostArea = View { visible: false }
 }
 
+/// Without mini-apps, any isolate only needs Robrix's light or dark base theme.
+pub mod splash_theme {
+    use makepad_widgets::*;
+
+    use crate::settings::app_preferences::Appearance;
+
+    pub fn set(_vm: &mut ScriptVm, appearance: Appearance) {
+        makepad_widgets::set_splash_theme(match appearance {
+            Appearance::Light => SplashTheme::Light,
+            Appearance::Dark => SplashTheme::Dark,
+        });
+    }
+}
+
 /// Stubs for the mini-app room panes, which only exist with the `a2app` feature.
 pub mod room_panes {
     use makepad_widgets::*;

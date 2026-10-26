@@ -201,10 +201,10 @@ script_mod! {
             size: 21
             color: (COLOR_SECONDARY), color_hover: (COLOR_SECONDARY_DARKER)
             color_active: (COLOR_ACTIVE_PRIMARY), color_focus: (COLOR_SECONDARY_DARKER)
-            color_down: (COLOR_ACTIVE_PRIMARY_DARKER), color_disabled: (COLOR_SECONDARY)
-            border_color: (COLOR_SECONDARY_DARKER), border_color_active: (COLOR_ACTIVE_PRIMARY_DARKER)
+            color_down: (COLOR_ACTIVE_PRIMARY_HOVER), color_disabled: (COLOR_SECONDARY)
+            border_color: (COLOR_SECONDARY_DARKER), border_color_active: (COLOR_ACTIVE_PRIMARY_HOVER)
             mark_color: (MESSAGE_TEXT_COLOR), mark_color_hover: (MESSAGE_TEXT_COLOR)
-            mark_color_active: (COLOR_PRIMARY), mark_color_disabled: (COLOR_FG_DISABLED)
+            mark_color_active: (COLOR_TEXT_ON_ACCENT), mark_color_disabled: (COLOR_FG_DISABLED)
         }
         draw_text +: {
             text_style: mod.widgets.SETTINGS_BOLD_TEXT_STYLE {},

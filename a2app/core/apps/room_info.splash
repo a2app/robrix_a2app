@@ -9,24 +9,22 @@ let PrimaryButton = Button{
     padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
     draw_bg +: {
         border_size: 0.0 border_radius: 4.0
-        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color: theme.palette.accent color_hover: theme.palette.accent_hover color_down: theme.palette.accent_down color_focus: theme.palette.accent
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+    draw_text +: { color: theme.palette.on_accent color_hover: theme.palette.on_accent color_down: theme.palette.on_accent color_focus: theme.palette.on_accent text_style: theme.font_regular{font_size: 10} }
 }
 let NeutralButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
-        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.neutral_border border_color_hover: theme.palette.neutral_border border_color_down: theme.palette.neutral_border border_color_focus: theme.palette.neutral_border
+        color: theme.palette.neutral color_hover: theme.palette.neutral_hover color_down: theme.palette.neutral_down color_focus: theme.palette.neutral }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title }
 }
 
 let info_loading = false
 let info_loaded = false
 
-let loaded = false
-let details = []
-let is_narrow = false
-let is_tiny = false
+// What the pane shows survives the re-run a theme switch does, which no resize follows.
+mod.state = {details: [] is_loaded: false is_narrow: false is_tiny: false}
 
 fn join_text(rule){
     if rule == "public" { return "Anyone" }
@@ -104,7 +102,7 @@ fn show_info(d){
     ui.no_topic_wrap.set_visible(topic == "")
     let enc = "Off"
     if d.encrypted { enc = "🔒 On" }
-    details = [
+    mod.state.details = [
         {label: "Members" value: count_text(d.member_count) top: false},
         {label: "Encryption" value: enc top: true},
         {label: "Who can join" value: join_text(d.join_rule) top: true},
@@ -117,7 +115,7 @@ fn show_info(d){
 
 // A failed refresh keeps what was shown; a failed first load explains itself.
 fn show_failure(error){
-    if loaded {
+    if mod.state.is_loaded {
         set_status("Couldn't refresh. " + sentence(error), true)
         return nil
     }
@@ -152,7 +150,7 @@ fn load(){
         info_loading = false
         info_loaded = r.is_ok
         if r.is_ok {
-            loaded = true
+            mod.state.is_loaded = true
             show_info(r.data)
             return nil
         }
@@ -163,15 +161,15 @@ fn load(){
 // Narrow panes stack each detail; tiny ones give the room name the full width.
 fn on_app_resize(w, h){
     let tiny = w < 300
-    if tiny != is_tiny {
-        is_tiny = tiny
+    if tiny != mod.state.is_tiny {
+        mod.state.is_tiny = tiny
         ui.refresh_wide.set_visible(!tiny)
         ui.refresh_narrow.set_visible(tiny)
     }
     let narrow = w < 360
-    if narrow == is_narrow { return nil }
-    is_narrow = narrow
-    if loaded { ui.details.render() }
+    if narrow == mod.state.is_narrow { return nil }
+    mod.state.is_narrow = narrow
+    if mod.state.is_loaded { ui.details.render() }
     return nil
 }
 
@@ -188,10 +186,10 @@ View{
         width: Fill height: Fill flow: Down spacing: 12 padding: 14
         loading_wrap := View{
             width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 10 wrap_spacing: 8 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24}
-            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
+            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: theme.palette.accent_text } }
             Label{
                 text: "Loading room details…" padding: 0 margin: 0
-                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} }
+                draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} }
             }
         }
         info_wrap := View{
@@ -202,13 +200,13 @@ View{
                     width: Fill height: Fit flow: Down spacing: 3
                     room_name := Label{
                         text: "" width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} }
+                        draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} }
                     }
                     alias_wrap := View{
                         width: Fill height: Fit visible: false
                         room_alias := Label{
                             text: "" width: Fill padding: 0 margin: 0
-                            draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                            draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} }
                         }
                     }
                 }
@@ -221,38 +219,38 @@ View{
                 width: Fill height: Fit visible: false
                 room_topic := Label{
                     text: "" width: Fill padding: 0 margin: 0
-                    draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} }
+                    draw_text +: { color: theme.palette.body text_style: theme.font_regular{font_size: 11} }
                 }
             }
             no_topic_wrap := View{
                 width: Fill height: Fit visible: false
                 Label{
                     text: "No topic set." width: Fill padding: 0 margin: 0
-                    draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                    draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} }
                 }
             }
             RoundedView{
                 width: Fill height: Fit padding: Inset{left: 12 right: 12 top: 2 bottom: 2}
                 show_bg: true
-                draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+                draw_bg +: { color: theme.palette.card border_radius: 8.0 }
                 details := View{
                     width: Fill height: Fit flow: Down
                     on_render: || {
-                        for d in details {
+                        for d in mod.state.details {
                             if d.top {
-                                RoundedView{ width: Fill height: 1 show_bg: true draw_bg +: { color: #xDCE4F2 border_radius: 0.0 } }
+                                RoundedView{ width: Fill height: 1 show_bg: true draw_bg +: { color: if theme.palette.is_dark {theme.palette.divider} else {#xDCE4F2} border_radius: 0.0 } }
                             }
-                            if is_narrow {
+                            if mod.state.is_narrow {
                                 View{
                                     width: Fill height: Fit flow: Down spacing: 3 padding: Inset{top: 9 bottom: 9}
-                                    Label{ text: d.label width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
-                                    Label{ text: d.value width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 11} } }
+                                    Label{ text: d.label width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
+                                    Label{ text: d.value width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_regular{font_size: 11} } }
                                 }
                             } else {
                                 View{
                                     width: Fill height: Fit flow: Right spacing: 8 padding: Inset{top: 10 bottom: 10}
-                                    Label{ text: d.label width: 128 padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 11} } }
-                                    Label{ text: d.value width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 11} } }
+                                    Label{ text: d.label width: 128 padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 11} } }
+                                    Label{ text: d.value width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_regular{font_size: 11} } }
                                 }
                             }
                         }
@@ -263,14 +261,14 @@ View{
                 width: Fill height: Fit visible: false
                 note := Label{
                     text: "" width: Fill padding: 0 margin: 0
-                    draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                    draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} }
                 }
             }
             note_err_wrap := View{
                 width: Fill height: Fit visible: false
                 note_err := Label{
                     text: "" width: Fill padding: 0 margin: 0
-                    draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} }
+                    draw_text +: { color: theme.palette.danger text_style: theme.font_regular{font_size: 10} }
                 }
             }
             refresh_narrow := View{
@@ -284,18 +282,18 @@ View{
                 width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5}
                 padding: Inset{top: 20 bottom: 20 left: 16 right: 16}
                 show_bg: true
-                draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+                draw_bg +: { color: theme.palette.card_subtle border_radius: 8.0 }
                 empty_icon := Label{
                     text: "😕" padding: 0 margin: 0
                     draw_text +: { text_style: theme.font_regular{font_size: 28} }
                 }
                 empty_title := Label{
                     text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
-                    draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} }
+                    draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 12.5} }
                 }
                 empty_detail := Label{
                     text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
-                    draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} }
+                    draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} }
                 }
                 empty_btn_wrap := View{
                     width: Fit height: Fit margin: Inset{top: 6}

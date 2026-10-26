@@ -420,6 +420,204 @@ fn kitchen_sink_inputs_bind_validate_and_answer() {
     assert_eq!(order["spice"].as_f64(), Some(5.0));
 }
 
+/// Robrix switching to its dark theme: every palette color changes.
+fn use_dark_theme() {
+    let dark = a2app_core::palette::LIGHT.map(|color| (!color & 0xFFFFFF00) | (color & 0xFF));
+    set_splash_theme(SplashTheme::Dark);
+    set_splash_theme_script(SplashThemeScript { theme: a2app_core::palette::theme_script(&dark, true), widgets: String::new() });
+}
+
+impl Harness {
+    /// Draws the app once, as Robrix does after a theme switch: its isolate restyles in place.
+    fn draw(&mut self, app: &WidgetRef) {
+        let source = app.borrow::<Splash>().unwrap().view.source.clone();
+        let vm_id = self.cx.script_ref_vm_id(&source).unwrap();
+        headless_splash_entry(&mut self.cx, vm_id, |cx| {
+            let size = dvec2(460.0, 1200.0);
+            let pass = DrawPass::new(cx);
+            pass.set_size(cx, size);
+            let mut list = DrawList2d::new(cx);
+            let event = DrawEvent::default();
+            let mut draw = makepad_widgets::makepad_draw::cx_draw::CxDraw::new(cx, &event);
+            let cx = &mut Cx2d::new(&mut draw);
+            cx.begin_pass(&pass, None);
+            list.begin_always(cx);
+            cx.begin_root_turtle(size, Layout::flow_down());
+            app.draw_all(cx, &mut Scope::empty());
+            cx.end_pass_sized_turtle();
+            list.end(cx);
+            cx.end_pass(&pass);
+        });
+        let logged = CALLBACK_ERRORS.with(|errors| std::mem::take(&mut *errors.borrow_mut()));
+        assert!(logged.is_empty(), "restyle errors: {logged:?}");
+        let errors = self.cx.with_script_vm_id(vm_id, |vm| {
+            let errors = vm.take_errors();
+            vm.bx.captured_errors = Some(Vec::new());
+            errors
+        });
+        // Makepad's restyle can't reload its own widgets' resources in a host-I/O-only isolate.
+        let errors: Vec<_> = errors.into_iter().filter(|e| !e.contains("stack_navigation.rs") && !e.contains("math_view.rs")).collect();
+        assert!(errors.is_empty(), "restyle errors: {errors:?}");
+    }
+
+    /// `theme.palette.is_dark` as the app's isolate sees it.
+    fn is_dark(&mut self, app: &WidgetRef) -> Option<bool> {
+        let source = app.borrow::<Splash>().unwrap().view.source.clone();
+        let vm_id = self.cx.script_ref_vm_id(&source).unwrap();
+        self.cx.with_script_vm_id(vm_id, |vm| {
+            let theme = vm.module(id!(theme));
+            let palette = vm.bx.heap.value(theme, id!(palette).into(), NoTrap).as_object()?;
+            vm.bx.heap.value(palette, id!(is_dark).into(), NoTrap).as_bool()
+        })
+    }
+
+    /// A widget's `draw_text` color for `state` as the app's isolate holds it, as `0xRRGGBB`.
+    fn text_color(&mut self, app: &WidgetRef, widget: &WidgetRef, state: LiveId) -> Option<u32> {
+        let source = app.borrow::<Splash>().unwrap().view.source.clone();
+        let vm_id = self.cx.script_ref_vm_id(&source).unwrap();
+        let object = widget.script_source();
+        self.cx.with_script_vm_id(vm_id, |vm| {
+            let draw_text = vm.bx.heap.value(object, id!(draw_text).into(), NoTrap).as_object()?;
+            vm.bx.heap.value(draw_text, state.into(), NoTrap).as_color().map(|rgba| rgba >> 8)
+        })
+    }
+
+    /// Switches Robrix to its dark theme and draws the app until it has restyled onto it.
+    fn switch_to_dark(&mut self, app: &WidgetRef) {
+        // Tests starting alongside put Splash back on the light theme, so switch until the surface is dark.
+        let mut is_dark = None;
+        for _ in 0..10 {
+            use_dark_theme();
+            self.draw(app);
+            is_dark = self.is_dark(app);
+            if is_dark == Some(true) { break; }
+        }
+        a2app_core::palette::use_light_theme();
+        assert_eq!(is_dark, Some(true), "the surface restyled onto the dark palette");
+    }
+}
+
+/// Splash's theme is process-wide, so the tests that switch it take turns.
+static THEME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn theme_turn() -> std::sync::MutexGuard<'static, ()> {
+    THEME.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[test]
+fn a_theme_switch_keeps_what_the_user_entered() {
+    let _theme = theme_turn();
+    let mut host = Harness::new();
+    let (app, _) = kitchen_sink(&mut host);
+    let fields = text_inputs(&app);
+    let (name, email, age, filter, pickup) = (&fields[0], &fields[1], &fields[2], &fields[3], &fields[4]);
+    host.type_into_widget(&app, name, "Grace");
+    host.type_into_widget(&app, email, "g@example.org");
+    host.type_into_widget(&app, age, "36");
+    let options = visible_control(&app, "Options").unwrap();
+    host.widget_callback(&app, &options, id!(on_click), &[]);
+    host.widget_click(&app, "Large", &[]);
+    host.type_into_widget(&app, filter, "CH");
+    let cheese = visible_control(&app, "Cheese").unwrap();
+    host.widget_callback(&app, &cheese, id!(on_click), &[true.into()]);
+    host.widget_click(&app, "⚪ Courier", &[]);
+    host.type_into_widget(&app, pickup, "2026-10-25 09:30");
+
+    assert_eq!(host.is_dark(&app), Some(false));
+    let title_color = |app: &WidgetRef| visible_control(app, "Kitchen sink").unwrap().borrow::<Label>().unwrap().draw_text.color;
+    let is_color = |color: Vec4f, rgba: u32| [color.x, color.y, color.z, color.w].iter().zip([24, 16, 8, 0])
+        .all(|(c, shift)| (c - ((rgba >> shift) & 0xFF) as f32 / 255.0).abs() < 0.01);
+    let title = a2app_core::palette::LIGHT[0];
+    assert!(is_color(title_color(&app), title), "titles use the palette's `title`");
+    host.switch_to_dark(&app);
+    assert!(is_color(title_color(&app), (!title & 0xFFFFFF00) | 0xFF), "its widgets took the dark colors");
+
+    // What the user sees is unchanged, and the model behind it agrees.
+    assert_eq!(text_inputs(&app)[0].text(), "Grace");
+    assert!(is_shown(&app, "🔘 Courier") && is_shown(&app, "Cheese") && !is_shown(&app, "Basil"));
+    let cheese = visible_control(&app, "Cheese").unwrap();
+    host.widget_callback(&app, &cheese, id!(on_click), &[true.into()]);
+    assert!(is_shown(&app, "Cheese") && !is_shown(&app, "Basil"), "the filter still applies");
+    let state = app.widget(&host.cx, &[LiveId::from_str(a2app_core::a2ui::STATE_WIDGET)]).text();
+    assert!(state.contains("\"Grace\"") && state.contains("\"g@example.org\""), "edits are still exported: {state}");
+    let profile = visible_control(&app, "Profile").unwrap();
+    host.widget_callback(&app, &profile, id!(on_click), &[]);
+    let body = press_save(&mut host, &app).expect("the edited form is sent");
+    assert_eq!(body["action"]["context"]["user"], serde_json::json!({"name": "Grace", "email": "g@example.org", "age": "36", "count": 3}));
+    let order = &body["dataModel"]["order"];
+    assert_eq!(order["size"], serde_json::json!(["l"]));
+    assert_eq!(order["toppings"], serde_json::json!(["cheese"]));
+    assert_eq!(order["delivery"], serde_json::json!(["courier"]));
+    assert_eq!(order["pickup"], "2026-10-25T09:30");
+}
+
+#[test]
+fn a_theme_switch_during_a_send_lets_the_surface_answer_again() {
+    let _theme = theme_turn();
+    let mut host = Harness::new();
+    let app = host.launch_a2ui(&inline_contact_app());
+    host.type_into_widget(&app, &text_inputs(&app)[0], "Alice");
+    assert!(press(&mut host, &app, "Send").is_some());
+    assert!(is_shown(&app, "Sending submitContactForm…"));
+    assert!(press(&mut host, &app, "Send").is_none(), "one answer at a time");
+    // The switch drops the reply the send was waiting for, so the surface stops waiting.
+    host.switch_to_dark(&app);
+    host.boot();
+    assert!(!is_shown(&app, "Sending submitContactForm…"));
+    assert!(is_shown(&app, "Handed your answer to Robrix to send."));
+    let body = press(&mut host, &app, "Send").expect("another press answers");
+    assert_eq!(body["action"]["context"]["contact"]["name"], "Alice");
+    assert!(is_shown(&app, "Sending submitContactForm…"));
+}
+
+#[test]
+fn borderless_buttons_shade_their_text_on_light_and_keep_it_on_dark() {
+    let _theme = theme_turn();
+    let accent = |name: &str| a2app_core::palette::LIGHT[a2app_core::palette::NAMES.iter().position(|n| *n == name).unwrap()] >> 8;
+    let inverted = |color: u32| !color & 0xFFFFFF;
+    // Resting, hovered and pressed text: light shades it, dark keeps its resting color.
+    for (create, light, dark) in [
+        (serde_json::json!({"surfaceId": "s", "theme": {"primaryColor": "#E05D2F"}}), [0xE05D2F, 0xC55129, 0xAA4623], [0xE36D44; 3]),
+        (serde_json::json!({"surfaceId": "s"}), [accent("accent_text"), accent("accent_hover"), accent("accent_down")], [inverted(accent("accent_text")); 3]),
+    ] {
+        let mut host = Harness::new();
+        let app = launch_surface(&mut host, "v0.9", create, serde_json::json!([
+            {"id": "root", "component": "Button", "variant": "borderless", "child": "go_label", "action": {"event": {"name": "go"}}},
+            {"id": "go_label", "component": "Text", "text": "Go"}
+        ]), None);
+        let colors = |host: &mut Harness| {
+            let go = visible_control(&app, "Go").unwrap();
+            [id!(color), id!(color_hover), id!(color_down)].map(|state| host.text_color(&app, &go, state).unwrap())
+        };
+        assert_eq!(colors(&mut host), light, "light");
+        host.switch_to_dark(&app);
+        assert_eq!(colors(&mut host), dark, "dark");
+    }
+}
+
+#[test]
+fn a_rebuilt_surface_answers_from_its_new_model() {
+    let mut host = Harness::new();
+    let messages = event_messages("contact_event.json");
+    let mut manifest = a2app_core::builtin::stock(a2app_core::a2ui::APP_ID).unwrap();
+    manifest.source = a2app_core::a2ui::to_inline_splash(&messages, "$surface:test", None).unwrap().source;
+    let app = host.launch_a2ui(&manifest);
+    host.type_into_widget(&app, &text_inputs(&app)[0], "Alice");
+    // The agent renames the contact, and the timeline rebuilds the surface in the same isolate.
+    let state = app.widget(&host.cx, &[LiveId::from_str(a2app_core::a2ui::STATE_WIDGET)]).text();
+    let edits = a2app_core::a2ui::Edits::parse(&state, 1).unwrap();
+    let original: serde_json::Value = serde_json::from_str(&messages).unwrap();
+    let rename = serde_json::json!([{"version": "v0.9", "updateDataModel": {"surfaceId": "main", "path": "/contact/name", "value": "Bob"}}]);
+    let source = a2app_core::a2ui::to_inline_splash(&serde_json::json!([original, rename]).to_string(), "$surface:test", Some(&edits)).unwrap().source;
+    let heap = app.borrow_mut::<Splash>().unwrap().isolate_heap_key(&mut host.cx);
+    let vm_id = host.cx.script_ref_vm_id(&app.borrow::<Splash>().unwrap().view.source).unwrap();
+    headless_splash_entry(&mut host.cx, vm_id, |cx| app.set_text(cx, &source));
+    assert_eq!(app.borrow_mut::<Splash>().unwrap().isolate_heap_key(&mut host.cx), heap);
+    assert_eq!(text_inputs(&app)[0].text(), "Bob");
+    let body = press(&mut host, &app, "Send").expect("an answer");
+    assert_eq!(body["action"]["context"]["contact"]["name"], "Bob", "the new model, not the last one's edits");
+}
+
 /// One v0.9 surface `s` as the timeline runs it (the A2UI app, granted).
 fn launch_surface(host: &mut Harness, version: &str, create: serde_json::Value, components: serde_json::Value, model: Option<serde_json::Value>) -> WidgetRef {
     let mut messages = vec![

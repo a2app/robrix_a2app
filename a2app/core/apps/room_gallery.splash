@@ -82,15 +82,21 @@ let env_error = ""
 let is_env_pending = false
 let is_setup_pending = false
 let setup_error = ""
-let is_foreground = true
-let is_compact = false
-let is_short = false
-let is_wide = false
-// Tiny panes put Refresh under the summary, which keeps the full width.
-let is_tiny = false
-// The "How it works" note under the grid.
-let is_how_open = false
 let notice = ""
+// Kept through a theme switch's re-run, which doesn't resize or refocus the pane, reset the
+// widgets or refill Robrix's request budget that these track.
+mod.state = {
+    is_foreground: true is_compact: false is_short: false is_wide: false
+    // Tiny panes put Refresh under the summary, which keeps the full width.
+    is_tiny: false
+    // The "How it works" note under the grid.
+    is_how_open: false
+    // Where the user is: the grid's filter and page, and the attachment open in the detail panel.
+    active_filter: "all" page: 0 detail_id: ""
+    // The tiles' mirror of their widgets, and the request budget's model (below).
+    tile_state: []
+    clock: 0 tokens: 30 auto_tokens: 24 tokens_at: 0 hold_until: 0 is_after_cooldown: false limit_hits: []
+}
 
 // The latest-messages read: idle, pending, done, blocked (not allowed) or failed.
 let read_state = "idle"
@@ -152,10 +158,8 @@ let run_found = 0
 let run_scanned = 0
 let older_note = ""
 
-// What the grid shows: the active filter and page over a fixed pool of tiles.
-let active_filter = "all"
+// What the grid shows, over a fixed pool of tiles; its filter and page are in `mod.state`.
 let shown = []
-let page = 0
 let is_flip_pending = false
 
 // Widget calls are the costly part of a render, so handles are bound once
@@ -164,7 +168,6 @@ let views = nil
 let last_text = {}
 let last_shown = {}
 let tiles = []
-let tile_state = []
 
 // Previews: thumbnails kept in the jail, a few large ones in memory, at most two in flight.
 let thumb_ids = []
@@ -176,22 +179,15 @@ let is_media_proven = false
 let media_refusal = ""
 let media_error = ""
 
-// The budget model. `clock` is wall time in seconds, never behind a timer that has fired.
-let clock = 0
-let tokens = 30
-let auto_tokens = 24
-let tokens_at = 0
-let hold_until = 0
-let is_after_cooldown = false
-let limit_hits = []
+// The budget model, whose counts are in `mod.state`. `clock` is wall time in seconds, never behind
+// a timer that has fired.
 let waiting = []
 let is_send_waiting = false
 let send_due = 0
 let is_pace_waiting = false
 let pace_due = 0
 
-// The detail panel for one attachment.
-let detail_id = ""
+// The detail panel for one attachment, whose id is in `mod.state`.
 let detail_token = 0
 let has_large = false
 let is_nav_pending = false
@@ -571,9 +567,10 @@ fn page_count(){ return max(1, floor((shown.len() + page_size - 1) / page_size))
 fn refilter(){
     shown = []
     for it in items {
-        if active_filter == "all" || group_of(it.kind) == active_filter { shown.push(it) }
+        if mod.state.active_filter == "all" || group_of(it.kind) == mod.state.active_filter { shown.push(it) }
     }
-    if page >= page_count() { page = page_count() - 1 }
+    // A page kept through a theme switch waits for the restore's later slices.
+    if !is_restoring() && mod.state.page >= page_count() { mod.state.page = page_count() - 1 }
     return nil
 }
 
@@ -608,7 +605,7 @@ fn remove_item(id){
     dead_keys += 1
     items.retain(|it| it.id != id)
     items_changed()
-    if detail_id == id {
+    if mod.state.detail_id == id {
         close_detail()
         notice = "That attachment was deleted from the room."
     }
@@ -708,6 +705,8 @@ fn restore_slice(){
         is_save_due = false
         save_gallery()
     }
+    // An attachment kept open through a theme switch closes if it didn't come back; callers render next.
+    if !is_restoring() && mod.state.detail_id != "" && known[mod.state.detail_id] == nil { close_detail() }
     return nil
 }
 
@@ -821,9 +820,11 @@ fn bind_ui(){
     }
     tiles = [ui.t0, ui.t1, ui.t2, ui.t3, ui.t4, ui.t5, ui.t6, ui.t7, ui.t8, ui.t9, ui.t10, ui.t11,
         ui.t12, ui.t13, ui.t14, ui.t15, ui.t16, ui.t17, ui.t18, ui.t19, ui.t20, ui.t21, ui.t22, ui.t23]
-    // Each tile starts as the template declares it: hidden, an icon, no picture.
-    for t in tiles {
-        tile_state.push({id: "" image: "" icon: "🖼️" name: "" meta: "" badge: "▶️" is_pic: false is_badge: false is_shown: false})
+    // Each tile starts as the template declares it: hidden, an icon, no picture. A theme
+    // switch's re-run keeps both the widgets and this mirror of them; a run cut short may
+    // have left the mirror short, so fill in whatever is missing.
+    while mod.state.tile_state.len() < tiles.len() {
+        mod.state.tile_state.push({id: "" image: "" icon: "🖼️" name: "" meta: "" badge: "▶️" is_pic: false is_badge: false is_shown: false})
     }
     return nil
 }
@@ -871,12 +872,12 @@ fn load_tile_picture(k, it){
         return false
     }
     tiles[k].img.load_image_from_data_async(bytes)
-    tile_state[k].image = it.id
+    mod.state.tile_state[k].image = it.id
     return true
 }
 
 fn is_tile_showing(id){
-    for s in tile_state {
+    for s in mod.state.tile_state {
         if s.id == id && s.image == id { return true }
     }
     return false
@@ -886,7 +887,7 @@ fn is_tile_showing(id){
 // picture, so they are only refreshed while they show.
 fn show_tile(k, it){
     let t = tiles[k]
-    let s = tile_state[k]
+    let s = mod.state.tile_state[k]
     s.id = it.id
     if s.name != it.name {
         s.name = it.name
@@ -926,7 +927,7 @@ fn show_tile(k, it){
 }
 
 fn hide_tile(k){
-    let s = tile_state[k]
+    let s = mod.state.tile_state[k]
     s.id = ""
     if !s.is_shown { return nil }
     s.is_shown = false
@@ -936,7 +937,7 @@ fn hide_tile(k){
 
 // Whether a photo or video on this page still shows an icon instead of its picture.
 fn page_lacks_pictures(){
-    for s in tile_state {
+    for s in mod.state.tile_state {
         if !s.is_shown || s.is_pic { continue }
         let it = known[s.id]
         if it != nil && is_visual(it) && !it.has_no_preview { return true }
@@ -946,16 +947,16 @@ fn page_lacks_pictures(){
 
 fn page_range(){
     if shown.len() == 0 { return "" }
-    let first = page * page_size + 1
-    let last = min(shown.len(), (page + 1) * page_size)
+    let first = mod.state.page * page_size + 1
+    let last = min(shown.len(), (mod.state.page + 1) * page_size)
     return "" + first + "–" + last + " of " + shown.len()
 }
 
 fn filter_noun(){
-    if active_filter == "photo" { return "photos" }
-    if active_filter == "video" { return "videos" }
-    if active_filter == "audio" { return "audio or voice messages" }
-    if active_filter == "file" { return "files" }
+    if mod.state.active_filter == "photo" { return "photos" }
+    if mod.state.active_filter == "video" { return "videos" }
+    if mod.state.active_filter == "audio" { return "audio or voice messages" }
+    if mod.state.active_filter == "file" { return "files" }
     return "attachments"
 }
 
@@ -992,7 +993,7 @@ fn empty_state(){
 
 fn render_grid(){
     bind_ui()
-    let start = page * page_size
+    let start = mod.state.page * page_size
     let k = 0
     while k < page_size {
         if start + k < shown.len() { show_tile(k, shown[start + k]) } else { hide_tile(k) }
@@ -1016,8 +1017,8 @@ fn render_grid(){
     }
     put_shown("grid", !is_empty && !is_flip_pending)
     put_text("page_line", page_range())
-    put_shown("prev_wrap", page > 0)
-    put_shown("next_wrap", page + 1 < page_count())
+    put_shown("prev_wrap", mod.state.page > 0)
+    put_shown("next_wrap", mod.state.page + 1 < page_count())
     return nil
 }
 
@@ -1032,7 +1033,7 @@ fn flip_grid(){
 }
 
 fn filter_label(title, emoji, n){
-    if is_compact && emoji != "" { return emoji + " " + n }
+    if mod.state.is_compact && emoji != "" { return emoji + " " + n }
     return title + " " + n
 }
 
@@ -1040,7 +1041,7 @@ fn filter_label(title, emoji, n){
 // A kind's chip shows once it has something, or while it is the active filter.
 fn put_chip(key, title, emoji, n){
     let label = filter_label(title, emoji, n)
-    let is_on = active_filter == key
+    let is_on = mod.state.active_filter == key
     put_text("f_" + key, label)
     put_text("f_" + key + "_on", label)
     put_shown("f_" + key + "_on_wrap", is_on)
@@ -1052,7 +1053,7 @@ fn put_chip(key, title, emoji, n){
 // The chips below count each kind, so only a wide pane, where it fits on one line, repeats the breakdown here.
 fn stats_text(){
     if items.len() == 0 { return "No attachments found yet" }
-    if !is_wide { return join([plural(items.len(), "attachment", "attachments"), size_text(total_bytes)], " · ") }
+    if !mod.state.is_wide { return join([plural(items.len(), "attachment", "attachments"), size_text(total_bytes)], " · ") }
     let parts = []
     if n_photo > 0 { parts.push(plural(n_photo, "photo", "photos")) }
     if n_video > 0 { parts.push(plural(n_video, "video", "videos")) }
@@ -1134,7 +1135,7 @@ fn render_older(){
 
 fn render_sections(){
     let is_room = room_state != "detached"
-    let is_browse = is_room && detail_id == ""
+    let is_browse = is_room && mod.state.detail_id == ""
     // Counts, filters and the previews hint need something shared; until then the empty card
     // speaks for the room, and the status line shows only news the card doesn't give.
     let are_items_found = items.len() > 0
@@ -1149,10 +1150,10 @@ fn render_sections(){
     put_shown("grid_scroll", is_browse && shown.len() > 0)
     put_shown("older_wrap", is_browse && room_state == "attached")
     put_shown("stats_wrap", is_browse && are_items_found)
-    put_shown("hint_wrap", is_browse && are_items_found && !is_compact && !is_short)
-    put_shown("detail_wrap", is_room && detail_id != "")
-    put_shown("refresh_wide", !is_tiny)
-    put_shown("refresh_narrow", is_browse && is_tiny)
+    put_shown("hint_wrap", is_browse && are_items_found && !mod.state.is_compact && !mod.state.is_short)
+    put_shown("detail_wrap", is_room && mod.state.detail_id != "")
+    put_shown("refresh_wide", !mod.state.is_tiny)
+    put_shown("refresh_narrow", is_browse && mod.state.is_tiny)
     return nil
 }
 
@@ -1189,7 +1190,7 @@ fn render_all(){
     render_grid()
     render_older()
     render_sections()
-    if detail_id != "" { render_detail_media() }
+    if mod.state.detail_id != "" { render_detail_media() }
     return nil
 }
 
@@ -1197,7 +1198,7 @@ fn render_all(){
 
 // A preview that failed on its own gets one more try when its page is shown again.
 fn retry_once(){
-    let i = page * page_size
+    let i = mod.state.page * page_size
     let end = min(shown.len(), i + page_size)
     while i < end {
         let it = shown[i]
@@ -1208,10 +1209,10 @@ fn retry_once(){
 }
 
 fn set_filter(key){
-    if active_filter == key { return nil }
-    active_filter = key
+    if mod.state.active_filter == key { return nil }
+    mod.state.active_filter = key
     notice = ""
-    page = 0
+    mod.state.page = 0
     refilter()
     retry_once()
     flip_grid()
@@ -1221,10 +1222,10 @@ fn set_filter(key){
 }
 
 fn go_page(delta){
-    let next = page + delta
+    let next = mod.state.page + delta
     if next < 0 || next >= page_count() { return nil }
     notice = ""
-    page = next
+    mod.state.page = next
     retry_once()
     flip_grid()
     render_all()
@@ -1239,11 +1240,11 @@ fn on_app_resize(width, height){
     let short = height < 420
     let wide = width >= 600
     let tiny = width < 300
-    if compact == is_compact && short == is_short && wide == is_wide && tiny == is_tiny { return nil }
-    is_compact = compact
-    is_short = short
-    is_wide = wide
-    is_tiny = tiny
+    if compact == mod.state.is_compact && short == mod.state.is_short && wide == mod.state.is_wide && tiny == mod.state.is_tiny { return nil }
+    mod.state.is_compact = compact
+    mod.state.is_short = short
+    mod.state.is_wide = wide
+    mod.state.is_tiny = tiny
     if compact {
         put_text("prev_btn", "‹")
         put_text("next_btn", "›")
@@ -1257,14 +1258,14 @@ fn on_app_resize(width, height){
 
 fn toggle_how(){
     bind_ui()
-    is_how_open = !is_how_open
-    if is_how_open { put_text("how_btn", "How it works ▲") } else { put_text("how_btn", "How it works ▼") }
-    put_shown("how_body", is_how_open)
+    mod.state.is_how_open = !mod.state.is_how_open
+    if mod.state.is_how_open { put_text("how_btn", "How it works ▲") } else { put_text("how_btn", "How it works ▼") }
+    put_shown("how_body", mod.state.is_how_open)
     return nil
 }
 
 fn on_focus_changed(json){
-    is_foreground = field(json.parse_json(), "foreground") != false
+    mod.state.is_foreground = field(json.parse_json(), "foreground") != false
     pump()
     return nil
 }
@@ -1272,55 +1273,55 @@ fn on_focus_changed(json){
 // ---- The request budget
 
 fn clock_at_least(t){
-    if t > clock { clock = t }
+    if t > mod.state.clock { mod.state.clock = t }
     return nil
 }
 
 // Credits the refill since the last look; right after a cooldown Robrix grants a fixed amount.
 fn refill(){
     clock_at_least(time_now())
-    if tokens_at > 0 && clock > tokens_at {
-        let dt = clock - tokens_at
-        auto_tokens += dt * auto_rate
-        if auto_tokens > auto_cap { auto_tokens = auto_cap }
-        if !is_after_cooldown {
-            tokens += dt * refill_rate
-            if tokens > bucket { tokens = bucket }
+    if mod.state.tokens_at > 0 && mod.state.clock > mod.state.tokens_at {
+        let dt = mod.state.clock - mod.state.tokens_at
+        mod.state.auto_tokens += dt * auto_rate
+        if mod.state.auto_tokens > auto_cap { mod.state.auto_tokens = auto_cap }
+        if !mod.state.is_after_cooldown {
+            mod.state.tokens += dt * refill_rate
+            if mod.state.tokens > bucket { mod.state.tokens = bucket }
         }
     }
-    tokens_at = clock
+    mod.state.tokens_at = mod.state.clock
     return nil
 }
 
 fn spend(cost, is_auto){
     refill()
-    if is_after_cooldown {
-        is_after_cooldown = false
-        tokens = after_cooldown
+    if mod.state.is_after_cooldown {
+        mod.state.is_after_cooldown = false
+        mod.state.tokens = after_cooldown
     }
-    tokens -= cost
-    if is_auto { auto_tokens -= cost }
+    mod.state.tokens -= cost
+    if is_auto { mod.state.auto_tokens -= cost }
     return nil
 }
 
 // Robrix refused a request for going over budget: everything waits out its cooldown.
 fn note_limit(){
     refill()
-    if clock < hold_until { return nil }
-    hold_until = clock + hold_secs
-    is_after_cooldown = true
-    tokens = after_cooldown
-    auto_tokens = 0
-    limit_hits.retain(|t| clock - t < 120)
-    limit_hits.push(clock)
+    if mod.state.clock < mod.state.hold_until { return nil }
+    mod.state.hold_until = mod.state.clock + hold_secs
+    mod.state.is_after_cooldown = true
+    mod.state.tokens = after_cooldown
+    mod.state.auto_tokens = 0
+    mod.state.limit_hits.retain(|t| mod.state.clock - t < 120)
+    mod.state.limit_hits.push(mod.state.clock)
     return nil
 }
 
 // Refusals within Robrix's two-minute strike window; a second one stops automatic retries.
 fn recent_limits(){
     refill()
-    limit_hits.retain(|t| clock - t < 120)
-    return limit_hits.len()
+    mod.state.limit_hits.retain(|t| mod.state.clock - t < 120)
+    return mod.state.limit_hits.len()
 }
 
 // A request refused for going over budget is sent once more, after the hold.
@@ -1333,8 +1334,8 @@ fn should_retry(error){
 // Seconds until a tap's request fits the budget (0 or less means now).
 fn tap_wait(cost){
     refill()
-    let wait = hold_until - clock
-    let need = cost + 1 - tokens
+    let wait = mod.state.hold_until - mod.state.clock
+    let need = cost + 1 - mod.state.tokens
     if need > 0 && need / refill_rate > wait { wait = need / refill_rate }
     return wait
 }
@@ -1343,8 +1344,8 @@ fn tap_wait(cost){
 // After a cooldown the budget stays at 10 until the next request, which goes without the reserve.
 fn auto_wait(cost){
     let wait = tap_wait(cost + reserve - 1)
-    if is_after_cooldown { wait = tap_wait(cost) }
-    let need = cost - auto_tokens
+    if mod.state.is_after_cooldown { wait = tap_wait(cost) }
+    let need = cost - mod.state.auto_tokens
     if need > 0 && need / auto_rate > wait { wait = need / auto_rate }
     return wait
 }
@@ -1366,7 +1367,7 @@ fn drain_later(){
     if is_send_waiting || waiting.len() == 0 { return nil }
     let wait = tap_wait(waiting[0].cost) + 0.01
     if wait < 0.02 { wait = 0.02 }
-    send_due = clock + wait
+    send_due = mod.state.clock + wait
     is_send_waiting = start_timeout(wait, || {
         is_send_waiting = false
         clock_at_least(send_due)
@@ -1391,7 +1392,7 @@ fn drain(){
 
 fn next_job(){
     if is_paging && !is_page_pending && pages_left > 0 { return {kind: "page" cost: 5 it: nil} }
-    if is_foreground && !is_lookup_pending && host.has("matrix.room.event.read") {
+    if mod.state.is_foreground && !is_lookup_pending && host.has("matrix.room.event.read") {
         if lookup_queue.len() > 0 { return {kind: "lookup" cost: 5 it: nil} }
         if check_queue.len() > 0 { return {kind: "check" cost: 5 it: nil} }
     }
@@ -1434,7 +1435,7 @@ fn pump(){
 }
 
 fn arm_pace(wait){
-    pace_due = clock + wait + 0.01
+    pace_due = mod.state.clock + wait + 0.01
     is_pace_waiting = start_timeout(wait + 0.01, || {
         is_pace_waiting = false
         clock_at_least(pace_due)
@@ -1587,8 +1588,8 @@ fn read_device(){
         let offset = field(r.data, "utc_offset_minutes")
         if offset.is_number() && offset > -1000 && offset < 1000 { utc_offset = offset }
         is_24h = uses_24h(field(r.data, "locale"))
-        let it = known[detail_id]
-        if detail_id != "" && it != nil { fill_detail(it) }
+        let it = known[mod.state.detail_id]
+        if mod.state.detail_id != "" && it != nil { fill_detail(it) }
         return nil
     }, false)
     return nil
@@ -1867,7 +1868,7 @@ fn on_room_message_changed(json){
     it.caption = ""
     if body != it.name { it.caption = clip(body, long_caption_re, caption_head_re) }
     save_gallery()
-    if detail_id == id { fill_detail(it) }
+    if mod.state.detail_id == id { fill_detail(it) }
     return nil
 }
 
@@ -1921,8 +1922,8 @@ fn needs_preview(it){
 }
 
 fn next_tile_preview(){
-    if detail_id != "" || !is_foreground { return nil }
-    let i = page * page_size
+    if mod.state.detail_id != "" || !mod.state.is_foreground { return nil }
+    let i = mod.state.page * page_size
     let end = min(shown.len(), i + page_size)
     while i < end {
         if needs_preview(shown[i]) { return shown[i] }
@@ -1932,8 +1933,8 @@ fn next_tile_preview(){
 }
 
 fn detail_needing_large(){
-    if detail_id == "" || has_large { return nil }
-    let it = known[detail_id]
+    if mod.state.detail_id == "" || has_large { return nil }
+    let it = known[mod.state.detail_id]
     if it == nil || !is_visual(it) || it.has_no_preview || it.is_large_failed || is_in_flight(it.id, detail_edge) { return nil }
     return it
 }
@@ -1970,15 +1971,15 @@ fn preview_landed(id, edge, data){
         if !store_thumb(id, b64) { it.is_preview_failed = true }
         let k = 0
         while k < tiles.len() {
-            if tile_state[k].id == id {
+            if mod.state.tile_state[k].id == id {
                 tiles[k].img.load_image_from_data_async(bytes)
-                tile_state[k].image = id
+                mod.state.tile_state[k].image = id
             }
             k += 1
         }
     }
     if edge == detail_edge { remember_large(id, b64) }
-    if detail_id != id || has_large { return nil }
+    if mod.state.detail_id != id || has_large { return nil }
     if edge == detail_edge { has_large = true }
     show_detail_picture(bytes)
     render_detail_media()
@@ -1993,7 +1994,7 @@ fn preview_failed(id, edge, error){
         return nil
     }
     preview_refused(id, edge, error)
-    if detail_id == id { render_detail_media() }
+    if mod.state.detail_id == id { render_detail_media() }
     return nil
 }
 
@@ -2060,7 +2061,7 @@ fn show_previews(){
 // ---- The detail panel
 
 fn open_tile(k){
-    let index = page * page_size + k
+    let index = mod.state.page * page_size + k
     if index >= shown.len() { return nil }
     open_item(shown[index])
     return nil
@@ -2112,7 +2113,7 @@ fn show_detail_picture(bytes){
 }
 
 fn render_detail_media(){
-    let it = known[detail_id]
+    let it = known[mod.state.detail_id]
     if it == nil { return nil }
     let is_loading = is_in_flight(it.id, detail_edge) || is_in_flight(it.id, tile_edge)
     put_shown("d_preview_wrap", is_visual(it) && !has_large && !it.has_no_preview && !is_loading && (!previews_on() || it.is_large_failed))
@@ -2125,7 +2126,7 @@ fn render_detail_media(){
 
 fn open_item(it){
     notice = ""
-    detail_id = it.id
+    mod.state.detail_id = it.id
     detail_token += 1
     has_large = false
     is_nav_pending = false
@@ -2158,7 +2159,7 @@ fn open_item(it){
 }
 
 fn close_detail(){
-    detail_id = ""
+    mod.state.detail_id = ""
     detail_token += 1
     has_large = false
     is_nav_pending = false
@@ -2176,7 +2177,7 @@ fn back_to_grid(){
 }
 
 fn show_detail_preview(){
-    let it = known[detail_id]
+    let it = known[mod.state.detail_id]
     if it == nil || is_in_flight(it.id, detail_edge) { return nil }
     if in_flight.len() >= preview_slots() {
         set_note("Still loading other previews. Try again in a moment.", 0)
@@ -2191,11 +2192,11 @@ fn show_detail_preview(){
 }
 
 fn show_in_chat(){
-    if detail_id == "" || is_nav_pending { return nil }
+    if mod.state.detail_id == "" || is_nav_pending { return nil }
     let token = detail_token
     is_nav_pending = true
     set_note("Opening it in the chat…", 0)
-    let is_now = send("nav.event", {event_id: detail_id}, 8, fn(r){
+    let is_now = send("nav.event", {event_id: mod.state.detail_id}, 8, fn(r){
         if token != detail_token { return nil }
         is_nav_pending = false
         if r.is_ok { set_note("Shown in the chat.", 1) } else { set_note(capitalized(friendly(r.error)), 2) }
@@ -2213,7 +2214,7 @@ fn too_big_text(size){
 
 // Downloads the whole file, then hands it to Robrix's attachment preview.
 fn share_again(){
-    let it = known[detail_id]
+    let it = known[mod.state.detail_id]
     if it == nil || is_share_pending { return nil }
     if it.size > max_share_bytes {
         set_note(too_big_text(it.size), 2)
@@ -2274,6 +2275,8 @@ let _init = load_saved()
 let _boot = start_timeout(0.05, || {
     restore_slice()
     render_all()
+    // A theme switch dropped the open attachment's pending request, so its progress note goes too.
+    if mod.state.detail_id != "" { set_note("", 0) }
     check_env()
     schedule_restore()
 })
@@ -2282,33 +2285,34 @@ let _boot = start_timeout(0.05, || {
 // is opaque, so showing it is the only change a tile needs to switch modes.
 let Tile = RoundedView{
     width: Fill height: Fill flow: Overlay visible: false
-    show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+    show_bg: true draw_bg +: { color: theme.palette.card border_radius: 8.0 }
     View{
         width: Fill height: Fill flow: Down align: Align{x: 0.5 y: 0.5} padding: Inset{left: 6 right: 6 top: 4 bottom: 34}
         ph_icon := Label{
             text: "🖼️" padding: 0 margin: 0
-            draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 26} }
+            draw_text +: { color: theme.palette.title text_style: theme.font_regular{font_size: 26} }
         }
     }
     View{
         width: Fill height: Fill flow: Down align: Align{y: 1.0} spacing: 1 padding: Inset{left: 8 right: 8 top: 0 bottom: 7}
         name := Label{
             text: "" width: Fill padding: 0 margin: 0 max_lines: 1 text_overflow: TextOverflow.Ellipsis
-            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 10} }
+            draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 10} }
         }
         meta := Label{
             text: "" width: Fill padding: 0 margin: 0 max_lines: 1 text_overflow: TextOverflow.Ellipsis
-            draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 9} }
+            draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 9} }
         }
     }
     img_wrap := RoundedView{
         width: Fill height: Fill visible: false
-        show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+        show_bg: true draw_bg +: { color: theme.palette.card border_radius: 8.0 }
         img := Image{
             width: Fill height: Fill fit: ImageFit.CropToFill
             draw_bg +: {
+                color_loading: uniform(if theme.palette.is_dark {#x353C4A} else {#xE3E9F5})
                 pixel: fn(){
-                    let color = mix(self.get_color(), #xE3E9F5, self.async_load)
+                    let color = mix(self.get_color(), self.color_loading, self.async_load)
                     let sdf = Sdf2d.viewport(self.pos * self.rect_size)
                     sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, 8.0)
                     sdf.fill(vec4(color.xyz, color.w * self.opacity))
@@ -2321,10 +2325,10 @@ let Tile = RoundedView{
         width: Fill height: Fill align: Align{x: 0.0 y: 1.0} padding: 6 visible: false
         RoundedView{
             width: Fit height: Fit padding: Inset{left: 6 right: 6 top: 2 bottom: 3}
-            show_bg: true draw_bg +: { color: #x1C274CCC border_radius: 7.0 }
+            show_bg: true draw_bg +: { color: if theme.palette.is_dark {#x1A1A1ACC} else {#x1C274CCC} border_radius: 7.0 }
             badge := Label{
                 text: "▶️" padding: 0 margin: 0
-                draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 9} }
+                draw_text +: { color: theme.palette.on_accent text_style: theme.font_bold{font_size: 9} }
             }
         }
     }
@@ -2336,53 +2340,53 @@ let PrimaryButton = Button{
     padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
     draw_bg +: {
         border_size: 0.0 border_radius: 4.0
-        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color: theme.palette.accent color_hover: theme.palette.accent_hover color_down: theme.palette.accent_down color_focus: theme.palette.accent
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+    draw_text +: { color: theme.palette.on_accent color_hover: theme.palette.on_accent color_down: theme.palette.on_accent color_focus: theme.palette.on_accent text_style: theme.font_regular{font_size: 10} }
 }
 let NeutralButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
-        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.neutral_border border_color_hover: theme.palette.neutral_border border_color_down: theme.palette.neutral_border border_color_focus: theme.palette.neutral_border
+        color: theme.palette.neutral color_hover: theme.palette.neutral_hover color_down: theme.palette.neutral_down color_focus: theme.palette.neutral }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title }
 }
 let GhostButton = PrimaryButton{
     padding: Inset{left: 6 right: 6 top: 4 bottom: 4}
     margin: Inset{left: -6}
-    draw_bg +: { border_size: 0.0 color: #xFFFFFF00 color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF00 }
-    draw_text +: { color: #x66708F color_hover: #x1C274C color_down: #x1C274C color_focus: #x66708F }
+    draw_bg +: { border_size: 0.0 color: theme.palette.transparent color_hover: theme.palette.card color_down: theme.palette.pressed color_focus: theme.palette.transparent }
+    draw_text +: { color: theme.palette.muted color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.muted }
 }
 // Filter chips: a white pill with a gray edge, or the accent-filled pill of the active filter.
 let Chip = PrimaryButton{
     padding: Inset{left: 10 right: 10 top: 5 bottom: 5}
     draw_bg +: { border_size: 1.0 border_radius: 12.0
-        border_color: #xC8C8C8 border_color_hover: #xC8C8C8 border_color_down: #xC8C8C8 border_color_focus: #xC8C8C8
-        color: #xFFFFFF color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF }
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+        border_color: theme.palette.border border_color_hover: theme.palette.border border_color_down: theme.palette.border border_color_focus: theme.palette.border
+        color: theme.palette.surface color_hover: theme.palette.card color_down: theme.palette.pressed color_focus: theme.palette.surface }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title }
 }
 let ChipOn = Chip{
-    draw_bg +: { border_color: #x0f88fe border_color_hover: #x106fcc border_color_down: #x0C5DAA border_color_focus: #x0f88fe
-        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF }
+    draw_bg +: { border_color: theme.palette.accent border_color_hover: theme.palette.accent_hover border_color_down: theme.palette.accent_down border_color_focus: theme.palette.accent
+        color: theme.palette.accent color_hover: theme.palette.accent_hover color_down: theme.palette.accent_down color_focus: theme.palette.accent }
+    draw_text +: { color: theme.palette.on_accent color_hover: theme.palette.on_accent color_down: theme.palette.on_accent color_focus: theme.palette.on_accent }
 }
-let Meta = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
-let OkText = Meta{ draw_text +: { color: #x138808 } }
-let ErrText = Meta{ draw_text +: { color: #xDC0005 } }
-let Caption = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
-let Body = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
+let Meta = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
+let OkText = Meta{ draw_text +: { color: theme.palette.success } }
+let ErrText = Meta{ draw_text +: { color: theme.palette.danger } }
+let Caption = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} } }
+let Body = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.body text_style: theme.font_regular{font_size: 11} } }
 let Slot = View{ width: Fill height: Fit }
 let Fits = View{ width: Fit height: Fit }
 let ButtonRow = View{ width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8 align: Align{y: 0.5} }
 let Card = RoundedView{
-    width: Fill height: Fit show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+    width: Fill height: Fit show_bg: true draw_bg +: { color: theme.palette.card border_radius: 8.0 }
 }
 let EmptyCard = RoundedView{
     width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5} padding: Inset{top: 20 bottom: 20 left: 16 right: 16}
-    show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+    show_bg: true draw_bg +: { color: theme.palette.card_subtle border_radius: 8.0 }
 }
-let EmptyIcon = Label{ padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 28} } }
-let EmptyTitle = Label{ width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} } }
-let EmptyText = Label{ width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+let EmptyIcon = Label{ padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_regular{font_size: 28} } }
+let EmptyTitle = Label{ width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 12.5} } }
+let EmptyText = Label{ width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
 
 View{
     width: Fill height: Fill flow: Down
@@ -2397,7 +2401,7 @@ View{
                     visible: false
                     stats_line := Label{
                         text: "" width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} }
+                        draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} }
                     }
                 }
                 title_wrap := Slot{
@@ -2488,7 +2492,7 @@ View{
         }
         preview_wrap := RoundedView{
             width: Fill height: Fit flow: Down spacing: 8 padding: 12 visible: false
-            show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+            show_bg: true draw_bg +: { color: theme.palette.card_subtle border_radius: 8.0 }
             preview_note := Body{ text: "" }
             Fits{
                 NeutralButton{ text: "Show previews" on_click: || show_previews() }
@@ -2508,8 +2512,8 @@ View{
             width: Fill height: Fit flow: Down visible: false
             loading_wrap := View{
                 width: Fill height: Fit flow: Right spacing: 10 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24} visible: false
-                LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
-                loading_line := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: theme.palette.accent_text } }
+                loading_line := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
             }
             empty_card := EmptyCard{
                 empty_icon := EmptyIcon{ text: "🖼️" }
@@ -2599,11 +2603,11 @@ View{
                 height: 150 flow: Down align: Align{x: 0.5 y: 0.5} spacing: 8 visible: false
                 d_file_icon := Label{
                     text: "📄" padding: 0 margin: 0
-                    draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 40} }
+                    draw_text +: { color: theme.palette.title text_style: theme.font_regular{font_size: 40} }
                 }
                 d_file_label := Label{
                     text: "" padding: 0 margin: 0
-                    draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} }
+                    draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} }
                 }
             }
             // Sized by its picture, at most half the pane, so short panes keep the actions in view.
@@ -2613,11 +2617,11 @@ View{
                     width: Fill height: 160 flow: Down align: Align{x: 0.5 y: 0.5} spacing: 8
                     d_icon := Label{
                         text: "📄" padding: 0 margin: 0
-                        draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 46} }
+                        draw_text +: { color: theme.palette.title text_style: theme.font_regular{font_size: 46} }
                     }
                     d_icon_label := Label{
                         text: "" padding: 0 margin: 0
-                        draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} }
+                        draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} }
                     }
                 }
                 d_img_wrap := View{
@@ -2625,8 +2629,9 @@ View{
                     d_img := Image{
                         width: Fill height: Fit{max: FitBound.Rel{base: Base.Full, factor: 0.5}} fit: ImageFit.Smallest
                         draw_bg +: {
+                            color_loading: uniform(if theme.palette.is_dark {#x353C4A} else {#xE3E9F5})
                             pixel: fn(){
-                                let color = mix(self.get_color(), #xE3E9F5, self.async_load)
+                                let color = mix(self.get_color(), self.color_loading, self.async_load)
                                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
                                 sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, 6.0)
                                 sdf.fill(vec4(color.xyz, color.w * self.opacity))
@@ -2640,7 +2645,7 @@ View{
                 width: Fill height: Fit flow: Down spacing: 4
                 d_name := Label{
                     text: "" width: Fill padding: 0 margin: 0
-                    draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} }
+                    draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} }
                 }
                 d_kind := Caption{ text: "" }
                 d_info_wrap := Slot{

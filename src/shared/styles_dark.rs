@@ -314,6 +314,47 @@ script_mod! {
 
     mod.widgets.COLOR_SETTINGS_LIST_BG = #x2C2C2C
 
+    // The few colors only mini-apps use; the rest of their palette is Robrix's own.
+    mod.widgets.COLOR_MINI_APP_TEXT_MUTED = #x9FA6B7
+    mod.widgets.COLOR_MINI_APP_CARD_SUBTLE = #x2B2D32
+    mod.widgets.COLOR_MINI_APP_PRESSED = #x2F3C54
+    // The outline of a card or framed box on a mini-app's surface.
+    mod.widgets.COLOR_MINI_APP_CARD_BORDER = #x454545
+    mod.widgets.COLOR_MINI_APP_ACCENT_TEXT = #x5AABFF
+    // The surface of an app that colors itself for the light theme only.
+    mod.widgets.COLOR_MINI_APP_LIGHT_ONLY_BG = #xFFFFFF
+    // The scroll bar over a light-only app's surface, which keeps the light theme's look.
+    mod.widgets.COLOR_MINI_APP_LIGHT_ONLY_SCROLL_BAR_HANDLE = #x00000040
+    mod.widgets.COLOR_MINI_APP_LIGHT_ONLY_SCROLL_BAR_HANDLE_HOVER = #x00000060
+    mod.widgets.COLOR_MINI_APP_LIGHT_ONLY_SCROLL_BAR_HANDLE_DRAG = #x00000080
+    // The border around a light-only app's surface: COLOR_SECONDARY's light value.
+    mod.widgets.COLOR_MINI_APP_LIGHT_ONLY_BORDER = #xE3E3E3
+
+    // The create card's strip naming the app a prompt would modify, and its link-like switch.
+    mod.widgets.COLOR_MINI_APPS_INTENT_HINT_BG = #x2F3C54
+    mod.widgets.COLOR_MINI_APPS_INTENT_SWITCH_BG_HOVER = #x5AABFF1F
+    mod.widgets.COLOR_MINI_APPS_INTENT_SWITCH_BG_DOWN = #x5AABFF33
+    // Lighter than the rest color, since the hover and press fills lighten the strip.
+    mod.widgets.COLOR_MINI_APPS_INTENT_SWITCH_TEXT_HOVER = #x9ECFFF
+    // The lines a source diff adds and removes.
+    mod.widgets.COLOR_MINI_APPS_DIFF_ADDED_BG = #x29392C
+    mod.widgets.COLOR_MINI_APPS_DIFF_ADDED_TEXT = #x7EE787
+    mod.widgets.COLOR_MINI_APPS_DIFF_REMOVED_BG = #x412C2B
+    mod.widgets.COLOR_MINI_APPS_DIFF_REMOVED_TEXT = #xFFA198
+
+    // An AI room's turn card: warm while its agent works, muted (on CARD_SUBTLE) once it settles.
+    mod.widgets.COLOR_AI_TURN_RUNNING_BG = #x3B3323
+    mod.widgets.COLOR_AI_TURN_RUNNING_BORDER = #x7A6127
+    mod.widgets.COLOR_AI_TURN_DONE_BORDER = #x41464D
+
+    // The chip of a mini-app running unseen in a room, which floats over that room's timeline.
+    mod.widgets.COLOR_PANE_CHIP_BG = #x333333E0
+    mod.widgets.COLOR_PANE_CHIP_BG_HOVER = #x3D3D3DF2
+    mod.widgets.COLOR_PANE_CHIP_BG_DOWN = #x474747F2
+    mod.widgets.COLOR_PANE_CHIP_BORDER = #xFFFFFF22
+    mod.widgets.COLOR_PANE_CHIP_BORDER_HOVER = #xFFFFFF33
+    mod.widgets.COLOR_PANE_CHIP_BORDER_DOWN = #xFFFFFF44
+
     // Code view syntax colors, one per kind of code token.
     mod.widgets.COLOR_CODE_TEXT = #xE1E4E8
     mod.widgets.COLOR_CODE_WHITESPACE = #x6A737D

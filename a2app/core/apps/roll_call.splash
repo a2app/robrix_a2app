@@ -10,29 +10,29 @@ let PrimaryButton = Button{
     padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
     draw_bg +: {
         border_size: 0.0 border_radius: 4.0
-        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color: theme.palette.accent color_hover: theme.palette.accent_hover color_down: theme.palette.accent_down color_focus: theme.palette.accent
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+    draw_text +: { color: theme.palette.on_accent color_hover: theme.palette.on_accent color_down: theme.palette.on_accent color_focus: theme.palette.on_accent text_style: theme.font_regular{font_size: 10} }
 }
 let NeutralButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
-        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.neutral_border border_color_hover: theme.palette.neutral_border border_color_down: theme.palette.neutral_border border_color_focus: theme.palette.neutral_border
+        color: theme.palette.neutral color_hover: theme.palette.neutral_hover color_down: theme.palette.neutral_down color_focus: theme.palette.neutral }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title }
 }
 
-let die_a = 1
-let die_b = 1
-let posting = false
-let drafting = false
+// The roll and the dice size survive the re-run a theme switch does, which no resize follows.
+// So does `in_flight` ("post", "draft" or ""), the request whose reply that re-run drops.
+mod.state = {die_a: 1 die_b: 1 faces: [] die_size: 80 side_pad: 28 in_flight: ""}
 
 // Pip cells (0-8, row by row) for faces 1-6.
 let pip_sets = [[4], [2, 6], [2, 4, 6], [0, 2, 6, 8], [0, 2, 4, 6, 8], [0, 2, 3, 5, 6, 8]]
-let faces = []
-let die_size = 80
-let side_pad = 28
 
-fn result_text(){ return "🎲 Rolled " + die_a + " + " + die_b + " = " + (die_a + die_b) }
+fn result_text(){
+    let a = mod.state.die_a
+    let b = mod.state.die_b
+    return "🎲 Rolled " + a + " + " + b + " = " + (a + b)
+}
 
 // A face as three rows of three cells, true where a pip sits.
 fn face_rows(n){
@@ -51,10 +51,12 @@ fn face_rows(n){
 }
 
 fn show_dice(){
-    faces = [face_rows(die_a), face_rows(die_b)]
+    let a = mod.state.die_a
+    let b = mod.state.die_b
+    mod.state.faces = [face_rows(a), face_rows(b)]
     ui.faces.render()
-    ui.total.set_text("" + (die_a + die_b))
-    ui.dice.set_text("" + die_a + " + " + die_b)
+    ui.total.set_text("" + (a + b))
+    ui.dice.set_text("" + a + " + " + b)
 }
 
 let lower_az = "abcdefghijklmnopqrstuvwxyz"
@@ -86,19 +88,19 @@ fn set_note(kind, text){
 
 // random() is a 64-bit generator; time-based floor() math runs in 32-bit floats.
 fn roll(){
-    die_a = min(floor(random() * 6) + 1, 6)
-    die_b = min(floor(random() * 6) + 1, 6)
+    mod.state.die_a = min(floor(random() * 6) + 1, 6)
+    mod.state.die_b = min(floor(random() * 6) + 1, 6)
     show_dice()
     set_note("info", "")
 }
 
 fn post(){
-    if posting || drafting { return nil }
+    if mod.state.in_flight != "" { return nil }
     let msg = result_text()
-    posting = true
+    mod.state.in_flight = "post"
     set_note("info", "Posting…")
     host.request("matrix.send_message", {body: msg}, fn(r){
-        posting = false
+        mod.state.in_flight = ""
         if r.is_ok {
             set_note("ok", "Posted to the room!")
             return nil
@@ -108,11 +110,11 @@ fn post(){
 }
 
 fn draft_result(){
-    if posting || drafting { return nil }
-    drafting = true
+    if mod.state.in_flight != "" { return nil }
+    mod.state.in_flight = "draft"
     set_note("info", "Preparing a draft…")
     host.request("composer.insert", {text: result_text()}, fn(r){
-        drafting = false
+        mod.state.in_flight = ""
         if r.is_ok {
             set_note("ok", "Draft ready. Review and send it in Robrix.")
             return nil
@@ -129,14 +131,26 @@ fn on_app_resize(w, h){
     size = max(min(size, floor((w - 92) / 2)), 36)
     let pad = 0
     if w >= 300 { pad = floor(size * 0.35) }
-    if size == die_size && pad == side_pad { return nil }
-    die_size = size
-    side_pad = pad
+    if size == mod.state.die_size && pad == mod.state.side_pad { return nil }
+    mod.state.die_size = size
+    mod.state.side_pad = pad
     ui.faces.render()
     return nil
 }
 
-let _boot = start_timeout(0.05, || show_dice())
+// A theme switch's re-run drops the reply an in-flight request awaited; Robrix still finishes it.
+fn resume(){
+    let cut = mod.state.in_flight
+    mod.state.in_flight = ""
+    if cut == "post" { set_note("info", "Handed your roll to Robrix to post. Check the room before posting again.") }
+    elif cut == "draft" { set_note("info", "Handed your roll to Robrix. Check the message box before drafting again.") }
+    return nil
+}
+
+let _boot = start_timeout(0.05, || {
+    show_dice()
+    resume()
+})
 
 View{
     width: Fill height: Fill flow: Down
@@ -146,19 +160,21 @@ View{
             width: Fit height: Fit flow: Down spacing: 14 align: Align{x: 0.5}
             padding: Inset{top: 22 bottom: 18 left: 16 right: 16}
             show_bg: true
-            draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+            draw_bg +: { color: theme.palette.card border_radius: 8.0 }
             faces := View{
                 width: Fit height: Fit flow: Right
                 on_render: || {
+                    let die_size = mod.state.die_size
+                    let side_pad = mod.state.side_pad
                     View{ width: side_pad height: 1 }
                     let k = 0
-                    for f in faces {
+                    for f in mod.state.faces {
                         if k > 0 { View{ width: 16 height: 1 } }
                         k += 1
                         RoundedView{
                             width: die_size height: die_size flow: Down padding: floor(die_size * 0.13)
                             show_bg: true
-                            draw_bg +: { color: #xFFFFFF border_radius: floor(die_size * 0.14) border_size: 1.0 border_color: #xC8C8C8 }
+                            draw_bg +: { color: theme.palette.surface border_radius: floor(die_size * 0.14) border_size: 1.0 border_color: theme.palette.border }
                             for row in f {
                                 View{
                                     width: Fill height: Fill flow: Right
@@ -168,7 +184,7 @@ View{
                                             width: Fill height: Fill align: Align{x: 0.5 y: 0.5}
                                             RoundedView{
                                                 width: floor(die_size * 0.15) height: floor(die_size * 0.15) visible: on show_bg: true
-                                                draw_bg +: { color: #x1C274C border_radius: floor(die_size * 0.075) }
+                                                draw_bg +: { color: theme.palette.title border_radius: floor(die_size * 0.075) }
                                             }
                                         }
                                     }
@@ -183,11 +199,11 @@ View{
                 width: Fit height: Fit flow: Down spacing: 2 align: Align{x: 0.5}
                 total := Label{
                     text: "2" padding: 0 margin: 0
-                    draw_text +: { color: #x0f88fe text_style: theme.font_bold{font_size: 26} }
+                    draw_text +: { color: theme.palette.accent_text text_style: theme.font_bold{font_size: 26} }
                 }
                 dice := Label{
                     text: "1 + 1" padding: 0 margin: 0
-                    draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                    draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} }
                 }
             }
         }
@@ -201,26 +217,26 @@ View{
             width: Fill height: Fit align: Align{x: 0.5} visible: false
             note := Label{
                 text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
-                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} }
             }
         }
         note_ok_wrap := View{
             width: Fill height: Fit align: Align{x: 0.5} visible: false
             note_ok := Label{
                 text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
-                draw_text +: { color: #x138808 text_style: theme.font_regular{font_size: 10} }
+                draw_text +: { color: theme.palette.success text_style: theme.font_regular{font_size: 10} }
             }
         }
         note_err_wrap := View{
             width: Fill height: Fit align: Align{x: 0.5} visible: false
             note_err := Label{
                 text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
-                draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} }
+                draw_text +: { color: theme.palette.danger text_style: theme.font_regular{font_size: 10} }
             }
         }
         Label{
             text: "Draft lets you review first. Post sends now." width: Fill align: Align{x: 0.5} padding: 0 margin: 0
-            draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+            draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} }
         }
     }
 }

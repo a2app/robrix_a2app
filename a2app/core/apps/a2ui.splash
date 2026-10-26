@@ -11,9 +11,9 @@ View{
     ScrollYView{
         width: Fill height: Fill flow: Down spacing: 10 padding: 14
         Label{ width: Fill padding: 0 margin: 0 text: "Interactive messages"
-            draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 14} } }
+            draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 14} } }
         Label{ width: Fill padding: 0 margin: 0
             text: "Agents can send interactive A2UI messages, such as forms and cards, that Robrix draws in the timeline. When you press a button on one, it answers the agent by sending an event to the room. Every interactive message acts as this app, so the permissions you give it here apply to all of them."
-            draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
+            draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
     }
 }

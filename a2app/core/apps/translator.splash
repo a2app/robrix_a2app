@@ -70,15 +70,26 @@ let named_entities = {quot: "\"", amp: "&", lt: "<", gt: ">", apos: "'", nbsp: "
 // Saved settings; an empty target or reply language means automatic.
 let settings = {target: "", reply: "", service: "mymemory", server: "", key: "", is_live: false}
 
+// What a theme switch's re-run keeps, like the widgets that show it.
+mod.state = {
+    // Oldest first, as Robrix sends them; shown holds the same rows newest first.
+    rows: [] shown: []
+    reply_result: nil
+    is_narrow: false
+    // Tiny panes move Refresh into the action row and shorten the privacy note.
+    is_tiny: false
+    // The open language menu ("target", "reply" or ""), the service panel and its LibreTranslate form.
+    menu_open: "" is_service_open: false is_libre_form: false
+    // Set once boot has put the saved server in its field, so a re-run keeps an address being typed.
+    is_server_seeded: false
+}
+
 let is_attached = false
 let device_lang = "en"
 let utc_offset = 0
 let is_device_read = false
 let is_device_pending = false
 
-// Oldest first, as Robrix sends them; shown holds the same rows newest first.
-let rows = []
-let shown = []
 let read_token = 0
 let is_read_pending = false
 let is_read_done = false
@@ -120,20 +131,13 @@ let live_line = "Off. New messages aren't translated."
 let live_pause_line = ""
 
 let reply_token = 0
-let reply_result = nil
 let reply_line = ""
 let reply_tone = 0
 let is_inserting = false
 let is_copying = false
 
-let menu_open = ""
-let is_service_open = false
-let is_libre_form = false
 let service_line = ""
 let service_tone = 0
-let is_narrow = false
-// Tiny panes move Refresh into the action row and shorten the privacy note.
-let is_tiny = false
 // Known once env answers; a room-less pane has nothing to watch.
 let is_detached = false
 
@@ -765,7 +769,7 @@ fn to_row(m){
 }
 
 fn row_of(event_id){
-    for m in rows {
+    for m in mod.state.rows {
         if m.event_id == event_id { return m }
     }
     return nil
@@ -774,7 +778,7 @@ fn row_of(event_id){
 // Keeps per-row choices and messages that arrived while the list was loading.
 fn merge_rows(list){
     let earlier = {}
-    for old in rows { earlier[old.event_id] = old }
+    for old in mod.state.rows { earlier[old.event_id] = old }
     let fresh = {}
     for row in list {
         fresh[row.event_id] = row
@@ -784,17 +788,17 @@ fn merge_rows(list){
             row.error = old.error
         }
     }
-    for old in rows {
+    for old in mod.state.rows {
         if old.is_live_row && lookup(fresh, old.event_id).is_nil() { list.push(old) }
     }
     while list.len() > row_limit { list.remove(0) }
-    rows = list
+    mod.state.rows = list
     return nil
 }
 
 fn show_loading(){
     set_list("Loading recent messages…", 0)
-    if rows.len() == 0 { set_empty("⏳", "Loading messages…", "Reading the latest messages in this room.", "") }
+    if mod.state.rows.len() == 0 { set_empty("⏳", "Loading messages…", "Reading the latest messages in this room.", "") }
     render_rows()
     return nil
 }
@@ -816,7 +820,7 @@ fn setup(is_retry){
         is_setup_pending = false
         if !r.is_ok {
             set_list(sentence(r.error) + " Tap Refresh to try again.", 2)
-            if rows.len() == 0 { set_empty("😕", "Couldn't ask for permission", error_line(r.error), "Try again") }
+            if mod.state.rows.len() == 0 { set_empty("😕", "Couldn't ask for permission", error_line(r.error), "Try again") }
             if settings.is_live && !is_live_ready && !is_live_pending { live_line = "Not started: " + list_line }
             show_controls()
             render_rows()
@@ -853,7 +857,7 @@ fn load_messages(){
         is_read_done = r.is_ok
         if !r.is_ok {
             set_list("Couldn't load messages: " + error_line(r.error) + " Tap Refresh to try again.", 2)
-            if rows.len() == 0 { set_empty("😕", "Couldn't read this room", error_line(r.error), "Try again") }
+            if mod.state.rows.len() == 0 { set_empty("😕", "Couldn't read this room", error_line(r.error), "Try again") }
             render_rows()
             return nil
         }
@@ -888,7 +892,7 @@ fn stop_reading(){
     is_read_pending = false
     is_read_done = false
     set_list("Reading this room is off, so the list won't refresh. Tap Refresh to ask again.", 0)
-    if rows.len() == 0 { set_empty("🔒", "Reading this room is off", "Allow Translator to read this room's messages.", "Ask again") }
+    if mod.state.rows.len() == 0 { set_empty("🔒", "Reading this room is off", "Allow Translator to read this room's messages.", "Ask again") }
     render_rows()
     return nil
 }
@@ -1252,8 +1256,8 @@ fn enqueue_message(m, origin){
 
 // The list shows rows newest first.
 fn tap_shown(i){
-    if i < 0 || i >= shown.len() { return nil }
-    let m = shown[i]
+    if i < 0 || i >= mod.state.shown.len() { return nil }
+    let m = mod.state.shown[i]
     if is_sending(m.event_id) || is_queued(m.event_id) { return nil }
     let entry = cached(m.event_id, target_lang())
     if entry.is_object() {
@@ -1280,9 +1284,9 @@ fn translate_all(){
     let target = target_lang()
     // The newest first, so translations fill in from the top of the list.
     let picked = []
-    let i = rows.len() - 1
+    let i = mod.state.rows.len() - 1
     while i >= 0 && picked.len() < batch_limit {
-        let m = rows[i]
+        let m = mod.state.rows[i]
         if !cached(m.event_id, target).is_object() && !is_sending(m.event_id) && !is_queued(m.event_id) { picked.push(m) }
         i -= 1
     }
@@ -1423,9 +1427,9 @@ fn stop_live(note){
 fn live_backlog(){
     let target = target_lang()
     let newest = []
-    let i = rows.len() - 1
+    let i = mod.state.rows.len() - 1
     while i >= 0 && newest.len() < live_queue_limit {
-        let m = rows[i]
+        let m = mod.state.rows[i]
         if m.is_live_row && !m.is_own && !cached(m.event_id, target).is_object() && !is_sending(m.event_id) && !is_queued(m.event_id) { newest.push(m) }
         i -= 1
     }
@@ -1482,14 +1486,14 @@ fn on_room_message(json){
         let row = to_row(m)
         if row.is_object() && !row_of(row.event_id).is_object() {
             row.is_live_row = true
-            rows.push(row)
+            mod.state.rows.push(row)
             let is_wanted = is_live_wanted(row)
             let is_queue_open = count_origin("live") < live_queue_limit
             if is_wanted && is_queue_open { enqueue_message(row, "live") }
             if is_wanted && !is_queue_open { skipped += 1 }
         }
     }
-    while rows.len() > row_limit { rows.remove(0) }
+    while mod.state.rows.len() > row_limit { mod.state.rows.remove(0) }
     if skipped > 0 { live_line = "Busy: " + skipped + " new " + plural(skipped, "message") + " skipped. Tap one to translate it." }
     pump()
     show_controls()
@@ -1513,7 +1517,7 @@ fn translate_reply(){
     }
     cancel_jobs("reply")
     reply_token += 1
-    reply_result = nil
+    mod.state.reply_result = nil
     let job = new_job("reply", "", text, reply_lang(), "reply")
     job.token = reply_token
     push_front(job)
@@ -1527,13 +1531,13 @@ fn finish_reply(job, text, detected, is_unchanged){
     if job.token != reply_token { return nil }
     let result_text = text
     if is_unchanged { result_text = job.text }
-    reply_result = {text: result_text, source: job.text, target: job.target, detected: detected, is_same: is_unchanged}
+    mod.state.reply_result = {text: result_text, source: job.text, target: job.target, detected: detected, is_same: is_unchanged}
     set_reply_line("", 0)
     return nil
 }
 
 fn reply_edited(text){
-    if !reply_result.is_object() || text.trim() == reply_result.source { return nil }
+    if !mod.state.reply_result.is_object() || text.trim() == mod.state.reply_result.source { return nil }
     set_reply_line("You changed your reply. Tap Translate to update the translation.", 0)
     show_reply()
     return nil
@@ -1541,7 +1545,7 @@ fn reply_edited(text){
 
 fn insert_reply(){
     if is_inserting { return nil }
-    if !reply_result.is_object() {
+    if !mod.state.reply_result.is_object() {
         set_reply_line("Translate your reply first.", 0)
         show_reply()
         return nil
@@ -1554,7 +1558,7 @@ fn insert_reply(){
     is_inserting = true
     set_reply_line("Putting the translation in the message box…", 0)
     show_reply()
-    host.request("composer.insert", {text: reply_result.text}, fn(r){
+    host.request("composer.insert", {text: mod.state.reply_result.text}, fn(r){
         is_inserting = false
         set_reply_line("Added to the message box. Review it there, then press Send.", 1)
         if !r.is_ok { set_reply_line("The message box wasn't changed: " + sentence(r.error), 2) }
@@ -1566,13 +1570,13 @@ fn insert_reply(){
 
 fn copy_reply(){
     if is_copying { return nil }
-    if !reply_result.is_object() {
+    if !mod.state.reply_result.is_object() {
         set_reply_line("Translate your reply first.", 0)
         show_reply()
         return nil
     }
     is_copying = true
-    host.request("clipboard.write", {text: reply_result.text}, fn(r){
+    host.request("clipboard.write", {text: mod.state.reply_result.text}, fn(r){
         is_copying = false
         set_reply_line("Copied the translation.", 1)
         if !r.is_ok { set_reply_line("Couldn't copy: " + sentence(r.error), 2) }
@@ -1585,7 +1589,7 @@ fn copy_reply(){
 // ---- Languages and menus
 
 fn toggle_menu(kind){
-    if menu_open == kind { menu_open = "" } else { menu_open = kind }
+    if mod.state.menu_open == kind { mod.state.menu_open = "" } else { mod.state.menu_open = kind }
     show_menus()
     return nil
 }
@@ -1609,7 +1613,7 @@ fn choose_language(kind, i){
     if i < 0 || i > languages.len() { return nil }
     let id = ""
     if i > 0 { id = languages[i - 1].id }
-    menu_open = ""
+    mod.state.menu_open = ""
     if kind == "target" { set_target(id) } else { set_reply(id) }
     show_menus()
     return nil
@@ -1633,10 +1637,10 @@ fn set_reply(id){
     let before = reply_lang()
     settings.reply = id
     save_settings()
-    if reply_lang() != before && (reply_result.is_object() || is_reply_pending()) {
+    if reply_lang() != before && (mod.state.reply_result.is_object() || is_reply_pending()) {
         cancel_jobs("reply")
         reply_token += 1
-        reply_result = nil
+        mod.state.reply_result = nil
         set_reply_line("Tap Translate to translate your reply into " + lang_name(reply_lang()) + ".", 0)
     }
     show_controls()
@@ -1671,7 +1675,7 @@ fn server_problem(server){
 // The service chips, in the order service_choice draws them.
 // A LibreTranslate pick shows as chosen while its server is being entered.
 fn service_items(){
-    let is_libre = is_libre_form || settings.service == "libre"
+    let is_libre = mod.state.is_libre_form || settings.service == "libre"
     return [{label: "MyMemory", is_selected: !is_libre}, {label: "LibreTranslate", is_selected: is_libre}]
 }
 
@@ -1682,7 +1686,7 @@ fn pick_service(i){
 }
 
 fn toggle_service(){
-    is_service_open = !is_service_open
+    mod.state.is_service_open = !mod.state.is_service_open
     show_service()
     return nil
 }
@@ -1706,7 +1710,7 @@ fn switch_service(name){
 }
 
 fn use_mymemory(){
-    is_libre_form = false
+    mod.state.is_libre_form = false
     if settings.service != "mymemory" { switch_service("mymemory") }
     set_service_line("Translations now go to " + mymemory_host + ".", 1)
     show_service()
@@ -1714,7 +1718,7 @@ fn use_mymemory(){
 }
 
 fn use_libre(){
-    is_libre_form = true
+    mod.state.is_libre_form = true
     ui.server_input.set_text(settings.server)
     if settings.server == "" {
         set_service_line("Enter your server's address, then tap Save server.", 0)
@@ -1771,7 +1775,7 @@ fn forget_key(){
 // ---- Display
 
 fn privacy_text(){
-    if is_tiny && settings.service == "mymemory" { return "🔒 Sent to MyMemory only when you translate it." }
+    if mod.state.is_tiny && settings.service == "mymemory" { return "🔒 Sent to MyMemory only when you translate it." }
     return "🔒 Text is sent to " + site_host() + " only when you translate it."
 }
 
@@ -1826,13 +1830,13 @@ fn render_rows(){
     for job in queue {
         if job.kind == "msg" { waiting[job.event_id] = true }
     }
-    shown = []
-    let looks = [empty_line, flag(is_tiny)]
-    let i = rows.len() - 1
+    mod.state.shown = []
+    let looks = [empty_line, flag(mod.state.is_tiny)]
+    let i = mod.state.rows.len() - 1
     while i >= 0 {
-        decorate(rows[i], waiting)
-        shown.push(rows[i])
-        looks.push(row_look(rows[i]))
+        decorate(mod.state.rows[i], waiting)
+        mod.state.shown.push(mod.state.rows[i])
+        looks.push(row_look(mod.state.rows[i]))
         i -= 1
     }
     let look = looks.to_string()
@@ -1845,14 +1849,14 @@ fn render_rows(){
 }
 
 fn loaded_line(){
-    if is_narrow { return "Tap a message to translate it" }
-    return "" + rows.len() + " recent " + plural(rows.len(), "message") + ", newest first · tap one to translate it"
+    if mod.state.is_narrow { return "Tap a message to translate it" }
+    return "" + mod.state.rows.len() + " recent " + plural(mod.state.rows.len(), "message") + ", newest first · tap one to translate it"
 }
 
 // The card for an empty list, with a Try again or Ask again button when one helps;
 // while loading, a spinner line stands in for it.
 fn show_empty(){
-    let is_empty = rows.len() == 0
+    let is_empty = mod.state.rows.len() == 0
     let look = [flag(is_empty), empty_icon, "|", empty_title, "|", empty_line, "|", empty_ask].to_string()
     if look == drawn.empty { return nil }
     drawn.empty = look
@@ -1883,7 +1887,7 @@ fn show_list_status(){
         line = "Translating " + min(batch_done + 1, batch_total) + " of " + batch_total + "…"
         tone = 0
     }
-    let has_rows = rows.len() > 0
+    let has_rows = mod.state.rows.len() > 0
     let look = line + flag(has_rows) + tone
     if look == drawn.status { return nil }
     drawn.status = look
@@ -1900,13 +1904,13 @@ fn show_list_status(){
 
 fn target_hint_text(){
     if settings.target != "" { return "" }
-    if is_narrow { return "Automatic" }
+    if mod.state.is_narrow { return "Automatic" }
     return "Automatic · your device language"
 }
 
 fn reply_hint_text(){
     if settings.reply != "" { return "" }
-    if is_narrow { return "Automatic" }
+    if mod.state.is_narrow { return "Automatic" }
     if room_lang() == "" { return "Automatic · until this room's language is detected" }
     return "Automatic · the language used most here"
 }
@@ -1941,19 +1945,19 @@ fn show_actions(){
     let all_label = "Translate all"
     if batch_total > 0 { all_label = "Stop" }
     let live_label = "Translate new messages"
-    if is_narrow { live_label = "Live" }
+    if mod.state.is_narrow { live_label = "Live" }
     live_label = mark(settings.is_live) + live_label
     let tone = live_tone()
-    let look = [all_label, "|", live_label, "|", live_line, flag(is_live_paused), tone, flag(is_tiny), flag(is_detached)].to_string()
+    let look = [all_label, "|", live_label, "|", live_line, flag(is_live_paused), tone, flag(mod.state.is_tiny), flag(is_detached)].to_string()
     if look == drawn.actions { return nil }
     drawn.actions = look
     ui.translate_all_btn.set_text(all_label)
     ui.live_btn.set_text(live_label)
     ui.live_wrap.set_visible(!is_detached)
-    ui.refresh_wide.set_visible(!is_tiny)
-    ui.refresh_narrow.set_visible(is_tiny)
+    ui.refresh_wide.set_visible(!mod.state.is_tiny)
+    ui.refresh_narrow.set_visible(mod.state.is_tiny)
     // Without a room the group would be empty, and an empty group still takes the column's spacing.
-    ui.actions_wrap.set_visible(!is_detached || is_tiny)
+    ui.actions_wrap.set_visible(!is_detached || mod.state.is_tiny)
     ui.live_note.set_text(live_line)
     if tone == 2 { ui.live_note_err.set_text(live_line) }
     // Plain "off" is what the toggle already shows.
@@ -1981,32 +1985,32 @@ fn show_controls(){
 }
 
 fn show_menus(){
-    ui.target_menu_wrap.set_visible(menu_open == "target")
-    ui.reply_menu_wrap.set_visible(menu_open == "reply")
-    if menu_open == "target" { ui.target_menu.render() }
-    if menu_open == "reply" { ui.reply_menu.render() }
+    ui.target_menu_wrap.set_visible(mod.state.menu_open == "target")
+    ui.reply_menu_wrap.set_visible(mod.state.menu_open == "reply")
+    if mod.state.menu_open == "target" { ui.target_menu.render() }
+    if mod.state.menu_open == "reply" { ui.reply_menu.render() }
     return nil
 }
 
 fn reply_note_text(){
-    let lang = english_name(reply_result.target)
-    if reply_result.is_same && reply_result.detected == "" { return "No translation needed" }
-    if reply_result.is_same { return "Already in " + lang }
-    let source_name = english_name(reply_result.detected)
+    let lang = english_name(mod.state.reply_result.target)
+    if mod.state.reply_result.is_same && mod.state.reply_result.detected == "" { return "No translation needed" }
+    if mod.state.reply_result.is_same { return "Already in " + lang }
+    let source_name = english_name(mod.state.reply_result.detected)
     if source_name == "" { return lang }
     return lang + " · from " + source_name
 }
 
 fn show_reply(){
-    let is_ready = reply_result.is_object()
+    let is_ready = mod.state.reply_result.is_object()
     let text = ""
     let note = ""
     if is_ready {
-        text = reply_result.text
+        text = mod.state.reply_result.text
         note = reply_note_text()
     }
     let insert_label = "Put in message box"
-    if is_narrow { insert_label = "Insert" }
+    if mod.state.is_narrow { insert_label = "Insert" }
     let look = [flag(is_ready), text, "|", note, "|", insert_label, "|", reply_line, reply_tone].to_string()
     if look == drawn.reply { return nil }
     drawn.reply = look
@@ -2031,22 +2035,22 @@ fn key_text(){
 
 fn show_service(){
     let arrow = " ▼"
-    if is_service_open { arrow = " ▲" }
+    if mod.state.is_service_open { arrow = " ▲" }
     let title = "Translation service: "
-    if is_narrow { title = "Service: " }
+    if mod.state.is_narrow { title = "Service: " }
     ui.service_btn.set_text(title + service_name() + arrow)
-    ui.service_body.set_visible(is_service_open)
+    ui.service_body.set_visible(mod.state.is_service_open)
     // The chips redraw only when the chosen service changes.
-    let chosen = settings.service + flag(is_libre_form)
+    let chosen = settings.service + flag(mod.state.is_libre_form)
     if drawn.service != chosen {
         drawn.service = chosen
         ui.service_choice.render()
     }
-    ui.lt_wrap.set_visible(is_libre_form || settings.service == "libre")
+    ui.lt_wrap.set_visible(mod.state.is_libre_form || settings.service == "libre")
     ui.key_wrap.set_visible(settings.key != "")
     ui.key_line.set_text(key_text())
     ui.site_line.set_text("Text you translate is sent to " + site_host() + ".")
-    ui.quota_wrap.set_visible(settings.service == "mymemory" && !is_libre_form)
+    ui.quota_wrap.set_visible(settings.service == "mymemory" && !mod.state.is_libre_form)
     ui.service_status.set_text(service_line)
     if service_tone == 1 { ui.service_status_ok.set_text(service_line) }
     if service_tone == 2 { ui.service_status_err.set_text(service_line) }
@@ -2105,9 +2109,9 @@ fn on_permissions_changed(caps){
 fn on_app_resize(w, h){
     let is_narrow_now = w < 360
     let is_tiny_now = w < 300
-    if is_narrow_now != is_narrow || is_tiny_now != is_tiny {
-        is_narrow = is_narrow_now
-        is_tiny = is_tiny_now
+    if is_narrow_now != mod.state.is_narrow || is_tiny_now != mod.state.is_tiny {
+        mod.state.is_narrow = is_narrow_now
+        mod.state.is_tiny = is_tiny_now
         show_controls()
         show_reply()
         show_service()
@@ -2117,7 +2121,10 @@ fn on_app_resize(w, h){
 }
 
 fn boot(){
-    ui.server_input.set_text(settings.server)
+    if !mod.state.is_server_seeded {
+        mod.state.is_server_seeded = true
+        ui.server_input.set_text(settings.server)
+    }
     show_all()
     host.request("env", nil, fn(r){
         is_attached = r.is_ok && get(r.data, "room_attached", false) == true
@@ -2143,80 +2150,80 @@ let PrimaryButton = Button{
     padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
     draw_bg +: {
         border_size: 0.0 border_radius: 4.0
-        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color: theme.palette.accent color_hover: theme.palette.accent_hover color_down: theme.palette.accent_down color_focus: theme.palette.accent
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+    draw_text +: { color: theme.palette.on_accent color_hover: theme.palette.on_accent color_down: theme.palette.on_accent color_focus: theme.palette.on_accent text_style: theme.font_regular{font_size: 10} }
 }
 let NeutralButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
-        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.neutral_border border_color_hover: theme.palette.neutral_border border_color_down: theme.palette.neutral_border border_color_focus: theme.palette.neutral_border
+        color: theme.palette.neutral color_hover: theme.palette.neutral_hover color_down: theme.palette.neutral_down color_focus: theme.palette.neutral }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title }
 }
 // The quiet disclosure for the service settings.
 let GhostButton = PrimaryButton{
     padding: Inset{left: 6 right: 6 top: 4 bottom: 4}
     margin: Inset{left: -6}
-    draw_bg +: { border_size: 0.0 color: #xFFFFFF00 color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF00 }
-    draw_text +: { color: #x66708F color_hover: #x1C274C color_down: #x1C274C color_focus: #x66708F }
+    draw_bg +: { border_size: 0.0 color: theme.palette.transparent color_hover: theme.palette.card color_down: theme.palette.pressed color_focus: theme.palette.transparent }
+    draw_text +: { color: theme.palette.muted color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.muted }
 }
 let NegativeButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #xDC0005 border_color_hover: #xDC0005 border_color_down: #xDC0005 border_color_focus: #xDC0005
-        color: #xFFF0F0 color_hover: #xF0D4D4 color_down: #xE0B8B8 color_focus: #xFFF0F0 }
-    draw_text +: { color: #xDC0005 color_hover: #xDC0005 color_down: #xDC0005 color_focus: #xDC0005 }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.danger border_color_hover: theme.palette.danger border_color_down: theme.palette.danger border_color_focus: theme.palette.danger
+        color: theme.palette.danger_bg color_hover: theme.palette.danger_bg_hover color_down: theme.palette.danger_bg_down color_focus: theme.palette.danger_bg }
+    draw_text +: { color: theme.palette.danger color_hover: theme.palette.danger color_down: theme.palette.danger color_focus: theme.palette.danger }
 }
 let Field = TextInput{
     width: Fill height: Fit padding: 10
     draw_bg +: {
         border_radius: 4.0 border_size: 1.0
-        color: #xFFFFFF color_hover: #xFFFFFF color_focus: #xFFFFFF color_down: #xFFFFFF color_empty: #xFFFFFF
-        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_focus: #x106fcc border_color_down: #x106fcc border_color_empty: #xC8C8C8
+        color: theme.palette.surface color_hover: theme.palette.surface color_focus: theme.palette.surface color_down: theme.palette.surface color_empty: theme.palette.surface
+        border_color: theme.palette.border border_color_hover: theme.palette.accent border_color_focus: theme.palette.focus border_color_down: theme.palette.focus border_color_empty: theme.palette.border
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #x333333 color_hover: #x333333 color_focus: #x333333 color_down: #x333333 color_empty: #xBBBBBB color_empty_hover: #x999999 color_empty_focus: #x999999 text_style: theme.font_regular{font_size: 11} }
+    draw_text +: { color: theme.palette.body color_hover: theme.palette.body color_focus: theme.palette.body color_down: theme.palette.body color_empty: theme.palette.placeholder color_empty_hover: theme.palette.placeholder_hover color_empty_focus: theme.palette.placeholder_hover text_style: theme.font_regular{font_size: 11} }
 }
-let Meta = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} } }
-let OkText = Meta{ draw_text +: { color: #x138808 } }
-let ErrText = Meta{ draw_text +: { color: #xDC0005 } }
-let Caption = Label{ padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_bold{font_size: 9.5} } }
-let Body = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} } }
+let Meta = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} } }
+let OkText = Meta{ draw_text +: { color: theme.palette.success } }
+let ErrText = Meta{ draw_text +: { color: theme.palette.danger } }
+let Caption = Label{ padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5} } }
+let Body = Label{ width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.body text_style: theme.font_regular{font_size: 11} } }
 let Slot = View{ width: Fill height: Fit }
 let ButtonRow = View{ width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8 }
 // A plain View draws no background here, so the divider is a SolidView.
-let Divider = SolidView{ width: Fill height: 1 draw_bg +: { color: #x00000018 } }
+let Divider = SolidView{ width: Fill height: 1 draw_bg +: { color: theme.palette.divider } }
 // A wrapping row aligns items to their tops, so picker rows give every item the same height.
 let PickerButton = NeutralButton{ height: 32 margin: 0 }
 let PickerSlot = View{ width: Fit height: 32 align: Align{y: 0.5} }
 let EmptyCard = RoundedView{
     width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5} padding: Inset{top: 20 bottom: 20 left: 16 right: 16}
-    show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+    show_bg: true draw_bg +: { color: theme.palette.card_subtle border_radius: 8.0 }
 }
 // A message row: the sender's avatar beside their name and time, the text, and any translation.
 // Rows use the neutral surface of the other apps' lists; blue stays for the reply card.
 let MessageCard = RoundedView{
     width: Fill height: Fit flow: Right spacing: 10 padding: Inset{top: 10, bottom: 10, left: 12, right: 12}
-    show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+    show_bg: true draw_bg +: { color: theme.palette.card_subtle border_radius: 8.0 }
 }
 let Avatar = RoundedView{
     width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
-    show_bg: true draw_bg +: { color: #x52b2ac border_radius: 16.0 }
+    show_bg: true draw_bg +: { color: theme.palette.avatar border_radius: 16.0 }
 }
-let AvatarLetter = Label{ padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
+let AvatarLetter = Label{ padding: 0 margin: 0 draw_text +: { color: theme.palette.on_accent text_style: theme.font_bold{font_size: 12} } }
 let MessageText = View{ width: Fill height: Fit flow: Down spacing: 4 }
 let SenderRow = View{ width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5} }
-let SenderName = Label{ width: Fill padding: 0 margin: 0 max_lines: 1 text_overflow: TextOverflow.Ellipsis draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} } }
+let SenderName = Label{ width: Fill padding: 0 margin: 0 max_lines: 1 text_overflow: TextOverflow.Ellipsis draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 11} } }
 let TranslationBox = RoundedView{
     width: Fill height: Fit flow: Down spacing: 3 padding: Inset{top: 8, bottom: 8, left: 10, right: 10}
-    show_bg: true draw_bg +: { color: #xFFFFFF border_radius: 6.0 border_size: 1.0 border_color: #xE0E0E0 }
+    show_bg: true draw_bg +: { color: theme.palette.surface border_radius: 6.0 border_size: 1.0 border_color: theme.palette.card_border }
 }
 // Chips: white with a gray edge, or accent-filled when chosen.
 let ChipOff = RoundedView{
     width: Fit height: Fit padding: Inset{top: 5, bottom: 5, left: 10, right: 10}
-    show_bg: true draw_bg +: { color: #xFFFFFF border_size: 1.0 border_color: #xC8C8C8 border_radius: 12.0 }
+    show_bg: true draw_bg +: { color: theme.palette.surface border_size: 1.0 border_color: theme.palette.border border_radius: 12.0 }
 }
-let ChipOn = ChipOff{ draw_bg +: { color: #x0f88fe border_color: #x0f88fe } }
-let ChipText = Label{ padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 10} } }
-let ChipOnText = ChipText{ draw_text +: { color: #xFFFFFF } }
+let ChipOn = ChipOff{ draw_bg +: { color: theme.palette.accent border_color: theme.palette.accent } }
+let ChipText = Label{ padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_regular{font_size: 10} } }
+let ChipOnText = ChipText{ draw_text +: { color: theme.palette.on_accent } }
 let ChipRow = View{ width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 8 }
 
 let _tables = build_tables()
@@ -2312,13 +2319,13 @@ View{
             width: Fill height: Fit flow: Down
             loading_wrap := View{
                 width: Fill height: Fit flow: Right spacing: 10 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24} visible: false
-                LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
-                loading_line := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: theme.palette.accent_text } }
+                loading_line := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
             }
             empty_card := EmptyCard{
-                empty_icon := Label{ text: "⏳" padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 28} } }
-                empty_title := Label{ text: "" width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} } }
-                empty_text := Label{ text: "" width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} } }
+                empty_icon := Label{ text: "⏳" padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_regular{font_size: 28} } }
+                empty_title := Label{ text: "" width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 12.5} } }
+                empty_text := Label{ text: "" width: Fill padding: 0 margin: 0 align: Align{x: 0.5} draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} } }
                 empty_ask_wrap := View{
                     width: Fit height: Fit visible: false margin: Inset{top: 6}
                     empty_ask := PrimaryButton{ text: "Ask again" on_click: || refresh() }
@@ -2334,23 +2341,23 @@ View{
             on_item_tap: |i| tap_shown(i)
             on_render: || {
                 // A render with no children keeps the old ones, so an empty list draws a spacer.
-                if shown.len() == 0 { list_spacer := View{ width: Fill height: 1 } }
-                for m in shown {
+                if mod.state.shown.len() == 0 { list_spacer := View{ width: Fill height: 1 } }
+                for m in mod.state.shown {
                     if m.state == "done" {
                         MessageCard{
-                            Avatar{ visible: !is_tiny AvatarLetter{ text: m.initial } }
+                            Avatar{ visible: !mod.state.is_tiny AvatarLetter{ text: m.initial } }
                             MessageText{
                                 SenderRow{ SenderName{ text: m.sender } Meta{ text: m.when width: Fit } }
                                 Body{ text: m.body }
                                 TranslationBox{
-                                    Body{ text: m.tr_text draw_text +: { color: #x1C274C } }
+                                    Body{ text: m.tr_text draw_text +: { color: theme.palette.title } }
                                     Meta{ text: m.tr_note }
                                 }
                             }
                         }
                     } elif m.state == "error" {
                         MessageCard{
-                            Avatar{ visible: !is_tiny AvatarLetter{ text: m.initial } }
+                            Avatar{ visible: !mod.state.is_tiny AvatarLetter{ text: m.initial } }
                             MessageText{
                                 SenderRow{ SenderName{ text: m.sender } Meta{ text: m.when width: Fit } }
                                 Body{ text: m.body }
@@ -2359,7 +2366,7 @@ View{
                         }
                     } elif m.state == "busy" || m.state == "muted" {
                         MessageCard{
-                            Avatar{ visible: !is_tiny AvatarLetter{ text: m.initial } }
+                            Avatar{ visible: !mod.state.is_tiny AvatarLetter{ text: m.initial } }
                             MessageText{
                                 SenderRow{ SenderName{ text: m.sender } Meta{ text: m.when width: Fit } }
                                 Body{ text: m.body }
@@ -2368,7 +2375,7 @@ View{
                         }
                     } else {
                         MessageCard{
-                            Avatar{ visible: !is_tiny AvatarLetter{ text: m.initial } }
+                            Avatar{ visible: !mod.state.is_tiny AvatarLetter{ text: m.initial } }
                             MessageText{
                                 SenderRow{ SenderName{ text: m.sender } Meta{ text: m.when width: Fit } }
                                 Body{ text: m.body }
@@ -2415,8 +2422,8 @@ View{
             }
             result_wrap := RoundedView{
                 width: Fill height: Fit flow: Down spacing: 8 padding: 12 visible: false
-                show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
-                result_text := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: #x1C274C text_style: theme.font_regular{font_size: 12} } }
+                show_bg: true draw_bg +: { color: theme.palette.card border_radius: 8.0 }
+                result_text := Label{ text: "" width: Fill padding: 0 margin: 0 draw_text +: { color: theme.palette.title text_style: theme.font_regular{font_size: 12} } }
                 result_note := Meta{ text: "" }
                 ButtonRow{
                     insert_btn := NeutralButton{ text: "Put in message box" on_click: || insert_reply() }

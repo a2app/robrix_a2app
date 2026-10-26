@@ -18,21 +18,12 @@ let thread_loaded = false
 let live_refresh_pending = false
 let setup_pending = false
 
-let items = []
-let open_id = ""
-let root_msg = nil
-let replies = []
-// The list: loading | list | empty | denied | error | no_room
-let state = "loading"
-let error_text = ""
-// The open thread: loading | loaded | error | denied
-let thread_state = "loading"
-let thread_error = ""
-let live_note = ""
-let nav_error = ""
-let is_narrow = false
-let is_tiny = false
-let is_wide = false
+// What the pane shows, kept through the re-run a theme switch does. The list is loading | list |
+// empty | denied | error | no_room; the open thread is loading | loaded | error | denied.
+mod.state = {
+    items: [] open_id: "" root_msg: nil replies: [] list_state: "loading" error_text: ""
+    thread_state: "loading" thread_error: "" live_note: "" nav_error: "" is_narrow: false is_tiny: false is_wide: false
+}
 
 let upper = {a: "A" b: "B" c: "C" d: "D" e: "E" f: "F" g: "G" h: "H" i: "I" j: "J" k: "K" l: "L" m: "M" n: "N" o: "O" p: "P" q: "Q" r: "R" s: "S" t: "T" u: "U" v: "V" w: "W" x: "X" y: "Y" z: "Z"}
 let error_prefix = regex("^[Cc]ouldn't [^:]*: ")
@@ -84,46 +75,46 @@ fn ago(ts){
 }
 
 fn show(){
-    let picked = open_id != ""
-    let list_on = !picked || is_wide
-    let thread_on = picked || (is_wide && state == "list")
+    let picked = mod.state.open_id != ""
+    let list_on = !picked || mod.state.is_wide
+    let thread_on = picked || (mod.state.is_wide && mod.state.list_state == "list")
     ui.list_wrap.set_visible(list_on)
     ui.split_line.set_visible(list_on && thread_on)
     ui.thread_wrap.set_visible(thread_on)
-    ui.loading_wrap.set_visible(state == "loading")
-    ui.header_row.set_visible(state == "list")
-    ui.refresh_wide.set_visible(!is_narrow)
-    ui.refresh_narrow.set_visible(is_narrow && state == "list")
-    ui.empty_card.set_visible(state != "loading" && state != "list")
-    ui.ask_wrap.set_visible(state == "denied")
-    ui.retry_wrap.set_visible(state == "error" || state == "empty")
-    let summary = "" + items.len() + " threads"
-    if items.len() == 1 { summary = "1 thread" }
-    if items.len() >= 20 { summary = "Latest 20 threads" }
+    ui.loading_wrap.set_visible(mod.state.list_state == "loading")
+    ui.header_row.set_visible(mod.state.list_state == "list")
+    ui.refresh_wide.set_visible(!mod.state.is_narrow)
+    ui.refresh_narrow.set_visible(mod.state.is_narrow && mod.state.list_state == "list")
+    ui.empty_card.set_visible(mod.state.list_state != "loading" && mod.state.list_state != "list")
+    ui.ask_wrap.set_visible(mod.state.list_state == "denied")
+    ui.retry_wrap.set_visible(mod.state.list_state == "error" || mod.state.list_state == "empty")
+    let summary = "" + mod.state.items.len() + " threads"
+    if mod.state.items.len() == 1 { summary = "1 thread" }
+    if mod.state.items.len() >= 20 { summary = "Latest 20 threads" }
     ui.summary.set_text(summary)
     let hint = "Tap a thread to read it here"
-    if is_narrow { hint = "Tap one to read it" }
+    if mod.state.is_narrow { hint = "Tap one to read it" }
     ui.meta.set_text(hint)
-    ui.live_wrap.set_visible(live_note != "" && !picked)
-    ui.live.set_text(live_note)
-    if state == "empty" {
+    ui.live_wrap.set_visible(mod.state.live_note != "" && !picked)
+    ui.live.set_text(mod.state.live_note)
+    if mod.state.list_state == "empty" {
         ui.empty_icon.set_text("🧵")
         ui.empty_title.set_text("No threads yet")
         ui.empty_body.set_text("Reply in a thread in Robrix and it shows up here.")
         ui.retry.set_text("Refresh")
     }
-    if state == "denied" {
+    if mod.state.list_state == "denied" {
         ui.empty_icon.set_text("🔒")
         ui.empty_title.set_text("Can't see threads")
         ui.empty_body.set_text("Allow Room Threads to read this room's threads.")
     }
-    if state == "error" {
+    if mod.state.list_state == "error" {
         ui.empty_icon.set_text("😕")
         ui.empty_title.set_text("Couldn't load threads")
-        ui.empty_body.set_text(sentence(error_text))
+        ui.empty_body.set_text(sentence(mod.state.error_text))
         ui.retry.set_text("Try again")
     }
-    if state == "no_room" {
+    if mod.state.list_state == "no_room" {
         ui.empty_icon.set_text("🧭")
         ui.empty_title.set_text("No room attached")
         ui.empty_body.set_text("Open Room Threads from a room to read its threads.")
@@ -133,55 +124,55 @@ fn show(){
 }
 
 fn show_thread(){
-    let picked = open_id != ""
-    ui.toolbar.set_visible(picked && !is_wide)
-    ui.open_inline.set_visible(is_wide)
+    let picked = mod.state.open_id != ""
+    ui.toolbar.set_visible(picked && !mod.state.is_wide)
+    ui.open_inline.set_visible(mod.state.is_wide)
     ui.thread_head.set_visible(picked)
-    ui.thread_refresh_wide.set_visible(!is_narrow)
-    ui.thread_refresh_narrow.set_visible(is_narrow && picked)
+    ui.thread_refresh_wide.set_visible(!mod.state.is_narrow)
+    ui.thread_refresh_narrow.set_visible(mod.state.is_narrow && picked)
     let back_label = "‹ All threads"
     let open_label = "Open in Robrix"
-    if is_narrow {
+    if mod.state.is_narrow {
         back_label = "‹ Back"
         open_label = "Open"
     }
     ui.back_btn.set_text(back_label)
     ui.open_btn.set_text(open_label)
     let header = "Replies"
-    if thread_state == "loaded" {
-        header = "" + replies.len() + " replies"
-        if replies.len() == 1 { header = "1 reply" }
-        if replies.len() == 0 { header = "No replies yet" }
+    if mod.state.thread_state == "loaded" {
+        header = "" + mod.state.replies.len() + " replies"
+        if mod.state.replies.len() == 1 { header = "1 reply" }
+        if mod.state.replies.len() == 0 { header = "No replies yet" }
     }
     ui.thread_header.set_text(header)
-    ui.thread_live_wrap.set_visible(live_note != "")
-    ui.thread_live.set_text(live_note)
-    ui.nav_wrap.set_visible(nav_error != "")
-    ui.nav_err.set_text(nav_error)
-    ui.root_card.set_visible(picked && root_msg != nil)
-    ui.root_avatar.set_visible(!is_tiny)
-    if root_msg != nil {
-        ui.root_initial.set_text(initial(root_msg.name))
-        ui.root_sender.set_text(root_msg.name)
-        ui.root_time.set_text(ago(root_msg.ts))
-        ui.root_body.set_text(root_msg.body)
+    ui.thread_live_wrap.set_visible(mod.state.live_note != "")
+    ui.thread_live.set_text(mod.state.live_note)
+    ui.nav_wrap.set_visible(mod.state.nav_error != "")
+    ui.nav_err.set_text(mod.state.nav_error)
+    ui.root_card.set_visible(picked && mod.state.root_msg != nil)
+    ui.root_avatar.set_visible(!mod.state.is_tiny)
+    if mod.state.root_msg != nil {
+        ui.root_initial.set_text(initial(mod.state.root_msg.name))
+        ui.root_sender.set_text(mod.state.root_msg.name)
+        ui.root_time.set_text(ago(mod.state.root_msg.ts))
+        ui.root_body.set_text(mod.state.root_msg.body)
     }
-    ui.thread_loading_wrap.set_visible(picked && thread_state == "loading")
-    let card = !picked || thread_state == "error" || thread_state == "denied"
+    ui.thread_loading_wrap.set_visible(picked && mod.state.thread_state == "loading")
+    let card = !picked || mod.state.thread_state == "error" || mod.state.thread_state == "denied"
     ui.thread_card.set_visible(card)
-    ui.thread_ask_wrap.set_visible(picked && thread_state == "denied")
-    ui.thread_retry_wrap.set_visible(picked && thread_state == "error")
+    ui.thread_ask_wrap.set_visible(picked && mod.state.thread_state == "denied")
+    ui.thread_retry_wrap.set_visible(picked && mod.state.thread_state == "error")
     if !picked {
         ui.thread_icon.set_text("🧵")
         ui.thread_title.set_text("Pick a thread")
         ui.thread_body.set_text("Its replies show up here.")
     }
-    if picked && thread_state == "error" {
+    if picked && mod.state.thread_state == "error" {
         ui.thread_icon.set_text("😕")
         ui.thread_title.set_text("Couldn't load the replies")
-        ui.thread_body.set_text(sentence(thread_error))
+        ui.thread_body.set_text(sentence(mod.state.thread_error))
     }
-    if picked && thread_state == "denied" {
+    if picked && mod.state.thread_state == "denied" {
         ui.thread_icon.set_text("🔒")
         ui.thread_title.set_text("Can't read this thread")
         ui.thread_body.set_text("Allow Room Threads to read its replies.")
@@ -190,11 +181,11 @@ fn show_thread(){
 }
 
 fn fail(error){
-    items = []
-    error_text = error
-    state = "error"
-    if error.search("not attached to a room") >= 0 { state = "no_room" }
-    if error.search("ermission") >= 0 || error.search("not approved") >= 0 { state = "denied" }
+    mod.state.items = []
+    mod.state.error_text = error
+    mod.state.list_state = "error"
+    if error.search("not attached to a room") >= 0 { mod.state.list_state = "no_room" }
+    if error.search("ermission") >= 0 || error.search("not approved") >= 0 { mod.state.list_state = "denied" }
     show()
 }
 
@@ -205,35 +196,35 @@ fn load(){
         threads_loading = false
         threads_loaded = r.is_ok
         if !r.is_ok { fail(r.error) return nil }
-        items = r.data.threads
-        state = "list"
-        if items.len() == 0 { state = "empty" }
+        mod.state.items = r.data.threads
+        mod.state.list_state = "list"
+        if mod.state.items.len() == 0 { mod.state.list_state = "empty" }
         show()
         return nil
     })
 }
 
 fn load_thread(){
-    if open_id == "" || thread_loading == open_id { return nil }
-    let requested_id = open_id
+    if mod.state.open_id == "" || thread_loading == mod.state.open_id { return nil }
+    let requested_id = mod.state.open_id
     thread_loading = requested_id
     thread_request += 1
     let request_id = thread_request
     host.request("matrix.thread_replies", {event_id: requested_id, limit: 50}, fn(r){
         if request_id != thread_request { return nil }
         thread_loading = ""
-        if open_id != requested_id { return nil }
+        if mod.state.open_id != requested_id { return nil }
         thread_loaded = r.is_ok
         if r.is_ok {
             let root = r.data.root
-            if root != nil { root_msg = {name: who(root), body: root.body, ts: root["ts"]} }
-            replies = r.data.replies
-            thread_state = "loaded"
+            if root != nil { mod.state.root_msg = {name: who(root), body: root.body, ts: root["ts"]} }
+            mod.state.replies = r.data.replies
+            mod.state.thread_state = "loaded"
         } else {
-            replies = []
-            thread_error = r.error
-            thread_state = "error"
-            if r.error.search("ermission") >= 0 || r.error.search("not approved") >= 0 { thread_state = "denied" }
+            mod.state.replies = []
+            mod.state.thread_error = r.error
+            mod.state.thread_state = "error"
+            if r.error.search("ermission") >= 0 || r.error.search("not approved") >= 0 { mod.state.thread_state = "denied" }
         }
         show_thread()
         return nil
@@ -241,32 +232,32 @@ fn load_thread(){
 }
 
 fn open_thread(i){
-    if i >= items.len() { return nil }
-    open_id = items[i].event_id
+    if i >= mod.state.items.len() { return nil }
+    mod.state.open_id = mod.state.items[i].event_id
     thread_loaded = false
     // Shown from the list row until the reply fetch brings the full root.
-    root_msg = {name: who(items[i]), body: items[i].body, ts: items[i]["ts"]}
-    replies = []
-    thread_state = "loading"
-    nav_error = ""
+    mod.state.root_msg = {name: who(mod.state.items[i]), body: mod.state.items[i].body, ts: mod.state.items[i]["ts"]}
+    mod.state.replies = []
+    mod.state.thread_state = "loading"
+    mod.state.nav_error = ""
     show()
     load_thread()
 }
 
 fn show_list(){
-    open_id = ""
+    mod.state.open_id = ""
     thread_loading = ""
     thread_request += 1
-    root_msg = nil
-    replies = []
-    nav_error = ""
+    mod.state.root_msg = nil
+    mod.state.replies = []
+    mod.state.nav_error = ""
     show()
     load()
 }
 
 fn open_in_robrix(){
-    host.request("nav.thread", {event_id: open_id}, fn(r){
-        if r.is_ok { nav_error = "" } else { nav_error = "Couldn't open the thread. " + sentence(r.error) }
+    host.request("nav.thread", {event_id: mod.state.open_id}, fn(r){
+        if r.is_ok { mod.state.nav_error = "" } else { mod.state.nav_error = "Couldn't open the thread. " + sentence(r.error) }
         show_thread()
         return nil
     })
@@ -278,15 +269,15 @@ fn on_room_message(json){
 
 fn schedule_live_refresh(){
     if live_refresh_pending { return nil }
-    if open_id == "" && !host.has("matrix.room.threads.read") { return nil }
-    if open_id != "" && !host.has("matrix.room.thread.read") { return nil }
+    if mod.state.open_id == "" && !host.has("matrix.room.threads.read") { return nil }
+    if mod.state.open_id != "" && !host.has("matrix.room.thread.read") { return nil }
     live_refresh_pending = start_timeout(1.0, || {
         live_refresh_pending = false
-        if open_id == "" && !host.has("matrix.room.threads.read") { return nil }
-        if open_id != "" && !host.has("matrix.room.thread.read") { return nil }
+        if mod.state.open_id == "" && !host.has("matrix.room.threads.read") { return nil }
+        if mod.state.open_id != "" && !host.has("matrix.room.thread.read") { return nil }
         if threads_loading || thread_loading != "" {
             schedule_live_refresh()
-        } elif open_id != "" {
+        } elif mod.state.open_id != "" {
             load_thread()
         } else { load() }
     }) != nil
@@ -298,7 +289,7 @@ fn watch(){
     host.request("events.subscribe", {event: "on_room_message"}, fn(r){
         watch_pending = false
         watch_ready = r.is_ok
-        if r.is_ok { live_note = "" } else { live_note = "Live updates are off. Tap Refresh to update." }
+        if r.is_ok { mod.state.live_note = "" } else { mod.state.live_note = "Live updates are off. Tap Refresh to update." }
         show()
         return nil
     })
@@ -308,9 +299,9 @@ fn on_permissions_changed(caps){
     if setup_pending { return nil }
     if !host.has("matrix.room.threads.read") { threads_loaded = false }
     if !host.has("matrix.room.thread.read") { thread_loaded = false }
-    if open_id != "" && host.has("matrix.room.thread.read") {
+    if mod.state.open_id != "" && host.has("matrix.room.thread.read") {
         if !thread_loaded { load_thread() }
-    } elif open_id == "" && host.has("matrix.room.threads.read") {
+    } elif mod.state.open_id == "" && host.has("matrix.room.threads.read") {
         if !threads_loaded { load() }
     }
     if host.has("on_room_message") { watch() } else { watch_ready = false }
@@ -321,10 +312,10 @@ fn on_app_resize(w, h){
     let narrow = w < 300
     let tiny = w < 260
     let wide = w >= 700
-    if narrow == is_narrow && tiny == is_tiny && wide == is_wide { return nil }
-    is_narrow = narrow
-    is_tiny = tiny
-    is_wide = wide
+    if narrow == mod.state.is_narrow && tiny == mod.state.is_tiny && wide == mod.state.is_wide { return nil }
+    mod.state.is_narrow = narrow
+    mod.state.is_tiny = tiny
+    mod.state.is_wide = wide
     show()
     return nil
 }
@@ -336,18 +327,18 @@ fn setup(retry){
         setup_pending = false
         if !r.is_ok { fail(r.error) return nil }
         let can_read = r.data.permissions["matrix-room-read"] == true
-        if open_id != "" {
+        if mod.state.open_id != "" {
             if can_read && host.has("matrix.room.thread.read") { load_thread() }
             else {
-                thread_state = "denied"
+                mod.state.thread_state = "denied"
                 show_thread()
             }
         }
-        if open_id == "" || is_wide {
+        if mod.state.open_id == "" || mod.state.is_wide {
             if can_read && host.has("matrix.room.threads.read") { load() }
             else {
-                items = []
-                state = "denied"
+                mod.state.items = []
+                mod.state.list_state = "denied"
                 show()
             }
         }
@@ -362,15 +353,15 @@ let PrimaryButton = Button{
     padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
     draw_bg +: {
         border_size: 0.0 border_radius: 4.0
-        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color: theme.palette.accent color_hover: theme.palette.accent_hover color_down: theme.palette.accent_down color_focus: theme.palette.accent
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+    draw_text +: { color: theme.palette.on_accent color_hover: theme.palette.on_accent color_down: theme.palette.on_accent color_focus: theme.palette.on_accent text_style: theme.font_regular{font_size: 10} }
 }
 let NeutralButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
-        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.neutral_border border_color_hover: theme.palette.neutral_border border_color_down: theme.palette.neutral_border border_color_focus: theme.palette.neutral_border
+        color: theme.palette.neutral color_hover: theme.palette.neutral_hover color_down: theme.palette.neutral_down color_focus: theme.palette.neutral }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title }
 }
 
 View{
@@ -383,17 +374,17 @@ View{
                 width: Fill height: Fit flow: Down spacing: 3
                 summary := Label{
                     text: "" width: Fill padding: 0 margin: 0
-                    draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} }
+                    draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} }
                 }
                 meta := Label{
                     text: "" width: Fill padding: 0 margin: 0
-                    draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                    draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} }
                 }
                 live_wrap := View{
                     width: Fill height: Fit visible: false
                     live := Label{
                         text: "" width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                        draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} }
                     }
                 }
             }
@@ -408,23 +399,23 @@ View{
         }
         loading_wrap := View{
             width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 10 wrap_spacing: 8 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24}
-            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
+            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: theme.palette.accent_text } }
             Label{
                 text: "Loading threads…" padding: 0 margin: 0
-                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} }
+                draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} }
             }
         }
         empty_card := RoundedView{
             width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5} padding: Inset{top: 20 bottom: 20 left: 16 right: 16} visible: false
-            show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+            show_bg: true draw_bg +: { color: theme.palette.card_subtle border_radius: 8.0 }
             empty_icon := Label{ text: "🧵" padding: 0 margin: 0 draw_text +: { text_style: theme.font_regular{font_size: 28} } }
             empty_title := Label{
                 text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
-                draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} }
+                draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 12.5} }
             }
             empty_body := Label{
                 text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
-                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} }
+                draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} }
             }
             ask_wrap := View{
                 width: Fit height: Fit margin: Inset{top: 6} visible: false
@@ -440,19 +431,19 @@ View{
             width: Fill height: Fill{min: 80} flow: Down spacing: 4 margin: Inset{left: -8 right: -8}
             on_item_tap: |i| open_thread(i)
             on_render: || {
-                for it in items {
+                for it in mod.state.items {
                     let name = who(it)
-                    let bg = #x00000000
-                    if it.event_id == open_id { bg = #xE4EEFF }
+                    let bg = theme.palette.transparent
+                    if it.event_id == mod.state.open_id { bg = theme.palette.pressed }
                     RoundedView{
                         width: Fill height: Fit flow: Down
                         show_bg: true draw_bg +: { color: bg border_radius: 8.0 }
                         View{
                             width: Fill height: Fit flow: Right spacing: 10 padding: Inset{top: 10 bottom: 10 left: 8 right: 8}
                             RoundedView{
-                                visible: !is_tiny width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
-                                show_bg: true draw_bg +: { color: #x52b2ac border_radius: 16.0 }
-                                Label{ text: initial(name) padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
+                                visible: !mod.state.is_tiny width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
+                                show_bg: true draw_bg +: { color: theme.palette.avatar border_radius: 16.0 }
+                                Label{ text: initial(name) padding: 0 margin: 0 draw_text +: { color: theme.palette.on_accent text_style: theme.font_bold{font_size: 12} } }
                             }
                             View{
                                 width: Fill height: Fit flow: Down spacing: 3
@@ -460,16 +451,16 @@ View{
                                     width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
                                     Label{
                                         text: name width: Fill max_lines: 1 text_overflow: TextOverflow.Ellipsis padding: 0 margin: 0
-                                        draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} }
+                                        draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 11} }
                                     }
                                     Label{
                                         text: ago(it["ts"]) padding: 0 margin: 0
-                                        draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                                        draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} }
                                     }
                                 }
                                 Label{
                                     text: it.body width: Fill max_lines: 3 text_overflow: TextOverflow.Ellipsis padding: 0 margin: 0
-                                    draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} }
+                                    draw_text +: { color: theme.palette.body text_style: theme.font_regular{font_size: 11} }
                                 }
                             }
                         }
@@ -478,7 +469,7 @@ View{
             }
         }
     }
-    split_line := SolidView{ width: 1 height: Fill visible: false draw_bg +: { color: #x00000018 } }
+    split_line := SolidView{ width: 1 height: Fill visible: false draw_bg +: { color: theme.palette.divider } }
     thread_wrap := ScrollYView{
         width: Fill height: Fill flow: Down spacing: 12 padding: 14 visible: false
         toolbar := View{
@@ -496,20 +487,20 @@ View{
                 width: Fill height: Fit flow: Down spacing: 3
                 thread_header := Label{
                     text: "Replies" width: Fill padding: 0 margin: 0
-                    draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 13} }
+                    draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 13} }
                 }
                 thread_live_wrap := View{
                     width: Fill height: Fit visible: false
                     thread_live := Label{
                         text: "" width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                        draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} }
                     }
                 }
                 nav_wrap := View{
                     width: Fill height: Fit visible: false
                     nav_err := Label{
                         text: "" width: Fill padding: 0 margin: 0
-                        draw_text +: { color: #xDC0005 text_style: theme.font_regular{font_size: 10} }
+                        draw_text +: { color: theme.palette.danger text_style: theme.font_regular{font_size: 10} }
                     }
                 }
             }
@@ -528,11 +519,11 @@ View{
         }
         root_card := RoundedView{
             width: Fill height: Fit flow: Right spacing: 10 padding: 12 visible: false
-            show_bg: true draw_bg +: { color: #xF0F5FF border_radius: 8.0 }
+            show_bg: true draw_bg +: { color: theme.palette.card border_radius: 8.0 }
             root_avatar := RoundedView{
                 width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
-                show_bg: true draw_bg +: { color: #x52b2ac border_radius: 16.0 }
-                root_initial := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
+                show_bg: true draw_bg +: { color: theme.palette.avatar border_radius: 16.0 }
+                root_initial := Label{ text: "" padding: 0 margin: 0 draw_text +: { color: theme.palette.on_accent text_style: theme.font_bold{font_size: 12} } }
             }
             View{
                 width: Fill height: Fit flow: Down spacing: 3
@@ -540,38 +531,38 @@ View{
                     width: Fill height: Fit flow: Right spacing: 6 align: Align{y: 0.5}
                     root_sender := Label{
                         text: "" width: Fill max_lines: 1 text_overflow: TextOverflow.Ellipsis padding: 0 margin: 0
-                        draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} }
+                        draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 11} }
                     }
                     root_time := Label{
                         text: "" padding: 0 margin: 0
-                        draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                        draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} }
                     }
                 }
                 root_body := Label{
                     text: "" width: Fill padding: 0 margin: 0
-                    draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} }
+                    draw_text +: { color: theme.palette.body text_style: theme.font_regular{font_size: 11} }
                 }
             }
         }
         thread_loading_wrap := View{
             width: Fill height: Fit flow: Flow.Right{wrap: true} spacing: 10 wrap_spacing: 8 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 16 bottom: 16} visible: false
-            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: #x0f88fe } }
+            LoadingSpinner{ width: 18 height: 18 draw_bg +: { color: theme.palette.accent_text } }
             Label{
                 text: "Loading replies…" padding: 0 margin: 0
-                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} }
+                draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} }
             }
         }
         thread_card := RoundedView{
             width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5} padding: Inset{top: 20 bottom: 20 left: 16 right: 16} visible: false
-            show_bg: true draw_bg +: { color: #xF7F9FC border_radius: 8.0 }
+            show_bg: true draw_bg +: { color: theme.palette.card_subtle border_radius: 8.0 }
             thread_icon := Label{ text: "🧵" padding: 0 margin: 0 draw_text +: { text_style: theme.font_regular{font_size: 28} } }
             thread_title := Label{
                 text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
-                draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 12.5} }
+                draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 12.5} }
             }
             thread_body := Label{
                 text: "" width: Fill align: Align{x: 0.5} padding: 0 margin: 0
-                draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10.5} }
+                draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5} }
             }
             thread_ask_wrap := View{
                 width: Fit height: Fit margin: Inset{top: 6} visible: false
@@ -585,14 +576,14 @@ View{
         reply_list := ScrollYView{
             width: Fill height: Fill{min: 80} flow: Down spacing: 4
             on_render: || {
-                for m in replies {
+                for m in mod.state.replies {
                     let name = who(m)
                     View{
                         width: Fill height: Fit flow: Right spacing: 10 padding: Inset{top: 6 bottom: 6 left: 12 right: 12}
                         RoundedView{
-                            visible: !is_tiny width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
-                            show_bg: true draw_bg +: { color: #x52b2ac border_radius: 16.0 }
-                            Label{ text: initial(name) padding: 0 margin: 0 draw_text +: { color: #xFFFFFF text_style: theme.font_bold{font_size: 12} } }
+                            visible: !mod.state.is_tiny width: 32 height: 32 align: Align{x: 0.5 y: 0.5}
+                            show_bg: true draw_bg +: { color: theme.palette.avatar border_radius: 16.0 }
+                            Label{ text: initial(name) padding: 0 margin: 0 draw_text +: { color: theme.palette.on_accent text_style: theme.font_bold{font_size: 12} } }
                         }
                         View{
                             width: Fill height: Fit flow: Down spacing: 3
@@ -600,16 +591,16 @@ View{
                                 width: Fill height: Fit flow: Right spacing: 6 align: Align{y: 0.5}
                                 Label{
                                     text: name width: Fill max_lines: 1 text_overflow: TextOverflow.Ellipsis padding: 0 margin: 0
-                                    draw_text +: { color: #x1C274C text_style: theme.font_bold{font_size: 11} }
+                                    draw_text +: { color: theme.palette.title text_style: theme.font_bold{font_size: 11} }
                                 }
                                 Label{
                                     text: ago(m["ts"]) padding: 0 margin: 0
-                                    draw_text +: { color: #x66708F text_style: theme.font_regular{font_size: 10} }
+                                    draw_text +: { color: theme.palette.muted text_style: theme.font_regular{font_size: 10} }
                                 }
                             }
                             Label{
                                 text: m.body width: Fill padding: 0 margin: 0
-                                draw_text +: { color: #x333333 text_style: theme.font_regular{font_size: 11} }
+                                draw_text +: { color: theme.palette.body text_style: theme.font_regular{font_size: 11} }
                             }
                         }
                     }

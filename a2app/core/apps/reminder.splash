@@ -7,16 +7,16 @@
 // why-notifications: Shows the reminder text you save when your task is due.
 
 let message = "Time for a break."
-let initialized = false
 let test_pending = false
 let test_edited = false
-let how_open = false
-// The status line's text and tone (0 neutral, 1 success, 2 error); drawn once the pane exists.
-let status = ""
-let tone = 0
+// Survives the re-run a theme switch does. The status line's text and tone
+// (0 neutral, 1 success, 2 error) are drawn once the pane exists.
+mod.state = {is_initialized: false is_how_open: false status: "" tone: 0}
 let upper = {a: "A" b: "B" c: "C" d: "D" e: "E" f: "F" g: "G" h: "H" i: "I" j: "J" k: "K" l: "L" m: "M" n: "N" o: "O" p: "P" q: "Q" r: "R" s: "S" t: "T" u: "U" v: "V" w: "W" x: "X" y: "Y" z: "Z"}
 
 fn paint_status(){
+    let status = mod.state.status
+    let tone = mod.state.tone
     ui.status.set_text(status)
     ui.status_ok.set_text(status)
     ui.status_err.set_text(status)
@@ -46,9 +46,9 @@ fn error_text(error){
 }
 
 fn show_status(text, next_tone){
-    status = text
-    tone = next_tone
-    if initialized { paint_status() }
+    mod.state.status = text
+    mod.state.tone = next_tone
+    if mod.state.is_initialized { paint_status() }
 }
 
 fn load(){
@@ -83,21 +83,21 @@ fn test_reminder(){
     if test_pending { return nil }
     test_pending = true
     // Tests always use the saved text; the status says so when the field differs.
-    test_edited = initialized && ui.message_input.text().trim() != message
+    test_edited = mod.state.is_initialized && ui.message_input.text().trim() != message
     show_reminder(0)
 }
 
 fn on_background(json){ show_reminder(json.parse_json().run_id) }
 
 fn toggle_how(){
-    how_open = !how_open
-    ui.how_body.set_visible(how_open)
-    ui.how_button.set_text(if how_open { "How it works ▲" } else { "How it works ▼" })
+    mod.state.is_how_open = !mod.state.is_how_open
+    ui.how_body.set_visible(mod.state.is_how_open)
+    ui.how_button.set_text(if mod.state.is_how_open { "How it works ▲" } else { "How it works ▼" })
 }
 
 fn on_app_resize(width, height){
-    if !initialized {
-        initialized = true
+    if !mod.state.is_initialized {
+        mod.state.is_initialized = true
         ui.message_input.set_text(message)
         paint_status()
     }
@@ -110,36 +110,36 @@ let PrimaryButton = Button{
     padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
     draw_bg +: {
         border_size: 0.0 border_radius: 4.0
-        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color: theme.palette.accent color_hover: theme.palette.accent_hover color_down: theme.palette.accent_down color_focus: theme.palette.accent
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+    draw_text +: { color: theme.palette.on_accent color_hover: theme.palette.on_accent color_down: theme.palette.on_accent color_focus: theme.palette.on_accent text_style: theme.font_regular{font_size: 10} }
 }
 let NeutralButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
-        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.neutral_border border_color_hover: theme.palette.neutral_border border_color_down: theme.palette.neutral_border border_color_focus: theme.palette.neutral_border
+        color: theme.palette.neutral color_hover: theme.palette.neutral_hover color_down: theme.palette.neutral_down color_focus: theme.palette.neutral }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title }
 }
 let GhostButton = PrimaryButton{
     padding: Inset{left: 6 right: 6 top: 4 bottom: 4}
     margin: Inset{left: -6}
-    draw_bg +: { border_size: 0.0 color: #xFFFFFF00 color_hover: #xF0F5FF color_down: #xE4EEFF color_focus: #xFFFFFF00 }
-    draw_text +: { color: #x66708F color_hover: #x1C274C color_down: #x1C274C color_focus: #x66708F }
+    draw_bg +: { border_size: 0.0 color: theme.palette.transparent color_hover: theme.palette.card color_down: theme.palette.pressed color_focus: theme.palette.transparent }
+    draw_text +: { color: theme.palette.muted color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.muted }
 }
 let Field = TextInput{
     width: Fill height: Fit padding: 10
     draw_bg +: {
         border_radius: 4.0 border_size: 1.0
-        color: #xFFFFFF color_hover: #xFFFFFF color_focus: #xFFFFFF color_down: #xFFFFFF color_empty: #xFFFFFF
-        border_color: #xC8C8C8 border_color_hover: #x0f88fe border_color_focus: #x106fcc border_color_down: #x106fcc border_color_empty: #xC8C8C8
+        color: theme.palette.surface color_hover: theme.palette.surface color_focus: theme.palette.surface color_down: theme.palette.surface color_empty: theme.palette.surface
+        border_color: theme.palette.border border_color_hover: theme.palette.accent border_color_focus: theme.palette.focus border_color_down: theme.palette.focus border_color_empty: theme.palette.border
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #x333333 color_hover: #x333333 color_focus: #x333333 color_down: #x333333 color_empty: #xBBBBBB color_empty_hover: #x999999 color_empty_focus: #x999999 text_style: theme.font_regular{font_size: 11} }
+    draw_text +: { color: theme.palette.body color_hover: theme.palette.body color_focus: theme.palette.body color_down: theme.palette.body color_empty: theme.palette.placeholder color_empty_hover: theme.palette.placeholder_hover color_empty_focus: theme.palette.placeholder_hover text_style: theme.font_regular{font_size: 11} }
 }
-let Caption = Label{padding: 0 margin: 0 draw_text +: {color: #x66708F text_style: theme.font_bold{font_size: 9.5}}}
-let Hint = Label{width: Fill padding: 0 margin: 0 draw_text +: {color: #x66708F text_style: theme.font_regular{font_size: 10}}}
-let Dot = Label{text: "•" padding: 0 margin: 0 draw_text +: {color: #x66708F text_style: theme.font_regular{font_size: 10}}}
-let Divider = SolidView{width: Fill{max: 480} height: 1 draw_bg +: {color: #x00000018}}
+let Caption = Label{padding: 0 margin: 0 draw_text +: {color: theme.palette.muted text_style: theme.font_bold{font_size: 9.5}}}
+let Hint = Label{width: Fill padding: 0 margin: 0 draw_text +: {color: theme.palette.muted text_style: theme.font_regular{font_size: 10}}}
+let Dot = Label{text: "•" padding: 0 margin: 0 draw_text +: {color: theme.palette.muted text_style: theme.font_regular{font_size: 10}}}
+let Divider = SolidView{width: Fill{max: 480} height: 1 draw_bg +: {color: theme.palette.divider}}
 
 View{
     width: Fill height: Fill flow: Down
@@ -162,11 +162,11 @@ View{
         }
         status_ok_wrap := View{
             visible: false width: Fill{max: 480} height: Fit
-            status_ok := Hint{text: "" draw_text +: {color: #x138808}}
+            status_ok := Hint{text: "" draw_text +: {color: theme.palette.success}}
         }
         status_err_wrap := View{
             visible: false width: Fill{max: 480} height: Fit
-            status_err := Hint{text: "" draw_text +: {color: #xDC0005}}
+            status_err := Hint{text: "" draw_text +: {color: theme.palette.danger}}
         }
         Divider{}
         how_button := GhostButton{text: "How it works ▼" on_click: || toggle_how()}

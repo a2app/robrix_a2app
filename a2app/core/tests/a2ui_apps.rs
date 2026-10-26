@@ -9,10 +9,19 @@ fn fixture(name: &str) -> String {
     std::fs::read_to_string(path).unwrap()
 }
 
+/// Splash's theme is process-wide, so the tests that set one take turns.
+static THEME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn theme_turn() -> std::sync::MutexGuard<'static, ()> {
+    THEME.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn a2ui_fixtures_pass_real_splash_validation() {
     let mut cx = Cx::new(Box::new(|_, _| {}));
     cx.with_vm(makepad_widgets::script_mod);
+    let _theme = theme_turn();
+    a2app_core::palette::use_light_theme();
     for name in FIXTURES {
         let payload = fixture(name);
         assert!(a2app_core::a2ui::is_a2ui(&payload), "{name} not detected");
@@ -35,10 +44,15 @@ fn event_messages(name: &str) -> String {
 fn matrix_a2ui_events_translate_for_panes_and_the_timeline() {
     let mut cx = Cx::new(Box::new(|_, _| {}));
     cx.with_vm(makepad_widgets::script_mod);
+    let _theme = theme_turn();
+    a2app_core::palette::use_light_theme();
     for event in ["contact_event.json", "flight_event.json"] {
         let payload = event_messages(event);
         assert!(a2app_core::a2ui::is_a2ui(&payload));
         for source in [a2app_core::a2ui::to_splash(&payload).unwrap(), a2app_core::a2ui::to_inline_splash(&payload, "$surface:test", None).unwrap().source] {
+            if std::env::var("A2UI_DUMP").is_ok() {
+                println!("===== {event}\n{source}");
+            }
             let errors = makepad_widgets::splash::validate_splash_body_with_host_io(&mut cx, &source);
             assert!(errors.is_empty(), "{event}: {errors:#?}\n{source}");
         }
@@ -81,10 +95,15 @@ fn updates_from_later_events_apply_in_order() {
 fn the_kitchen_sink_translates_every_catalog_feature() {
     let mut cx = Cx::new(Box::new(|_, _| {}));
     cx.with_vm(makepad_widgets::script_mod);
+    let _theme = theme_turn();
+    a2app_core::palette::use_light_theme();
     let payload = event_messages("kitchen_sink_event.json");
     let pane = a2app_core::a2ui::to_splash(&payload).unwrap();
     let inline = a2app_core::a2ui::to_inline_splash(&payload, "$sink:test", None).unwrap();
     for source in [&pane, &inline.source] {
+        if std::env::var("A2UI_DUMP").is_ok() {
+            println!("===== kitchen_sink_event.json\n{source}");
+        }
         let errors = makepad_widgets::splash::validate_splash_body_with_host_io(&mut cx, source);
         assert!(errors.is_empty(), "{errors:#?}\n{source}");
     }
@@ -101,6 +120,144 @@ fn the_kitchen_sink_translates_every_catalog_feature() {
     assert!(source.contains(&format!("{} := Image{{", inline.images[0].widget)));
     // Panes can't load host media: there the picture is a label.
     assert!(!pane.contains("Image{"));
+}
+
+/// Robrix's dark theme as far as a surface can tell: every palette color changes.
+fn use_dark_theme() {
+    let dark = a2app_core::palette::LIGHT.map(|color| (!color & 0xFFFFFF00) | (color & 0xFF));
+    set_splash_theme(SplashTheme::Dark);
+    set_splash_theme_script(SplashThemeScript { theme: a2app_core::palette::theme_script(&dark, true), widgets: String::new() });
+}
+
+/// A line of Splash with its string literals emptied.
+fn code_of(line: &str) -> String {
+    let mut out = String::new();
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c == '"' {
+            while let Some(c) = chars.next() {
+                if c == '\\' { chars.next(); } else if c == '"' { out.push(c); break; }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn translated_surfaces_take_their_colors_from_the_palette() {
+    let mut cx = Cx::new(Box::new(|_, _| {}));
+    cx.with_vm(makepad_widgets::script_mod);
+    let payloads = FIXTURES.iter().map(|name| (*name, fixture(name)))
+        .chain(["contact_event.json", "flight_event.json", "kitchen_sink_event.json"].map(|name| (name, event_messages(name))));
+    let mut sources = Vec::new();
+    for (name, payload) in payloads {
+        sources.push((name, a2app_core::a2ui::to_splash(&payload).unwrap()));
+        sources.push((name, a2app_core::a2ui::to_inline_splash(&payload, "$s:test", None).unwrap().source));
+    }
+    for (name, source) in &sources {
+        assert!(a2app_core::palette::is_theme_aware(source), "{name}");
+        // A payload's own primaryColor is the only hex color left, in the tint it sets.
+        let is_tinted = ["booking_v08.jsonl", "kitchen_sink_event.json"].contains(name);
+        for line in source.lines().filter(|line| !line.trim_start().starts_with("//") && code_of(line).contains('#')) {
+            assert!(is_tinted && line.starts_with("let a2ui_"), "{name}: a color outside the palette: {line}");
+        }
+    }
+    let _theme = theme_turn();
+    use_dark_theme();
+    let failures: Vec<String> = sources.iter().filter_map(|(name, source)| {
+        let errors = makepad_widgets::splash::validate_splash_body_with_host_io(&mut cx, source);
+        (!errors.is_empty()).then(|| format!("{name}: {errors:?}"))
+    }).collect();
+    a2app_core::palette::use_light_theme();
+    assert!(failures.is_empty(), "on the dark theme: {failures:#?}");
+}
+
+/// WCAG contrast of two `#xRRGGBB` colors.
+fn contrast(a: &str, b: &str) -> f64 {
+    let luminance = |hex: &str| {
+        let color = u32::from_str_radix(hex.trim_start_matches("#x"), 16).unwrap();
+        let channel = |shift: u32| {
+            let c = ((color >> shift) & 0xFF) as f64 / 255.0;
+            if c <= 0.03928 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+    };
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+#[test]
+fn a_custom_tint_keeps_its_text_and_borders_readable_on_both_themes() {
+    let tinted = |color: &str| inline(&serde_json::json!([
+        {"version": "v0.9", "createSurface": {"surfaceId": "s", "theme": {"primaryColor": color}}},
+        {"version": "v0.9", "updateComponents": {"surfaceId": "s", "components": [
+            {"id": "root", "component": "Button", "variant": "borderless", "child": "go_label", "action": {"event": {"name": "go"}}},
+            {"id": "go_label", "component": "Text", "text": "Go"}
+        ]}}
+    ]).to_string());
+    let value = |source: &str, name: &str| source.lines().find_map(|line| line.strip_prefix(&format!("let {name} = "))).unwrap().to_string();
+    // A color on Robrix's light and dark panes: `if theme.palette.is_dark {dark} else {light}`, or one for both.
+    let by_theme = |source: &str, name: &str| {
+        let color = value(source, name);
+        let colors: Vec<&str> = color.split(['{', '}', ' ']).filter(|part| part.starts_with("#x")).collect();
+        match colors[..] { [dark, light] => (light.to_string(), dark.to_string()), [both] => (both.to_string(), both.to_string()), _ => panic!("{color}") }
+    };
+    for (tint, on_tint) in [("#7C3AED", "theme.palette.on_accent"), ("#E05D2F", "theme.palette.on_accent"),
+        ("#FFD700", "#x1C274C"), ("#1A237E", "theme.palette.on_accent")]
+    {
+        let source = tinted(tint);
+        let hex = format!("#x{}", &tint[1..]);
+        assert_eq!(value(&source, "a2ui_tint"), hex, "fills keep the tint");
+        assert_eq!(value(&source, "a2ui_on_tint"), on_tint, "{tint}: text on the tint");
+        let (light, dark) = by_theme(&source, "a2ui_tint_text");
+        assert!(contrast(&light, "#xFFFFFF") >= 3.0 && contrast(&dark, "#x262626") >= 4.5, "{tint}: {light} / {dark}");
+        if contrast(&hex, "#xFFFFFF") >= 3.0 { assert_eq!(light, hex, "{tint} reads on the light pane as it is"); }
+        // A borderless button's text darkens like the fill when hovered and pressed on light; on dark it keeps its color.
+        for (text, fill) in [("a2ui_tint_text_hover", "a2ui_tint_hover"), ("a2ui_tint_text_down", "a2ui_tint_down")] {
+            let (text_light, text_dark) = by_theme(&source, text);
+            assert!(contrast(&text_light, "#xFFFFFF") > contrast(&light, "#xFFFFFF"), "{tint}: {text} is {text_light} on the light pane");
+            if light == hex { assert_eq!(text_light, value(&source, fill), "{tint}: {text} is the shaded tint"); }
+            assert_eq!(text_dark, dark, "{tint}: {text} on the dark pane");
+        }
+        // Hover, focus and selected-chip borders: the fill's own color on light, a line that shows on dark.
+        for (line, fill) in [("a2ui_tint_line", "a2ui_tint"), ("a2ui_tint_line_hover", "a2ui_tint_hover"), ("a2ui_tint_line_down", "a2ui_tint_down")] {
+            let (light, dark) = by_theme(&source, line);
+            assert_eq!(light, value(&source, fill), "{tint}: {line} on the light pane");
+            assert!(contrast(&dark, "#x262626") >= 3.0, "{tint}: {line} is {dark} on the dark pane");
+            if contrast(&light, "#x262626") >= 3.0 { assert_eq!(dark, light, "{tint}: {line} shows on the dark pane as it is"); }
+        }
+        assert_eq!(value(&source, "a2ui_focus"), "a2ui_tint_line", "a focused field's border");
+    }
+    // On light, a tint's hovered and pressed text is the tint 12% and 24% darker.
+    let booking = tinted("#E05D2F");
+    assert_eq!([by_theme(&booking, "a2ui_tint_text_hover").0, by_theme(&booking, "a2ui_tint_text_down").0], ["#xC55129", "#xAA4623"]);
+    let plain = inline(&surface(serde_json::json!([{"id": "root", "component": "Text", "text": "Hi"}]), serde_json::json!({})));
+    assert_eq!(value(&plain, "a2ui_tint"), "theme.palette.accent", "no primaryColor: Robrix's accent");
+    assert_eq!(value(&plain, "a2ui_tint_text"), "theme.palette.accent_text");
+    assert_eq!(value(&plain, "a2ui_tint_text_hover"), "if theme.palette.is_dark {theme.palette.accent_text} else {theme.palette.accent_hover}");
+    assert_eq!(value(&plain, "a2ui_tint_text_down"), "if theme.palette.is_dark {theme.palette.accent_text} else {theme.palette.accent_down}");
+    assert_eq!(value(&plain, "a2ui_tint_line"), "theme.palette.accent");
+    assert_eq!(value(&plain, "a2ui_focus"), "theme.palette.focus");
+    assert!(plain.contains("color_hover: a2ui_tint_text_hover color_down: a2ui_tint_text_down"), "a borderless button's text shades");
+}
+
+#[test]
+fn cards_take_the_card_outline_and_modal_panes_the_border() {
+    let source = a2app_core::a2ui::to_splash(&surface(serde_json::json!([
+        {"id": "root", "component": "Column", "children": ["card", "modal"]},
+        {"id": "card", "component": "Card", "child": "note"},
+        {"id": "note", "component": "Text", "text": "In a card"},
+        {"id": "modal", "component": "Modal", "trigger": "open", "content": "more"},
+        {"id": "open", "component": "Text", "text": "Details"},
+        {"id": "more", "component": "Text", "text": "More"}
+    ]), serde_json::json!({}))).unwrap();
+    // A Card on the surface takes `card_border`; a Modal pane's card_subtle fill keeps the stronger `border`.
+    let boxes: Vec<&str> = source.lines().filter(|line| line.contains("border_radius: 8.0")).collect();
+    assert_eq!(boxes.len(), 2, "{source}");
+    let outline_of = |fill: &str| boxes.iter().find(|line| line.contains(&format!("{{ color: theme.palette.{fill} "))).copied().unwrap_or_default();
+    assert!(outline_of("surface").ends_with("border_color: theme.palette.card_border }"), "{boxes:#?}");
+    assert!(outline_of("card_subtle").ends_with("border_color: theme.palette.border }"), "{boxes:#?}");
 }
 
 #[test]
@@ -287,13 +444,13 @@ fn final_review_translation_fixes() {
         {"id": "field", "component": "TextField", "label": "", "weight": 1, "value": {"path": "/email"}},
         {"id": "trail", "component": "TextField", "label": "Trail", "value": {"path": "/form/email/"}}
     ]), serde_json::json!({"q": "cats"})));
-    assert!(source.contains(r#"a2ui_open("https://example.com/search?q=" + ("" + a2ui_v0))"#), "the link follows the input\n{source}");
+    assert!(source.contains(r#"a2ui_open("https://example.com/search?q=" + ("" + mod.a2ui.v0))"#), "the link follows the input\n{source}");
     let privacy = source.split("fn ").find(|f| f.contains(r#"a2ui_open("https://example.com/privacy")"#)).unwrap();
     assert!(!privacy.contains("a2ui_valid_s"), "a link isn't blocked by the form's checks");
     assert!(source.contains(r#"text: "⭐ Rate ⭐""#), "a repeated icon stays in the label");
     assert!(source.contains("#1 priority: use 2**10 bytes via snake__case__name(), really"), "{source}");
     assert!(source.contains(r#"Label{ width: Fit padding: 0 margin: 0 text: "Email""#), "a weighted sibling takes the row");
-    assert!(source.contains(r#"["s", "/form/email", a2ui_v"#), "paths are normalized");
+    assert!(source.contains(r#"["s", "/form/email", mod.a2ui.v"#), "paths are normalized");
 }
 
 #[test]

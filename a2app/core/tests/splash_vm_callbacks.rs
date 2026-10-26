@@ -4,6 +4,7 @@ use makepad_widgets::*;
 fn callback_control_flow_retains_a_value_for_each_statement() {
     let mut cx = Cx::new(Box::new(|_, _| {}));
     cx.with_vm(makepad_widgets::script_mod);
+    a2app_core::palette::use_light_theme();
     cx.with_vm(|vm| {
         // These stock callback shapes must continue after a successful loop.
         // A loop alone supplies no if-branch result in the pinned script VM.

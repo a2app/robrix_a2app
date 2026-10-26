@@ -95,21 +95,43 @@ fn on_app_resize(width, height){
     return nil
 }
 
+// A theme switch runs this script again from the top, dropping the last run's
+// pending fetch; `resume` starts that fetch over.
+fn saved_state(){ return {busy: busy} }
+fn resume(){
+    let last_run = ok{mod.state.saved()}
+    if last_run == nil {
+        mod.state = {saved: saved_state}
+        return nil
+    }
+    mod.state.saved = saved_state
+    // The cut-off fetch stays busy until it starts over, even across another switch.
+    if last_run.busy {
+        busy = true
+        let _refetch = start_timeout(0.05, || {
+            busy = false
+            fetch_example()
+        })
+    }
+    return nil
+}
+let _resume = resume()
+
 let PrimaryButton = Button{
     padding: Inset{left: 12 right: 12 top: 8 bottom: 8}
     draw_bg +: {
         border_size: 0.0 border_radius: 4.0
-        color: #x0f88fe color_hover: #x106fcc color_down: #x0C5DAA color_focus: #x0f88fe
+        color: theme.palette.accent color_hover: theme.palette.accent_hover color_down: theme.palette.accent_down color_focus: theme.palette.accent
         color_2: vec4(-1.0, -1.0, -1.0, -1.0) border_color_2: vec4(-1.0, -1.0, -1.0, -1.0)
     }
-    draw_text +: { color: #xFFFFFF color_hover: #xFFFFFF color_down: #xFFFFFF color_focus: #xFFFFFF text_style: theme.font_regular{font_size: 10} }
+    draw_text +: { color: theme.palette.on_accent color_hover: theme.palette.on_accent color_down: theme.palette.on_accent color_focus: theme.palette.on_accent text_style: theme.font_regular{font_size: 10} }
 }
 let NeutralButton = PrimaryButton{
-    draw_bg +: { border_size: 1.0 border_color: #xE0E0E0 border_color_hover: #xE0E0E0 border_color_down: #xE0E0E0 border_color_focus: #xE0E0E0
-        color: #xE3E3E3 color_hover: #xD0D0D0 color_down: #xC0C0C0 color_focus: #xE3E3E3 }
-    draw_text +: { color: #x1C274C color_hover: #x1C274C color_down: #x1C274C color_focus: #x1C274C }
+    draw_bg +: { border_size: 1.0 border_color: theme.palette.neutral_border border_color_hover: theme.palette.neutral_border border_color_down: theme.palette.neutral_border border_color_focus: theme.palette.neutral_border
+        color: theme.palette.neutral color_hover: theme.palette.neutral_hover color_down: theme.palette.neutral_down color_focus: theme.palette.neutral }
+    draw_text +: { color: theme.palette.title color_hover: theme.palette.title color_down: theme.palette.title color_focus: theme.palette.title }
 }
-let Hint = Label{width: Fill padding: 0 margin: 0 draw_text +: {color: #x66708F text_style: theme.font_regular{font_size: 10}}}
+let Hint = Label{width: Fill padding: 0 margin: 0 draw_text +: {color: theme.palette.muted text_style: theme.font_regular{font_size: 10}}}
 
 View{
     width: Fill height: Fill flow: Down
@@ -118,18 +140,18 @@ View{
         Hint{text: "Fetches a public page. Your rooms and account stay private."}
         loading_wrap := View{
             visible: false width: Fill height: Fit flow: Right spacing: 10 align: Align{x: 0.5 y: 0.5} padding: Inset{top: 24 bottom: 24}
-            LoadingSpinner{width: 18 height: 18 draw_bg +: {color: #x0f88fe}}
-            fetching := Label{text: "Fetching example.com…" padding: 0 margin: 0 draw_text +: {color: #x66708F text_style: theme.font_regular{font_size: 10.5}}}
+            LoadingSpinner{width: 18 height: 18 draw_bg +: {color: theme.palette.accent_text}}
+            fetching := Label{text: "Fetching example.com…" padding: 0 margin: 0 draw_text +: {color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5}}}
         }
         card := RoundedView{
             width: Fill height: Fit flow: Down spacing: 6 align: Align{x: 0.5}
             padding: Inset{left: 16 right: 16 top: 20 bottom: 20}
-            show_bg: true draw_bg +: {color: #xF7F9FC border_radius: 8.0}
+            show_bg: true draw_bg +: {color: theme.palette.card_subtle border_radius: 8.0}
             card_icon := Label{text: "🌐" padding: 0 margin: 0 draw_text +: {text_style: theme.font_regular{font_size: 28}}}
-            card_title := Label{text: "Nothing fetched yet" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: {color: #x1C274C text_style: theme.font_bold{font_size: 12.5}}}
+            card_title := Label{text: "Nothing fetched yet" width: Fill align: Align{x: 0.5} padding: 0 margin: 0 draw_text +: {color: theme.palette.title text_style: theme.font_bold{font_size: 12.5}}}
             status := Label{
                 text: "Fetch example.com to see it here." width: Fill align: Align{x: 0.5} padding: 0 margin: 0
-                draw_text +: {color: #x66708F text_style: theme.font_regular{font_size: 10.5}}
+                draw_text +: {color: theme.palette.muted text_style: theme.font_regular{font_size: 10.5}}
             }
             fetch_wrap := View{
                 width: Fit height: Fit margin: Inset{top: 6}
@@ -150,7 +172,7 @@ View{
                 width: Fill height: Fit flow: Right spacing: 8 align: Align{y: 0.5}
                 View{
                     width: Fill height: Fit flow: Down spacing: 4
-                    page_title := Label{text: "" width: Fill padding: 0 margin: 0 draw_text +: {color: #x1C274C text_style: theme.font_bold{font_size: 13}}}
+                    page_title := Label{text: "" width: Fill padding: 0 margin: 0 draw_text +: {color: theme.palette.title text_style: theme.font_bold{font_size: 13}}}
                     page_meta := Hint{text: ""}
                 }
                 again_side := View{width: Fit height: Fit NeutralButton{text: "Fetch again" on_click: || fetch_example()}}
@@ -158,7 +180,7 @@ View{
             again_below := View{visible: false width: Fit height: Fit NeutralButton{text: "Fetch again" on_click: || fetch_example()}}
             http_wrap := View{
                 visible: false width: Fill height: Fit
-                http_note := Hint{text: "" draw_text +: {color: #xDC0005}}
+                http_note := Hint{text: "" draw_text +: {color: theme.palette.danger}}
             }
             big_note := View{
                 visible: false width: Fill height: Fit
@@ -166,8 +188,8 @@ View{
             }
             code := RoundedView{
                 width: Fill height: Fit padding: 12
-                show_bg: true draw_bg +: {color: #xF7F9FC border_radius: 8.0}
-                result := Label{text: "" width: Fill padding: 0 margin: 0 draw_text +: {color: #x333333 text_style: theme.font_code{font_size: 9.5}}}
+                show_bg: true draw_bg +: {color: theme.palette.card_subtle border_radius: 8.0}
+                result := Label{text: "" width: Fill padding: 0 margin: 0 draw_text +: {color: theme.palette.body text_style: theme.font_code{font_size: 9.5}}}
             }
         }
     }

@@ -270,7 +270,10 @@ impl Widget for SharingCard {
     }
 }
 
-#[derive(Script, ScriptHook, Widget)]
+/// The wizard's dropdowns, whose choices are the draft rule's only record.
+const DRAFT_DROP_DOWNS: [&[LiveId]; 5] = [ids!(source_choice), ids!(context_choice), ids!(reader_app), ids!(target_room), ids!(lifetime_room)];
+
+#[derive(Script, Widget)]
 pub struct DataSharing {
     #[deref] view: View,
     #[rust] account: String,
@@ -310,6 +313,24 @@ pub struct DataSharing {
     #[rust] effect_authorities: Vec<EffectAuthority>,
     #[rust] activities: Vec<a2app_core::protection_audit::Activity>,
     #[rust] activity_key: Option<(u64, usize, Option<ContextId>, Option<Source>, Option<Recipient>)>,
+    /// The `DRAFT_DROP_DOWNS` choices from before a reload, to restore after it.
+    #[rust] draft_choices: [usize; 5],
+}
+
+impl ScriptHook for DataSharing {
+    fn on_before_reload(&mut self, vm: &mut ScriptVm) {
+        self.draft_choices = vm.with_cx(|cx| DRAFT_DROP_DOWNS.map(|path| self.view.drop_down2(cx, path).selected_item()));
+    }
+
+    /// A reload resets dropdowns to their DSL labels and first item, which would silently change the draft rule.
+    fn on_after_reload(&mut self, vm: &mut ScriptVm) {
+        vm.with_cx_mut(|cx| {
+            self.view.drop_down2(cx, ids!(context_choice)).set_labels(cx, self.context_choice_labels(&self.snapshots));
+            for (path, index) in DRAFT_DROP_DOWNS.into_iter().zip(self.draft_choices) {
+                self.view.drop_down2(cx, path).set_selected_item(cx, index);
+            }
+        });
+    }
 }
 
 impl Widget for DataSharing {
@@ -1167,6 +1188,23 @@ mod diagnostics;
 mod activity;
 use diagnostics::{bullets, decision_key, is_decision_for, DecisionKey};
 
+/// Reruns the scripts in dark mode and reapplies `widget` from `template`, as a live theme switch does.
+#[cfg(test)]
+pub(super) fn switch_to_dark(cx: &mut Cx, widget: &WidgetRef, template: impl FnOnce(&mut ScriptVm) -> ScriptValue) {
+    cx.with_vm(|vm| {
+        let value = vm.with_reload(|vm| {
+            makepad_widgets::script_mod(vm);
+            makepad_code_editor::script_mod(vm);
+            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Dark);
+            super::permission_choices::script_mod(vm);
+            super::permission_message_preview::script_mod(vm);
+            super::permission_prompt::script_mod(vm);
+            template(vm)
+        });
+        widget.clone().script_apply(vm, &Apply::ScriptReapply, &mut Scope::empty(), value);
+    });
+}
+
 impl DataSharingRef {
     pub fn configure(&self, cx: &mut Cx) {
         if let Some(mut inner) = self.borrow_mut() { inner.configure(cx); }
@@ -1594,6 +1632,35 @@ mod tests {
         assert!(!click(&mut editor, &mut cx, ids!(add_button)).iter().any(|action| action.downcast_ref::<A2AppOp>().is_some()));
         click(&mut editor, &mut cx, ids!(wizard_next));
         assert!(!editor.wizard_open, "stale navigation must not reopen a cancelled rule");
+    }
+
+    #[test]
+    fn theme_switch_keeps_the_draft_rule() {
+        let (mut cx, widget) = editor();
+        let draft = {
+            let mut editor = widget.borrow_mut::<DataSharing>().unwrap();
+            editor.account = "@alice:example.org".into();
+            let snapshot = context_fixture();
+            editor.sources.push((Source::Account { account: "@alice:example.org".into() }, "Account data".into()));
+            editor.sources.push((snapshot.label.first().unwrap().clone(), "Private room".into()));
+            editor.snapshots.push(snapshot);
+            editor.rooms.push(("!first:example.org".into(), "First".into()));
+            editor.rooms.push(("!second:example.org".into(), "Second".into()));
+            for (path, labels) in [(ids!(source_choice), ["Account data", "Private room"]),
+                (ids!(context_choice), ["Choose a mini-app or agent", "This agent"]), (ids!(target_room), ["First", "Second"])]
+            {
+                editor.view.drop_down2(&cx, path).set_labels(&mut cx, labels.map(String::from).to_vec());
+                editor.view.drop_down2(&cx, path).set_selected_item(&mut cx, 1);
+            }
+            editor.view.permission_choices(&cx, ids!(recipient_kind)).set_selected_item(&mut cx, 2);
+            editor.sharing_draft(&cx).unwrap()
+        };
+        switch_to_dark(&mut cx, &widget, |vm| {
+            super::script_mod(vm);
+            script_eval!(vm, { mod.widgets.DataSharing {} })
+        });
+        let editor = widget.borrow::<DataSharing>().unwrap();
+        assert_eq!(editor.sharing_draft(&cx), Some(draft), "a theme switch must not change what the open rule would allow");
     }
 
     #[test]
