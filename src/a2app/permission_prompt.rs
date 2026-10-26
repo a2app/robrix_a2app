@@ -424,7 +424,7 @@ impl PermissionPromptInfo {
 
     fn write_warning(&self) -> &str {
         match self {
-            Self::Ordinary(info) if info.enable_writes && info.message_preview.is_some() => ROOM_WRITE_WARNING,
+            Self::Ordinary(info) if info.enable_writes => ROOM_WRITE_WARNING,
             Self::Flow(info) => info.write_warning.as_deref().unwrap_or(""),
             _ => "",
         }
@@ -918,7 +918,7 @@ impl MiniAppPermissionPromptRef {
         let blurb = ordinary_action(info);
         inner.view.label(cx, ids!(prompt_blurb)).set_text(cx, &review_text(&blurb));
         inner.view.widget(cx, ids!(prompt_message)).as_permission_message_content().set_message(cx, info.message_preview.as_ref());
-        let warning = if info.enable_writes && info.message_preview.is_some() { ROOM_WRITE_WARNING } else { "" };
+        let warning = if info.enable_writes { ROOM_WRITE_WARNING } else { "" };
         inner.view.label(cx, ids!(prompt_write_warning)).set_text(cx, warning);
         inner.view.widget(cx, ids!(prompt_write_warning)).set_visible(cx, !warning.is_empty());
         let context = ordinary_context(cx, info);
@@ -1063,10 +1063,7 @@ fn review_text(payload: &str) -> String {
 const ROOM_WRITE_WARNING: &str = "Approving also turns on room changes. Other apps still need their own permission.";
 
 fn ordinary_action(info: &PromptInfo) -> String {
-    let action = info.capability.as_deref().filter(|action| !action.trim().is_empty()).unwrap_or_else(|| permission_action_text(info.perm));
-    if info.enable_writes && info.message_preview.is_none() {
-        format!("{action}. {ROOM_WRITE_WARNING}")
-    } else { action.to_string() }
+    info.capability.as_deref().filter(|action| !action.trim().is_empty()).unwrap_or_else(|| permission_action_text(info.perm)).to_string()
 }
 
 /// Permission categories are useful in settings; a popup needs a concrete verb.
@@ -2046,12 +2043,27 @@ mod tests {
             assert_eq!(prompt.borrow().unwrap().durations, [ApprovalDuration::RoomSession, ApprovalDuration::Session, ApprovalDuration::Forever]);
             assert!(matches!(answer_for_duration(&prompt, &mut cx, ApprovalDuration::RoomSession).answer,
                 PermissionPromptAction::AllowScoped { duration: GrantDuration::RoomSession, .. }));
-            if enable_writes { assert!(prompt.borrow().unwrap().view.label(&cx, ids!(prompt_blurb)).text().contains("turns on room changes")); }
+            if enable_writes {
+                let inner = prompt.borrow().unwrap();
+                assert!(!inner.view.label(&cx, ids!(prompt_blurb)).text().contains("turns on room changes"), "the action stays a plain heading");
+                assert_eq!(inner.view.label(&cx, ids!(prompt_write_warning)).text(), ROOM_WRITE_WARNING);
+                assert!(inner.view.widget(&cx, ids!(prompt_write_warning)).visible());
+            }
         }
         info.can_allow_once = true;
         info.enable_writes = false;
         prompt.show(&mut cx, &info);
         assert_eq!(prompt.borrow().unwrap().durations[0], ApprovalDuration::Once, "the next request restores its own choices");
+        assert!(!prompt.borrow().unwrap().view.widget(&cx, ids!(prompt_write_warning)).visible());
+    }
+
+    #[test]
+    fn group_rows_and_checkboxes_keep_the_room_change_warning_out_of_the_action() {
+        let mut info = ordinary_info();
+        info.enable_writes = true;
+        let request = PermissionPromptInfo::Ordinary(info);
+        assert_eq!(request.action(), "Search messages");
+        assert_eq!(request.write_warning(), ROOM_WRITE_WARNING);
     }
 
     #[test]

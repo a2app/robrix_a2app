@@ -5055,9 +5055,7 @@ fn flow_prompt_info(state: &A2AppState, rooms: Option<&RoomsListRef>, flow: &Flo
             services::can_enable_writes(&state.permissions, manifest, capability,
                 services::permission_context(&request.service, &args, review.context.room()))))
         {
-            let warning = "Approving also turns on room changes for mini-apps. Each app still needs its own permission.";
-            if message_preview.is_some() { write_warning = Some(warning.into()); }
-            else { action.push_str(&format!(". {warning}")); }
+            write_warning = Some("Approving also turns on room changes for mini-apps. Each app still needs its own permission.".into());
         }
     }
     let (app_name, app_icon) = if let FlowContinuation::Generated { .. } = flow {
@@ -5639,25 +5637,7 @@ fn prompt_info_for(
             None => String::from("register an AI tool"),
         })
     } else {
-        parked.iter().find_map(|p| match p {
-            ParkedRequest::AppMedia(_) => Some(AppMediaPost::capability()),
-            ParkedRequest::Bridge(request) => {
-                let Some(request) = request else { return None };
-                let hook_name = (request.service == "events.subscribe")
-                    .then(|| serde_json::from_str::<serde_json::Value>(&request.args_json).ok())
-                    .flatten()
-                    .and_then(|args| args["event"].as_str().map(str::to_string));
-                match hook_name {
-                    Some(name) => a2app_core::capabilities::for_hook(&name),
-                    None => a2app_core::capabilities::for_service(&request.service),
-                }
-            }
-            #[cfg(unix)]
-            ParkedRequest::AiTool { .. } => None,
-            #[cfg(unix)]
-            ParkedRequest::NetworkAccess { .. } => None,
-        })
-        .map(|c| {
+        parked.iter().find_map(parked_capability).map(|c| {
             let args = parked.iter().find_map(|parked| if let ParkedRequest::Bridge(Some(request)) = parked {
                 serde_json::from_str::<serde_json::Value>(&request.args_json).ok()
             } else { None }).unwrap_or_default();
@@ -11778,6 +11758,33 @@ mod permission_tests {
             assert!(info.write_warning.is_none());
             assert!(info.allow_once);
             assert!(!state.permissions.matrix_write());
+        });
+    }
+
+    #[test]
+    fn write_review_without_a_message_keeps_the_write_switch_notice_out_of_the_action() {
+        use a2app_core::information_flow::{ContextId, EffectReview, Recipient, SensitiveAction};
+        struct Restore(Option<A2AppState>);
+        impl Drop for Restore { fn drop(&mut self) { A2APP.with(|state| { state.replace(self.0.take()); }); } }
+        let _restore = Restore(A2APP.with(|state| state.replace(None)));
+        let manifest = builtin::stock("room-tools").unwrap();
+        initialize_background_test(manifest.clone());
+        let args = serde_json::json!({"event_id":"$pinned:test", "pinned":true});
+        let request = SplashHostRequest { app_tag: a2app_core::manifest::instance_tag(&manifest.id, Some(SOURCE)),
+            heap_key: 0, req_id: 1, service: "matrix.pin".into(), args_json: args.to_string(), may_prompt: true };
+        let review = EffectReview { id: 1,
+            context: ContextId::App { account: "alice".into(), app: manifest.id.clone(), room: Some(SOURCE.into()) }, epoch: 1,
+            recipient: Some(Recipient::MatrixRoom { account: "alice".into(), room: SOURCE.into() }),
+            action: Some(SensitiveAction { kind: "matrix.room.pin.set".into(), target: SOURCE.into() }),
+            sources: Default::default(), denied_sources: Default::default(), influences: Default::default(),
+            payload: serde_json::json!({"operation":"matrix.room.pin.set", "parameters":args}).to_string().into(), allowed: false };
+        with_a2app(|state| {
+            let flow = FlowContinuation::Bridge { request, review, allow_once: false, permission: Some(Permission::MatrixRoomManage) };
+            let info = flow_prompt_info(state, None, &flow);
+            assert!(info.message_preview.is_none());
+            assert_eq!(info.action, "Pin this message");
+            assert_eq!(info.write_warning.as_deref(),
+                Some("Approving also turns on room changes for mini-apps. Each app still needs its own permission."));
         });
     }
 

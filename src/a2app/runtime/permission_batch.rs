@@ -528,6 +528,19 @@ mod tests {
     }
 
     #[test]
+    fn setup_prompts_name_each_requested_group_rather_than_the_request() {
+        initialize_background_test(builtin::stock("roll-call").unwrap());
+        with_a2app(|state| for perm in [Permission::RobrixComposer, Permission::MatrixRoomSend] {
+            let parked = ParkedRequest::Bridge(Some(request("permissions.request", serde_json::json!({ "perm": perm.as_str() }))));
+            let prompt = PermissionPrompt { id: 1, setup: Some((0, 1)), subject: "roll-call".into(), perm, parked: vec![parked],
+                tool: None, flow: None, enable_writes: false, activations: Vec::new() };
+            let PermissionPromptInfo::Ordinary(shown) = info(state, None, &prompt) else { panic!("setup prompts are ordinary") };
+            assert_eq!(shown.capability, None, "{perm:?} is shown as itself, not as \"Ask for permissions\"");
+        });
+        A2APP.with(|state| *state.borrow_mut() = None);
+    }
+
+    #[test]
     fn queued_ordinary_requests_respect_denials_recorded_after_enqueue() {
         initialize_background_test(builtin::stock("reminder").unwrap());
         let mut prompt = PermissionPrompt { id: 1, setup: None, subject: "reminder".into(), perm: Permission::Location,

@@ -896,13 +896,22 @@ impl Broker {
         if req.service == "permissions.request" {
             return respond(cx, Reply::of(req), Ok("{\"granted\": false}"));
         }
-        // Name the exact capability, so an author learns which single
-        // ability is blocked rather than just its group.
-        let msg = match crate::capabilities::for_service(&req.service) {
+        respond(cx, Reply::of(req), Err(&Self::denied_message(req)));
+    }
+
+    /// Names the exact capability, so an author learns which single ability
+    /// is blocked rather than just its group; a subscribe names its event.
+    fn denied_message(req: &SplashHostRequest) -> String {
+        if req.service == "events.subscribe" {
+            let args: serde_json::Value = serde_json::from_str(&req.args_json).unwrap_or_default();
+            if let Some(hook) = args["event"].as_str().and_then(crate::capabilities::for_hook) {
+                return format!("The request for \"{}\" was not approved.", hook.title);
+            }
+        }
+        match crate::capabilities::for_service(&req.service) {
             Some(cap) => format!("The request to use \"{}\" was not approved.", cap.title),
             None => "permission denied".to_string(),
-        };
-        respond(cx, Reply::of(req), Err(&msg));
+        }
     }
 
     fn respond_policy_denied(cx: &mut Cx, req: &SplashHostRequest, store: &PermissionStore,
@@ -2273,5 +2282,14 @@ mod failure_context_tests {
         assert!(!failures[1].show_popup);
         assert_eq!(failures[0].error, failures[1].error);
         assert!(broker.failures().is_empty());
+    }
+
+    #[test]
+    fn a_declined_subscribe_names_its_event_rather_than_the_subscribe_call() {
+        let request = |service: &str, args: &str| SplashHostRequest { app_tag: "inbox".into(), heap_key: 1, req_id: 1,
+            service: service.into(), args_json: args.into(), may_prompt: true };
+        assert_eq!(Broker::denied_message(&request("events.subscribe", r#"{"event":"on_room_message"}"#)),
+            "The request for \"New messages\" was not approved.");
+        assert_eq!(Broker::denied_message(&request("nav.event", "{}")), "The request to use \"Jump to a message\" was not approved.");
     }
 }
