@@ -617,12 +617,9 @@ impl Widget for MiniAppPermissionPrompt {
                 for (index, request) in self.group_requests.iter().enumerate() {
                     let Some(row) = list.item(cx, LiveId(index as u64 + 1), id!(Request)) else { continue };
                     if summary {
-                        let action = request.action();
-                        let action = if self.group_selected.get(index).copied().unwrap_or(false) { action }
-                            else { format!("Not selected: {action}") };
+                        let (action, warning) = self.group_row_text(index);
                         row.label(cx, ids!(request_action)).set_text(cx, &review_text(&action));
                         row.widget(cx, ids!(request_message)).as_permission_message_content().set_message(cx, request.message_preview());
-                        let warning = request.write_warning();
                         row.label(cx, ids!(request_write_warning)).set_text(cx, warning);
                         row.widget(cx, ids!(request_write_warning)).set_visible(cx, !warning.is_empty());
                         let context = request.context(cx);
@@ -662,6 +659,13 @@ impl MiniAppPermissionPrompt {
             return;
         }
         cx.action(PermissionPromptResponse { prompt_id: self.prompt_id, answer });
+    }
+
+    /// A group row's heading and room-change notice. An unchecked request is denied, so it turns nothing on.
+    fn group_row_text(&self, index: usize) -> (String, &str) {
+        let request = &self.group_requests[index];
+        if self.group_selected.get(index).copied().unwrap_or(false) { (request.action(), request.write_warning()) }
+        else { (format!("Not selected: {}", request.action()), "") }
     }
 
     fn group_answer(&self, request: &PermissionPromptInfo, duration: ApprovalDuration) -> PermissionPromptAction {
@@ -744,7 +748,7 @@ impl MiniAppPermissionPrompt {
             else { format!("Approve allows {count} of {} requests. Unchecked requests will be denied.", self.group_requests.len()) };
         self.view.label(cx, ids!(group_selection_summary)).set_text(cx, &summary);
         let details = self.group_requests.iter().enumerate().map(|(index, request)| {
-            let mut text = format!("{}{}", if self.group_selected.get(index).copied().unwrap_or(false) { "" } else { "Not selected: " }, request.action());
+            let mut text = self.group_row_text(index).0;
             match request {
                 PermissionPromptInfo::Flow(info) => text.push_str(&format!("\n{}\n\n{}", info.destination, info.payload)),
                 PermissionPromptInfo::Ordinary(info) => {
@@ -2085,6 +2089,19 @@ mod tests {
         let request = PermissionPromptInfo::Ordinary(info);
         assert_eq!(request.action(), "Search messages");
         assert_eq!(request.write_warning(), ROOM_WRITE_WARNING);
+    }
+
+    #[test]
+    fn an_unchecked_group_row_drops_its_room_change_warning() {
+        let (mut cx, prompt) = prompt();
+        let mut info = ordinary_info();
+        info.enable_writes = true;
+        let request = PermissionPromptInfo::Ordinary(info);
+        prompt.show_group(&mut cx, &PermissionPromptGroupInfo { group_id: 12, requests: vec![request.clone(), request] });
+        let mut inner = prompt.borrow_mut().unwrap();
+        inner.group_selected = vec![true, false];
+        assert_eq!(inner.group_row_text(0), ("Search messages".to_string(), ROOM_WRITE_WARNING));
+        assert_eq!(inner.group_row_text(1), ("Not selected: Search messages".to_string(), ""));
     }
 
     #[test]

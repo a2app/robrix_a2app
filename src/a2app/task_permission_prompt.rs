@@ -97,6 +97,14 @@ pub struct TaskItemView {
     pub checked: bool,
 }
 
+impl TaskItemView {
+    /// The row's checkbox label. An unchecked item won't be granted, so it doesn't say it will.
+    fn label(&self) -> String {
+        let chip = if self.grantable && !self.checked { "Not selected" } else { self.chip.as_str() };
+        format!("{} — {chip}", self.title)
+    }
+}
+
 /// What the modal shows for one resolved task plan.
 #[derive(Clone, Debug)]
 pub struct TaskPromptInfo {
@@ -165,7 +173,7 @@ impl Widget for TaskPermissionPrompt {
                     let Some(item) = self.items.get(index).cloned() else { continue };
                     let row = list.item(cx, index, id!(item));
                     let check = row.check_box(cx, ids!(check));
-                    check.set_text(&format!("{} — {}", item.title, item.chip));
+                    check.set_text(&item.label());
                     check.set_active(cx, item.checked, Animate::No);
                     row.widget(cx, ids!(check)).set_disabled(cx, !item.grantable);
                     row.label(cx, ids!(detail)).set_text(cx, &item.detail);
@@ -270,5 +278,15 @@ mod tests {
         assert_eq!(inner.items[0].id, "next");
         assert!(!inner.items[0].checked);
         assert!(inner.view.widget(&cx, ids!(allow_button)).disabled(&cx));
+    }
+
+    #[test]
+    fn an_unchecked_task_item_does_not_say_it_will_be_granted() {
+        let item = |grantable, checked, chip: &str| TaskItemView {
+            id: "pin".into(), title: "Pin a message".into(), detail: String::new(), chip: chip.into(), grantable, checked,
+        };
+        assert_eq!(item(true, true, "Will be granted until this turn ends").label(), "Pin a message — Will be granted until this turn ends");
+        assert_eq!(item(true, false, "Will be granted until this turn ends").label(), "Pin a message — Not selected");
+        assert_eq!(item(false, false, "Already allowed").label(), "Pin a message — Already allowed");
     }
 }
