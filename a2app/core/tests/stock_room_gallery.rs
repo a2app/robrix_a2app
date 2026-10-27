@@ -116,7 +116,7 @@ impl Rig {
     fn launch() -> Self {
         let mut host = Harness::new();
         let (app, context) = host.launch_stock_permissions(APP, false, false);
-        Self::with(host, app, context, Answers::default())
+        Self::with(host, app, context, Answers::default()).pin_budget_clock()
     }
 
     fn with(host: Harness, app: WidgetRef, context: ContextId, answers: Answers) -> Self {
@@ -127,7 +127,7 @@ impl Rig {
     fn launch_detached() -> Self {
         let mut host = Harness::new();
         let (app, context) = launch_widget(&mut host, None);
-        Self::with(host, app, context, Answers::default())
+        Self::with(host, app, context, Answers::default()).pin_budget_clock()
     }
 
     /// Closes this instance and opens the stock app again in the same room and storage jail.
@@ -136,7 +136,7 @@ impl Rig {
         host.retire_stock(&app, &context);
         let (app, reopened) = host.launch_stock_permissions(APP, false, false);
         assert_eq!(reopened, context);
-        Self::with(host, app, context, answers)
+        Self::with(host, app, context, answers).pin_budget_clock()
     }
 
     fn boot(&mut self) {
@@ -154,6 +154,23 @@ impl Rig {
         self.host.broker.forget_app(APP);
         self.host.boot();
         self.settle();
+    }
+
+    /// Lets only the gallery's timers refill its model of the request budget, never real time, so a
+    /// slow run can't let through a request that should wait. Only the real-time tests skip this.
+    fn pin_budget_clock(mut self) -> Self {
+        let pinned = Cx::time_now() + 3600.0;
+        let vm_id = self.vm_id();
+        self.host.cx.with_script_vm_id(vm_id, |vm| {
+            // Read first: assigning a renamed field would silently add a new one.
+            for probe in [script! { mod.state.clock }, script! { mod.state.tokens_at }] {
+                assert!(vm.eval(probe).is_number(), "the gallery's budget model changed: {:?}", vm.take_errors());
+            }
+            let pin = script! { mod.state.clock = #(pinned) mod.state.tokens_at = #(pinned) };
+            let value = vm.eval(pin);
+            assert!(!value.is_err(), "pinning the budget clock: {:?}", vm.take_errors());
+        });
+        self
     }
 
     /// A person's next action comes after the host's request budget has refilled.
@@ -1933,19 +1950,25 @@ fn every_request_carries_exactly_its_documented_arguments() {
 
 // ---- The request budget
 
-/// Launches with every declared group already allowed, media included.
-fn booted_with_everything(rows: &[serde_json::Value]) -> Rig {
+/// Launches with every declared group already allowed, media included, on the real clock.
+fn launched_with_everything(rows: &[serde_json::Value]) -> Rig {
     let mut host = Harness::new();
     let (app, context) = host.launch_stock(APP, false);
     let mut rig = Rig::with(host, app, context, Answers::default());
     rig.queue_read(rows);
+    rig
+}
+
+fn booted_with_everything(rows: &[serde_json::Value]) -> Rig {
+    let mut rig = launched_with_everything(rows);
     rig.boot();
     rig
 }
 
 #[test]
 fn previews_burst_then_pace_under_the_budget() {
-    let mut rig = booted_with_everything(&photos(30, 1));
+    let mut rig = launched_with_everything(&photos(30, 1)).pin_budget_clock();
+    rig.boot();
     assert!(rig.trace.batches.is_empty() && rig.trace.silent_batches == 0, "with everything allowed, startup asks nothing");
     assert_eq!(rig.trace.previews.len(), 1, "the first preview goes alone");
     // Answered at once, previews keep coming without a timer while the budget stays above the taps' reserve.
