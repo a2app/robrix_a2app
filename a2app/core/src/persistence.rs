@@ -95,6 +95,27 @@ pub struct A2AppPersistedState {
     /// Sharing editor from being recreated on a later session.
     #[serde(default)]
     pub default_sharing_applied: std::collections::BTreeSet<String>,
+    /// Account-data key names each writing compartment has saved, keyed by
+    /// `account_data::index_key`. Never removed: the server keeps every type.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub account_data_keys: BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
+impl A2AppPersistedState {
+    /// Whether the compartment behind `index` already saved `key`.
+    pub fn is_account_data_key_used(&self, index: &str, key: &str) -> bool {
+        self.account_data_keys.get(index).is_some_and(|keys| keys.contains(key))
+    }
+
+    /// Refuses a new key once the compartment behind `index` has used `MAX_KEYS` names.
+    pub fn check_account_data_key(&self, index: &str, key: &str) -> Result<(), String> {
+        crate::account_data::check_key_slot(self.account_data_keys.get(index), key)
+    }
+
+    /// Remembers that the compartment behind `index` saved `key`.
+    pub fn record_account_data_key(&mut self, index: String, key: &str) {
+        self.account_data_keys.entry(index).or_default().insert(key.to_string());
+    }
 }
 
 pub fn save_registry_state(state: &A2AppPersistedState) -> Result<()> {
@@ -811,6 +832,28 @@ mod tests {
         let bundle = crate::bundle::parse_with_history(&restored.archived_bundles[&m.id]).unwrap();
         assert_eq!(bundle.history.len(), 1);
         assert_eq!(bundle.history[0].source, m.source);
+    }
+
+    #[test]
+    fn account_data_key_names_persist_per_compartment_and_old_files_load() {
+        use crate::account_data::{Kind, MAX_KEYS, TOO_MANY_KEYS, index_key};
+        use crate::information_flow::ContextId;
+        let old: A2AppPersistedState = serde_json::from_str(r#"{"archived":[],"recents":{}}"#).unwrap();
+        assert!(old.account_data_keys.is_empty());
+        assert!(!serde_json::to_string(&old).unwrap().contains("account_data_keys"), "an empty index is not written");
+        let context = |room: &str| ContextId::App { account: "@a:s".into(), app: "notes".into(), room: Some(room.into()) };
+        let (room_a, room_b) = (index_key(&context("!a:s"), Kind::Global).unwrap(), index_key(&context("!b:s"), Kind::Global).unwrap());
+        let mut state = A2AppPersistedState::default();
+        for n in 0..MAX_KEYS { state.record_account_data_key(room_a.clone(), &format!("k{n}")); }
+        state.record_account_data_key(room_a.clone(), "k0");
+        assert!(state.is_account_data_key_used(&room_a, "k0"));
+        assert!(!state.is_account_data_key_used(&room_b, "k0"));
+        assert_eq!(state.check_account_data_key(&room_a, "k0"), Ok(()));
+        assert_eq!(state.check_account_data_key(&room_a, "new").unwrap_err(), TOO_MANY_KEYS);
+        assert_eq!(state.check_account_data_key(&room_b, "new"), Ok(()), "room A's keys never limit room B");
+        let restored: A2AppPersistedState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(restored.account_data_keys, state.account_data_keys);
+        assert_eq!(restored.account_data_keys[&room_a].len(), MAX_KEYS);
     }
 
     #[test]

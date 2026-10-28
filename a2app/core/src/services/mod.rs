@@ -2290,6 +2290,10 @@ mod failure_context_tests {
             service: service.into(), args_json: args.into(), may_prompt: true };
         assert_eq!(Broker::denied_message(&request("events.subscribe", r#"{"event":"on_room_message"}"#)),
             "The request for \"New messages\" was not approved.");
+        assert_eq!(Broker::denied_message(&request("events.subscribe", r#"{"event":"on_account_data_changed"}"#)),
+            "The request for \"App account data changed\" was not approved.");
+        assert_eq!(Broker::denied_message(&request("matrix.account_data", r#"{"key":"prefs"}"#)),
+            "The request to use \"Read app account data\" was not approved.");
         assert_eq!(Broker::denied_message(&request("nav.event", "{}")), "The request to use \"Jump to a message\" was not approved.");
     }
 }

@@ -56,6 +56,8 @@ pub mod matrix;
 pub mod room_watch;
 /// The worker-side account watch behind the rooms-list hooks.
 pub mod account_watch;
+/// The per-login handler behind the saved account-data hook.
+pub mod account_data_watch;
 /// The timeline card for `rs.robius.a2app` events (apps shared into rooms).
 pub mod timeline_card;
 /// Robrix's theme for mini-app isolates.

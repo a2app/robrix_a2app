@@ -867,6 +867,14 @@ fn matrix_fixture(call: &services::MatrixServiceCall) -> serde_json::Value {
         Device => serde_json::json!({"device_id":"TEST","name":"Test device","verified":true}),
         AccountInfo => serde_json::json!({"user_id":ACCOUNT,"homeserver":"https://homeserver.test","account_management_url":"https://homeserver.test/account?tab=profile"}),
         IgnoredUsers => serde_json::json!({"users":["@alice:test"]}),
+        AccountData { keys, is_batch } | RoomAccountData { keys, is_batch } => {
+            // The first key holds a saved object; the rest were never saved.
+            let item = |(index, key): (usize, &String)| serde_json::json!({"key":key,
+                "content":if index == 0 { serde_json::json!({"theme":"dark","count":3}) } else { serde_json::Value::Null }});
+            let mut items = keys.iter().enumerate().map(item);
+            if *is_batch { serde_json::json!({"items":items.collect::<Vec<_>>()}) } else { items.next().unwrap() }
+        }
+        SetAccountData { key, .. } | SetRoomAccountData { key, .. } => serde_json::json!({"key":key}),
         Join { .. } => serde_json::json!({"knocked":false,"room_id":ROOM}),
         _ => serde_json::json!({"event_id":"$posted:test","added":true}),
     }

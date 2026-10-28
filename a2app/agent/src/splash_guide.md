@@ -424,7 +424,9 @@ let _boot = start_timeout(0.05, || refresh())
 - `fs.write(path, text)`, `fs.read(path)` → string, `fs.exists(path)`,
   `fs.append(path, text)`, `fs.remove(path)`, `fs.mkdir(path)`,
   `fs.list(path)` → array of names (dirs end with "/").
-- Paths are inside YOUR app only; `/` is your app's root, quota ~1MB/file.
+- Paths are inside YOUR app only, on this device; `/` is your app's root,
+  quota ~1MB/file. Each room the app runs in, and no room, has its own
+  jail: an instance never sees another room's files.
 - Serialize with `.to_json()` on any value; parse with `"...".parse_json()`.
   Always guard the parse result (`.is_array()` / `.is_object()`) so a
   corrupt file can't crash the app.
@@ -433,6 +435,10 @@ let _boot = start_timeout(0.05, || refresh())
   fire and overwrite the file); defer only `refresh()`, which needs the `ui`
   handles that exist after eval. Apps that track user data (lists, notes,
   scores, settings) SHOULD persist it this way.
+
+`fs` is the default. To make a few small settings follow the user to their
+other rooms and devices, save them to their Matrix account instead (see
+"Synced app data").
 
 ## Data
 
@@ -502,8 +508,11 @@ and scope (this room, account, device, app-local). Available today:
 | matrix-room-info | `matrix.room.info.read` | read · this room |
 | matrix-room-read | `matrix.room.messages.read`, `matrix.room.members.read`, `matrix.room.pins.read`, `matrix.room.threads.read`, `matrix.room.messages.search` | read · this room |
 | matrix-room-send | `matrix.room.message.send` | write · this room |
+| matrix-room-manage | `matrix.room.account_data.read` (read), `matrix.room.account_data.write`, `matrix.room.pin.set`, `matrix.room.favorite.set`, `matrix.room.low_priority.set`, `matrix.room.unread.set` (write) | read / write · this room |
 | matrix-media | `matrix.media.download`, `matrix.media.upload`, `matrix.media.send` | read source room / upload homeserver / post this room |
 | matrix-profile | `matrix.profile.read` | read · account |
+| matrix-account-read | `matrix.account.data.read`, `on_account_data_changed` (Robrix→app hook), `matrix.account.device.read`, `matrix.account.info.read`, `matrix.account.ignored.read` | read · account |
+| matrix-account-write | `matrix.account.data.write` | write · account |
 | matrix-rooms-list | `matrix.rooms.list` | read · many rooms |
 | matrix-rooms-read | `matrix.rooms.messages.search` | read · many rooms · critical |
 | robrix-navigation | `host.nav.user`, `host.nav.thread`, `host.nav.event`, `host.nav.room`, `host.nav.space`, `host.nav.screen`, `host.nav.link`, `host.nav.app` | act · app→Robrix · this room / account |
@@ -756,9 +765,10 @@ capability id (`host.has("matrix.room.members.read")`), and
 `host.capabilities()` lists both. Check the capability you are about to use:
 the group may be allowed while that one ability is blocked.
 
-Only the ids in the table above exist in this Robrix. Anything else (other
-Matrix reads or writes, live event hooks) is refused with `unknown service`.
-Do not invent service names; fall back.
+Only the ids in the table above and the services and hooks named in this
+guide exist in this Robrix ("Matrix services" also names groups the table
+leaves out). Anything else (other Matrix reads or writes, live event hooks)
+is refused with `unknown service`. Do not invent service names; fall back.
 
 **Declaring is not granting.** Sensitive capabilities (`network`,
 `location`, `notifications`, `clipboard-read`, `ipc`, `robrix-navigation`,
@@ -1082,6 +1092,9 @@ burning a permission.
   null unless the homeserver uses OAuth.
 - `"matrix.ignored_users"` (needs `matrix-account-read`, prompts, works without a
   room): `{}` -> `{users: [user_id]}`, the account's ignore list.
+- `"matrix.account_data"`, `"matrix.set_account_data"` and the attached
+  room's `"matrix.room_account_data"` / `"matrix.set_room_account_data"`:
+  data your app saves to the user's account; see "Synced app data".
 
 <!-- send -->
 
@@ -1143,6 +1156,126 @@ write to rooms" switch, off by default: while it is off every write above
 `r.error` says why) and `host.has(...)` is false for its capability (e.g.
 `host.has("matrix.room.message.send")`), so show `r.error` and never assume
 a write went through.
+
+## Synced app data (Matrix account data)
+
+`fs` keeps data on this device, separately for each room. To make a setting
+follow the user to every room and device, save small JSON objects under keys
+on their Matrix account. Unlike `fs`, that data:
+
+- is shared by every instance of your app id: each room's, the detached one,
+  and any app with your id on the user's other devices (guard every field you
+  read);
+- is stored unencrypted on the user's homeserver, room notes included, even
+  for an encrypted room: never save passwords or tokens there, and save
+  message text only when the user asks to;
+- carries labels. A save records what your app had read (a room's messages,
+  say), and every instance that reads it, in any room or on any device, then
+  needs the same sharing approvals to send anything out. Reading it, or
+  getting its hook, counts as reading the user's account data. A save goes to
+  the homeserver, so once your app has read private or web data (its own
+  saved data included), the user reviews exactly what a save sends.
+
+Keys are 1 to 64 lowercase letters, digits, `-` or `_`, starting with a
+letter or digit.
+
+- `"matrix.account_data"` (needs `matrix.account.data.read` in
+  `matrix-account-read`, prompts, works without a room): `{key}` ->
+  `{key, content}`, or `{keys: [...]}` (1 to 32, one request) ->
+  `{items: [{key, content}, ...]}` in the asked order. `content` is the saved
+  object, or nil when nothing is saved (never saved, or deleted). A value this
+  Robrix can't read comes back as `content: nil` with an `error` text: check
+  `["error"]` on the reply or item, and never overwrite that key.
+- `"matrix.set_account_data"` (needs `matrix-account-write`, prompts, works
+  without a room): `{key, content}` -> `{key}`; `content: nil` deletes the
+  key. `content` is an object of at most 16 KiB as JSON, with up to about
+  2,000 numbers, true/false and nil values in all (keep long number lists in a
+  string). The room-writes switch doesn't affect it.
+- `on_account_data_changed(json)` (its own capability in
+  `matrix-account-read`, prompts), after
+  `events.subscribe {event: "on_account_data_changed"}`: `{keys: [...]}`, the
+  sorted keys of this app's synced data that changed, one call per burst. It
+  fires for other devices' saves and, once they come back from the server,
+  this device's own; it is never replayed on subscribe and may list a key
+  whose value didn't change. Re-read the keys you use with one `{keys}`
+  request.
+- `"matrix.room_account_data"` (needs `matrix.room.account_data.read` in
+  `matrix-room-manage`, prompts, attached room): like `matrix.account_data`,
+  for your app's private notes on the attached room only. Only the user can
+  see them; no hook reports their changes.
+- `"matrix.set_room_account_data"` (needs `matrix.room.account_data.write` in
+  `matrix-room-manage`, prompts, attached room): like
+  `matrix.set_account_data`, for those notes. Like room writes, it fails while
+  the user's room-writes switch is off, which is the default.
+
+Rules:
+
+- Pass only `key` or `keys` to a read and `key` and `content` to a save.
+  Robrix picks the event type (`rs.robius.a2app.appdata.<app_id>.<key>`) and
+  refuses any other field; no other account data is reachable.
+- Until Robrix has synced the account after sign-in, all four fail with
+  "Robrix is still syncing your account. Try again in a moment." Always retry
+  after a few seconds (one `start_timeout`), as `load()` below does. Waiting
+  for `on_account_data_changed` instead can leave your app unloaded: it never
+  fires for a key nobody saved.
+- Never save defaults at startup or after a failed read: they would overwrite
+  what the user saved on another device. Save after a successful read, on a
+  user action (a tap, Return), never per keystroke or on a timer: a save costs
+  as much of the request budget as eight reads, and every instance of your app
+  shares one budget.
+- A read returns what Robrix last synced, so right after a save it can briefly
+  return the old value: keep your own copy rather than reading it back.
+- On this device, each room's instance and the detached one can use 32 key
+  names (synced data and notes counted apart); a deleted key still counts. Use
+  a few fixed keys such as `"prefs"`, never keys built from dates or input:
+  a 33rd name fails with "This app has already used its 32 keys here. Reuse
+  one of them."
+- An app that has read data from more than 256 rooms (listing every room can
+  do it) can't save: "This app has used data from too many rooms to save it
+  to your account."
+- Declare the capability ids you use, not their groups (which also cover
+  device, account and ignore-list reads, or pins and room flags), including
+  `on_account_data_changed` if you subscribe. Ask for `matrix-account-read` in
+  your setup batch so one prompt covers the read and the hook, then subscribe
+  first and read second, so no change slips between them.
+
+```splash
+// permissions: matrix.account.data.read, on_account_data_changed, matrix.account.data.write
+// why-matrix-account-read: Uses the units you picked on your other devices.
+// why-matrix-account-write: Saves your units to your Matrix account.
+let SYNCING = "Robrix is still syncing your account. Try again in a moment."
+mod.state = {units: "metric" is_loaded: false}
+fn start_sync(){   // after your setup batch grants matrix-account-read
+    host.request("events.subscribe", {event: "on_account_data_changed"}, fn(r){
+        if !r.is_ok { ui.status.set_text("Changes from other devices won't show: " + r.error) }
+        return nil
+    })
+    load()
+}
+fn on_account_data_changed(json){ load() }   // {keys: ["prefs", ...]}
+fn load(){
+    host.request("matrix.account_data", {keys: ["prefs"]}, fn(r){
+        if !r.is_ok && r.error == SYNCING {
+            let _retry = start_timeout(3.0, || load())
+            return nil
+        }
+        if !r.is_ok { ui.status.set_text(r.error) return nil }
+        let saved = r.data.items[0]
+        if saved["error"] != nil { ui.status.set_text(saved.error) return nil }
+        if saved.content != nil && saved.content["units"].is_string() { mod.state.units = saved.content.units }
+        mod.state.is_loaded = true
+        ui.units.set_text(mod.state.units)
+        return nil
+    })
+}
+fn save(){   // only from the units buttons
+    if !mod.state.is_loaded { ui.status.set_text("Your saved units haven't loaded yet.") return nil }
+    host.request("matrix.set_account_data", {key: "prefs" content: {units: mod.state.units}}, fn(r){
+        ui.status.set_text(if r.is_ok {"Saved to your account."} else {r.error})
+        return nil
+    })
+}
+```
 
 ## Acting inside Robrix (navigation and composer)
 

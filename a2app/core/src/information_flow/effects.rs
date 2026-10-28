@@ -53,6 +53,10 @@ fn room_action(action: &SensitiveAction, context: &ContextId, _sources: &Label, 
         return matches!(recipient, Some(Recipient::MatrixRoom { account, room })
             if account == context.account() && room == &action.target);
     }
+    // Room notes go to the homeserver, but their target is the writer's own room.
+    if capability.id == "matrix.room.account_data.write" {
+        return action.target.starts_with('!');
+    }
     // These targets are resolved and validated by the host navigation route;
     // opening a room does not require having read its contents beforehand.
     matches!(capability.id, "host.nav.event" | "host.nav.thread" | "host.nav.link")
@@ -929,6 +933,29 @@ mod tests {
             assert!(registry.commit_effect_for_activation(&context, epoch, Some(&recipient()),
                 Some(&SensitiveAction { kind: "host.nav.user".into(), target: "!next:test".into() }), &changed).is_err());
         }
+    }
+
+    #[test]
+    fn room_notes_approved_for_all_rooms_cover_the_apps_other_room_instances_only() {
+        let root = TestRoot::new(); let mut registry = root.registry();
+        let first = scoped_context("!first:test"); let second = scoped_context("!second:test");
+        scoped_private(&mut registry, &first); scoped_private(&mut registry, &second);
+        let server = Recipient::NetworkOrigin("https://hs.example".into());
+        let notes = |target: &str| SensitiveAction { kind: "matrix.room.account_data.write".into(), target: target.into() };
+        let payload = crate::account_data::write_payload("todo", Some(&serde_json::json!({"done": false})));
+        let epoch = registry.context_epoch(&first).unwrap();
+        let review = registry.prepare_effect_for_activation(&first, epoch, Some(&server), Some(&notes("!first:test")), &payload).unwrap();
+        assert!(!review.allowed);
+        registry.approve_effect_scoped(&review, RoomScope::AllRooms, SharingDuration::Permanent).unwrap();
+        let next_epoch = registry.context_epoch(&second).unwrap();
+        registry.commit_effect_for_activation(&second, next_epoch, Some(&server), Some(&notes("!second:test")),
+            &crate::account_data::write_payload("todo", None)).unwrap();
+        assert!(registry.commit_effect_for_activation(&second, next_epoch, Some(&server), Some(&notes("host")), &payload).is_err(),
+            "only a room target counts as a room action");
+        let global = SensitiveAction { kind: "matrix.account.data.write".into(), target: crate::account_data::WRITE_TARGET.into() };
+        assert!(registry.commit_effect_for_activation(&second, next_epoch, Some(&server), Some(&global), &payload).is_err(),
+            "notes approval never covers the app's global data");
+        assert!(registry.sharing_grants().unwrap().is_empty());
     }
 
     #[test]

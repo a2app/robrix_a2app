@@ -207,8 +207,8 @@ pub const CATALOG: &[Capability] = &[
     cap!("host.env.read", "App environment", "Its app id, attached room, instance tag, surface, platform and view mode.", Read, Outgoing, Instance, None, Available, Low, ["env"]),
     cap!("permissions.query", "Check its grants", "State of every declared group (and, with detail, every capability).", Read, Outgoing, App, None, Available, Low, ["permissions.query"]),
     cap!("permissions.request", "Ask for permissions", "Ask ahead of first use for one declared permission group (perm) or several related groups together (perms). Outgoing effects and website requests still receive host IFC checks.", Act, Outgoing, App, None, Available, Low, ["permissions.request"]),
-    cap!("storage.file.read", "Read private storage", "fs.read / fs.exists / fs.list inside the app's own jail, which is per APP and shared by all its instances.", Read, Outgoing, App, None, Available, Low, []),
-    cap!("storage.file.write", "Write private storage", "fs.write / append / remove / mkdir in the app's jail, which is per app and shared by all its instances.", Write, Outgoing, App, None, Available, Low, []),
+    cap!("storage.file.read", "Read private storage", "fs.read / fs.exists / fs.list inside the app's jail on this device. Each account, app and room (or no room) has its own jail, and public instances get a separate one.", Read, Outgoing, App, None, Available, Low, []),
+    cap!("storage.file.write", "Write private storage", "fs.write / append / remove / mkdir in that same per-account, per-app, per-room jail; the app's instances in other rooms never see it.", Write, Outgoing, App, None, Available, Low, []),
     cap!("storage.instance.write", "Per-instance storage", "A reserved /instance/ prefix private to this app@room pair, ending the cross-instance clobber.", ReadWrite, Outgoing, Instance, None, PlannedNewPlumbing, Low, []),
     cap!("storage.quota.read", "Storage usage", "Bytes used and the cap, so an app can trim before writes fail.", Read, Outgoing, App, None, Available, Low, ["storage.quota"]),
     cap!("timer.schedule", "Timers", "start_timeout / start_interval inside the isolate; runs on the UI thread under the per-call instruction limit.", Write, Outgoing, App, None, Available, Low, []),
@@ -307,14 +307,14 @@ pub const CATALOG: &[Capability] = &[
     // ----- matrix-account-read -----
     cap!("matrix.account.device.read", "This device", "Device id, name, and verification state.", Read, Outgoing, Account, Some(P::MatrixAccountRead), Available, Medium, ["matrix.device"]),
     cap!("matrix.account.info.read", "Account info", "Homeserver URL and account-management URL.", Read, Outgoing, Account, Some(P::MatrixAccountRead), Available, Medium, ["matrix.account_info"]),
-    cap!("matrix.account.data.read", "Read app account data", "A global account-data event of an app-namespaced type (rs.robius.a2app.<app_id>.*); m.* types are refused.", Read, Outgoing, Account, Some(P::MatrixAccountRead), PlannedNewPlumbing, Medium, []),
+    cap!("matrix.account.data.read", "Read app account data", "Read data saved to your Matrix account under this app's id (type rs.robius.a2app.appdata.<app_id>.<key>). Apps with the same id on your other devices share it, and it is not encrypted on your homeserver.", Read, Outgoing, Account, Some(P::MatrixAccountRead), Available, Medium, ["matrix.account_data"]),
     cap!("matrix.account.ignored.read", "Read your ignore list", "See which users you have ignored.", Read, Outgoing, Account, Some(P::MatrixAccountRead), Available, Medium, ["matrix.ignored_users"]),
-    cap!("on_account_data_changed", "App account data changed", "Called when a subscribed app-namespaced type changes on any device.", Read, Incoming, Account, Some(P::MatrixAccountRead), PlannedNewPlumbing, Medium, []),
+    cap!("on_account_data_changed", "App account data changed", "Called with only the keys of this app's saved account data that changed, here or on another device; reading the new values needs Read app account data.", Read, Incoming, Account, Some(P::MatrixAccountRead), Available, Medium, ["on_account_data_changed"]),
     // ----- matrix-account-write -----
     cap!("matrix.account.display_name.set", "Change your name", "Set your global display name; the new name is shown on the prompt.", Write, Outgoing, Account, Some(P::MatrixAccountWrite), PlannedMachinery, Critical, []),
     cap!("matrix.account.avatar.set", "Change your avatar", "Upload and set, or clear, your global avatar.", Write, Outgoing, Account, Some(P::MatrixAccountWrite), PlannedMachinery, Critical, []),
     cap!("matrix.user.ignore.set", "Block or unblock someone", "Add or remove a user from the account-wide ignore list.", Write, Outgoing, User, Some(P::MatrixAccountWrite), PlannedMachinery, Critical, []),
-    cap!("matrix.account.data.write", "Store app account data", "Write an app-namespaced account-data type so app state follows the user across devices.", Write, Outgoing, Account, Some(P::MatrixAccountWrite), PlannedNewPlumbing, High, []),
+    cap!("matrix.account.data.write", "Store app account data", "Save or delete data under this app's id on your Matrix account (type rs.robius.a2app.appdata.<app_id>.<key>). It syncs to your other devices, is stored unencrypted on your homeserver, and is shared by apps with the same id.", Write, Outgoing, Account, Some(P::MatrixAccountWrite), Available, High, ["matrix.set_account_data"]),
     // ----- matrix-users -----
     cap!("matrix.user.profile.read", "Look up a user", "Display name, avatar and ignored flag for any user id through your homeserver.", Read, Outgoing, User, Some(P::MatrixUsers), Available, Medium, ["matrix.user_profile"]),
     cap!("matrix.user.dm.find", "Find an existing DM", "The DM room with a user if one exists; never creates one.", Read, Outgoing, User, Some(P::MatrixUsers), Available, Medium, ["matrix.dm_find"]),
@@ -344,8 +344,8 @@ pub const CATALOG: &[Capability] = &[
     cap!("matrix.room.low_priority.set", "Low priority", "Mark this room low priority or restore it.", Write, Outgoing, Room, Some(P::MatrixRoomManage), RefusedBySwitch, Low, ["matrix.low_priority"]),
     cap!("matrix.room.unread.set", "Flag unread", "Flag this room unread, or clear the flag, without sending a receipt.", Write, Outgoing, Room, Some(P::MatrixRoomManage), RefusedBySwitch, Low, ["matrix.mark_unread"]),
     cap!("matrix.room.state.send", "Change room settings", "A state event of a declared type (name, topic, avatar, or an app-owned state type); power levels and membership types refused.", Write, Outgoing, Room, Some(P::MatrixRoomManage), PlannedNewPlumbing, Critical, []),
-    cap!("matrix.room.account_data.read", "Read room notes", "App-owned per-room account data.", Read, Outgoing, Room, Some(P::MatrixRoomManage), PlannedNewPlumbing, Medium, []),
-    cap!("matrix.room.account_data.write", "Store room notes", "Write app-owned per-room account data (never m.* types).", Write, Outgoing, Room, Some(P::MatrixRoomManage), PlannedNewPlumbing, Medium, []),
+    cap!("matrix.room.account_data.read", "Read room notes", "Read this app's private notes for the attached room only (room account data, type rs.robius.a2app.appdata.<app_id>.<key>). Only you can see them, but they are not encrypted on your homeserver.", Read, Outgoing, Room, Some(P::MatrixRoomManage), Available, Medium, ["matrix.room_account_data"]),
+    cap!("matrix.room.account_data.write", "Store room notes", "Save or delete this app's private notes for the attached room only. Only you can see them; they sync to your devices, are stored unencrypted on your homeserver, and are shared by apps with the same id.", Write, Outgoing, Room, Some(P::MatrixRoomManage), RefusedBySwitch, Medium, ["matrix.set_room_account_data"]),
     // ----- matrix-room-invite -----
     cap!("matrix.room.invite.send", "Invite someone", "Invite a user to the attached room as you; the user id is shown on every prompt.", Write, Outgoing, Room, Some(P::MatrixRoomInvite), RefusedBySwitch, High, ["matrix.invite"]),
     // ----- matrix-media -----
@@ -490,6 +490,55 @@ mod tests {
         assert_eq!(for_service("matrix.room_members").unwrap().id, "matrix.room.members.read");
         assert_eq!(for_hook("on_ipc_message").unwrap().group, Some(Permission::Ipc));
         assert!(for_service("nope").is_none());
+        for (service, id) in [("matrix.account_data", "matrix.account.data.read"), ("matrix.set_account_data", "matrix.account.data.write"),
+            ("matrix.room_account_data", "matrix.room.account_data.read"), ("matrix.set_room_account_data", "matrix.room.account_data.write")]
+        {
+            assert_eq!(for_service(service).unwrap().id, id);
+        }
+        assert_eq!(for_hook("on_account_data_changed").unwrap().group, Some(Permission::MatrixAccountRead));
+        assert!(for_service("on_account_data_changed").is_none(), "the hook is not a service");
+    }
+
+    #[test]
+    fn account_data_rows_have_their_status_contract_and_review_target() {
+        use crate::information_flow::{Recipient, Source};
+        let rows = [
+            ("matrix.account.data.read", Status::Available, Permission::MatrixAccountRead, (FlowSource::Account, FlowOutput::Local, true, false)),
+            ("on_account_data_changed", Status::Available, Permission::MatrixAccountRead, (FlowSource::Account, FlowOutput::Local, true, false)),
+            // Available, not switch-gated: an account write follows no room's rules.
+            ("matrix.account.data.write", Status::Available, Permission::MatrixAccountWrite, (FlowSource::None, FlowOutput::MatrixServer, false, true)),
+            ("matrix.room.account_data.read", Status::Available, Permission::MatrixRoomManage, (FlowSource::TargetRoom, FlowOutput::Local, true, false)),
+            ("matrix.room.account_data.write", Status::RefusedBySwitch, Permission::MatrixRoomManage, (FlowSource::None, FlowOutput::MatrixServer, false, true)),
+        ];
+        for (id, status, group, expected) in rows {
+            let capability = by_id(id).unwrap();
+            assert_eq!((capability.status, capability.group), (status, Some(group)), "{id}");
+            let contract = capability.flow_contract().unwrap();
+            assert_eq!((contract.source, contract.output, contract.untrusted_content, contract.privileged_effect), expected, "{id}");
+        }
+        let args = serde_json::json!({"key":"prefs","content":{"theme":"dark"}});
+        let homeserver = Some(Recipient::NetworkOrigin("https://hs.example".into()));
+        let global = by_id("matrix.account.data.write").unwrap().flow_contract().unwrap();
+        for room in [None, Some("!attached:s")] {
+            let action = global.sensitive_action("matrix.account.data.write", &args, room).unwrap();
+            assert_eq!(action.target, crate::account_data::WRITE_TARGET, "every room's instance reviews the same target");
+            assert_eq!(global.recipient("alice", room, &args, Some("https://hs.example/")).unwrap(), homeserver);
+        }
+        let notes = by_id("matrix.room.account_data.write").unwrap().flow_contract().unwrap();
+        assert_eq!(notes.sensitive_action("matrix.room.account_data.write", &args, Some("!attached:s")).unwrap().target, "!attached:s");
+        assert_eq!(notes.recipient("alice", Some("!attached:s"), &args, Some("https://hs.example/")).unwrap(), homeserver,
+            "notes go to the homeserver, never to the room's members");
+        for id in ["matrix.account.data.read", "matrix.room.account_data.read", "on_account_data_changed"] {
+            let contract = by_id(id).unwrap().flow_contract().unwrap();
+            assert!(contract.sensitive_action(id, &args, Some("!attached:s")).is_none());
+            assert_eq!(contract.recipient("alice", Some("!attached:s"), &args, Some("https://hs.example/")).unwrap(), None);
+        }
+        let read = by_id("matrix.account.data.read").unwrap().flow_contract().unwrap();
+        assert_eq!(read.source_labels("alice", Some("!attached:s"), Some("!attached:s")).unwrap(),
+            [Source::Account { account: "alice".into() }].into_iter().collect());
+        let notes_read = by_id("matrix.room.account_data.read").unwrap().flow_contract().unwrap();
+        assert_eq!(notes_read.source_labels("alice", Some("!attached:s"), Some("!attached:s")).unwrap(),
+            [Source::Room { account: "alice".into(), room: "!attached:s".into() }].into_iter().collect());
     }
 
     #[test]

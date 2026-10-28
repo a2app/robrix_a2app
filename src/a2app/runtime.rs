@@ -53,6 +53,7 @@ use crate::a2app::instances::{self, MiniAppInstanceAction, Surface};
 use crate::a2app::matrix::{self, A2AppMatrixRequest, A2AppMatrixResult};
 use crate::a2app::room_watch::{A2AppRoomWatchEvent, RoomWatchKind};
 use crate::a2app::account_watch::{A2AppAccountWatchEvent, AccountWatchKind, ACCOUNT_HOOKS};
+use crate::a2app::account_data_watch::A2AppAccountDataEvent;
 use crate::app::{AppStateAction, SelectedRoom};
 use crate::home::navigation_tab_bar::NavigationBarAction;
 use crate::home::rooms_list::{RoomsListAction, RoomsListRef};
@@ -1462,6 +1463,8 @@ fn deliver_matrix_result(cx: &mut Cx, result: A2AppMatrixResult) {
     let reply = result.reply;
     let Some(authorization) = result.authorization.as_ref() else { return };
     let Some(context) = authorization.flow_context.as_ref() else { return };
+    // A save uses up its key name even if the app stopped before hearing back.
+    if result.result.is_ok() { record_account_data_key(authorization, context); }
     if authorization.check_context().is_err()
         || super::information_flow::context_for_heap(reply.heap_key).as_ref() != Ok(context)
     { return; }
@@ -1473,6 +1476,18 @@ fn deliver_matrix_result(cx: &mut Cx, result: A2AppMatrixResult) {
             Ok(data)
         });
     services::respond(cx, reply, response.as_deref().map_err(String::as_str));
+}
+
+/// A saved key keeps its name slot in its writing compartment for good: the
+/// server keeps every type, even after a delete.
+fn record_account_data_key(authorization: &matrix::MatrixAuthorization, context: &a2app_core::information_flow::ContextId) {
+    let Some(kind) = a2app_core::account_data::Kind::of_write(&authorization.capability) else { return };
+    let Some(key) = authorization.flow_payload.as_ref().and_then(|payload| payload["key"].as_str()) else { return };
+    let Ok(index) = a2app_core::account_data::index_key(context, kind) else { return };
+    with_a2app(|state| if !state.persisted.is_account_data_key_used(&index, key) {
+        state.persisted.record_account_data_key(index, key);
+        state.registry_dirty = true;
+    });
 }
 
 /// Drives all a2app machinery for one event pass. Called from
@@ -1511,6 +1526,7 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     let mut stopped: Vec<MiniAppId> = Vec::new();
     let mut watch_events: Vec<A2AppRoomWatchEvent> = Vec::new();
     let mut account_events: Vec<A2AppAccountWatchEvent> = Vec::new();
+    let mut account_data_events: Vec<A2AppAccountDataEvent> = Vec::new();
     let mut host_events: Vec<(&'static str, serde_json::Value)> = Vec::new();
     #[cfg(unix)]
     let mut ai_room_actions: Vec<AiRoomAction> = Vec::new();
@@ -1574,6 +1590,10 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
             }
             if let Some(watch_event) = action.downcast_ref::<A2AppAccountWatchEvent>() {
                 account_events.push(watch_event.clone());
+                continue;
+            }
+            if let Some(event) = action.downcast_ref::<A2AppAccountDataEvent>() {
+                if event.is_current() { account_data_events.push(event.clone()); }
                 continue;
             }
             if let Some(op) = action.downcast_ref::<A2AppOp>() {
@@ -1734,8 +1754,8 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
     for op in ops {
         apply_op(cx, ui, op);
     }
-    if !watch_events.is_empty() || !account_events.is_empty() || !host_events.is_empty() {
-        deliver_room_hooks(cx, ui, watch_events, account_events, host_events);
+    if !watch_events.is_empty() || !account_events.is_empty() || !account_data_events.is_empty() || !host_events.is_empty() {
+        deliver_room_hooks(cx, ui, watch_events, account_events, account_data_events, host_events);
     }
     #[cfg(unix)]
     for action in ai_room_actions {
@@ -1887,6 +1907,11 @@ pub(super) fn stop_background_watches() {
 
 pub(super) fn refresh_background_watches() { prune_hook_subs(); }
 
+/// A retired isolate's heap key can go to the next one, so its subscriptions go now.
+pub(super) fn forget_hook_subs(heap: usize) {
+    with_a2app(|state| { state.hook_subs.remove(&heap); });
+}
+
 /// Forgets subscriptions whose isolate is gone or whose grant was pulled,
 /// and starts or stops the worker's watches to match what's left.
 fn prune_hook_subs() {
@@ -1935,6 +1960,7 @@ fn deliver_room_hooks(
     ui: &WidgetRef,
     events: Vec<A2AppRoomWatchEvent>,
     account_events: Vec<A2AppAccountWatchEvent>,
+    account_data_events: Vec<A2AppAccountDataEvent>,
     host_events: Vec<(&'static str, serde_json::Value)>,
 ) {
     prune_hook_subs();
@@ -2072,6 +2098,14 @@ fn deliver_room_hooks(
     for (hook, payload) in host_events {
         latest.insert((None, hook), payload);
     }
+    // Saved account data goes only to its own app: one call with the sorted
+    // changed keys, after the union of the saved values' labels.
+    let mut saved_data: HashMap<String, (BTreeSet<String>, a2app_core::information_flow::Label)> = HashMap::new();
+    for event in account_data_events.into_iter().filter(A2AppAccountDataEvent::is_current) {
+        let (keys, label) = saved_data.entry(event.app_id).or_default();
+        keys.insert(event.key);
+        label.extend(event.label);
+    }
     let subs: Vec<(usize, String, Option<OwnedRoomId>, HashSet<&'static str>)> = with_a2app(|state| {
         state.hook_subs.iter().map(|(heap, s)| (*heap, s.app_id.clone(), s.room_id.clone(), s.hooks.clone())).collect()
     }).unwrap_or_default();
@@ -2108,6 +2142,18 @@ fn deliver_room_hooks(
             if let Some(payload) = permission_filtered_hook(&app_id, room_id.as_deref(), hook, payload) {
                 delivered |= instances::call_hook_by_heap(cx, heap, LiveId::from_str(hook), &[&payload]);
             }
+        }
+        if hooks.contains("on_account_data_changed")
+            && let Some((keys, label)) = saved_data.get(&app_id)
+            && let Some(payload) = permission_filtered_hook(&app_id, room_id.as_deref(), "on_account_data_changed",
+                &serde_json::json!({ "keys": keys }))
+            // Only the app's own live compartment hears it, and the saved labels arrive first.
+            && super::information_flow::context_for_heap(heap).and_then(|context| {
+                matrix::account_data::check_instance(&context, &app_id, room_id.as_deref().map(RoomId::as_str), false)?;
+                a2app_core::information_flow::add_sources(&context, label.iter().cloned())
+            }).is_ok()
+        {
+            delivered |= instances::call_hook_by_heap(cx, heap, live_id!(on_account_data_changed), &[&payload]);
         }
     }
     if !closed.is_empty() {
@@ -3034,7 +3080,7 @@ fn install_import(
         with_a2app(|state| {
             let mut manifest = imported.manifest;
             // New identity never overwrites another app or its provenance.
-            let taken: Vec<MiniAppId> = state.registry.iter().map(|a| a.id.clone()).collect();
+            let taken = taken_app_ids(state);
             let suggested_id = manifest.id.clone();
             manifest.id = unique_import_id(&suggested_id, &taken);
             let context = super::information_flow::app_context(&manifest.id, None)?;
@@ -3097,6 +3143,13 @@ fn manifest_name_for_popup(manifest: &MiniAppManifest) -> String {
     if manifest.name.is_empty() { manifest.id.clone() } else { manifest.name.clone() }
 }
 
+/// Installed and uninstalled app ids. Saved account data belongs to an app's id,
+/// so a new app never reuses an old one's.
+fn taken_app_ids(state: &A2AppState) -> Vec<MiniAppId> {
+    state.registry.iter().map(|app| app.id.clone())
+        .chain(state.persisted.archived.iter().map(|app| app.id.clone())).collect()
+}
+
 fn unique_import_id(base: &str, taken: &[MiniAppId]) -> MiniAppId {
     if !taken.iter().any(|t| t == base) && !persistence::has_app_files(base) {
         return base.to_string();
@@ -3138,7 +3191,7 @@ fn start_generation(
         let apps: Vec<(MiniAppId, String)> = state.registry.iter()
             .map(|a| (a.id.clone(), a.name.clone()))
             .collect();
-        let taken: Vec<MiniAppId> = apps.iter().map(|(id, _)| id.clone()).collect();
+        let taken = taken_app_ids(state);
 
         // An explicit intent wins; otherwise classify the request text.
         let intent = intent.unwrap_or_else(|| a2app_agent::intent::classify(&request, &apps));
@@ -3311,7 +3364,7 @@ fn finish_generated_app(cx: &mut Cx, ui: &WidgetRef, mut pending: PendingGenerat
         a2app_core::information_flow::ensure_context_epoch(&pending.context, pending.epoch)?;
         let valid = with_a2app(|state| {
             state.generation_context.as_ref() == Some(&pending.context) && state.generation_epoch == Some(pending.epoch)
-                && (pending.refine_of.is_some() || (state.registry.get(&pending.manifest.id).is_none()
+                && (pending.refine_of.is_some() || (!taken_app_ids(state).contains(&pending.manifest.id)
                     && !persistence::has_app_files(&pending.manifest.id)))
         }).unwrap_or(false);
         if !valid { return Err("This completed build was cancelled or another app now uses its ID. Start a new generation.".into()); }
@@ -3339,7 +3392,7 @@ fn finish_generated_app(cx: &mut Cx, ui: &WidgetRef, mut pending: PendingGenerat
         with_a2app(|state| -> Result<(), String> {
             super::information_flow::current_context(&pending.context)?;
             a2app_core::information_flow::ensure_context_epoch(&pending.context, pending.epoch)?;
-            if pending.refine_of.is_none() && (state.registry.get(&pending.manifest.id).is_some()
+            if pending.refine_of.is_none() && (taken_app_ids(state).contains(&pending.manifest.id)
                 || persistence::has_app_files(&pending.manifest.id)) {
                 return Err("Another saved app now uses this generated app's ID. Start a new generation.".into());
             }
@@ -3596,9 +3649,13 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
                 Ok(context) => context,
                 Err(error) => return services::respond(cx, reply, Err(&error)),
             };
+            if let Err(error) = check_account_data_call(&call, capability, &flow_context, &app_id, room.as_deref()) {
+                with_a2app(|state| state.broker.note(reply, &app_id));
+                return services::respond(cx, reply, Err(&error));
+            }
             let origin = room.clone();
             let room = room.and_then(|r| OwnedRoomId::try_from(r.as_str()).ok());
-            match matrix::request_for(call, room, reply) {
+            match matrix::request_for(call, &app_id, room, reply) {
                 Ok(request) if request.media_post_payload().is_some() =>
                     app_media::start(cx, ui, request, app_id, origin, consent, flow_context, reply, may_prompt),
                 Ok(request) => submit_async_request(MatrixRequest::A2App(request.authorized(app_id, capability, origin, consent, flow_context, args))),
@@ -3617,6 +3674,10 @@ fn apply_broker_ask(cx: &mut Cx, ui: &WidgetRef, ask: BrokerAsk) {
             let Ok(room_id) = room.as_deref().map(OwnedRoomId::try_from).transpose() else {
                 return services::respond(cx, reply, Err("not a valid room id"));
             };
+            if hook == "on_account_data_changed"
+                && let Err(error) = super::information_flow::context_for_heap(heap_key).and_then(|context|
+                    matrix::account_data::check_instance(&context, &app_id, room.as_deref(), false))
+            { return services::respond(cx, reply, Err(&error)); }
             if let Err(error) = super::information_flow::record_subscription(heap_key, hook) {
                 return services::respond(cx, reply, Err(&error));
             }
@@ -4181,6 +4242,178 @@ mod matrix_link_scope_tests {
     }
 }
 
+#[cfg(test)]
+mod account_data_tests {
+    use super::*;
+    use a2app_core::account_data::{self as saved, Kind};
+    use a2app_core::information_flow::{self as flow, ContextId, Source};
+    use services::MatrixServiceCall as Call;
+
+    const ACCOUNT: &str = "@saver:runtime-account-data.test";
+    const ROOM_A: &str = "!a:runtime-account-data.test";
+    const ROOM_B: &str = "!b:runtime-account-data.test";
+
+    /// Runtime state signed in as `ACCOUNT` with `app` installed; restored on drop.
+    struct SignedIn {
+        app: &'static str,
+        contexts: Vec<ContextId>,
+        previous_state: Option<A2AppState>,
+        previous_account: Option<String>,
+    }
+
+    impl SignedIn {
+        fn new(app: &'static str) -> Self {
+            let previous_state = A2APP.with(|state| state.replace(None));
+            let previous_account = crate::a2app::information_flow::TEST_ACCOUNT.with(|account| account.replace(Some(ACCOUNT.into())));
+            let mut manifest = builtin::stock("room-peek").unwrap();
+            manifest.id = app.into();
+            initialize_background_test(manifest);
+            Self { app, contexts: Vec::new(), previous_state, previous_account }
+        }
+
+        fn context(&mut self, app: &str, room: Option<&str>) -> ContextId {
+            let context = ContextId::App { account: ACCOUNT.into(), app: app.into(), room: room.map(str::to_owned) };
+            flow::register_context(&context).unwrap();
+            self.contexts.push(context.clone());
+            context
+        }
+    }
+
+    impl Drop for SignedIn {
+        fn drop(&mut self) {
+            for context in &self.contexts { let _ = flow::remove_context(context); }
+            A2APP.with(|state| { state.replace(self.previous_state.take()); });
+            crate::a2app::information_flow::TEST_ACCOUNT.with(|account| { account.replace(self.previous_account.take()); });
+        }
+    }
+
+    fn write(key: &str) -> Call { Call::SetAccountData { key: key.into(), content: None } }
+
+    #[test]
+    fn saved_data_calls_come_only_from_the_instances_own_compartment() {
+        let mut signed = SignedIn::new("identity-call-test");
+        let app = signed.app;
+        let read = Call::AccountData { keys: vec!["prefs".into()], is_batch: false };
+        let (attached, detached) = (signed.context(app, Some(ROOM_A)), signed.context(app, None));
+        // An app dir named "identity-call-test@x" has a tag that splits into this app and room "x".
+        let tagged = signed.context("identity-call-test@x", None);
+        for (call, capability) in [(&read, "matrix.account.data.read"), (&write("prefs"), "matrix.account.data.write")] {
+            assert_eq!(check_account_data_call(call, capability, &attached, app, Some(ROOM_A)), Ok(()));
+            assert_eq!(check_account_data_call(call, capability, &detached, app, None), Ok(()));
+            for (context, app_id, room) in [(&tagged, app, Some("x")), (&attached, app, Some(ROOM_B)),
+                (&attached, "another-app", Some(ROOM_A)), (&detached, app, Some(ROOM_A))]
+            {
+                assert_eq!(check_account_data_call(call, capability, context, app_id, room).unwrap_err(), saved::WRONG_COMPARTMENT,
+                    "{context:?} asking as {app_id}@{room:?}");
+            }
+        }
+        let public = ContextId::PublicApp { account: ACCOUNT.into(), app: app.into() };
+        assert_eq!(check_account_data_call(&write("prefs"), "matrix.account.data.write", &public, app, None).unwrap_err(), saved::PUBLIC_APP);
+        assert_eq!(check_account_data_call(&read, "matrix.account.data.read", &public, app, None).unwrap_err(), saved::WRONG_COMPARTMENT);
+        assert_eq!(check_account_data_call(&Call::IgnoredUsers, "matrix.account.ignored.read", &public, app, None), Ok(()),
+            "other services keep their own checks");
+    }
+
+    #[test]
+    fn each_writing_compartment_has_its_own_key_names() {
+        let mut signed = SignedIn::new("key-cap-test");
+        let app = signed.app;
+        let (room_a, room_b, detached) = (signed.context(app, Some(ROOM_A)), signed.context(app, Some(ROOM_B)), signed.context(app, None));
+        with_a2app(|state| for n in 0..saved::MAX_KEYS {
+            state.persisted.record_account_data_key(saved::index_key(&room_a, Kind::Global).unwrap(), &format!("k{n}"));
+        });
+        let global = "matrix.account.data.write";
+        assert_eq!(check_account_data_call(&write("new"), global, &room_a, app, Some(ROOM_A)).unwrap_err(), saved::TOO_MANY_KEYS);
+        assert_eq!(check_account_data_call(&write("k0"), global, &room_a, app, Some(ROOM_A)), Ok(()), "a used name can be saved again");
+        assert_eq!(check_account_data_call(&write("new"), global, &room_b, app, Some(ROOM_B)), Ok(()), "room A's keys never limit room B");
+        assert_eq!(check_account_data_call(&write("new"), global, &detached, app, None), Ok(()));
+        let note = Call::SetRoomAccountData { key: "new".into(), content: None };
+        assert_eq!(check_account_data_call(&note, "matrix.room.account_data.write", &room_a, app, Some(ROOM_A)), Ok(()),
+            "notes have their own names");
+        // A label too big for its envelope is refused before any review.
+        flow::add_sources(&room_b, (0..=saved::MAX_LABEL_SOURCES).map(|n|
+            Source::Room { account: ACCOUNT.into(), room: format!("!r{n}:runtime-account-data.test") })).unwrap();
+        assert_eq!(check_account_data_call(&write("new"), global, &room_b, app, Some(ROOM_B)).unwrap_err(), saved::TOO_MANY_SOURCES);
+    }
+
+    #[test]
+    fn a_saved_key_is_recorded_once_for_its_writing_compartment() {
+        let mut signed = SignedIn::new("record-key-test");
+        let app = signed.app;
+        let context = signed.context(app, Some(ROOM_A));
+        let authorization = |capability: &str| matrix::MatrixAuthorization::new(app, capability, Some(ROOM_A), &PermissionStore::default())
+            .with_flow(context.clone()).with_payload(serde_json::json!({"key": "prefs", "content": null}));
+        let index = |kind| saved::index_key(&context, kind).unwrap();
+        record_account_data_key(&authorization("matrix.account.data.read"), &context);
+        with_a2app(|state| assert!(state.persisted.account_data_keys.is_empty() && !state.registry_dirty));
+        record_account_data_key(&authorization("matrix.account.data.write"), &context);
+        with_a2app(|state| {
+            assert!(state.persisted.is_account_data_key_used(&index(Kind::Global), "prefs"));
+            assert!(state.registry_dirty, "the index is saved with the registry state");
+            state.registry_dirty = false;
+        });
+        record_account_data_key(&authorization("matrix.account.data.write"), &context);
+        with_a2app(|state| assert!(!state.registry_dirty, "a known key changes nothing"));
+        record_account_data_key(&authorization("matrix.room.account_data.write"), &context);
+        with_a2app(|state| assert!(state.persisted.is_account_data_key_used(&index(Kind::RoomNotes), "prefs")));
+    }
+
+    #[test]
+    fn a_save_counts_even_after_its_app_stopped_and_a_failure_never_does() {
+        let mut signed = SignedIn::new("stopped-save-test");
+        let app = signed.app;
+        let context = signed.context(app, None);
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let result = |key: &str, result: Result<String, String>| A2AppMatrixResult {
+            reply: Reply { heap_key: usize::MAX, req_id: 1 }, result, target: None, reads_rooms: false,
+            authorization: Some(matrix::MatrixAuthorization::new(app, "matrix.account.data.write", None, &PermissionStore::default())
+                .with_flow(context.clone()).with_payload(serde_json::json!({"key": key, "content": {}}))),
+        };
+        deliver_matrix_result(&mut cx, result("failed", Err("Denied".into())));
+        deliver_matrix_result(&mut cx, result("saved", Ok(r#"{"key":"saved"}"#.into())));
+        let index = saved::index_key(&context, Kind::Global).unwrap();
+        with_a2app(|state| {
+            assert!(state.persisted.is_account_data_key_used(&index, "saved"), "no heap answers, but the save happened");
+            assert!(!state.persisted.is_account_data_key_used(&index, "failed"));
+        });
+    }
+
+    #[test]
+    fn prompts_name_the_saved_keys_and_what_happens_to_them() {
+        use serde_json::json;
+        let action = |id: &str, args: serde_json::Value| permission_action(a2app_core::capabilities::by_id(id).unwrap(), &args);
+        assert_eq!(action("matrix.account.data.read", json!({"key": "prefs"})), "Read “prefs” saved to your account under this app's id");
+        assert_eq!(action("matrix.account.data.read", json!({"keys": ["a", "b", "c", "d", "e"]})),
+            "Read “a”, “b”, “c” and 2 more saved to your account under this app's id");
+        assert_eq!(action("matrix.account.data.read", json!({"key": "Not\na key"})), "Read data saved to your account under this app's id");
+        assert_eq!(action("matrix.account.data.write", json!({"key": "prefs", "content": {"theme": "dark"}})), "Save “prefs” to your account");
+        assert_eq!(action("matrix.account.data.write", json!({"key": "prefs", "content": null})), "Delete “prefs” from your account");
+        assert_eq!(action("matrix.account.data.write", json!({"key": "prefs"})), "Save “prefs” to your account",
+            "a call missing its content fails after the prompt and deletes nothing");
+        assert_eq!(action("on_account_data_changed", json!({"event": "on_account_data_changed"})),
+            "Know when this app's saved data changes, here or on your other devices");
+        assert_eq!(action("matrix.room.account_data.read", json!({})), "Read this app's private notes for this room");
+        assert_eq!(action("matrix.room.account_data.write", json!({"key": "todo", "content": {}})),
+            "Save “todo” to this app's private notes for this room");
+        assert_eq!(action("matrix.room.account_data.write", json!({"key": "todo", "content": null})),
+            "Delete “todo” from this app's private notes for this room");
+        assert_eq!(action("matrix.room.account_data.write", json!({"key": "todo"})),
+            "Save “todo” to this app's private notes for this room");
+    }
+
+    #[test]
+    fn a_new_app_never_takes_an_uninstalled_apps_id() {
+        let signed = SignedIn::new("installed-id-test");
+        let mut uninstalled = builtin::stock("room-peek").unwrap();
+        uninstalled.id = "uninstalled-id-test".into();
+        with_a2app(|state| state.persisted.archived.push(uninstalled));
+        let taken = with_a2app(|state| taken_app_ids(state)).unwrap();
+        assert!(taken.contains(&signed.app.to_string()) && taken.contains(&"uninstalled-id-test".to_string()));
+        assert_eq!(unique_import_id("uninstalled-id-test", &taken), "uninstalled-id-test-2");
+        assert_eq!(a2app_agent::pipeline::unique_id("Uninstalled Id Test", &taken), "uninstalled-id-test-2");
+    }
+}
+
 fn perform_host_action(cx: &mut Cx, ui: &WidgetRef, reply: Reply, action: HostAction) -> Result<(), String> {
     let heap = reply.heap_key;
     let room_of = |room: Option<String>| -> Result<OwnedRoomId, String> {
@@ -4368,6 +4601,40 @@ fn prefs_json(cx: &mut Cx) -> serde_json::Value {
     })
 }
 
+/// Allows account-data calls only from the instance's own compartment, and a
+/// new key only while that compartment has key names left.
+fn check_account_data_call(call: &services::MatrixServiceCall, capability: &str,
+    context: &a2app_core::information_flow::ContextId, app_id: &str, room: Option<&str>) -> Result<(), String>
+{
+    use services::MatrixServiceCall as Call;
+    let key = match call {
+        Call::SetAccountData { key, .. } | Call::SetRoomAccountData { key, .. } => key,
+        Call::AccountData { .. } | Call::RoomAccountData { .. } => return matrix::account_data::check_instance(context, app_id, room, false),
+        _ => return Ok(()),
+    };
+    matrix::account_data::check_instance(context, app_id, room, true)?;
+    // The writer's label must fit its envelope; checked before any review.
+    a2app_core::account_data::wrap(&a2app_core::information_flow::labels(context)?, context.account(), None)?;
+    let kind = a2app_core::account_data::Kind::of_write(capability).ok_or("This is not an account-data write.")?;
+    let index = a2app_core::account_data::index_key(context, kind)?;
+    with_a2app(|state| state.persisted.check_account_data_key(&index, key))
+        .unwrap_or_else(|| Err("Mini Apps are unavailable.".into()))
+}
+
+/// [`check_account_data_call`] before a prompt, so nobody approves a call that
+/// will be refused; bad arguments are answered after the prompt.
+fn check_account_data_request(request: &SplashHostRequest) -> Result<(), String> {
+    if !matches!(request.service.as_str(),
+        "matrix.account_data" | "matrix.set_account_data" | "matrix.room_account_data" | "matrix.set_room_account_data")
+    { return Ok(()); }
+    let (Some(capability), Ok(context)) = (a2app_core::capabilities::for_service(&request.service),
+        super::information_flow::context_for_heap(request.heap_key)) else { return Ok(()) };
+    let args = serde_json::from_str(&request.args_json).unwrap_or(serde_json::Value::Null);
+    let (app_id, room) = a2app_core::manifest::split_instance_tag(&request.app_tag);
+    let Ok(call) = services::matrix::parse(&request.service, &args, room.is_some()) else { return Ok(()) };
+    check_account_data_call(&call, capability.id, &context, app_id, room)
+}
+
 fn queue_permission_prompt(
     cx: &mut Cx,
     ui: &WidgetRef,
@@ -4376,6 +4643,11 @@ fn queue_permission_prompt(
     parked: ParkedRequest,
     tool: Option<PromptToolGrant>,
 ) {
+    if let ParkedRequest::Bridge(Some(request)) = &parked
+        && let Err(error) = check_account_data_request(request)
+    {
+        return services::respond(cx, Reply { heap_key: request.heap_key, req_id: request.req_id }, Err(&error));
+    }
     // "Not Now" this session: refuse without re-asking, so a looping caller
     // (a script, or an agent that keeps trying the same tool) can't nag its
     // way to an accidental Allow. Refusing re-enters the state, so it runs
@@ -4487,6 +4759,7 @@ fn matrix_permission_review(request: &SplashHostRequest, context: &a2app_core::i
     let capability = a2app_core::capabilities::for_service(&request.service).ok_or("Unknown Matrix action.")?;
     let contract = capability.flow_contract().ok_or("Missing data-flow contract.")?;
     let call = services::matrix::parse(&request.service, args, context.room().is_some())?;
+    check_account_data_request(request)?;
     let permission_context = services::permission_context(&request.service, args, context.room());
     let Some(client) = crate::sliding_sync::get_client() else { return Ok(None) };
     let epoch = flow::context_epoch(context)?;
@@ -4533,6 +4806,12 @@ fn matrix_permission_review(request: &SplashHostRequest, context: &a2app_core::i
         services::MatrixServiceCall::InviteRespond { room_id, accept } => {
             let room = matrix_sdk::ruma::OwnedRoomId::try_from(room_id).map_err(|_| "invalid room_id")?;
             sensitive(room.as_str(), serde_json::json!({ "accept": accept }))?
+        }
+        services::MatrixServiceCall::SetAccountData { key, content } =>
+            sensitive(a2app_core::account_data::WRITE_TARGET, a2app_core::account_data::write_payload(&key, content.as_ref()))?,
+        services::MatrixServiceCall::SetRoomAccountData { key, content } => {
+            let room = permission_context.target_room.ok_or("Missing notes room.")?;
+            sensitive(room, a2app_core::account_data::write_payload(&key, content.as_ref()))?
         }
         services::MatrixServiceCall::Invite { user_id } => {
             let room = permission_context.target_room.ok_or("Missing invite destination.")?;
@@ -5027,7 +5306,7 @@ fn flow_prompt_info(state: &A2AppState, rooms: Option<&RoomsListRef>, flow: &Flo
             payload.get("parameters").unwrap_or(&payload))).unwrap_or_else(|| "Send this request".into()) };
     if capability.is_some_and(|capability| matches!(capability.id,
         "matrix.room.event.read" | "matrix.room.thread.read" | "matrix.room.messages.paginate" | "matrix.media.download"
-            | "host.nav.event" | "host.nav.thread"))
+            | "host.nav.event" | "host.nav.thread" | "matrix.room.account_data.read" | "matrix.room.account_data.write"))
     {
         let parameters = payload.get("parameters").unwrap_or(&payload);
         if let Some(room) = parameters["room_id"].as_str().or_else(|| parameters["room"].as_str())
@@ -5044,6 +5323,13 @@ fn flow_prompt_info(state: &A2AppState, rooms: Option<&RoomsListRef>, flow: &Flo
             }
         }
         action.push_str("\nThe search text is sent to your Matrix server. Encrypted rooms are searched on this device.");
+    }
+    match capability.map(|capability| capability.id) {
+        Some("matrix.account.data.write") =>
+            action.push_str("\nIt is stored unencrypted on your Matrix server and synced to your other devices."),
+        Some("matrix.room.account_data.write") =>
+            action.push_str("\nOnly you can see these notes, but they are stored unencrypted on your Matrix server."),
+        _ => {}
     }
     if capability.is_some_and(|capability| capability.id == "matrix.space.rooms.list")
         && let Some(space) = payload["parameters"]["space_id"].as_str()
@@ -5481,8 +5767,38 @@ fn permission_action(capability: &a2app_core::capabilities::Capability, args: &s
         "matrix.account.device.read" => "Read this device’s name and verification status".into(),
         "matrix.account.info.read" => "Read your Matrix server and account settings links".into(),
         "on_unread_totals_changed" => "Watch changes to your unread message totals".into(),
+        "matrix.account.data.read" => saved_keys(args).map(|keys| format!("Read {keys} saved to your account under this app's id"))
+            .unwrap_or_else(|| "Read data saved to your account under this app's id".into()),
+        // A missing content is an argument error, not a delete.
+        "matrix.account.data.write" => match saved_keys(args) {
+            Some(key) if args.get("content").is_some_and(serde_json::Value::is_null) => format!("Delete {key} from your account"),
+            Some(key) => format!("Save {key} to your account"),
+            None => "Save this app's data to your account".into(),
+        },
+        "on_account_data_changed" => "Know when this app's saved data changes, here or on your other devices".into(),
+        "matrix.room.account_data.read" => saved_keys(args).map(|keys| format!("Read {keys} from this app's private notes for this room"))
+            .unwrap_or_else(|| "Read this app's private notes for this room".into()),
+        "matrix.room.account_data.write" => match saved_keys(args) {
+            Some(key) if args.get("content").is_some_and(serde_json::Value::is_null) =>
+                format!("Delete {key} from this app's private notes for this room"),
+            Some(key) => format!("Save {key} to this app's private notes for this room"),
+            None => "Save this app's private notes for this room".into(),
+        },
         _ => capability.title.into(),
     }
+}
+
+/// The valid account-data keys a call names, quoted: “a”, “b” and 2 more.
+fn saved_keys(args: &serde_json::Value) -> Option<String> {
+    let mut keys: Vec<&str> = match &args["keys"] {
+        serde_json::Value::Array(keys) => keys.iter().filter_map(serde_json::Value::as_str).collect(),
+        _ => args["key"].as_str().into_iter().collect(),
+    };
+    let mut seen = HashSet::new();
+    keys.retain(|key| seen.insert(*key));
+    if keys.is_empty() || keys.iter().any(|key| a2app_core::account_data::validate_key(key).is_err()) { return None; }
+    let shown = keys.iter().take(3).map(|key| format!("“{key}”")).collect::<Vec<_>>().join(", ");
+    Some(if keys.len() > 3 { format!("{shown} and {} more", keys.len() - 3) } else { shown })
 }
 
 /// Default to the rooms requested; the popup can widen or narrow this scope.
@@ -12400,6 +12716,22 @@ View{note := Label{text:"waiting"}}
         let group = bridge("permissions.request", serde_json::json!({ "permission": "matrix-room-read", "capability": "matrix.room.members.read" }), Some(SOURCE));
         assert!(parked_capability(&group).is_none());
         assert!(parked_capability(&ParkedRequest::Bridge(None)).is_none());
+    }
+
+    #[test]
+    fn saved_data_prompts_name_their_own_ability_and_the_hook_is_never_once() {
+        let hook = bridge("events.subscribe", serde_json::json!({ "event": "on_account_data_changed" }), None);
+        assert_eq!(parked_capability(&hook).unwrap().id, "on_account_data_changed");
+        assert!(!parked_can_allow_once(&hook));
+        for (service, id, room) in [("matrix.account_data", "matrix.account.data.read", None),
+            ("matrix.set_account_data", "matrix.account.data.write", Some(SOURCE)),
+            ("matrix.room_account_data", "matrix.room.account_data.read", Some(SOURCE)),
+            ("matrix.set_room_account_data", "matrix.room.account_data.write", Some(SOURCE))]
+        {
+            let parked = bridge(service, serde_json::json!({ "key": "prefs", "content": null }), room);
+            assert_eq!(parked_capability(&parked).unwrap().id, id);
+            assert!(parked_can_allow_once(&parked), "{service}");
+        }
     }
 
     #[test]

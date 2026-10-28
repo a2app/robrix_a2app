@@ -451,6 +451,12 @@ pub fn ensure_agent_room_output_access(room: &str) -> Result<(), String> {
 
 /// Recheck a host-defined sensitive target immediately before its effect.
 pub async fn commit_sensitive_target(target: &str, payload: &serde_json::Value) -> Result<(), String> {
+    let homeserver = crate::sliding_sync::get_client().map(|client| client.homeserver().to_string());
+    commit_sensitive_target_at(target, payload, homeserver.as_deref()).await
+}
+
+/// [`commit_sensitive_target`] for the homeserver of the client doing the effect.
+pub async fn commit_sensitive_target_at(target: &str, payload: &serde_json::Value, homeserver: Option<&str>) -> Result<(), String> {
     ensure_live_activation()?;
     let auth = AUTHORIZATION.try_with(Clone::clone)
         .map_err(|_| "Missing host information-flow authorization.".to_string())?;
@@ -460,8 +466,7 @@ pub async fn commit_sensitive_target(target: &str, payload: &serde_json::Value) 
     let action = SensitiveAction { kind: auth.capability.clone(), target: target.into() };
     let contract = a2app_core::capabilities::by_id(&auth.capability)
         .and_then(|capability| capability.flow_contract()).ok_or("Missing information-flow contract.")?;
-    let homeserver = crate::sliding_sync::get_client().map(|client| client.homeserver().to_string());
-    let recipient = contract.recipient(context.account(), Some(target), payload, homeserver.as_deref())?;
+    let recipient = contract.recipient(context.account(), Some(target), payload, homeserver)?;
     let review = flow::prepare_effect_for_activation(context, epoch, recipient.as_ref(), Some(&action), payload)?;
     crate::a2app::effect_review::request(review, true).await?;
     auth.check_current_permission()?;

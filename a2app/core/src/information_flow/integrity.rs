@@ -184,6 +184,12 @@ const MAX_PENDING_ACTIONS: usize = 64;
 
 pub const ACTION_REVIEW_REQUIRED: &str = "Your permission is needed before this action can continue.";
 
+/// Whether a review can show `value` in full, measured exactly as the review
+/// measures its payload (size, nesting and serialized length).
+pub fn is_reviewable_payload(value: &serde_json::Value) -> bool {
+    canonical_payload(value).is_ok()
+}
+
 /// Bound allocation and nesting before sorting/serializing untrusted JSON.
 /// Object order has no meaning; arrays, numbers and strings retain their value.
 pub(super) fn canonical_payload(value: &serde_json::Value) -> Result<String, String> {

@@ -44,9 +44,9 @@ pub enum Permission {
     Camera,
     /// Record an audio clip through the system recorder.
     Microphone,
-    /// See this device's ID and verification state, your homeserver, and app-owned account settings.
+    /// See this device, your homeserver, your ignore list, and data saved under this app's id.
     MatrixAccountRead,
-    /// Change your display name or avatar, block people, or store app settings on your account. A
+    /// Save this app's data to your account, change your display name or avatar, or block people.
     MatrixAccountWrite,
     /// Fetch other Matrix users' public profiles and find existing chats with them.
     MatrixUsers,
@@ -56,7 +56,7 @@ pub enum Permission {
     MatrixRoomInteract,
     /// Store and read this app's own data as events in this room so everyone using it sees the sa
     MatrixRoomAppData,
-    /// Pin messages, favorite this room, flag it unread, or change its settings. Writes are off u
+    /// Pin messages, favorite or flag this room, change its settings, or keep this app's notes for it.
     MatrixRoomManage,
     /// Invite people to this room as you, subject to room and space write rules.
     MatrixRoomInvite,
@@ -356,13 +356,13 @@ impl Permission {
             Permission::DeviceInfo => "Low-sensitivity facts about this device and connection: platform, locale, time zone, online/offline, sync state.",
             Permission::Camera => "Take a photo through the system camera.",
             Permission::Microphone => "Record an audio clip through the system recorder.",
-            Permission::MatrixAccountRead => "See this device's ID and verification state, your homeserver, and app-owned account settings.",
-            Permission::MatrixAccountWrite => "Change your display name or avatar, block people, or store app settings on your account. Asks every time and is off unless 'Apps may change your account' is on.",
+            Permission::MatrixAccountRead => "See this device's ID and verification state, your homeserver, your ignore list, and data saved to your account under this app's id.",
+            Permission::MatrixAccountWrite => "Save this app's data to your account, where it is stored unencrypted on your homeserver and synced to your other devices. Also covers changing your display name or avatar and blocking people.",
             Permission::MatrixUsers => "Fetch other Matrix users' public profiles and find existing chats with them.",
             Permission::MatrixRoomWatch => "Be told as messages, edits, reactions, typing, receipts, joins and mentions happen in this room.",
             Permission::MatrixRoomInteract => "React, show typing, and mark this room read as you. Your room and space write rules always apply.",
             Permission::MatrixRoomAppData => "Store and read this app's own data as events in this room so everyone using it sees the same state. Your room and space read/write rules always apply.",
-            Permission::MatrixRoomManage => "Pin messages, favorite this room, flag it unread, or change its settings. Your room and space write rules always apply.",
+            Permission::MatrixRoomManage => "Pin messages, favorite this room, flag it unread, change its settings, or read and save this app's private notes for this room. Your room and space read and write rules always apply.",
             Permission::MatrixRoomInvite => "Invite people to this room as you. Your room and space write rules always apply.",
             Permission::MatrixMedia => "Fetch room attachments, and upload or post images, audio, video, or files as you in approved rooms. Your room and space read and write rules apply.",
             Permission::MatrixRoomsList => "See which rooms, DMs and invites you have with unread counts, and be told when that changes.",
@@ -2322,5 +2322,65 @@ mod tests {
         assert_eq!(reloaded.state(&subject, Permission::MatrixRoomRead), GrantState::Granted);
         assert_eq!(reloaded.capability_state(&subject, members.id), GrantState::Denied);
         assert!(reloaded.matrix_write());
+    }
+
+    /// The read and its change hook share a group: a group answer covers
+    /// both, but approving one concrete request grants only that ability.
+    #[test]
+    fn account_data_read_and_hook_share_a_group_but_not_a_prompt_grant() {
+        use crate::capabilities::by_id;
+        let (read, hook) = (by_id("matrix.account.data.read").unwrap(), by_id("on_account_data_changed").unwrap());
+        let m = manifest(&["matrix-account-read"]);
+        let room = PermissionContext { origin_room: Some("!r:s"), target_room: Some("!r:s") };
+        let mut store = PermissionStore::default();
+        assert_eq!(store.effective_capability(&m, read), Effective::NeedsPrompt);
+        assert_eq!(store.effective_capability(&m, hook), Effective::NeedsPrompt);
+        // What the host records when the user approves a parked read.
+        store.grant_scoped("t", Permission::MatrixAccountRead, Some(read.id), RoomScope::room("!r:s"),
+            GrantDuration::RobrixSession, Some("!r:s")).unwrap();
+        assert_eq!(store.effective_capability_in_context(&m, read, room), Effective::Granted);
+        assert_eq!(store.effective_capability_in_context(&m, hook, room), Effective::NeedsPrompt);
+        store.set("t", Permission::MatrixAccountRead, GrantState::Granted);
+        assert_eq!(store.effective_capability(&m, read), Effective::Granted);
+        assert_eq!(store.effective_capability(&m, hook), Effective::Granted);
+        store.set_capability("t", hook.id, GrantState::Denied);
+        assert_eq!(store.effective_capability(&m, hook), Effective::Denied);
+        assert_eq!(store.effective_capability(&m, read), Effective::Granted, "blocking the hook leaves the read");
+        let mut narrowed = manifest(&["matrix-account-read"]);
+        narrowed.capabilities = vec![read.id.into()];
+        narrowed.normalize_permissions();
+        assert!(!narrowed.declares_capability(hook), "declaring the read alone leaves out the hook");
+        store.set_capability("t", hook.id, GrantState::Ask);
+        assert_eq!(store.effective_capability(&narrowed, hook), Effective::Undeclared);
+        assert_eq!(store.effective_capability(&narrowed, read), Effective::Granted);
+    }
+
+    /// Notes writes pause with room changes, like the room's other flags;
+    /// reading notes and the account-wide write follow no write switch.
+    #[test]
+    fn room_notes_writes_follow_the_write_switch_but_reads_and_account_writes_do_not() {
+        use crate::capabilities::by_id;
+        let (notes_read, notes_write) = (by_id("matrix.room.account_data.read").unwrap(), by_id("matrix.room.account_data.write").unwrap());
+        let account_write = by_id("matrix.account.data.write").unwrap();
+        assert_eq!(capability_room_access(notes_read), Some(RoomAccess::Read));
+        assert_eq!(capability_room_access(notes_write), Some(RoomAccess::Write));
+        assert_eq!(capability_room_access(account_write), None);
+        let m = manifest(&["matrix-room-manage", "matrix-account-write"]);
+        let room = PermissionContext { origin_room: Some("!r:s"), target_room: Some("!r:s") };
+        let mut store = PermissionStore::default();
+        store.set("t", Permission::MatrixRoomManage, GrantState::Granted);
+        store.set("t", Permission::MatrixAccountWrite, GrantState::Granted);
+        assert!(!store.matrix_write());
+        assert_eq!(store.effective_capability_in_context(&m, notes_write, room), Effective::Denied);
+        assert_eq!(store.effective_capability(&m, notes_write), Effective::Denied);
+        assert_eq!(store.effective_capability_in_context(&m, notes_read, room), Effective::Granted);
+        assert_eq!(store.effective_capability_in_context(&m, account_write, room), Effective::Granted);
+        assert_eq!(store.effective_capability_in_context(&m, account_write, PermissionContext { origin_room: None, target_room: None }),
+            Effective::Granted);
+        store.set_matrix_write(true);
+        assert_eq!(store.effective_capability_in_context(&m, notes_write, room), Effective::Granted);
+        store.set_room_policy("!r:s", RoomAccess::Read, PolicyDecision::Deny);
+        assert_eq!(store.effective_capability_in_context(&m, notes_read, room), Effective::Denied, "room read rules cover notes");
+        assert!(!Permission::MatrixAccountWrite.blurb().contains("Apps may change your account"), "no such switch exists");
     }
 }

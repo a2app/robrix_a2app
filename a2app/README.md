@@ -200,16 +200,18 @@ be downloaded and prepared as media. It does not post anything into Matrix.
 - **Matrix services**, each behind its own permission group: the attached
   room (info, messages, older history, one event, threads and replies,
   members, pins, search, read receipts, unread counts, power levels,
-  permalinks, upgrades), rooms and spaces (list, search, invites, previews,
-  cross-room read and search, space trees), the account (profile, device,
-  homeserver, ignored users, other users' profiles, DM lookup), and, behind
-  the room and space write rules, sends, replies, reactions, typing, read receipts, pins,
-  room flags, invites, joins and DMs.
+  permalinks, upgrades, the app's private notes), rooms and spaces (list,
+  search, invites, previews, cross-room read and search, space trees), the
+  account (profile, device, homeserver, ignored users, other users' profiles,
+  DM lookup, and data the app saves to the account, synced to the user's
+  other devices), and, behind the room and space write rules, sends, replies,
+  reactions, typing, read receipts, pins, room flags, room notes, invites,
+  joins and DMs.
 - **Live updates instead of polling**: room hooks (messages, edits and
   redactions, reactions, typing, read receipts, members, pins, room details,
-  unread counts), account hooks (room list, invites, unread totals), and host
-  hooks (focus, surface, display settings, which room or screen the user is
-  on).
+  unread counts), account hooks (room list, invites, unread totals, the app's
+  saved account data), and host hooks (focus, surface, display settings,
+  which room or screen the user is on).
 - **Host and pane services**: an app can read where it runs (surface, dock
   side, size, platform, view mode), move, pop out, minimize, restore or close
   its own pane, and read Robrix's display settings and device facts.
@@ -870,6 +872,9 @@ grants. Read and write are independent. The **Allow apps to send or change rooms
 pauses all room writes by mini-apps and agents, except an AI room's own replies
 and cards in that room, and disables individual write editors, retaining their
 saved rules and the previous write default for when the switch is enabled again.
+It also pauses saving an app's private room notes. Saving an app's data to the
+account is not a room change, so the switch leaves it alone; it still prompts,
+and the homeserver review below applies.
 Read and write defaults each support **Only in rooms I allow**:
 selected room/space allowances work, unlisted rooms are denied, and explicit
 blocks still win. The ordinary Ask default instead prompts for unlisted rooms.
@@ -902,6 +907,31 @@ invite targets and state metadata) require a separate allowance for the
 actual homeserver origin before a request is sent, even in encrypted rooms.
 Cached event reads stay local; ordinary messages use the destination room's
 normal encryption and sharing checks.
+
+**App data saved to the account carries its writer's label.** It is the one
+store an app shares across its compartments: every room's instance, the
+detached instance, and the same app id on the user's other devices. New and
+imported apps on this device avoid the ids of uninstalled ones, so they never
+inherit an old app's data. Each key is the account data type
+`rs.robius.a2app.appdata.<app_id>.<key>`, global or, for notes, in the attached
+room. Robrix chooses the type and stores `{"v": 1, "label": [...], "data": ...}`,
+where `label` is the writing compartment's label; a delete keeps it with
+`data: null`. Account data is plaintext on the homeserver, so a save is an
+output to it: its sources need sharing approval, and after untrusted input the
+user reviews the exact `{key, content}`. A reader joins the saved label, the
+Account source (the room, for notes) and an unknown influence before it sees
+the value, wherever it runs; the change hook, which reports only key names,
+joins the same labels before delivery. Labels never collapse to
+`UnknownPrivate`: a compartment with more than 256 sources, or with another
+account's data, cannot save, and an envelope this version cannot read exactly
+comes back as an error for that key. Objects other Matrix clients wrote carry
+no saved label. Public instances cannot save.
+
+Each writing compartment may use 32 key names for account data and 32 for its
+room's notes on this device, and a deleted name still counts, so a refusal
+depends only on that compartment's own writes. Until the first sync after
+sign-in has filled the store, these services refuse with a retryable error
+rather than report data that has not arrived yet as missing.
 
 Mini Apps → **Agent permissions** manages source-to-recipient allowances
 for a configured model service, an exact HTTP(S) origin, a Matrix room, or the clipboard.
@@ -952,7 +982,8 @@ reviewed destinations.
 Source restrictions transfer across app/agent
 boundaries before delivery. Normal app navigation transfers provenance to
 the opened app. Each account/app/room combination has a separate filesystem
-jail and persistent provenance. Current source-code provenance is inherited by
+jail and persistent provenance; only data saved to the Matrix account is shared
+between them, and it carries its labels. Current source-code provenance is inherited by
 every instance. Historical source keeps its own archived provenance, which is
 joined before reading or restoring it. Generating or editing private source
 cannot be laundered by opening it in another compartment.
@@ -970,7 +1001,8 @@ Archiving an ordinary bundled release does not make its current code private.
 Old `app_data/<app>` files remain in their original directory; they are not
 automatically mounted in new compartments. App Info explains this and counts
 them in storage usage. Clear data removes both old files and new compartment
-files, while retaining provenance.
+files, while retaining provenance. Neither Clear data nor uninstalling removes
+what an app saved to the Matrix account.
 
 **Public instances have an immutable empty clearance.** App Info → **Open
 public instance** creates separate storage and refuses room/account reads,

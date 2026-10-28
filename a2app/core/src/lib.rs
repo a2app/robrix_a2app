@@ -35,6 +35,8 @@ pub mod diff;
 pub mod permissions;
 /// Host-owned information-flow labels and source-to-recipient sharing rules.
 pub mod information_flow;
+/// Names, limits and the label envelope for data apps save to the Matrix account.
+pub mod account_data;
 /// Bounded, local metadata about protection decisions and actual request outcomes.
 pub mod protection_audit;
 pub mod background;

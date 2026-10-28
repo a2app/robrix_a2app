@@ -95,7 +95,7 @@ pub fn contract(id: &str) -> Option<FlowContract> {
         | "matrix.room.power_levels.read" | "matrix.room.link.create"
         | "matrix.room.successor.read" | "matrix.room.receipts.read"
         | "matrix.rooms.info.read" | "matrix.rooms.messages.read"
-        | "matrix.space.info.read"
+        | "matrix.space.info.read" | "matrix.room.account_data.read"
             => (S::TargetRoom, O::Local, true, false),
         "matrix.room.thread.read" | "matrix.room.event.read" | "matrix.space.rooms.list" | "matrix.media.download"
             => (S::TargetRoom, O::MatrixServer, true, false),
@@ -111,11 +111,14 @@ pub fn contract(id: &str) -> Option<FlowContract> {
         "matrix.room.reaction.toggle" => (S::TargetRoom, O::TargetRoom, true, true),
         "matrix.rooms.join" => (S::None, O::MatrixServer, false, true),
         "matrix.media.upload" => (S::None, O::MatrixServer, false, true),
+        // Saved data is plaintext on the homeserver; room notes never reach room members.
+        "matrix.account.data.write" | "matrix.room.account_data.write" => (S::None, O::MatrixServer, false, true),
         "matrix.user.dm.open" => (S::Account, O::MatrixServer, true, true),
         "matrix.profile.read" | "matrix.account.device.read" | "matrix.account.info.read"
         | "matrix.account.ignored.read" | "matrix.user.dm.find" | "matrix.rooms.list"
         | "matrix.rooms.search" | "matrix.rooms.invites.list" | "matrix.spaces.list"
         | "on_rooms_changed" | "on_invite_received" | "on_active_room_changed"
+        | "matrix.account.data.read" | "on_account_data_changed"
             => (S::Account, O::Local, true, false),
         "matrix.user.profile.read" | "matrix.rooms.preview.read"
             => (S::Account, O::MatrixServer, true, false),
@@ -181,6 +184,8 @@ impl FlowContract {
                     _ => args["url"].as_str().unwrap_or("external").into(),
                 },
                 FlowOutput::MatrixServer if capability == "matrix.user.dm.open" => "host".into(),
+                // One target from any room; room notes keep their room below.
+                FlowOutput::MatrixServer if capability == "matrix.account.data.write" => crate::account_data::WRITE_TARGET.into(),
                 FlowOutput::TargetRoom | FlowOutput::MatrixServer => target_room.unwrap_or("host").into(),
                 FlowOutput::Local if matches!(capability, "host.composer.insert" | "host.composer.attach" | "host.composer.reply_to")
                     => target_room.unwrap_or("host").into(),

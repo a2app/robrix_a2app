@@ -2050,6 +2050,15 @@ impl Widget for MiniAppPermissionRow {
     }
 }
 
+/// Whether every available ability the app declares in `perm` waits for room
+/// changes; a group that can also read (room notes) isn't turned off.
+fn are_all_switch_gated(manifest: Option<&MiniAppManifest>, perm: Permission) -> bool {
+    let mut declared = a2app_core::capabilities::in_group(perm)
+        .filter(|cap| cap.is_available() && manifest.is_none_or(|manifest| manifest.declares_capability(cap)))
+        .peekable();
+    declared.peek().is_some() && declared.all(|cap| cap.status == a2app_core::capabilities::Status::RefusedBySwitch)
+}
+
 impl MiniAppPermissionRow {
     fn populate(&mut self, cx: &mut Cx, app_id: &str, perm: Permission, effective: Effective) {
         self.app_id = app_id.to_string();
@@ -2067,8 +2076,7 @@ impl MiniAppPermissionRow {
             state.permissions.scoped_grants(app_id).into_iter()
                 .filter(|grant| grant.permission == perm.as_str()).cloned().collect::<Vec<_>>(),
             if perm == Permission::Network { state.permissions.network_grants(app_id).into_iter().cloned().collect() } else { Vec::new() },
-            !state.permissions.matrix_write() && a2app_core::capabilities::in_group(perm)
-                .any(|cap| cap.status == a2app_core::capabilities::Status::RefusedBySwitch),
+            !state.permissions.matrix_write() && are_all_switch_gated(state.registry.get(app_id), perm),
         )).unwrap_or_default();
         let (state_text, color) = if writes_blocked {
             ("Room changes are turned off", self.state_color_blocked)
@@ -3107,7 +3115,7 @@ impl Widget for MiniAppsScreen {
                 self.confirm_delete(
                     cx,
                     format!("Clear {name}'s data?"),
-                    String::from("Everything the app saved in its private storage is deleted. The app itself stays installed."),
+                    String::from("Everything the app saved in its private storage is deleted. Data it saved to your Matrix account is not removed. The app itself stays installed."),
                     "Clear data",
                     move |cx| cx.action(A2AppOp::ClearData(app)),
                 );
@@ -3118,7 +3126,7 @@ impl Widget for MiniAppsScreen {
                 self.confirm_delete(
                     cx,
                     format!("Uninstall {name}?"),
-                    String::from("Its saved data and permissions are removed. The app's bundle is archived, so it can be brought back."),
+                    String::from("Its private storage and permissions are removed, but data it saved to your Matrix account is not. The app's bundle is archived, so it can be brought back."),
                     "Uninstall",
                     move |cx| cx.action(A2AppOp::Uninstall(app)),
                 );
@@ -5484,6 +5492,27 @@ mod access_tests {
         row.populate(&mut cx, app, write, GrantState::Granted, effective);
         assert!(status.text().starts_with("Blocked"));
         assert_eq!(status.borrow().unwrap().draw_text.color, row.state_color_blocked);
+    }
+
+    #[test]
+    fn room_changes_note_needs_every_declared_available_ability_switch_gated() {
+        // Room Tools narrows matrix-room-manage to pins and room flags.
+        let tools = a2app_core::builtin::stock("room-tools").unwrap();
+        assert!(are_all_switch_gated(Some(&tools), Permission::MatrixRoomManage));
+        let mut whole = tools.clone();
+        whole.capabilities.clear();
+        whole.normalize_permissions();
+        assert!(!are_all_switch_gated(Some(&whole), Permission::MatrixRoomManage), "the notes read isn't switch-gated");
+        whole.declare(Permission::MatrixRoomSend);
+        assert!(are_all_switch_gated(Some(&whole), Permission::MatrixRoomSend), "planned abilities don't count");
+        let mut planned = whole.clone();
+        planned.capabilities = vec!["matrix.room.message.edit".into()];
+        planned.normalize_permissions();
+        assert!(!are_all_switch_gated(Some(&planned), Permission::MatrixRoomSend), "no available ability declared");
+        planned.declare(Permission::Camera);
+        assert!(!are_all_switch_gated(Some(&planned), Permission::Camera));
+        assert!(are_all_switch_gated(None, Permission::MatrixRoomSend));
+        assert!(!are_all_switch_gated(None, Permission::MatrixRoomManage));
     }
 
     #[test]

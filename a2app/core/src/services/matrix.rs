@@ -86,6 +86,15 @@ pub enum MatrixServiceCall {
     AccountInfo,
     /// The account's ignore list.
     IgnoredUsers,
+    /// This app's saved account data for `keys`, deduped in asked order. A `{keys}`
+    /// read (`is_batch`) answers `{items: [{key, content}]}`, else `{key, content}`.
+    AccountData { keys: Vec<String>, is_batch: bool },
+    /// Save `content` under `key` in this app's account data; None deletes it.
+    SetAccountData { key: String, content: Option<serde_json::Value> },
+    /// This app's private notes for the attached room, shaped like `AccountData`.
+    RoomAccountData { keys: Vec<String>, is_batch: bool },
+    /// Save one of this app's notes for the attached room; None deletes it.
+    SetRoomAccountData { key: String, content: Option<serde_json::Value> },
 
     // --- send ---
     /// Reply to `event_id`, or post into the thread rooted there when
@@ -146,6 +155,7 @@ fn room_free(service: &str) -> bool {
         | "matrix.spaces" | "matrix.space_info" | "matrix.space_rooms"
         | "matrix.user_profile" | "matrix.dm_find" | "matrix.device"
         | "matrix.account_info" | "matrix.ignored_users"
+        | "matrix.account_data" | "matrix.set_account_data"
 
         | "matrix.rooms_send" | "matrix.join" | "matrix.invite_respond" | "matrix.dm_open"
 
@@ -207,6 +217,60 @@ fn text_body(service: &str, args: &serde_json::Value) -> Result<String, String> 
 /// The most an A2UI action's content may take: events max out at 64 KiB, and
 /// encryption grows content by about a third.
 const MAX_A2UI_ACTION_BYTES: usize = 44 * 1024;
+
+/// The arguments of an account-data service, refusing any but `allowed`:
+/// Robrix chooses the event type, so `type`, `room_id` and the like never apply.
+fn account_data_args<'a>(service: &str, args: &'a serde_json::Value, allowed: &[&str])
+    -> Result<&'a serde_json::Map<String, serde_json::Value>, String>
+{
+    let shape = if allowed.contains(&"content") { "{key, content}" } else { "{key} or {keys}" };
+    match args.as_object() {
+        Some(object) if object.keys().all(|name| allowed.contains(&name.as_str())) => Ok(object),
+        Some(_) => Err(format!("{service} takes only {shape}: Robrix chooses the event type.")),
+        None => Err(format!("{service} needs {shape}")),
+    }
+}
+
+/// A read's `{key}` or `{keys: [..]}`: valid keys, deduped in asked order, and
+/// whether the app asked for a batch.
+fn account_data_keys(service: &str, args: &serde_json::Value) -> Result<(Vec<String>, bool), String> {
+    use crate::account_data::{MAX_KEYS, validate_key, INVALID_KEY};
+    let object = account_data_args(service, args, &["key", "keys"])?;
+    let parse_key = |value: &serde_json::Value| -> Result<String, String> {
+        let key = value.as_str().ok_or(INVALID_KEY)?;
+        validate_key(key)?;
+        Ok(key.to_string())
+    };
+    match (object.get("key"), object.get("keys")) {
+        (Some(single), None) => Ok((vec![parse_key(single)?], false)),
+        (None, Some(many)) => {
+            let many = many.as_array().filter(|many| (1..=MAX_KEYS).contains(&many.len()))
+                .ok_or_else(|| format!("{service} {{keys}} must list 1 to {MAX_KEYS} keys"))?;
+            let mut keys: Vec<String> = Vec::new();
+            for value in many {
+                let key = parse_key(value)?;
+                if !keys.contains(&key) { keys.push(key); }
+            }
+            Ok((keys, true))
+        }
+        (Some(_), Some(_)) => Err(format!("{service} takes {{key}} or {{keys}}, not both")),
+        (None, None) => Err(format!("{service} needs {{key}} or {{keys}}")),
+    }
+}
+
+/// A write's `{key, content}`: an object within the size caps, or null to delete.
+fn account_data_write(service: &str, args: &serde_json::Value) -> Result<(String, Option<serde_json::Value>), String> {
+    use crate::account_data::{validate_content, validate_key, INVALID_KEY};
+    let object = account_data_args(service, args, &["key", "content"])?;
+    let (Some(key), Some(content)) = (object.get("key"), object.get("content")) else {
+        return Err(format!("{service} needs {{key, content}}; content: null deletes the key"));
+    };
+    let key = key.as_str().ok_or(INVALID_KEY)?;
+    validate_key(key)?;
+    if content.is_null() { return Ok((key.to_string(), None)); }
+    validate_content(key, content)?;
+    Ok((key.to_string(), Some(content.clone())))
+}
 
 /// Validates and clamps a call's arguments. Runs AFTER the permission gate,
 /// so a first-use prompt still reads sensibly before an argument error.
@@ -364,6 +428,16 @@ pub fn parse(service: &str, args: &serde_json::Value, has_room: bool) -> Result<
         "matrix.device" => MatrixServiceCall::Device,
         "matrix.account_info" => MatrixServiceCall::AccountInfo,
         "matrix.ignored_users" => MatrixServiceCall::IgnoredUsers,
+        "matrix.account_data" | "matrix.room_account_data" => {
+            let (keys, is_batch) = account_data_keys(service, args)?;
+            if service == "matrix.account_data" { MatrixServiceCall::AccountData { keys, is_batch } }
+            else { MatrixServiceCall::RoomAccountData { keys, is_batch } }
+        }
+        "matrix.set_account_data" | "matrix.set_room_account_data" => {
+            let (key, content) = account_data_write(service, args)?;
+            if service == "matrix.set_account_data" { MatrixServiceCall::SetAccountData { key, content } }
+            else { MatrixServiceCall::SetRoomAccountData { key, content } }
+        }
 
         // --- send ---
         "matrix.reply" | "matrix.thread_reply" => MatrixServiceCall::Reply {
@@ -441,6 +515,9 @@ pub fn cost(service: &str) -> f64 {
         "matrix.profile" => 1.0,
         "matrix.device" | "matrix.account_info" | "matrix.ignored_users" | "matrix.dm_find" => 1.0,
         "matrix.user_profile" => 5.0,
+        // One charge per read, however many keys; a write reaches the server.
+        "matrix.account_data" | "matrix.room_account_data" => 1.0,
+        "matrix.set_account_data" | "matrix.set_room_account_data" => 8.0,
         // ----- send: speaks as the user -----
         "matrix.send_message" | "matrix.a2ui_action" => 5.0,
         "matrix.send_media" => 8.0,
@@ -475,6 +552,7 @@ mod tests {
             "matrix.thread_replies", "matrix.older_messages", "matrix.event", "matrix.read_receipts",
             "matrix.unread", "matrix.power_levels", "matrix.permalink", "matrix.successor",
             "matrix.download_media", "matrix.media_preview",
+            "matrix.room_account_data", "matrix.set_room_account_data",
         ] {
             let err = parse(service, &serde_json::json!({}), false).err();
             assert_eq!(err.as_deref(), Some("this mini-app is not attached to a room"), "{service}");
@@ -711,6 +789,123 @@ mod rooms_and_account_tests {
         assert!(matches!(parse("matrix.device", &json!({}), false), Ok(MatrixServiceCall::Device)));
         assert!(matches!(parse("matrix.account_info", &json!({}), false), Ok(MatrixServiceCall::AccountInfo)));
         assert!(matches!(parse("matrix.ignored_users", &json!({}), false), Ok(MatrixServiceCall::IgnoredUsers)));
+        assert!(matches!(parse("matrix.account_data", &json!({"key": "prefs"}), false), Ok(MatrixServiceCall::AccountData { .. })));
+        assert!(matches!(parse("matrix.set_account_data", &json!({"key": "prefs", "content": null}), false),
+            Ok(MatrixServiceCall::SetAccountData { .. })));
+    }
+}
+
+#[cfg(test)]
+mod account_data_tests {
+    use super::*;
+    use crate::account_data::{CONTENT_NOT_OBJECT, CONTENT_TOO_COMPLEX, CONTENT_TOO_LARGE, INVALID_KEY, MAX_CONTENT_BYTES, MAX_KEYS};
+    use serde_json::json;
+
+    fn read(service: &str, args: serde_json::Value) -> Result<(Vec<String>, bool), String> {
+        match parse(service, &args, true)? {
+            MatrixServiceCall::AccountData { keys, is_batch } if service == "matrix.account_data" => Ok((keys, is_batch)),
+            MatrixServiceCall::RoomAccountData { keys, is_batch } if service == "matrix.room_account_data" => Ok((keys, is_batch)),
+            _ => panic!("{service} parsed to another call"),
+        }
+    }
+
+    fn write(service: &str, args: serde_json::Value) -> Result<(String, Option<serde_json::Value>), String> {
+        match parse(service, &args, true)? {
+            MatrixServiceCall::SetAccountData { key, content } if service == "matrix.set_account_data" => Ok((key, content)),
+            MatrixServiceCall::SetRoomAccountData { key, content } if service == "matrix.set_room_account_data" => Ok((key, content)),
+            _ => panic!("{service} parsed to another call"),
+        }
+    }
+
+    #[test]
+    fn reads_take_one_key_or_a_deduped_batch() {
+        for service in ["matrix.account_data", "matrix.room_account_data"] {
+            assert_eq!(read(service, json!({"key": "prefs"})), Ok((vec!["prefs".to_string()], false)));
+            assert_eq!(read(service, json!({"keys": ["prefs"]})), Ok((vec!["prefs".to_string()], true)), "a batch of one keeps its shape");
+            assert_eq!(read(service, json!({"keys": ["b", "a", "b", "a", "c"]})),
+                Ok((["b", "a", "c"].map(String::from).to_vec(), true)), "deduped in asked order");
+            let most: Vec<String> = (0..MAX_KEYS).map(|n| format!("k{n}")).collect();
+            assert_eq!(read(service, json!({"keys": most})), Ok((most.clone(), true)));
+            let too_many: Vec<String> = (0..=MAX_KEYS).map(|n| format!("k{n}")).collect();
+            for args in [json!({"keys": []}), json!({"keys": too_many}), json!({"keys": "prefs"}), json!({"keys": null})] {
+                assert_eq!(read(service, args).unwrap_err(), format!("{service} {{keys}} must list 1 to {MAX_KEYS} keys"));
+            }
+            assert_eq!(read(service, json!({"key": "prefs", "keys": ["prefs"]})).unwrap_err(), format!("{service} takes {{key}} or {{keys}}, not both"));
+            for args in [json!({}), json!(null), json!([]), json!("prefs")] {
+                assert_eq!(read(service, args).unwrap_err(), format!("{service} needs {{key}} or {{keys}}"));
+            }
+            for args in [json!({"key": "Prefs"}), json!({"key": ""}), json!({"key": 3}), json!({"key": null}), json!({"key": "m.direct"}),
+                json!({"key": "rs.robius.a2app.appdata.other.prefs"}), json!({"keys": ["ok", "not ok"]}), json!({"keys": ["ok", 1]})]
+            {
+                assert_eq!(read(service, args).unwrap_err(), INVALID_KEY);
+            }
+        }
+    }
+
+    #[test]
+    fn robrix_chooses_the_type_so_other_arguments_are_refused() {
+        for (service, args) in [
+            ("matrix.account_data", json!({"key": "prefs", "type": "m.direct"})),
+            ("matrix.room_account_data", json!({"key": "prefs", "room_id": "!other:s"})),
+            ("matrix.account_data", json!({"keys": ["prefs"], "app_id": "other"})),
+            ("matrix.room_account_data", json!({"event_type": "m.fully_read"})),
+        ] {
+            assert_eq!(read(service, args).unwrap_err(), format!("{service} takes only {{key}} or {{keys}}: Robrix chooses the event type."));
+        }
+        for (service, args) in [
+            ("matrix.set_account_data", json!({"key": "prefs", "content": {}, "type": "m.direct"})),
+            ("matrix.set_room_account_data", json!({"key": "prefs", "content": {}, "room_id": "!other:s"})),
+            ("matrix.set_account_data", json!({"key": "prefs", "content": {}, "keys": ["prefs"]})),
+        ] {
+            assert_eq!(write(service, args).unwrap_err(), format!("{service} takes only {{key, content}}: Robrix chooses the event type."));
+        }
+    }
+
+    #[test]
+    fn writes_take_an_object_within_both_caps_or_null_to_delete() {
+        for service in ["matrix.set_account_data", "matrix.set_room_account_data"] {
+            let content = json!({"theme": "dark", "sizes": [1, 2]});
+            assert_eq!(write(service, json!({"key": "prefs", "content": content})), Ok(("prefs".to_string(), Some(content))));
+            assert_eq!(write(service, json!({"key": "prefs", "content": null})), Ok(("prefs".to_string(), None)), "null deletes");
+            for args in [json!({"key": "prefs"}), json!({"content": {}}), json!({}), json!(null)] {
+                assert!(write(service, args).unwrap_err().starts_with(&format!("{service} needs {{key, content}}")));
+            }
+            for content in [json!([1]), json!("text"), json!(1), json!(false)] {
+                assert_eq!(write(service, json!({"key": "prefs", "content": content})).unwrap_err(), CONTENT_NOT_OBJECT);
+            }
+            let large = json!({"data": "x".repeat(MAX_CONTENT_BYTES)});
+            assert_eq!(write(service, json!({"key": "prefs", "content": large})).unwrap_err(), CONTENT_TOO_LARGE);
+            let grid = json!({"cells": vec![vec![1; 64]; 64]});
+            assert_eq!(write(service, json!({"key": "grid", "content": grid})).unwrap_err(), CONTENT_TOO_COMPLEX,
+                "small JSON that a review could not show is refused before any effect review");
+            for args in [json!({"key": "Prefs", "content": {}}), json!({"key": 1, "content": {}}), json!({"key": "a.b", "content": null})] {
+                assert_eq!(write(service, args).unwrap_err(), INVALID_KEY);
+            }
+        }
+    }
+
+    #[test]
+    fn room_notes_need_a_room_but_global_data_does_not() {
+        for (service, args) in [("matrix.room_account_data", json!({"key": "notes"})),
+            ("matrix.set_room_account_data", json!({"key": "notes", "content": {}}))]
+        {
+            assert_eq!(parse(service, &args, false).err().as_deref(), Some("this mini-app is not attached to a room"));
+            assert!(parse(service, &args, true).is_ok());
+        }
+        assert!(matches!(parse("matrix.account_data", &json!({"keys": ["a", "b"]}), false),
+            Ok(MatrixServiceCall::AccountData { is_batch: true, .. })));
+        assert!(matches!(parse("matrix.set_account_data", &json!({"key": "a", "content": {"x": 1}}), false),
+            Ok(MatrixServiceCall::SetAccountData { content: Some(_), .. })));
+    }
+
+    #[test]
+    fn a_read_costs_one_token_however_many_keys_and_a_write_costs_a_send() {
+        for service in ["matrix.account_data", "matrix.room_account_data"] {
+            assert_eq!(cost(service), 1.0);
+        }
+        for service in ["matrix.set_account_data", "matrix.set_room_account_data"] {
+            assert_eq!(cost(service), 8.0);
+        }
     }
 }
 

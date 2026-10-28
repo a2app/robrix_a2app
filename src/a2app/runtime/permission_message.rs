@@ -136,10 +136,12 @@ mod tests {
     fn nonmessage_and_malformed_inputs_never_become_a_message_preview() {
         let payload = json!({"body":"request body", "text":"agent text", "caption":"not a media message",
             "format":"org.matrix.custom.html", "formatted_body":"<b>unrelated rich data</b>"});
-        for capability in ["network.http", "matrix.room.messages.search", "matrix.room.info.read", "device.clipboard.write", "apps.generate"] {
+        for capability in ["network.http", "matrix.room.messages.search", "matrix.room.info.read", "device.clipboard.write", "apps.generate",
+            "matrix.account.data.write", "matrix.room.account_data.write"] {
             assert!(from_flow_payload(capability, &payload, true).is_none(), "{capability}");
         }
-        for service in ["network.http", "matrix.room_info", "matrix.search_room", "clipboard.write", "permissions.request"] {
+        for service in ["network.http", "matrix.room_info", "matrix.search_room", "clipboard.write", "permissions.request",
+            "matrix.set_account_data", "matrix.set_room_account_data"] {
             assert!(from_bridge(&request(service, payload.clone())).is_none(), "{service}");
         }
         assert!(from_flow_payload("matrix.room.message.send", &json!({"body":42}), false).is_none());

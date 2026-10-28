@@ -709,6 +709,7 @@ pub fn terminate(cx: &mut Cx, key: &InstanceKey) -> bool {
     let _ = a2app_core::information_flow::remove_context_for_activation(&instance.flow_context, instance.flow_epoch);
     if let Some(heap) = instance.heap_key {
         super::runtime::with_a2app(|state| state.broker.forget_instance(heap));
+        super::runtime::forget_hook_subs(heap);
     }
     splash_of(cx, &instance.host).set_text(cx, "");
     drop(instance);

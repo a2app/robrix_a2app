@@ -138,7 +138,10 @@ mod tests {
     }
 
     impl Fixture {
-        fn new(name: &str) -> Self {
+        fn new(name: &str) -> Self { Self::with_app(name, |_| {}) }
+
+        /// The fixture with its app changed by `customize` before any instance starts.
+        fn with_app(name: &str, customize: impl FnOnce(&mut MiniAppManifest)) -> Self {
             let account = format!("@{name}:room-session-test");
             let previous_account = super::super::super::information_flow::TEST_ACCOUNT.with(|value| value.replace(Some(account.clone())));
             let previous_state = A2APP.with(|value| value.replace(None));
@@ -155,6 +158,7 @@ fn ask_watch(){
 fn on_room_message(payload){ ui.hits.set_text("delivered") }
 View{status := Label{text:"waiting"} hits := Label{text:"none"}}
 "#.into();
+            customize(&mut manifest);
             initialize_background_test(manifest.clone());
             let mut cx = Cx::new(Box::new(|_, _| {}));
             let (template, root) = cx.with_vm(|vm| {
@@ -182,13 +186,20 @@ View{status := Label{text:"waiting"} hits := Label{text:"none"}}
         fn context(&self, index: usize) -> ContextId { instances::context_of_key(&self.keys[index]).unwrap() }
         fn heap(&self, index: usize) -> usize { instances::heap_of(&self.keys[index]).unwrap() }
         fn host(&self, index: usize) -> WidgetRef { instances::host_of(&self.keys[index]).unwrap() }
-        fn prompt(&mut self, index: usize) -> PermissionPrompt {
+        fn status(&self, index: usize) -> String { self.host(index).widget(&self.cx, ids!(status)).text() }
+
+        /// Runs script fn `name` in instance `index` and takes the `service` request it made.
+        fn request(&mut self, index: usize, name: LiveId, args: &[&str], service: &str) -> SplashHostRequest {
             let host = self.host(index);
             assert!(host.widget(&self.cx, ids!(splash)).borrow_mut::<Splash>().unwrap()
-                .call_script_fn(&mut self.cx, id!(ask_watch), &[]));
+                .call_script_fn_with_strings(&mut self.cx, name, args));
             self.cx.with_vm_and_async(|_| {});
-            let request = makepad_widgets::splash_host::take_splash_host_requests().into_iter()
-                .find(|request| request.heap_key == self.heap(index) && request.service == "events.subscribe").unwrap();
+            makepad_widgets::splash_host::take_splash_host_requests().into_iter()
+                .find(|request| request.heap_key == self.heap(index) && request.service == service).unwrap()
+        }
+
+        fn prompt(&mut self, index: usize) -> PermissionPrompt {
+            let request = self.request(index, id!(ask_watch), &[], "events.subscribe");
             let context = self.context(index);
             let epoch = flow::context_epoch(&context).unwrap();
             PermissionPrompt { setup: None, id: next_permission_prompt_id(), subject: self.manifest.id.clone(),
@@ -314,11 +325,151 @@ View{status := Label{text:"waiting"} hits := Label{text:"none"}}
             assert_eq!(state.permissions.effective_capability_in_context(&fixture.manifest, capability,
                 PermissionContext { origin_room: Some(ORIGIN), target_room: Some(ORIGIN) }), Effective::NeedsPrompt);
         });
-        deliver_room_hooks(&mut fixture.cx, &WidgetRef::empty(), Vec::new(), Vec::new(),
+        deliver_room_hooks(&mut fixture.cx, &WidgetRef::empty(), Vec::new(), Vec::new(), Vec::new(),
             vec![("on_room_message", serde_json::json!({"room_id":OTHER,"body":"after close"}))]);
         fixture.cx.with_vm_and_async(|_| {});
         assert_eq!(surviving_host.widget(&fixture.cx, ids!(hits)).text(), "delivered");
         assert!(!instances::call_hook(&mut fixture.cx, &fixture.keys[0], id!(on_room_message), &["[]"]));
+    }
+
+    #[test]
+    fn saved_data_changes_reach_only_their_own_app_after_the_saved_labels() {
+        use a2app_core::information_flow::{Label, Source};
+        let _policy_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
+        let mut fixture = Fixture::with_app("saved-data-hook", |manifest| {
+            manifest.permissions = vec![Permission::MatrixAccountRead.as_str().into()];
+            manifest.capabilities = vec!["on_account_data_changed".into()];
+            manifest.source = r#"
+fn on_account_data_changed(payload){ ui.hits.set_text(payload) }
+View{status := Label{text:"waiting"} hits := Label{text:"none"}}
+"#.into();
+        });
+        let (app, account) = (fixture.manifest.id.clone(), fixture.account.clone());
+        let heaps = [fixture.heap(0), fixture.heap(1)];
+        with_a2app(|state| {
+            state.permissions.set(&app, Permission::MatrixAccountRead, GrantState::Granted);
+            for (index, room) in [ORIGIN, OTHER].into_iter().enumerate() {
+                state.hook_subs.insert(heaps[index], HookSubscription { app_id: app.clone(),
+                    room_id: Some(room.try_into().unwrap()), hooks: HashSet::from(["on_account_data_changed"]) });
+            }
+        });
+        let room = |room: &str| Source::Room { account: account.clone(), room: room.into() };
+        let event = |app: &str, key: &str, account: &str, label: Label|
+            A2AppAccountDataEvent { account: account.into(), app_id: app.into(), key: key.into(), label };
+        deliver_room_hooks(&mut fixture.cx, &WidgetRef::empty(), Vec::new(), Vec::new(), vec![
+            event(&app, "prefs", &account, [room("!writer:test")].into()),
+            event(&app, "drafts", &account, [room("!drafts:test")].into()),
+            event(&app, "prefs", &account, Label::new()),
+            event("another-app", "secret", &account, [room("!another-app:test")].into()),
+            event(&app, "stale", "@previous:room-session-test", [room("!previous:test")].into()),
+        ], Vec::new());
+        fixture.cx.with_vm_and_async(|_| {});
+        for index in 0..2 {
+            assert_eq!(fixture.host(index).widget(&fixture.cx, ids!(hits)).text(), r#"{"keys":["drafts","prefs"]}"#,
+                "one call per instance with its app's sorted keys");
+            let labels = flow::labels(&fixture.context(index)).unwrap();
+            assert!(labels.contains(&room("!writer:test")) && labels.contains(&room("!drafts:test")));
+            assert!(!labels.contains(&room("!another-app:test")) && !labels.contains(&room("!previous:test")));
+        }
+        // A label that can't be joined stops the call itself.
+        let unjoinable = Source::Room { account: String::new(), room: String::new() };
+        deliver_room_hooks(&mut fixture.cx, &WidgetRef::empty(), Vec::new(), Vec::new(),
+            vec![event(&app, "later", &account, [unjoinable].into())], Vec::new());
+        fixture.cx.with_vm_and_async(|_| {});
+        assert_eq!(fixture.host(0).widget(&fixture.cx, ids!(hits)).text(), r#"{"keys":["drafts","prefs"]}"#);
+    }
+
+    #[test]
+    fn only_the_instances_own_app_and_room_subscribe_to_saved_data_changes() {
+        let _policy_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
+        let mut fixture = Fixture::with_app("saved-data-subscribe", |manifest| {
+            manifest.permissions = vec![Permission::MatrixAccountRead.as_str().into()];
+            manifest.capabilities = vec!["on_account_data_changed".into()];
+            manifest.source = r#"
+fn subscribe(){
+    ui.status.set_text("waiting")
+    host.request("events.subscribe", {event:"on_account_data_changed"}, fn(r){
+        ui.status.set_text(if r.is_ok {"subscribed"} else {r.error})
+    })
+}
+fn on_account_data_changed(payload){ ui.hits.set_text(payload) }
+View{status := Label{text:"waiting"} hits := Label{text:"none"}}
+"#.into();
+        });
+        let (app, heap) = (fixture.manifest.id.clone(), fixture.heap(0));
+        with_a2app(|state| state.permissions.set(&app, Permission::MatrixAccountRead, GrantState::Granted));
+        let subscribe = |fixture: &mut Fixture, app_id: &str, room: Option<&str>| {
+            let request = fixture.request(0, id!(subscribe), &[], "events.subscribe");
+            apply_broker_ask(&mut fixture.cx, &WidgetRef::empty(), BrokerAsk::Subscribe {
+                reply: Reply { heap_key: heap, req_id: request.req_id }, app_id: app_id.into(), heap_key: heap,
+                room: room.map(str::to_owned), hook: "on_account_data_changed",
+            });
+            fixture.cx.with_vm_and_async(|_| {});
+            fixture.status(0)
+        };
+        // The broker takes the app and room from the instance tag, which an app dir named "app@room" can forge.
+        for (app_id, room) in [("another-app", Some(ORIGIN)), (app.as_str(), Some(OTHER)), (app.as_str(), None)] {
+            assert_eq!(subscribe(&mut fixture, app_id, room), a2app_core::account_data::WRONG_COMPARTMENT, "{app_id} in {room:?}");
+            with_a2app(|state| assert!(!state.hook_subs.contains_key(&heap), "{app_id} in {room:?}"));
+        }
+        assert_eq!(subscribe(&mut fixture, &app, Some(ORIGIN)), "subscribed");
+        with_a2app(|state| assert!(state.hook_subs[&heap].hooks.contains("on_account_data_changed")));
+        let changed = A2AppAccountDataEvent { account: fixture.account.clone(), app_id: app.clone(), key: "prefs".into(), label: Default::default() };
+        deliver_room_hooks(&mut fixture.cx, &WidgetRef::empty(), Vec::new(), Vec::new(), vec![changed], Vec::new());
+        fixture.cx.with_vm_and_async(|_| {});
+        assert_eq!(fixture.host(0).widget(&fixture.cx, ids!(hits)).text(), r#"{"keys":["prefs"]}"#);
+        // The next isolate can get this heap key, so the row leaves with its instance.
+        instances::terminate(&mut fixture.cx, &fixture.keys[0]);
+        with_a2app(|state| assert!(!state.hook_subs.contains_key(&heap)));
+    }
+
+    #[test]
+    fn saved_data_calls_that_would_be_refused_never_prompt() {
+        use a2app_core::account_data::{self as saved, Kind};
+        let _policy_lock = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
+        let mut fixture = Fixture::with_app("saved-data-cap", |manifest| {
+            manifest.permissions = vec![Permission::MatrixAccountWrite.as_str().into(), Permission::MatrixRoomManage.as_str().into()];
+            manifest.capabilities = vec!["matrix.account.data.write".into(), "matrix.room.account_data.write".into()];
+            manifest.source = r#"
+fn save(service, name){
+    ui.status.set_text("waiting")
+    host.request(service, {key: name content: {}}, fn(r){
+        ui.status.set_text(if r.is_ok {"saved"} else {r.error})
+    })
+}
+View{status := Label{text:"waiting"} hits := Label{text:"none"}}
+"#.into();
+        });
+        let app = fixture.manifest.id.clone();
+        let context = fixture.context(0);
+        with_a2app(|state| for kind in [Kind::Global, Kind::RoomNotes] {
+            for n in 0..saved::MAX_KEYS {
+                state.persisted.record_account_data_key(saved::index_key(&context, kind).unwrap(), &format!("k{n}"));
+            }
+        });
+        let prompts = || with_a2app(|state| state.prompts.len() + usize::from(state.active_prompt.is_some())).unwrap();
+        let ask = |fixture: &mut Fixture, request: SplashHostRequest, perm: Permission| {
+            queue_permission_prompt(&mut fixture.cx, &WidgetRef::empty(), fixture.manifest.id.clone(), perm,
+                ParkedRequest::Bridge(Some(request)), None);
+            fixture.cx.with_vm_and_async(|_| {});
+            fixture.status(0)
+        };
+        for (service, perm) in [("matrix.set_account_data", Permission::MatrixAccountWrite),
+            ("matrix.set_room_account_data", Permission::MatrixRoomManage)]
+        {
+            let request = fixture.request(0, id!(save), &[service, "new"], service);
+            assert_eq!(ask(&mut fixture, request, perm), saved::TOO_MANY_KEYS, "{service}");
+            assert_eq!(prompts(), 0, "{service}: a 33rd key is refused before anyone approves it");
+            let request = fixture.request(0, id!(save), &[service, "k0"], service);
+            assert_eq!(ask(&mut fixture, request, perm), "waiting");
+            assert_eq!(prompts(), 1, "{service}: a used key still asks");
+            with_a2app(|state| { state.prompts.clear(); state.active_prompt = None; });
+        }
+        // A tag naming another compartment than the heap's own.
+        let mut request = fixture.request(0, id!(save), &["matrix.set_account_data", "k0"], "matrix.set_account_data");
+        request.app_tag = a2app_core::manifest::instance_tag(&app, Some(OTHER));
+        assert_eq!(ask(&mut fixture, request, Permission::MatrixAccountWrite), saved::WRONG_COMPARTMENT);
+        assert_eq!(prompts(), 0);
     }
 
     #[test]

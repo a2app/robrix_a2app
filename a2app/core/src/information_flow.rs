@@ -29,7 +29,7 @@ mod integrity;
 mod storage;
 mod effects;
 pub use sharing::{ReaderScope, SharingDuration, SharingGrant, FlowDecision};
-pub use integrity::{Influence, Influences, SensitiveAction, AuthoritySession, ActionAuthority, ActionDecision, ActionRequest, ACTION_REVIEW_REQUIRED};
+pub use integrity::{Influence, Influences, SensitiveAction, AuthoritySession, ActionAuthority, ActionDecision, ActionRequest, ACTION_REVIEW_REQUIRED, is_reviewable_payload};
 pub use effects::{EffectAuthority, EffectReview, EffectRoomScopeMatcher, EFFECT_REVIEW_REQUIRED};
 use storage::{Metadata, StoredContext, StoredProvenance};
 

@@ -3955,6 +3955,7 @@ async fn start_matrix_client_login_and_sync(rt: Handle) {
         let status = format!("Logged in as {}.\n → Loading rooms...", logged_in_user_id);
         enqueue_rooms_list_update(RoomsListUpdate::Status { status });
 
+        #[cfg(feature = "a2app")] crate::a2app::matrix::account_data::reset_store_synced();
         // Store this active client in our global Client state so that other tasks can access it.
         if let Some(_existing) = CLIENT.lock().unwrap().replace(client.clone()) {
             error!("BUG: unexpectedly replaced an existing client when initializing the matrix client.");
@@ -3990,6 +3991,7 @@ async fn start_matrix_client_login_and_sync(rt: Handle) {
             handle_session_changes(client.clone()),
         ];
         add_room_member_event_handlers(&client);
+        #[cfg(feature = "a2app")] crate::a2app::account_data_watch::register(&client);
 
         Cx::post_action(LoginAction::Status {
             title: "Connecting".into(),
@@ -5371,6 +5373,8 @@ fn handle_sync_indicator_subscriber(sync_service: &SyncService) -> JoinHandle<()
 
 fn handle_room_list_service_loading_state(mut loading_state: Subscriber<RoomListLoadingState>) {
     log!("Initial room list loading state is {:?}", loading_state.get());
+    // Read after CLIENT is stored, so this names the account whose rooms are loading.
+    #[cfg(feature = "a2app")] let synced_account = current_user_id();
     Handle::current().spawn(async move {
         while let Some(state) = loading_state.next().await {
             log!("Received a room list loading state update: {state:?}");
@@ -5380,6 +5384,7 @@ fn handle_room_list_service_loading_state(mut loading_state: Subscriber<RoomList
                 }
                 RoomListLoadingState::Loaded { maximum_number_of_rooms } => {
                     enqueue_rooms_list_update(RoomsListUpdate::LoadedRooms { max_rooms: maximum_number_of_rooms });
+                    #[cfg(feature = "a2app")] crate::a2app::matrix::account_data::mark_store_synced(synced_account.clone());
                     // The SDK docs state that we cannot move from the `Loaded` state
                     // back to the `NotLoaded` state, so we can safely exit this task here.
                     return;
@@ -7033,6 +7038,7 @@ impl UserPowerLevels {
 /// which needs to keep running to receive the next login request.
 pub async fn clear_app_state(config: &LogoutConfig) -> Result<()> {
     CLIENT.lock().unwrap().take();
+    #[cfg(feature = "a2app")] crate::a2app::matrix::account_data::reset_store_synced();
     SYNC_SERVICE.lock().unwrap().take();
     SYNC_SERVICE_ASSUMED_RUNNING.store(false, Ordering::Release);
     set_blocked_users(HashSet::default());
