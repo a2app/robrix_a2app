@@ -633,7 +633,7 @@ async fn check_marker(room_id: &OwnedRoomId) -> Option<AiRoomAction> {
     };
     for _ in 0..20 {
         if let Some(marker) = read_marker(&room).await {
-            return Some(attached_action(&room, room_id, marker).await);
+            return attached_action(&room, room_id, marker).await;
         }
         let state_synced = room
             .get_state_event(StateEventType::RoomCreate, "")
@@ -648,7 +648,7 @@ async fn check_marker(room_id: &OwnedRoomId) -> Option<AiRoomAction> {
             // authoritative "not an AI room", and a transient fetch failure
             // just retries below without classifying the room.
             match read_marker_from_server(&room).await {
-                Ok(Some(marker)) => return Some(attached_action(&room, room_id, marker).await),
+                Ok(Some(marker)) => return attached_action(&room, room_id, marker).await,
                 Ok(None) => {
                     log!("AI Rooms worker: room {room_id} exists and its state has synced (m.room.create cached), but the homeserver reports no ai_room marker event.");
                     return Some(AiRoomAction::NotAiRoom { room_id: room_id.clone() });
@@ -670,12 +670,17 @@ async fn attached_action(
     room: &Room,
     room_id: &OwnedRoomId,
     marker: AiRoomMarkerContent,
-) -> AiRoomAction {
-    let cursor = read_cursor(room).await
-        .and_then(|c| c.cursor)
-        .and_then(|c| <&matrix_sdk::ruma::EventId>::try_from(c.as_str()).ok().map(ToOwned::to_owned));
+) -> Option<AiRoomAction> {
+    let cursor = match read_cursor(room).await {
+        Ok(saved) => saved.and_then(|c| c.cursor)
+            .and_then(|c| <&matrix_sdk::ruma::EventId>::try_from(c.as_str()).ok().map(ToOwned::to_owned)),
+        Err(e) => {
+            log!("AI Rooms worker: couldn't read room {room_id}'s forwarding cursor ({e}); deferring (re-checked when the room is next opened).");
+            return None;
+        }
+    };
     log!("AI Rooms worker: room {room_id} IS an AI room (marker name: {:?}, saved cursor: {:?}).", marker.name, cursor);
-    AiRoomAction::Attached { room_id: room_id.clone(), name: marker.name, cursor }
+    Some(AiRoomAction::Attached { room_id: room_id.clone(), name: marker.name, cursor })
 }
 
 /// Reads the raw JSON of a `Raw<AnySyncStateEvent>`/`Raw<AnyStrippedStateEvent>`,
@@ -766,18 +771,26 @@ async fn read_marker_from_full_state(
     Ok(None)
 }
 
-/// Reads this room's forwarding-cursor account data, if any.
-async fn read_cursor(room: &Room) -> Option<AiSessionCursorContent> {
-    let raw = room.account_data(RoomAccountDataEventType::from(AI_SESSION_DATA_EVENT_TYPE)).await.ok()??;
-    let json: serde_json::Value = raw.deserialize_as_unchecked().ok()?;
-    serde_json::from_value(json.get("content")?.clone()).ok()
+/// Reads this room's forwarding-cursor account data, if any. A store error is
+/// not "nothing saved": attaching without the cursor would forward old messages.
+async fn read_cursor(room: &Room) -> Result<Option<AiSessionCursorContent>, String> {
+    let Some(raw) = room.account_data(RoomAccountDataEventType::from(AI_SESSION_DATA_EVENT_TYPE)).await
+        .map_err(|e| e.to_string())? else { return Ok(None) };
+    let json: serde_json::Value = raw.deserialize_as_unchecked().map_err(|e| e.to_string())?;
+    Ok(json.get("content").cloned().and_then(|content| serde_json::from_value(content).ok()))
 }
 
-/// Persists the last-forwarded event id as room account data.
+/// Persists the last-forwarded event id as room account data. The id is Robrix's
+/// own record of what it forwarded, so the agent's label doesn't gate it.
 async fn save_cursor(room: &Room, cursor: &OwnedEventId, flow_context: &ContextId) -> Result<(), String> {
-    policy::ensure_agent_room_output_access(room.room_id().as_str())?;
-    policy::ensure_room_flow_output(flow_context, room.room_id().as_str())?;
+    ensure_agent_cursor_access(flow_context, room.room_id().as_str())?;
     write_cursor_account_data(room, cursor).await
+}
+
+/// A live agent activation may move its own room's cursor unless that room is blocked.
+fn ensure_agent_cursor_access(flow_context: &ContextId, room_id: &str) -> Result<(), String> {
+    crate::a2app::information_flow::current_context(flow_context)?;
+    policy::ensure_agent_room_output_access(room_id)
 }
 
 fn ensure_host_cursor_access(account: &str, current_account: Option<&str>, room_id: &OwnedRoomId) -> Result<(), String> {
@@ -1094,7 +1107,7 @@ mod cursor_write_tests {
         assert!(ensure_host_cursor_access(&captured, Some("@another:test"), &room_id).is_err());
         assert!(ensure_host_cursor_access(&captured, None, &room_id).is_err());
         assert!(policy::with_flow_activation(context.clone(), epoch, async {
-            policy::ensure_room_flow_output(&context, room.as_str())
+            ensure_agent_cursor_access(&context, room.as_str())
         }).await.is_err(), "ordinary agent cursor writes retain their activation check");
         store.set_room_policy(room.as_str(), RoomAccess::Write, a2app_core::permissions::PolicyDecision::Deny);
         policy::publish_permission_policy(&store);
@@ -1102,6 +1115,27 @@ mod cursor_write_tests {
         policy::publish_permission_policy(&a2app_core::permissions::PermissionStore::default());
         assert!(ensure_host_cursor_access(&captured, Some(&account), &room_id).is_ok(),
             "the write switch alone does not stop an AI room's own cursor");
+        crate::a2app::information_flow::TEST_ACCOUNT.with(|a| { a.replace(previous_account); });
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_live_agent_saves_its_cursor_even_while_holding_another_rooms_label() {
+        let _policy_guard = crate::a2app::effect_review::TEST_LOCK.lock().unwrap();
+        let account = format!("@cursor-label-{}:test", std::process::id());
+        let previous_account = crate::a2app::information_flow::TEST_ACCOUNT.with(|a| a.replace(Some(account.clone())));
+        let room: OwnedRoomId = "!cursor-label:test".try_into().unwrap();
+        let context = crate::a2app::information_flow::begin_agent_session(room.as_str()).unwrap();
+        let epoch = flow::context_epoch(&context).unwrap();
+        // A read from an earlier turn whose turn-scoped sharing rule is gone.
+        flow::add_sources(&context, [flow::Source::Room { account: account.clone(), room: "!other:test".into() }]).unwrap();
+        policy::publish_permission_policy(&a2app_core::permissions::PermissionStore::default());
+        let (is_label_allowed, is_cursor_allowed) = policy::with_flow_activation(context.clone(), epoch, async {
+            (policy::ensure_room_flow_output(&context, room.as_str()).is_ok(), ensure_agent_cursor_access(&context, room.as_str()).is_ok())
+        }).await;
+        assert!(!is_label_allowed, "the agent's label can't reach its room");
+        assert!(is_cursor_allowed, "yet the cursor, Robrix's own record, still saves, so a restart doesn't replay answered messages");
+        flow::remove_context_for_activation(&context, epoch).unwrap();
         crate::a2app::information_flow::TEST_ACCOUNT.with(|a| { a.replace(previous_account); });
     }
 

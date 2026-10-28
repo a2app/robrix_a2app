@@ -925,18 +925,36 @@ fn display_name_or_user_id(cx: &mut Cx, room_id: &OwnedRoomId, user_id: OwnedUse
 }
 
 /// Returns where forwarding can safely begin, or `None` when more history is needed.
-/// A missing saved cursor must never make previously answered messages look new.
+/// It starts after the saved cursor or the newest message an AI reply answered,
+/// whichever is later, so a stale or missing cursor never replays answered messages.
 #[cfg(all(feature = "a2app", unix))]
 fn ai_room_scan_start<'a>(
     cursor: Option<&EventId>,
+    is_answered: impl Fn(&EventId) -> bool,
     event_ids: impl IntoIterator<Item = Option<&'a EventId>>,
 ) -> Option<usize> {
-    match cursor {
-        Some(cursor) => event_ids.into_iter()
-            .position(|event_id| event_id == Some(cursor))
-            .map(|index| index + 1),
+    let (mut after_cursor, mut after_answered) = (None, None);
+    for (index, event_id) in event_ids.into_iter().enumerate() {
+        let Some(event_id) = event_id else { continue };
+        if Some(event_id) == cursor { after_cursor = Some(index + 1); }
+        if is_answered(event_id) { after_answered = Some(index + 1); }
+    }
+    match after_cursor.max(after_answered) {
+        Some(start) => Some(start),
+        None if cursor.is_some() => None,
         None => Some(0),
     }
+}
+
+/// The message one of this account's `ai_reply` items says it answered.
+#[cfg(all(feature = "a2app", unix))]
+fn ai_reply_answered(item: &TimelineItem, me: Option<&UserId>) -> Option<OwnedEventId> {
+    let TimelineItemKind::Event(event) = item.kind() else { return None };
+    let TimelineItemContent::OtherState(other) = event.content() else { return None };
+    let timeline::AnyOtherStateEventContentChange::_Custom { event_type } = other.content() else { return None };
+    if event_type != crate::a2app::ai_room_events::AI_REPLY_EVENT_TYPE || Some(event.sender()) != me { return None; }
+    let json = event.latest_json()?.deserialize_as::<serde_json::Value>().ok()?;
+    OwnedEventId::try_from(json.get("content")?.get("in_reply_to")?.as_str()?).ok()
 }
 
 /// Scans an AI room's currently-loaded timeline for member text messages
@@ -970,8 +988,13 @@ fn scan_ai_room_messages(
         return false;
     };
     let max_power: Option<UserPowerLevel> = members.iter().map(|m| m.power_level()).max();
+    let me = crate::sliding_sync::current_user_id();
+    let answered: HashSet<OwnedEventId> = items.iter()
+        .filter_map(|item| ai_reply_answered(item, me.as_deref()))
+        .collect();
     let Some(start_idx) = ai_room_scan_start(
         scan_state.cursor.as_deref(),
+        |event_id| answered.contains(event_id),
         items.iter().map(|item| item.as_event().and_then(|event| event.event_id())),
     ) else {
         // Recover the cursor before forwarding anything, even when enough newer
@@ -7626,16 +7649,32 @@ mod ai_room_scan_tests {
     #[test]
     fn new_room_starts_at_zero_without_a_saved_cursor() {
         let events = [None, Some(event_id!("$first:example.org"))];
-        assert_eq!(ai_room_scan_start(None, events), Some(0));
-        assert_eq!(ai_room_scan_start(None, []), Some(0));
+        assert_eq!(ai_room_scan_start(None, |_| false, events), Some(0));
+        assert_eq!(ai_room_scan_start(None, |_| false, []), Some(0));
     }
 
     #[test]
     fn missing_saved_cursor_waits_instead_of_replaying_loaded_messages() {
         let cursor = event_id!("$cursor:example.org");
         let events = [None, Some(event_id!("$newer:example.org"))];
-        assert_eq!(ai_room_scan_start(Some(cursor), events), None);
-        assert_eq!(ai_room_scan_start(Some(cursor), []), None);
+        assert_eq!(ai_room_scan_start(Some(cursor), |_| false, events), None);
+        assert_eq!(ai_room_scan_start(Some(cursor), |_| false, []), None);
+    }
+
+    #[test]
+    fn answered_messages_are_never_forwarded_again_whatever_the_saved_cursor() {
+        let (stale, answered, unanswered) =
+            (event_id!("$stale:example.org"), event_id!("$answered:example.org"), event_id!("$unanswered:example.org"));
+        let events = [Some(stale), Some(answered), None, Some(unanswered)];
+        let is_answered = |id: &matrix_sdk::ruma::EventId| id == answered;
+        // A cursor that stopped saving, one that was lost, and one that never loaded.
+        for cursor in [Some(stale), None, Some(event_id!("$older:example.org"))] {
+            let start = ai_room_scan_start(cursor, is_answered, events).unwrap();
+            let forwarded: Vec<_> = events.into_iter().skip(start).flatten().collect();
+            assert_eq!(forwarded, vec![unanswered], "cursor {cursor:?}");
+        }
+        // A newer saved cursor still wins over an older answered message.
+        assert_eq!(ai_room_scan_start(Some(unanswered), is_answered, events), Some(4));
     }
 
     #[test]
@@ -7649,7 +7688,7 @@ mod ai_room_scan_tests {
             None,
             Some(new_message),
         ];
-        let start = ai_room_scan_start(Some(cursor), events).unwrap();
+        let start = ai_room_scan_start(Some(cursor), |_| false, events).unwrap();
         let forwarded: Vec<_> = events.into_iter().skip(start).flatten().collect();
         assert_eq!(forwarded, vec![new_message]);
     }
@@ -7658,7 +7697,7 @@ mod ai_room_scan_tests {
     fn cursor_at_either_edge_never_replays_the_cursor_itself() {
         let cursor = event_id!("$cursor:example.org");
         let newer = event_id!("$newer:example.org");
-        assert_eq!(ai_room_scan_start(Some(cursor), [Some(cursor), Some(newer)]), Some(1));
-        assert_eq!(ai_room_scan_start(Some(cursor), [Some(newer), None, Some(cursor)]), Some(3));
+        assert_eq!(ai_room_scan_start(Some(cursor), |_| false, [Some(cursor), Some(newer)]), Some(1));
+        assert_eq!(ai_room_scan_start(Some(cursor), |_| false, [Some(newer), None, Some(cursor)]), Some(3));
     }
 }

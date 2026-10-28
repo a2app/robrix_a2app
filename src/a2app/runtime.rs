@@ -382,8 +382,8 @@ pub enum TaskResume {
     /// user approved (on a decline, the model call is refused as usual).
     UserPrompt { texts: Vec<(OwnedEventId, String)> },
     /// A tool read the host reviewed on the agent's behalf: the read runs once
-    /// approved, or is refused.
-    Read { kind: ReadToolKind, answer: Sender<Result<String, String>> },
+    /// approved, or is refused. `also` holds identical reads that joined it.
+    Read { kind: ReadToolKind, answer: Sender<Result<String, String>>, also: Vec<(ReadToolKind, Sender<Result<String, String>>)> },
     /// A finished reply the sharing check refused. It is posted once approved.
     /// `answer_id` is a parked `send_message`; `token` holds a closed turn's
     /// final writes open while the user decides.
@@ -6541,11 +6541,13 @@ fn show_next_task_prompt(cx: &mut Cx, ui: &WidgetRef) {
     // Names for the detail lines come from the room list, so a prompt says
     // "General" rather than `!abc:server`.
     let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
+    // A queued read review an earlier answer already covers is settled unseen.
+    let prompt = loop {
+        let next = with_a2app(|state| if permission_modal_is_open(state) { None } else { state.task_prompts.pop_front() }).flatten();
+        let Some(next) = next else { return show_next_permission_prompt(cx, ui) };
+        if let Some(prompt) = settle_read_review(cx, ui, next) { break prompt; }
+    };
     let info = with_a2app(|state| {
-        if permission_modal_is_open(state) {
-            return None;
-        }
-        let prompt = state.task_prompts.pop_front()?;
         // The model label and the room's live app-tool names let the details
         // name what a grant reaches instead of echoing raw ids.
         let model = a2app_agent::model_transport::current_recipient(&state.agent_prefs)
@@ -6570,12 +6572,13 @@ fn show_next_task_prompt(cx: &mut Cx, ui: &WidgetRef) {
 /// are shown ahead of task plans, one modal at a time.
 #[cfg(unix)]
 fn show_next_exact_review(cx: &mut Cx, ui: &WidgetRef) {
+    let rooms = cx.has_global::<RoomsListRef>().then(|| cx.get_global::<RoomsListRef>().clone());
     let info = with_a2app(|state| {
         if permission_modal_is_open(state) {
             return None;
         }
         let prompt = state.exact_reviews.pop_front()?;
-        let info = prompt.info.clone();
+        let info = TaskPromptInfo { title: ai_prompt_title(rooms.as_ref(), Some(prompt.room_id.as_str())), ..prompt.info.clone() };
         state.active_exact_review = Some(prompt);
         Some(info)
     })
@@ -6619,6 +6622,7 @@ fn task_prompt_info(
         })
         .collect();
     TaskPromptInfo {
+        title: ai_prompt_title(rooms, plan.context.room()),
         // Only the assistant's own paragraph. Robrix's framing is the modal
         // title and the detail rows below, never a label on the agent's words.
         explanation: plan.explanation.clone(),
@@ -6626,6 +6630,15 @@ fn task_prompt_info(
         // Exact capabilities, room scopes and sharing destinations are shown
         // in the item rows. A bounded room read needs no blanket warning.
         risk: None,
+    }
+}
+
+/// The modal's title, naming the room whose AI is asking.
+#[cfg(unix)]
+fn ai_prompt_title(rooms: Option<&RoomsListRef>, room: Option<&str>) -> String {
+    match room {
+        Some(room) => format!("The AI in “{}” is asking for access", resolve_room_label(rooms, room)),
+        None => String::from("Your room's AI is asking for access"),
     }
 }
 
@@ -6875,22 +6888,28 @@ fn answer_task_prompt(cx: &mut Cx, ui: &WidgetRef, action: TaskPermissionAction)
         // The reviewed read runs once, without asking again; a decline or a
         // partial approval refuses it, and the model is told not to retry.
         TaskResume::Reply { text, answer_id, token } => release_held_reply(&room_id, text, answer_id, token, is_granted),
-        TaskResume::Read { kind, answer } => match outcome {
-            Ok(_) if is_granted => run_ai_read_tool(cx, ui, &room_id, kind, answer, true),
-            Ok(_) => {
-                // "Not now" declines unrequested reads of this kind for the
-                // turn, so the agent cannot ask again room by room.
-                if matches!(action, TaskPermissionAction::NotNow) && let Some(group) = kind.capability().and_then(|cap| cap.group) {
-                    decline_read_reviews(&room_id, group);
+        TaskResume::Read { kind, answer, also } => {
+            // "Not now" declines unrequested reads of this kind for the
+            // turn, so the agent cannot ask again room by room.
+            if !is_granted && outcome.is_ok() && matches!(action, TaskPermissionAction::NotNow)
+                && let Some(group) = kind.capability().and_then(|cap| cap.group)
+            {
+                decline_read_reviews(&room_id, group);
+            }
+            for (kind, answer) in std::iter::once((kind, answer)).chain(also) {
+                match &outcome {
+                    Ok(_) if is_granted => run_ai_read_tool(cx, ui, &room_id, kind, answer, true),
+                    Ok(_) => {
+                        note_ai_tool_call(&room_id, read_tool_name(&kind), false, "Declined");
+                        let _ = answer.send(Err(AI_READ_DECLINED.into()));
+                    }
+                    Err(error) => {
+                        note_ai_tool_call(&room_id, read_tool_name(&kind), false, error);
+                        let _ = answer.send(Err(error.clone()));
+                    }
                 }
-                note_ai_tool_call(&room_id, read_tool_name(&kind), false, "Declined");
-                let _ = answer.send(Err(AI_READ_DECLINED.into()));
             }
-            Err(error) => {
-                note_ai_tool_call(&room_id, read_tool_name(&kind), false, &error);
-                let _ = answer.send(Err(error));
-            }
-        },
+        }
     }
     show_next_permission_prompt(cx, ui);
     ui.redraw(cx);
@@ -7066,8 +7085,10 @@ fn withdraw_task_prompt(prompt: TaskPrompt) {
         TaskResume::AgentTool(answer) => {
             let _ = answer.send(Ok(task_grants::outcome(&prompt.plan, &BTreeSet::new()).to_string()));
         }
-        TaskResume::Read { answer, .. } => {
-            let _ = answer.send(Err("The request was cancelled before it was reviewed.".into()));
+        TaskResume::Read { answer, also, .. } => {
+            for answer in std::iter::once(answer).chain(also.into_iter().map(|(_, answer)| answer)) {
+                let _ = answer.send(Err("The request was cancelled before it was reviewed.".into()));
+            }
         }
         TaskResume::Reply { answer_id, token, .. } => {
             with_a2app(|state| {
@@ -9848,38 +9869,13 @@ fn queue_ai_read_review(
     kind: ReadToolKind,
     answer: Sender<Result<String, String>>,
 ) {
-    let targets = match &kind {
-        ReadToolKind::OtherRoom { room, .. } => vec![room.clone()],
-        ReadToolKind::SpaceInfo { space } | ReadToolKind::SpaceRooms { space } => vec![space.clone()],
-        _ => Vec::new(),
-    };
-    let detail = read_kind_detail(&kind, &|id| resolve_room_label(None, id));
-    let request = task_grants::TaskRequest {
-        task: match detail {
-            Some(detail) => format!("{} {detail}", crate::a2app::ai_room_events::ai_tool_display_name(read_tool_name(&kind))),
-            None => crate::a2app::ai_room_events::ai_tool_display_name(read_tool_name(&kind)),
-        },
-        explanation: String::from("The assistant wants to read this to answer you. Allowing it also lets what it reads reach your AI service and its reply be posted here, until this turn ends."),
-        needs: vec![task_grants::TaskNeed::Capability { id: "read".into(), capability: cap.id.into(), targets, why: None }],
-    };
-    let plan = match resolve_agent_task(room_id, context, &request) {
+    let plan = match resolve_agent_task(room_id, context, &read_review_request(&kind, cap)) {
         Ok(plan) => plan,
         Err(error) => { let _ = answer.send(Err(error)); return; }
     };
     if !plan.needs_prompt() {
         // Nothing left to ask: either it is allowed now, or it cannot be.
-        let outcome = task_grants::outcome(&plan, &BTreeSet::new());
-        if outcome["status"] == "granted" {
-            run_ai_read_tool(cx, ui, room_id, kind, answer, true);
-            return;
-        }
-        let text = match outcome["not_granted"][0]["reason"].as_str() {
-            Some("invalid_target") => String::from("That room is not one of the user's joined rooms. Use list_rooms to find a room to read."),
-            Some("blocked_by_room_policy") => String::from("Reading this room is blocked in Mini Apps permissions."),
-            _ => cap.group.map(ai_tool_refused_text).unwrap_or_else(|| AI_READ_DECLINED.into()),
-        };
-        note_ai_tool_call(room_id, read_tool_name(&kind), false, &text);
-        let _ = answer.send(Err(text));
+        finish_unprompted_reads(cx, ui, room_id, cap, &plan, [(kind, answer)]);
         return;
     }
     if is_holding_unknown_data(context) {
@@ -9892,6 +9888,18 @@ fn queue_ai_read_review(
         let _ = answer.send(Err(text.into()));
         return;
     }
+    // The same review already waiting (or on screen) answers this read too.
+    let mut read = Some((kind, answer));
+    with_a2app(|state| {
+        let is_same = |prompt: &TaskPrompt| &prompt.room_id == room_id
+            && prompt.plan.needs_fingerprint == plan.needs_fingerprint
+            && matches!(prompt.resume, TaskResume::Read { .. });
+        let waiting = state.active_task.iter_mut().chain(state.task_prompts.iter_mut()).find(|prompt| is_same(prompt));
+        if let Some(TaskPrompt { resume: TaskResume::Read { also, .. }, .. }) = waiting {
+            also.extend(read.take());
+        }
+    });
+    let Some((kind, answer)) = read else { return };
     // Reviews have their own cap, so a looping agent cannot raise them forever.
     let is_over_limit = with_a2app(|state| {
         let count = state.read_review_counts.entry(room_id.to_string()).or_insert(0);
@@ -9907,9 +9915,70 @@ fn queue_ai_read_review(
         return;
     }
     with_a2app(|state| {
-        state.task_prompts.push_back(TaskPrompt { room_id: room_id.clone(), plan, resume: TaskResume::Read { kind, answer } });
+        state.task_prompts.push_back(TaskPrompt { room_id: room_id.clone(), plan, resume: TaskResume::Read { kind, answer, also: Vec::new() } });
     });
     show_next_permission_prompt(cx, ui);
+}
+
+/// The review a read the agent did not plan for raises.
+#[cfg(unix)]
+fn read_review_request(kind: &ReadToolKind, cap: &a2app_core::capabilities::Capability) -> task_grants::TaskRequest {
+    let targets = match kind {
+        ReadToolKind::OtherRoom { room, .. } => vec![room.clone()],
+        ReadToolKind::SpaceInfo { space } | ReadToolKind::SpaceRooms { space } => vec![space.clone()],
+        _ => Vec::new(),
+    };
+    let name = crate::a2app::ai_room_events::ai_tool_display_name(read_tool_name(kind));
+    task_grants::TaskRequest {
+        task: match read_kind_detail(kind, &|id| resolve_room_label(None, id)) {
+            Some(detail) => format!("{name} {detail}"),
+            None => name,
+        },
+        explanation: String::from("The assistant wants to read this to answer you. Allowing it also lets what it reads reach your AI service and its reply be posted here, until this turn ends."),
+        needs: vec![task_grants::TaskNeed::Capability { id: "read".into(), capability: cap.id.into(), targets, why: None }],
+    }
+}
+
+/// Runs the reads a plan that needs no prompt allows, or refuses them with its reason.
+#[cfg(unix)]
+fn finish_unprompted_reads(
+    cx: &mut Cx,
+    ui: &WidgetRef,
+    room_id: &OwnedRoomId,
+    cap: &a2app_core::capabilities::Capability,
+    plan: &TaskPlan,
+    reads: impl IntoIterator<Item = (ReadToolKind, Sender<Result<String, String>>)>,
+) {
+    let outcome = task_grants::outcome(plan, &BTreeSet::new());
+    let refusal = (outcome["status"] != "granted").then(|| match outcome["not_granted"][0]["reason"].as_str() {
+        Some("invalid_target") => String::from("That room is not one of the user's joined rooms. Use list_rooms to find a room to read."),
+        Some("blocked_by_room_policy") => String::from("Reading this room is blocked in Mini Apps permissions."),
+        _ => cap.group.map(ai_tool_refused_text).unwrap_or_else(|| AI_READ_DECLINED.into()),
+    });
+    for (kind, answer) in reads {
+        match &refusal {
+            None => run_ai_read_tool(cx, ui, room_id, kind, answer, true),
+            Some(text) => {
+                note_ai_tool_call(room_id, read_tool_name(&kind), false, text);
+                let _ = answer.send(Err(text.clone()));
+            }
+        }
+    }
+}
+
+/// A queued read review that an earlier answer already settled runs (or is
+/// refused) without being shown. Returns the prompt if it still needs the user.
+#[cfg(unix)]
+fn settle_read_review(cx: &mut Cx, ui: &WidgetRef, prompt: TaskPrompt) -> Option<TaskPrompt> {
+    let TaskResume::Read { kind, .. } = &prompt.resume else { return Some(prompt) };
+    let Some(cap) = kind.capability() else { return Some(prompt) };
+    let plan = match resolve_agent_task(&prompt.room_id, &prompt.plan.context, &read_review_request(kind, cap)) {
+        Ok(plan) if !plan.needs_prompt() => plan,
+        _ => return Some(prompt),
+    };
+    let TaskPrompt { room_id, resume: TaskResume::Read { kind, answer, also }, .. } = prompt else { return None };
+    finish_unprompted_reads(cx, ui, &room_id, cap, &plan, std::iter::once((kind, answer)).chain(also));
+    None
 }
 
 /// Declines the agent's unrequested reads of one kind for the rest of its
@@ -9925,9 +9994,11 @@ fn decline_read_reviews(room_id: &OwnedRoomId, group: Permission) {
         same.into_iter().filter_map(|prompt| Some((read_review_refusal(state, room_id, &prompt.plan, Some(group))?, prompt))).collect()
     }).unwrap_or_default();
     for ((note, text), prompt) in queued {
-        if let TaskResume::Read { kind, answer } = prompt.resume {
-            note_ai_tool_call(room_id, read_tool_name(&kind), false, note);
-            let _ = answer.send(Err(text.into()));
+        if let TaskResume::Read { kind, answer, also } = prompt.resume {
+            for (kind, answer) in std::iter::once((kind, answer)).chain(also) {
+                note_ai_tool_call(room_id, read_tool_name(&kind), false, note);
+                let _ = answer.send(Err(text.into()));
+            }
         }
     }
 }
@@ -10450,6 +10521,7 @@ fn exact_review_info(
         other => format!("Run {other} against {}", action.target),
     };
     TaskPromptInfo {
+        title: ai_prompt_title(None, None),
         explanation: String::from(
             "The assistant wants to do this, and it may have been influenced by content it read. \
              Review exactly what it will do before allowing it.",
@@ -14496,6 +14568,57 @@ View{note := Label{text:"waiting"}}
         assert!(flow::labels(&fixture.context).unwrap().contains(&target));
         assert!(flow::sharing_allows_for_reader(&target, &provider, &fixture.context).unwrap());
         assert!(flow::sharing_allows_for_reader(&target, &own_room, &fixture.context).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identical_reads_share_one_review_and_a_covered_queued_review_never_shows() {
+        use a2app_core::information_flow::{self as flow, FlowPolicy};
+        let fixture = FinalWriteTestState::new("read-dedupe");
+        let _model = ModelIdGuard::pin(Some("read-dedupe-provider"));
+        let _joined = JoinedRoomsGuard::new(&[SOURCE, TARGET]);
+        apply_agent_defaults(&fixture);
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let ui = WidgetRef::empty();
+        let read = |cx: &mut Cx, limit| {
+            let (answer, reply) = std::sync::mpsc::channel();
+            execute_session_job(cx, &ui, &fixture.room, SessionJob::ReadTool {
+                kind: ReadToolKind::OtherRoom { room: TARGET.into(), limit }, answer,
+            });
+            reply
+        };
+        let target_reads = || with_a2app(|state| state.ai_reads.values().filter(|(room, kind, _)| room == &fixture.room
+            && matches!(kind, ReadToolKind::OtherRoom { room, .. } if room == TARGET)).count()).unwrap();
+        let is_running = |reply: &std::sync::mpsc::Receiver<Result<String, String>>|
+            matches!(reply.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+        // A second identical read while the first review is on screen joins it.
+        let (first, second) = (read(&mut cx, 5), read(&mut cx, 8));
+        let (plan, is_joined) = with_a2app(|state| (state.active_task.as_ref().unwrap().plan.clone(), state.task_prompts.is_empty()
+            && matches!(&state.active_task, Some(TaskPrompt { resume: TaskResume::Read { also, .. }, .. }) if also.len() == 1))).unwrap();
+        assert!(is_joined, "one review covers both reads");
+        assert!(task_prompt_info(&plan, None, None, &[]).title.starts_with("The AI in “"), "the prompt names the room whose AI asks");
+        answer_task_prompt(&mut cx, &ui, TaskPermissionAction::Allow(plan.grantable().map(|item| item.id.clone()).collect()));
+        assert!(is_running(&first) && is_running(&second));
+        assert_eq!(target_reads(), 2);
+        // Next turn: a review queued behind another prompt, then covered by
+        // access granted meanwhile, runs without being shown.
+        revoke_task_grants(&fixture.room);
+        let (placeholder_answer, _placeholder) = std::sync::mpsc::channel();
+        with_a2app(|state| state.active_task = Some(modal_task_fixture(102, placeholder_answer)));
+        let queued = read(&mut cx, 5);
+        assert_eq!(with_a2app(|state| state.task_prompts.len()).unwrap(), 1);
+        let account = fixture.context.account().to_string();
+        with_a2app(|state| state.permissions.grant_scoped(&agent_subject(SOURCE), Permission::MatrixRoomsRead,
+            Some("matrix.rooms.messages.read"), RoomScope::room(TARGET), GrantDuration::Always, None).unwrap());
+        flow::set_policy(Source::Room { account: account.clone(), room: TARGET.into() }, FlowPolicy { recipients: [
+            Recipient::ModelProvider("read-dedupe-provider".into()),
+            Recipient::MatrixRoom { account, room: SOURCE.into() },
+        ].into() }).unwrap();
+        withdraw_task_prompt(with_a2app(|state| state.active_task.take()).flatten().unwrap());
+        show_next_permission_prompt(&mut cx, &ui);
+        assert!(with_a2app(|state| state.active_task.is_none() && state.task_prompts.is_empty()).unwrap(), "nothing was shown");
+        assert!(is_running(&queued));
+        assert_eq!(target_reads(), 3);
     }
 
     #[cfg(unix)]

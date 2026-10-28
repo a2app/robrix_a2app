@@ -108,6 +108,8 @@ impl TaskItemView {
 /// What the modal shows for one resolved task plan.
 #[derive(Clone, Debug)]
 pub struct TaskPromptInfo {
+    /// Robrix's title, naming the room whose AI is asking.
+    pub title: String,
     /// The agent's paragraph, shown verbatim and quoted.
     pub explanation: String,
     pub items: Vec<TaskItemView>,
@@ -211,6 +213,7 @@ impl TaskPermissionPromptRef {
         inner.items = info.items.clone();
         inner.expanded = false;
         inner.view.collapsible_header(cx, ids!(details_toggle)).set_expanded(cx, false, Animate::No);
+        inner.view.label(cx, ids!(prompt_title)).set_text(cx, &info.title);
         inner.view.label(cx, ids!(agent_paragraph)).set_text(cx, &info.explanation);
         match &info.risk {
             Some(risk) => {
@@ -245,6 +248,7 @@ mod tests {
             chip: if grantable { "Will be granted".into() } else { "Blocked".into() }, grantable, checked,
         };
         let info = TaskPromptInfo {
+            title: "The AI in “Plans” is asking for access".into(),
             explanation: "I need access for this task.".into(),
             items: vec![item("selected", true, true), item("unchecked", true, false), item("blocked", false, false)],
             risk: None,
