@@ -83,6 +83,8 @@ pub mod a2app_dummy;
 pub mod sliding_sync;
 pub mod space_service_sync;
 pub mod threads_list_sync;
+pub mod room_info_sync;
+pub mod directory_search;
 pub mod avatar_cache;
 pub mod room_preview_cache;
 pub mod media_cache;

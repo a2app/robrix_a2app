@@ -1,27 +1,105 @@
-//! A top-level view for adding (joining) or exploring new rooms and spaces.
+//! A top-level view for adding (joining) or exploring new rooms and spaces, and for finding users.
 
+
+use std::{cmp::Reverse, collections::HashSet};
 
 use makepad_widgets::*;
 use matrix_sdk::RoomState;
-use ruma::{IdParseError, OwnedRoomOrAliasId, OwnedServerName, matrix_uri::MatrixId, room::{JoinRuleSummary, RoomType}};
+use ruma::{OwnedRoomOrAliasId, OwnedServerName, RoomId, ServerName, room::{JoinRuleSummary, RoomType}};
 
-use crate::{app::AppStateAction, home::invite_screen::JoinRoomResultAction, room::{FetchedRoomAvatar, FetchedRoomPreview, RoomPreviewAction}, shared::{avatar::AvatarWidgetRefExt, popup_list::{PopupKind, enqueue_popup_notification}}, sliding_sync::{MatrixRequest, RoomPreviewResponseMode, submit_async_request}, utils};
+use crate::{app::AppStateAction, avatar_cache::{self, AvatarCacheEntry}, directory_search::{DirectorySearchAction, RoomKind, RoomSearchResult, SEARCH_PAGE_SIZE, SearchQuery, UserSearchResult, get_room_directory_servers}, home::{invite_screen::{JoinRoomResultAction, LeaveRoomResultAction}, navigation_tab_bar::NavigationBarAction}, logout::logout_confirm_modal::LogoutAction, profile::{user_profile::{UserProfilePaneInfo, UserProfileSlidingPaneWidgetExt, UserProfileSlidingPaneWidgetRefExt}, user_profile_cache}, room::{FetchedRoomAvatar, FetchedRoomPreview, RoomPreviewAction}, settings::app_preferences::AppPreferencesAction, shared::{avatar::{AvatarWidgetRefExt, TextAvatarBgColor}, collapsible_header::{CollapsibleHeaderAction, CollapsibleHeaderWidgetExt}, list_rows::{LIST_ROW_HEIGHT, draw_flat_list_status_row, handle_row_actions}, popup_list::{PopupKind, enqueue_popup_notification}, styles::set_view_bg_color}, sliding_sync::{MatrixRequest, RoomPreviewResponseMode, submit_async_request}, utils::{self, MatchQuality}};
+
+/// The width of the Go buttons and the Edit button below the room search box, so they line up.
+const SEARCH_BUTTON_WIDTH: f64 = 72.0;
 
 script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
 
 
-    // The main view that allows the user to add (join) or explore new rooms/spaces.
-    mod.widgets.AddRoomScreen = #(AddRoomScreen::register_widget(vm)) {
-        ..mod.widgets.ScrollYView
+    // A row with a search box and a button that searches right away.
+    let SearchInputRow = View {
+        width: Fill,
+        height: Fit,
+        margin: Inset{ top: 3, bottom: 4 }
+        align: Align{y: 0.5}
+        spacing: 5
+        flow: Right
+    }
 
+    // A search box with a button inside it that clears its text.
+    let SearchInputBox = View {
+        width: Fill { max: 400 } // same width as the above `help_info`
+        height: 40
+        margin: Inset{top: 0, left: 5, right: 5, bottom: 0},
+        flow: Overlay
+        align: Align{x: 1.0, y: 0.5}
+    }
+
+    let SearchInput = RobrixTextInput {
+        width: Fill, height: Fill
+        autocapitalize: None,
+        autocorrect: Disabled,
+    }
+
+    let SearchClearButton = mod.widgets.ClearTextButton {
+        margin: Inset{top: 0, bottom: 0, left: 0, right: 7.5}
+    }
+
+    let SearchButton = RobrixIconButton {
+        padding: Inset{top: 10, bottom: 10, left: 12, right: 14}
+        width: #(SEARCH_BUTTON_WIDTH), height: 40
+        align: Align{x: 0.5, y: 0.5}
+        draw_icon.svg: (ICON_SEARCH)
+        icon_walk: Walk{width: 16, height: 16}
+        text: "Go"
+    }
+
+    let SectionHeader = SubsectionLabel {
+        margin: Inset{top: 12, bottom: 4}
+        draw_text +: { text_style: theme.font_bold { font_size: 11.5 } }
+    }
+
+    // Search results in sections, each with an optional header, its rows, and a "Load more" button.
+    let SearchResultsList = View {
+        width: Fill, height: Fit
+        list := FlatList {
+            width: Fill, height: Fit
+            margin: Inset{left: 5, right: 5, bottom: 5}
+            scroll_bars: ScrollBars { show_scroll_x: false, show_scroll_y: false }
+
+            section_header := SectionHeader {}
+            // The first section's header sits right below its search box, so it needs less space above it.
+            first_section_header := SectionHeader { margin: Inset{top: 6, bottom: 4} }
+            result_row := mod.widgets.AvatarListRow {}
+            // The rows below are left-aligned with the results' avatars.
+            loading_row := mod.widgets.ListLoadingRow {
+                align: Align{x: 0.0, y: 0.5}
+                padding: Inset{left: 10, right: 10, top: 13, bottom: 13}
+            }
+            empty_row := mod.widgets.ListEmptyRow {
+                padding: Inset{left: 10, right: 10, top: 13, bottom: 13}
+                empty_label +: { padding: theme.mspace_1{left: 0.}, align: Align{x: 0.0, y: 0.0} }
+            }
+            load_more_row := View {
+                width: Fill, height: Fit
+                padding: Inset{left: 10, right: 10, top: 5, bottom: 5}
+                load_more_button := RobrixNeutralIconButton {
+                    padding: Inset{top: 8, bottom: 8, left: 14, right: 14}
+                    text: "Load more"
+                }
+            }
+        }
+    }
+
+    // The scrollable content of the AddRoomScreen, beneath its user profile pane.
+    let AddRoomScreenContent = ScrollYView {
         width: Fill, height: Fill,
         flow: Down,
         padding: Inset{top: 5, left: 15, right: 15, bottom: 0},
 
         title := TitleLabel {
-            text: "Add/Explore Rooms and Spaces"
+            text: "Add Rooms, Spaces, and People"
             draw_text +: {
                 text_style: theme.font_regular {font_size: 18},
             }
@@ -29,51 +107,84 @@ script_mod! {
         
         LineH { padding: 10, margin: Inset{top: 10, right: 2} }
 
-        SubsectionLabel {
-            text: "Join an existing room or space:"
+        find_rooms_heading := SubsectionLabel {
+            text: "Find and join rooms or spaces"
         }
 
-        // TODO: support showing/hiding this help with a collapsible widget wrapper
-        //       (Accordion widget, once it's added to Makepad upstream)
+        search_tips_header := CollapsibleHeader {
+            width: Fit, height: 30
+            margin: Inset{left: 5, right: 5, top: 3, bottom: 3}
+            padding: Inset{left: 5, right: 12, top: 5, bottom: 5}
+            starts_expanded: false
+            draw_bg +: { color: (COLOR_BG_LAVENDER) }
+            collapse_icon +: { draw_bg +: { color: (ROOM_NAME_TEXT_COLOR) } }
+            label +: {
+                width: Fit
+                text: "What you can search for:"
+                draw_text +: { color: (ROOM_NAME_TEXT_COLOR) }
+            }
+        }
 
-        help_info := MessageHtml {
-            padding: 7
+        help_view := View {
+            visible: false
             width: Fill, height: Fit
-            font_size: 10.
-            font_color: (MESSAGE_TEXT_COLOR)
-            body: "<p>You can enter a room/space address using either:</p>
-                <ul>
-                  <li> An <i>alias</i>, starting with <code>#</code>, like <code>#robrix:matrix.org</code>.</li>
-                  <li> An <i>ID</i>, starting with <code>!</code>, like <code>!room_id:matrix.org</code>.</li>
-                  <li> A Matrix link, like <code>matrix:...</code> or <code>https:matrix.to/...</code>.</li>
-                </ul>
-            "
+            help_info := MessageHtml {
+                padding: 7
+                width: Fill, height: Fit
+                font_size: 10.
+                font_color: (MESSAGE_TEXT_COLOR)
+                body: "<ul>
+                      <li> A room or space name like <code>Robrix</code>.</li>
+                      <li> Keywords in a public room or space topic/description.</li>
+                      <li> An <i>alias</i>, starting with <code>#</code>, like <code>#robrix:matrix.org</code>.</li>
+                      <li> An <i>ID</i>, starting with <code>!</code>, like <code>!room_id:matrix.org</code>.</li>
+                      <li> A Matrix link, like <code>matrix:...</code> or <code>https://matrix.to/...</code>.</li>
+                    </ul>
+                "
+            }
         }
 
-        join_room_view := View {
-            width: Fill,
-            height: Fit,
-            margin: Inset{ top: 3, bottom: 4 }
-            align: Align{y: 0.5}
-            spacing: 5
-            flow: Right
+        join_room_view := SearchInputRow {
+            room_search_box := SearchInputBox {
+                room_alias_id_input := SearchInput {
+                    empty_text: "Enter a name, alias, ID, or Matrix link..."
+                }
+                clear_room_search_button := SearchClearButton {}
+            }
+            search_for_room_button := SearchButton {}
+        }
 
-            room_alias_id_input := RobrixTextInput {
-                margin: Inset{top: 0, left: 5, right: 5, bottom: 0},
-                padding: Inset{left: 12, right: 12, top: 0, bottom: 0}
-                width: Fill { max: 400 } // same width as the above `help_info`
-                height: 40
-                empty_text: "Enter alias, ID, or Matrix link..."
-                autocapitalize: None,
-                autocorrect: Disabled,
+        // The other room directories that we search, laid out like the search box and Go button above,
+        // with a button to change them in the settings.
+        room_directories_view := SearchInputRow {
+            margin: Inset{bottom: 4}
+            align: Align{y: 0.0}
+
+            View {
+                width: Fill { max: 400 }, height: Fit
+                margin: Inset{left: 5, right: 5}
+                // The margins line up this label's text with the search box's text and the Edit button's text.
+                room_directories_label := Label {
+                    width: Fill, height: Fit
+                    padding: 0
+                    margin: Inset{left: 12, top: 9}
+                    flow: Flow.Right{wrap: true},
+                    max_lines: 3,
+                    text_overflow: Ellipsis,
+                    draw_text +: {
+                        color: (COLOR_TEXT_MUTED),
+                        text_style: MESSAGE_TEXT_STYLE { font_size: 10 },
+                    }
+                }
             }
 
-            search_for_room_button := RobrixIconButton {
-                padding: Inset{top: 10, bottom: 10, left: 12, right: 14}
-                height: 40
-                draw_icon.svg: (ICON_SEARCH)
-                icon_walk: Walk{width: 16, height: 16}
-                text: "Go"
+            edit_room_directories_button := RobrixNeutralIconButton {
+                width: #(SEARCH_BUTTON_WIDTH)
+                align: Align{x: 0.5, y: 0.5}
+                padding: Inset{top: 6, bottom: 6, left: 10, right: 12}
+                draw_icon.svg: (ICON_SETTINGS)
+                icon_walk: Walk{width: 14, height: 14}
+                text: "Edit"
             }
         }
 
@@ -246,6 +357,35 @@ script_mod! {
             }
         }
 
+        // The results of searching for rooms and spaces, in separate lists.
+        room_results := SearchResultsList {}
+
+        LineH { padding: 10, margin: Inset{top: 15, right: 2} }
+
+        find_people_heading := SubsectionLabel {
+            text: "Find people"
+        }
+
+        user_help_info := MessageHtml {
+            padding: Inset{left: 18, right: 7, top: 7, bottom: 7}
+            width: Fill, height: Fit
+            font_size: 10.
+            font_color: (MESSAGE_TEXT_COLOR)
+            body: "<p>Search by name or user ID (<code>@alice:matrix.org</code>).</p>"
+        }
+
+        find_user_view := SearchInputRow {
+            user_search_box := SearchInputBox {
+                user_search_input := SearchInput {
+                    empty_text: "Enter a name or user ID..."
+                }
+                clear_user_search_button := SearchClearButton {}
+            }
+            search_for_user_button := SearchButton {}
+        }
+
+        user_results := SearchResultsList {}
+
         LineH { padding: 10, margin: Inset{top: 10, right: 2} }
 
         SubsectionLabel {
@@ -290,20 +430,80 @@ script_mod! {
             height: 20
         }
     }
+
+    // The main view that allows the user to add (join) or explore new rooms/spaces, and find people.
+    mod.widgets.AddRoomScreen = #(AddRoomScreen::register_widget(vm)) {
+        width: Fill, height: Fill
+        flow: Overlay
+        result_row_color: (COLOR_TRANSPARENT)
+        result_row_color_hover: (COLOR_LIST_ITEM_BG_HOVER)
+        result_row_color_focus: (COLOR_LIST_ITEM_BG_FOCUS)
+        search_input_padding: Inset{left: 12, right: 12, top: 0, bottom: 0}
+        clear_button_gutter: 42.5
+
+        content := AddRoomScreenContent {}
+
+        // Shown upon clicking a person in the search results, on top of all other content.
+        user_profile_sliding_pane := mod.widgets.UserProfileSlidingPane { }
+    }
 }
 
-#[derive(Script, ScriptHook, Widget)]
+/// Delay after the last keystroke before we search for rooms, spaces, or people.
+const SEARCH_DELAY: f64 = 0.5;
+
+#[derive(Script, Widget)]
 pub struct AddRoomScreen {
     #[deref] view: View,
+    #[live] result_row_color: Vec4f,
+    #[live] result_row_color_hover: Vec4f,
+    #[live] result_row_color_focus: Vec4f,
+    #[live] search_input_padding: Inset,
+    /// The right padding of a search box while it shows its clear button.
+    #[live] clear_button_gutter: f64,
+
     #[rust] state: AddRoomState,
+    /// Held while a room preview is shown, so that going back or pressing Escape cancels it.
+    #[rust] cancel_scope: Option<CancelScope>,
     /// The function to perform when the user clicks the `join_room_button`.
     #[rust(JoinButtonFunction::None)] join_function: JoinButtonFunction,
+    #[rust] room_search: Search<RoomResults>,
+    #[rust] user_search: Search<SectionResults<UserSearchResult>>,
+    /// The search box that the user submitted (with Enter or Go) before we knew how many matches it has.
+    /// Once we know, we open its match if there's just one.
+    #[rust] pending_submit: Option<SearchBox>,
+    #[rust] result_rows: ResultRows,
+    #[rust] was_profile_pane_shown: bool,
+    /// What our Tab handling just focused, so we can scroll to it instead of to the widget makepad would have focused.
+    #[rust] tab_scroll_target: Option<Area>,
+    /// Where the content was as of its last draw, which doesn't change while it scrolls,
+    /// so the result lists can skip drawing the rows that are far from view.
+    #[rust] content_viewport: Rect,
+    /// Whether the label of which room directories we search is out of date. We update it upon our next draw,
+    /// since we're only drawn while logged in, which is when we know our own homeserver.
+    #[rust(true)] is_room_directories_label_stale: bool,
+}
+
+impl ScriptHook for AddRoomScreen {
+    fn on_after_apply(&mut self, vm: &mut ScriptVm, apply: &Apply, _scope: &mut Scope, _value: ScriptValue) {
+        if apply.is_eval() || apply.is_animate() { return; }
+        // Applying the DSL resets the search boxes' padding, which must still make room for any shown clear button.
+        vm.with_cx_mut(|cx| {
+            self.update_clear_button(cx, SearchBox::Rooms);
+            self.update_clear_button(cx, SearchBox::People);
+        });
+        self.is_room_directories_label_stale = true;
+    }
+
+    fn on_after_reload(&mut self, _vm: &mut ScriptVm) {
+        // Some reloads reset the rows' avatars to their template, so we populate every row again.
+        self.result_rows.populated.clear();
+    }
 }
 
 #[derive(Default)]
 #[allow(clippy::large_enum_variant)]
 enum AddRoomState {
-    /// We're waiting for the user to input a room ID, alias, or matrix link.
+    /// We're waiting for the user to enter what to search for, or to pick a search result.
     #[default]
     WaitingOnUserInput,
     /// We successfully parsed the user input and have sent a request.
@@ -385,17 +585,180 @@ impl AddRoomState {
 
 impl Widget for AddRoomScreen {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        self.view.handle_event(cx, event, scope);
-        
+        let profile_pane = self.view.child(id!(user_profile_sliding_pane)).as_user_profile_sliding_pane();
+
+        // Going back (Back, the back mouse button) or pressing Escape cancels a shown room preview, like its Cancel button.
+        // We check ownership first because `back_pressed()` consumes the press, so only the owner may call it.
+        if self.cancel_scope.as_ref().is_some_and(|s| cx.owns_cancel(s))
+            && (event.back_pressed()
+                || matches!(event, Event::KeyUp(key) if key.key_code == KeyCode::Escape)
+                || matches!(event, Event::MouseUp(e) if e.button.is_back()))
+        {
+            self.cancel_room_preview(cx);
+            return;
+        }
+
+        // Handle arrow keys and enter before forwarding this event to the search textinput,
+        // because we want those keys to control moving through search results, not the text input.
+        if let Event::KeyDown(key_event) = event && !profile_pane.is_currently_shown(cx) {
+            let is_room_box_focused = cx.has_key_focus(self.view.text_input(cx, ids!(room_alias_id_input)).area());
+            let is_people_box_focused = cx.has_key_focus(self.view.text_input(cx, ids!(user_search_input)).area());
+            let is_enter = matches!(key_event.key_code, KeyCode::ReturnKey | KeyCode::NumpadEnter);
+            // Holding down Enter shouldn't submit a search box or open a result over and over.
+            if is_enter && key_event.is_repeat && (is_room_box_focused || is_people_box_focused) {
+                return;
+            }
+            // Tab and Shift+Tab move between the rooms list, the spaces list, and the people search box.
+            if key_event.key_code == KeyCode::Tab
+                && (is_room_box_focused || is_people_box_focused)
+                && !(key_event.modifiers.control || key_event.modifiers.alt || key_event.modifiers.logo)
+                && self.move_focus_with_tab(cx, is_people_box_focused, !key_event.modifiers.shift)
+            {
+                return;
+            }
+            let search_box = if key_event.modifiers.any() {
+                None
+            } else if is_room_box_focused && self.are_room_results_shown() {
+                Some(SearchBox::Rooms)
+            } else if is_people_box_focused {
+                Some(SearchBox::People)
+            } else {
+                None
+            };
+            let is_handled = match (search_box, key_event.key_code) {
+                (Some(search_box), KeyCode::ArrowDown) => self.move_result_focus(cx, search_box, true),
+                (Some(search_box), KeyCode::ArrowUp) => self.move_result_focus(cx, search_box, false),
+                (Some(search_box), _) if is_enter => match self.result_rows.focused {
+                    Some((focused_box, key)) if focused_box == search_box => {
+                        match search_box {
+                            SearchBox::Rooms => self.open_room_result(cx, key),
+                            SearchBox::People => self.open_user_result(cx, key),
+                        }
+                        true
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            if is_handled {
+                return;
+            }
+        }
+
+        // On Tab, makepad asks the content to scroll to the next widget it would focus, and the content only
+        // follows the first such request, so we swap it for one that scrolls to what we focused instead.
+        let tab_scroll_event;
+        let event = if let Event::Trigger(trigger_event) = event && let Some(area) = self.tab_scroll_target.take() {
+            let mut trigger_event = trigger_event.clone();
+            trigger_event.triggers.insert(
+                self.view.child(id!(content)).area(),
+                vec![Trigger { id: live_id!(scroll_focus_nav), from: area }],
+            );
+            tab_scroll_event = Event::Trigger(trigger_event);
+            &tab_scroll_event
+        } else {
+            event
+        };
+
+        // While the profile pane is shown, it gets all of the user's input.
+        if utils::is_interactive_hit_event(event) && profile_pane.is_currently_shown(cx) {
+            profile_pane.handle_event(cx, event, scope);
+        } else {
+            self.view.handle_event(cx, event, scope);
+        }
+
+        // Closing the profile pane doesn't put the user back in the people search box,
+        // so we stop showing the arrow keys' focus on the person they had opened.
+        let is_profile_pane_shown = profile_pane.is_currently_shown(cx);
+        if self.was_profile_pane_shown
+            && !is_profile_pane_shown
+            && !cx.has_key_focus(self.view.text_input(cx, ids!(user_search_input)).area())
+            && self.result_rows.unfocus(SearchBox::People)
+        {
+            self.redraw(cx);
+        }
+        self.was_profile_pane_shown = is_profile_pane_shown;
+
+        if self.room_search.timer.is_event(event).is_some() {
+            let query = self.view.text_input(cx, ids!(room_alias_id_input)).text();
+            self.search_rooms(cx, query.trim());
+        }
+        if self.user_search.timer.is_event(event).is_some() {
+            let query = self.view.text_input(cx, ids!(user_search_input)).text();
+            self.search_users(cx, query.trim());
+        }
+
+        // An overlay can take a row's hover-out event, so we un-hover it ourselves.
+        if let Event::ClearHover = event && self.result_rows.hovered_key.take().is_some() {
+            self.redraw(cx);
+        }
+
         if let Event::Actions(actions) = event {
             let room_alias_id_input = self.view.text_input(cx, ids!(room_alias_id_input));
+            let clear_room_search_button = self.view.button(cx, ids!(clear_room_search_button));
             let search_for_room_button = self.view.button(cx, ids!(search_for_room_button));
+            let user_search_input = self.view.text_input(cx, ids!(user_search_input));
+            let clear_user_search_button = self.view.button(cx, ids!(clear_user_search_button));
+            let search_for_user_button = self.view.button(cx, ids!(search_for_user_button));
             let cancel_button = self.view.button(cx, ids!(fetched_room_summary.buttons_view.cancel_button));
             let join_room_button = self.view.button(cx, ids!(fetched_room_summary.buttons_view.join_room_button));
 
+            let search_tips_header = self.view.collapsible_header(cx, ids!(search_tips_header));
+            if let Some(action) = actions.find_widget_action(search_tips_header.widget_uid())
+                && let CollapsibleHeaderAction::Toggled { .. } = action.cast()
+            {
+                self.view.view(cx, ids!(help_view)).set_visible(cx, search_tips_header.is_expanded());
+                self.redraw(cx);
+            }
+
+            let edit_room_directories_button = self.view.button(cx, ids!(edit_room_directories_button));
+            if edit_room_directories_button.clicked(actions) {
+                // The settings screen covers this button, so it never gets the hover-out event.
+                edit_room_directories_button.reset_hover(cx);
+                cx.action(NavigationBarAction::OpenSettings);
+            }
+
             // Enable or disable the button based on if the text input is empty.
             if let Some(text) = room_alias_id_input.changed(actions) {
-                search_for_room_button.set_enabled(cx, !text.trim().is_empty());
+                let has_text = !text.trim().is_empty();
+                search_for_room_button.set_enabled(cx, has_text);
+                if clear_room_search_button.visible() != has_text {
+                    self.update_clear_button(cx, SearchBox::Rooms);
+                }
+                self.room_search.handle_text_changed(cx, &text);
+                // Typing in either box means the user has moved on from any result they moved to or submitted to open.
+                self.pending_submit = None;
+                self.result_rows.focused = None;
+                // The user is looking for something else now, so we stop showing the room preview.
+                self.set_state(cx, AddRoomState::WaitingOnUserInput);
+                self.redraw(cx);
+            }
+            if let Some(text) = user_search_input.changed(actions) {
+                let has_text = !text.trim().is_empty();
+                search_for_user_button.set_enabled(cx, has_text);
+                if clear_user_search_button.visible() != has_text {
+                    self.update_clear_button(cx, SearchBox::People);
+                }
+                self.user_search.handle_text_changed(cx, &text);
+                self.pending_submit = None;
+                self.result_rows.focused = None;
+                self.redraw(cx);
+            }
+            // A clear button empties its search box just like the user deleting the text would, emitting the `Changed`
+            // action handled above. Only a click gives the box its focus back, so a scroll from the X won't pop up the keyboard.
+            for (input, clear_button) in [(&room_alias_id_input, &clear_room_search_button), (&user_search_input, &clear_user_search_button)] {
+                if clear_button.clicked(actions) {
+                    let _ = input.replace_range(cx, 0..input.text().len(), "", text_input::UndoGroup::New);
+                    input.set_key_focus(cx);
+                }
+            }
+            // We only show the arrow keys' focus while the user is in that result's search box,
+            // or looking at the profile of a person they opened from it.
+            if !profile_pane.is_currently_shown(cx)
+                && ((room_alias_id_input.key_focus_lost(actions) && self.result_rows.unfocus(SearchBox::Rooms))
+                    || (user_search_input.key_focus_lost(actions) && self.result_rows.unfocus(SearchBox::People)))
+            {
+                self.redraw(cx);
             }
 
             // If the create-AI-room button was clicked (or Enter was pressed),
@@ -430,10 +793,7 @@ impl Widget for AddRoomScreen {
 
             // If the cancel button was clicked, hide the room preview and return to default state.
             if cancel_button.clicked(actions) {
-                self.state = AddRoomState::WaitingOnUserInput;
-                room_alias_id_input.set_text(cx, "");
-                room_alias_id_input.set_key_focus(cx);
-                self.redraw(cx);
+                self.cancel_room_preview(cx);
             }
 
             // If the join button was clicked, perform the appropriate action.
@@ -465,12 +825,35 @@ impl Widget for AddRoomScreen {
                 }
             }
 
-            // If the button was clicked or enter was pressed, try to parse the room address.
-            let new_room_query = search_for_room_button.clicked(actions)
-                .then(|| room_alias_id_input.text())
-                .or_else(|| room_alias_id_input.returned(actions).map(|(t, _)| t));
-            if let Some(t) = new_room_query {
-                self.search_for_room(cx, &t);
+            // Submitting takes key focus away from a search box, but with a physical keyboard
+            // the user can then keep typing or move through the results with the arrow keys.
+            let should_keep_key_focus = !cfg!(any(target_os = "android", target_os = "ios")) || cx.keyboard.has_physical_keyboard();
+
+            // If the button was clicked or enter was pressed, search right away.
+            if let Some(query) = get_submitted_query(&room_alias_id_input, &search_for_room_button, actions) {
+                if should_keep_key_focus {
+                    room_alias_id_input.set_key_focus(cx);
+                }
+                self.search_rooms(cx, &query);
+                let only_match = self.room_search.results.as_ref()
+                    .and_then(|results| get_only_match(&query, &[&results.rooms, &results.spaces]));
+                match (only_match, SearchQuery::parse(&query).and_then(|search_query| search_query.full_room_address())) {
+                    // We already have the preview of the query's only match.
+                    (Some(Some(key)), _) => self.open_room_result(cx, key),
+                    (_, Some((room_or_alias_id, via))) => self.request_room_preview(cx, room_or_alias_id, via),
+                    // Other text may match several rooms, so we wait to see whether it matches just one.
+                    (None, None) => self.pending_submit = Some(SearchBox::Rooms),
+                    // It matches no rooms, or several of them.
+                    (Some(None), None) => self.pending_submit = None,
+                }
+            }
+            if let Some(query) = get_submitted_query(&user_search_input, &search_for_user_button, actions) {
+                if should_keep_key_focus {
+                    user_search_input.set_key_focus(cx);
+                }
+                self.search_users(cx, &query);
+                self.pending_submit = Some(SearchBox::People);
+                self.open_only_match(cx);
             }
 
             // If we're waiting for the room preview to be fetched (i.e., in the Parsed state),
@@ -482,14 +865,7 @@ impl Widget for AddRoomScreen {
                             if fetched_id == room_or_alias_id =>
                         {
                             let room_or_alias_id = room_or_alias_id.clone();
-                            self.state = AddRoomState::FetchedRoomPreview {
-                                frp: frp.clone(),
-                                room_or_alias_id,
-                            };
-                            // Reset the buttons' hover states when they are first shown.
-                            join_room_button.reset_hover(cx);
-                            cancel_button.reset_hover(cx);
-                            self.redraw(cx);
+                            self.show_room_preview(cx, frp.clone(), room_or_alias_id);
                             break;
                         }
                         Some(RoomPreviewAction::Fetched { room_or_alias_id: fetched_id, result: Err(e) })
@@ -501,7 +877,7 @@ impl Widget for AddRoomScreen {
                                 PopupKind::Error,
                                 None,
                             );
-                            self.state = AddRoomState::FetchError(err_str);
+                            self.set_state(cx, AddRoomState::FetchError(err_str));
                             self.redraw(cx);
                             break;
                         }
@@ -515,31 +891,13 @@ impl Widget for AddRoomScreen {
             // the user clicking the join button (e.g., knocked on or joined the room/space).
             let mut transition_to_knocked = false;
             let mut transition_to_joined  = false;
-            if let AddRoomState::FetchedRoomPreview { frp, room_or_alias_id, .. } = &self.state {
+            if let AddRoomState::FetchedRoomPreview { frp, .. } = &self.state {
                 for action in actions {
-                    match action.downcast_ref() {
-                        Some(KnockResultAction::Knocked { room, .. }) if room.room_id() == frp.room_name_id.room_id() => {
-                            let room_type = match room.room_type() {
-                                Some(RoomType::Space) => "space",
-                                _ => "room",
-                            };
-                            enqueue_popup_notification(
-                                format!("Successfully knocked on {room_type} {}.", frp.room_name_id),
-                                PopupKind::Success,
-                                Some(4.0),
-                            );
-                            transition_to_knocked = true;
-                            break;
-                        }
-                        Some(KnockResultAction::Failed { error, room_or_alias_id: roai }) if room_or_alias_id == roai => {
-                            enqueue_popup_notification(
-                                format!("Failed to knock on room.\n\nError: {error}."),
-                                PopupKind::Error,
-                                None,
-                            );
-                            break;
-                        }
-                        _ => { }
+                    if let Some(KnockResultAction::Knocked { room, .. }) = action.downcast_ref()
+                        && room.room_id() == frp.room_name_id.room_id()
+                    {
+                        transition_to_knocked = true;
+                        break;
                     }
 
                     match action.downcast_ref() {
@@ -574,13 +932,158 @@ impl Widget for AddRoomScreen {
                         self.state.transition_to_loaded(*is_invite);
                         self.redraw(cx);
                     }
+                    self.record_room_state(cx, room_name_id.room_id(), if *is_invite { RoomState::Invited } else { RoomState::Joined });
                 }
+                // We show a found room's preview as soon as the user picks it, so we keep our membership in it up to date.
+                if let Some(JoinRoomResultAction::Joined { room_id }) = action.downcast_ref() {
+                    self.record_room_state(cx, room_id, RoomState::Joined);
+                }
+                if let Some(KnockResultAction::Knocked { room, .. }) = action.downcast_ref() {
+                    self.record_room_state(cx, room.room_id(), RoomState::Knocked);
+                }
+                if let Some(LeaveRoomResultAction::Left { room_id }) = action.downcast_ref() {
+                    self.record_room_state(cx, room_id, RoomState::Left);
+                }
+
+                if let Some(AppPreferencesAction::RoomDirectoriesChanged) = action.downcast_ref() {
+                    self.is_room_directories_label_stale = true;
+                    // Forgetting the query makes us search the new set of room directories for it again.
+                    let query = std::mem::take(&mut self.room_search.query);
+                    if !query.is_empty() {
+                        self.search_rooms(cx, &query);
+                    }
+                    self.redraw(cx);
+                }
+
+                match action.downcast_ref() {
+                    Some(DirectorySearchAction::JoinedRooms { query, rooms }) if *query == self.room_search.query => {
+                        if let Some(results) = self.room_search.results.as_mut() {
+                            results.add_results(rooms, &mut self.result_rows);
+                        }
+                        self.redraw(cx);
+                    }
+                    Some(DirectorySearchAction::ExactRooms { query, rooms }) if *query == self.room_search.query => {
+                        if let Some(results) = self.room_search.results.as_mut() {
+                            results.add_results(rooms, &mut self.result_rows);
+                            results.rooms.has_exact_matches = true;
+                            results.spaces.has_exact_matches = true;
+                        }
+                        self.open_only_match(cx);
+                        self.redraw(cx);
+                    }
+                    Some(DirectorySearchAction::ExactUsers { query, users }) if *query == self.user_search.query => {
+                        if let Some(section) = self.user_search.results.as_mut() {
+                            section.add_results(users, &mut self.result_rows);
+                            section.has_exact_matches = true;
+                        }
+                        self.open_only_match(cx);
+                        self.redraw(cx);
+                    }
+                    Some(DirectorySearchAction::DirectoryRooms { query, kind, server, rooms, next_batch, is_next_page, error })
+                        if *query == self.room_search.query =>
+                    {
+                        let Some(results) = self.room_search.results.as_mut() else { continue };
+                        let section = results.section_mut(*kind);
+                        // We've since stopped searching this room directory.
+                        let Some(directory) = section.get_directory_mut(server.as_deref()) else { continue };
+                        // We've started a new search since asking for this next page.
+                        if *is_next_page && !directory.has_matches { continue }
+                        directory.has_matches = true;
+                        // Upon an error, we keep the old token so the user can try again.
+                        if error.is_none() {
+                            directory.more = next_batch.clone().map(MoreResults::NextBatch);
+                        }
+                        directory.error = error.clone();
+                        directory.is_loading_more = false;
+                        section.add_results(rooms, &mut self.result_rows);
+                        self.open_only_match(cx);
+                        self.redraw(cx);
+                    }
+                    Some(DirectorySearchAction::DirectoryUsers { query, users, limit, is_limited, error })
+                        if *query == self.user_search.query =>
+                    {
+                        let Some(section) = self.user_search.results.as_mut() else { continue };
+                        let Some(directory) = section.get_directory_mut(None) else { continue };
+                        directory.has_matches = true;
+                        // Upon an error, we keep the old limit so the user can try again.
+                        if error.is_none() {
+                            directory.more = is_limited.then(|| MoreResults::Limit(limit + SEARCH_PAGE_SIZE));
+                        }
+                        directory.error = error.clone();
+                        directory.is_loading_more = false;
+                        // A bigger search gives us the users we already have plus some more.
+                        section.add_results(users, &mut self.result_rows);
+                        self.open_only_match(cx);
+                        self.redraw(cx);
+                    }
+                    _ => {}
+                }
+
+                if let Some(LogoutAction::ClearAppState { .. }) = action.downcast_ref() {
+                    // The next account to log in shouldn't see this account's searches.
+                    cx.stop_timer(self.room_search.timer);
+                    cx.stop_timer(self.user_search.timer);
+                    self.room_search = Search::default();
+                    self.user_search = Search::default();
+                    self.pending_submit = None;
+                    self.result_rows = ResultRows::default();
+                    self.set_state(cx, AddRoomState::WaitingOnUserInput);
+                    room_alias_id_input.set_text(cx, "");
+                    user_search_input.set_text(cx, "");
+                    self.update_clear_button(cx, SearchBox::Rooms);
+                    self.update_clear_button(cx, SearchBox::People);
+                    profile_pane.reset(cx);
+                    self.redraw(cx);
+                }
+            }
+
+            let room_items = self.view.flat_list(cx, ids!(room_results.list)).items_with_actions(actions);
+            for (key, item) in &room_items {
+                let section = match *key {
+                    key if key == ROOMS_SECTION.load_more_key => ResultSection::Rooms,
+                    key if key == SPACES_SECTION.load_more_key => ResultSection::Spaces,
+                    _ => continue,
+                };
+                if item.button(cx, ids!(load_more_button)).clicked(actions) {
+                    self.load_more_results(cx, section);
+                }
+            }
+            let (tapped_room, is_room_hover_changed) = handle_row_actions(room_items, false, actions, &mut self.result_rows.hovered_key);
+            if let Some(key) = tapped_room {
+                self.open_room_result(cx, key);
+            }
+
+            let user_items = self.view.flat_list(cx, ids!(user_results.list)).items_with_actions(actions);
+            for (key, item) in &user_items {
+                if *key == PEOPLE_SECTION.load_more_key && item.button(cx, ids!(load_more_button)).clicked(actions) {
+                    self.load_more_results(cx, ResultSection::People);
+                }
+            }
+            let (tapped_user, is_user_hover_changed) = handle_row_actions(user_items, false, actions, &mut self.result_rows.hovered_key);
+            if let Some(key) = tapped_user {
+                self.open_user_result(cx, key);
+            }
+
+            if is_room_hover_changed || is_user_hover_changed {
+                self.redraw(cx);
             }
         }
     }
 
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        if self.is_room_directories_label_stale {
+            self.is_room_directories_label_stale = false;
+            let servers = get_room_directory_servers(cx);
+            let other_servers: Vec<&str> = servers.iter().flatten().map(|server| server.as_str()).collect();
+            let text = if other_servers.is_empty() {
+                String::from("Only searching your homeserver's room directory.")
+            } else {
+                format!("Also searching: {}", other_servers.join(", "))
+            };
+            self.view.label(cx, ids!(room_directories_label)).set_text(cx, &text);
+        }
+
         let loading_room_view = self.view.view(cx, ids!(loading_room_view));
         let fetched_room_summary = self.view.view(cx, ids!(fetched_room_summary));
         let error_view = self.view.view(cx, ids!(error_view));
@@ -617,8 +1120,9 @@ impl Widget for AddRoomScreen {
                 // Populate the content of the fetched room preview.
                 let room_avatar = fetched_room_summary.avatar(cx, ids!(room_avatar));
                 match &frp.room_avatar {
-                    FetchedRoomAvatar::Text(text) => {
-                        room_avatar.show_text(cx, None, None, text);
+                    // We may not have this avatar's image yet, e.g., for a search result, so the avatar cache fetches it.
+                    FetchedRoomAvatar::Text(_) => {
+                        room_avatar.show_room(cx, frp.room_name_id.room_id(), frp.avatar_url.as_ref(), frp.room_name_id.name_for_avatar());
                     }
                     FetchedRoomAvatar::Image(avatar_image) => {
                         let res = room_avatar.show_image(
@@ -629,7 +1133,7 @@ impl Widget for AddRoomScreen {
                         if res.is_err() {
                             room_avatar.show_text(
                                 cx,
-                                None,
+                                Some(TextAvatarBgColor::UnknownRoom),
                                 None,
                                 frp.room_name_id.name_for_avatar().unwrap_or("?"),
                             );
@@ -670,6 +1174,9 @@ impl Widget for AddRoomScreen {
 
                 let room_summary = fetched_room_summary.label(cx, ids!(room_summary));
                 let join_room_button = fetched_room_summary.button(cx, ids!(join_room_button));
+                // A restricted room lets us join right away if we're in any of the rooms that its join rule allows,
+                // just like a public room does.
+                let can_join_directly = frp.is_in_allowed_room || matches!(frp.join_rule, Some(JoinRuleSummary::Public));
                 let join_function = match (&frp.state, &frp.join_rule) {
                     (Some(RoomState::Joined), _) => {
                         room_summary.set_text(cx, &format!("You have already joined this {room_or_space_lc}."));
@@ -694,7 +1201,7 @@ impl Widget for AddRoomScreen {
                     (Some(RoomState::Left), join_rule) => {
                         room_summary.set_text(cx, &format!("You previously left this {room_or_space_lc}."));
                         let (join_room_text, join_function) = match join_rule {
-                            Some(JoinRuleSummary::Public) => (
+                            _ if can_join_directly => (
                                 format!("Re-join this {room_or_space_lc}"),
                                 JoinButtonFunction::NavigateOrJoin,
                             ),
@@ -706,7 +1213,6 @@ impl Widget for AddRoomScreen {
                                 format!("Knock to re-join {room_or_space_lc}"),
                                 JoinButtonFunction::Knock,
                             ),
-                            // TODO: handle this after we update matrix-sdk to the new `JoinRule` enum.
                             Some(JoinRuleSummary::Restricted(_)) => (
                                 format!("Re-joining {room_or_space_lc} requires an invite or other room membership"),
                                 JoinButtonFunction::None,
@@ -732,7 +1238,7 @@ impl Widget for AddRoomScreen {
                         ));
 
                         let (join_room_text, join_function) = match join_rule {
-                            Some(JoinRuleSummary::Public) => (
+                            _ if can_join_directly => (
                                 format!("Join this {room_or_space_lc}"),
                                 JoinButtonFunction::NavigateOrJoin,
                             ),
@@ -744,7 +1250,6 @@ impl Widget for AddRoomScreen {
                                 format!("Knock to join {room_or_space_lc}"),
                                 JoinButtonFunction::Knock,
                             ),
-                            // TODO: handle this after we update matrix-sdk to the new `JoinRule` enum.
                             Some(JoinRuleSummary::Restricted(_)) => (
                                 format!("Joining {room_or_space_lc} requires an invite or other room membership"),
                                 JoinButtonFunction::None,
@@ -787,35 +1292,437 @@ impl Widget for AddRoomScreen {
             }
         }
 
-        self.view.draw_walk(cx, scope, walk)
+        let room_results_uid = self.view.child_by_path(ids!(content.room_results.list)).widget_uid();
+        let are_room_results_shown = self.are_room_results_shown();
+        let (color, color_hover, color_focus) = (self.result_row_color, self.result_row_color_hover, self.result_row_color_focus);
+        let viewport = self.content_viewport;
+        let visible_y = if viewport.size.y > 0.0 { (viewport.pos.y, viewport.pos.y + viewport.size.y) } else { (f64::NEG_INFINITY, f64::INFINITY) };
+        while let Some(step) = self.view.draw_walk(cx, scope, walk).step() {
+            let is_room_results = step.widget_uid() == room_results_uid;
+            let list_ref = step.as_flat_list();
+            let Some(mut list) = list_ref.borrow_mut() else { continue };
+            let rows = &mut self.result_rows;
+            if is_room_results {
+                if are_room_results_shown {
+                    match &self.room_search.results {
+                        Some(results) => {
+                            draw_search_section(cx, scope, &mut list, &results.rooms, &ROOMS_SECTION, rows, visible_y, color, color_hover, color_focus);
+                            draw_search_section(cx, scope, &mut list, &results.spaces, &SPACES_SECTION, rows, visible_y, color, color_hover, color_focus);
+                        }
+                        None if !self.room_search.query.is_empty() => {
+                            draw_flat_list_status_row(cx, scope, &mut list, id!(rooms_hint), false, "To find a person, search for them below.");
+                        }
+                        None => {}
+                    }
+                }
+            } else {
+                match &self.user_search.results {
+                    Some(section) => draw_search_section(cx, scope, &mut list, section, &PEOPLE_SECTION, rows, visible_y, color, color_hover, color_focus),
+                    None if !self.user_search.query.is_empty() => {
+                        draw_flat_list_status_row(cx, scope, &mut list, id!(people_hint), false, "To find a room or space, search for it above.");
+                    }
+                    None => {}
+                }
+            }
+            // Drop the rows that we didn't draw this time.
+            list.items.retain_visible();
+        }
+        // If the content moved or resized, rows we skipped could be in view now, so we draw once more.
+        self.content_viewport = self.view.child(id!(content)).area().rect(cx);
+        if self.content_viewport != viewport {
+            cx.redraw_area_in_draw(self.view.area());
+        }
+        DrawStep::done()
     }
 }
 
 impl AddRoomScreen {
     /// Parses the given room address and starts fetching a preview of that room or space.
     fn search_for_room(&mut self, cx: &mut Cx, address: &str) {
-        match parse_address(address.trim()) {
-            Ok((room_or_alias_id, via)) => {
-                self.state = AddRoomState::Parsed {
-                    room_or_alias_id: room_or_alias_id.clone(),
-                };
-                submit_async_request(MatrixRequest::GetRoomPreview {
-                    room_or_alias_id,
-                    via,
-                    response_mode: RoomPreviewResponseMode::Action,
-                });
-            }
-            Err(e) => {
-                let err_str = format!("Could not parse the text as a valid room address.\nError: {e}.");
+        self.view.user_profile_sliding_pane(cx, ids!(user_profile_sliding_pane)).reset(cx);
+        // We search for it too, so the search results match the input if the user cancels the room preview.
+        self.search_rooms(cx, address.trim());
+        match SearchQuery::parse(address).and_then(|search_query| search_query.full_room_address()) {
+            Some((room_or_alias_id, via)) => self.request_room_preview(cx, room_or_alias_id, via),
+            None => {
+                let err_str = String::from("Could not parse the text as a valid room address.");
                 enqueue_popup_notification(
                     err_str.clone(),
                     PopupKind::Error,
                     None,
                 );
-                self.state = AddRoomState::ParseError(err_str);
+                self.set_state(cx, AddRoomState::ParseError(err_str));
                 self.view.text_input(cx, ids!(room_alias_id_input)).set_key_focus(cx);
             }
         }
+        self.redraw(cx);
+    }
+
+    /// Starts fetching a preview of the given room or space, which we show once we get it.
+    fn request_room_preview(&mut self, cx: &mut Cx, room_or_alias_id: OwnedRoomOrAliasId, via: Vec<OwnedServerName>) {
+        self.pending_submit = None;
+        self.set_state(cx, AddRoomState::Parsed {
+            room_or_alias_id: room_or_alias_id.clone(),
+        });
+        submit_async_request(MatrixRequest::GetRoomPreview {
+            room_or_alias_id,
+            via,
+            response_mode: RoomPreviewResponseMode::Action,
+        });
+        self.redraw(cx);
+    }
+
+    /// Sets our state, and holds a cancel scope while that state shows a room preview.
+    fn set_state(&mut self, cx: &mut Cx, state: AddRoomState) {
+        self.state = state;
+        let shows_room_preview = matches!(
+            self.state,
+            AddRoomState::FetchedRoomPreview { .. } | AddRoomState::Knocked { .. } | AddRoomState::Joined { .. } | AddRoomState::Loaded { .. }
+        );
+        if !shows_room_preview {
+            self.cancel_scope = None;
+        } else if self.cancel_scope.is_none() {
+            self.cancel_scope = Some(self.begin_cancel_scope(cx));
+        }
+    }
+
+    /// Hides the room preview and goes back to the search results.
+    fn cancel_room_preview(&mut self, cx: &mut Cx) {
+        // Hidden buttons still get key presses, so we take key focus away from the preview's buttons.
+        let buttons_view = self.view.view(cx, ids!(fetched_room_summary.buttons_view));
+        if cx.has_key_focus(buttons_view.button(cx, ids!(join_room_button)).area())
+            || cx.has_key_focus(buttons_view.button(cx, ids!(cancel_button)).area())
+        {
+            cx.set_key_focus(Area::Empty);
+        }
+        self.set_state(cx, AddRoomState::WaitingOnUserInput);
+        self.redraw(cx);
+    }
+
+    /// Shows the given preview of a room or space, which we found by `room_or_alias_id`.
+    fn show_room_preview(&mut self, cx: &mut Cx, frp: FetchedRoomPreview, room_or_alias_id: OwnedRoomOrAliasId) {
+        self.set_state(cx, AddRoomState::FetchedRoomPreview { frp, room_or_alias_id });
+        // Reset the buttons' hover states when they are first shown.
+        self.view.button(cx, ids!(fetched_room_summary.buttons_view.join_room_button)).reset_hover(cx);
+        self.view.button(cx, ids!(fetched_room_summary.buttons_view.cancel_button)).reset_hover(cx);
+        // The preview replaces the results, which the user may have scrolled down, so we scroll back up to it.
+        self.view.child(id!(content)).as_view().set_scroll_pos(cx, Vec2d::default());
+        self.redraw(cx);
+    }
+
+    /// Shows the clear 'X' button inside the given search box if it is non-empty, and adjusts its padding.
+    fn update_clear_button(&self, cx: &mut Cx, search_box: SearchBox) {
+        let (input, clear_button) = match search_box {
+            SearchBox::Rooms => (ids!(room_alias_id_input), ids!(clear_room_search_button)),
+            SearchBox::People => (ids!(user_search_input), ids!(clear_user_search_button)),
+        };
+        let mut input = self.view.text_input(cx, input);
+        let has_text = !input.text().trim().is_empty();
+        let clear_button = self.view.button(cx, clear_button);
+        clear_button.set_visible(cx, has_text);
+        clear_button.reset_hover(cx);
+        let right = if has_text { self.clear_button_gutter } else { self.search_input_padding.right };
+        let padding = Inset { right, ..self.search_input_padding };
+        script_apply_eval!(cx, input, {padding: #(padding)});
+    }
+
+    /// Returns whether we're showing the room search results, which a room preview replaces but an error doesn't.
+    fn are_room_results_shown(&self) -> bool {
+        matches!(self.state, AddRoomState::WaitingOnUserInput | AddRoomState::ParseError(_) | AddRoomState::FetchError(_))
+    }
+
+    /// Moves the focus to the next or previous row of the given search box's results, scrolling to show it.
+    ///
+    /// Moving down from a list's last row loads more of it instead, and moving up from the first row scrolls up
+    /// to show the heading above the search box. Returns `false` if there are no results to move through.
+    fn move_result_focus(&mut self, cx: &mut Cx, search_box: SearchBox, is_down: bool) -> bool {
+        // Each list of results in this search box, with its rows and whether it has more results to load.
+        let lists: Vec<(ResultSection, Vec<LiveId>, bool)> = match search_box {
+            SearchBox::Rooms => self.room_search.results.iter()
+                .flat_map(|results| [
+                    (ResultSection::Rooms, results.rooms.row_keys().collect(), results.rooms.has_more()),
+                    (ResultSection::Spaces, results.spaces.row_keys().collect(), results.spaces.has_more()),
+                ])
+                .collect(),
+            SearchBox::People => self.user_search.results.iter()
+                .map(|section| (ResultSection::People, section.row_keys().collect(), section.has_more()))
+                .collect(),
+        };
+        let heading_path = match search_box {
+            SearchBox::Rooms => ids!(find_rooms_heading),
+            SearchBox::People => ids!(find_people_heading),
+        };
+        let rows: Vec<(LiveId, ResultSection)> = lists.iter()
+            .flat_map(|(section, keys, _)| keys.iter().map(|key| (*key, *section)))
+            .collect();
+        if rows.is_empty() {
+            return false;
+        }
+        let index = match self.result_rows.focused {
+            Some((focused_box, key)) if focused_box == search_box => rows.iter().position(|(row_key, _)| *row_key == key),
+            _ => None,
+        };
+        let new_index = match (index, is_down) {
+            (None, true) => 0,
+            (None | Some(0), false) => {
+                // We only scroll up far enough to show the heading above this search box.
+                let heading = self.view.widget(cx, heading_path).area();
+                self.scroll_into_view(cx, heading);
+                return true;
+            }
+            (Some(index), false) => index - 1,
+            (Some(index), true) => {
+                let section = rows[index].1;
+                let is_last_in_list = rows.get(index + 1).is_none_or(|(_, next_section)| *next_section != section);
+                if is_last_in_list && lists.iter().any(|(list, _, has_more)| *list == section && *has_more) {
+                    self.load_more_results(cx, section);
+                    return true;
+                }
+                (index + 1).min(rows.len() - 1)
+            }
+        };
+        self.focus_result_row(cx, search_box, rows[new_index].0);
+        true
+    }
+
+    /// Moves the focus with Tab from the rooms list to the spaces list to the people search box, skipping empty lists,
+    /// or back the other way with Shift+Tab. Returns `false` if the focus isn't on one of those or can't go any further.
+    fn move_focus_with_tab(&mut self, cx: &mut Cx, is_people_box_focused: bool, is_forward: bool) -> bool {
+        // Each room results list that has any rows. The people search box comes after these lists.
+        let room_lists: Vec<_> = self.room_search.results.iter()
+            .filter(|_| self.are_room_results_shown())
+            .flat_map(|results| [&results.rooms, &results.spaces])
+            .filter(|list| !list.items.is_empty())
+            .collect();
+        let current = if is_people_box_focused {
+            room_lists.len()
+        } else if let Some((SearchBox::Rooms, key)) = self.result_rows.focused
+            && let Some(list) = room_lists.iter().position(|list| list.row_keys().any(|row_key| row_key == key))
+        {
+            list
+        } else {
+            return false;
+        };
+        let target = if is_forward { current + 1 } else if current > 0 { current - 1 } else { return false };
+        let target_row = room_lists.get(target).and_then(|list| list.row_keys().next());
+        let is_people_box_target = target == room_lists.len();
+        // Makepad's own Tab navigation has already asked to focus and scroll to the next widget,
+        // so we set key focus ourselves and replace its scroll with ours (see `tab_scroll_target`).
+        self.tab_scroll_target = if let Some(key) = target_row {
+            self.view.text_input(cx, ids!(room_alias_id_input)).set_key_focus(cx);
+            self.focus_result_row(cx, SearchBox::Rooms, key)
+        } else if is_people_box_target {
+            let people_input = self.view.text_input(cx, ids!(user_search_input));
+            people_input.set_key_focus(cx);
+            self.result_rows.focused = None;
+            self.redraw(cx);
+            self.scroll_into_view(cx, people_input.area());
+            Some(people_input.area())
+        } else {
+            return false;
+        };
+        true
+    }
+
+    /// Moves the arrow keys focus to the given result row and scrolls to show it, returning the row's area.
+    fn focus_result_row(&mut self, cx: &mut Cx, search_box: SearchBox, key: LiveId) -> Option<Area> {
+        self.result_rows.focused = Some((search_box, key));
+        self.result_rows.hovered_key = None;
+        self.pending_submit = None;
+        self.redraw(cx);
+        let list_path = match search_box {
+            SearchBox::Rooms => ids!(room_results.list),
+            SearchBox::People => ids!(user_results.list),
+        };
+        let row_area = self.view.flat_list(cx, list_path).borrow()
+            .and_then(|list| list.items.get(&key).map(|item| item.widget.area()))?;
+        self.scroll_into_view(cx, row_area);
+        Some(row_area)
+    }
+
+    /// Scrolls the content to show the given area, just like makepad does for the widget that Tab moves to.
+    fn scroll_into_view(&self, cx: &mut Cx, area: Area) {
+        cx.send_trigger(self.view.child(id!(content)).area(), Trigger { id: live_id!(scroll_focus_nav), from: area });
+    }
+
+    /// Starts getting more results for the given list from each directory that has more,
+    /// unless we're already getting them.
+    fn load_more_results(&mut self, cx: &mut Cx, section: ResultSection) {
+        self.pending_submit = None;
+        match section {
+            ResultSection::Rooms | ResultSection::Spaces => {
+                let kind = if section == ResultSection::Rooms { RoomKind::Room } else { RoomKind::Space };
+                let Some(results) = self.room_search.results.as_mut() else { return };
+                let section_results = results.section_mut(kind);
+                for directory in &mut section_results.directories {
+                    if let Some(MoreResults::NextBatch(next_batch)) = &directory.more
+                        && !directory.is_loading_more
+                    {
+                        submit_async_request(MatrixRequest::SearchRoomDirectory {
+                            query: self.room_search.query.clone(),
+                            kind,
+                            server: directory.server.clone(),
+                            next_batch: Some(next_batch.clone()),
+                        });
+                        directory.is_loading_more = true;
+                        section_results.load_more_start_index = section_results.joined_start_index;
+                    }
+                }
+            }
+            ResultSection::People => {
+                let Some(section_results) = self.user_search.results.as_mut() else { return };
+                for directory in &mut section_results.directories {
+                    if let Some(MoreResults::Limit(limit)) = directory.more
+                        && !directory.is_loading_more
+                    {
+                        submit_async_request(MatrixRequest::SearchUserDirectory { query: self.user_search.query.clone(), limit });
+                        directory.is_loading_more = true;
+                    }
+                }
+            }
+        }
+        self.redraw(cx);
+    }
+
+    /// Starts searching for rooms and spaces that match the given query.
+    ///
+    /// If we already have this query's results, we just search again each room directory that failed.
+    fn search_rooms(&mut self, cx: &mut Cx, query: &str) {
+        cx.stop_timer(self.room_search.timer);
+        if query == self.room_search.query {
+            let Some(results) = self.room_search.results.as_mut() else { return };
+            for (kind, section) in [(RoomKind::Room, &mut results.rooms), (RoomKind::Space, &mut results.spaces)] {
+                // A directory that failed to get its next page still has a "Load more" button to try again.
+                for directory in section.directories.iter_mut().filter(|d| d.error.is_some() && d.more.is_none()) {
+                    submit_async_request(MatrixRequest::SearchRoomDirectory {
+                        query: query.to_owned(),
+                        kind,
+                        server: directory.server.clone(),
+                        next_batch: None,
+                    });
+                    directory.has_matches = false;
+                    directory.error = None;
+                }
+            }
+            self.redraw(cx);
+            return;
+        }
+        let mut results = None;
+        if SearchQuery::parse(query).is_some_and(|search_query| search_query.can_match_rooms()) {
+            let servers = get_room_directory_servers(cx);
+            submit_async_request(MatrixRequest::ResolveRoomSearchQuery { query: query.to_owned() });
+            for server in &servers {
+                for kind in [RoomKind::Room, RoomKind::Space] {
+                    submit_async_request(MatrixRequest::SearchRoomDirectory {
+                        query: query.to_owned(),
+                        kind,
+                        server: server.clone(),
+                        next_batch: None,
+                    });
+                }
+            }
+            results = Some(RoomResults {
+                rooms: SectionResults::new(&servers),
+                spaces: SectionResults::new(&servers),
+            });
+        }
+        self.room_search = Search {
+            query: query.to_owned(),
+            results,
+            ..Default::default()
+        };
+        self.result_rows.unfocus(SearchBox::Rooms);
+        self.redraw(cx);
+    }
+
+    /// Starts searching for people that match the given query, unless we already have its results.
+    fn search_users(&mut self, cx: &mut Cx, query: &str) {
+        cx.stop_timer(self.user_search.timer);
+        let has_error = self.user_search.results.as_ref().is_some_and(SectionResults::has_error);
+        if query == self.user_search.query && !has_error {
+            return;
+        }
+        let can_match_users = SearchQuery::parse(query).is_some_and(|search_query| search_query.can_match_users());
+        if can_match_users {
+            submit_async_request(MatrixRequest::ResolveUserSearchQuery { query: query.to_owned() });
+            submit_async_request(MatrixRequest::SearchUserDirectory { query: query.to_owned(), limit: SEARCH_PAGE_SIZE });
+        }
+        self.user_search = Search {
+            query: query.to_owned(),
+            results: can_match_users.then(SectionResults::default),
+            ..Default::default()
+        };
+        self.result_rows.unfocus(SearchBox::People);
+        self.redraw(cx);
+    }
+
+    /// Opens the only match in the search box that the user submitted, once we've looked up its matches.
+    fn open_only_match(&mut self, cx: &mut Cx) {
+        let Some(search_box) = self.pending_submit else { return };
+        let only_match = match search_box {
+            SearchBox::Rooms => self.room_search.results.as_ref()
+                .and_then(|results| get_only_match(&self.room_search.query, &[&results.rooms, &results.spaces])),
+            SearchBox::People => self.user_search.results.as_ref()
+                .and_then(|section| get_only_match(&self.user_search.query, &[section])),
+        };
+        // We're still looking up its matches.
+        let Some(only_match) = only_match else { return };
+        self.pending_submit = None;
+        let Some(key) = only_match else { return };
+        match search_box {
+            SearchBox::Rooms => self.open_room_result(cx, key),
+            SearchBox::People => self.open_user_result(cx, key),
+        }
+    }
+
+    /// Shows the preview of the room or space search result with the given row key.
+    ///
+    /// We already have everything that its preview shows, so we don't have to fetch it.
+    fn open_room_result(&mut self, cx: &mut Cx, key: LiveId) {
+        self.pending_submit = None;
+        let Some(mut frp) = self.room_search.results.as_ref()
+            .and_then(|results| results.rooms.items.iter().chain(&results.spaces.items).find(|room| room.row_key() == key))
+            .map(|room| room.preview.clone())
+        else { return };
+        if let Some(avatar_url) = &frp.avatar_url
+            && let AvatarCacheEntry::Loaded(data) = avatar_cache::get_or_fetch_avatar(cx, avatar_url)
+        {
+            frp.room_avatar = FetchedRoomAvatar::Image((avatar_url.clone(), data).into());
+        }
+        let room_or_alias_id = frp.alias.clone().map_or_else(|| frp.room_name_id.room_id().clone().into(), Into::into);
+        self.show_room_preview(cx, frp, room_or_alias_id);
+    }
+
+    /// Records our new membership in the given room, if it's one of the rooms or spaces that we found.
+    fn record_room_state(&mut self, cx: &mut Cx, room_id: &RoomId, state: RoomState) {
+        let Some(results) = self.room_search.results.as_mut() else { return };
+        let mut is_changed = false;
+        for room in results.rooms.items.iter_mut().chain(&mut results.spaces.items) {
+            if room.room_id() == room_id && room.preview.state != Some(state) {
+                room.preview.state = Some(state);
+                // Its row shows whether we've joined it.
+                self.result_rows.populated.remove(&room.row_key());
+                is_changed = true;
+            }
+        }
+        if is_changed {
+            self.redraw(cx);
+        }
+    }
+
+    /// Opens the profile of the person search result with the given row key.
+    fn open_user_result(&mut self, cx: &mut Cx, key: LiveId) {
+        self.pending_submit = None;
+        let Some(user_profile) = self.user_search.results.as_ref()
+            .and_then(|section| section.items.iter().find(|user| user.row_key() == key))
+            .map(|user| user.user_profile.clone())
+        else { return };
+        user_profile_cache::insert_user_profile_if_missing(cx, user_profile.clone());
+        // The pane covers the rows and takes their hover-out events, so no row stays hovered.
+        self.result_rows.hovered_key = None;
+        let profile_pane = self.view.user_profile_sliding_pane(cx, ids!(user_profile_sliding_pane));
+        profile_pane.set_info(cx, UserProfilePaneInfo { user_profile, room: None });
+        profile_pane.show(cx);
         self.redraw(cx);
     }
 }
@@ -825,6 +1732,7 @@ impl AddRoomScreenRef {
     pub fn search_for_room(&self, cx: &mut Cx, address: &str) {
         let Some(mut inner) = self.borrow_mut() else { return };
         inner.view.text_input(cx, ids!(room_alias_id_input)).set_text(cx, address);
+        inner.update_clear_button(cx, SearchBox::Rooms);
         inner.view.button(cx, ids!(search_for_room_button)).set_enabled(cx, true);
         inner.search_for_room(cx, address);
     }
@@ -860,28 +1768,426 @@ pub enum KnockResultAction {
 }
 
 
-/// Tries to extract a room address (Alias or ID) from the given text.
-///
-/// This function is quite flexible and will attempt to parse `text` as:
-/// * A Room ID (with a leading `!`).
-/// * A Room Alias (with a leading `#`).
-/// * A `https://matrix.to` URI, which includes either a room alias, or a room ID plus `via` servers.
-/// * A `matrix:` scheme URI, which is similar to above.
-fn parse_address(text: &str) -> Result<(OwnedRoomOrAliasId, Vec<OwnedServerName>), IdParseError> {
-    match OwnedRoomOrAliasId::try_from(text) {
-        Ok(room_or_alias_id) => Ok((room_or_alias_id, Vec::new())),
-        Err(e) => {
-            if let Some((matrix_id, via)) = utils::parse_matrix_link(text) {
-                if let Some(room_or_alias_id) = match matrix_id {
-                    MatrixId::Room(room_id) => Some(room_id.into()),
-                    MatrixId::RoomAlias(alias) => Some(alias.into()),
-                    MatrixId::Event(room_or_alias_id, _) => Some(room_or_alias_id),
-                    _ => None,
-                } {
-                    return Ok((room_or_alias_id, via));
+/// The text entered in one of the search boxes, and the results of searching for it.
+#[derive(Default)]
+struct Search<R> {
+    /// The trimmed text that these results are for.
+    query: String,
+    /// This is `None` if the query can't match what this search box is for, e.g., a user ID in the room search.
+    results: Option<R>,
+    /// The countdown to searching after the user stops typing.
+    timer: Timer,
+}
+impl<R: Default> Search<R> {
+    /// Searches once the user stops typing, or clears the results if the search box is now empty.
+    fn handle_text_changed(&mut self, cx: &mut Cx, text: &str) {
+        cx.stop_timer(self.timer);
+        if text.trim().is_empty() {
+            *self = Self::default();
+        } else {
+            self.timer = cx.start_timeout(SEARCH_DELAY);
+        }
+    }
+}
+
+/// One of the two search boxes on this screen.
+#[derive(Clone, Copy, PartialEq)]
+enum SearchBox {
+    Rooms,
+    People,
+}
+
+/// One of the lists of search results, each with its own "Load more" button.
+#[derive(Clone, Copy, PartialEq)]
+enum ResultSection {
+    Rooms,
+    Spaces,
+    People,
+}
+
+/// The results of searching for rooms and spaces, which we show in separate lists.
+#[derive(Default)]
+struct RoomResults {
+    rooms: SectionResults<RoomSearchResult>,
+    spaces: SectionResults<RoomSearchResult>,
+}
+impl RoomResults {
+    fn section_mut(&mut self, kind: RoomKind) -> &mut SectionResults<RoomSearchResult> {
+        match kind {
+            RoomKind::Room => &mut self.rooms,
+            RoomKind::Space => &mut self.spaces,
+        }
+    }
+
+    /// Adds each of the given results to the rooms or spaces section.
+    fn add_results(&mut self, results: &[RoomSearchResult], rows: &mut ResultRows) {
+        let (spaces, rooms): (Vec<_>, Vec<_>) = results.iter().cloned().partition(RoomSearchResult::is_space);
+        self.rooms.add_results(&rooms, rows);
+        self.spaces.add_results(&spaces, rows);
+    }
+}
+
+/// The results shown in one section of the search results, i.e., rooms, spaces, or people.
+struct SectionResults<T> {
+    /// The results ranked by how well they match, except that the rooms we'd already joined go last.
+    items: Vec<T>,
+    /// Where the rooms that we'd already joined when we got them start in `items`.
+    joined_start_index: usize,
+    /// Where the results that we got since the user last asked for more start in `items`, which is 0 before then.
+    /// We rank these again as more of them arrive, but the results before them never move.
+    load_more_start_index: usize,
+    /// Whether we've looked up the results that the query could exactly be.
+    has_exact_matches: bool,
+    /// Our search of each directory for the query, which all add to `items`.
+    directories: Vec<DirectorySearch>,
+}
+impl<T> Default for SectionResults<T> {
+    fn default() -> Self {
+        Self::new(&[None])
+    }
+}
+impl<T> SectionResults<T> {
+    /// Creates empty results that we'll get by searching the directories of the given servers,
+    /// in which `None` is our own homeserver.
+    fn new(servers: &[Option<OwnedServerName>]) -> Self {
+        Self {
+            items: Vec::new(),
+            joined_start_index: 0,
+            load_more_start_index: 0,
+            has_exact_matches: false,
+            directories: servers.iter()
+                .map(|server| DirectorySearch { server: server.clone(), ..Default::default() })
+                .collect(),
+        }
+    }
+
+    fn get_directory_mut(&mut self, server: Option<&ServerName>) -> Option<&mut DirectorySearch> {
+        self.directories.iter_mut().find(|directory| directory.server.as_deref() == server)
+    }
+
+    fn has_error(&self) -> bool {
+        self.directories.iter().any(|directory| directory.error.is_some())
+    }
+
+    fn has_more(&self) -> bool {
+        self.directories.iter().any(|directory| directory.more.is_some())
+    }
+
+    fn is_searching(&self) -> bool {
+        !self.has_exact_matches || self.directories.iter().any(|directory| !directory.has_matches)
+    }
+}
+impl<T: SearchResultRow> SectionResults<T> {
+    /// Adds the given results, except for ones that we already have, which an exact match replaces in place,
+    /// and ranks them among the other results that we got since the user last asked for more.
+    ///
+    /// The user is most likely looking for new rooms, so the rooms we've already joined stay last.
+    fn add_results(&mut self, results: &[T], rows: &mut ResultRows) {
+        for result in results {
+            let key = result.row_key();
+            match self.items.iter_mut().find(|item| item.row_key() == key) {
+                Some(item) if result.is_exact_match() => {
+                    *item = result.clone();
+                    rows.populated.remove(&key);
+                }
+                Some(_) => {}
+                None if result.is_joined() => self.items.push(result.clone()),
+                None => {
+                    self.items.insert(self.joined_start_index, result.clone());
+                    self.joined_start_index += 1;
                 }
             }
-            Err(e)
         }
-    }    
+        self.items[self.load_more_start_index .. self.joined_start_index].sort_by_key(T::get_rank);
+        self.items[self.joined_start_index..].sort_by_key(T::get_rank);
+    }
+
+    fn row_keys(&self) -> impl Iterator<Item = LiveId> {
+        self.items.iter().map(SearchResultRow::row_key)
+    }
+
+    fn exact_match_keys(&self) -> impl Iterator<Item = LiveId> {
+        self.items.iter().filter(|result| result.is_exact_match()).map(SearchResultRow::row_key)
+    }
+}
+
+/// Our search of one server's room or user directory for one section of the search results.
+#[derive(Default)]
+struct DirectorySearch {
+    /// The server whose directory this is, or `None` for our own homeserver's.
+    server: Option<OwnedServerName>,
+    /// Whether we've gotten this directory's first page of matches.
+    has_matches: bool,
+    error: Option<String>,
+    /// How to get more matches from this directory, if it has more.
+    more: Option<MoreResults>,
+    is_loading_more: bool,
+}
+
+/// How to get more matches from a directory for one section of the search results.
+enum MoreResults {
+    /// Get the room directory's next page of matches, starting from this token.
+    NextBatch(String),
+    /// Search the user directory again for up to this many users.
+    Limit(u32),
+}
+
+/// What we track about the rows that we draw in the list of search results.
+#[derive(Default)]
+struct ResultRows {
+    hovered_key: Option<LiveId>,
+    /// The row that the user moved to with the arrow keys, and the search box whose results it's in.
+    focused: Option<(SearchBox, LiveId)>,
+    /// The keys of the rows whose content is up to date, which needn't be set again when drawn.
+    populated: HashSet<LiveId>,
+}
+impl ResultRows {
+    /// Clears the arrow keys' focus if it's on one of the given search box's results, returning whether it was.
+    fn unfocus(&mut self, search_box: SearchBox) -> bool {
+        let was_focused = self.focused.is_some_and(|(focused_box, _)| focused_box == search_box);
+        if was_focused {
+            self.focused = None;
+        }
+        was_focused
+    }
+}
+
+/// The texts, the list keys, and the header template of one section of the search results.
+struct SectionInfo {
+    header: Option<&'static str>,
+    header_template: LiveId,
+    searching_text: &'static str,
+    empty_text: &'static str,
+    header_key: LiveId,
+    loading_key: LiveId,
+    status_key: LiveId,
+    load_more_key: LiveId,
+}
+
+const ROOMS_SECTION: SectionInfo = SectionInfo {
+    header: Some("Rooms"),
+    header_template: LiveId::from_str("first_section_header"),
+    searching_text: "Searching for rooms...",
+    empty_text: "No rooms found.",
+    header_key: LiveId::from_str("rooms_header"),
+    loading_key: LiveId::from_str("rooms_loading"),
+    status_key: LiveId::from_str("rooms_status"),
+    load_more_key: LiveId::from_str("rooms_load_more"),
+};
+
+const SPACES_SECTION: SectionInfo = SectionInfo {
+    header: Some("Spaces"),
+    header_template: LiveId::from_str("section_header"),
+    searching_text: "Searching for spaces...",
+    empty_text: "No spaces found.",
+    header_key: LiveId::from_str("spaces_header"),
+    loading_key: LiveId::from_str("spaces_loading"),
+    status_key: LiveId::from_str("spaces_status"),
+    load_more_key: LiveId::from_str("spaces_load_more"),
+};
+
+// The "Find people" label already says what this one section is.
+const PEOPLE_SECTION: SectionInfo = SectionInfo {
+    header: None,
+    header_template: LiveId::from_str("section_header"),
+    searching_text: "Searching for people...",
+    empty_text: "No people found.",
+    header_key: LiveId::from_str("people_header"),
+    loading_key: LiveId::from_str("people_loading"),
+    status_key: LiveId::from_str("people_status"),
+    load_more_key: LiveId::from_str("people_load_more"),
+};
+
+/// A search result that we show as a row in the list of search results.
+trait SearchResultRow: Clone {
+    fn row_key(&self) -> LiveId;
+
+    fn is_exact_match(&self) -> bool;
+
+    fn is_joined(&self) -> bool;
+
+    /// Returns where this result goes among the others: better matches first, then bigger rooms first.
+    fn get_rank(&self) -> (MatchQuality, MatchQuality, Reverse<u64>);
+
+    /// Sets the content of the given row to show this result.
+    ///
+    /// Returns `false` if its avatar is still being fetched, in which case call this again later.
+    fn populate_row(&self, cx: &mut Cx, row: &WidgetRef) -> bool;
+}
+
+impl SearchResultRow for RoomSearchResult {
+    fn row_key(&self) -> LiveId {
+        LiveId::from_str(self.room_id().as_str())
+    }
+
+    fn is_exact_match(&self) -> bool {
+        self.is_exact_match
+    }
+
+    fn is_joined(&self) -> bool {
+        self.preview.state == Some(RoomState::Joined)
+    }
+
+    fn get_rank(&self) -> (MatchQuality, MatchQuality, Reverse<u64>) {
+        let alias_match = if self.is_exact_match || self.is_alias_match { MatchQuality::Exact } else { MatchQuality::None };
+        // A room with exactly that name goes before a room with only that alias.
+        (self.name_match.min(alias_match), self.name_match, Reverse(self.preview.num_joined_members))
+    }
+
+    fn populate_row(&self, cx: &mut Cx, row: &WidgetRef) -> bool {
+        let room_name = self.preview.room_name_id.name_for_avatar();
+        let name = room_name.or(self.alias()).unwrap_or(self.room_id().as_str());
+        row.label(cx, ids!(info.title)).set_text(cx, name);
+        let members = match self.preview.num_joined_members {
+            1 => "1 member".to_owned(),
+            n => format!("{n} members"),
+        };
+        let mut subtitle = match self.alias() {
+            Some(alias) if room_name.is_some_and(|name| name != alias) => format!("{alias} · {members}"),
+            _ => members,
+        };
+        // Like the space lobby, we mark the rooms that we're already in.
+        if self.is_joined() {
+            subtitle.insert_str(0, "✅ Joined · ");
+        }
+        row.label(cx, ids!(info.subtitle)).set_text(cx, &subtitle);
+        row.avatar(cx, ids!(avatar)).show_room(cx, self.room_id(), self.preview.avatar_url.as_ref(), Some(name))
+    }
+}
+
+impl SearchResultRow for UserSearchResult {
+    fn row_key(&self) -> LiveId {
+        LiveId::from_str(self.user_profile.user_id.as_str())
+    }
+
+    fn is_exact_match(&self) -> bool {
+        self.is_exact_match
+    }
+
+    fn is_joined(&self) -> bool {
+        false
+    }
+
+    // Our homeserver's user directory already ranks the people that it finds.
+    fn get_rank(&self) -> (MatchQuality, MatchQuality, Reverse<u64>) {
+        (MatchQuality::None, MatchQuality::None, Reverse(0))
+    }
+
+    fn populate_row(&self, cx: &mut Cx, row: &WidgetRef) -> bool {
+        let name = self.user_profile.displayable_name();
+        row.label(cx, ids!(info.title)).set_text(cx, name);
+        row.label(cx, ids!(info.subtitle)).set_text(cx, self.user_profile.user_id.as_str());
+        row.avatar(cx, ids!(avatar)).show_user(cx, self.user_profile.avatar_state.uri(), name)
+    }
+}
+
+/// Draws one section of the search results into the given list:
+/// its header, then its results or status, then a button to load more results.
+#[allow(clippy::too_many_arguments)]
+fn draw_search_section<T: SearchResultRow>(
+    cx: &mut Cx2d,
+    scope: &mut Scope,
+    list: &mut FlatList,
+    section: &SectionResults<T>,
+    info: &SectionInfo,
+    rows: &mut ResultRows,
+    (visible_top, visible_bottom): (f64, f64),
+    color: Vec4f,
+    color_hover: Vec4f,
+    color_focus: Vec4f,
+) {
+    if let Some(header_text) = info.header
+        && let Some(header) = list.item(cx, info.header_key, info.header_template)
+    {
+        header.set_text(cx, header_text);
+        header.draw_all(cx, scope);
+    }
+
+    // Drawing hundreds of rows on every frame makes scrolling lag, so rows far from view only take up their space.
+    // We still draw the focused row and each list's first row, since the arrow keys and Tab scroll to them.
+    let row_walk = Walk::new(Size::fill(), Size::Fixed(LIST_ROW_HEIGHT));
+    for (index, result) in section.items.iter().enumerate() {
+        let key = result.row_key();
+        // The list drops rows that it didn't draw last time,
+        // so a row that it creates again starts out empty and unhovered.
+        if !list.items.contains_key(&key) {
+            rows.populated.remove(&key);
+            if rows.hovered_key == Some(key) {
+                rows.hovered_key = None;
+            }
+        }
+        let Some(row) = list.item(cx, key, id!(result_row)) else { continue };
+        if !rows.populated.contains(&key) && result.populate_row(cx, &row) {
+            rows.populated.insert(key);
+        }
+        let is_focused = rows.focused.is_some_and(|(_, focused_key)| focused_key == key);
+        let row_rect = cx.peek_walk_turtle(row_walk);
+        let is_near_view = row_rect.pos.y + row_rect.size.y >= visible_top - 2.0 * LIST_ROW_HEIGHT
+            && row_rect.pos.y <= visible_bottom + 2.0 * LIST_ROW_HEIGHT;
+        if !is_near_view && !is_focused && index != 0 {
+            cx.walk_turtle(row_walk);
+            continue;
+        }
+        let row_color = if is_focused {
+            color_focus
+        } else if rows.hovered_key == Some(key) {
+            color_hover
+        } else {
+            color
+        };
+        set_view_bg_color(cx, &row.as_view(), row_color);
+        row.draw_all(cx, scope);
+    }
+
+    for directory in &section.directories {
+        if let Some(error) = &directory.error {
+            let key = directory.server.as_ref().map_or(info.status_key, |server| info.status_key.str_append(server.as_str()));
+            draw_flat_list_status_row(cx, scope, list, key, false, error);
+        }
+    }
+    if section.items.is_empty() && !section.is_searching() && !section.has_error() {
+        draw_flat_list_status_row(cx, scope, list, info.status_key, false, info.empty_text);
+    }
+    if section.is_searching() || section.directories.iter().any(|directory| directory.is_loading_more) {
+        draw_flat_list_status_row(cx, scope, list, info.loading_key, true, info.searching_text);
+    } else if section.has_more()
+        && let Some(load_more_row) = list.item(cx, info.load_more_key, id!(load_more_row))
+    {
+        load_more_row.draw_all(cx, scope);
+    }
+}
+
+/// Returns the text that was submitted by clicking the given button or pressing Enter in the given input, if any.
+fn get_submitted_query(input: &TextInputRef, button: &ButtonRef, actions: &Actions) -> Option<String> {
+    button.clicked(actions).then(|| input.text())
+        .or_else(|| input.returned(actions).map(|(text, _)| text))
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+}
+
+/// Returns the only item of the given iterator, if it has exactly one.
+fn get_only_item<T>(mut items: impl Iterator<Item = T>) -> Option<T> {
+    match (items.next(), items.next()) {
+        (Some(item), None) => Some(item),
+        _ => None,
+    }
+}
+
+/// Returns `None` while we're still looking up matches for `query`, else the key of its only match in these sections, if any.
+/// A fully-qualified query can only be one room or user, so for one we only need its exact matches.
+fn get_only_match<T: SearchResultRow>(query: &str, sections: &[&SectionResults<T>]) -> Option<Option<LiveId>> {
+    if SearchQuery::parse(query).is_some_and(|search_query| search_query.is_fully_qualified()) {
+        if !sections.iter().all(|section| section.has_exact_matches) {
+            return None;
+        }
+        return Some(get_only_item(sections.iter().flat_map(|section| section.exact_match_keys())));
+    }
+    if sections.iter().any(|section| section.is_searching()) {
+        return None;
+    }
+    // A section that failed or that has more pages might have more matches.
+    if sections.iter().any(|section| section.has_error() || section.has_more()) {
+        return Some(None);
+    }
+    Some(get_only_item(sections.iter().flat_map(|section| section.row_keys())))
 }

@@ -12,6 +12,7 @@ use crate::{
         room_members_list::{RoomMembersChanged, RoomMembersFetchAction, RoomMembersListAction, RoomMembersListWidgetRefExt, show_member_profile},
         pane_dock::{SavedPaneContent, populate_content, restore_content, save_content, set_pane_header},
         pinned_messages_list::PinnedMessagesListWidgetRefExt,
+        room_info::{RoomInfoViewAction, RoomInfoViewWidgetRefExt},
         room_pane::{self, RoomPaneKind, RoomPaneOp, RoomPaneRequest, mini_app_panes},
         threads_list::ThreadsListWidgetRefExt,
     },
@@ -61,6 +62,7 @@ script_mod! {
                 pinned_messages := mod.widgets.PinnedMessagesList { visible: false }
                 mini_app_host := mod.widgets.MiniAppHostArea { visible: false }
                 threads := mod.widgets.ThreadsList { visible: false }
+                room_info := mod.widgets.RoomInfoView { visible: false }
             }
         }
 
@@ -81,6 +83,11 @@ pub enum RoomPaneScreenAction {
     /// This pane's content went away (e.g., its mini-app was closed),
     /// so its tab or view should be closed.
     Closed {
+        room_name_id: RoomNameId,
+        kind: RoomPaneKind,
+    },
+    /// The user asked to show the given kind of pane in place of this pane.
+    ShowPaneInPlace {
         room_name_id: RoomNameId,
         kind: RoomPaneKind,
     },
@@ -181,6 +188,13 @@ impl Widget for RoomPaneScreen {
                 self.redraw(cx);
                 continue;
             }
+            if let RoomInfoViewAction::ShowPane(kind) = action.as_widget_action().cast()
+                && let Some((room_name_id, displayed_kind)) = self.displayed.clone()
+            {
+                room_pane::open_in_place_of(room_name_id.room_id(), kind.clone(), displayed_kind);
+                cx.widget_action(self.widget_uid(), RoomPaneScreenAction::ShowPaneInPlace { room_name_id, kind });
+                continue;
+            }
             unhandled.push(action);
         }
         let return_clicked = self.view.button(cx, ids!(return_button)).clicked(&unhandled);
@@ -220,6 +234,7 @@ impl RoomPaneScreen {
         self.view.child_by_path(ids!(content.threads)).set_visible(cx, kind == RoomPaneKind::Threads);
         let host_area = self.view.widget(cx, ids!(content.mini_app_host));
         host_area.set_visible(cx, matches!(kind, RoomPaneKind::MiniApp(_)));
+        self.view.child_by_path(ids!(content.room_info)).set_visible(cx, kind == RoomPaneKind::RoomInfo);
         self.displayed = Some((room_name_id.clone(), kind.clone()));
         if let RoomPaneKind::MiniApp(app_id) = &kind {
             // A vacated screen is about to close, so it must not take its app back.
@@ -327,6 +342,7 @@ impl RoomPaneScreen {
         self.view.child_by_path(ids!(content.room_members)).as_room_members_list().reset(cx);
         self.view.child_by_path(ids!(content.pinned_messages)).as_pinned_messages_list().reset(cx);
         self.view.child_by_path(ids!(content.threads)).as_threads_list().reset(cx);
+        self.view.child_by_path(ids!(content.room_info)).as_room_info_view().reset(cx);
         self.displayed = None;
         self.is_vacated = false;
     }

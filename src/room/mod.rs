@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 use makepad_widgets::ScriptVm;
-use matrix_sdk::{RoomDisplayName, RoomHeroWithProfile, RoomState, room_preview::RoomPreview};
-use ruma::{OwnedRoomAliasId, OwnedRoomId, OwnedRoomOrAliasId, OwnedServerName, room::{JoinRuleSummary, RoomType}};
+use matrix_sdk::{Client, RoomDisplayName, RoomHeroWithProfile, RoomState, room_preview::RoomPreview};
+use ruma::{OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedRoomOrAliasId, OwnedServerName, room::{JoinRuleSummary, RoomType}};
 
 use crate::shared::avatar::AvatarImage;
 use crate::utils::RoomNameId;
@@ -13,6 +13,7 @@ pub mod pane_dock;
 pub mod pinned_messages_list;
 pub mod reply_preview;
 pub mod room_action_bar;
+pub mod room_info;
 pub mod room_members_list;
 pub mod room_pane;
 pub mod room_tab_hover_card;
@@ -33,6 +34,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
     message_list::script_mod(vm);
     pinned_messages_list::script_mod(vm);
     threads_list::script_mod(vm);
+    room_info::script_mod(vm);
     pane_dock::script_mod(vm);
 }
 
@@ -42,6 +44,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
 /// but haven't yet fetched the full room preview,
 /// such as a room to navigate to, or a room to join.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum BasicRoomDetails {
     /// We only know the room's ID, so we'll need to fetch the room preview
     /// to get more info about the room.
@@ -148,6 +151,8 @@ pub struct FetchedRoomPreview {
     pub via: Vec<OwnedServerName>,
     /// The alias this preview was fetched through, if any, which can also be used to join the room.
     pub alias: Option<OwnedRoomAliasId>,
+    /// Whether we've joined any of the rooms whose members can join this one, if its join rule is restricted.
+    pub is_in_allowed_room: bool,
 
     // Below: copied from the `RoomPreview` struct.
 
@@ -155,6 +160,8 @@ pub struct FetchedRoomPreview {
     pub canonical_alias: Option<OwnedRoomAliasId>,
     /// The room's topic, if set.
     pub topic: Option<String>,
+    /// The room's avatar URL, if set.
+    pub avatar_url: Option<OwnedMxcUri>,
     /// The number of joined members.
     pub num_joined_members: u64,
     /// The number of active members, if known (joined + invited).
@@ -177,6 +184,7 @@ pub struct FetchedRoomPreview {
 }
 impl FetchedRoomPreview {
     pub fn from(
+        client: &Client,
         room_preview: RoomPreview,
         room_avatar: FetchedRoomAvatar,
         via: Vec<OwnedServerName>,
@@ -186,13 +194,22 @@ impl FetchedRoomPreview {
             RoomDisplayName::Empty,
             RoomDisplayName::Named,
         );
+        let is_in_allowed_room = match &room_preview.join_rule {
+            Some(JoinRuleSummary::Restricted(restricted) | JoinRuleSummary::KnockRestricted(restricted)) => {
+                restricted.allowed_room_ids.iter()
+                    .any(|room_id| client.get_room(room_id).is_some_and(|room| room.state() == RoomState::Joined))
+            }
+            _ => false,
+        };
         Self {
             room_name_id: RoomNameId::new(display_name, room_preview.room_id),
             room_avatar,
             via,
             alias,
+            is_in_allowed_room,
             canonical_alias: room_preview.canonical_alias,
             topic: room_preview.topic,
+            avatar_url: room_preview.avatar_url,
             num_joined_members: room_preview.num_joined_members,
             num_active_members: room_preview.num_active_members,
             room_type: room_preview.room_type,

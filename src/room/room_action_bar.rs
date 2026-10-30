@@ -147,7 +147,7 @@ script_mod! {
 
         // A long press on one of these shows its tooltip.
         room_mini_apps_button       := mod.widgets.RoomActionButton {enable_long_press: true, draw_icon.svg: ICON_SPARKLE, visible: false}
-        // room_info_button            := mod.widgets.RoomActionButton {enable_long_press: true, draw_icon.svg: ICON_INFO}
+        room_info_button            := mod.widgets.RoomActionButton {enable_long_press: true, draw_icon.svg: ICON_INFO}
         room_threads_button         := mod.widgets.RoomActionButton {enable_long_press: true, draw_icon.svg: ICON_REPLY_IN_THREAD}
         room_pinned_messages_button := mod.widgets.RoomActionButton {enable_long_press: true, draw_icon.svg: ICON_PIN}
         room_members_button         := mod.widgets.RoomActionButton {enable_long_press: true, draw_icon.svg: ICON_MEMBERS}
@@ -173,7 +173,7 @@ script_mod! {
                 wrap_spacing: 8
                 padding: 8
                 room_mini_apps_button := RoomActionTextButton {draw_icon.svg: ICON_SPARKLE, visible: false}
-                // room_info_button := RoomActionTextButton {draw_icon.svg: ICON_INFO}
+                room_info_button := RoomActionTextButton {draw_icon.svg: ICON_INFO}
                 // room_settings_button := RoomActionTextButton {draw_icon.svg: ICON_SETTINGS}
                 room_threads_button := RoomActionTextButton {draw_icon.svg: ICON_REPLY_IN_THREAD}
                 room_members_button := RoomActionTextButton {draw_icon.svg: ICON_MEMBERS}
@@ -236,6 +236,8 @@ script_mod! {
         title_container := View {
             width: Fill, height: 45
             align: Align{y: 0.5}
+            cursor: MouseCursor.Hand
+            grab_key_focus: false
             title := Label {
                 width: Fill, height: Fit
                 margin: Inset{left: 4, right: 4}
@@ -261,7 +263,7 @@ script_mod! {
 const ACTIONS: &[(LiveId, &str, RoomActionBarAction)] = &[
     #[cfg(feature = "a2app")]
     (id!(room_mini_apps_button), "Mini Apps", RoomActionBarAction::None),
-    // (id!(room_info_button), "Room info", RoomActionBarAction::None),
+    (id!(room_info_button), "Room info", RoomActionBarAction::TogglePane(RoomPaneKind::RoomInfo)),
     // (id!(room_settings_button), "Room settings", RoomActionBarAction::None),
     (id!(room_threads_button), "Threads", RoomActionBarAction::TogglePane(RoomPaneKind::Threads)),
     (id!(room_members_button), "Members", RoomActionBarAction::TogglePane(RoomPaneKind::Members)),
@@ -294,7 +296,7 @@ pub enum RoomActionBarAction {
         /// The action bar's height in logical pixels, including any expanded rows.
         new_height: f64,
     },
-    /// The user clicked the button that shows or hides the given kind of room pane.
+    /// The user asked to show or hide the given kind of room pane.
     TogglePane(RoomPaneKind),
     /// The user clicked the Invite button.
     Invite,
@@ -396,6 +398,16 @@ impl Widget for RoomActionBar {
                 || self.view.button(cx, ids!(collapse_room_actions_button)).clicked(actions))
             {
                 self.set_expanded(cx, !self.is_expanded, true);
+            }
+            if !self.is_desktop_mode
+                && let Some(fe) = self.view.child(id!(title_container)).as_view().finger_up(actions)
+                && fe.is_over && fe.is_primary_hit() && fe.was_tap()
+            {
+                if self.is_space() {
+                    show_room_action_placeholder("Space info");
+                } else {
+                    cx.widget_action(self.widget_uid(), RoomActionBarAction::TogglePane(RoomPaneKind::RoomInfo));
+                }
             }
             for (id, label, action) in ACTIONS {
                 if !self.action_available(*id) { continue; }

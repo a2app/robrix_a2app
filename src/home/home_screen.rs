@@ -647,7 +647,9 @@ mod navigation_tests {
             let response = deliver(&mut cx, &home, &mut app_state, back);
             assert_eq!(app_state.selected_room, Some(a));
             assert!(app_state.nav_history.back.is_empty());
-            assert_eq!(app_state.nav_history.forward, vec![current_screen, Some(b.clone())]);
+            // The rooms list is Home, which is never a forward-history destination.
+            let expected_forward = current_screen.into_iter().chain([b.clone()]).map(Some).collect::<Vec<_>>();
+            assert_eq!(app_state.nav_history.forward, expected_forward);
             let closed_rooms: HashSet<_> = response.iter().filter_map(|action| match action.downcast_ref() {
                 Some(crate::a2app::runtime::A2AppOp::RoomClosed { room_id, .. }) => Some(room_id.clone()),
                 _ => None,
@@ -1110,6 +1112,11 @@ impl Widget for HomeScreen {
                 {
                     self.return_to_room_from_pane(cx, app_state, room_name_id, kind);
                 }
+                if let RoomPaneScreenAction::ShowPaneInPlace { room_name_id, kind } = action.as_widget_action().cast()
+                    && !effective_is_desktop(cx)
+                {
+                    self.navigate_to_screen(cx, app_state, SelectedRoom::RoomPane { room_name_id, kind });
+                }
 
                 // A popped-out pane's content went away (e.g., its mini-app quit), so go back from it.
                 if let RoomPaneScreenAction::Closed { room_name_id, kind } = action.as_widget_action().cast()
@@ -1444,7 +1451,7 @@ impl HomeScreen {
         }
         // Skip any screens for rooms that the user has left.
         let can_show = can_show(cx);
-        app_state.selected_room.take_if(|screen| !can_show(screen));
+        app_state.selected_room.take_if(|screen| !can_show(Some(screen)));
         if let Some(screen) = app_state.selected_room.clone() {
             self.push_selected_screen_view(cx, app_state, screen, Animate::No);
         }
@@ -1749,7 +1756,12 @@ impl HomeScreen {
             return true;
         }
         let old_screens = Self::screens_with_resources(app_state);
-        let is_pushed = self.push_selected_screen_view(cx, app_state, screen, Animate::Yes);
+        let animate = if current_screen.as_ref().is_some_and(|current| room_pane::share_spot(current, &screen)) {
+            Animate::No
+        } else {
+            Animate::Yes
+        };
+        let is_pushed = self.push_selected_screen_view(cx, app_state, screen, animate);
         if is_pushed {
             self.tab_to_restore_on_mobile = None;
             // If we just re-showed the current screen (it was hidden behind AddRoom or Settings),

@@ -22,11 +22,11 @@ use makepad_widgets::*;
 use matrix_sdk_ui::spaces::room_list::SpaceRoomListPaginationState;
 use ruma::events::tag::TagName;
 use tokio::sync::mpsc::UnboundedSender;
-use matrix_sdk::{RoomState, ruma::{events::tag::Tags, MilliSecondsSinceUnixEpoch, OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomAliasId}};
+use matrix_sdk::{RoomState, ruma::{events::tag::Tags, room::JoinRuleSummary, MilliSecondsSinceUnixEpoch, OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomAliasId}};
 use crate::{
     app::{AppState, AppStateAction, SelectedRoom},
     home::{
-        invite_screen::{InviteScreenAction, JoinRoomResultAction, LeaveRoomResultAction}, navigation_tab_bar::{NavigationBarAction, SelectedTab}, room_context_menu::RoomContextMenuDetails, room_screen::invalidate_entire_room_timeline_states, rooms_list_entry::RoomsListEntryAction, space_lobby::{SpaceLobbyAction, SpaceLobbyEntryWidgetExt}, spaces_bar::{SpacesListUpdate, enqueue_spaces_list_update}
+        invite_screen::{InviteScreenAction, JoinRoomResultAction, LeaveRoomResultAction}, navigation_tab_bar::{NavigationBarAction, SelectedTab}, room_context_menu::RoomContextMenuDetails, room_screen::{invalidate_entire_room_timeline_states, input_bar_focus}, rooms_list_entry::RoomsListEntryAction, space_lobby::{SpaceLobbyAction, SpaceLobbyEntryWidgetExt}, spaces_bar::{SpacesListUpdate, enqueue_spaces_list_update}
     },
     logout::logout_confirm_modal::LogoutAction,
     room::{
@@ -231,6 +231,12 @@ pub enum RoomsListUpdate {
         room_id: OwnedRoomId,
         is_space: bool,
     },
+    /// Update the topic and join rule of the given invited room.
+    UpdateTopicAndJoinRule {
+        room_id: OwnedRoomId,
+        topic: Option<String>,
+        join_rule: Option<JoinRuleSummary>,
+    },
     /// Remove the given room from the rooms list
     RemoveRoom {
         room_id: OwnedRoomId,
@@ -328,6 +334,14 @@ impl ActionDefaultRef for RoomsListAction {
     }
 }
 
+/// Posted when the rooms list has a new avatar for the given joined room.
+///
+/// This is NOT a widget action.
+#[derive(Debug)]
+pub struct RoomAvatarUpdated {
+    pub room_id: OwnedRoomId,
+}
+
 
 /// A preview of a room's latest event, as shown in its entry in the rooms list.
 #[derive(Debug)]
@@ -404,6 +418,10 @@ pub struct InvitedRoomInfo {
     pub canonical_alias: Option<OwnedRoomAliasId>,
     /// The alternative aliases for this room, if any.
     pub alt_aliases: Vec<OwnedRoomAliasId>,
+    /// The topic of this room, if any.
+    pub topic: Option<String>,
+    /// The join rule of this room, if known.
+    pub join_rule: Option<JoinRuleSummary>,
     /// The avatar for this room: either an array of bytes holding the avatar image
     /// or a string holding the first Unicode character of the room name.
     pub room_avatar: FetchedRoomAvatar,
@@ -873,6 +891,7 @@ impl RoomsList {
                 RoomsListUpdate::UpdateRoomAvatar { room_id, room_avatar } => {
                     if let Some(room) = self.all_joined_rooms.get_mut(&room_id) {
                         room.room_avatar = room_avatar;
+                        cx.action(RoomAvatarUpdated { room_id });
                     } else if let Some(room) = self.invited_rooms.borrow_mut().get_mut(&room_id) {
                         room.room_avatar = room_avatar;
                         did_invited_rooms_change = true;
@@ -1022,6 +1041,12 @@ impl RoomsList {
                         did_invited_rooms_change = true;
                         // Broadcast this update to an already-open InviteScreen that might be showing this room.
                         cx.action(InviteScreenAction::IsSpace { room_id, is_space });
+                    }
+                }
+                RoomsListUpdate::UpdateTopicAndJoinRule { room_id, topic, join_rule } => {
+                    if let Some(room) = self.invited_rooms.borrow_mut().get_mut(&room_id) {
+                        room.topic = topic;
+                        room.join_rule = join_rule;
                     }
                 }
                 RoomsListUpdate::RemoveRoom { room_id, new_state, is_space } => {
@@ -1680,7 +1705,7 @@ impl Widget for RoomsList {
         );
         for action in rooms_list_actions {
             // Handle a regular room (joined or invited) being clicked.
-            if let RoomsListEntryAction::PrimaryClicked(room_id) = action.as_widget_action().cast() {
+            if let RoomsListEntryAction::PrimaryClicked { room_id, is_touch } = action.as_widget_action().cast() {
                 let new_selected_room = if let Some(jr) = self.all_joined_rooms.get(&room_id) {
                     SelectedRoom::JoinedRoom {
                         room_name_id: jr.room_name_id.clone(),
@@ -1695,6 +1720,11 @@ impl Widget for RoomsList {
                 };
 
                 self.set_current_active_room(cx, Some(new_selected_room.clone()));
+                // Clicking on a joined room focuses its input bar so the user can start typing right away,
+                // but tapping on it doesn't, since that would pop up the soft keyboard.
+                if !is_touch && matches!(new_selected_room, SelectedRoom::JoinedRoom { .. }) {
+                    input_bar_focus::request(cx, TimelineKind::MainRoom { room_id });
+                }
                 cx.widget_action(
                     self.widget_uid(), 
                     RoomsListAction::Selected(new_selected_room),

@@ -64,7 +64,7 @@ script_mod! {
     mod.widgets.RobrixSettingsCollapsibleHeader = mod.widgets.CollapsibleHeader {
         height: 40, margin: 0
         title: "Details"
-        is_expanded: false
+        starts_expanded: false
         draw_bg +: { color: (COLOR_BG_PREVIEW) }
         collapse_icon +: { draw_bg.color: (MESSAGE_TEXT_COLOR) }
         label +: {
@@ -121,16 +121,24 @@ pub enum CollapsibleHeaderAction {
     None,
 }
 
-#[derive(Script, ScriptHook, Widget)]
+#[derive(Script, Widget)]
 pub struct CollapsibleHeader {
     #[deref] view: View,
-    /// A standalone disclosure title; empty uses the room-category name.
+    /// A standalone disclosure title; empty keeps the DSL label or room-category name.
     #[live] title: String,
-    /// Kept across a theme switch, which would otherwise reset it to its DSL default.
-    #[live(true)] #[apply_state] is_expanded: bool,
+    /// A reload (like a theme switch) resets `#[live]` fields,
+    /// so this only seeds `is_expanded` once, when the header is created.
+    #[live(true)] starts_expanded: bool,
+    #[rust] is_expanded: bool,
     #[rust] category: HeaderCategory,
     #[rust] num_unread_mentions: u64,
     #[rust] num_unread_messages: u64,
+}
+
+impl ScriptHook for CollapsibleHeader {
+    fn on_after_new(&mut self, _vm: &mut ScriptVm) {
+        self.is_expanded = self.starts_expanded;
+    }
 }
 
 impl Widget for CollapsibleHeader {
@@ -162,8 +170,11 @@ impl Widget for CollapsibleHeader {
         if let Some(mut arrow) = self.view.child_by_path(ids!(collapse_icon)).borrow_mut::<ExpandArrow>() {
             arrow.set_is_open_no_animate(self.is_expanded);
         }
-        let title = if self.title.is_empty() { self.category.as_str() } else { &self.title };
-        self.view.child_by_path(ids!(label)).set_text(cx, title);
+        if !self.title.is_empty() {
+            self.view.child_by_path(ids!(label)).set_text(cx, &self.title);
+        } else if !matches!(self.category, HeaderCategory::None) {
+            self.view.child_by_path(ids!(label)).set_text(cx, self.category.as_str());
+        }
         self.view.child_by_path(ids!(unread_badge))
             .as_unread_badge()
             .update_counts(false, self.num_unread_mentions, self.num_unread_messages);
@@ -242,6 +253,10 @@ impl CollapsibleHeaderRef {
             inner.num_unread_messages = num_unread_messages;
         }
     }
+
+    pub fn is_expanded(&self) -> bool {
+        self.borrow().is_some_and(|inner| inner.is_expanded)
+    }
 }
 
 #[cfg(test)]
@@ -268,6 +283,14 @@ mod tests {
         assert!(actions.is_empty(), "render-state synchronization must not act like user approval");
         assert!(settings.borrow().unwrap().is_expanded);
         assert_eq!(settings.borrow().unwrap().title, "Permission details");
+        cx.with_vm(|vm| {
+            let value = vm.with_reload(|vm| {
+                crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Dark);
+                script_eval!(vm, { mod.widgets.RobrixSettingsCollapsibleHeader { title: "Permission details" } })
+            });
+            settings.clone().script_apply(vm, &Apply::ScriptReapply, &mut Scope::empty(), value);
+        });
+        assert!(settings.is_expanded(), "a theme switch preserves the disclosure's state");
         for expanded in [false, true, false] {
             let actions = cx.capture_actions(|cx| settings.borrow_mut().unwrap().toggle_collapse(cx, &mut Scope::empty()));
             assert_eq!(settings.expansion_changed(&actions), Some(expanded));

@@ -16,17 +16,17 @@ use matrix_sdk::{
                 encrypted::Relation as EncryptedRelation, message::{MessageType, Relation, RoomMessageEventContent, TextMessageEventContent}, pinned_events::RoomPinnedEventsEventContent, power_levels::{RoomPowerLevels, SyncRoomPowerLevelsEvent}, redaction::SyncRoomRedactionEvent, tombstone::RoomTombstoneEventContent, MediaSource
             }, AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncTimelineEvent, MessageLikeEventType, StateEventType
         }, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomOrAliasId, TransactionId, UserId, serde::Raw
-    }, send_queue::{LocalEcho, LocalEchoContent, RoomSendQueueUpdate, SendQueueUpdate}, sliding_sync::VersionBuilder, Client, ClientBuildError, OwnedServerName, Room, RoomDisplayName, RoomMemberships, RoomState, SessionChange, SuccessorRoom
+    }, notification_settings::RoomNotificationMode, send_queue::{LocalEcho, LocalEchoContent, RoomSendQueueUpdate, SendQueueUpdate}, sliding_sync::VersionBuilder, Client, ClientBuildError, OwnedServerName, Room, RoomDisplayName, RoomMemberships, RoomState, SessionChange, SuccessorRoom
 };
 use matrix_sdk::Error;
 #[cfg(not(target_os = "ios"))]
 use matrix_sdk::utils::local_server::{LocalServerBuilder, LocalServerResponse};
 use matrix_sdk_ui::{
-    RoomListService, Timeline, encryption_sync_service, room_list_service::{RoomListItem, RoomListLoadingState, SyncIndicator, filters}, sync_service::{self, SyncService}, timeline::{AttachmentSource, EventSendState, LatestEventValue, RedactError, RoomExt, TimelineEventItemId, TimelineFocus, TimelineItem, TimelineReadReceiptTracking, TimelineDetails}
+    RoomListService, Timeline, encryption_sync_service, room_list_service::{self, RoomListItem, RoomListLoadingState, filters}, sync_service::{self, SyncService}, timeline::{AttachmentSource, EventSendState, LatestEventValue, RedactError, RoomExt, TimelineEventItemId, TimelineFocus, TimelineItem, TimelineReadReceiptTracking, TimelineDetails}
 };
 #[cfg(not(target_os = "ios"))]
 use robius_open::Uri;
-use ruma::{OwnedRoomAliasId, OwnedRoomOrAliasId, RoomId, events::tag::Tags};
+use ruma::{OwnedRoomAliasId, OwnedRoomOrAliasId, RoomId, events::tag::Tags, room::JoinRuleSummary};
 use tokio::{
     runtime::Handle,
     sync::{broadcast, mpsc::{Sender, UnboundedReceiver, UnboundedSender}, watch, Notify, Semaphore}, task::JoinHandle, time::{Instant, error::Elapsed},
@@ -37,11 +37,11 @@ use std::io;
 use hashbrown::{HashMap, HashSet};
 use crate::{
     app::AppStateAction, app_data_dir, cache_dir, avatar_cache::AvatarUpdate, event_preview::{BeforeText, TextPreview, text_preview_of_raw_timeline_event, text_preview_of_timeline_item}, home::{
-        add_room::KnockResultAction, invite_screen::{JoinRoomResultAction, LeaveRoomResultAction}, link_preview::LinkPreviewData, room_screen::{InviteResultAction, RoomLink, RoomLinkDestination, RoomLinkResolved, TimelineUpdate}, rooms_list::{self, InvitedRoomInfo, InviterInfo, JoinedRoomInfo, LatestEventPreview, RoomsListUpdate, enqueue_rooms_list_update}, rooms_list_header::RoomsListHeaderAction, send_status_indicator::stringify_send_error, timeline_items::index_of_event, tombstone_footer::SuccessorRoomDetails
+        add_room::KnockResultAction, invite_screen::{JoinRoomResultAction, LeaveRoomResultAction}, link_preview::LinkPreviewData, room_screen::{InviteResultAction, RoomLink, RoomLinkDestination, RoomLinkResolved, TimelineUpdate}, rooms_list::{self, InvitedRoomInfo, InviterInfo, JoinedRoomInfo, LatestEventPreview, RoomsListUpdate, enqueue_rooms_list_update}, rooms_list_header::{RoomListSyncStatus, RoomsListHeaderAction}, send_status_indicator::{stringify_send_error, upload_percent}, timeline_items::index_of_event, tombstone_footer::SuccessorRoomDetails
     }, login::login_screen::LoginAction, logout::{logout_confirm_modal::LogoutAction, logout_state_machine::{LogoutConfig, is_logout_in_progress, logout_with_state_machine}}, media_cache::{MediaCacheEntry, MediaCacheEntryRef}, persistence::{self, ClientSessionPersisted, load_app_state}, profile::{
         user_profile::UserProfile,
         user_profile_cache::{UserProfileUpdate, enqueue_user_profile_update},
-    }, room::{FetchedRoomAvatar, FetchedRoomPreview, RoomPreviewAction, pinned_messages_list::PinnedMessagesAction, room_members_list::{RoomMembersChanged, RoomMembersFetchAction}}, room_preview_cache::{RoomPreviewUpdate, enqueue_room_preview_update}, settings::account_settings::AccountManagementUrl, shared::{
+    }, room::{FetchedRoomAvatar, FetchedRoomPreview, RoomPreviewAction, pinned_messages_list::PinnedMessagesAction, room_members_list::{RoomMembersChanged, RoomMembersFetchAction}}, room_info_sync::{room_info_subscriber_handler, set_room_notification_mode}, room_preview_cache::{RoomPreviewUpdate, enqueue_room_preview_update}, settings::account_settings::AccountManagementUrl, shared::{
         attachment_download::{MediaDownloadResult, media_source_mxc}, avatar::AvatarState, file_upload_modal::{AttachmentUpload, FileUploadAttemptId, FileUploadMetadata}, jump_to_bottom_button::UnreadMessageCount, mention_popup::{MentionItem, RoomMentionCandidate}, mentionable_text_input::MentionMatches, popup_list::{PopupKind, enqueue_popup_notification}
     }, space_service_sync::space_service_loop, threads_list_sync::{get_bundled_thread_summary, threads_list_subscriber_handler}, utils::{self, AVATAR_THUMBNAIL_FORMAT, MatchQuality, RoomNameId, VecDiff, alias_localpart, avatar_from_room_name}, verification::add_verification_event_handlers_and_sync_client
 };
@@ -679,6 +679,13 @@ pub enum MatrixRequest {
         room_id: OwnedRoomId,
         is_low_priority: bool,
     },
+    /// Request to set the notification mode of the given room,
+    /// which is then posted to the widgets subscribed to [`RoomDataKind::RoomInfo`].
+    SetRoomNotificationMode {
+        room_id: OwnedRoomId,
+        /// The new mode, or `None` to use the default mode.
+        mode: Option<RoomNotificationMode>,
+    },
     /// Request to gather diagnostic info about the given room's sync/cache state.
     GetRoomDiagnostics {
         room_id: OwnedRoomId,
@@ -958,6 +965,36 @@ pub enum MatrixRequest {
     /// [`crate::a2app::ai::session::AiSession`], which is unix-only itself.
     #[cfg(all(feature = "a2app", unix))]
     AiRoom(crate::a2app::ai::rooms::AiRoomRequest),
+    /// Request to look up the rooms and spaces that the `query` text could exactly be, e.g., a partial alias.
+    ///
+    /// The results are posted as a [`DirectorySearchAction::ExactRooms`](crate::directory_search::DirectorySearchAction::ExactRooms).
+    ResolveRoomSearchQuery {
+        query: String,
+    },
+    /// Request to look up the users that the `query` text could exactly be, e.g., a partial user ID.
+    ///
+    /// The results are posted as a [`DirectorySearchAction::ExactUsers`](crate::directory_search::DirectorySearchAction::ExactUsers).
+    ResolveUserSearchQuery {
+        query: String,
+    },
+    /// Request to search the room directory of the given `server` (or our own homeserver's if `None`)
+    /// for rooms or spaces matching the `query` text.
+    ///
+    /// If `next_batch` is `Some`, this gets that next page of matches.
+    /// The results are posted as a [`DirectorySearchAction::DirectoryRooms`](crate::directory_search::DirectorySearchAction::DirectoryRooms).
+    SearchRoomDirectory {
+        query: String,
+        kind: crate::directory_search::RoomKind,
+        server: Option<OwnedServerName>,
+        next_batch: Option<String>,
+    },
+    /// Request to search our homeserver's user directory for the `query` text, getting up to `limit` users.
+    ///
+    /// The results are posted as a [`DirectorySearchAction::DirectoryUsers`](crate::directory_search::DirectorySearchAction::DirectoryUsers).
+    SearchUserDirectory {
+        query: String,
+        limit: u32,
+    },
 }
 
 /// Submits a request to the worker thread to be executed asynchronously.
@@ -1310,18 +1347,35 @@ async fn matrix_worker_task(
                 let Some(client) = get_client() else { continue };
                 let _knock_room_task = Handle::current().spawn(async move {
                     log!("Sending request to knock on room {room_or_alias_id}...");
+                    // Show the success/failure popup here in case the UI screen that requested the knock
+                    // has been hidden or navigated away from since then.
                     match client.knock(room_or_alias_id.clone(), reason, server_names).await {
                         Ok(room) => {
-                            let _ = room.display_name().await; // populate this room's display name cache
+                            let room_name_id = RoomNameId::from_room(&room).await;
+                            enqueue_popup_notification(
+                                format!(
+                                    "Successfully knocked on {} \"{room_name_id}\".",
+                                    if room.is_space() { "space" } else { "room" },
+                                ),
+                                PopupKind::Success,
+                                Some(4.0),
+                            );
                             Cx::post_action(KnockResultAction::Knocked {
                                 room_or_alias_id,
                                 room,
                             });
                         }
-                        Err(error) => Cx::post_action(KnockResultAction::Failed {
-                            room_or_alias_id,
-                            error,
-                        }),
+                        Err(error) => {
+                            enqueue_popup_notification(
+                                format!("Failed to knock on room.\n\nError: {error}."),
+                                PopupKind::Error,
+                                None,
+                            );
+                            Cx::post_action(KnockResultAction::Failed {
+                                room_or_alias_id,
+                                error,
+                            });
+                        }
                     }
                 });
             }
@@ -1670,6 +1724,26 @@ async fn matrix_worker_task(
                 });
             }
 
+            MatrixRequest::ResolveRoomSearchQuery { query } => {
+                let Some(client) = get_client() else { continue };
+                let _resolve_task = Handle::current().spawn(crate::directory_search::resolve_room_search_query(client, query));
+            }
+
+            MatrixRequest::ResolveUserSearchQuery { query } => {
+                let Some(client) = get_client() else { continue };
+                let _resolve_task = Handle::current().spawn(crate::directory_search::resolve_user_search_query(client, query));
+            }
+
+            MatrixRequest::SearchRoomDirectory { query, kind, server, next_batch } => {
+                let Some(client) = get_client() else { continue };
+                let _search_task = Handle::current().spawn(crate::directory_search::search_room_directory(client, query, kind, server, next_batch));
+            }
+
+            MatrixRequest::SearchUserDirectory { query, limit } => {
+                let Some(client) = get_client() else { continue };
+                let _search_task = Handle::current().spawn(crate::directory_search::search_user_directory(client, query, limit));
+            }
+
             MatrixRequest::GetNumberUnreadMessages { timeline_kind } => {
                 // The SDK only tracks unread counts per room, not per thread.
                 let TimelineKind::MainRoom { .. } = &timeline_kind else { continue };
@@ -1784,6 +1858,27 @@ async fn matrix_worker_task(
                         Err(e) => error!("Failed to set low priority to {} for room {}: {:?}", is_low_priority, room_id, e),
                     }
                 });
+            }
+
+            MatrixRequest::SetRoomNotificationMode { room_id, mode } => {
+                // A room info pane's subscriber task changes the mode, as it keeps its notification settings up to date.
+                if let Some(subscriber) = ALL_JOINED_ROOMS.lock().unwrap()
+                    .get(&room_id)
+                    .and_then(|room_info| room_info.room_info_subscriber.as_ref())
+                    && subscriber.requests.send(mode).is_ok()
+                {
+                    continue;
+                }
+                let Some(room) = get_client().and_then(|client| client.get_room(&room_id)) else {
+                    error!("BUG: skipping set notification mode request for unknown room {room_id}");
+                    enqueue_popup_notification(
+                        "Failed to change the room's notifications: Robrix couldn't locate it.",
+                        PopupKind::Error,
+                        None,
+                    );
+                    continue;
+                };
+                Handle::current().spawn(set_room_notification_mode(room, mode));
             }
 
             MatrixRequest::SetAvatar { avatar_url } => {
@@ -2169,10 +2264,11 @@ async fn matrix_worker_task(
                                     matches!(details.main_timeline.timeline_subscriber, TimelineSubscriber::Running(_)),
                                     details.main_timeline.timeline_singleton_endpoints.is_none(),
                                 );
-                                let _ = writeln!(text, "typing notices subscribed: {}, pinned messages subscribers: {}, threads list subscribers: {}",
+                                let _ = writeln!(text, "typing notices subscribed: {}, pinned messages subscribers: {}, threads list subscribers: {}, room info subscribers: {}",
                                     details.typing_notice_subscriber.is_some(),
                                     details.pinned_messages_subscriber.as_ref().map_or(0, |p| p.subscribers.len()),
                                     details.threads_list_subscriber.as_ref().map_or(0, |t| t.subscribers.len()),
+                                    details.room_info_subscriber.as_ref().map_or(0, |r| r.subscribers.len()),
                                 );
                                 let _ = writeln!(text, "thread timelines: {:?}, pending: {:?}",
                                     details.thread_timelines.keys().collect::<Vec<_>>(),
@@ -2465,6 +2561,20 @@ async fn matrix_worker_task(
                             },
                         );
                     }
+                    RoomDataKind::RoomInfo => {
+                        add_or_remove_room_data_subscriber(
+                            &mut room_info.room_info_subscriber,
+                            subscriber,
+                            subscribe,
+                            |resend_notifier| {
+                                let (new_modes_sender, new_modes) = tokio::sync::mpsc::unbounded_channel();
+                                let task = Handle::current().spawn(
+                                    room_info_subscriber_handler(room, resend_notifier, new_modes)
+                                );
+                                (new_modes_sender, task)
+                            },
+                        );
+                    }
                 }
             }
 
@@ -2473,7 +2583,7 @@ async fn matrix_worker_task(
                     .get(&room_id)
                     .and_then(|room_info| room_info.threads_list_subscriber.as_ref())
                 {
-                    threads.load_more.notify_one();
+                    threads.requests.notify_one();
                 }
             }
 
@@ -2823,7 +2933,7 @@ async fn matrix_worker_task(
                                 if related_to == txn_id =>
                             {
                                 let percent = (progress.total > 0)
-                                    .then(|| progress.current * 100 / progress.total);
+                                    .then(|| upload_percent(progress.current, progress.total));
                                 if last_percent == percent { continue }
                                 last_percent = percent;
                                 let _ = sender_clone.send(TimelineUpdate::FileUploadProgress {
@@ -3439,6 +3549,8 @@ struct JoinedRoomDetails {
     pinned_messages_subscriber: Option<RoomDataSubscriber>,
     /// The task that watches this room's threads while any list shows them (or saved them).
     threads_list_subscriber: Option<RoomDataSubscriber<Arc<Notify>>>,
+    /// The task that watches this room's info while any room info pane shows it (or saved it).
+    room_info_subscriber: Option<RoomDataSubscriber<UnboundedSender<Option<RoomNotificationMode>>>>,
 }
 impl Drop for JoinedRoomDetails {
     fn drop(&mut self) {
@@ -3448,6 +3560,7 @@ impl Drop for JoinedRoomDetails {
         drop(self.typing_notice_subscriber.take());
         drop(self.pinned_messages_subscriber.take());
         drop(self.threads_list_subscriber.take());
+        drop(self.room_info_subscriber.take());
     }
 }
 impl JoinedRoomDetails {
@@ -3736,6 +3849,10 @@ struct RoomListServiceRoomInfo {
     alt_aliases: Vec<OwnedRoomAliasId>,
     /// Only ever set for invited rooms.
     inviter_info: Option<InviterInfo>,
+    /// Only ever set for invited rooms.
+    topic: Option<String>,
+    /// Only ever set for invited rooms.
+    join_rule: Option<JoinRuleSummary>,
     num_joined_members: u64,
     num_invited_members: u64,
     /// Whether all of this room's members are fully available in the local store.
@@ -3775,6 +3892,7 @@ impl RoomListServiceRoomInfo {
             }
         );
 
+        let is_invited = room.state() == RoomState::Invited;
         Self {
             room_id: room.room_id().to_owned(),
             state: room.state(),
@@ -3793,6 +3911,8 @@ impl RoomListServiceRoomInfo {
             canonical_alias: room.canonical_alias(),
             alt_aliases: room.alt_aliases(),
             inviter_info,
+            topic: is_invited.then(|| room.topic()).flatten(),
+            join_rule: is_invited.then(|| room.join_rule().map(JoinRuleSummary::from)).flatten(),
             num_joined_members: room.joined_members_count(),
             num_invited_members: room.invited_members_count(),
             members_synced: room.are_members_synced(),
@@ -4031,7 +4151,7 @@ async fn start_matrix_client_login_and_sync(rt: Handle) {
         // Attempt to load the previously-saved app state.
         // One-shot, drops on its own; not tracked.
         handle_load_app_state(logged_in_user_id.to_owned());
-        subscriber_task_handles.push(handle_sync_indicator_subscriber(&sync_service));
+        subscriber_task_handles.push(handle_room_list_service_state_subscriber(sync_service.room_list_service().state()));
         subscriber_task_handles.push(handle_sync_service_state_subscriber(sync_service.state()));
 
         let room_list_service = sync_service.room_list_service();
@@ -4629,6 +4749,15 @@ async fn update_room(
             });
         }
 
+        // An invite's topic and join rule might arrive after the invite itself.
+        if old_room.topic != new_room.topic || old_room.join_rule != new_room.join_rule {
+            enqueue_rooms_list_update(RoomsListUpdate::UpdateTopicAndJoinRule {
+                room_id: new_room_id.clone(),
+                topic: new_room.topic.clone(),
+                join_rule: new_room.join_rule.clone(),
+            });
+        }
+
         // Check to see if any room aliases have changed.
         if old_room.canonical_alias != new_room.canonical_alias
             || old_room.alt_aliases != new_room.alt_aliases
@@ -4826,6 +4955,8 @@ async fn add_new_room(
                 room_avatar,
                 canonical_alias: new_room.canonical_alias.clone(),
                 alt_aliases: new_room.alt_aliases.clone(),
+                topic: new_room.topic.clone(),
+                join_rule: new_room.join_rule.clone(),
                 invite_state: Default::default(),
                 is_selected: false,
                 is_direct: new_room.is_direct,
@@ -4888,6 +5019,7 @@ async fn add_new_room(
             typing_notice_subscriber: None,
             pinned_messages_subscriber: None,
             threads_list_subscriber: None,
+            room_info_subscriber: None,
         },
     );
     // A visible RoomScreen might still have this room's previous channel endpoints,
@@ -5346,27 +5478,45 @@ fn handle_sync_service_state_subscriber(mut subscriber: Subscriber<sync_service:
     })
 }
 
-fn handle_sync_indicator_subscriber(sync_service: &SyncService) -> JoinHandle<()> {
-    /// Duration for sync indicator delay before showing
-    const SYNC_INDICATOR_DELAY: Duration = Duration::from_millis(100);
-    /// Duration for sync indicator delay before hiding
-    const SYNC_INDICATOR_HIDE_DELAY: Duration = Duration::from_millis(200);
-    let sync_indicator_stream = sync_service
-        .room_list_service()
-        .sync_indicator(
-            SYNC_INDICATOR_DELAY,
-            SYNC_INDICATOR_HIDE_DELAY
-        );
+fn handle_room_list_service_state_subscriber(mut subscriber: Subscriber<room_list_service::State>) -> JoinHandle<()> {
+    /// How long the room list service can go without a sync response while it's running
+    /// before we stop calling it fully synced: 30s for the server to answer an idle long-poll, plus slack for slow networks.
+    const STALLED_SYNC_TIMEOUT: Duration = Duration::from_secs(40);
 
+    let state = subscriber.get();
+    log!("Initial room list service state is {state:?}");
     Handle::current().spawn(async move {
-       let mut sync_indicator_stream = std::pin::pin!(sync_indicator_stream);
-
-        while let Some(indicator) = sync_indicator_stream.next().await {
-            let is_syncing = match indicator {
-                SyncIndicator::Show => true,
-                SyncIndicator::Hide => false,
+        let (last_synced_at_sender, last_synced_at_receiver) = watch::channel(None);
+        let post_sync_status = |is_fully_synced| Cx::post_action(RoomsListHeaderAction::SetSyncStatus(RoomListSyncStatus {
+            is_fully_synced,
+            last_sync_time: last_synced_at_receiver.clone(),
+        }));
+        let mut is_fully_synced = matches!(state, room_list_service::State::Running);
+        post_sync_status(is_fully_synced);
+        loop {
+            // We get a state update after every sync response, even if the state didn't change,
+            // so going this long without one while running means the sync has stalled.
+            let next_state = if !is_fully_synced {
+                subscriber.next().await
+            } else if let Ok(next_state) = tokio::time::timeout(STALLED_SYNC_TIMEOUT, subscriber.next()).await {
+                next_state
+            } else {
+                log!("The room list service hasn't received a sync response in {STALLED_SYNC_TIMEOUT:?}.");
+                is_fully_synced = false;
+                post_sync_status(is_fully_synced);
+                continue;
             };
-            Cx::post_action(RoomsListHeaderAction::SetSyncStatus(is_syncing));
+            let Some(state) = next_state else { break };
+            // Every state update besides these comes right after a sync response.
+            if !matches!(state, room_list_service::State::Error { .. } | room_list_service::State::Terminated { .. }) {
+                last_synced_at_sender.send_replace(Some(MilliSecondsSinceUnixEpoch::now()));
+            }
+            let is_now_fully_synced = matches!(state, room_list_service::State::Running);
+            if is_now_fully_synced != is_fully_synced {
+                is_fully_synced = is_now_fully_synced;
+                log!("Received a room list service state update: {state:?}");
+                post_sync_status(is_fully_synced);
+            }
         }
     })
 }
@@ -5472,7 +5622,7 @@ async fn fetch_room_preview_with_avatar(
         avatar_from_room_name(room_preview.name.as_deref())
     };
     let alias = <&RoomId>::try_from(room).err().map(ToOwned::to_owned);
-    Ok(FetchedRoomPreview::from(room_preview, room_avatar, via, alias))
+    Ok(FetchedRoomPreview::from(client, room_preview, room_avatar, via, alias))
 }
 
 /// Resolves a room link to determine whether we should show it as a room, space, or event.
@@ -5951,16 +6101,19 @@ pub enum RoomDataKind {
     /// Posts a [`ThreadsListAction`](crate::room::threads_list::ThreadsListAction)
     /// once the first page of threads loads, and whenever the threads change.
     Threads,
+    /// Posts a [`RoomInfoAction`](crate::room::room_info::RoomInfoAction) for the room's info
+    /// and another one for its notification modes, right away and whenever either one changes.
+    RoomInfo,
 }
 
-/// A task that watches some of a room's data while any lists show it (or saved it), e.g., its pinned messages.
+/// A task that watches some of a room's data while any widgets show it (or saved it), e.g., its pinned messages.
 struct RoomDataSubscriber<L = ()> {
-    /// The subscriptions to this data, held by the lists showing it or by their saved states.
+    /// The subscriptions to this data, held by the widgets showing it or by their saved states.
     subscribers: HashSet<WidgetUid>,
     /// Asks the task to post its data again, e.g., for a new subscriber.
     resend_notifier: Arc<Notify>,
-    /// Asks the task to load more of its data, if it's paginated.
-    load_more: L,
+    /// Sends the task the requests that only its kind of data has, e.g., to load more threads.
+    requests: L,
     /// The async subscriber task.
     task: JoinHandle<()>,
 }
@@ -6003,8 +6156,8 @@ fn add_or_remove_room_data_subscriber<L>(
                 .unwrap_or_default();
             subscribers.insert(subscriber);
             let resend_notifier = Arc::new(Notify::new());
-            let (load_more, task) = start(resend_notifier.clone());
-            *room_data_subscriber = Some(RoomDataSubscriber { subscribers, resend_notifier, load_more, task });
+            let (requests, task) = start(resend_notifier.clone());
+            *room_data_subscriber = Some(RoomDataSubscriber { subscribers, resend_notifier, requests, task });
         }
     }
 }
@@ -6421,9 +6574,7 @@ async fn timeline_subscriber_handler(
                             && new_event.transaction_id() == Some(old_txn_id)
                             && let Some(EventSendState::NotSentYet { progress: Some(p) }) = new_event.send_state()
                         {
-                            let percent = (p.progress.current * 100)
-                                .checked_div(p.progress.total)
-                                .unwrap_or(0);
+                            let percent = upload_percent(p.progress.current, p.progress.total) as usize;
                             latest_progress_updates = Some((index, percent));
                             num_progress_updates += 1;
                         }
