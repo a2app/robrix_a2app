@@ -6,7 +6,7 @@ use makepad_widgets::*;
 use matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType;
 use serde::{Deserialize, Serialize};
 
-use crate::directory_search::RoomDirectories;
+use crate::{directory_search::RoomDirectories, home::quick_reaction::QuickReaction, persistence};
 
 /// App-wide user preferences controlled by the App Settings UI.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -21,9 +21,30 @@ pub struct AppPreferences {
     ///   virtual/soft keyboards always insert a newline upon Enter.
     #[serde(default = "default_true", deserialize_with = "deserialize_or_true")]
     pub send_on_enter: bool,
+    /// Whether double-tapping (or double-clicking) a message toggles our `quick_reaction` on it.
+    #[serde(default = "default_true", deserialize_with = "deserialize_or_true")]
+    pub double_tap_to_react: bool,
+    #[serde(default, deserialize_with = "crate::utils::deserialize_or_default")]
+    pub quick_reaction: QuickReaction,
+    /// Whether the user's recent emoji are shared with their other Matrix clients through their account data.
+    #[serde(default = "default_true", deserialize_with = "deserialize_or_true")]
+    pub sync_recent_emojis: bool,
+    /// Whether a mouse or trackpad can scroll views by clicking and dragging them.
+    #[serde(default = "default_true", deserialize_with = "deserialize_or_true")]
+    pub mouse_drag_scrolling: bool,
+    /// Whether scrolling down the rooms list, Settings, or AddRoom page hides its header in the narrow layout.
+    #[serde(default = "default_true", deserialize_with = "deserialize_or_true")]
+    pub hide_header_on_scroll: bool,
+    /// Whether scrolling down the rooms list, Settings, or AddRoom page hides the bottom bars (navigation and spaces bars)
+    /// in the narrow layout, instead of shrinking the nav bar into a pill.
+    #[serde(default, deserialize_with = "crate::utils::deserialize_or_default")]
+    pub hide_bottom_bars_on_scroll: bool,
     /// Max height of image thumbnails in the room timeline.
     #[serde(default, deserialize_with = "crate::utils::deserialize_or_default")]
     pub thumbnail_max_height: ThumbnailMaxHeight,
+    /// How the previews of links in messages look, if they're shown at all.
+    #[serde(default, deserialize_with = "crate::utils::deserialize_or_default")]
+    pub link_preview_style: LinkPreviewStyle,
     /// UI-wide zoom level, which scaled the entire UI (not just text).
     #[serde(default, deserialize_with = "crate::utils::deserialize_or_default")]
     pub ui_zoom: UiZoom,
@@ -50,9 +71,15 @@ pub struct AppPreferences {
     /// Whether to let other users see when we're typing a message.
     #[serde(default = "default_true", deserialize_with = "deserialize_or_true")]
     pub send_typing_notices: bool,
+    /// Whether to show a red or gray shield next to messages that aren't encrypted or may not be authentic.
+    #[serde(default, deserialize_with = "crate::utils::deserialize_or_default")]
+    pub show_message_shields: bool,
     /// The other room directories that we can search for rooms and spaces, besides our homeserver's.
     #[serde(default, deserialize_with = "crate::utils::deserialize_or_default")]
     pub room_directories: RoomDirectories,
+    /// Whether the rooms list's Unreads and Mentions filters also show the rooms we've been invited to.
+    #[serde(default, deserialize_with = "crate::utils::deserialize_or_default")]
+    pub show_invites_in_unread_filters: bool,
 
     // Note: if you add a new preference here, be sure to add a new
     // function `on_<NEW_PREFERENCE>_changed` and update `broadcast_all()`.
@@ -63,7 +90,14 @@ impl Default for AppPreferences {
         Self {
             view_mode: ViewModeOverride::default(),
             send_on_enter: true,
+            double_tap_to_react: true,
+            quick_reaction: QuickReaction::default(),
+            sync_recent_emojis: true,
+            mouse_drag_scrolling: true,
+            hide_header_on_scroll: true,
+            hide_bottom_bars_on_scroll: false,
             thumbnail_max_height: ThumbnailMaxHeight::default(),
+            link_preview_style: LinkPreviewStyle::default(),
             ui_zoom: UiZoom::default(),
             read_receipts_privacy: ReadReceiptsPrivacy::default(),
             mark_as_read_behavior: MarkAsReadBehavior::default(),
@@ -72,7 +106,9 @@ impl Default for AppPreferences {
             are_interactive_messages_enabled: true,
             show_typing_notices: true,
             send_typing_notices: true,
+            show_message_shields: false,
             room_directories: RoomDirectories::default(),
+            show_invites_in_unread_filters: false,
         }
     }
 }
@@ -92,6 +128,37 @@ impl AppPreferences {
     pub fn on_send_on_enter_changed(&self, cx: &mut Cx) {
         cx.global::<AppPreferencesGlobal>().0.send_on_enter = self.send_on_enter;
         cx.action(AppPreferencesAction::SendOnEnterChanged(self.send_on_enter));
+    }
+
+    /// Applies the current `double_tap_to_react` value.
+    pub fn on_double_tap_to_react_changed(&self, cx: &mut Cx) {
+        cx.global::<AppPreferencesGlobal>().0.double_tap_to_react = self.double_tap_to_react;
+    }
+
+    /// Applies the current `quick_reaction` value.
+    pub fn on_quick_reaction_changed(&self, cx: &mut Cx) {
+        cx.global::<AppPreferencesGlobal>().0.quick_reaction = self.quick_reaction.clone();
+    }
+
+    /// Applies the current `sync_recent_emojis` value.
+    pub fn on_sync_recent_emojis_changed(&self, cx: &mut Cx) {
+        cx.global::<AppPreferencesGlobal>().0.sync_recent_emojis = self.sync_recent_emojis;
+    }
+
+    /// Applies the current `mouse_drag_scrolling` value.
+    pub fn on_mouse_drag_scrolling_changed(&self, cx: &mut Cx) {
+        cx.global::<AppPreferencesGlobal>().0.mouse_drag_scrolling = self.mouse_drag_scrolling;
+        cx.set_mouse_drag_scrolling(self.mouse_drag_scrolling);
+    }
+
+    /// Applies the current `hide_header_on_scroll` value.
+    pub fn on_hide_header_on_scroll_changed(&self, cx: &mut Cx) {
+        cx.global::<AppPreferencesGlobal>().0.hide_header_on_scroll = self.hide_header_on_scroll;
+    }
+
+    /// Applies the current `hide_bottom_bars_on_scroll` value.
+    pub fn on_hide_bottom_bars_on_scroll_changed(&self, cx: &mut Cx) {
+        cx.global::<AppPreferencesGlobal>().0.hide_bottom_bars_on_scroll = self.hide_bottom_bars_on_scroll;
     }
 
     /// Broadcasts the current `thumbnail_max_height` to listening widgets.
@@ -117,6 +184,13 @@ impl AppPreferences {
         // Now that we've updated the `IMG_MSG_FIT.max` object in place,
         // we need to instruct every widget that uses this object to re-read
         // the new value and update their whole widget tree accordingly.
+        cx.request_script_reapply();
+    }
+
+    /// Applies the current `link_preview_style` value.
+    pub fn on_link_preview_style_changed(&self, cx: &mut Cx) {
+        cx.global::<AppPreferencesGlobal>().0.link_preview_style = self.link_preview_style;
+        // This makes every timeline re-populate its messages, which rebuilds their link previews.
         cx.request_script_reapply();
     }
 
@@ -204,10 +278,23 @@ impl AppPreferences {
         cx.action(AppPreferencesAction::SendTypingNoticesChanged(self.send_typing_notices));
     }
 
+    /// Applies the current `show_message_shields` value.
+    pub fn on_show_message_shields_changed(&self, cx: &mut Cx) {
+        cx.global::<AppPreferencesGlobal>().0.show_message_shields = self.show_message_shields;
+        // Message shields check this pref at draw time, so redraw everything.
+        cx.redraw_all();
+    }
+
     /// Applies the current `room_directories` value.
     pub fn on_room_directories_changed(&self, cx: &mut Cx) {
         cx.global::<AppPreferencesGlobal>().0.room_directories = self.room_directories.clone();
         cx.action(AppPreferencesAction::RoomDirectoriesChanged);
+    }
+
+    /// Applies the current `show_invites_in_unread_filters` value.
+    pub fn on_show_invites_in_unread_filters_changed(&self, cx: &mut Cx) {
+        cx.global::<AppPreferencesGlobal>().0.show_invites_in_unread_filters = self.show_invites_in_unread_filters;
+        cx.action(AppPreferencesAction::ShowInvitesInUnreadFiltersChanged(self.show_invites_in_unread_filters));
     }
 
     /// Broadcasts every preference to listening widgets.
@@ -219,7 +306,14 @@ impl AppPreferences {
     pub fn broadcast_all(&self, cx: &mut Cx) {
         self.on_view_mode_changed(cx);
         self.on_send_on_enter_changed(cx);
+        self.on_double_tap_to_react_changed(cx);
+        self.on_quick_reaction_changed(cx);
+        self.on_sync_recent_emojis_changed(cx);
+        self.on_mouse_drag_scrolling_changed(cx);
+        self.on_hide_header_on_scroll_changed(cx);
+        self.on_hide_bottom_bars_on_scroll_changed(cx);
         self.on_thumbnail_max_height_changed(cx);
+        self.on_link_preview_style_changed(cx);
         self.on_ui_zoom_changed(cx);
         self.on_read_receipts_privacy_changed(cx);
         self.on_mark_as_read_behavior_changed(cx);
@@ -228,7 +322,9 @@ impl AppPreferences {
         self.on_interactive_messages_changed(cx);
         self.on_show_typing_notices_changed(cx);
         self.on_send_typing_notices_changed(cx);
+        self.on_show_message_shields_changed(cx);
         self.on_room_directories_changed(cx);
+        self.on_show_invites_in_unread_filters_changed(cx);
     }
 }
 
@@ -305,6 +401,39 @@ impl ThumbnailMaxHeight {
             Self::Medium => 300,
             Self::Large => 400,
             Self::Custom(v) => *v,
+        }
+    }
+}
+
+/// How the previews of links in messages look.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkPreviewStyle {
+    /// A card with the image beside the text, or above it if there isn't enough room.
+    /// Links to images (like GIFs) show a bigger image instead.
+    #[default]
+    Automatic,
+    /// Always a card with the image beside the text.
+    Compact,
+    /// Always a card with the image above the text, or a bigger image for links to images.
+    Large,
+    /// Link previews aren't shown, or even fetched.
+    Off,
+}
+impl LinkPreviewStyle {
+    pub fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::Compact,
+            2 => Self::Large,
+            3 => Self::Off,
+            _ => Self::Automatic,
+        }
+    }
+    pub fn to_index(self) -> usize {
+        match self {
+            Self::Automatic => 0,
+            Self::Compact => 1,
+            Self::Large => 2,
+            Self::Off => 3,
         }
     }
 }
@@ -485,6 +614,7 @@ pub enum AppPreferencesAction {
     SendTypingNoticesChanged(bool),
     /// See [`AppPreferencesGlobal`] for the new room directories.
     RoomDirectoriesChanged,
+    ShowInvitesInUnreadFiltersChanged(bool),
 }
 
 /// A `Cx` global mirror of the current [`AppPreferences`].
@@ -523,3 +653,12 @@ impl Appearance {
 /// A `Cx` global holding the current [`Appearance`].
 #[derive(Clone, Copy, Default, Debug)]
 pub struct AppearanceGlobal(pub Appearance);
+
+/// Switches the whole app to the given appearance and saves it for future launches.
+pub fn set_appearance(cx: &mut Cx, appearance: Appearance) {
+    cx.global::<AppearanceGlobal>().0 = appearance;
+    if let Err(e) = persistence::save_appearance(appearance) {
+        error!("Failed to save appearance. Error: {e}");
+    }
+    cx.request_style_reload();
+}

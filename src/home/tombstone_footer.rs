@@ -58,25 +58,35 @@ script_mod! {
             icon_walk: Walk{width: 17, height: 17, margin: Inset{left: -2, right: -1} }
         }
 
-        successor_room_avatar := Avatar {
-            width: 30, height: 30,
-            cursor: MouseCursor.Default,
-            text_view +: {
-                text +: {
-                    draw_text +: {
-                        text_style: TITLE_TEXT { font_size: 13.0 }
+        successor_room := View {
+            width: Fill, height: Fit,
+            flow: Right,
+            align: Align{x: 0.5, y: 0.5}
+
+            successor_room_avatar := Avatar {
+                width: 30, height: 30,
+                // The gap before the name is a margin, since the name's max width doesn't count the row's spacing.
+                margin: Inset{right: 8}
+                cursor: MouseCursor.Default,
+                text_view +: {
+                    text +: {
+                        draw_text +: {
+                            text_style: TITLE_TEXT { font_size: 13.0 }
+                        }
                     }
                 }
             }
-        }
 
-        successor_room_name := Label {
-            width: Fill, height: Fit,
-            flow: Flow.Right{wrap: true},
-            align: Align{x: 0.5}
-            draw_text +: {
-                text_style: TITLE_TEXT { font_size: 12 }
-                color: (COLOR_TEXT)
+            // A long name wraps within the space left after the avatar, but only once it has a max number of lines.
+            successor_room_name := Label {
+                width: Fit{max: FitBound.Rel{base: Base.Unused, factor: 1.0}}, height: Fit,
+                flow: Flow.Right{wrap: true},
+                max_lines: 3
+                text_overflow: TextOverflow.Ellipsis
+                draw_text +: {
+                    text_style: TITLE_TEXT { font_size: 12 }
+                    color: (COLOR_TEXT)
+                }
             }
         }
     }
@@ -172,7 +182,7 @@ impl TombstoneFooter {
                 replacement_reason.set_text(cx, DEFAULT_TOMBSTONE_REASON);
                 join_successor_button.set_text(cx, DEFAULT_JOIN_BUTTON_TEXT);
                 successor_room_avatar.show_text(cx, None, None, "?");
-                successor_room_name.set_text(cx, "(Unknown successor room");
+                successor_room_name.set_text(cx, "(Unknown successor room)");
                 self.successor_info = None;
             }
             SuccessorRoomDetails::Basic { successor_room: sr, via } => {
@@ -182,7 +192,7 @@ impl TombstoneFooter {
                 );
                 join_successor_button.set_text(cx, DEFAULT_JOIN_BUTTON_TEXT);
                 successor_room_avatar.show_text(cx, None, None, "#");
-                successor_room_name.set_text(cx, &format!("Room ID {}", sr.room_id));
+                successor_room_name.set_text(cx, "(Unknown room name)");
                 self.successor_info = Some(BasicRoomDetails::NameAndVia {
                     room_name_id: utils::RoomNameId::empty(sr.room_id.clone()),
                     via: via.clone(),
@@ -219,10 +229,7 @@ impl TombstoneFooter {
                         }
                     }
                 }
-                match room_preview.room_name_id.name_for_avatar() {
-                    Some(n) => successor_room_name.set_text(cx, n),
-                    _ => successor_room_name.set_text(cx, &format!("Unnamed Room, ID: {}", room_preview.room_name_id.room_id())),
-                }
+                successor_room_name.set_text(cx, room_preview.room_name_id.name_for_avatar().unwrap_or("Unnamed Room"));
                 self.successor_info = Some(room_preview.clone().into());
             }
         }

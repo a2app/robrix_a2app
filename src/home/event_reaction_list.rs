@@ -1,10 +1,11 @@
 use crate::home::room_screen::RoomScreenTooltipActions;
 use crate::profile::user_profile_cache;
+use crate::shared::{emoji_catalog::{get_emoji_catalog, get_shortcode}, inline_image::{InlineImageRef, InlineImageWidgetRefExt}, recent_emojis::record_emoji_pick};
 use crate::sliding_sync::{current_user_id, submit_async_request, MatrixRequest, TimelineKind};
 use indexmap::IndexMap;
 use makepad_widgets::*;
 use crate::{LivePtr, widget_ref_from_live_ptr};
-use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId};
+use matrix_sdk::ruma::{MxcUri, OwnedRoomId, OwnedUserId};
 use matrix_sdk_ui::timeline::{ReactionInfo, ReactionsByKeyBySender, TimelineEventItemId};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -83,6 +84,7 @@ script_mod! {
                 }
             }
 
+            custom_emoji := mod.widgets.InlineImage { width: 18, height: 18 }
             reaction := ReactionLabel {
                 flow: Flow.Right { wrap: false },
                 width: Fit{max: FitBound.Rel{base: Base.Line, factor: 1.0}},
@@ -110,18 +112,24 @@ impl ReactionData {
     /// Returns this reaction with each emoji's shortcode in parentheses after it, e.g., "👍 (+1)".
     ///
     /// A run of the same emoji only gets one shortcode, after its last emoji.
+    /// A custom emoji is just its `:shortcode:`, or "a custom emoji" if no sender named it.
     pub fn format_with_shortcodes(&self) -> String {
+        if is_custom_emoji(&self.reaction) {
+            return self.reaction_senders.values()
+                .find_map(|info| info.shortcode.as_deref())
+                .map_or_else(
+                    || "a custom emoji".into(),
+                    |shortcode| format!(":{}:", shortcode.trim_matches(':')),
+                );
+        }
         let mut text = String::new();
         let mut graphemes = self.reaction.graphemes(true).peekable();
         while let Some(grapheme) = graphemes.next() {
             text.push_str(grapheme);
             let Some(emoji) = emojis::get(grapheme) else { continue };
             let next_emoji = graphemes.peek().and_then(|next| emojis::get(next));
-            // Skin tone variants don't have their own shortcode, so we use the default one's.
-            let shortcode = emoji.shortcode()
-                .or_else(|| emoji.with_skin_tone(emojis::SkinTone::Default)?.shortcode());
             if next_emoji != Some(emoji)
-                && let Some(shortcode) = shortcode
+                && let Some(shortcode) = get_shortcode(emoji)
             {
                 text.push_str(&format!(" ({shortcode})"));
                 if next_emoji.is_some() {
@@ -139,6 +147,8 @@ pub struct ReactionList {
     #[redraw] #[rust] area: Area,
     #[live] item: Option<LivePtr>,
     #[rust] children: Vec<(ViewRef, ReactionData)>,
+    /// The custom emoji in our buttons, which need our events so they can load and animate.
+    #[rust] custom_emoji_images: Vec<InlineImageRef>,
     #[layout] layout: Layout,
     #[walk] walk: Walk,
 
@@ -173,13 +183,18 @@ impl Widget for ReactionList {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        for custom_emoji in &self.custom_emoji_images {
+            custom_emoji.handle_event(cx, event, scope);
+        }
         for (button_ref, reaction_data) in self.children.iter() {
             let button_area = button_ref.area();
             // Note: the `break` statements are used to break out of the loop over
             // all reaction buttons, since a hit event can only occur on one button.
             match event.hits(cx, button_area) {
-                Hit::FingerDown(..) => {
-                    cx.set_key_focus(button_area);
+                Hit::FingerDown(fde) => {
+                    if !fde.device.is_touch() {
+                        cx.set_key_focus(button_area);
+                    }
                     break;
                 }
                 Hit::FingerHoverIn(..) => {
@@ -267,6 +282,11 @@ impl ReactionList {
 
 
 impl ReactionListRef {
+    /// Returns whether there are no reactions to show.
+    pub fn is_empty(&self) -> bool {
+        self.borrow().is_none_or(|inner| inner.children.is_empty())
+    }
+
     /// Set the list of reactions and their counts to display in the ReactionList widget,
     /// along with the room ID and event ID that these reactions are for.
     ///
@@ -291,6 +311,7 @@ impl ReactionListRef {
         let Some(curr_user_id) = current_user_id() else { return };
         let Some(event_tl_item_reactions) = event_tl_item_reactions else {
             inner.children.clear();
+            inner.custom_emoji_images.clear();
             inner.last_reaction_counts = None;
             return;
         };
@@ -311,6 +332,7 @@ impl ReactionListRef {
         // here, things have changed, so we need to repopulate the list of reactions and redraw it.
         inner.last_reaction_counts = Some(new_counts);
         inner.children.clear();
+        inner.custom_emoji_images.clear();
         for (reaction_text, reaction_senders) in event_tl_item_reactions.iter() {
             let mut includes_user: bool = false;
             for (sender, _) in reaction_senders.iter() {
@@ -338,10 +360,17 @@ impl ReactionListRef {
             };
             let mut button = widget_ref_from_live_ptr(cx, inner.item).as_view();
             let reaction_label = button.label(cx, ids!(reaction));
-            reaction_label.set_text(cx, &reaction_data.reaction);
-            let is_emoji_only = reaction_text.graphemes(true).all(|g| emojis::get(g).is_some());
-            if is_emoji_only && let Some(mut label) = reaction_label.borrow_mut() {
-                label.draw_text.text_style.font_size += 1.0;
+            if is_custom_emoji(reaction_text) {
+                let custom_emoji = button.inline_image(cx, ids!(custom_emoji));
+                custom_emoji.set_mxc_uri(reaction_text.as_str().into());
+                reaction_label.set_visible(cx, false);
+                inner.custom_emoji_images.push(custom_emoji);
+            } else {
+                reaction_label.set_text(cx, &reaction_data.reaction);
+                let is_emoji_only = reaction_text.graphemes(true).all(|g| emojis::get(g).is_some());
+                if is_emoji_only && let Some(mut label) = reaction_label.borrow_mut() {
+                    label.draw_text.text_style.font_size += 1.0;
+                }
             }
             button.label(cx, ids!(count)).set_text(cx, &reaction_senders.len().to_string());
             apply_reaction_button_colors(cx, &mut button, reaction_data.includes_user);
@@ -349,6 +378,14 @@ impl ReactionListRef {
         }
         inner.timeline_kind = Some(timeline_kind.clone());
         inner.timeline_event_id = Some(timeline_event_item_id.clone());
+    }
+
+    pub fn get_own_reactions(&self) -> Vec<String> {
+        self.borrow().map(|inner| inner.children.iter()
+            .filter(|(_, reaction_data)| reaction_data.includes_user)
+            .map(|(_, reaction_data)| reaction_data.reaction.clone())
+            .collect()
+        ).unwrap_or_default()
     }
 
     /// Returns `true` if the `abs` coord is within one of the reaction buttons.
@@ -396,6 +433,61 @@ fn apply_reaction_button_colors(cx: &mut Cx, button: &mut ViewRef, includes_user
                 reaction_bg_color: mod.widgets.COLOR_REACTION_BG,
                 reaction_border_color: mod.widgets.COLOR_REACTION_BORDER,
             }
+        });
+    }
+}
+
+/// Returns whether the given reaction is a custom emoji, which is the `mxc://` URI of its image.
+pub fn is_custom_emoji(reaction: &str) -> bool {
+    <&MxcUri>::from(reaction).is_valid()
+}
+
+/// Returns the reaction that the user typed, or `None` if it's blank.
+/// An emoji or `:shortcode:` becomes its fully-qualified emoji, so it matches everyone else's reactions.
+pub fn get_typed_reaction(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let emoji = emojis::get(text).or_else(|| {
+        let shortcode = text.strip_prefix(':')?.strip_suffix(':')?;
+        get_emoji_catalog().get_by_shortcode(&shortcode.to_lowercase())
+    });
+    Some(emoji.map_or(text, |emoji| emoji.as_str()).to_owned())
+}
+
+/// Toggles `reaction` on a message: if the user already sent it or an emoji that looks the same (like ❤ for ❤️),
+/// we remove those, or else we add it, which counts as a recent pick for an emoji.
+pub fn toggle_reaction(
+    cx: &mut Cx,
+    timeline_kind: &TimelineKind,
+    timeline_event_id: &TimelineEventItemId,
+    reactions: Option<&ReactionsByKeyBySender>,
+    reaction: &str,
+) {
+    let emoji = emojis::get(reaction);
+    let own_equivalents: Vec<String> = emoji
+        .zip(reactions)
+        .zip(current_user_id())
+        .map(|((emoji, reactions), user_id)| reactions.iter()
+            .filter(|(key, senders)| senders.contains_key(&user_id) && emojis::get(key) == Some(emoji))
+            .map(|(key, _)| key.clone())
+            .collect()
+        )
+        .unwrap_or_default();
+    let toggled = if own_equivalents.is_empty() {
+        if emoji.is_some() {
+            record_emoji_pick(cx, reaction);
+        }
+        vec![reaction.to_owned()]
+    } else {
+        own_equivalents
+    };
+    for reaction in toggled {
+        submit_async_request(MatrixRequest::ToggleReaction {
+            timeline_kind: timeline_kind.clone(),
+            timeline_event_id: timeline_event_id.clone(),
+            reaction,
         });
     }
 }

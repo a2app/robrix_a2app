@@ -1,13 +1,14 @@
-//! A top-level view for adding (joining) or exploring new rooms and spaces, and for finding users.
+//! A top-level view for adding (joining) or exploring new rooms and spaces, finding users, and creating new rooms.
 
 
-use std::{cmp::Reverse, collections::HashSet};
+use std::cmp::Reverse;
 
 use makepad_widgets::*;
 use matrix_sdk::RoomState;
 use ruma::{OwnedRoomOrAliasId, OwnedServerName, RoomId, ServerName, room::{JoinRuleSummary, RoomType}};
+use rustc_hash::FxHashSet;
 
-use crate::{app::AppStateAction, avatar_cache::{self, AvatarCacheEntry}, directory_search::{DirectorySearchAction, RoomKind, RoomSearchResult, SEARCH_PAGE_SIZE, SearchQuery, UserSearchResult, get_room_directory_servers}, home::{invite_screen::{JoinRoomResultAction, LeaveRoomResultAction}, navigation_tab_bar::NavigationBarAction}, logout::logout_confirm_modal::LogoutAction, profile::{user_profile::{UserProfilePaneInfo, UserProfileSlidingPaneWidgetExt, UserProfileSlidingPaneWidgetRefExt}, user_profile_cache}, room::{FetchedRoomAvatar, FetchedRoomPreview, RoomPreviewAction}, settings::app_preferences::AppPreferencesAction, shared::{avatar::{AvatarWidgetRefExt, TextAvatarBgColor}, collapsible_header::{CollapsibleHeaderAction, CollapsibleHeaderWidgetExt}, list_rows::{LIST_ROW_HEIGHT, draw_flat_list_status_row, handle_row_actions}, popup_list::{PopupKind, enqueue_popup_notification}, styles::set_view_bg_color}, sliding_sync::{MatrixRequest, RoomPreviewResponseMode, submit_async_request}, utils::{self, MatchQuality}};
+use crate::{app::AppStateAction, avatar_cache::{self, AvatarCacheEntry}, directory_search::{DirectorySearchAction, RoomKind, RoomSearchResult, SEARCH_PAGE_SIZE, Search, SearchQuery, UserSearchResult, get_room_directory_servers}, home::{create_room_modal::CreateRoomModalAction, invite_screen::{JoinRoomResultAction, LeaveRoomResultAction}, navigation_tab_bar::NavigationBarAction}, logout::logout_confirm_modal::LogoutAction, profile::{user_profile::{UserProfilePaneInfo, UserProfileSlidingPaneWidgetExt, UserProfileSlidingPaneWidgetRefExt}, user_profile_cache}, room::{FetchedRoomAvatar, FetchedRoomPreview, RoomPreviewAction}, settings::app_preferences::AppPreferencesAction, shared::{avatar::{AvatarWidgetRefExt, TextAvatarBgColor}, collapsible_header::{CollapsibleHeaderAction, CollapsibleHeaderWidgetExt}, collapsible_html::handle_link_clicked, list_rows::{LIST_ROW_HEIGHT, draw_flat_list_status_row, handle_row_actions}, page_header::PAGE_SIDE_PADDING, popup_list::{PopupKind, enqueue_popup_notification}, styles::set_view_bg_color}, sliding_sync::{MatrixRequest, RoomPreviewResponseMode, submit_async_request}, utils::{self, MatchQuality}};
 
 /// The width of the Go buttons and the Edit button below the room search box, so they line up.
 const SEARCH_BUTTON_WIDTH: f64 = 72.0;
@@ -92,20 +93,15 @@ script_mod! {
         }
     }
 
-    // The scrollable content of the AddRoomScreen, beneath its user profile pane.
+    // The scrollable content of the AddRoomScreen, beneath its header and its user profile pane.
     let AddRoomScreenContent = ScrollYView {
         width: Fill, height: Fill,
         flow: Down,
-        padding: Inset{top: 5, left: 15, right: 15, bottom: 0},
+        padding: Inset{left: #(PAGE_SIDE_PADDING), right: #(PAGE_SIDE_PADDING)},
 
-        title := TitleLabel {
-            text: "Add Rooms, Spaces, and People"
-            draw_text +: {
-                text_style: theme.font_regular {font_size: 18},
-            }
-        }
-        
-        LineH { padding: 10, margin: Inset{top: 10, right: 2} }
+        // The mobile root view makes this as tall as how far the header has slid up,
+        // so this content stays put while the header slides out of view.
+        header_space := View { width: Fill, height: 0 }
 
         find_rooms_heading := SubsectionLabel {
             text: "Find and join rooms or spaces"
@@ -323,12 +319,12 @@ script_mod! {
                 draw_text +: { text_style: theme.font_regular { font_size: 12 } }
             }
 
-            room_topic := MessageHtml {
+            room_topic := CollapsibleHtml {
                 padding: Inset{left: 20, top: 5, right: 10, bottom: 10}
-                width: Fill,
-                height: Fit,
-                font_size: 11
-                font_color: (MESSAGE_TEXT_COLOR)
+                html +: {
+                    font_size: 11
+                    font_color: (MESSAGE_TEXT_COLOR)
+                }
             }
 
             buttons_view := View {
@@ -425,10 +421,35 @@ script_mod! {
             }
         }
 
+        LineH { padding: 10, margin: Inset{top: 15, right: 2} }
+
+        SubsectionLabel {
+            text: "Create a new room"
+        }
+
+        MessageHtml {
+            padding: Inset{left: 18, right: 7, top: 7, bottom: 7}
+            width: Fill, height: Fit
+            font_size: 10.
+            font_color: (MESSAGE_TEXT_COLOR)
+            body: "<p>To create a direct message (DM), it's easier to find a person above.</p>"
+        }
+
+        create_room_button := RobrixIconButton {
+            margin: Inset{left: 5, top: 3}
+            padding: Inset{top: 10, bottom: 10, left: 12, right: 15}
+            draw_icon.svg: (ICON_ADD)
+            icon_walk: Walk{width: 16, height: 16}
+            text: "Create a Room"
+        }
+
         View {
             width: Fill
             height: 20
         }
+
+        // The mobile root view makes this as tall as its bottom bars, so this content can scroll out from under them.
+        bottom_bars_space := View { width: Fill, height: 0 }
     }
 
     // The main view that allows the user to add (join) or explore new rooms/spaces, and find people.
@@ -441,15 +462,20 @@ script_mod! {
         search_input_padding: Inset{left: 12, right: 12, top: 0, bottom: 0}
         clear_button_gutter: 42.5
 
-        content := AddRoomScreenContent {}
+        View {
+            flow: Down
+
+            page_header := PageHeader {
+                title_row +: { title +: { text: "Add Rooms, Spaces, and People" } }
+            }
+
+            content := AddRoomScreenContent {}
+        }
 
         // Shown upon clicking a person in the search results, on top of all other content.
         user_profile_sliding_pane := mod.widgets.UserProfileSlidingPane { }
     }
 }
-
-/// Delay after the last keystroke before we search for rooms, spaces, or people.
-const SEARCH_DELAY: f64 = 0.5;
 
 #[derive(Script, Widget)]
 pub struct AddRoomScreen {
@@ -464,6 +490,8 @@ pub struct AddRoomScreen {
     #[rust] state: AddRoomState,
     /// Held while a room preview is shown, so that going back or pressing Escape cancels it.
     #[rust] cancel_scope: Option<CancelScope>,
+    /// How far down the user had scrolled when a room preview (or its loading view) replaced the room results.
+    #[rust] results_scroll_pos: Vec2d,
     /// The function to perform when the user clicks the `join_room_button`.
     #[rust(JoinButtonFunction::None)] join_function: JoinButtonFunction,
     #[rust] room_search: Search<RoomResults>,
@@ -559,21 +587,31 @@ impl AddRoomState {
         }
     }
 
-    fn transition_to_joined(&mut self) {
+    fn transition_to_joined(&mut self, is_space: bool) {
         let prev = std::mem::take(self);
-        if let Self::FetchedRoomPreview { frp, .. } = prev {
-            *self = Self::Joined { frp };
-        } else {
+        let Self::FetchedRoomPreview { mut frp, .. } = prev else {
             *self = prev;
+            return;
+        };
+        // Now we know for sure whether it's a space, which its preview may have gotten wrong.
+        if is_space != (frp.room_type == Some(RoomType::Space)) {
+            frp.room_type = is_space.then_some(RoomType::Space);
+        }
+        *self = Self::Joined { frp };
+        // We never get a `RoomLoadedSuccessfully` for a space, so we can go to it as soon as we've joined it.
+        if is_space {
+            self.transition_to_loaded(false);
         }
     }
 
     fn transition_to_loaded(&mut self, is_invite: bool) {
         let prev = std::mem::take(self);
         match prev {
-            Self::FetchedRoomPreview { frp, .. }
-            | Self::Joined { frp }
-            | Self::Knocked { frp } => {
+            Self::FetchedRoomPreview { mut frp, .. }
+            | Self::Joined { mut frp }
+            | Self::Knocked { mut frp } => {
+                // Going to a joined space depends on its preview's state, so we keep that up to date.
+                frp.state = Some(if is_invite { RoomState::Invited } else { RoomState::Joined });
                 *self = Self::Loaded { frp, is_invite };
             }
             _ => {
@@ -651,7 +689,7 @@ impl Widget for AddRoomScreen {
         let event = if let Event::Trigger(trigger_event) = event && let Some(area) = self.tab_scroll_target.take() {
             let mut trigger_event = trigger_event.clone();
             trigger_event.triggers.insert(
-                self.view.child(id!(content)).area(),
+                self.view.child_by_path(ids!(content)).area(),
                 vec![Trigger { id: live_id!(scroll_focus_nav), from: area }],
             );
             tab_scroll_event = Event::Trigger(trigger_event);
@@ -661,11 +699,16 @@ impl Widget for AddRoomScreen {
         };
 
         // While the profile pane is shown, it gets all of the user's input.
-        if utils::is_interactive_hit_event(event) && profile_pane.is_currently_shown(cx) {
-            profile_pane.handle_event(cx, event, scope);
-        } else {
-            self.view.handle_event(cx, event, scope);
-        }
+        // We only open the links that were clicked within this screen.
+        let mut inner_actions = cx.capture_actions(|cx| {
+            if utils::is_interactive_hit_event(event) && profile_pane.is_currently_shown(cx) {
+                profile_pane.handle_event(cx, event, scope);
+            } else {
+                self.view.handle_event(cx, event, scope);
+            }
+        });
+        inner_actions.retain(|action| !handle_link_clicked(action));
+        cx.extend_actions(inner_actions);
 
         // Closing the profile pane doesn't put the user back in the people search box,
         // so we stop showing the arrow keys' focus on the person they had opened.
@@ -705,7 +748,7 @@ impl Widget for AddRoomScreen {
 
             let search_tips_header = self.view.collapsible_header(cx, ids!(search_tips_header));
             if let Some(action) = actions.find_widget_action(search_tips_header.widget_uid())
-                && let CollapsibleHeaderAction::Toggled { .. } = action.cast()
+                && let CollapsibleHeaderAction::Toggled = action.cast()
             {
                 self.view.view(cx, ids!(help_view)).set_visible(cx, search_tips_header.is_expanded());
                 self.redraw(cx);
@@ -716,6 +759,22 @@ impl Widget for AddRoomScreen {
                 // The settings screen covers this button, so it never gets the hover-out event.
                 edit_room_directories_button.reset_hover(cx);
                 cx.action(NavigationBarAction::OpenSettings);
+            }
+
+            let create_room_button = self.view.button(cx, ids!(create_room_button));
+            if create_room_button.clicked(actions) {
+                // The modal covers this button, so it never gets the hover-out event.
+                create_room_button.reset_hover(cx);
+                cx.action(CreateRoomModalAction::Open);
+            }
+
+            let close_button = self.view.button(cx, ids!(page_header.close_button));
+            if close_button.clicked(actions) {
+                // This screen gets hidden, so the button never gets the hover-out event,
+                // and nothing in it should keep key focus.
+                close_button.reset_hover(cx);
+                cx.set_key_focus(Area::Empty);
+                cx.action(NavigationBarAction::CloseAddRoom);
             }
 
             // Enable or disable the button based on if the text input is empty.
@@ -890,7 +949,7 @@ impl Widget for AddRoomScreen {
             // If we've fetched and displayed the room preview, handle any responses to
             // the user clicking the join button (e.g., knocked on or joined the room/space).
             let mut transition_to_knocked = false;
-            let mut transition_to_joined  = false;
+            let mut joined_is_space = None;
             if let AddRoomState::FetchedRoomPreview { frp, .. } = &self.state {
                 for action in actions {
                     if let Some(KnockResultAction::Knocked { room, .. }) = action.downcast_ref()
@@ -903,8 +962,8 @@ impl Widget for AddRoomScreen {
                     match action.downcast_ref() {
                         // Don't show success/failure popups here, they're shown in the backend task
                         // which is more consistent than doing it here, as the user may have left the AddRoom screen by then.
-                        Some(JoinRoomResultAction::Joined { room_id }) if room_id == frp.room_name_id.room_id() => {
-                            transition_to_joined = true;
+                        Some(JoinRoomResultAction::Joined { room_id, is_space }) if room_id == frp.room_name_id.room_id() => {
+                            joined_is_space = Some(*is_space);
                             break;
                         }
                         Some(JoinRoomResultAction::Failed { room_id, .. }) if room_id == frp.room_name_id.room_id() => {
@@ -918,8 +977,8 @@ impl Widget for AddRoomScreen {
                 self.state.transition_to_knocked();
                 self.redraw(cx);
             }
-            if transition_to_joined {
-                self.state.transition_to_joined();
+            if let Some(is_space) = joined_is_space {
+                self.state.transition_to_joined(is_space);
                 self.redraw(cx);
             }
 
@@ -935,8 +994,17 @@ impl Widget for AddRoomScreen {
                     self.record_room_state(cx, room_name_id.room_id(), if *is_invite { RoomState::Invited } else { RoomState::Joined });
                 }
                 // We show a found room's preview as soon as the user picks it, so we keep our membership in it up to date.
-                if let Some(JoinRoomResultAction::Joined { room_id }) = action.downcast_ref() {
+                if let Some(JoinRoomResultAction::Joined { room_id, is_space }) = action.downcast_ref() {
                     self.record_room_state(cx, room_id, RoomState::Joined);
+                    if *is_space {
+                        self.mark_room_as_space(cx, room_id);
+                    }
+                }
+                // A room that the user opened from a room directory might turn out to be a space.
+                if let Some(RoomPreviewAction::Fetched { result: Ok(fetched), .. }) = action.downcast_ref()
+                    && fetched.room_type == Some(RoomType::Space)
+                {
+                    self.mark_room_as_space(cx, fetched.room_name_id.room_id());
                 }
                 if let Some(KnockResultAction::Knocked { room, .. }) = action.downcast_ref() {
                     self.record_room_state(cx, room.room_id(), RoomState::Knocked);
@@ -1122,7 +1190,7 @@ impl Widget for AddRoomScreen {
                 match &frp.room_avatar {
                     // We may not have this avatar's image yet, e.g., for a search result, so the avatar cache fetches it.
                     FetchedRoomAvatar::Text(_) => {
-                        room_avatar.show_room(cx, frp.room_name_id.room_id(), frp.avatar_url.as_ref(), frp.room_name_id.name_for_avatar());
+                        room_avatar.show_room(cx, frp.room_name_id.room_id(), frp.avatar_url.as_ref(), frp.room_name_id.name_for_avatar(), TextAvatarBgColor::UnknownRoom);
                     }
                     FetchedRoomAvatar::Image(avatar_image) => {
                         let res = room_avatar.show_image(
@@ -1163,14 +1231,13 @@ impl Widget for AddRoomScreen {
                     cx,
                     &format!("ID: {}", frp.room_name_id.room_id().as_str()),
                 );
-                fetched_room_summary.label(cx, ids!(subsection_topic)).set_text(
-                    cx,
-                    &format!("{room_or_space_uc} Topic"),
-                );
-                fetched_room_summary.html(cx, ids!(room_topic)).set_text(
-                    cx,
-                    frp.topic.as_deref().unwrap_or("<i>No topic set</i>"),
-                );
+                let topic = frp.topic.as_deref().map(str::trim).filter(|topic| !topic.is_empty());
+                let subsection_topic = fetched_room_summary.label(cx, ids!(subsection_topic));
+                subsection_topic.set_text(cx, &format!("{room_or_space_uc} Topic"));
+                subsection_topic.set_visible(cx, topic.is_some());
+                let room_topic = fetched_room_summary.widget(cx, ids!(room_topic));
+                room_topic.set_text(cx, topic.unwrap_or_default());
+                room_topic.set_visible(cx, topic.is_some());
 
                 let room_summary = fetched_room_summary.label(cx, ids!(room_summary));
                 let join_room_button = fetched_room_summary.button(cx, ids!(join_room_button));
@@ -1328,7 +1395,7 @@ impl Widget for AddRoomScreen {
             list.items.retain_visible();
         }
         // If the content moved or resized, rows we skipped could be in view now, so we draw once more.
-        self.content_viewport = self.view.child(id!(content)).area().rect(cx);
+        self.content_viewport = self.view.child_by_path(ids!(content)).area().rect(cx);
         if self.content_viewport != viewport {
             cx.redraw_area_in_draw(self.view.area());
         }
@@ -1374,7 +1441,11 @@ impl AddRoomScreen {
 
     /// Sets our state, and holds a cancel scope while that state shows a room preview.
     fn set_state(&mut self, cx: &mut Cx, state: AddRoomState) {
+        let were_results_shown = self.are_room_results_shown();
         self.state = state;
+        if were_results_shown && !self.are_room_results_shown() {
+            self.results_scroll_pos = self.view.child_by_path(ids!(content)).as_view().scroll_pos();
+        }
         let shows_room_preview = matches!(
             self.state,
             AddRoomState::FetchedRoomPreview { .. } | AddRoomState::Knocked { .. } | AddRoomState::Joined { .. } | AddRoomState::Loaded { .. }
@@ -1396,6 +1467,8 @@ impl AddRoomScreen {
             cx.set_key_focus(Area::Empty);
         }
         self.set_state(cx, AddRoomState::WaitingOnUserInput);
+        // We go back to where the user was in the results, which are taller than the preview was.
+        self.view.child_by_path(ids!(content)).as_view().set_scroll_pos_no_clip(cx, self.results_scroll_pos);
         self.redraw(cx);
     }
 
@@ -1406,7 +1479,7 @@ impl AddRoomScreen {
         self.view.button(cx, ids!(fetched_room_summary.buttons_view.join_room_button)).reset_hover(cx);
         self.view.button(cx, ids!(fetched_room_summary.buttons_view.cancel_button)).reset_hover(cx);
         // The preview replaces the results, which the user may have scrolled down, so we scroll back up to it.
-        self.view.child(id!(content)).as_view().set_scroll_pos(cx, Vec2d::default());
+        self.view.child_by_path(ids!(content)).as_view().set_scroll_pos(cx, Vec2d::default());
         self.redraw(cx);
     }
 
@@ -1542,7 +1615,7 @@ impl AddRoomScreen {
 
     /// Scrolls the content to show the given area, just like makepad does for the widget that Tab moves to.
     fn scroll_into_view(&self, cx: &mut Cx, area: Area) {
-        cx.send_trigger(self.view.child(id!(content)).area(), Trigger { id: live_id!(scroll_focus_nav), from: area });
+        cx.send_trigger(self.view.child_by_path(ids!(content)).area(), Trigger { id: live_id!(scroll_focus_nav), from: area });
     }
 
     /// Starts getting more results for the given list from each directory that has more,
@@ -1680,17 +1753,51 @@ impl AddRoomScreen {
     /// We already have everything that its preview shows, so we don't have to fetch it.
     fn open_room_result(&mut self, cx: &mut Cx, key: LiveId) {
         self.pending_submit = None;
-        let Some(mut frp) = self.room_search.results.as_ref()
+        let Some((mut frp, is_exact_match)) = self.room_search.results.as_ref()
             .and_then(|results| results.rooms.items.iter().chain(&results.spaces.items).find(|room| room.row_key() == key))
-            .map(|room| room.preview.clone())
+            .map(|room| (room.preview.clone(), room.is_exact_match))
         else { return };
         if let Some(avatar_url) = &frp.avatar_url
             && let AvatarCacheEntry::Loaded(data) = avatar_cache::get_or_fetch_avatar(cx, avatar_url)
         {
             frp.room_avatar = FetchedRoomAvatar::Image((avatar_url.clone(), data).into());
         }
-        let room_or_alias_id = frp.alias.clone().map_or_else(|| frp.room_name_id.room_id().clone().into(), Into::into);
+        let room_or_alias_id: OwnedRoomOrAliasId = frp.alias.clone().map_or_else(|| frp.room_name_id.room_id().clone().into(), Into::into);
+        // A room directory might not say which rooms are spaces, so we check the rooms that we don't know yet.
+        if !is_exact_match && frp.state.is_none() && frp.room_type != Some(RoomType::Space) {
+            submit_async_request(MatrixRequest::GetRoomPreview {
+                room_or_alias_id: room_or_alias_id.clone(),
+                via: frp.via.clone(),
+                response_mode: RoomPreviewResponseMode::Action,
+            });
+        }
         self.show_room_preview(cx, frp, room_or_alias_id);
+    }
+
+    /// Shows the given room as a space, if its preview or search result said that it's a room.
+    fn mark_room_as_space(&mut self, cx: &mut Cx, room_id: &RoomId) {
+        if let AddRoomState::FetchedRoomPreview { frp, .. } = &mut self.state
+            && frp.room_name_id.room_id() == room_id
+        {
+            frp.room_type = Some(RoomType::Space);
+        }
+        if let Some(results) = self.room_search.results.as_mut()
+            && let Some(index) = results.rooms.items.iter().position(|room| room.room_id() == room_id)
+        {
+            let rooms = &mut results.rooms;
+            // The rooms after it move up to take its place.
+            if index < rooms.joined_start_index {
+                rooms.joined_start_index -= 1;
+            }
+            if index < rooms.load_more_start_index {
+                rooms.load_more_start_index -= 1;
+            }
+            let mut space = rooms.items.remove(index);
+            space.preview.room_type = Some(RoomType::Space);
+            self.result_rows.populated.remove(&space.row_key());
+            results.spaces.add_results(&[space], &mut self.result_rows);
+        }
+        self.redraw(cx);
     }
 
     /// Records our new membership in the given room, if it's one of the rooms or spaces that we found.
@@ -1767,28 +1874,6 @@ pub enum KnockResultAction {
     }
 }
 
-
-/// The text entered in one of the search boxes, and the results of searching for it.
-#[derive(Default)]
-struct Search<R> {
-    /// The trimmed text that these results are for.
-    query: String,
-    /// This is `None` if the query can't match what this search box is for, e.g., a user ID in the room search.
-    results: Option<R>,
-    /// The countdown to searching after the user stops typing.
-    timer: Timer,
-}
-impl<R: Default> Search<R> {
-    /// Searches once the user stops typing, or clears the results if the search box is now empty.
-    fn handle_text_changed(&mut self, cx: &mut Cx, text: &str) {
-        cx.stop_timer(self.timer);
-        if text.trim().is_empty() {
-            *self = Self::default();
-        } else {
-            self.timer = cx.start_timeout(SEARCH_DELAY);
-        }
-    }
-}
 
 /// One of the two search boxes on this screen.
 #[derive(Clone, Copy, PartialEq)]
@@ -1939,7 +2024,7 @@ struct ResultRows {
     /// The row that the user moved to with the arrow keys, and the search box whose results it's in.
     focused: Option<(SearchBox, LiveId)>,
     /// The keys of the rows whose content is up to date, which needn't be set again when drawn.
-    populated: HashSet<LiveId>,
+    populated: FxHashSet<LiveId>,
 }
 impl ResultRows {
     /// Clears the arrow keys' focus if it's on one of the given search box's results, returning whether it was.
@@ -2051,7 +2136,7 @@ impl SearchResultRow for RoomSearchResult {
             subtitle.insert_str(0, "✅ Joined · ");
         }
         row.label(cx, ids!(info.subtitle)).set_text(cx, &subtitle);
-        row.avatar(cx, ids!(avatar)).show_room(cx, self.room_id(), self.preview.avatar_url.as_ref(), Some(name))
+        row.avatar(cx, ids!(avatar)).show_room(cx, self.room_id(), self.preview.avatar_url.as_ref(), Some(name), TextAvatarBgColor::UnknownRoom)
     }
 }
 

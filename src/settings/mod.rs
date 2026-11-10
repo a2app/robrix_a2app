@@ -10,11 +10,12 @@ pub mod privacy_settings;
 pub mod room_directory_settings;
 pub mod about_settings;
 pub mod app_preferences;
+pub mod text_rendering;
 
 pub fn script_mod(vm: &mut ScriptVm) {
     account_settings::script_mod(vm);
-    encryption_settings::script_mod(vm);
     app_settings::script_mod(vm);
+    encryption_settings::script_mod(vm);
     privacy_settings::script_mod(vm);
     room_directory_settings::script_mod(vm);
     about_settings::script_mod(vm);
@@ -22,9 +23,9 @@ pub fn script_mod(vm: &mut ScriptVm) {
 }
 
 /// How a settings sub-widget should be (re)populated. Both modes re-apply
-/// animator-driven controls, `script_apply_eval` outputs, and code-derived text.
-/// They only differ on *user-mutable* text inputs (currently `display_name_input`
-/// and `thumb_custom_input`).
+/// `script_apply_eval` outputs and code-derived text.
+/// They only differ on *user-mutable* text inputs (currently `display_name_input`,
+/// `thumb_custom_input` and `quick_reaction_input`).
 #[derive(Clone, Copy)]
 pub(crate) enum PopulateMode {
     /// Full populate. Writes user-mutable inputs from the cached source

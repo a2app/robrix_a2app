@@ -7,7 +7,7 @@
 use std::ops::{Deref, DerefMut};
 
 use futures_util::future::join_all;
-use makepad_widgets::Cx;
+use makepad_widgets::{Cx, Timer};
 use matrix_sdk::{Client, Room, RoomDisplayName, RoomState, room_preview::RoomPreview};
 use ruma::{
     OwnedRoomId, OwnedRoomOrAliasId, OwnedServerName, OwnedUserId, RoomAliasId, RoomId, ServerName, UInt, UserId,
@@ -20,6 +20,31 @@ use crate::{profile::user_profile::UserProfile, room::FetchedRoomPreview, settin
 
 /// How many results we ask for at a time.
 pub const SEARCH_PAGE_SIZE: u32 = 20;
+
+/// Delay after the last keystroke before we search for rooms, spaces, or people.
+const SEARCH_DELAY: f64 = 0.5;
+
+/// The text entered in a search box, and the results of searching for it.
+#[derive(Default)]
+pub struct Search<R> {
+    /// The trimmed text that these results are for.
+    pub query: String,
+    /// This is `None` if the query can't match what this search box is for, e.g., a user ID in the room search.
+    pub results: Option<R>,
+    /// The countdown to searching after the user stops typing.
+    pub timer: Timer,
+}
+impl<R: Default> Search<R> {
+    /// Searches once the user stops typing, or clears the results if the search box is now empty.
+    pub fn handle_text_changed(&mut self, cx: &mut Cx, text: &str) {
+        cx.stop_timer(self.timer);
+        if text.trim().is_empty() {
+            *self = Self::default();
+        } else {
+            self.timer = cx.start_timeout(SEARCH_DELAY);
+        }
+    }
+}
 
 /// Another server's room directory that we can search along with our own homeserver's.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -317,7 +342,10 @@ impl RoomSearchResult {
             avatar_url: public_room.avatar_url.filter(|url| url.is_valid()),
             num_joined_members: public_room.num_joined_members.into(),
             num_active_members: None,
-            room_type: public_room.room_type,
+            // A room directory might not say which rooms are spaces, but our own copy of a room does.
+            room_type: known_room.as_ref()
+                .and_then(|room| room.create_content())
+                .map_or(public_room.room_type, |create| create.room_type),
             join_rule: Some(public_room.join_rule.into()),
             is_world_readable: Some(public_room.world_readable),
             state,
@@ -506,12 +534,13 @@ pub async fn search_room_directory(client: Client, query: String, kind: RoomKind
     let (rooms, next_batch, error) = match result {
         Ok((public_rooms, next_batch)) => {
             let mut rooms = Vec::with_capacity(public_rooms.len());
-            // Not every room directory filters by room type, so we make sure.
-            let public_rooms = public_rooms.into_iter()
-                .filter(|public_room| (public_room.room_type == Some(RoomType::Space)) == (kind == RoomKind::Space));
             for public_room in public_rooms {
                 let known_room = client.get_room(&public_room.room_id);
-                rooms.push(RoomSearchResult::from_directory(public_room, directory_server.as_deref(), known_room, lowercase_term.as_deref()).await);
+                let room = RoomSearchResult::from_directory(public_room, directory_server.as_deref(), known_room, lowercase_term.as_deref()).await;
+                // Not every room directory filters by room type, so we make sure.
+                if room.is_space() == (kind == RoomKind::Space) {
+                    rooms.push(room);
+                }
             }
             (rooms, next_batch, None)
         }

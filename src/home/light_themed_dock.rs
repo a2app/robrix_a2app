@@ -11,6 +11,9 @@ script_mod! {
         // min_vertical: theme.splitter_min_vertical
         // max_vertical: theme.splitter_max_vertical
 
+        // The narrowest the rooms sidebar can get while still fitting an avatar and its unread badge.
+        min_vertical: 76
+
         draw_bg +: {
             color: COLOR_PANE_DIVIDER_GRIP
             color_hover: COLOR_ROBRIX_PURPLE
@@ -317,6 +320,9 @@ script_mod! {
 
     mod.widgets.RoomTabs = mod.widgets.RoomTabsBase {
         room_tab_actions: mod.widgets.RoomTabActions {}
+        dm_verification_badge: mod.widgets.UserVerificationBadge {}
+        tombstone_icon: mod.widgets.TombstoneIcon { visible: true }
+        tooltip_bg_color_tombstoned: (COLOR_BG_DANGER_RED_SOLID)
         tab_title_measure: mod.widgets.RobrixTab.draw_text
     }
 

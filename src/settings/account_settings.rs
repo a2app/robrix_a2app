@@ -4,7 +4,7 @@ use makepad_widgets::{text::selection::Cursor, *};
 use matrix_sdk::encryption::{identities::Device, VerificationState};
 use url::Url;
 
-use crate::{app::ConfirmDeleteAction, logout::logout_confirm_modal::{LogoutAction, LogoutConfirmModalAction}, profile::user_profile::UserProfile, settings::{PopulateMode, is_settings_screen_shown}, shared::{avatar::{AvatarState, TextAvatarBgColor, AvatarWidgetExt}, confirmation_modal::ConfirmationModalContent, file_upload_modal::{FileUploadMetadata, PendingUpload, handle_picked_file, handle_picker_launch_errors}, popup_list::{PopupKind, enqueue_popup_notification}}, sliding_sync::{get_client, submit_async_request, AccountDataAction, MatrixRequest}, utils, verification::VerificationStateAction};
+use crate::{app::ConfirmDeleteAction, home::navigation_tab_bar::get_own_profile, logout::logout_confirm_modal::{LogoutAction, LogoutConfirmModalAction}, profile::{user_profile::UserProfile, user_profile_cache::UserProfilesUpdated}, settings::{PopulateMode, is_settings_screen_shown}, shared::{avatar::{AvatarState, TextAvatarBgColor, AvatarWidgetExt}, confirmation_modal::ConfirmationModalContent, file_upload_modal::{PendingUpload, handle_picked_file, handle_picker_launch_errors, validate_avatar_image}, popup_list::{PopupKind, enqueue_popup_notification}}, sliding_sync::{get_client, submit_async_request, AccountDataAction, MatrixRequest}, utils, verification::VerificationStateAction};
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -442,6 +442,17 @@ impl WidgetMatchEvent for AccountSettings {
                 continue;
             }
 
+            // Fill in our account info as soon as our own profile arrives.
+            if self.own_profile.is_none()
+                && is_settings_screen_shown(scope)
+                && action.downcast_ref::<UserProfilesUpdated>().is_some()
+            {
+                if let Some(own_profile) = get_own_profile(cx) {
+                    self.populate(cx, Some(own_profile));
+                }
+                continue;
+            }
+
             // Handle LogoutAction::InProgress to update button state
             if let Some(LogoutAction::InProgress(is_in_progress)) = action.downcast_ref() {
                 let logout_button = self.view.button(cx, ids!(logout_button));
@@ -573,6 +584,29 @@ impl WidgetMatchEvent for AccountSettings {
         if !is_settings_screen_shown(scope) {
             return;
         }
+
+        if self.view.button(cx, ids!(verify_device_button)).clicked(actions) {
+            submit_async_request(MatrixRequest::RequestSelfVerification);
+        }
+
+        if self.view.button(cx, ids!(manage_account_button)).clicked(actions) {
+            match &self.account_management_url {
+                AccountManagementUrl::Known(url) => utils::open_url(url.as_str()),
+                AccountManagementUrl::Unavailable => Self::notify_no_account_page(),
+                // Already waiting on a lookup, so let that one finish.
+                AccountManagementUrl::OpenWhenKnown => {}
+                // If we don't know the URL, fetch it and open it once we get the result.
+                AccountManagementUrl::Unknown => {
+                    self.account_management_url = AccountManagementUrl::OpenWhenKnown;
+                    submit_async_request(MatrixRequest::GetAccountManagementUrl);
+                }
+            }
+        }
+
+        if self.view.button(cx, ids!(logout_button)).clicked(actions) {
+            cx.action(LogoutConfirmModalAction::Open);
+        }
+
         let Some(own_profile) = &self.own_profile else { return };
 
         let accept_display_name_button = self.view.button(cx, ids!(accept_display_name_button));
@@ -588,7 +622,7 @@ impl WidgetMatchEvent for AccountSettings {
                 robius_file_picker::FileDialog::new()
                     .add_filter("Images", utils::AVATAR_IMAGE_EXTENSIONS)
                     .set_media_representation(robius_file_picker::MediaRepresentation::Compatible)
-                    .pick_image(|result| handle_picked_file(result, validate_avatar_image))
+                    .pick_image(|result| handle_picked_file(result, |file_data| validate_avatar_image(file_data).map(PendingUpload::Avatar)))
             );
         }
 
@@ -654,28 +688,6 @@ impl WidgetMatchEvent for AccountSettings {
                 PopupKind::Success,
                 Some(3.0),
             );
-        }
-
-        if self.view.button(cx, ids!(verify_device_button)).clicked(actions) {
-            submit_async_request(MatrixRequest::RequestSelfVerification);
-        }
-
-        if self.view.button(cx, ids!(manage_account_button)).clicked(actions) {
-            match &self.account_management_url {
-                AccountManagementUrl::Known(url) => utils::open_url(url.as_str()),
-                AccountManagementUrl::Unavailable => Self::notify_no_account_page(),
-                // Already waiting on a lookup, so let that one finish.
-                AccountManagementUrl::OpenWhenKnown => {}
-                // If we don't know the URL, fetch it and open it once we get the result.
-                AccountManagementUrl::Unknown => {
-                    self.account_management_url = AccountManagementUrl::OpenWhenKnown;
-                    submit_async_request(MatrixRequest::GetAccountManagementUrl);
-                }
-            }
-        }
-
-        if self.view.button(cx, ids!(logout_button)).clicked(actions) {
-            cx.action(LogoutConfirmModalAction::Open);
         }
     }
 }
@@ -747,12 +759,7 @@ impl AccountSettings {
     /// and display-name button enable logic. Avatar repaint, hover sweep,
     /// and redraw are the same.
     fn populate_inner(&mut self, cx: &mut Cx, mode: PopulateMode) {
-        let Some(own_profile) = self.own_profile.as_ref() else {
-            if matches!(mode, PopulateMode::Initial) {
-                error!("BUG: AccountSettings::populate() called with no cached profile.");
-            }
-            return;
-        };
+        let Some(own_profile) = self.own_profile.as_ref() else { return };
 
         let cached_user_id = own_profile.user_id.as_str().to_owned();
         let cached_name = own_profile.username.clone().unwrap_or_default();
@@ -948,21 +955,6 @@ impl AccountSettingsRef {
         let Some(mut inner) = self.borrow_mut() else { return };
         inner.restore_after_reapply(cx);
     }
-}
-
-/// Validates that a picked file is an acceptable avatar image format and size.
-fn validate_avatar_image(file_data: FileUploadMetadata) -> Result<PendingUpload, String> {
-    let name = file_data.file_name();
-    if !utils::is_supported_avatar_mimetype(&file_data.mime_type) {
-        return Err(format!(
-            "\"{name}\" isn't an image type that Matrix avatars support. \
-             Please choose a PNG, JPEG, GIF, WebP, or AVIF image."
-        ));
-    }
-    if file_data.size == 0 {
-        return Err(format!("\"{name}\" is empty (0 bytes). Please choose a different image."));
-    }
-    Ok(PendingUpload::Avatar(file_data))
 }
 
 /// Actions that are handled by the AccountSettings widget.

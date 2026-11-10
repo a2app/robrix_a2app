@@ -7,15 +7,18 @@ script_mod! {
 
     mod.widgets.ICON_ADD              = crate_resource("self://resources/icons/add.svg")
     mod.widgets.ICON_ADD_REACTION     = crate_resource("self://resources/icons/add_reaction.svg")
+    mod.widgets.ICON_ADD_TEXT_REACTION = crate_resource("self://resources/icons/add_text_reaction.svg")
     mod.widgets.ICON_ADD_PHOTO        = crate_resource("self://resources/icons/add_photo.svg")
     mod.widgets.ICON_ADD_USER         = crate_resource("self://resources/icons/add_user.svg")
     mod.widgets.ICON_ADD_WALLET       = crate_resource("self://resources/icons/add_wallet.svg")
     mod.widgets.ICON_ARROW_LEFT       = crate_resource("self://resources/icons/arrow_left.svg")
     mod.widgets.ICON_ARROW_RIGHT      = crate_resource("self://resources/icons/arrow_right.svg")
+    mod.widgets.ICON_BROKEN_IMAGE     = crate_resource("self://resources/icons/broken_image.svg")
     mod.widgets.ICON_FORBIDDEN        = crate_resource("self://resources/icons/forbidden.svg")
     mod.widgets.ICON_CHECKMARK        = crate_resource("self://resources/icons/checkmark.svg")
     mod.widgets.ICON_CHEVRON_DOWN     = crate_resource("self://resources/icons/chevron_down.svg")
     mod.widgets.ICON_CHEVRON_UP       = crate_resource("self://resources/icons/chevron_up.svg")
+    mod.widgets.ICON_CHEVRON_RIGHT    = crate_resource("self://resources/icons/chevron_right.svg")
     mod.widgets.ICON_CLOSE            = crate_resource("self://resources/icons/close.svg")
     mod.widgets.ICON_CLOSE_THIN       = crate_resource("self://resources/icons/close_thin.svg")
     mod.widgets.ICON_CLOUD_CHECKMARK  = crate_resource("self://resources/icons/cloud_checkmark.svg")
@@ -38,6 +41,7 @@ script_mod! {
     mod.widgets.ICON_LOCATION_PIN     = crate_resource("self://resources/icons/location-pin.svg")
     mod.widgets.ICON_LOGOUT           = crate_resource("self://resources/icons/logout.svg")
     mod.widgets.ICON_MEMBERS          = crate_resource("self://resources/icons/members.svg")
+    mod.widgets.ICON_MUTE             = crate_resource("self://resources/icons/microphone_off.svg")
     mod.widgets.ICON_LINK             = crate_resource("self://resources/icons/link.svg")
     mod.widgets.ICON_PIN              = crate_resource("self://resources/icons/pin.svg")
     mod.widgets.ICON_UNPIN            = crate_resource("self://resources/icons/unpin.svg")
@@ -50,16 +54,18 @@ script_mod! {
     mod.widgets.ICON_SETTINGS         = crate_resource("self://resources/icons/settings.svg")
     mod.widgets.ICON_SHARE            = crate_resource("self://resources/icons/share.svg")
     mod.widgets.ICON_SHARE_THIN       = crate_resource("self://resources/icons/share_thin.svg")
+    mod.widgets.ICON_SIDEBAR_HIDE     = crate_resource("self://resources/icons/sidebar_chevron_left.svg")
+    mod.widgets.ICON_SIDEBAR_SHOW     = crate_resource("self://resources/icons/sidebar_chevron_right.svg")
     mod.widgets.ICON_SQUARES          = crate_resource("self://resources/icons/squares_filled.svg")
     mod.widgets.ICON_TOMBSTONE        = crate_resource("self://resources/icons/tombstone.svg")
     mod.widgets.ICON_TRASH            = crate_resource("self://resources/icons/trash.svg")
     mod.widgets.ICON_TRIANGLE_DOWN    = crate_resource("self://resources/icons/triangle_down_fill.svg")
     mod.widgets.ICON_TRIANGLE_UP      = crate_resource("self://resources/icons/triangle_up_fill.svg")
-    mod.widgets.ICON_CARET_LEFT       = crate_resource("self://resources/icons/caret_left.svg")
-    mod.widgets.ICON_CARET_RIGHT      = crate_resource("self://resources/icons/caret_right.svg")
-    mod.widgets.ICON_CARET_UP         = crate_resource("self://resources/icons/caret_up.svg")
-    mod.widgets.ICON_CARET_DOWN       = crate_resource("self://resources/icons/caret_down.svg")
     mod.widgets.ICON_MINIMIZE         = crate_resource("self://resources/icons/minimize.svg")
+    mod.widgets.ICON_PANE_TO_LEFT     = crate_resource("self://resources/icons/square_chevron_left.svg")
+    mod.widgets.ICON_PANE_TO_RIGHT    = crate_resource("self://resources/icons/square_chevron_right.svg")
+    mod.widgets.ICON_PANE_TO_TOP      = crate_resource("self://resources/icons/square_chevron_up.svg")
+    mod.widgets.ICON_PANE_TO_BOTTOM   = crate_resource("self://resources/icons/square_chevron_down.svg")
     mod.widgets.ICON_UPLOAD           = crate_resource("self://resources/icons/upload.svg")
     mod.widgets.ICON_VIEW_SOURCE      = crate_resource("self://resources/icons/view_source.svg")
     mod.widgets.ICON_WARNING          = crate_resource("self://resources/icons/warning.svg")
@@ -69,6 +75,17 @@ script_mod! {
     mod.widgets.ICON_ADD_ATTACHMENT   = crate_resource("self://resources/icons/add_attachment.svg")
     mod.widgets.ICON_FILE             = crate_resource("self://resources/icons/file.svg")
     mod.widgets.ICON_SPARKLE          = crate_resource("self://resources/icons/sparkle.svg")
+    mod.widgets.ICON_EMOJI            = crate_resource("self://resources/icons/emoji.svg")
+    // The emoji picker's category icons.
+    mod.widgets.ICON_HISTORY          = crate_resource("self://resources/icons/history.svg")
+    mod.widgets.ICON_HAND_WAVE        = crate_resource("self://resources/icons/hand_wave.svg")
+    mod.widgets.ICON_ANIMAL_CAT       = crate_resource("self://resources/icons/animal_cat.svg")
+    mod.widgets.ICON_FOOD_PIZZA       = crate_resource("self://resources/icons/food_pizza.svg")
+    mod.widgets.ICON_VEHICLE_CAR      = crate_resource("self://resources/icons/vehicle_car.svg")
+    mod.widgets.ICON_SPORT_SOCCER     = crate_resource("self://resources/icons/sport_soccer.svg")
+    mod.widgets.ICON_LIGHTBULB        = crate_resource("self://resources/icons/lightbulb.svg")
+    mod.widgets.ICON_SYMBOLS          = crate_resource("self://resources/icons/symbols.svg")
+    mod.widgets.ICON_FLAG             = crate_resource("self://resources/icons/flag.svg")
 
     mod.widgets.IMG_APP_LOGO = crate_resource("self://resources/robrix_logo_alpha.png")
 
@@ -82,6 +99,17 @@ script_mod! {
 
     mod.widgets.TEXT_SUB = theme.font_regular {
         font_size: (10),
+    }
+
+    // Draws emoji from the color emoji font first, since the regular fonts draw a few of them (like ☀️) in plain black.
+    // Its members match makepad's own, so no font gets loaded twice. Set `ink_centered: false` wherever you use it.
+    mod.widgets.EMOJI_TEXT = TextStyle {
+        font_size: 17
+        line_spacing: 1.0
+        font_family: FontFamily {
+            noto_color_emoji := FontMember{res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0}
+            ibm_plex_text := FontMember{res: crate_resource("makepad_widgets:resources/IBMPlexSans-Text.ttf") asc: -0.1 desc: 0.0}
+        }
     }
 
     mod.widgets.USERNAME_FONT_SIZE = 11
@@ -192,9 +220,16 @@ script_mod! {
     mod.widgets.COLOR_ACTIVE_PRIMARY_HOVER = #x106fcc
     mod.widgets.COLOR_ACTIVE_PRIMARY_DOWN = #x0C5DAA
 
+    // Translucent tints of COLOR_ACTIVE_PRIMARY, so they work atop any background.
+    mod.widgets.COLOR_BG_ACCENT_TINT = #x0F88FE21
+    mod.widgets.COLOR_BG_ACCENT_TINT_HOVER = #x0F88FE38
+    mod.widgets.COLOR_BG_ACCENT_TINT_DOWN = #x0F88FE4D
+
     mod.widgets.COLOR_BG_PREVIEW = #F0F5FF
     // Looks like COLOR_BG_PREVIEW atop white, but it also darkens a hovered or highlighted message behind it.
     mod.widgets.COLOR_BG_PREVIEW_TRANSLUCENT = #x1060FF10
+    // The area behind a link preview's image, a bit darker than the preview itself.
+    mod.widgets.COLOR_BG_LINK_PREVIEW_IMAGE = #x1060FF14
 
     // The light lavender of the room action buttons and room pane headers.
     mod.widgets.COLOR_BG_LAVENDER = #xEDE8FD
@@ -206,6 +241,9 @@ script_mod! {
     mod.widgets.COLOR_BG_LAVENDER_SELECTED = #x7C5BD7
     mod.widgets.COLOR_BG_LAVENDER_SELECTED_HOVER = #x7451D5
     mod.widgets.COLOR_BG_LAVENDER_SELECTED_DOWN = #x6B46D2
+
+    // The border of a lavender button, which only stands out from its fill in the dark theme.
+    mod.widgets.COLOR_LAVENDER_BUTTON_BORDER = (mod.widgets.COLOR_BG_LAVENDER)
 
     mod.widgets.COLOR_BG_PREVIEW_HOVER = #CDEDDF
     mod.widgets.COLOR_BG_PREVIEW_DOWN = #xA8DBBF
@@ -417,11 +455,11 @@ script_mod! {
     // A lighter version of the main Robrix purple color
     mod.widgets.COLOR_LOGIN_BG_TOP = #EEEAFA
     mod.widgets.COLOR_LOGIN_BG_BOTTOM = #FFFFFF
+    // Shows the appearance we'd switch to, so it's a moon here and a sun in the dark theme.
+    mod.widgets.ICON_SWITCH_APPEARANCE = crate_resource("self://resources/icons/moon.svg")
 
     mod.widgets.COLOR_SPACE_LOBBY_NAME_TEXT = #x1A1A1A
     mod.widgets.COLOR_SPACE_LOBBY_TREE_LINES = #x888888
-    // Not COLOR_TEXT_ON_ACCENT, since white on the light accent is only 3.5:1.
-    mod.widgets.COLOR_SPACE_LOBBY_ENTRY_TEXT_ACTIVE = #x111830
 
     mod.widgets.COLOR_INVITE_SCREEN_TOPIC_TEXT = #x444444
 
@@ -516,6 +554,9 @@ script_mod! {
     // Toggles, checkboxes, and radio buttons.
     // The mark is a toggle's knob, a checkbox's check, or a radio button's dot.
     mod.widgets.COLOR_TOGGLE_BG = #x00000019
+    mod.widgets.COLOR_TOGGLE_BG_HOVER = #x0000002E
+    // A darker Robrix purple, for hovering over an enabled toggle.
+    mod.widgets.COLOR_TOGGLE_BG_ACTIVE_HOVER = #x4624A3
     mod.widgets.COLOR_TOGGLE_BG_DISABLED = #x00000008
     mod.widgets.COLOR_TOGGLE_BORDER = #x0000001F
     mod.widgets.COLOR_TOGGLE_BORDER_HOVER = #x0000003F
@@ -524,11 +565,6 @@ script_mod! {
     mod.widgets.COLOR_TOGGLE_MARK_ACTIVE = #x00000099
     mod.widgets.COLOR_TOGGLE_TEXT = #x000000BF
     mod.widgets.COLOR_TOGGLE_TEXT_DISABLED = #x0000001F
-
-    mod.widgets.COLOR_LINK_PREVIEW_TITLE_DOWN = #x000000BF
-    mod.widgets.COLOR_LINK_PREVIEW_TITLE_FOCUS = #x00000099
-    mod.widgets.COLOR_LINK_PREVIEW_UNDERLINE = #x00000099
-    mod.widgets.COLOR_LINK_PREVIEW_UNDERLINE_DOWN = #x000000BF
 
     mod.widgets.COLOR_MESSAGE_TABLE_HEADER_BG = #xFFFFFF0C
     mod.widgets.COLOR_MESSAGE_TABLE_BORDER = #x0000001F
@@ -545,6 +581,9 @@ script_mod! {
     mod.widgets.COLOR_NAVIGATION_TAB_BG = #xE3E3E3
     mod.widgets.COLOR_NAVIGATION_TAB_BG_HOVER = #xC0C0C0D8
     mod.widgets.COLOR_NAVIGATION_TAB_BG_ACTIVE = #9
+    // The nav bar's background and the thin ring around it while it's shrunk into a floating pill.
+    mod.widgets.COLOR_NAVIGATION_PILL_BG = #xE3E3E3
+    mod.widgets.COLOR_NAVIGATION_PILL_RING = #x00000014
 
     mod.widgets.COLOR_IMAGE_VIEWER_BACKGROUND = #333333CC // 80% Opacity
 
@@ -607,6 +646,49 @@ pub fn apply_primary_button_style(cx: &mut Cx, button: &mut ButtonRef) {
             color: mod.widgets.COLOR_TEXT_ON_ACCENT,
         }
     });
+}
+
+/// Applies the lavender button styling to the given button, or the purple styling if it's selected.
+pub fn apply_lavender_button_style(cx: &mut Cx, button: &mut ButtonRef, is_selected: bool) {
+    if is_selected {
+        script_apply_eval!(cx, button, {
+            draw_bg +: {
+                color: mod.widgets.COLOR_BG_LAVENDER_SELECTED,
+                color_hover: mod.widgets.COLOR_BG_LAVENDER_SELECTED_HOVER,
+                color_down: mod.widgets.COLOR_BG_LAVENDER_SELECTED_DOWN,
+                border_color: mod.widgets.COLOR_BG_LAVENDER_SELECTED,
+                border_color_hover: mod.widgets.COLOR_BG_LAVENDER_SELECTED_HOVER,
+                border_color_down: mod.widgets.COLOR_BG_LAVENDER_SELECTED_DOWN,
+            }
+            draw_text +: {
+                color: mod.widgets.COLOR_TEXT_ON_ACCENT,
+                color_hover: mod.widgets.COLOR_TEXT_ON_ACCENT,
+                color_down: mod.widgets.COLOR_TEXT_ON_ACCENT,
+            }
+            draw_icon +: {
+                color: mod.widgets.COLOR_TEXT_ON_ACCENT,
+            }
+        });
+    } else {
+        script_apply_eval!(cx, button, {
+            draw_bg +: {
+                color: mod.widgets.COLOR_BG_LAVENDER,
+                color_hover: mod.widgets.COLOR_BG_LAVENDER_HOVER,
+                color_down: mod.widgets.COLOR_BG_LAVENDER_DOWN,
+                border_color: mod.widgets.COLOR_LAVENDER_BUTTON_BORDER,
+                border_color_hover: mod.widgets.COLOR_LAVENDER_BUTTON_BORDER,
+                border_color_down: mod.widgets.COLOR_LAVENDER_BUTTON_BORDER,
+            }
+            draw_text +: {
+                color: mod.widgets.ROOM_NAME_TEXT_COLOR,
+                color_hover: mod.widgets.ROOM_NAME_TEXT_COLOR,
+                color_down: mod.widgets.ROOM_NAME_TEXT_COLOR,
+            }
+            draw_icon +: {
+                color: mod.widgets.ROOM_NAME_TEXT_COLOR,
+            }
+        });
+    }
 }
 
 /// Sets the background color of the given view, updating it in place if it's already drawn.

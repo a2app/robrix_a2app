@@ -2,6 +2,8 @@ use makepad_widgets::*;
 use matrix_sdk::encryption::VerificationState;
 
 use crate::{
+    profile::user_verification_cache::UserVerificationState,
+    shared::lazy_view::LazyViewWidgetExt,
     sliding_sync::get_client,
     verification::VerificationStateAction,
 };
@@ -22,12 +24,13 @@ script_mod! {
     mod.widgets.VERIFICATION_UNK_BG = crate_resource("self://resources/icons/verification_unk_bg.svg")
 
     mod.widgets.VerificationIcon = Icon {
+        width: Fill, height: Fill
         icon_walk: Walk {
-            width: (NAVIGATION_TAB_BAR_SIZE * 0.28),
-            height: (NAVIGATION_TAB_BAR_SIZE * 0.28),
+            width: Fill,
+            height: Fill,
             margin: 0,
         }
-        margin: Inset{left: 0, right: 3, top: 2, bottom: 0}
+        margin: 0
     }
 
     // Each verification icon is a colored shield with the inner glyph carved
@@ -37,7 +40,8 @@ script_mod! {
     mod.widgets.IconYes = View {
 
         visible: false
-        width: Fit, height: Fit
+        width: Fill, height: Fill
+        clip_x: false, clip_y: false
         flow: Overlay
         mod.widgets.VerificationIcon {
             draw_icon +: {
@@ -56,7 +60,8 @@ script_mod! {
     mod.widgets.IconNo = View {
 
         visible: false
-        width: Fit, height: Fit
+        width: Fill, height: Fill
+        clip_x: false, clip_y: false
         flow: Overlay
         mod.widgets.VerificationIcon {
             draw_icon +: {
@@ -75,7 +80,8 @@ script_mod! {
     mod.widgets.IconUnk = View {
 
         visible: false
-        width: Fit, height: Fit
+        width: Fill, height: Fill
+        clip_x: false, clip_y: false
         flow: Overlay
         mod.widgets.VerificationIcon {
             draw_icon +: {
@@ -91,6 +97,16 @@ script_mod! {
         }
     }
 
+    // Shows whether we've verified another user, or that their identity was reset.
+    mod.widgets.UserVerificationBadge = #(UserVerificationBadge::register_widget(vm)) {
+        visible: false
+        width: 15, height: 15
+        flow: Overlay
+        clip_x: false, clip_y: false
+        verified_icon := LazyView { template: mod.widgets.IconYes { visible: true } }
+        identity_reset_icon := LazyView { template: mod.widgets.IconNo { visible: true } }
+    }
+
     mod.widgets.VerificationBadge = #(VerificationBadge::register_widget(vm)) {
 
         width: Fit, height: Fit
@@ -99,15 +115,45 @@ script_mod! {
         tooltip_bg_verified: (COLOR_BG_ACCEPT_GREEN_SOLID)
         tooltip_bg_unverified: (COLOR_BG_DANGER_RED_SOLID)
 
+        // The badge's size is on this view rather than on its icons,
+        // so that the mobile nav bar can shrink it into its floating pill.
         verification_icons := View {
             flow: Overlay
             align: Align{ x: 1.0, y: 0 }
-            width: Fit, height: Fit
+            width: (NAVIGATION_TAB_BAR_SIZE * 0.28 + 3.0), height: (NAVIGATION_TAB_BAR_SIZE * 0.28 + 2.0)
+            padding: Inset{right: 3, top: 2}
 
             icon_yes := mod.widgets.IconYes {}
             icon_no := mod.widgets.IconNo {}
             icon_unk := mod.widgets.IconUnk {}
         }
+    }
+}
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct UserVerificationBadge {
+    #[deref] view: View,
+}
+
+impl Widget for UserVerificationBadge {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl UserVerificationBadgeRef {
+    /// Shows the icon for the given user's verification state, or hides this badge if there's nothing to show.
+    pub fn show_state(&self, cx: &mut Cx, state: Option<UserVerificationState>) {
+        let Some(mut inner) = self.borrow_mut() else { return };
+        let is_verified = state == Some(UserVerificationState::Verified);
+        let is_identity_reset = state == Some(UserVerificationState::VerificationViolation);
+        inner.view.lazy_view(cx, ids!(verified_icon)).set_visible(cx, is_verified);
+        inner.view.lazy_view(cx, ids!(identity_reset_icon)).set_visible(cx, is_identity_reset);
+        inner.view.set_visible(cx, is_verified || is_identity_reset);
     }
 }
 

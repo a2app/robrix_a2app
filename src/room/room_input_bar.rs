@@ -25,7 +25,7 @@ use matrix_sdk::room::reply::{EnforceThread, Reply};
 use ruma::events::room::message::AddMentions;
 use matrix_sdk_ui::timeline::{EmbeddedEvent, EventTimelineItem, TimelineEventItemId};
 use ruma::{events::room::message::{LocationMessageEventContent, MessageType, ReplyWithinThread, RoomMessageEventContent}, OwnedEventId, OwnedRoomId, OwnedTransactionId};
-use crate::{block_user_modal::{BlockUserModalAction, BlockUserRequest}, home::{editing_pane::{EditingPaneState, EditingPaneWidgetExt, EditingPaneWidgetRefExt}, location_preview::{LocationPreviewWidgetExt, LocationPreviewWidgetRefExt}, room_screen::{MessageAction, populate_preview_of_timeline_item}, rooms_list::RoomsListRef, tombstone_footer::{SuccessorRoomDetails, TombstoneFooterWidgetExt}, upload_progress::{UploadProgressViewWidgetRefExt, UploadState}}, join_leave_room_modal::{JoinLeaveModalKind, JoinLeaveRoomModalAction}, location::init_location_subscriber, profile::user_profile::{ShowUserProfileAction, UserProfile, UserProfileAndRoomId}, room::BasicRoomDetails, settings::app_preferences::{AppPreferencesAction, AppPreferencesGlobal}, shared::{avatar::{AvatarState, AvatarWidgetRefExt}, file_upload_modal::{AttachmentUpload, FileUploadAttemptId, FileUploadMetadata, PendingUpload, handle_picked_file, handle_picker_launch_errors, stage_local_file}, html_or_plaintext::HtmlOrPlaintextWidgetRefExt, mentionable_text_input::{MentionableTextInputWidgetExt, MentionableTextInputWidgetRefExt, MentionableTextInputState}, popup_list::{PopupKind, enqueue_popup_notification}, room_input_popup_menu::RoomInputPopupMenuAction, slash_commands::{SlashCommandAction, SlashCommandOutcome}, styles::{apply_positive_button_style, apply_primary_button_style}}, sliding_sync::{MatrixRequest, TimelineKind, UserPowerLevels, submit_async_request}, utils};
+use crate::{block_user_modal::{BlockUserModalAction, BlockUserRequest}, home::{editing_pane::{EditingPaneRef, EditingPaneState, EditingPaneWidgetExt, EditingPaneWidgetRefExt}, location_preview::{LocationPreviewWidgetExt, LocationPreviewWidgetRefExt}, room_screen::{MessageAction, display_name_or_user_id, populate_preview_of_timeline_item}, rooms_list::RoomsListRef, tombstone_footer::{SuccessorRoomDetails, TombstoneFooterWidgetExt}, upload_progress::{UploadProgressViewWidgetRefExt, UploadState}}, join_leave_room_modal::{JoinLeaveModalKind, JoinLeaveRoomModalAction}, location::init_location_subscriber, moderation::MemberModeration, moderation_modal::{ModerationModalAction, ModerationRequest}, profile::user_profile::{ShowUserProfileAction, UserProfile, UserProfileAndRoomId}, room::BasicRoomDetails, settings::app_preferences::{AppPreferencesAction, AppPreferencesGlobal}, shared::{avatar::{AvatarState, AvatarWidgetRefExt}, file_upload_modal::{AttachmentUpload, FileUploadAttemptId, FileUploadMetadata, PendingUpload, handle_picked_file, handle_picker_launch_errors, stage_local_file}, html_or_plaintext::HtmlOrPlaintextWidgetRefExt, mentionable_text_input::{MentionableTextInputRef, MentionableTextInputWidgetExt, MentionableTextInputWidgetRefExt, MentionableTextInputState}, popup_list::{PopupKind, enqueue_popup_notification}, room_input_popup_menu::RoomInputPopupMenuAction, slash_commands::{SlashCommandAction, SlashCommandOutcome}, styles::{apply_positive_button_style, apply_primary_button_style}}, sliding_sync::{MatrixRequest, TimelineKind, UserPowerLevels, submit_async_request}, utils};
 use crate::room::reply_preview::CollapsiblePreviewWidgetRefExt;
 
 script_mod! {
@@ -127,6 +127,7 @@ script_mod! {
                 send_message_button := RobrixPositiveIconButton {
                     // Disabled by default; enabled when text is inputted
                     enabled: false,
+                    hide_keyboard_on_tap: false
                     padding: 8
                     margin: Inset { top: 4, left: 4, right: 4, bottom: 5}
                     spacing: 0,
@@ -201,6 +202,20 @@ pub struct RoomInputBar {
     #[rust] timeline_kind: Option<TimelineKind>,
     /// The widget UID of the RoomScreen containing this RoomInputBar.
     #[rust] room_screen_widget_uid: Option<WidgetUid>,
+    /// The child widgets we use on every draw and event, looked up once.
+    #[rust] child_refs: Option<ChildRefs>,
+}
+
+#[derive(Clone)]
+struct ChildRefs {
+    reply_preview_content: WidgetRef,
+    input_bar: ViewRef,
+    mentionable_text_input: MentionableTextInputRef,
+    open_popup_menu_button: ButtonRef,
+    send_message_button: ButtonRef,
+    cancel_reply_button: ButtonRef,
+    send_location_button: ButtonRef,
+    editing_pane: EditingPaneRef,
 }
 
 impl ScriptHook for RoomInputBar {
@@ -212,11 +227,16 @@ impl ScriptHook for RoomInputBar {
                 .set_submit_on_enter(send_on_enter);
         });
     }
+
+    fn on_after_reload(&mut self, _vm: &mut ScriptVm) {
+        self.child_refs = None;
+    }
 }
 
 impl Widget for RoomInputBar {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        match event.hits(cx, self.view.widget(cx, ids!(replying_preview.reply_preview_content)).area()) {
+        let reply_preview_content_area = self.child_refs(cx).reply_preview_content.area();
+        match event.hits(cx, reply_preview_content_area) {
             // If the hit occurred on the replying message preview, jump to it.
             Hit::FingerUp(fe) if fe.is_over && fe.is_primary_hit() && fe.was_tap() => {
                 if let Some(event_id) = self.replying_to.as_ref()
@@ -247,12 +267,12 @@ impl Widget for RoomInputBar {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let ChildRefs { reply_preview_content, input_bar, editing_pane, .. } = self.child_refs(cx).clone();
         // Shrink the input_bar's height as the editing pane slides in,
         // and grow it back as the editing pane slides out.
         // slide=1.0 → editing pane hidden → input_bar at full Fit height.
         // slide=0.0 → editing pane shown → input_bar at zero height.
-        let slide = self.editing_pane(cx, ids!(editing_pane)).slide();
-        let input_bar = self.view.view(cx, ids!(input_bar));
+        let slide = editing_pane.slide();
 
         // Remap slide through a steeper curve so the input_bar reaches
         // its full target height before the ExpDecay tail.
@@ -275,9 +295,7 @@ impl Widget for RoomInputBar {
             }
         }
 
-        self.view.view(cx, ids!(replying_preview))
-            .widget(cx, ids!(reply_preview_content))
-            .set_visible(cx, true);
+        reply_preview_content.set_visible(cx, true);
 
         self.view.draw_walk(cx, scope, walk)
     }
@@ -315,7 +333,16 @@ impl RoomInputBar {
         cx: &mut Cx,
         actions: &Actions,
     ) {
-        let mentionable_text_input = self.mentionable_text_input(cx, ids!(mentionable_text_input));
+        let ChildRefs {
+            input_bar,
+            mentionable_text_input,
+            open_popup_menu_button,
+            send_message_button,
+            cancel_reply_button,
+            send_location_button,
+            editing_pane,
+            ..
+        } = self.child_refs(cx).clone();
         let text_input = mentionable_text_input.text_input_ref();
 
         for action in actions {
@@ -338,7 +365,7 @@ impl RoomInputBar {
 
         // Clear the replying-to preview pane if the "cancel reply" button was clicked
         // or if the `Escape` key was pressed within the message input box.
-        if self.button(cx, ids!(cancel_reply_button)).clicked(actions)
+        if cancel_reply_button.clicked(actions)
             || text_input.escaped(actions)
         {
             self.clear_replying_to(cx);
@@ -367,7 +394,6 @@ impl RoomInputBar {
             cx.action(crate::a2app::runtime::A2AppOp::AbortAiRoom(room_id.clone()));
         }
 
-        let open_popup_menu_button = self.button(cx, ids!(open_popup_menu_button));
         if open_popup_menu_button.clicked(actions) {
             let button_rect = open_popup_menu_button.area().rect(cx);
             cx.widget_action(
@@ -377,7 +403,7 @@ impl RoomInputBar {
         }
 
         // Handle the send location button being clicked.
-        if self.button(cx, ids!(location_preview.send_location_button)).clicked(actions) {
+        if send_location_button.clicked(actions) {
             let location_preview = self.location_preview(cx, ids!(location_preview));
             if let Some((coords, _system_time_opt)) = location_preview.get_current_data() {
                 let geo_uri = format!("{}{},{}", utils::GEO_URI_SCHEME, coords.latitude, coords.longitude);
@@ -424,12 +450,12 @@ impl RoomInputBar {
 
         // Keyboard events still reach a hidden input bar (like the send msg shortcut),
         // so we have to ignore them unless the user is allowed to send a message.
-        let can_post = self.view.view(cx, ids!(input_bar)).visible();
+        let can_post = input_bar.visible();
 
         // Handle the send message button being clicked, or a `Returned` action
         // from the message text input, which already respects the user's app setting.
         if can_post && (
-            self.button(cx, ids!(send_message_button)).clicked(actions)
+            send_message_button.clicked(actions)
             || text_input.returned(actions).is_some()
         ) {
             self.cancel_dictation(cx);
@@ -470,11 +496,19 @@ impl RoomInputBar {
                         self.clear_replying_to(cx);
                         mentionable_text_input.set_text(cx, "");
                         self.enable_send_message_button(cx, false);
+                        submit_async_request(MatrixRequest::SendTypingNotice {
+                            room_id: timeline_kind.room_id().clone(),
+                            typing: false,
+                        });
                     }
                     SlashCommandOutcome::Action(action) => {
                         self.run_slash_command_action(cx, action, timeline_kind.room_id(), room_screen_widget_uid);
                         mentionable_text_input.set_text(cx, "");
                         self.enable_send_message_button(cx, false);
+                        submit_async_request(MatrixRequest::SendTypingNotice {
+                            room_id: timeline_kind.room_id().clone(),
+                            typing: false,
+                        });
                     }
                     // Keep the text around so the user can fix the command and try again.
                     SlashCommandOutcome::Error(error) => {
@@ -521,9 +555,22 @@ impl RoomInputBar {
         }
 
         // When the hide animation fully completes, restore the replying preview.
-        if self.view.editing_pane(cx, ids!(editing_pane)).was_hidden(actions) {
+        if editing_pane.was_hidden(actions) {
             self.on_editing_pane_hidden(cx);
         }
+    }
+
+    fn child_refs(&mut self, cx: &mut Cx) -> &ChildRefs {
+        self.child_refs.get_or_insert_with(|| ChildRefs {
+            reply_preview_content: self.view.widget(cx, ids!(replying_preview.reply_preview_content)),
+            input_bar: self.view.view(cx, ids!(input_bar)),
+            mentionable_text_input: self.view.mentionable_text_input(cx, ids!(mentionable_text_input)),
+            open_popup_menu_button: self.view.button(cx, ids!(open_popup_menu_button)),
+            send_message_button: self.view.button(cx, ids!(send_message_button)),
+            cancel_reply_button: self.view.button(cx, ids!(cancel_reply_button)),
+            send_location_button: self.view.button(cx, ids!(location_preview.send_location_button)),
+            editing_pane: self.view.editing_pane(cx, ids!(editing_pane)),
+        })
     }
 
     /// Runs the given slash command action within this room.
@@ -580,6 +627,22 @@ impl RoomInputBar {
                     display_name: None,
                     block,
                     reject_invite_to: None,
+                }))
+            }
+            SlashCommandAction::ModerateMember { user_id, action, reason, can_remove_messages } => {
+                let room_name_id = cx.get_global::<RoomsListRef>().get_room_name(room_id)
+                    .unwrap_or_else(|| utils::RoomNameId::empty(room_id.clone()));
+                let user_name = display_name_or_user_id(cx, room_id, user_id.clone());
+                cx.action(ModerationModalAction::Open(ModerationRequest::Member {
+                    moderation: MemberModeration {
+                        room_id: room_id.clone(),
+                        room_name: room_name_id.to_string(),
+                        user_id,
+                        user_name,
+                        action,
+                    },
+                    initial_reason: reason,
+                    can_remove_messages,
                 }))
             }
             SlashCommandAction::SetDisplayName(new_display_name) => {
@@ -826,11 +889,10 @@ impl RoomInputBar {
             }
         }
 
-        let can_notify = user_power_levels.can_notify_room();
         self.mentionable_text_input(cx, ids!(mentionable_text_input))
-            .set_can_notify_room(cx, can_notify);
+            .set_user_power_levels(cx, user_power_levels);
         self.mentionable_text_input(cx, ids!(editing_pane.editing_content.edit_text_input))
-            .set_can_notify_room(cx, can_notify);
+            .set_user_power_levels(cx, user_power_levels);
     }
 
     /// Enables or disables (grays out) the send_message_button.
@@ -876,13 +938,15 @@ impl RoomInputBar {
             script_apply_eval!(cx, send_message_button, {
                 draw_icon.svg: mod.widgets.ICON_SEND_ENCRYPTED,
             });
-            empty_text = "Send encrypted message…";
+            // empty_text = "Send encrypted message…";
+            empty_text = "Message…";
         } else {
             apply_positive_button_style(cx, &mut send_message_button);
             script_apply_eval!(cx, send_message_button, {
                 draw_icon.svg: mod.widgets.ICON_SEND_UNENCRYPTED,
             });
-            empty_text = "Send unencrypted message…";
+            // empty_text = "Send unencrypted message…";
+            empty_text = "Message…";
         }
 
         self.text_input(cx, ids!(input_bar.mentionable_text_input.text_input))

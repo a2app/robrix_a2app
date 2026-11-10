@@ -137,6 +137,13 @@ impl NavHistory {
         self.drop_duplicate_places(current);
     }
 
+    /// Removes the given screen from this history, e.g., a space that the user left.
+    pub fn remove(&mut self, screen: &SelectedRoom, current: Option<&SelectedRoom>) {
+        self.back.retain(|place| place.as_ref() != Some(screen));
+        self.forward.retain(|place| place.as_ref() != Some(screen));
+        self.drop_duplicate_places(current);
+    }
+
     /// Drops any place that's the same as the one next to it, including the `current` place.
     fn drop_duplicate_places(&mut self, current: Option<&SelectedRoom>) {
         self.back.dedup();
@@ -215,7 +222,11 @@ pub fn can_show(cx: &mut Cx) -> impl Fn(Option<&SelectedRoom>) -> bool + use<> {
             if !room_pane::mini_app_panes::is_running(room_name_id.room_id(), app_id) => false,
         // Joined spaces aren't in the rooms list.
         Some(SelectedRoom::Space { .. }) => true,
-        Some(screen) => rooms_list.as_ref().is_none_or(|rooms_list| rooms_list.get_room_state(screen.room_id()).is_some()),
+        Some(screen) => rooms_list.as_ref().is_none_or(|rooms_list|
+            rooms_list.get_room_state(screen.room_id()).is_some()
+                // Nor are the spaces whose panes we show.
+                || (matches!(screen, SelectedRoom::RoomPane { .. }) && rooms_list.is_known_space(screen.room_id()))
+        ),
     }
 }
 

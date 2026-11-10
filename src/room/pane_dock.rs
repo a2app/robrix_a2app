@@ -1,4 +1,4 @@
-//! A dock around a room's timeline that shows that room's panes, e.g., its member list or a mini-app.
+//! A dock around a room's timeline (or a space's lobby) that shows that room's panes, e.g., its member list or a mini-app.
 //!
 //! Each pane is docked to one of the four edges around the timeline,
 //! can be resized via the grab handles on its inner border and between it and its edge's other panes,
@@ -21,7 +21,7 @@ use crate::{
 use super::{
     room_action_bar::RoomActionTooltip,
     pinned_messages_list::{PinnedMessagesListWidgetRefExt, SavedPinnedMessagesList},
-    room_members_list::{RoomMembersListRef, RoomMembersListWidgetRefExt, SavedRoomMembersList},
+    room_members_list::{LISTED_MEMBERSHIPS, MembersUpdate, RoomMembersListRef, RoomMembersListWidgetRefExt, SavedRoomMembersList, get_members_update},
     room_info::{RoomInfoViewAction, RoomInfoViewWidgetRefExt, SavedRoomInfoView},
     room_pane::{self, PaneLayout, PaneSide, RoomPaneKind, RoomPaneOp, RoomPaneRequest, RoomPanesPending, mini_app_panes},
     threads_list::{SavedThreadsList, ThreadsListWidgetRefExt},
@@ -36,7 +36,7 @@ script_mod! {
         width: #(HEADER_BUTTON_SIZE), height: #(HEADER_BUTTON_SIZE)
         padding: 0, spacing: 0, margin: 0
         align: Align{x: 0.5, y: 0.5}
-        icon_walk: Walk{width: 13, height: 13, margin: 0}
+        icon_walk: Walk{width: 16, height: 16, margin: 0}
         draw_icon.color: (COLOR_TEXT_MUTED)
         draw_bg +: {
             border_size: 0
@@ -112,7 +112,7 @@ script_mod! {
             width: Fill, height: Fit
             flow: Right
             spacing: #(HEADER_SPACING)
-            padding: Inset{top: #(HEADER_PADDING), right: #(FRAME_PADDING), bottom: #(HEADER_PADDING), left: #(FRAME_PADDING)}
+            padding: Inset{top: #(HEADER_PADDING), right: #(HEADER_PADDING), bottom: #(HEADER_PADDING), left: #(FRAME_PADDING)}
             show_bg: true
             draw_bg +: { color: (COLOR_BG_LAVENDER) }
 
@@ -129,7 +129,7 @@ script_mod! {
                 flow: Overlay
 
                 pane_edge_button := mod.widgets.RoomPaneHeaderButton {
-                    draw_icon.svg: (ICON_CARET_DOWN)
+                    draw_icon.svg: (ICON_PANE_TO_BOTTOM)
                 }
                 pane_pop_out_button := mod.widgets.RoomPaneHeaderButton {
                     margin: Inset{left: #(HEADER_BUTTON_STEP)}
@@ -143,7 +143,7 @@ script_mod! {
                 }
                 pane_close_button := mod.widgets.RoomPaneHeaderButton {
                     margin: Inset{left: #(2.0 * HEADER_BUTTON_STEP)}
-                    icon_walk: Walk{width: 12, height: 12, margin: 0}
+                    icon_walk: Walk{width: 15, height: 15, margin: 0}
                     draw_icon.svg: (ICON_CLOSE)
                 }
             }
@@ -273,7 +273,7 @@ script_mod! {
 
     // Docked panes are real flow children around the center, so they reflow the timeline.
     mod.widgets.RoomPaneDock = set_type_default() do #(RoomPaneDock::register_widget(vm)) {
-        ..mod.widgets.RoundedView
+        ..mod.widgets.View
         width: Fill, height: Fill
         flow: Overlay
 
@@ -325,10 +325,10 @@ script_mod! {
         }
 
         // The edge button's icon for each side that it can move its pane to.
-        edge_icon_top: (ICON_CARET_UP)
-        edge_icon_bottom: (ICON_CARET_DOWN)
-        edge_icon_left: (ICON_CARET_LEFT)
-        edge_icon_right: (ICON_CARET_RIGHT)
+        edge_icon_top: (ICON_PANE_TO_TOP)
+        edge_icon_bottom: (ICON_PANE_TO_BOTTOM)
+        edge_icon_left: (ICON_PANE_TO_LEFT)
+        edge_icon_right: (ICON_PANE_TO_RIGHT)
     }
 }
 
@@ -342,9 +342,9 @@ const CONTENT_TOP_PADDING: f64 = 6.0;
 const VERTICAL_CONTENT_TOP_PADDING: f64 = 12.0;
 /// The spacing between the header's icon, titles, and buttons.
 const HEADER_SPACING: f64 = 4.0;
-/// The space above and below the header's contents.
-const HEADER_PADDING: f64 = 7.0;
-const HEADER_BUTTON_SIZE: f64 = 25.0;
+/// The space above, below and to the right of the header's contents.
+const HEADER_PADDING: f64 = 5.5;
+const HEADER_BUTTON_SIZE: f64 = 28.0;
 const HEADER_BUTTON_SPACING: f64 = 2.0;
 /// The distance between the starts of adjacent header buttons.
 const HEADER_BUTTON_STEP: f64 = HEADER_BUTTON_SIZE + HEADER_BUTTON_SPACING;
@@ -379,7 +379,7 @@ fn header_button_ids(kind: &RoomPaneKind) -> &'static [&'static [LiveId]] {
 
 /// The narrowest a top or bottom pane can be while its header still fits its icon and one row of `buttons`.
 fn min_header_width(buttons: usize) -> f64 {
-    FRAME_PADDING * 2.0 + HEADER_ICON_WIDTH + HEADER_SPACING * 2.0
+    FRAME_PADDING + HEADER_PADDING + HEADER_ICON_WIDTH + HEADER_SPACING * 2.0
         + HEADER_BUTTON_STEP * buttons as f64 - HEADER_BUTTON_SPACING
 }
 
@@ -668,6 +668,8 @@ pub struct RoomPaneDock {
     #[rust] room_name_id: Option<RoomNameId>,
     /// The timeline that this dock's panes belong to.
     #[rust] timeline_kind: Option<TimelineKind>,
+    /// Whether this dock is in a space's lobby, which has no timeline to get the space's members from.
+    #[rust] is_space: bool,
     /// Our timeline's room members, shared with its RoomScreen and given to any members pane.
     #[rust] room_members: TimelineMembers,
     #[rust] panes: Vec<DockedPane>,
@@ -808,11 +810,23 @@ impl Widget for RoomPaneDock {
                     selected_room.room_id() == timeline_kind.room_id() && match selected_room {
                         SelectedRoom::JoinedRoom { .. } => timeline_kind.thread_root_event_id().is_none(),
                         SelectedRoom::Thread { thread_root_event_id, .. } => timeline_kind.thread_root_event_id() == Some(thread_root_event_id),
+                        SelectedRoom::Space { .. } => self.is_space,
                         _ => false,
                     }
                 );
                 self.update_cancel_scope(cx);
                 continue;
+            }
+            if self.is_space {
+                match get_members_update(action, room_id) {
+                    Some(MembersUpdate::Fetched(members)) => self.set_room_members(cx, Some(Ok(members))),
+                    Some(MembersUpdate::Failed(error)) => {
+                        error!("Failed to fetch members of space {room_id}: {error}");
+                        self.set_room_members(cx, Some(Err(error)));
+                    }
+                    Some(MembersUpdate::Outdated) if self.has_pane(&RoomPaneKind::Members) => self.fetch_members(),
+                    _ => {}
+                }
             }
             if let Some(widget_action) = action.as_widget_action() {
                 match widget_action.cast() {
@@ -997,23 +1011,28 @@ impl RoomPaneDock {
         }
         self.room_name_id = None;
         self.timeline_kind = None;
+        self.is_space = false;
         self.room_members = None;
         self.chips.clear();
         self.chips_revision = None;
     }
 
     /// Shows the given timeline's saved panes right away, and then slides in any pending panes.
-    fn show_timeline(
+    ///
+    /// A space has no timeline, so its lobby's panes belong to the main timeline of the space's room ID.
+    fn show_panes(
         &mut self,
         cx: &mut Cx,
         room_name_id: &RoomNameId,
         timeline_kind: TimelineKind,
+        is_space: bool,
         room_members: Option<Arc<Vec<RoomMember>>>,
         saved_panes: Vec<SavedRoomPane>,
     ) {
         self.clear(cx);
         self.room_name_id = Some(room_name_id.clone());
         self.timeline_kind = Some(timeline_kind);
+        self.is_space = is_space;
         self.room_members = room_members.map(Ok);
         for saved in saved_panes {
             // A mini-app that minimized itself while hidden stays minimized.
@@ -1359,17 +1378,22 @@ impl RoomPaneDock {
             }
             // Our timeline only keeps its members up to date while a members pane is open,
             // so refresh them when one is opened (and fetch any that are missing).
-            if *kind == RoomPaneKind::Members
-                && let Some(timeline_kind) = self.timeline_kind.clone()
-            {
-                submit_async_request(MatrixRequest::GetRoomMembers {
-                    timeline_kind,
-                    memberships: matrix_sdk::RoomMemberships::ACTIVE,
-                    local_only: false,
-                });
+            if *kind == RoomPaneKind::Members {
+                self.fetch_members();
             }
         }
         Some(frame)
+    }
+
+    /// Fetches our room's members for our members pane, from our timeline,
+    /// or for a space, from the space's room itself.
+    fn fetch_members(&self) {
+        let Some(timeline_kind) = self.timeline_kind.clone() else { return };
+        submit_async_request(if self.is_space {
+            MatrixRequest::GetRoomMembersList { room_id: timeline_kind.room_id().clone(), local_only: false }
+        } else {
+            MatrixRequest::GetRoomMembers { timeline_kind, memberships: LISTED_MEMBERSHIPS, local_only: false }
+        });
     }
 
     /// Creates a pane for `place_panes()` to place, returning whether it was created.
@@ -1460,6 +1484,11 @@ impl RoomPaneDock {
         if let Some(mut content) = pane.frame.view(cx, ids!(content)).borrow_mut() {
             content.layout.padding = Inset { top, right, bottom: FRAME_PADDING, left: FRAME_PADDING };
         }
+        // The edge's divider covers the top of a bottom pane's header, so we move its contents down by that much.
+        if let Some(mut header) = pane.frame.view(cx, ids!(header)).borrow_mut() {
+            header.layout.padding.top = HEADER_PADDING + if pane.layout.side == PaneSide::Bottom { EDGE_DIVIDER_COVERAGE } else { 0.0 };
+            header.layout.padding.right = get_header_right_padding(pane.layout.side);
+        }
     }
 
     /// Limits each pair of opposite edges such that the center keeps at least `MIN_CENTER_SIZE`.
@@ -1498,7 +1527,7 @@ impl RoomPaneDock {
                 let icon_width = pane.frame.widget(cx, ids!(pane_icon)).area().rect(cx).size.x
                     + pane.frame.widget(cx, ids!(pane_glyph)).area().rect(cx).size.x;
                 let icon_width = if icon_width > 0.0 { icon_width } else { pane.glyph_width.unwrap_or(HEADER_ICON_WIDTH) };
-                let title_area = |cols: usize| pane_width - FRAME_PADDING * 2.0 - icon_width - HEADER_SPACING * 2.0
+                let title_area = |cols: usize| pane_width - FRAME_PADDING - get_header_right_padding(side) - icon_width - HEADER_SPACING * 2.0
                     - (HEADER_BUTTON_STEP * cols as f64 - HEADER_BUTTON_SPACING);
                 // Beside two or more rows of buttons, the title can wrap onto a second line.
                 (1..=buttons.len()).rev()
@@ -1537,7 +1566,7 @@ impl RoomPaneDock {
 }
 
 impl RoomPaneDockRef {
-    /// See [`RoomPaneDock::show_timeline()`].
+    /// Shows the panes of the given timeline. See [`RoomPaneDock::show_panes()`].
     pub fn show_timeline(
         &self,
         cx: &mut Cx,
@@ -1547,7 +1576,15 @@ impl RoomPaneDockRef {
         saved_panes: Vec<SavedRoomPane>,
     ) {
         if let Some(mut inner) = self.borrow_mut() {
-            inner.show_timeline(cx, room_name_id, timeline_kind, room_members, saved_panes);
+            inner.show_panes(cx, room_name_id, timeline_kind, false, room_members, saved_panes);
+        }
+    }
+
+    /// Shows the panes of the given space's lobby. See [`RoomPaneDock::show_panes()`].
+    pub fn show_space(&self, cx: &mut Cx, space_name_id: &RoomNameId, saved_panes: Vec<SavedRoomPane>) {
+        if let Some(mut inner) = self.borrow_mut() {
+            let timeline_kind = TimelineKind::MainRoom { room_id: space_name_id.room_id().clone() };
+            inner.show_panes(cx, space_name_id, timeline_kind, true, None, saved_panes);
         }
     }
 
@@ -1615,6 +1652,13 @@ const GRAB_TOUCH_SLOP: f64 = 8.0;
 const EDGE_MIN_SIZE: f64 = 60.0;
 /// The thickness of the dividers beside and between panes.
 const DIVIDER_THICKNESS: f64 = 2.0;
+/// How much of a pane its edge's divider visibly covers, since its rounded shape draws a bit smaller than its rect.
+const EDGE_DIVIDER_COVERAGE: f64 = DIVIDER_THICKNESS - 0.33;
+
+/// Returns the padding to the right of a pane's header buttons, which clears the divider on a left pane's right edge.
+fn get_header_right_padding(side: PaneSide) -> f64 {
+    HEADER_PADDING + if side == PaneSide::Left { EDGE_DIVIDER_COVERAGE } else { 0.0 }
+}
 
 /// Widget actions emitted by a [`RoomPaneDock`].
 #[derive(Clone, Debug, Default)]
@@ -1774,15 +1818,11 @@ pub struct RoomPaneEdge {
     #[rust] initial_swap_progress: f64,
     /// Whether our size changed such that our dock must redraw.
     #[rust] needs_dock_redraw: bool,
-    /// Whether the animator must be cut to our current state, e.g., after a reapply.
-    #[rust] needs_animator_resync: bool,
 }
 
 impl ScriptHook for RoomPaneEdge {
     fn on_after_apply(&mut self, _vm: &mut ScriptVm, apply: &Apply, _scope: &mut Scope, _value: ScriptValue) {
         if apply.is_reload() {
-            self.slide = if !self.panes.is_empty() && !self.is_sliding_out { 0.0 } else { 1.0 };
-            self.needs_animator_resync = true;
             self.apply_walk();
         }
     }
@@ -2091,14 +2131,6 @@ impl Widget for RoomPaneEdge {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
 
-        if std::mem::take(&mut self.needs_animator_resync) {
-            if !self.panes.is_empty() && !self.is_sliding_out {
-                self.animator_cut(cx, ids!(panel.show));
-            } else {
-                self.animator_cut(cx, ids!(panel.hide));
-            }
-            self.animator_cut(cx, ids!(swap.on));
-        }
         // Our dock redraws itself while we're animating.
         if self.animator_handle_event(cx, event).must_redraw() {
             self.apply_walk();
@@ -2108,8 +2140,6 @@ impl Widget for RoomPaneEdge {
             self.is_sliding_out = false;
             self.panes.clear();
             self.pane_swap = None;
-            // Keep the animator's state in sync, e.g., if a rebake cut the slide short.
-            self.animator_cut(cx, ids!(panel.hide));
             self.apply_walk();
         }
         if self.pane_swap.is_some() && !self.animator.is_track_animating(id!(swap)) {

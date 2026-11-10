@@ -4,9 +4,12 @@ use std::{borrow::Cow, ops::{Deref, DerefMut}};
 use makepad_widgets::*;
 use matrix_sdk::{room::{RoomMember, RoomMemberRole}, ruma::{events::room::member::MembershipState, OwnedRoomId, OwnedUserId}};
 use crate::{
-    block_user_modal::{BlockUserModalAction, BlockUserRequest}, shared::{avatar::{AvatarState, AvatarWidgetExt}, popup_list::{PopupKind, enqueue_popup_notification}, styles::set_view_bg_color}, sliding_sync::{MatrixRequest, current_user_id, is_user_blocked, submit_async_request}, utils
+    block_user_modal::{BlockUserModalAction, BlockUserRequest}, moderation::{MemberAbilities, MemberAbilitiesFetched, MemberAction, MemberModeration, ReportTarget}, moderation_modal::{ModerationModalAction, ModerationRequest}, remove_messages_modal::{RemoveMessagesModalAction, RemoveMessagesRequest}, room::room_members_list::RoomMembersChanged, shared::{avatar::{AvatarState, AvatarWidgetExt}, popup_list::{PopupKind, enqueue_popup_notification}, styles::set_view_bg_color, verification_badge::UserVerificationBadgeWidgetExt}, sliding_sync::{MatrixRequest, current_user_id, is_user_blocked, submit_async_request}, utils, verification::UserVerificationRequestAction
 };
-use super::user_profile_cache::{self, UserProfilesUpdated};
+use super::{
+    user_profile_cache::{self, UserProfilesUpdated},
+    user_verification_cache::{UserVerificationState, UserVerificationStatesUpdated, get_or_fetch_user_verification_state},
+};
 
 
 /// Information retrieved about a user: their displayable name, ID, and known avatar state.
@@ -68,6 +71,15 @@ script_mod! {
 
     mod.widgets.ICON_DOUBLE_CHAT = crate_resource("self://resources/icons/double_chat.svg")
 
+    let ActionsTitle = Label {
+        width: Fill, height: Fit
+        flow: Flow.Right{wrap: true}
+        draw_text +: {
+            text_style: USERNAME_TEXT_STYLE { font_size: 11.5 },
+            color: (COLOR_TEXT_TITLE)
+        }
+    }
+
     let UserProfileView = ScrollXYView {
         width: Fill,
         height: Fill,
@@ -84,16 +96,30 @@ script_mod! {
             spacing: 3
             flow: Down
 
-            avatar := Avatar {
+            avatar_box := View {
                 width: 150,
                 height: 150,
                 margin: 10.0,
-                text_view +: {
-                    text +: {
-                        draw_text +: {
-                            text_style: theme.font_regular { font_size: 40.0 }
+                flow: Overlay,
+                align: Align{x: 1.0, y: 0.0}
+                // The badge sticks out a bit above the avatar, so don't clip it.
+                clip_x: false, clip_y: false
+
+                avatar := Avatar {
+                    width: Fill, height: Fill
+                    text_view +: {
+                        text +: {
+                            draw_text +: {
+                                text_style: theme.font_regular { font_size: 40.0 }
+                            }
                         }
                     }
+                }
+
+                // Sized and placed like the nav bar's `ProfileIcon` badge, scaled up to this avatar.
+                verification_badge := UserVerificationBadge {
+                    width: 56.7, height: 56.7
+                    margin: Inset{top: -3.75}
                 }
             }
 
@@ -117,6 +143,62 @@ script_mod! {
                     text_style: MESSAGE_TEXT_STYLE { font_size: 11 },
                 }
                 text: "User ID"
+            }
+
+            verified_label := RoundedView {
+                visible: false
+                width: Fit, height: Fit
+                margin: Inset{top: 8}
+                padding: Inset{top: 4, bottom: 4, left: 7, right: 9}
+                spacing: 5
+                align: Align{y: 0.5}
+                show_bg: true
+                draw_bg +: {
+                    color: (COLOR_BG_ACCEPT_GREEN)
+                    border_radius: 4.0
+                }
+                Icon {
+                    icon_walk: Walk{width: 14, height: 14}
+                    draw_icon +: {
+                        svg: (VERIFICATION_YES)
+                        color: (COLOR_FG_ACCEPT_GREEN)
+                    }
+                }
+                Label {
+                    draw_text +: {
+                        color: (COLOR_FG_ACCEPT_GREEN),
+                        text_style: MESSAGE_TEXT_STYLE { font_size: 10.5 },
+                    }
+                    text: "Verified"
+                }
+            }
+
+            identity_reset_view := View {
+                visible: false
+                width: Fill, height: Fit
+                margin: Inset{top: 10}
+                flow: Down
+                spacing: 10
+                align: Align{x: 0.5}
+
+                Label {
+                    width: Fill, height: Fit
+                    align: Align{x: 0.5}
+                    flow: Flow.Right{wrap: true}
+                    draw_text +: {
+                        color: (COLOR_FG_DANGER_RED),
+                        text_style: MESSAGE_TEXT_STYLE { font_size: 11 },
+                    }
+                    text: "This user's identity was reset, so they're no longer verified."
+                }
+
+                withdraw_verification_button := RobrixNegativeIconButton {
+                    padding: Inset{top: 10, bottom: 10, left: 12, right: 15}
+                    margin: 0,
+                    draw_icon.svg: (VERIFICATION_NO)
+                    icon_walk: Walk{width: 16, height: 16, margin: Inset{left: -1, right: -1} }
+                    text: "Withdraw Verification"
+                }
             }
         }
 
@@ -171,15 +253,7 @@ script_mod! {
             spacing: 10,
             padding: Inset{left: 10., right: 10, bottom: 10}
 
-            Label {
-                width: Fill, height: Fit
-                flow: Flow.Right{wrap: true}
-                draw_text +: {
-                    text_style: USERNAME_TEXT_STYLE { font_size: 11.5 },
-                    color: (COLOR_TEXT_TITLE)
-                }
-                text: "Actions"
-            }
+            ActionsTitle { text: "Actions" }
 
             direct_message_button := RobrixIconButton {
                 margin: 0,
@@ -187,6 +261,27 @@ script_mod! {
                 draw_icon.svg: (mod.widgets.ICON_DOUBLE_CHAT)
                 icon_walk: Walk{width: 22, height: 16, margin: Inset{left: -5, right: -3, top: 1, bottom: -1} }
                 text: "Direct Message"
+            }
+
+            verify_this_user_view := View {
+                width: Fit, height: Fit
+                flow: Right,
+                align: Align{y: 0.5}
+                spacing: 10
+
+                verify_this_user_button := RobrixPositiveIconButton {
+                    padding: Inset{top: 10, bottom: 10, left: 12, right: 15}
+                    margin: 0,
+                    draw_icon.svg: (VERIFICATION_YES)
+                    icon_walk: Walk{width: 16, height: 16, margin: Inset{left: -1, right: -1} }
+                    text: "Verify this User"
+                }
+
+                verify_this_user_spinner := LoadingSpinner {
+                    width: 16, height: 16
+                    visible: false
+                    draw_bg.color: (COLOR_ACTIVE_PRIMARY)
+                }
             }
 
             copy_link_to_user_button := RobrixNeutralIconButton {
@@ -211,6 +306,73 @@ script_mod! {
                 draw_icon.svg: (ICON_FORBIDDEN)
                 icon_walk: Walk{width: 16, height: 16, margin: Inset{left: -2, right: -0.5} }
                 text: "Block User"
+            }
+
+            report_user_button := RobrixNegativeIconButton {
+                padding: Inset{top: 10, bottom: 10, left: 12, right: 15}
+                margin: 0,
+                draw_icon.svg: (ICON_FLAG)
+                icon_walk: Walk{width: 16, height: 16, margin: Inset{left: -2, right: -0.5} }
+                text: "Report User"
+            }
+        }
+
+        moderation_divider := LineH { padding: 15 }
+
+        moderation_actions := View {
+            width: Fill, height: Fit
+            flow: Down,
+            spacing: 10,
+            padding: Inset{left: 10., right: 10, bottom: 10}
+
+            ActionsTitle { text: "Moderation" }
+
+            mute_user_button := RobrixNegativeIconButton {
+                padding: Inset{top: 10, bottom: 10, left: 12, right: 15}
+                margin: 0,
+                draw_icon.svg: (ICON_MUTE)
+                icon_walk: Walk{width: 16, height: 16, margin: Inset{left: -2, right: -0.5} }
+                text: "Mute User"
+            }
+
+            unmute_user_button := RobrixPositiveIconButton {
+                padding: Inset{top: 10, bottom: 10, left: 12, right: 15}
+                margin: 0,
+                draw_icon.svg: (ICON_CHECKMARK)
+                icon_walk: Walk{width: 16, height: 16, margin: Inset{left: -2, right: -0.5} }
+                text: "Unmute User"
+            }
+
+            kick_user_button := RobrixNegativeIconButton {
+                padding: Inset{top: 10, bottom: 10, left: 12, right: 15}
+                margin: 0,
+                draw_icon.svg: (ICON_LOGOUT)
+                icon_walk: Walk{width: 16, height: 16, margin: Inset{left: -2, right: -0.5} }
+                text: "Kick User"
+            }
+
+            ban_user_button := RobrixNegativeIconButton {
+                padding: Inset{top: 10, bottom: 10, left: 12, right: 15}
+                margin: 0,
+                draw_icon.svg: (ICON_FORBIDDEN)
+                icon_walk: Walk{width: 16, height: 16, margin: Inset{left: -2, right: -0.5} }
+                text: "Ban User"
+            }
+
+            unban_user_button := RobrixPositiveIconButton {
+                padding: Inset{top: 10, bottom: 10, left: 12, right: 15}
+                margin: 0,
+                draw_icon.svg: (ICON_CHECKMARK)
+                icon_walk: Walk{width: 16, height: 16, margin: Inset{left: -2, right: -0.5} }
+                text: "Unban User"
+            }
+
+            remove_messages_button := RobrixNegativeIconButton {
+                padding: Inset{top: 10, bottom: 10, left: 12, right: 15}
+                margin: 0,
+                draw_icon.svg: (ICON_TRASH)
+                icon_walk: Walk{width: 16, height: 16, margin: Inset{left: -2, right: -0.5} }
+                text: "Remove Messages"
             }
         }
 
@@ -395,6 +557,9 @@ pub struct UserProfileSlidingPane {
     #[rust] info: Option<UserProfilePaneInfo>,
     #[rust] is_showing_current_account: bool,
     #[rust] is_animating_out: bool,
+    #[rust] sending_verification_request_to: Option<OwnedUserId>,
+    /// What the current user can do to the shown user in the shown room, which is empty until it's fetched.
+    #[rust] member_abilities: MemberAbilities,
     /// Held while this pane is shown such that `Escape` closes this pane.
     /// This scope is dropped when the pane starts animating out or is reset.
     #[rust] cancel_scope: Option<CancelScope>,
@@ -403,6 +568,15 @@ pub struct UserProfileSlidingPane {
 impl Widget for UserProfileSlidingPane {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
+
+        // We check this even while hidden, so the spinner isn't still going when we're shown again.
+        if let Event::Actions(actions) = event
+            && let Some(user_id) = self.sending_verification_request_to.as_ref()
+            && actions.iter().any(|a| matches!(a.downcast_ref(), Some(UserVerificationRequestAction::Done(done_user_id)) if done_user_id == user_id))
+        {
+            self.sending_verification_request_to = None;
+            self.redraw(cx);
+        }
 
         if !self.visible {
             self.cancel_scope = None;
@@ -457,7 +631,7 @@ impl Widget for UserProfileSlidingPane {
                 && (event.back_pressed() || matches!(event, Event::KeyUp(key) if key.key_code == KeyCode::Escape))
             )
             || match event.hits_with_capture_overload(cx, area, true) {
-                Hit::FingerDown(_fde) => {
+                Hit::FingerDown(fde) if !fde.device.is_touch() => {
                     cx.set_key_focus(area);
                     false
                 }
@@ -507,6 +681,31 @@ impl Widget for UserProfileSlidingPane {
             self.redraw(cx);
         }
 
+        if let Event::Actions(actions) = event
+            && actions.iter().any(|a| a.downcast_ref::<UserVerificationStatesUpdated>().is_some())
+        {
+            self.redraw(cx);
+        }
+
+        if let Event::Actions(actions) = event
+            && let Some(info) = self.info.as_ref()
+            && let Some(room) = info.room.as_ref()
+        {
+            if actions.iter().any(|a| a.downcast_ref::<RoomMembersChanged>().is_some_and(|c| c.room_id == room.room_id)) {
+                self.request_member_abilities();
+            }
+            if let Some(fetched) = actions.iter()
+                .filter_map(|a| a.downcast_ref::<MemberAbilitiesFetched>())
+                .rfind(|f| f.room_id == room.room_id && f.user_id == info.user_id)
+            {
+                self.member_abilities = fetched.abilities;
+                if let Some(room_member) = fetched.room_member.clone() {
+                    user_profile_cache::insert_room_member(cx, room.room_id.clone(), room_member);
+                }
+                self.redraw(cx);
+            }
+        }
+
         // A Signal may mean that the avatar image we're waiting for has been fetched.
         if let Event::Signal = event
             && let Some(our_info) = self.info.as_mut()
@@ -527,6 +726,18 @@ impl Widget for UserProfileSlidingPane {
                 });
             }
 
+            if self.button(cx, ids!(verify_this_user_button)).clicked(actions)
+                && self.sending_verification_request_to.as_ref() != Some(&info.user_id)
+            {
+                self.sending_verification_request_to = Some(info.user_id.clone());
+                submit_async_request(MatrixRequest::RequestUserVerification { user_id: info.user_id.clone() });
+                self.view.redraw(cx);
+            }
+
+            if self.button(cx, ids!(withdraw_verification_button)).clicked(actions) {
+                submit_async_request(MatrixRequest::AcknowledgeIdentityReset { user_id: info.user_id.clone() });
+            }
+
             if self.button(cx, ids!(copy_link_to_user_button)).clicked(actions) {
                 let matrix_to_uri = info.user_id.matrix_to_uri().to_string();
                 cx.copy_to_clipboard(&matrix_to_uri);
@@ -544,11 +755,7 @@ impl Widget for UserProfileSlidingPane {
                     UserProfilePaneAction::JumpToReadReceipt(info.user_id.clone()),
                 );
                 // Close the sliding pane so it doesn't cover the event we're jumping to.
-                self.cancel_scope = None;
-                self.is_animating_out = true;
-                cx.revert_key_focus();
-                self.animator_play(cx, ids!(panel.hide));
-                self.redraw(cx);
+                self.animate_out(cx);
                 return;
             }
 
@@ -559,13 +766,57 @@ impl Widget for UserProfileSlidingPane {
                     block: !is_user_blocked(&info.user_id),
                     reject_invite_to: None,
                 };
-                // Hide the pane immediately to make room for the confirmation modal
-                self.cancel_scope = None;
-                self.is_animating_out = true;
-                cx.revert_key_focus();
-                self.animator_play(cx, ids!(panel.hide));
                 cx.action(BlockUserModalAction::Open(request));
-                self.redraw(cx);
+                // Hide the pane immediately to make room for the confirmation modal
+                self.animate_out(cx);
+                return;
+            }
+
+            if self.button(cx, ids!(report_user_button)).clicked(actions) {
+                cx.action(ModerationModalAction::Open(ModerationRequest::Report(ReportTarget::User {
+                    user_id: info.user_id.clone(),
+                    user_name: info.displayable_name().to_owned(),
+                })));
+                self.animate_out(cx);
+                return;
+            }
+
+            let clicked_member_action = [
+                (ids!(mute_user_button), MemberAction::Mute),
+                (ids!(unmute_user_button), MemberAction::Unmute),
+                (ids!(kick_user_button), MemberAction::Kick),
+                (ids!(ban_user_button), MemberAction::Ban),
+                (ids!(unban_user_button), MemberAction::Unban),
+            ].into_iter().find_map(|(button, action)| self.button(cx, button).clicked(actions).then_some(action));
+            if let Some(action) = clicked_member_action
+                && let Some(room) = info.room.as_ref()
+            {
+                cx.action(ModerationModalAction::Open(ModerationRequest::Member {
+                    moderation: MemberModeration {
+                        room_id: room.room_id.clone(),
+                        room_name: room.room_name.clone(),
+                        user_id: info.user_id.clone(),
+                        user_name: info.displayable_name().to_owned(),
+                        action,
+                    },
+                    initial_reason: None,
+                    can_remove_messages: self.member_abilities.contains(MemberAbilities::CanRemoveMessages),
+                }));
+                self.animate_out(cx);
+                return;
+            }
+
+            if self.button(cx, ids!(remove_messages_button)).clicked(actions)
+                && let Some(room) = info.room.as_ref()
+            {
+                cx.action(RemoveMessagesModalAction::Open(RemoveMessagesRequest {
+                    room_id: room.room_id.clone(),
+                    room_name: room.room_name.clone(),
+                    user_id: info.user_id.clone(),
+                    user_name: info.displayable_name().to_owned(),
+                    initial_reason: None,
+                }));
+                self.animate_out(cx);
             }
         }
     }
@@ -604,6 +855,15 @@ impl Widget for UserProfileSlidingPane {
             .and_then(|image| avatar_ref.show_image(cx, None, |cx, img| utils::load_avatar_image(&img, cx, image)).ok())
             .unwrap_or_else(|| avatar_ref.show_text(cx, None, None, info.displayable_name()));
 
+        let verification_state = get_or_fetch_user_verification_state(cx, &info.user_id);
+        let is_verified = verification_state == Some(UserVerificationState::Verified);
+        self.user_verification_badge(cx, ids!(verification_badge)).show_state(cx, verification_state);
+        self.view(cx, ids!(verified_label)).set_visible(cx, is_verified);
+        self.view(cx, ids!(identity_reset_view)).set_visible(
+            cx,
+            !self.is_showing_current_account && verification_state == Some(UserVerificationState::VerificationViolation),
+        );
+
         // Set the membership status and role in the room.
         self.view(cx, ids!(membership)).set_visible(cx, info.room.is_some());
         self.view(cx, ids!(membership_divider)).set_visible(cx, info.room.is_some());
@@ -616,12 +876,21 @@ impl Widget for UserProfileSlidingPane {
         // Draw and show/hide the buttons according to user and room membership info:
         // * `direct_message_button` is hidden if the user is the same as the account user,
         //    since you cannot direct message yourself.
+        // * `verify_this_user_button` is hidden for the account user and for already-verified users.
+        //    * A spinner shows next to it while we're sending this user a verification request.
         // * `copy_link_to_user_button` is always enabled with the same text.
         // * `jump_to_read_receipt_button` is hidden if there's no room, since there's no timeline to jump in.
         // * `block_user_button` is hidden if the user is the same as the account user,
         //    since you cannot block yourself.
         //    * The button text changes to "Unblock" if the user is already blocked.
+        // * `report_user_button` is hidden if the user is the same as the account user.
+        // * The moderation buttons are only shown if the account user can perform them on this user.
         self.button(cx, ids!(direct_message_button)).set_visible(cx, !self.is_showing_current_account);
+        self.view(cx, ids!(verify_this_user_view)).set_visible(cx, !self.is_showing_current_account && !is_verified);
+        self.view(cx, ids!(verify_this_user_spinner)).set_visible(
+            cx,
+            self.sending_verification_request_to.as_ref() == Some(&info.user_id),
+        );
         if info.room.is_none() {
             self.button(cx, ids!(jump_to_read_receipt_button)).set_visible(cx, false);
         }
@@ -635,6 +904,17 @@ impl Widget for UserProfileSlidingPane {
             cx,
             if is_blocked { "Unblock User" } else { "Block User" }
         );
+
+        self.button(cx, ids!(report_user_button)).set_visible(cx, !self.is_showing_current_account);
+        let abilities = self.member_abilities;
+        self.view(cx, ids!(moderation_divider)).set_visible(cx, !abilities.is_empty());
+        self.view(cx, ids!(moderation_actions)).set_visible(cx, !abilities.is_empty());
+        self.button(cx, ids!(mute_user_button)).set_visible(cx, abilities.contains(MemberAbilities::CanMute));
+        self.button(cx, ids!(unmute_user_button)).set_visible(cx, abilities.contains(MemberAbilities::CanUnmute));
+        self.button(cx, ids!(kick_user_button)).set_visible(cx, abilities.contains(MemberAbilities::CanKick));
+        self.button(cx, ids!(ban_user_button)).set_visible(cx, abilities.contains(MemberAbilities::CanBan));
+        self.button(cx, ids!(unban_user_button)).set_visible(cx, abilities.contains(MemberAbilities::CanUnban));
+        self.button(cx, ids!(remove_messages_button)).set_visible(cx, abilities.contains(MemberAbilities::CanRemoveMessages));
 
         self.view.draw_walk(cx, scope, walk)
     }
@@ -710,6 +990,30 @@ impl UserProfileSlidingPane {
 
         self.is_showing_current_account = current_user_id().is_some_and(|uid| uid == info.user_id);
         self.info = Some(info);
+        self.member_abilities = MemberAbilities::empty();
+        self.request_member_abilities();
+    }
+
+    /// Requests what the current user can do to the shown user in the shown room, if there is one.
+    fn request_member_abilities(&self) {
+        if self.is_showing_current_account { return }
+        if let Some(info) = self.info.as_ref()
+            && let Some(room) = info.room.as_ref()
+        {
+            submit_async_request(MatrixRequest::GetMemberAbilities {
+                room_id: room.room_id.clone(),
+                user_id: info.user_id.clone(),
+            });
+        }
+    }
+
+    /// Starts sliding this pane out right away, e.g., to make room for a modal.
+    fn animate_out(&mut self, cx: &mut Cx) {
+        self.cancel_scope = None;
+        self.is_animating_out = true;
+        cx.revert_key_focus();
+        self.animator_play(cx, ids!(panel.hide));
+        self.redraw(cx);
     }
 
     pub fn show(&mut self, cx: &mut Cx) {
@@ -722,9 +1026,18 @@ impl UserProfileSlidingPane {
 
         self.view.button(cx, ids!(close_button)).reset_hover(cx);
         self.view.button(cx, ids!(direct_message_button)).reset_hover(cx);
+        self.view.button(cx, ids!(verify_this_user_button)).reset_hover(cx);
+        self.view.button(cx, ids!(withdraw_verification_button)).reset_hover(cx);
         self.view.button(cx, ids!(copy_link_to_user_button)).reset_hover(cx);
         self.view.button(cx, ids!(jump_to_read_receipt_button)).reset_hover(cx);
         self.view.button(cx, ids!(block_user_button)).reset_hover(cx);
+        self.view.button(cx, ids!(report_user_button)).reset_hover(cx);
+        self.view.button(cx, ids!(mute_user_button)).reset_hover(cx);
+        self.view.button(cx, ids!(unmute_user_button)).reset_hover(cx);
+        self.view.button(cx, ids!(kick_user_button)).reset_hover(cx);
+        self.view.button(cx, ids!(ban_user_button)).reset_hover(cx);
+        self.view.button(cx, ids!(unban_user_button)).reset_hover(cx);
+        self.view.button(cx, ids!(remove_messages_button)).reset_hover(cx);
         self.redraw(cx);
     }
 }

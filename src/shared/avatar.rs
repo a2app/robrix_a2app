@@ -25,6 +25,9 @@ use crate::{
     utils::{self, RoomNameId},
 };
 
+/// How much each avatar drawn by [`draw_stacked_avatars()`] overlaps the one before it.
+const STACKED_AVATAR_OVERLAP: f64 = 5.0;
+
 script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
@@ -172,7 +175,7 @@ impl Widget for Avatar {
         let Some(info) = self.info.as_ref() else { return };
         let area = self.view.area();
         match event.hits(cx, area) {
-            Hit::FingerDown(_fde) => {
+            Hit::FingerDown(fde) if !fde.device.is_touch() => {
                 cx.set_key_focus(area);
             }
             Hit::FingerUp(fue) if fue.is_over && fue.is_primary_hit() && fue.was_tap() => {
@@ -487,7 +490,14 @@ impl AvatarRef {
     /// Shows a room's avatar from the rooms list or the avatar cache, else the first letter of its name.
     ///
     /// Returns `false` if the image is still being fetched, in which case call this again later.
-    pub fn show_room(&self, cx: &mut Cx, room_id: &OwnedRoomId, avatar_url: Option<&OwnedMxcUri>, name_for_avatar: Option<&str>) -> bool {
+    pub fn show_room(
+        &self,
+        cx: &mut Cx,
+        room_id: &OwnedRoomId,
+        avatar_url: Option<&OwnedMxcUri>,
+        name_for_avatar: Option<&str>,
+        bg_color: TextAvatarBgColor,
+    ) -> bool {
         if cx.has_global::<RoomsListRef>()
             && let Some(FetchedRoomAvatar::Image(image)) = cx.get_global::<RoomsListRef>().get_room_avatar(room_id)
             && self.show_image(cx, None, |cx, img| utils::load_avatar_image(&img, cx, &image)).is_ok()
@@ -495,7 +505,7 @@ impl AvatarRef {
             return true;
         }
         let FetchedRoomAvatar::Text(text) = utils::avatar_from_room_name(name_for_avatar) else { return true };
-        self.borrow_mut().is_none_or(|mut inner| inner.show_image_or_text(cx, avatar_url, &text, TextAvatarBgColor::UnknownRoom))
+        self.borrow_mut().is_none_or(|mut inner| inner.show_image_or_text(cx, avatar_url, &text, bg_color))
     }
 
     /// Shows the given avatar of a room/space, or the first letter of its name like the rooms list does.
@@ -566,6 +576,35 @@ impl AvatarRef {
             (avatar_user_id.to_string(), false)
         }
     }
+}
+
+/// Draws the given avatars in a row, each one slightly overlapping the one before it.
+pub fn draw_stacked_avatars<'a>(cx: &mut Cx2d, scope: &mut Scope, avatars: impl Iterator<Item = &'a AvatarRef>) {
+    for (i, avatar) in avatars.enumerate() {
+        let walk = get_stacked_avatar_walk(cx, i, avatar);
+        let _ = avatar.draw_walk(cx, scope, walk);
+    }
+}
+
+/// Returns how much room [`draw_stacked_avatars()`] takes up for the given fixed-size avatars.
+pub fn get_stacked_avatars_size<'a>(cx: &mut Cx, avatars: impl Iterator<Item = &'a AvatarRef>) -> DVec2 {
+    let mut size = DVec2::default();
+    for (i, avatar) in avatars.enumerate() {
+        let walk = get_stacked_avatar_walk(cx, i, avatar);
+        let (Size::Fixed(width), Size::Fixed(height)) = (walk.width, walk.height) else { continue };
+        size.x += walk.margin.left + width + walk.margin.right;
+        size.y = size.y.max(walk.margin.top + height + walk.margin.bottom);
+    }
+    size
+}
+
+/// Returns the walk of the `i`th avatar in a stack, which overlaps the one before it.
+fn get_stacked_avatar_walk(cx: &mut Cx, i: usize, avatar: &AvatarRef) -> Walk {
+    let mut walk = avatar.walk(cx);
+    if i > 0 {
+        walk.margin.left = -STACKED_AVATAR_OVERLAP;
+    }
+    walk
 }
 
 impl SelectedRoom {

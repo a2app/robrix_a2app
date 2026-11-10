@@ -10,6 +10,7 @@ use crate::{
     event_preview::{is_email_invite_revocation, membership_transition_of},
     home::{
         room_read_receipt::{AvatarRowWidgetRefExt, populate_read_receipts},
+        new_message_context_menu::MessageDetails,
         room_screen::ItemDrawnStatus,
         state_event_group::{AvatarStackWidgetRefExt, GroupToggleLineWidgetRefExt, SmallStateEventWidgetRefExt, StackedUser, StateEventGroup, StateEventGroupHeaderWidgetRefExt},
         state_event_summary::{MembershipTransition, ProfileChange, RoomChange, RoomSetting, StateChange, SummaryEntry, Who, summarize},
@@ -38,11 +39,32 @@ pub(super) fn populate_group_summary_item(
     group: &StateEventGroup,
     first_event_tl_item: &EventTimelineItem,
     first_event_content: &SmallStateContent,
+    first_event_details: MessageDetails,
+    item_drawn_status: ItemDrawnStatus,
+) -> (WidgetRef, ItemDrawnStatus) {
+    let (item, existed) = list.item_with_existed(cx, item_id, id!(GroupSummaryItem));
+    populate_group_summary(cx, item, existed, timeline, group, first_event_tl_item, first_event_content, first_event_details, item_drawn_status)
+}
+
+/// Populates the group `header` and `first_event` within the given item, see [`populate_group_summary_item()`].
+///
+/// `existed` is whether this item was already showing this group.
+pub(super) fn populate_group_summary(
+    cx: &mut Cx,
+    item: WidgetRef,
+    existed: bool,
+    timeline: TimelineInfo,
+    group: &StateEventGroup,
+    first_event_tl_item: &EventTimelineItem,
+    first_event_content: &SmallStateContent,
+    first_event_details: MessageDetails,
     item_drawn_status: ItemDrawnStatus,
 ) -> (WidgetRef, ItemDrawnStatus) {
     let TimelineInfo { items, kind: timeline_kind, .. } = timeline;
     let room_id = timeline_kind.room_id();
-    let (item, existed) = list.item_with_existed(cx, item_id, id!(GroupSummaryItem));
+    // Set even for a cached item, since the user's power levels or the pinned events may have changed.
+    let first_event = item.small_state_event(cx, ids!(first_event));
+    first_event.set_details(cx, first_event_details);
     let content_already_drawn = existed && item_drawn_status.content_drawn;
     if content_already_drawn && item_drawn_status.profile_drawn {
         return (item, item_drawn_status);
@@ -59,7 +81,6 @@ pub(super) fn populate_group_summary_item(
     // The group's first event is technically a part of this item,
     // but we only actually show it when the group is expanded.
     // Its cached drawn status is only correct if it hasn't been expanded/collapsed since.
-    let first_event = item.small_state_event(cx, ids!(first_event));
     let first_event_was_shown = existed && first_event.visible();
     first_event.set_shown(group.is_expanded);
     if group.is_expanded {
@@ -73,7 +94,6 @@ pub(super) fn populate_group_summary_item(
             first_event_tl_item,
             first_event_content,
             item_drawn_status,
-            false,
             false,
         );
         return (item, first_event_status);
@@ -260,7 +280,9 @@ fn known_display_name(cx: &mut Cx, room_id: &OwnedRoomId, user_id: &UserId) -> (
 }
 
 
-/// Creates, populates, and adds a `SmallStateEvent` widget to the given `PortalList` at the given `item_id`.
+/// Creates, populates, and adds a `SmallStateEventItem` widget to the given `PortalList` at the given `item_id`.
+///
+/// `show_collapse_line` is true for the last event of an expanded group, so it can collapse the group.
 pub(super) fn populate_small_state_event(
     cx: &mut Cx,
     list: &mut PortalList,
@@ -268,24 +290,29 @@ pub(super) fn populate_small_state_event(
     timeline_kind: &TimelineKind,
     event_tl_item: &EventTimelineItem,
     event_content: &SmallStateContent,
+    details: MessageDetails,
     item_drawn_status: ItemDrawnStatus,
     show_collapse_line: bool,
     show_invite_button: bool,
 ) -> (WidgetRef, ItemDrawnStatus) {
-    let (item, existed) = list.item_with_existed(cx, item_id, id!(SmallStateEvent));
-    populate_read_receipts(&item, cx, timeline_kind, event_tl_item);
-    populate_small_state_event_widget(
-        cx, item, existed, timeline_kind, event_tl_item, event_content, item_drawn_status, show_collapse_line, show_invite_button,
-    )
+    let (item, existed) = list.item_with_existed(cx, item_id, id!(SmallStateEventItem));
+    // This one's cheap and depends on the group, not the event, so always keep it up to date.
+    item.group_toggle_line(cx, ids!(collapse_line)).set_shown(show_collapse_line);
+    let event = item.small_state_event(cx, ids!(event));
+    event.set_details(cx, details);
+    populate_read_receipts(&event, cx, timeline_kind, event_tl_item);
+    let (_, event_status) = populate_small_state_event_widget(
+        cx, (*event).clone(), existed, timeline_kind, event_tl_item, event_content, item_drawn_status, show_invite_button,
+    );
+    (item, event_status)
 }
 
-/// Populates the given `SmallStateEvent` widget with the event's profile and content, but not its read receipts.
+/// Populates the given `SmallStateEvent` widget with the event's profile and content, but not its read receipts or details.
 ///
 /// ## Arguments
 /// * `existed`: whether this widget was already showing this event.
-/// * `show_collapse_line`: true for the last event of an expanded group, so it can collapse the group.
 /// * `show_invite_button`: true for a knock that's still waiting on an answer.
-fn populate_small_state_event_widget(
+pub(super) fn populate_small_state_event_widget(
     cx: &mut Cx,
     item: WidgetRef,
     existed: bool,
@@ -293,7 +320,6 @@ fn populate_small_state_event_widget(
     event_tl_item: &EventTimelineItem,
     event_content: &SmallStateContent,
     item_drawn_status: ItemDrawnStatus,
-    show_collapse_line: bool,
     show_invite_button: bool,
 ) -> (WidgetRef, ItemDrawnStatus) {
     let mut new_drawn_status = item_drawn_status;
@@ -301,8 +327,6 @@ fn populate_small_state_event_widget(
     // so we can only mark the content as drawn after the profile has been fully drawn and cached.
     let skip_redrawing_profile = existed && item_drawn_status.profile_drawn;
     let skip_redrawing_content = skip_redrawing_profile && item_drawn_status.content_drawn;
-    // This one's cheap and depends on the group, not the event, so always keep it up to date.
-    item.group_toggle_line(cx, ids!(collapse_line)).set_shown(show_collapse_line);
     if skip_redrawing_content {
         return (item, new_drawn_status);
     }
@@ -336,7 +360,7 @@ fn populate_small_state_event_widget(
     // Only a knock still waiting on an answer should show the invite button.
     // See the `PendingKnocks` struct for more details on how that gets updated.
     item.button(cx, ids!(invite_user_button)).set_visible(cx, show_invite_button);
-    item.label(cx, ids!(content)).set_text(cx, &event_content.text(event_tl_item, &username));
+    item.set_text(cx, &event_content.text(event_tl_item, &username));
     new_drawn_status.content_drawn = true;
     (item, new_drawn_status)
 }

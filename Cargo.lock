@@ -55,7 +55,7 @@ dependencies = [
 [[package]]
 name = "ab_glyph_rasterizer"
 version = "0.1.8"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "accessory"
@@ -363,7 +363,7 @@ dependencies = [
 [[package]]
 name = "arrayvec"
 version = "0.7.6"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "arrayvec"
@@ -389,7 +389,7 @@ checksum = "d92bec98840b8f03a5ff5413de5293bfcd8bf96467cf5452609f939ec6f5de16"
 [[package]]
 name = "ash"
 version = "0.38.0+1.3.281"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "libloading 0.8.9",
 ]
@@ -866,7 +866,7 @@ dependencies = [
 [[package]]
 name = "bit-set"
 version = "0.8.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "bit-vec",
 ]
@@ -874,12 +874,12 @@ dependencies = [
 [[package]]
 name = "bit-vec"
 version = "0.8.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "bitflags"
 version = "2.10.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "bitflags"
@@ -1038,7 +1038,7 @@ checksum = "175812e0be2bccb6abe50bb8d566126198344f707e304f45c648fd8f2cc0365e"
 [[package]]
 name = "bytemuck"
 version = "1.25.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "bytemuck"
@@ -1055,7 +1055,7 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 [[package]]
 name = "byteorder"
 version = "1.5.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "byteorder-lite"
@@ -1148,7 +1148,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 [[package]]
 name = "cfg-if"
 version = "1.0.4"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "cfg_aliases"
@@ -1159,7 +1159,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 [[package]]
 name = "cfg_aliases"
 version = "0.2.1"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "chacha20"
@@ -1709,7 +1709,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 [[package]]
 name = "crunchy"
 version = "0.2.4"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "crypto-bigint"
@@ -2194,7 +2194,7 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 [[package]]
 name = "downcast-rs"
 version = "1.2.1"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "dunce"
@@ -2332,6 +2332,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b1514ced566c94991ed9563258ecf61e311fd773bf0a3f20606830386bf66e3"
 dependencies = [
  "phf 0.13.1",
+ "serde",
 ]
 
 [[package]]
@@ -2426,7 +2427,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 [[package]]
 name = "equivalent"
 version = "1.0.2"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "errno"
@@ -2671,7 +2672,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 [[package]]
 name = "foldhash"
 version = "0.2.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "foreign-types"
@@ -2875,7 +2876,7 @@ dependencies = [
 [[package]]
 name = "fxhash"
 version = "0.2.1"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "byteorder 1.5.0 (git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix)",
 ]
@@ -3123,7 +3124,7 @@ dependencies = [
 [[package]]
 name = "hashbrown"
 version = "0.16.1"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "foldhash 0.2.0 (git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix)",
 ]
@@ -3176,7 +3177,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 [[package]]
 name = "hexf-parse"
 version = "0.2.1"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "hilog-sys"
@@ -3725,7 +3726,7 @@ dependencies = [
 [[package]]
 name = "indexmap"
 version = "2.13.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "equivalent 1.0.2 (git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix)",
  "hashbrown 0.16.1 (git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix)",
@@ -4108,13 +4109,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07033963ba89ebaf1584d767badaa2e8fcec21aedea6b8c0346d487d49c28667"
 dependencies = [
  "cfg-if 1.0.4 (registry+https://github.com/rust-lang/crates.io-index)",
- "windows-targets 0.48.5",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
 name = "libloading"
 version = "0.8.9"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "cfg-if 1.0.4 (git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix)",
  "windows-link 0.2.1",
@@ -4355,7 +4356,7 @@ dependencies = [
 [[package]]
 name = "makepad-apple-sys"
 version = "1.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-objc-sys",
 ]
@@ -4363,12 +4364,12 @@ dependencies = [
 [[package]]
 name = "makepad-byteorder-lite"
 version = "0.1.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "makepad-code-editor"
 version = "2.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-code-language",
  "makepad-widgets",
@@ -4377,7 +4378,7 @@ dependencies = [
 [[package]]
 name = "makepad-code-language"
 version = "0.1.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "pulldown-cmark 0.12.2",
 ]
@@ -4385,7 +4386,7 @@ dependencies = [
 [[package]]
 name = "makepad-derive-wasm-bridge"
 version = "1.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-micro-proc-macro",
 ]
@@ -4393,7 +4394,7 @@ dependencies = [
 [[package]]
 name = "makepad-derive-widget"
 version = "2.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-live-id",
  "makepad-micro-proc-macro",
@@ -4402,7 +4403,7 @@ dependencies = [
 [[package]]
 name = "makepad-draw"
 version = "2.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "ab_glyph_rasterizer",
  "fxhash",
@@ -4428,7 +4429,7 @@ dependencies = [
 [[package]]
 name = "makepad-error-log"
 version = "1.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-micro-serde",
 ]
@@ -4436,12 +4437,12 @@ dependencies = [
 [[package]]
 name = "makepad-fast-inflate"
 version = "0.1.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "makepad-filesystem-watcher"
 version = "0.1.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-git",
 ]
@@ -4449,17 +4450,17 @@ dependencies = [
 [[package]]
 name = "makepad-futures"
 version = "1.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "makepad-futures-legacy"
 version = "1.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "makepad-gif"
 version = "0.1.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "weezl 0.1.12 (git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix)",
 ]
@@ -4467,7 +4468,7 @@ dependencies = [
 [[package]]
 name = "makepad-git"
 version = "0.1.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-fast-inflate",
 ]
@@ -4475,7 +4476,7 @@ dependencies = [
 [[package]]
 name = "makepad-half"
 version = "2.7.1"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "cfg-if 1.0.4 (git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix)",
  "crunchy 0.2.4 (git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix)",
@@ -4486,7 +4487,7 @@ dependencies = [
 [[package]]
 name = "makepad-html"
 version = "1.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-live-id",
 ]
@@ -4500,7 +4501,7 @@ checksum = "9775cbec5fa0647500c3e5de7c850280a88335d1d2d770e5aa2332b801ba7064"
 [[package]]
 name = "makepad-latex-math"
 version = "0.1.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "ttf-parser",
 ]
@@ -4508,7 +4509,7 @@ dependencies = [
 [[package]]
 name = "makepad-live-id"
 version = "1.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-live-id-macros",
  "serde",
@@ -4517,7 +4518,7 @@ dependencies = [
 [[package]]
 name = "makepad-live-id-macros"
 version = "1.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-micro-proc-macro",
 ]
@@ -4525,7 +4526,7 @@ dependencies = [
 [[package]]
 name = "makepad-live-reload-core"
 version = "0.1.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-filesystem-watcher",
 ]
@@ -4533,7 +4534,7 @@ dependencies = [
 [[package]]
 name = "makepad-math"
 version = "1.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-micro-serde",
 ]
@@ -4541,12 +4542,12 @@ dependencies = [
 [[package]]
 name = "makepad-micro-proc-macro"
 version = "1.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "makepad-micro-serde"
 version = "1.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-live-id",
  "makepad-micro-serde-derive",
@@ -4555,7 +4556,7 @@ dependencies = [
 [[package]]
 name = "makepad-micro-serde-derive"
 version = "1.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-micro-proc-macro",
 ]
@@ -4563,7 +4564,7 @@ dependencies = [
 [[package]]
 name = "makepad-network"
 version = "1.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-apple-sys",
  "makepad-error-log",
@@ -4577,12 +4578,12 @@ dependencies = [
 [[package]]
 name = "makepad-objc-sys"
 version = "1.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "makepad-platform"
 version = "2.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "ash",
  "bitflags 2.10.0",
@@ -4620,7 +4621,7 @@ dependencies = [
 [[package]]
 name = "makepad-platform-video"
 version = "1.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-apple-sys",
  "makepad-objc-sys",
@@ -4630,12 +4631,12 @@ dependencies = [
 [[package]]
 name = "makepad-regex"
 version = "0.1.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "makepad-script"
 version = "1.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-error-log",
  "makepad-html",
@@ -4650,7 +4651,7 @@ dependencies = [
 [[package]]
 name = "makepad-script-derive"
 version = "1.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-micro-proc-macro",
 ]
@@ -4658,7 +4659,7 @@ dependencies = [
 [[package]]
 name = "makepad-script-std"
 version = "1.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-network",
  "makepad-script",
@@ -4667,17 +4668,17 @@ dependencies = [
 [[package]]
 name = "makepad-shared-bytes"
 version = "1.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "makepad-stitch"
 version = "0.1.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "makepad-studio-protocol"
 version = "0.1.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "bitflags 2.10.0",
  "makepad-error-log",
@@ -4689,7 +4690,7 @@ dependencies = [
 [[package]]
 name = "makepad-svg"
 version = "1.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-html",
  "makepad-live-id",
@@ -4698,7 +4699,7 @@ dependencies = [
 [[package]]
 name = "makepad-tsdf"
 version = "0.1.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-math",
  "makepad-micro-serde",
@@ -4707,7 +4708,7 @@ dependencies = [
 [[package]]
 name = "makepad-wasm-bridge"
 version = "1.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-derive-wasm-bridge",
  "makepad-live-id",
@@ -4716,7 +4717,7 @@ dependencies = [
 [[package]]
 name = "makepad-webp"
 version = "0.2.4"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-byteorder-lite",
 ]
@@ -4724,7 +4725,7 @@ dependencies = [
 [[package]]
 name = "makepad-widgets"
 version = "2.0.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-derive-widget",
  "makepad-draw",
@@ -4739,7 +4740,7 @@ dependencies = [
 [[package]]
 name = "makepad-zune-bmp"
 version = "0.5.2"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-error-log",
  "makepad-zune-core",
@@ -4748,12 +4749,12 @@ dependencies = [
 [[package]]
 name = "makepad-zune-core"
 version = "0.5.1"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "makepad-zune-inflate"
 version = "0.2.54"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "simd-adler32 0.3.9",
 ]
@@ -4761,7 +4762,7 @@ dependencies = [
 [[package]]
 name = "makepad-zune-jpeg"
 version = "0.5.15"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-zune-core",
 ]
@@ -4769,7 +4770,7 @@ dependencies = [
 [[package]]
 name = "makepad-zune-png"
 version = "0.5.2"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-fast-inflate",
  "makepad-zune-core",
@@ -4779,7 +4780,7 @@ dependencies = [
 [[package]]
 name = "makepad-zune-qoi"
 version = "0.5.2"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-zune-core",
 ]
@@ -4898,7 +4899,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk"
 version = "0.19.1"
-source = "git+https://github.com/project-robius/matrix-rust-sdk?branch=robrix_pagination_completion#3d1723f0dcda80ea4fda9ec2336b83bfd00e0047"
+source = "git+https://github.com/project-robius/matrix-rust-sdk?branch=robrix_pagination_completion#e6a0cdd9a03d0510da552c3cf70f06735b403b41"
 dependencies = [
  "anymap3",
  "as_variant",
@@ -4954,7 +4955,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-base"
 version = "0.19.1"
-source = "git+https://github.com/project-robius/matrix-rust-sdk?branch=robrix_pagination_completion#3d1723f0dcda80ea4fda9ec2336b83bfd00e0047"
+source = "git+https://github.com/project-robius/matrix-rust-sdk?branch=robrix_pagination_completion#e6a0cdd9a03d0510da552c3cf70f06735b403b41"
 dependencies = [
  "as_variant",
  "async-trait",
@@ -4981,7 +4982,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-common"
 version = "0.19.1"
-source = "git+https://github.com/project-robius/matrix-rust-sdk?branch=robrix_pagination_completion#3d1723f0dcda80ea4fda9ec2336b83bfd00e0047"
+source = "git+https://github.com/project-robius/matrix-rust-sdk?branch=robrix_pagination_completion#e6a0cdd9a03d0510da552c3cf70f06735b403b41"
 dependencies = [
  "eyeball-im",
  "futures-core",
@@ -5004,7 +5005,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-crypto"
 version = "0.19.1"
-source = "git+https://github.com/project-robius/matrix-rust-sdk?branch=robrix_pagination_completion#3d1723f0dcda80ea4fda9ec2336b83bfd00e0047"
+source = "git+https://github.com/project-robius/matrix-rust-sdk?branch=robrix_pagination_completion#e6a0cdd9a03d0510da552c3cf70f06735b403b41"
 dependencies = [
  "aes 0.9.3",
  "as_variant",
@@ -5043,7 +5044,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-indexeddb"
 version = "0.19.1"
-source = "git+https://github.com/project-robius/matrix-rust-sdk?branch=robrix_pagination_completion#3d1723f0dcda80ea4fda9ec2336b83bfd00e0047"
+source = "git+https://github.com/project-robius/matrix-rust-sdk?branch=robrix_pagination_completion#e6a0cdd9a03d0510da552c3cf70f06735b403b41"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -5075,7 +5076,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-sqlite"
 version = "0.19.1"
-source = "git+https://github.com/project-robius/matrix-rust-sdk?branch=robrix_pagination_completion#3d1723f0dcda80ea4fda9ec2336b83bfd00e0047"
+source = "git+https://github.com/project-robius/matrix-rust-sdk?branch=robrix_pagination_completion#e6a0cdd9a03d0510da552c3cf70f06735b403b41"
 dependencies = [
  "as_variant",
  "async-trait",
@@ -5103,7 +5104,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-store-encryption"
 version = "0.19.1"
-source = "git+https://github.com/project-robius/matrix-rust-sdk?branch=robrix_pagination_completion#3d1723f0dcda80ea4fda9ec2336b83bfd00e0047"
+source = "git+https://github.com/project-robius/matrix-rust-sdk?branch=robrix_pagination_completion#e6a0cdd9a03d0510da552c3cf70f06735b403b41"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -5125,7 +5126,7 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-ui"
 version = "0.19.1"
-source = "git+https://github.com/project-robius/matrix-rust-sdk?branch=robrix_pagination_completion#3d1723f0dcda80ea4fda9ec2336b83bfd00e0047"
+source = "git+https://github.com/project-robius/matrix-rust-sdk?branch=robrix_pagination_completion#e6a0cdd9a03d0510da552c3cf70f06735b403b41"
 dependencies = [
  "as_variant",
  "async-rx",
@@ -5218,7 +5219,7 @@ checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 [[package]]
 name = "memchr"
 version = "2.7.6"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "memoffset"
@@ -5376,7 +5377,7 @@ dependencies = [
 [[package]]
 name = "naga"
 version = "27.0.3"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "arrayvec 0.7.6",
  "bit-set",
@@ -5610,7 +5611,7 @@ dependencies = [
 [[package]]
 name = "num-traits"
 version = "0.2.20"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "num_cpus"
@@ -6187,7 +6188,7 @@ checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 [[package]]
 name = "once_cell"
 version = "1.21.3"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "once_cell_polyfill"
@@ -6608,7 +6609,7 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 [[package]]
 name = "pkg-config"
 version = "0.3.32"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "plain"
@@ -6806,7 +6807,7 @@ dependencies = [
 [[package]]
 name = "pulldown-cmark"
 version = "0.12.2"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "bitflags 2.10.0",
  "memchr 2.7.6 (git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix)",
@@ -7587,7 +7588,7 @@ dependencies = [
 
 [[package]]
 name = "robrix"
-version = "1.0.0-beta.4"
+version = "1.0.0-beta.6"
 dependencies = [
  "a2app-agent",
  "a2app-core",
@@ -7635,10 +7636,12 @@ dependencies = [
  "robius-use-makepad",
  "robius-web-auth-session",
  "ruma",
+ "rustc-hash 2.1.1",
  "sanitize-filename",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "strpack",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -7889,7 +7892,7 @@ checksum = "b74b56ffa8bb2830709a538c2cbcae9aa062db0d2a42563bfb09bdaae44020eb"
 [[package]]
 name = "rustc-hash"
 version = "1.1.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "rustc-hash"
@@ -8014,7 +8017,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 [[package]]
 name = "rustybuzz"
 version = "0.18.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "bitflags 2.10.0",
  "bytemuck 1.25.0",
@@ -8153,7 +8156,7 @@ checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
 [[package]]
 name = "scoped-tls"
 version = "1.0.1"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "scopeguard"
@@ -8184,7 +8187,7 @@ dependencies = [
 [[package]]
 name = "sdfer"
 version = "0.2.1"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "sealed"
@@ -8582,7 +8585,7 @@ dependencies = [
 [[package]]
 name = "simd-adler32"
 version = "0.3.9"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "simd-adler32"
@@ -8648,7 +8651,7 @@ dependencies = [
 [[package]]
 name = "smallvec"
 version = "1.15.1"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "socket2"
@@ -8672,7 +8675,7 @@ dependencies = [
 [[package]]
 name = "spirv"
 version = "0.3.0+sdk-1.3.268.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "bitflags 2.10.0",
 ]
@@ -8971,6 +8974,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "strpack"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "affced45a4f8f500e83089e7a5d17c6d34c04d86c55167ebf71e63c29b266991"
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9167,7 +9176,7 @@ dependencies = [
 [[package]]
 name = "thiserror"
 version = "2.0.18"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "thiserror-impl 2.0.18",
 ]
@@ -9195,7 +9204,7 @@ dependencies = [
 [[package]]
 name = "thiserror-impl"
 version = "2.0.18"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-micro-proc-macro",
 ]
@@ -9682,7 +9691,7 @@ dependencies = [
 [[package]]
 name = "ttf-parser"
 version = "0.24.1"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "tungstenite"
@@ -9787,7 +9796,7 @@ checksum = "75b844d17643ee918803943289730bec8aac480150456169e647ed0b576ba539"
 [[package]]
 name = "unicase"
 version = "2.9.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "unicode-bidi"
@@ -9798,17 +9807,17 @@ checksum = "5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"
 [[package]]
 name = "unicode-bidi"
 version = "0.3.18"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "unicode-bidi-mirroring"
 version = "0.3.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "unicode-ccc"
 version = "0.3.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "unicode-ident"
@@ -9819,7 +9828,7 @@ checksum = "f63a545481291138910575129486daeaf8ac54aee4387fe7906919f7830c7d9d"
 [[package]]
 name = "unicode-ident"
 version = "1.0.22"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "unicode-normalization"
@@ -9839,17 +9848,17 @@ checksum = "e70f2a8b45122e719eb623c01822704c4e0907e7e426a05927e1a1cfff5b75d0"
 [[package]]
 name = "unicode-properties"
 version = "0.1.4"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "unicode-script"
 version = "0.5.8"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "unicode-segmentation"
 version = "1.12.0"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "unicode-segmentation"
@@ -10151,7 +10160,7 @@ dependencies = [
 [[package]]
 name = "wayland-backend"
 version = "0.3.12"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "downcast-rs",
  "scoped-tls 1.0.1 (git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix)",
@@ -10162,7 +10171,7 @@ dependencies = [
 [[package]]
 name = "wayland-client"
 version = "0.31.12"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "bitflags 2.10.0",
  "wayland-backend",
@@ -10172,7 +10181,7 @@ dependencies = [
 [[package]]
 name = "wayland-egl"
 version = "0.32.9"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "wayland-backend",
  "wayland-sys",
@@ -10181,7 +10190,7 @@ dependencies = [
 [[package]]
 name = "wayland-protocols"
 version = "0.32.10"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "bitflags 2.10.0",
  "wayland-backend",
@@ -10191,7 +10200,7 @@ dependencies = [
 [[package]]
 name = "wayland-sys"
 version = "0.31.8"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "makepad-error-log",
  "pkg-config 0.3.32 (git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix)",
@@ -10285,7 +10294,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 [[package]]
 name = "weezl"
 version = "0.1.12"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "which"
@@ -10418,7 +10427,7 @@ dependencies = [
 [[package]]
 name = "windows"
 version = "0.62.2"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "windows-collections 0.3.2",
  "windows-core 0.62.2",
@@ -10446,7 +10455,7 @@ dependencies = [
 [[package]]
 name = "windows-collections"
 version = "0.3.2"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "windows-core 0.62.2",
 ]
@@ -10492,7 +10501,7 @@ dependencies = [
 [[package]]
 name = "windows-core"
 version = "0.62.2"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "windows-link 0.2.1",
  "windows-result 0.4.1",
@@ -10524,7 +10533,7 @@ dependencies = [
 [[package]]
 name = "windows-future"
 version = "0.3.2"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "windows-core 0.62.2",
 ]
@@ -10588,7 +10597,7 @@ checksum = "45e46c0661abb7180e7b9c281db115305d49ca1709ab8242adf09666d2173c65"
 [[package]]
 name = "windows-link"
 version = "0.2.1"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "windows-numerics"
@@ -10662,7 +10671,7 @@ dependencies = [
 [[package]]
 name = "windows-result"
 version = "0.4.1"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "windows-link 0.2.1",
 ]
@@ -10688,7 +10697,7 @@ dependencies = [
 [[package]]
 name = "windows-strings"
 version = "0.5.1"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 dependencies = [
  "windows-link 0.2.1",
 ]
@@ -11250,7 +11259,7 @@ dependencies = [
 [[package]]
 name = "zerocopy"
 version = "0.8.39"
-source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#4a41276523570cfb7a9940b55d5669be787a8534"
+source = "git+https://github.com/kevinaboos/makepad?branch=splash_theme_robrix#08e8ac592a4fb33e54658cc4a139cce2106ed5cc"
 
 [[package]]
 name = "zerocopy-derive"

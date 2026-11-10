@@ -1,16 +1,17 @@
 //! Background tasks that subscribe to the Matrix SpaceService in order to
 //! track changes to the user's joined spaces and send updates the UI.
 
-use std::{collections::{HashMap, HashSet}, iter::Peekable, sync::Arc};
+use std::{iter::Peekable, sync::Arc};
 use eyeball_im::VectorDiff;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use imbl::Vector;
 use makepad_widgets::*;
 use matrix_sdk::{Client, RoomState, media::MediaRequestParameters, ruma::api::error::ErrorKind};
 use matrix_sdk_ui::spaces::{SpaceRoom, SpaceRoomList, SpaceService, room_list::SpaceRoomListPaginationState};
-use ruma::{OwnedMxcUri, OwnedRoomId, events::room::MediaSource, room::RoomType};
+use ruma::{OwnedMxcUri, OwnedRoomId, RoomId, events::room::MediaSource, room::RoomType};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use tokio::{runtime::Handle, sync::mpsc::{UnboundedReceiver, UnboundedSender}, task::JoinHandle};
-use crate::{app::AppStateAction, home::{rooms_list::{RoomsListUpdate, enqueue_rooms_list_update}, spaces_bar::{JoinedSpaceInfo, SpacesListUpdate, enqueue_spaces_list_update}}, room::FetchedRoomAvatar, utils::{self, RoomNameId, stringify_matrix_error}};
+use crate::{app::AppStateAction, home::{rooms_list::{RoomsListUpdate, enqueue_rooms_list_update}, spaces_bar::{JoinedSpaceInfo, SpacesListUpdate, enqueue_spaces_list_update}}, persistence, room::FetchedRoomAvatar, sliding_sync::{is_room_private, refresh_rooms_restricted_to, wait_for_create_event}, utils::{self, RoomNameId, stringify_matrix_error}};
 
 /// Whether to enable verbose logging of all spaces service diff updates.
 const LOG_SPACE_SERVICE_DIFFS: bool = cfg!(feature = "log_space_service_diffs");
@@ -37,11 +38,18 @@ pub enum SpaceRequest {
     UnsubscribeFromSpaceRoomList {
         space_id: OwnedRoomId,
     },
-    /// Leave the given space and all joined rooms within it.
+    /// Get all of the rooms and subspaces within the given space that the user has joined.
+    ///
+    /// This will result in a [`SpaceRoomListAction::JoinedRoomsInSpace`] action being emitted.
+    GetJoinedRoomsInSpace {
+        space_id: OwnedRoomId,
+    },
+    /// Leave the given space, along with the given rooms and subspaces within it.
     ///
     /// Will emit a [`SpaceRoomListAction::LeaveSpaceResult`] action.
     LeaveSpace {
         space_name_id: RoomNameId,
+        rooms_to_leave: Vec<OwnedRoomId>,
     },
     /// Paginate the given space's room list, i.e., fetch the next batch of rooms in the list.
     ///
@@ -73,11 +81,13 @@ pub enum SpaceRequest {
     GetSpaceDetails {
         space_id: OwnedRoomId,
     },
-    /// Determine which top-level space's dock a newly-joined space's lobby belongs in.
+    /// Determine which top-level space's dock a joined space's lobby belongs in.
     ///
     /// This will result in a [`SpaceRoomListAction::JoinedSpaceAncestor`] action being emitted.
     ResolveJoinedSpaceAncestor {
         space_name_id: RoomNameId,
+        /// Whether this space was an invite that we just accepted.
+        was_invite: bool,
     },
 }
 
@@ -112,12 +122,29 @@ fn is_still_in_space(space: &SpaceRoom) -> bool {
     !matches!(space.state, Some(RoomState::Left) | Some(RoomState::Banned))
 }
 
+/// Returns whether the given room is anywhere within the given space, according to the local space graph.
+async fn is_room_in_space(space_service: &SpaceService, room_id: &RoomId, space_id: &OwnedRoomId) -> bool {
+    let mut to_visit = vec![room_id.to_owned()];
+    let mut visited = FxHashSet::default();
+    while let Some(id) = to_visit.pop() {
+        for parent_id in space_service.joined_parent_ids_of_child(&id).await {
+            if parent_id == *space_id {
+                return true;
+            }
+            if visited.insert(parent_id.clone()) {
+                to_visit.push(parent_id);
+            }
+        }
+    }
+    false
+}
+
 /// Stops the room list task for the given space and any now-unreachable subspaces within it.
 ///
 /// Because a subspace can be within multiple parent spaces, we skip any subspace that
 /// is itself a joined space; the rest are restarted by `ResubscribeSubspaces`.
 fn shutdown_space_room_list_tasks(
-    space_room_list_tasks: &mut HashMap<OwnedRoomId, SpaceRoomListTask>,
+    space_room_list_tasks: &mut FxHashMap<OwnedRoomId, SpaceRoomListTask>,
     space_id: &OwnedRoomId,
     all_joined_spaces: &Vector<SpaceRoom>,
 ) {
@@ -145,16 +172,24 @@ pub async fn space_service_loop(client: Client) -> anyhow::Result<()> {
     let (space_request_sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<SpaceRequest>();
     // Give the request sender channel endpoint to the RoomsList widget.
     enqueue_rooms_list_update(RoomsListUpdate::SpaceRequestSender(space_request_sender.clone()));
+    // Restore the space graph we cached last time (while the space service below starts up),
+    // so we can show each space's rooms right away.
+    let restore_space_graph = async {
+        if let Some(user_id) = client.user_id() {
+            enqueue_rooms_list_update(RoomsListUpdate::RestoreSpaceGraph(persistence::load_space_graph(&client, user_id).await));
+        }
+    };
 
     // Create the actual space service.
-    let space_service = Arc::new(SpaceService::new(client.clone()).await);
+    let (_, space_service) = tokio::join!(restore_space_graph, SpaceService::new(client.clone()));
+    let space_service = Arc::new(space_service);
 
     // The set of async tasks that are handling room list requests for each top-level joined space,
     // along with a sender to send `SpaceRoomListRequest`s to those tasks.
-    let mut space_room_list_tasks: HashMap<OwnedRoomId, SpaceRoomListTask> = HashMap::new();
+    let mut space_room_list_tasks: FxHashMap<OwnedRoomId, SpaceRoomListTask> = FxHashMap::default();
     // A closure to make it easier to use/spawn a `space_room_list_loop` task.
     let get_or_spawn_space_room_list = async |
-        space_room_list_tasks: &mut HashMap<OwnedRoomId, SpaceRoomListTask>,
+        space_room_list_tasks: &mut FxHashMap<OwnedRoomId, SpaceRoomListTask>,
         space_name_id: &RoomNameId,
         parent_chain: &ParentChain,
     | -> UnboundedSender<SpaceRoomListRequest> {
@@ -230,39 +265,72 @@ pub async fn space_service_loop(client: Client) -> anyhow::Result<()> {
                         &all_joined_spaces,
                     );
                 }
-                SpaceRequest::LeaveSpace { space_name_id } => {
-                    match space_service.leave_space(space_name_id.room_id()).await {
-                        Ok(leave_handle) => {
-                            match leave_handle.leave(|_| true).await {
-                                Ok(()) => {
-                                    // Leaving a space leaves its subspaces too, so stop all of their tasks.
-                                    shutdown_space_room_list_tasks(
-                                        &mut space_room_list_tasks,
-                                        space_name_id.room_id(),
-                                        &all_joined_spaces,
-                                    );
-                                    Cx::post_action(SpaceRoomListAction::LeaveSpaceResult {
-                                        space_name_id,
-                                        result: Ok(()),
-                                    });
-                                }
-                                Err(error) => {
-                                    error!("LeaveSpace: failed to leave all rooms in space {space_name_id}: {error:?}");
-                                    Cx::post_action(SpaceRoomListAction::LeaveSpaceResult {
-                                        space_name_id,
-                                        result: Err(error),
-                                    });
+                SpaceRequest::GetJoinedRoomsInSpace { space_id } => {
+                    let space_service = Arc::clone(&space_service);
+                    let client = client.clone();
+                    let top_level_spaces = all_joined_spaces.clone();
+                    // This checks every joined room, so spawn it in a new task.
+                    Handle::current().spawn(async move {
+                        // A subspace's rooms are always inside of its ancestors, so those aren't "other" spaces.
+                        let own_ancestors = space_service.top_level_ancestors_of(&space_id).await;
+                        let mut children = FxHashMap::<OwnedRoomId, Vector<SpaceRoom>>::default();
+                        let mut other_spaces = FxHashMap::default();
+                        for room in client.joined_rooms() {
+                            let room_id = room.room_id();
+                            if room_id == space_id || !is_room_in_space(&space_service, room_id, &space_id).await {
+                                continue;
+                            }
+                            let Some(space_room) = space_service.get_space_room(room_id).await else { continue };
+                            for parent_id in space_service.joined_parent_ids_of_child(room_id).await {
+                                if parent_id == space_id || is_room_in_space(&space_service, &parent_id, &space_id).await {
+                                    children.entry(parent_id).or_default().push_back(space_room.clone());
                                 }
                             }
+                            let ancestors = space_service.top_level_ancestors_of(room_id).await;
+                            let names: Vec<_> = top_level_spaces.iter()
+                                .filter(|s| ancestors.contains(&s.room_id) && !own_ancestors.contains(&s.room_id))
+                                .map(|s| s.display_name.clone())
+                                .collect();
+                            if !names.is_empty() {
+                                other_spaces.insert(room_id.to_owned(), names);
+                            }
                         }
-                        Err(error) => {
-                            error!("Failed to leave space {space_name_id}: {error:?}");
-                            Cx::post_action(SpaceRoomListAction::LeaveSpaceResult {
-                                space_name_id,
-                                result: Err(error),
-                            });
+                        let is_private = client.get_room(&space_id).is_none_or(|space| is_room_private(&space));
+                        Cx::post_action(SpaceRoomListAction::JoinedRoomsInSpace { space_id, is_private, children, other_spaces });
+                    });
+                }
+                SpaceRequest::LeaveSpace { space_name_id, rooms_to_leave } => {
+                    let client = client.clone();
+                    // Each room is left with a separate request, so spawn this in a new task.
+                    Handle::current().spawn(async move {
+                        log!(
+                            "Leaving space \"{space_name_id}\" ({}), along with {} of its rooms and subspaces.",
+                            space_name_id.room_id(),
+                            rooms_to_leave.len(),
+                        );
+                        let mut result = Ok(());
+                        // We leave the space itself last, so the user can try again if leaving a room fails.
+                        for room_id in rooms_to_leave.iter().chain([space_name_id.room_id()]) {
+                            let Some(room) = client.get_room(room_id) else {
+                                error!("Couldn't find {room_id} to leave it.");
+                                result = Err(matrix_sdk_ui::spaces::Error::RoomNotFound(room_id.clone()));
+                                break;
+                            };
+                            let room_name_id = RoomNameId::from_room(&room).await;
+                            let kind = if room_id == space_name_id.room_id() { "space" } else if room.is_space() { "subspace" } else { "room" };
+                            result = room.leave().await.map_err(matrix_sdk_ui::spaces::Error::LeaveSpace);
+                            if let Err(error) = &result {
+                                error!("Failed to leave {kind} \"{room_name_id}\" ({room_id}): {error:?}");
+                                break;
+                            }
+                            log!("Left {kind} \"{room_name_id}\" ({room_id}).");
+                            refresh_rooms_restricted_to(&client, room_id);
                         }
-                    }
+                        if result.is_err() {
+                            error!("Didn't finish leaving space \"{space_name_id}\" ({}), so we're still in it.", space_name_id.room_id());
+                        }
+                        Cx::post_action(SpaceRoomListAction::LeaveSpaceResult { space_name_id, result });
+                    });
                 }
                 SpaceRequest::GetDetailedChildren { space_name_id, parent_chain } => {
                     let sender = get_or_spawn_space_room_list(&mut space_room_list_tasks, &space_name_id, &parent_chain).await;
@@ -281,14 +349,17 @@ pub async fn space_service_loop(client: Client) -> anyhow::Result<()> {
                         error!("GetSpaceDetails: space {space_id} is unknown to the space service");
                     }
                 }
-                SpaceRequest::ResolveJoinedSpaceAncestor { space_name_id } => {
+                SpaceRequest::ResolveJoinedSpaceAncestor { space_name_id, was_invite } => {
                     let space_service = Arc::clone(&space_service);
                     let client = client.clone();
                     // this is potentially a long-running operation, so spawn it in a new task.
                     Handle::current().spawn(async move {
-                        if !client.get_room(space_name_id.room_id())
-                            .is_some_and(|r| r.state() == RoomState::Joined)
-                        {
+                        let space = client.get_room(space_name_id.room_id());
+                        // The space graph won't have a space that we just joined until its state arrives.
+                        if let Some(space) = space.as_ref() {
+                            wait_for_create_event(space).await;
+                        }
+                        if !space.is_some_and(|r| r.state() == RoomState::Joined) {
                             log!("Space {space_name_id:?} was not actually joined, ignoring it.");
                             return;
                         }
@@ -303,7 +374,7 @@ pub async fn space_service_loop(client: Client) -> anyhow::Result<()> {
                                 matrix_sdk::RoomDisplayName::Named(ancestor.display_name.clone()),
                                 ancestor.room_id.clone(),
                             ));
-                        Cx::post_action(SpaceRoomListAction::JoinedSpaceAncestor { space_name_id, dock_space });
+                        Cx::post_action(SpaceRoomListAction::JoinedSpaceAncestor { space_name_id, dock_space, was_invite });
                     });
                 }
             }
@@ -777,7 +848,7 @@ async fn space_room_list_loop(
     paginate_once().await;
 
     // The set of subspaces within this `space_id` that are already known to us.
-    let mut known_subspaces = HashSet::new();
+    let mut known_subspaces = FxHashSet::default();
 
     let (mut all_rooms_in_space, mut space_room_stream) = space_room_list.subscribe_to_room_updates().await;
     handle_subspaces(&space_id, &parent_chain, &mut known_subspaces, all_rooms_in_space.iter(), &request_sender);
@@ -785,6 +856,16 @@ async fn space_room_list_loop(
     // A tuple of: the latest `(direct child rooms, and direct subspaces)` within this space.
     // This makes it very cheap & fast to repeatedly handle `GetChildren` requests.
     let mut cached_hash_sets = space_children_to_hash_sets(&all_rooms_in_space);
+    // Sends the latest sets of this space's children, and whether we've fetched all of them.
+    let post_updated_children = |(rooms, subspaces): &(Arc<FxHashSet<OwnedRoomId>>, Arc<FxHashSet<OwnedRoomId>>)| {
+        Cx::post_action(SpaceRoomListAction::UpdatedChildren {
+            space_id: space_id.clone(),
+            parent_chain: parent_chain.clone(),
+            direct_child_rooms: Arc::clone(rooms),
+            direct_subspaces: Arc::clone(subspaces),
+            is_complete: matches!(space_room_list.pagination_state(), SpaceRoomListPaginationState::Idle { end_reached: true }),
+        })
+    };
 
     loop { tokio::select! {
         // Handles requests first such that a Shutdown takes priority over other updates.
@@ -795,12 +876,20 @@ async fn space_room_list_loop(
             let Some(request) = request_opt else { break };
             match request {
                 SpaceRoomListRequest::GetChildren => {
-                    Cx::post_action(SpaceRoomListAction::UpdatedChildren {
-                        space_id: space_id.clone(),
-                        parent_chain: parent_chain.clone(),
-                        direct_child_rooms: Arc::clone(&cached_hash_sets.0),
-                        direct_subspaces: Arc::clone(&cached_hash_sets.1),
-                    });
+                    // Requests are handled before room updates, so we apply any pending room updates first
+                    // (ignoring tokio's coop budget, which could hide them) so we don't send outdated children.
+                    if let Some(Some(batch)) = tokio::task::coop::unconstrained(space_room_stream.next()).now_or_never() {
+                        apply_space_room_diffs(
+                            batch,
+                            &mut all_rooms_in_space,
+                            &space_id,
+                            &parent_chain,
+                            &mut known_subspaces,
+                            &request_sender,
+                            &mut cached_hash_sets,
+                        );
+                    }
+                    post_updated_children(&cached_hash_sets);
                 }
                 SpaceRoomListRequest::GetDetailedChildren => {
                     Cx::post_action(SpaceRoomListAction::DetailedChildren {
@@ -843,42 +932,68 @@ async fn space_room_list_loop(
         // Handle updates to the list of rooms and subspaces in this space.
         batch_opt = space_room_stream.next() => {
             let Some(batch) = batch_opt else { break };
-            for diff in batch {
-                // Manually inspect any diff that could result in new space room(s),
-                // such that we can check to see if any of them are nested subspaces.
-                match &diff {
-                    VectorDiff::Append { values }
-                    | VectorDiff::Reset { values } => handle_subspaces(
-                        &space_id,
-                        &parent_chain,
-                        &mut known_subspaces,
-                        values.iter(),
-                        &request_sender,
-                    ),
-                    VectorDiff::PushFront { value }
-                    | VectorDiff::PushBack { value }
-                    | VectorDiff::Insert { value, .. }
-                    | VectorDiff::Set { value, .. } => handle_subspaces(
-                        &space_id,
-                        &parent_chain,
-                        &mut known_subspaces,
-                        std::iter::once(value),
-                        &request_sender,
-                    ),
-                    _ => { }
-                };
-                diff.apply(&mut all_rooms_in_space);
-            }
-            // Here: children have changed, so we re-calculate the sets of child rooms and subspaces.
-            cached_hash_sets = space_children_to_hash_sets(&all_rooms_in_space);
-            Cx::post_action(SpaceRoomListAction::UpdatedChildren {
-                space_id: space_id.clone(),
-                parent_chain: parent_chain.clone(),
-                direct_child_rooms: Arc::clone(&cached_hash_sets.0),
-                direct_subspaces: Arc::clone(&cached_hash_sets.1),
-            });
+            apply_space_room_diffs(
+                batch,
+                &mut all_rooms_in_space,
+                &space_id,
+                &parent_chain,
+                &mut known_subspaces,
+                &request_sender,
+                &mut cached_hash_sets,
+            );
+            post_updated_children(&cached_hash_sets);
         }
     } }
+}
+
+/// Applies the given changes to a space's list of rooms, subscribing to any new subspaces among them.
+///
+/// We only rebuild the cached sets of the space's children if they changed,
+/// so that receivers can tell nothing changed by comparing their pointers.
+fn apply_space_room_diffs(
+    batch: Vec<VectorDiff<SpaceRoom>>,
+    all_rooms_in_space: &mut Vector<SpaceRoom>,
+    space_id: &OwnedRoomId,
+    parent_chain: &ParentChain,
+    known_subspaces: &mut FxHashSet<OwnedRoomId>,
+    request_sender: &UnboundedSender<SpaceRequest>,
+    cached_hash_sets: &mut (Arc<FxHashSet<OwnedRoomId>>, Arc<FxHashSet<OwnedRoomId>>),
+) {
+    let mut are_children_changed = false;
+    for diff in batch {
+        // Manually inspect any diff that could result in new space room(s),
+        // such that we can check to see if any of them are nested subspaces.
+        match &diff {
+            VectorDiff::Append { values }
+            | VectorDiff::Reset { values } => handle_subspaces(
+                space_id,
+                parent_chain,
+                known_subspaces,
+                values.iter(),
+                request_sender,
+            ),
+            VectorDiff::PushFront { value }
+            | VectorDiff::PushBack { value }
+            | VectorDiff::Insert { value, .. }
+            | VectorDiff::Set { value, .. } => handle_subspaces(
+                space_id,
+                parent_chain,
+                known_subspaces,
+                std::iter::once(value),
+                request_sender,
+            ),
+            _ => { }
+        };
+        // The SDK re-sets a child room whenever anything about it changes, which keeps the same children.
+        are_children_changed |= !matches!(&diff, VectorDiff::Set { index, value }
+            if all_rooms_in_space.get(*index).is_some_and(|old| old.room_id == value.room_id && old.is_space() == value.is_space())
+        );
+        diff.apply(all_rooms_in_space);
+    }
+    if are_children_changed {
+        // Here: children have changed, so we re-calculate the sets of child rooms and subspaces.
+        *cached_hash_sets = space_children_to_hash_sets(all_rooms_in_space);
+    }
 }
 
 /// Finds nested/subspaces within a list of space rooms and submits a request
@@ -886,7 +1001,7 @@ async fn space_room_list_loop(
 fn handle_subspaces<'a>(
     parent_space_id: &OwnedRoomId,
     parent_chain: &ParentChain,
-    known_subspaces: &mut HashSet<OwnedRoomId>,
+    known_subspaces: &mut FxHashSet<OwnedRoomId>,
     changed_space_rooms: impl Iterator<Item = &'a SpaceRoom>,
     request_sender: &UnboundedSender<SpaceRequest>,
 ) {
@@ -919,9 +1034,9 @@ fn handle_subspaces<'a>(
 /// 2. the set of subspaces directly within this space.
 fn space_children_to_hash_sets(
     all_rooms_in_space: &Vector<SpaceRoom>
-) -> (Arc<HashSet<OwnedRoomId>>, Arc<HashSet<OwnedRoomId>>) {
-    let mut direct_child_rooms = HashSet::new();
-    let mut direct_subspaces = HashSet::new();
+) -> (Arc<FxHashSet<OwnedRoomId>>, Arc<FxHashSet<OwnedRoomId>>) {
+    let mut direct_child_rooms = FxHashSet::with_capacity_and_hasher(all_rooms_in_space.len(), FxBuildHasher);
+    let mut direct_subspaces = FxHashSet::default();
     for sr in all_rooms_in_space.iter() {
         if sr.is_space() {
             direct_subspaces.insert(sr.room_id.clone());
@@ -953,9 +1068,11 @@ pub enum SpaceRoomListAction {
         space_id: OwnedRoomId,
         parent_chain: ParentChain,
         /// The child rooms within this space itself, excluding nested rooms/subspaces.
-        direct_child_rooms: Arc<HashSet<OwnedRoomId>>,
+        direct_child_rooms: Arc<FxHashSet<OwnedRoomId>>,
         /// The nested subspaces (only spaces) directly within this space.
-        direct_subspaces: Arc<HashSet<OwnedRoomId>>,
+        direct_subspaces: Arc<FxHashSet<OwnedRoomId>>,
+        /// Whether these are all of this space's children, i.e., we've fully paginated it.
+        is_complete: bool,
     },
     /// The state of the background pagination process that was fetching the list
     /// of rooms in the given space has changed.
@@ -982,7 +1099,7 @@ pub enum SpaceRoomListAction {
     ///
     /// This is sent in response to a [`SpaceRequest::GetSpaceDetails`] request.
     SpaceDetails(SpaceRoom),
-    /// Which top-level space's dock a newly-joined space should be shown in
+    /// Which top-level space's dock a joined space should be shown in
     ///
     /// This is sent in response to a [`SpaceRequest::ResolveJoinedSpaceAncestor`] request.
     JoinedSpaceAncestor {
@@ -990,6 +1107,20 @@ pub enum SpaceRoomListAction {
         /// The top-level ancestor whose dock should host the lobby, which is
         /// `space_name_id` itself when that space is top-level.
         dock_space: Option<RoomNameId>,
+        /// The `was_invite` value that was originally sent with the request.
+        was_invite: bool,
+    },
+    /// The rooms and subspaces that the user has joined within the given space.
+    ///
+    /// This is sent in response to a [`SpaceRequest::GetJoinedRoomsInSpace`] request.
+    JoinedRoomsInSpace {
+        space_id: OwnedRoomId,
+        /// Whether the user would need an invite to join this space again after leaving it.
+        is_private: bool,
+        /// The joined rooms and subspaces directly within each space, keyed by that space's ID.
+        children: FxHashMap<OwnedRoomId, Vector<SpaceRoom>>,
+        /// The names of the other joined top-level spaces that a given room is also in.
+        other_spaces: FxHashMap<OwnedRoomId, Vec<String>>,
     },
     /// The result of a [`SpaceRequest::LeaveSpace`].
     LeaveSpaceResult {
@@ -1000,12 +1131,13 @@ pub enum SpaceRoomListAction {
 impl std::fmt::Debug for SpaceRoomListAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SpaceRoomListAction::UpdatedChildren { space_id, parent_chain, direct_child_rooms, direct_subspaces } => {
+            SpaceRoomListAction::UpdatedChildren { space_id, parent_chain, direct_child_rooms, direct_subspaces, is_complete } => {
                 f.debug_struct("SpaceRoomListAction::UpdatedChildren")
                     .field("space_id", space_id)
                     .field("parent_chain", &parent_chain)
                     .field("num_direct_child_rooms", &direct_child_rooms.len())
                     .field("num_direct_subspaces", &direct_subspaces.len())
+                    .field("is_complete", is_complete)
                     .finish()
             }
             SpaceRoomListAction::PaginationState { space_id, parent_chain, state } => {
@@ -1033,10 +1165,19 @@ impl std::fmt::Debug for SpaceRoomListAction {
                     .field(space)
                     .finish()
             }
-            SpaceRoomListAction::JoinedSpaceAncestor { space_name_id, dock_space } => {
+            SpaceRoomListAction::JoinedSpaceAncestor { space_name_id, dock_space, was_invite } => {
                 f.debug_struct("SpaceRoomListAction::JoinedSpaceAncestor")
                     .field("space_name_id", space_name_id)
                     .field("dock_space", dock_space)
+                    .field("was_invite", was_invite)
+                    .finish()
+            }
+            SpaceRoomListAction::JoinedRoomsInSpace { space_id, is_private, children, other_spaces } => {
+                f.debug_struct("SpaceRoomListAction::JoinedRoomsInSpace")
+                    .field("space_id", space_id)
+                    .field("is_private", is_private)
+                    .field("num_parent_spaces", &children.len())
+                    .field("num_rooms_in_other_spaces", &other_spaces.len())
                     .finish()
             }
             SpaceRoomListAction::LeaveSpaceResult { space_name_id, result } => {

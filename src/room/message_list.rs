@@ -2,11 +2,12 @@
 //!
 //! Each list shows its messages in a [`MessageListRow`], and keeps a [`MessageListState`].
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use makepad_widgets::*;
 use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, OwnedRoomId, RoomId, UserId};
 use matrix_sdk_ui::timeline::{Profile, TimelineDetails, TimelineItemContent};
+use rustc_hash::FxHashSet;
 
 use crate::{
     event_preview::{UNSUPPORTED_MESSAGE_PREVIEW, text_preview_of_timeline_item},
@@ -126,6 +127,7 @@ script_mod! {
         scroll_bar: ListScrollBar {}
         auto_tail: false
         keep_invisible: false
+        emit_scroll_actions: false
     }
 }
 
@@ -150,7 +152,7 @@ pub enum MessageListRowAction {
 
 /// A row in a list of messages, which handles clicks and hovers on the whole row
 /// before its children, so that a click on a link in its preview still counts as a click on the row.
-#[derive(Script, Widget, Animator)]
+#[derive(Script, ScriptHook, Widget, Animator)]
 pub struct MessageListRow {
     #[source] source: ScriptObjectRef,
     #[deref] view: View,
@@ -162,19 +164,6 @@ pub struct MessageListRow {
     #[rust] timestamp_width: f64,
     /// Whether the timestamp is shown beneath the preview, as it'd cut off the sender's name beside it.
     #[rust] is_timestamp_below: bool,
-}
-
-impl ScriptHook for MessageListRow {
-    fn on_after_reload(&mut self, vm: &mut ScriptVm) {
-        // A reload keeps the hover color from the old template (or drops it), so we cut to our hover state again.
-        vm.with_cx_mut(|cx| {
-            if self.animator_in_state(cx, ids!(bg_hover.on)) {
-                self.animator_cut(cx, ids!(bg_hover.on));
-            } else {
-                self.animator_cut(cx, ids!(bg_hover.off));
-            }
-        });
-    }
 }
 
 impl Widget for MessageListRow {
@@ -310,9 +299,9 @@ pub struct MessageListState {
     /// at its last row until we get more messages loaded.
     has_scrolled_to_pending: bool,
     /// The indices of the rows whose message is set.
-    rows_with_content: HashSet<usize>,
+    rows_with_content: FxHashSet<usize>,
     /// The indices of the rows that are completely populated, including their sender's profile.
-    populated_rows: HashSet<usize>,
+    populated_rows: FxHashSet<usize>,
     /// Whether all rows were fully drawn, i.e., no senders' profiles or avatars are still being fetched.
     is_fully_drawn: bool,
     /// Triggers every [`TIMESTAMP_REFRESH_INTERVAL`] to keep relative timestamps correct.
@@ -328,8 +317,8 @@ impl MessageListState {
             main_timeline_kind: None,
             pending_scroll: None,
             has_scrolled_to_pending: false,
-            rows_with_content: HashSet::new(),
-            populated_rows: HashSet::new(),
+            rows_with_content: FxHashSet::default(),
+            populated_rows: FxHashSet::default(),
             is_fully_drawn: true,
             timestamp_refresh_timer: Timer::empty(),
         }

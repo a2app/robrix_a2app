@@ -9,7 +9,7 @@ use imbl::Vector;
 use makepad_widgets::{error, image_cache::image_size_by_data, log, warning, Cx, SignalToUI, WidgetUid};
 use matrix_sdk_base::crypto::{DecryptionSettings, TrustRequirement};
 use matrix_sdk::{
-    authentication::oauth::{error::{OAuthDiscoveryError, OAuthError}, registration::{ApplicationType, ClientMetadata, Localized, OAuthGrantType}, OAuthAuthorizationData}, config::RequestConfig, encryption::{identities::Device, recovery::{IdentityResetHandle, RecoveryError, RecoveryState}, secret_storage::SecretStorageError, CrossSigningResetAuthType, EncryptionSettings}, event_handler::EventHandlerDropGuard, media::MediaRequestParameters, room::{edit::EditedContent, reply::Reply, Receipts}, serde_helpers::extract_thread_root, ruma::{
+    authentication::oauth::{error::{OAuthDiscoveryError, OAuthError}, registration::{ApplicationType, ClientMetadata, Localized, OAuthGrantType}, OAuthAuthorizationData}, config::RequestConfig, encryption::{identities::Device, recovery::{IdentityResetHandle, RecoveryError, RecoveryState}, secret_storage::SecretStorageError, CrossSigningResetAuthType, EncryptionSettings}, event_handler::EventHandlerDropGuard, media::MediaRequestParameters, room::{edit::EditedContent, reply::Reply, Receipts, RoomMemberRole}, serde_helpers::extract_thread_root, ruma::{
         api::{client::{alias::get_alias, authenticated_media::get_media_preview, discovery::get_authorization_server_metadata::v1::{AccountManagementAction, AccountManagementActionData, Prompt}, profile::{AvatarUrl, DisplayName}, receipt::create_receipt::v3::ReceiptType, session::get_login_types::v3::LoginType, uiaa::{self, AuthData, AuthType, MatrixUserIdentifier, UserIdentifier}}, error::{ErrorKind, RetryAfter}}, events::{
             receipt::{ReceiptThread, ReceiptType as ReceiptEventType},
             room::{
@@ -27,23 +27,25 @@ use matrix_sdk_ui::{
 #[cfg(not(target_os = "ios"))]
 use robius_open::Uri;
 use ruma::{OwnedRoomAliasId, OwnedRoomOrAliasId, RoomId, events::tag::Tags, room::JoinRuleSummary};
+use rustc_hash::FxBuildHasher;
 use tokio::{
     runtime::Handle,
-    sync::{broadcast, mpsc::{Sender, UnboundedReceiver, UnboundedSender}, watch, Notify, Semaphore}, task::JoinHandle, time::{Instant, error::Elapsed},
+    sync::{broadcast, mpsc::{Sender, UnboundedReceiver, UnboundedSender}, oneshot, watch, Notify, Semaphore}, task::JoinHandle, time::{Instant, error::Elapsed},
 };
 use url::Url;
-use std::{borrow::Cow, cmp::{max, min}, future::Future, hash::{BuildHasherDefault, DefaultHasher}, iter::Peekable, ops::{Deref, DerefMut, Not}, path::{Path, PathBuf}, sync::{Arc, LazyLock, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}}, time::{Duration, SystemTime}};
+use std::{borrow::Cow, cmp::{max, min}, future::Future, iter::Peekable, ops::{Deref, DerefMut, Not}, path::{Path, PathBuf}, sync::{Arc, LazyLock, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}}, time::{Duration, SystemTime}};
 use std::io;
 use hashbrown::{HashMap, HashSet};
 use crate::{
     app::AppStateAction, app_data_dir, cache_dir, avatar_cache::AvatarUpdate, event_preview::{BeforeText, TextPreview, text_preview_of_raw_timeline_event, text_preview_of_timeline_item}, home::{
-        add_room::KnockResultAction, invite_screen::{JoinRoomResultAction, LeaveRoomResultAction}, link_preview::LinkPreviewData, room_screen::{InviteResultAction, RoomLink, RoomLinkDestination, RoomLinkResolved, TimelineUpdate}, rooms_list::{self, InvitedRoomInfo, InviterInfo, JoinedRoomInfo, LatestEventPreview, RoomsListUpdate, enqueue_rooms_list_update}, rooms_list_header::{RoomListSyncStatus, RoomsListHeaderAction}, send_status_indicator::{stringify_send_error, upload_percent}, timeline_items::index_of_event, tombstone_footer::SuccessorRoomDetails
-    }, login::login_screen::LoginAction, logout::{logout_confirm_modal::LogoutAction, logout_state_machine::{LogoutConfig, is_logout_in_progress, logout_with_state_machine}}, media_cache::{MediaCacheEntry, MediaCacheEntryRef}, persistence::{self, ClientSessionPersisted, load_app_state}, profile::{
+        add_room::KnockResultAction, create_room_modal::{CreateRoomAction, NewRoomDetails, create_room}, invite_screen::{JoinRoomResultAction, LeaveRoomResultAction}, link_preview::LinkPreviewData, room_screen::{InviteResultAction, RoomLink, RoomLinkDestination, RoomLinkResolved, TimelineUpdate}, rooms_list::{self, InvitedRoomInfo, InviterInfo, JoinedRoomInfo, LatestEventPreview, RoomsListUpdate, enqueue_rooms_list_update}, rooms_list_header::{RoomListSyncStatus, RoomsListHeaderAction}, send_status_indicator::{stringify_send_error, upload_percent}, timeline_items::index_of_event, tombstone_footer::SuccessorRoomDetails
+    }, login::login_screen::LoginAction, logout::{logout_confirm_modal::LogoutAction, logout_state_machine::{LogoutConfig, is_logout_in_progress, logout_with_state_machine}}, media_cache::{MediaCacheEntry, MediaCacheEntryRef}, moderation::{self, MemberModeration, ReportTarget, UserMessage}, persistence::{self, ClientSessionPersisted, load_app_state}, profile::{
         user_profile::UserProfile,
         user_profile_cache::{UserProfileUpdate, enqueue_user_profile_update},
-    }, room::{FetchedRoomAvatar, FetchedRoomPreview, RoomPreviewAction, pinned_messages_list::PinnedMessagesAction, room_members_list::{RoomMembersChanged, RoomMembersFetchAction}}, room_info_sync::{room_info_subscriber_handler, set_room_notification_mode}, room_preview_cache::{RoomPreviewUpdate, enqueue_room_preview_update}, settings::account_settings::AccountManagementUrl, shared::{
-        attachment_download::{MediaDownloadResult, media_source_mxc}, avatar::AvatarState, file_upload_modal::{AttachmentUpload, FileUploadAttemptId, FileUploadMetadata}, jump_to_bottom_button::UnreadMessageCount, mention_popup::{MentionItem, RoomMentionCandidate}, mentionable_text_input::MentionMatches, popup_list::{PopupKind, enqueue_popup_notification}
-    }, space_service_sync::space_service_loop, threads_list_sync::{get_bundled_thread_summary, threads_list_subscriber_handler}, utils::{self, AVATAR_THUMBNAIL_FORMAT, MatchQuality, RoomNameId, VecDiff, alias_localpart, avatar_from_room_name}, verification::add_verification_event_handlers_and_sync_client
+        user_verification_cache::{UserVerificationState, UserVerificationUpdate, enqueue_user_verification_update},
+    }, room::{FetchedRoomAvatar, FetchedRoomPreview, RoomPreviewAction, pinned_messages_list::PinnedMessagesAction, room_members_list::{LISTED_MEMBERSHIPS, RoomMembersChanged, RoomMembersFetchAction}}, room_info_sync::{room_info_subscriber_handler, set_room_notification_mode}, room_preview_cache::{RoomPreviewUpdate, enqueue_room_preview_update}, settings::account_settings::AccountManagementUrl, shared::{
+        attachment_download::{MediaDownloadResult, media_source_mxc}, avatar::AvatarState, file_upload_modal::{AttachmentUpload, FileUploadAttemptId, FileUploadMetadata}, jump_to_bottom_button::UnreadMessageCount, mention_popup::{MentionItem, RoomMentionCandidate}, mentionable_text_input::MentionMatches, popup_list::{PopupKind, enqueue_popup_notification}, recent_emojis::{handle_recent_emojis_subscriber, spawn_recent_emoji_writer}
+    }, space_service_sync::space_service_loop, threads_list_sync::{get_bundled_thread_summary, threads_list_subscriber_handler}, utils::{self, AVATAR_THUMBNAIL_FORMAT, MatchQuality, RoomNameId, VecDiff, alias_localpart, avatar_from_room_name}, verification::{add_verification_event_handlers_and_sync_client, handle_user_identities_subscriber}
 };
 
 #[derive(Parser, Default)]
@@ -595,7 +597,7 @@ pub enum MatrixRequest {
         ///   all members are fetched from the server and sent again.
         local_only: bool,
     },
-    /// Request to get a room's joined and invited members for a popped-out room members pane,
+    /// Request to get the members to list in a popped-out room members pane,
     /// which has no timeline to get them via [`MatrixRequest::GetRoomMembers`].
     ///
     /// The result is posted as a [`RoomMembersFetchAction`].
@@ -622,6 +624,13 @@ pub enum MatrixRequest {
         /// The ID of the link's room, if the UI already knows it (e.g., from its alias).
         known_room_id: Option<OwnedRoomId>,
     },
+    /// Request to load the given room if it's outdated, i.e., replaced by a newer room that we've joined.
+    ///
+    /// This posts `AppStateAction::RoomLoadedSuccessfully` once it's loaded, or else an [`OutdatedRoomNotLoaded`] action.
+    /// For a joined room that the rooms list just hasn't loaded yet, the rooms list posts the former once it does.
+    LoadOutdatedRoom {
+        room_id: OwnedRoomId,
+    },
     /// Request to fetch the full details (the room preview) of a tombstoned room.
     GetSuccessorRoomDetails {
         tombstoned_room_id: OwnedRoomId,
@@ -637,6 +646,15 @@ pub enum MatrixRequest {
         user_profile: UserProfile,
         allow_create: bool,
     },
+    /// Request to create a new room with the given details, and then invite people to it.
+    ///
+    /// The result is posted as a [`CreateRoomAction`](crate::home::create_room_modal::CreateRoomAction).
+    CreateRoom {
+        details: NewRoomDetails,
+    },
+    /// Request to fetch the room versions that our homeserver supports,
+    /// which are posted as a [`CreateRoomAction::RoomVersions`](crate::home::create_room_modal::CreateRoomAction::RoomVersions).
+    GetRoomVersions,
     /// Request to fetch profile information for the given user ID.
     GetUserProfile {
         user_id: OwnedUserId,
@@ -743,6 +761,21 @@ pub enum MatrixRequest {
     /// Request to verify this device by sending an outgoing verification request
     /// to the user's other logged-in devices, which'll open the verification modal.
     RequestSelfVerification,
+    /// Request to verify another user by sending them a verification request
+    /// in our DM room with them, which'll open the verification modal.
+    RequestUserVerification {
+        user_id: OwnedUserId,
+    },
+    /// Request to find out whether we've verified the given user.
+    /// The response is delivered to the [`crate::profile::user_verification_cache`].
+    GetUserVerificationState {
+        user_id: OwnedUserId,
+    },
+    /// Request to accept that the given user reset their identity, which stops the warnings about it.
+    /// If we had verified them before, this also withdraws that verification.
+    AcknowledgeIdentityReset {
+        user_id: OwnedUserId,
+    },
     /// Request to fetch an Avatar image from the server.
     /// Upon completion of the async media request, the `on_fetched` function
     /// will be invoked with the content of an `AvatarUpdate`.
@@ -853,6 +886,13 @@ pub enum MatrixRequest {
         /// Whether to subscribe or unsubscribe.
         subscribe: bool,
     },
+    /// Subscribe to the identity resets of the given room's members,
+    /// which are sent to the UI via the room's main timeline update sender.
+    SubscribeToIdentityResets {
+        room_id: OwnedRoomId,
+        /// Whether to subscribe or unsubscribe.
+        subscribe: bool,
+    },
     /// Subscribe to the given `kind` of data feed from the given room, e.g., pinned messages, threads.
     ///
     /// The data is posted upon several conditions:
@@ -886,14 +926,18 @@ pub enum MatrixRequest {
         timeline_kind: TimelineKind,
         user_id: OwnedUserId,
     },
-    /// Sends a request to obtain the power levels for this room.
+    /// Sends a request to obtain the current user's power levels in this room or space.
     ///
-    /// The response is delivered back to the main UI thread via [`TimelineUpdate::UserPowerLevels`].
-    ///
-    /// Even though it operates on a room itself, this accepts a `TimelineKind`
-    /// in order to be able to send the fetched room member list to a specific timeline UI.
+    /// The response is delivered back to the main UI thread via a [`UserPowerLevelsUpdated`] action,
+    /// and also via [`TimelineUpdate::UserPowerLevels`] to each of this room's timelines.
     GetRoomPowerLevels {
-        timeline_kind: TimelineKind,
+        room_id: OwnedRoomId,
+    },
+    /// Reads the current user's power levels in many rooms, a few rooms at a time (or one at a time in the background),
+    /// and then sends all of them to the rooms list in one [`RoomsListUpdate::UpdatePowerLevels`].
+    GetPowerLevelsInRooms {
+        room_ids: Vec<OwnedRoomId>,
+        in_background: bool,
     },
     /// Toggles the given reaction to the given event in the given room.
     ToggleReaction {
@@ -901,12 +945,59 @@ pub enum MatrixRequest {
         timeline_event_id: TimelineEventItemId,
         reaction: String,
     },
+    /// Request to add the given emoji to the front of the account's recently used emoji.
+    ///
+    /// The updated list arrives via a [`RecentEmojisAction::Updated`](crate::shared::recent_emojis::RecentEmojisAction)
+    /// action once the homeserver syncs it back to us, or a `RecentEmojisAction::PickNotSaved` if adding it failed.
+    AddRecentEmoji {
+        emoji: String,
+    },
     /// Redacts (deletes) the given event in the given room.
     #[doc(alias("delete"))]
     RedactMessage {
         timeline_kind: TimelineKind,
         timeline_event_id: TimelineEventItemId,
         reason: Option<String>,
+    },
+    /// Reports the given message, room, or user to the homeserver's admins.
+    ///
+    /// The result is shown to the user as a popup notification.
+    Report {
+        target: ReportTarget,
+        reason: Option<String>,
+    },
+    /// Kicks, bans, unbans, mutes, or unmutes a member of a room.
+    ///
+    /// The result is shown to the user as a popup notification.
+    #[doc(alias("kick", "ban", "unban", "mute", "unmute"))]
+    ModerateMember {
+        moderation: MemberModeration,
+        reason: Option<String>,
+    },
+    /// Requests what the current user can do to the given user in the given room.
+    ///
+    /// The result is posted as a [`MemberAbilitiesFetched`](moderation::MemberAbilitiesFetched) action.
+    GetMemberAbilities {
+        room_id: OwnedRoomId,
+        user_id: OwnedUserId,
+    },
+    /// Requests all of the given user's messages that we can see in the given room.
+    ///
+    /// See [`moderation::fetch_user_messages()`].
+    GetUserMessages {
+        room_id: OwnedRoomId,
+        user_id: OwnedUserId,
+        fetch_id: u64,
+        stop: oneshot::Receiver<()>,
+    },
+    /// Removes the given messages from the given room.
+    ///
+    /// See [`moderation::remove_user_messages()`].
+    RemoveUserMessages {
+        room_id: OwnedRoomId,
+        messages: Vec<UserMessage>,
+        reason: Option<String>,
+        stop: oneshot::Receiver<()>,
     },
     /// Retries sending the given local echo of a message,
     /// typically one that previously failed to send.
@@ -1085,6 +1176,7 @@ async fn matrix_worker_task(
     // The async tasks spawned to handle media downloads, keyed by MxcUri.
     // Here we intentionally use a `std` Mutex, not async, since it's cheaper under no contention.
     let download_tasks: Arc<Mutex<HashMap<OwnedMxcUri, ActiveDownload>>> = Arc::new(Mutex::new(HashMap::new()));
+    let recent_emoji_writer = spawn_recent_emoji_writer();
 
     while let Some(request) = request_receiver.recv().await {
         match request {
@@ -1421,21 +1513,26 @@ async fn matrix_worker_task(
                         (_, Some(alias)) => client.join_room_by_id_or_alias((&*alias).into(), &via).await,
                         (_, None) => client.join_room_by_id_or_alias((&*room_id).into(), &via).await,
                     };
+                    let joined_room = result.as_ref().ok().cloned();
                     // Show the success/failure popup here in case the UI screen that requested the join action
                     // has been hidden or navigated away from since then.
                     let result_action = match result {
                         Ok(room) => {
                             log!("Successfully joined room {room_id}.");
+                            refresh_rooms_restricted_to(&client, &room_id);
+                            // Until the room's state arrives, we don't know its name or whether it's a space.
+                            wait_for_create_event(&room).await;
+                            let is_space = room.is_space();
                             let room_name_id = RoomNameId::from_room(&room).await;
                             enqueue_popup_notification(
                                 format!(
                                     "Successfully joined {} \"{room_name_id}\".",
-                                    if room.is_space() { "space" } else { "room" },
+                                    if is_space { "space" } else { "room" },
                                 ),
                                 PopupKind::Success,
                                 Some(4.0),
                             );
-                            JoinRoomResultAction::Joined { room_id }
+                            JoinRoomResultAction::Joined { room_id, is_space }
                         }
                         Err(e) => {
                             error!("Error joining room {room_id}: {e:?}");
@@ -1452,6 +1549,11 @@ async fn matrix_worker_task(
                         }
                     };
                     Cx::post_action(result_action);
+                    // The rooms list won't load an old room that we just joined if we're already in the room
+                    // that replaced it, so we load it ourselves.
+                    if let Some(room) = joined_room {
+                        load_outdated_room(&room).await;
+                    }
                 });
             }
 
@@ -1474,10 +1576,21 @@ async fn matrix_worker_task(
                     };
                     // Rejecting an invite is the same as leaving a room, but is phrased differently.
                     let was_invite = room.state() == RoomState::Invited;
+                    let was_outdated = is_outdated_room(&room);
                     let room_name_id = RoomNameId::from_room(&room).await;
                     let result_action = match room.leave().await {
                         Ok(()) => {
                             log!("Successfully left room {room_id}.");
+                            refresh_rooms_restricted_to(&client, &room_id);
+                            // The room list service doesn't track outdated rooms, so it won't remove this one for us.
+                            if was_outdated {
+                                ALL_JOINED_ROOMS.lock().unwrap().remove(&room_id);
+                                enqueue_rooms_list_update(RoomsListUpdate::RemoveRoom {
+                                    room_id: room_id.clone(),
+                                    is_space: room.is_space(),
+                                    new_state: RoomState::Left,
+                                });
+                            }
                             enqueue_popup_notification(
                                 if was_invite {
                                     format!("Successfully rejected the invite to \"{room_name_id}\".")
@@ -1540,7 +1653,7 @@ async fn matrix_worker_task(
                         });
                         return;
                     };
-                    fetch_room_members(&room, RoomMemberships::ACTIVE, local_only, |result| {
+                    fetch_room_members(&room, LISTED_MEMBERSHIPS, local_only, |result| {
                         let room_id = room_id.clone();
                         Cx::post_action(match result {
                             Ok(members) => RoomMembersFetchAction::Fetched { room_id, members: Arc::new(members) },
@@ -1578,6 +1691,21 @@ async fn matrix_worker_task(
                 let _resolve_room_link_task = Handle::current().spawn(async move {
                     let result = resolve_room_link(&client, &link, known_room_id).await;
                     Cx::post_action(RoomLinkResolved { link, result });
+                });
+            }
+
+            MatrixRequest::LoadOutdatedRoom { room_id } => {
+                let Some(client) = get_client() else { continue };
+                let _load_outdated_room_task = Handle::current().spawn(async move {
+                    let will_be_loaded = match client.get_room(&room_id) {
+                        // The rooms list will load a room we just joined or created, it just hasn't yet.
+                        Some(room) if room.state() == RoomState::Joined && !room.is_space() && !is_outdated_room(&room) => true,
+                        Some(room) => load_outdated_room(&room).await,
+                        None => false,
+                    };
+                    if !will_be_loaded {
+                        Cx::post_action(OutdatedRoomNotLoaded { room_id });
+                    }
                 });
             }
 
@@ -1621,6 +1749,8 @@ async fn matrix_worker_task(
                     match client.create_dm(&user_profile.user_id).await {
                         Ok(room) => {
                             log!("Successfully created DM room: {}", room.room_id());
+                            // The rooms list only gets a new room once its state arrives, so we wait for that too.
+                            wait_for_create_event(&room).await;
                             Cx::post_action(DirectMessageRoomAction::NewlyCreated {
                                 user_profile,
                                 room_name_id: RoomNameId::from_room(&room).await,
@@ -1633,6 +1763,21 @@ async fn matrix_worker_task(
                                 error,
                             });
                         }
+                    }
+                });
+            }
+
+            MatrixRequest::CreateRoom { details } => {
+                let Some(client) = get_client() else { continue };
+                let _create_room_task = Handle::current().spawn(create_room(client, details));
+            }
+
+            MatrixRequest::GetRoomVersions => {
+                let Some(client) = get_client() else { continue };
+                let _room_versions_task = Handle::current().spawn(async move {
+                    match client.homeserver_capabilities().room_versions().await {
+                        Ok(room_versions) => Cx::post_action(CreateRoomAction::RoomVersions(room_versions)),
+                        Err(e) => warning!("Failed to fetch the room versions that our homeserver supports: {e}"),
                     }
                 });
             }
@@ -1669,18 +1814,29 @@ async fn matrix_worker_task(
 
                     if !local_only {
                         if update.is_none() {
-                            if let Ok(response) = client.account().fetch_user_profile_of(&user_id).await {
-                                update = Some(UserProfileUpdate::UserProfileOnly(
-                                    UserProfile {
-                                        username: response.get_static::<DisplayName>().ok().flatten(),
-                                        user_id: user_id.clone(),
-                                        avatar_state: response.get_static::<AvatarUrl>()
-                                            .ok()
-                                            .map_or(AvatarState::Unknown, AvatarState::Known),
-                                    }
-                                ));
-                            } else {
-                                log!("User profile request: client could not get user with ID {user_id}");
+                            match client.account().fetch_user_profile_of(&user_id).await {
+                                Ok(response) => {
+                                    update = Some(UserProfileUpdate::UserProfileOnly(
+                                        UserProfile {
+                                            username: response.get_static::<DisplayName>().ok().flatten(),
+                                            user_id: user_id.clone(),
+                                            avatar_state: response.get_static::<AvatarUrl>()
+                                                .ok()
+                                                .map_or(AvatarState::Unknown, AvatarState::Known),
+                                        }
+                                    ));
+                                }
+                                // Servers answer 404 for a user with no name or avatar (or no such user), so that's just an empty profile.
+                                Err(e) if matches!(e.client_api_error_kind(), Some(ErrorKind::NotFound)) => {
+                                    update = Some(UserProfileUpdate::UserProfileOnly(
+                                        UserProfile {
+                                            username: None,
+                                            user_id: user_id.clone(),
+                                            avatar_state: AvatarState::Known(None),
+                                        }
+                                    ));
+                                }
+                                Err(e) => log!("User profile request: failed to fetch the profile of user {user_id}: {e}"),
                             }
                         }
 
@@ -1705,6 +1861,9 @@ async fn matrix_worker_task(
                         enqueue_user_profile_update(upd);
                     } else {
                         log!("Failed to get user profile: user: {user_id}, room: {room_id:?}, local_only: {local_only}.");
+                        if !local_only {
+                            enqueue_user_profile_update(UserProfileUpdate::UserProfileFailed { user_id: user_id.clone() });
+                        }
                     }
 
                     if let Some(room_id) = missing_member_room_id {
@@ -1903,23 +2062,11 @@ async fn matrix_worker_task(
             MatrixRequest::UploadAvatar { file_data } => {
                 let Some(client) = get_client() else { continue };
                 let _upload_avatar_task = Handle::current().spawn(async move {
-                    let name = file_data.file_name();
-                    let size = utils::format_decimal_file_size(file_data.size);
-                    log!("Uploading new avatar image {name} ({} bytes)...", file_data.size);
-                    let content_type: Mime = file_data.mime_type.parse()
-                        .unwrap_or(mime::APPLICATION_OCTET_STREAM);
-
-                    let result = match exceeds_upload_limit(file_data.size, "the new avatar").await {
-                        Some(max_size) => Err(format!(
-                            "\"{name}\" is {size}, over your homeserver's {} upload limit. \
-                             Please choose a smaller image.",
-                            utils::format_decimal_file_size(max_size),
-                        )),
-                        None => match tokio::fs::read(file_data.path()).await {
-                            Err(e) => Err(format!("Couldn't read \"{name}\": {e}")),
-                            Ok(data) => client.account().upload_avatar(&content_type, data).await
-                                .map_err(|e| avatar_rejection_message(&e, &size, &file_data.mime_type)),
-                        },
+                    let result = match upload_avatar_image(&client, &file_data).await {
+                        Ok(avatar_url) => client.account().set_avatar_url(Some(&avatar_url)).await
+                            .map(|_| avatar_url)
+                            .map_err(|e| avatar_rejection_message(&e, &utils::format_decimal_file_size(file_data.size), &file_data.mime_type)),
+                        Err(err_msg) => Err(err_msg),
                     };
                     match result {
                         Ok(avatar_url) => {
@@ -2200,6 +2347,47 @@ async fn matrix_worker_task(
                 let _verify_task = Handle::current().spawn(
                     crate::verification::request_self_verification_handler(client)
                 );
+            }
+
+            MatrixRequest::RequestUserVerification { user_id } => {
+                let Some(client) = get_client() else { continue };
+                let _verify_task = Handle::current().spawn(
+                    crate::verification::request_user_verification_handler(client, user_id)
+                );
+            }
+
+            MatrixRequest::GetUserVerificationState { user_id } => {
+                let Some(client) = get_client() else { continue };
+                let _get_verification_state_task = Handle::current().spawn(async move {
+                    let state = match client.encryption().get_user_identity(&user_id).await {
+                        Ok(identity) => identity.as_ref().map_or(UserVerificationState::Unverified, UserVerificationState::from),
+                        Err(e) => {
+                            error!("Failed to get the identity of {user_id}: {e:?}");
+                            UserVerificationState::Unverified
+                        }
+                    };
+                    enqueue_user_verification_update(UserVerificationUpdate::States(vec![(user_id, state)]));
+                });
+            }
+
+            MatrixRequest::AcknowledgeIdentityReset { user_id } => {
+                let Some(client) = get_client() else { continue };
+                let _acknowledge_task = Handle::current().spawn(async move {
+                    let result = match client.encryption().get_user_identity(&user_id).await {
+                        Ok(Some(identity)) if identity.has_verification_violation() => identity.withdraw_verification().await,
+                        Ok(Some(identity)) => identity.pin().await,
+                        Ok(None) => return,
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = result {
+                        error!("Failed to acknowledge the identity reset of {user_id}: {e:?}");
+                        enqueue_popup_notification(
+                            format!("Couldn't accept {user_id}'s new identity. Error: {e}"),
+                            PopupKind::Error,
+                            None,
+                        );
+                    }
+                });
             }
 
             MatrixRequest::GetRoomDiagnostics { room_id } => {
@@ -2527,6 +2715,25 @@ async fn matrix_worker_task(
                 });
                 if let Some(old) = subscribers_pinned_events.insert(room_id, subscribe_pinned_events_task) {
                     old.abort();
+                }
+            }
+
+            MatrixRequest::SubscribeToIdentityResets { room_id, subscribe } => {
+                let mut all_joined_rooms = ALL_JOINED_ROOMS.lock().unwrap();
+                let Some(jrd) = all_joined_rooms.get_mut(&room_id) else {
+                    log!("BUG: skipping subscribe to identity resets request for unknown room {room_id}");
+                    continue;
+                };
+                if let Some(old) = jrd.identity_resets_subscriber.take() {
+                    old.abort();
+                }
+                if subscribe {
+                    jrd.identity_resets_subscriber = Some(Handle::current().spawn(
+                        crate::verification::identity_resets_subscriber_handler(
+                            jrd.main_timeline.timeline.room().clone(),
+                            jrd.main_timeline.timeline_update_sender.clone(),
+                        )
+                    ));
                 }
             }
 
@@ -3026,29 +3233,52 @@ async fn matrix_worker_task(
                 });
             },
 
-            MatrixRequest::GetRoomPowerLevels { timeline_kind } => {
-                let Some((timeline, sender)) = get_timeline_and_sender(&timeline_kind) else {
-                    log!("BUG: {timeline_kind} not found for room power levels request");
+            MatrixRequest::GetRoomPowerLevels { room_id } => {
+                let Some(client) = get_client() else { continue };
+                let Some(room) = client.get_room(&room_id) else {
+                    error!("Room {room_id} not found for room power levels request");
                     continue;
                 };
 
                 let Some(user_id) = current_user_id() else { continue };
 
                 let _power_levels_task = Handle::current().spawn(async move {
-                    match timeline.room().power_levels().await {
+                    match room.power_levels().await {
                         Ok(power_levels) => {
-                            log!("Successfully fetched power levels for {timeline_kind}.");
-                            if sender.send(TimelineUpdate::UserPowerLevels(
-                                UserPowerLevels::from(&power_levels, &user_id),
-                            )).is_err() {
-                                error!("Failed to send room power levels to UI.")
+                            let user_power_levels = UserPowerLevels::from(&power_levels, &user_id);
+                            // Spaces have no timelines, so for them we only post the action.
+                            let timeline_update_senders = ALL_JOINED_ROOMS.lock().unwrap().get(&room_id)
+                                .map(JoinedRoomDetails::all_timeline_update_senders)
+                                .unwrap_or_default();
+                            for sender in &timeline_update_senders {
+                                let _ = sender.send(TimelineUpdate::UserPowerLevels(user_power_levels));
                             }
                             SignalToUI::set_ui_signal();
+                            Cx::post_action(UserPowerLevelsUpdated { room_id, user_power_levels });
                         }
                         Err(e) => {
-                            error!("Failed to fetch power levels for {timeline_kind}: {e:?}");
+                            error!("Failed to fetch power levels for room {room_id}: {e:?}");
                         }
                     }
+                });
+            },
+
+            MatrixRequest::GetPowerLevelsInRooms { room_ids, in_background } => {
+                let rooms: Vec<Room> = get_client()
+                    .map(|client| room_ids.iter().filter_map(|room_id| client.get_room(room_id)).collect())
+                    .unwrap_or_default();
+                let _power_levels_task = Handle::current().spawn(async move {
+                    let user_power_levels: Vec<_> = stream::iter(rooms)
+                        .map(|room| async move {
+                            let user_power_levels = UserPowerLevels::from_room(&room, room.own_user_id()).await?;
+                            Some((room.room_id().to_owned(), user_power_levels))
+                        })
+                        .buffer_unordered(if in_background { 1 } else { *MAX_CONCURRENCY })
+                        .filter_map(std::future::ready)
+                        .collect()
+                        .await;
+                    // We send this even if some rooms failed, so the rooms list never waits on them forever.
+                    enqueue_rooms_list_update(RoomsListUpdate::UpdatePowerLevels { room_ids, user_power_levels });
                 });
             },
 
@@ -3068,6 +3298,11 @@ async fn matrix_worker_task(
                         Err(_e) => error!("Failed to send toggle reaction to {timeline_kind}; error: {_e:?}"),
                     }
                 });
+            },
+
+            MatrixRequest::AddRecentEmoji { emoji } => {
+                let Some(user_id) = current_user_id() else { continue };
+                let _ = recent_emoji_writer.send((user_id, emoji));
             },
 
             MatrixRequest::RedactMessage { timeline_kind, timeline_event_id, reason } => {
@@ -3091,6 +3326,31 @@ async fn matrix_worker_task(
                         }
                     }
                 });
+            },
+
+            MatrixRequest::Report { target, reason } => {
+                let Some(client) = get_client() else { continue };
+                let _report_task = Handle::current().spawn(moderation::report(client, target, reason));
+            },
+
+            MatrixRequest::ModerateMember { moderation, reason } => {
+                let Some(client) = get_client() else { continue };
+                let _moderate_task = Handle::current().spawn(moderation::moderate_member(client, moderation, reason));
+            },
+
+            MatrixRequest::GetMemberAbilities { room_id, user_id } => {
+                let Some(client) = get_client() else { continue };
+                let _abilities_task = Handle::current().spawn(moderation::fetch_member_abilities(client, room_id, user_id));
+            },
+
+            MatrixRequest::GetUserMessages { room_id, user_id, fetch_id, stop } => {
+                let Some(client) = get_client() else { continue };
+                let _fetch_task = Handle::current().spawn(moderation::fetch_user_messages(client, room_id, user_id, fetch_id, stop));
+            },
+
+            MatrixRequest::RemoveUserMessages { room_id, messages, reason, stop } => {
+                let Some(client) = get_client() else { continue };
+                let _remove_task = Handle::current().spawn(moderation::remove_user_messages(client, room_id, messages, reason, stop));
             },
 
             MatrixRequest::RetrySend { timeline_kind, timeline_event_id } => {
@@ -3203,7 +3463,12 @@ async fn matrix_worker_task(
                     let result: Result<LinkPreviewData, UrlPreviewError> = async {
                         let client = get_client().ok_or(UrlPreviewError::ClientNotAvailable)?;
                         let request = get_media_preview::v1::Request::new(url);
-                        let response = client.send(request).await.map_err(UrlPreviewError::Request)?;
+                        // The server can fail to preview a link forever (e.g., one that can't be reached),
+                        // so we only retry a few times rather than leave its preview loading.
+                        let response = client.send(request)
+                            .with_request_config(client.request_config().retry_limit(3))
+                            .await
+                            .map_err(UrlPreviewError::Request)?;
                         match response.data {
                             Some(raw) => serde_json::from_str::<LinkPreviewData>(raw.get())
                                 .map_err(UrlPreviewError::Json),
@@ -3551,6 +3816,8 @@ struct JoinedRoomDetails {
     threads_list_subscriber: Option<RoomDataSubscriber<Arc<Notify>>>,
     /// The task that watches this room's info while any room info pane shows it (or saved it).
     room_info_subscriber: Option<RoomDataSubscriber<UnboundedSender<Option<RoomNotificationMode>>>>,
+    /// The task that watches for this room's members' identity resets while this room is shown.
+    identity_resets_subscriber: Option<JoinHandle<()>>,
 }
 impl Drop for JoinedRoomDetails {
     fn drop(&mut self) {
@@ -3561,25 +3828,53 @@ impl Drop for JoinedRoomDetails {
         drop(self.pinned_messages_subscriber.take());
         drop(self.threads_list_subscriber.take());
         drop(self.room_info_subscriber.take());
+        if let Some(task) = self.identity_resets_subscriber.take() {
+            task.abort();
+        }
     }
 }
 impl JoinedRoomDetails {
+    /// Returns the details of this room's main timeline and all of its thread timelines.
+    fn all_timelines(&self) -> impl Iterator<Item = &PerTimelineDetails> {
+        std::iter::once(&self.main_timeline).chain(self.thread_timelines.values())
+    }
+
     /// Returns the update senders for this room's main timeline and all of its thread timelines.
     fn all_timeline_update_senders(&self) -> Vec<crossbeam_channel::Sender<TimelineUpdate>> {
-        std::iter::once(&self.main_timeline)
-            .chain(self.thread_timelines.values())
+        self.all_timelines()
             .map(|d| d.timeline_update_sender.clone())
             .collect()
     }
 }
 
+/// Asks every timeline to re-check the encryption info of messages sent by the given users
+/// (or by anyone, if `None`), so that those messages show their senders' current verification state.
+pub async fn refresh_encryption_info_of_messages(senders: Option<&[OwnedUserId]>) {
+    let timelines: Vec<Arc<Timeline>> = ALL_JOINED_ROOMS.lock().unwrap()
+        .values()
+        .flat_map(JoinedRoomDetails::all_timelines)
+        .map(|details| details.timeline.clone())
+        .collect();
+    for timeline in timelines {
+        let session_ids: Vec<String> = timeline.items().await
+            .iter()
+            .filter_map(|item| item.as_event())
+            .filter(|event| senders.is_none_or(|senders| senders.iter().any(|s| s == event.sender())))
+            .filter_map(|event| event.encryption_info()?.session_id().map(ToOwned::to_owned))
+            .collect();
+        if !session_ids.is_empty() {
+            timeline.retry_decryption(session_ids).await;
+        }
+    }
+}
+
 
 /// A const-compatible hasher, used for `static` items containing `HashMap`s or `HashSet`s.
-type ConstHasher = BuildHasherDefault<DefaultHasher>;
+type ConstHasher = FxBuildHasher;
 
 /// Information about all joined rooms that our client currently know about.
 /// We use a `HashMap` for O(1) lookups, as this is accessed frequently (e.g. every timeline update).
-static ALL_JOINED_ROOMS: Mutex<HashMap<OwnedRoomId, JoinedRoomDetails, ConstHasher>> = Mutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
+static ALL_JOINED_ROOMS: Mutex<HashMap<OwnedRoomId, JoinedRoomDetails, ConstHasher>> = Mutex::new(HashMap::with_hasher(FxBuildHasher));
 
 /// The diagnostic info gathered upon a [`MatrixRequest::GetRoomDiagnostics`] request.
 ///
@@ -3595,6 +3890,15 @@ pub struct RoomDiagnosticsReady {
 /// This is *NOT* a widget action.
 #[derive(Debug)]
 pub struct TimelineEndpointsRecreated {
+    pub room_id: OwnedRoomId,
+}
+
+/// A [`MatrixRequest::LoadOutdatedRoom`] request's room didn't get loaded and won't be,
+/// e.g., because we're not in that room.
+///
+/// This is *NOT* a widget action.
+#[derive(Debug)]
+pub struct OutdatedRoomNotLoaded {
     pub room_id: OwnedRoomId,
 }
 
@@ -3750,7 +4054,7 @@ pub fn stop_sync_service_for_shutdown(timeout: Duration) -> Result<(), Elapsed> 
 /// The list of users that the current user has chosen to block.
 /// Ideally we shouldn't have to maintain this list ourselves,
 /// but the Matrix SDK doesn't currently properly maintain the list of blocked users.
-static BLOCKED_USERS: Mutex<HashSet<OwnedUserId, ConstHasher>> = Mutex::new(HashSet::with_hasher(BuildHasherDefault::new()));
+static BLOCKED_USERS: Mutex<HashSet<OwnedUserId, ConstHasher>> = Mutex::new(HashSet::with_hasher(FxBuildHasher));
 
 /// Returns a sorted list of the currently blocked users.
 #[doc(alias("ignored"))]
@@ -3834,7 +4138,10 @@ struct RoomListServiceRoomInfo {
     room_id: OwnedRoomId,
     state: RoomState,
     is_direct: bool,
+    /// The other user in this room, if it's a direct room with just one other user.
+    dm_user_id: Option<OwnedUserId>,
     is_space: bool,
+    has_create_event: bool,
     is_marked_unread: bool,
     is_tombstoned: bool,
     is_encrypted: bool,
@@ -3853,6 +4160,7 @@ struct RoomListServiceRoomInfo {
     topic: Option<String>,
     /// Only ever set for invited rooms.
     join_rule: Option<JoinRuleSummary>,
+    is_private: bool,
     num_joined_members: u64,
     num_invited_members: u64,
     /// Whether all of this room's members are fully available in the local store.
@@ -3893,11 +4201,17 @@ impl RoomListServiceRoomInfo {
         );
 
         let is_invited = room.state() == RoomState::Invited;
+        let is_direct = is_direct.unwrap_or(false);
+        let dm_user_id = is_direct.then(|| room.direct_targets())
+            .filter(|targets| targets.len() == 1)
+            .and_then(|targets| targets.into_iter().next()?.into_user_id());
         Self {
             room_id: room.room_id().to_owned(),
             state: room.state(),
-            is_direct: is_direct.unwrap_or(false),
+            is_direct,
+            dm_user_id,
             is_space: room.is_space(),
+            has_create_event: room.create_content().is_some(),
             is_marked_unread: room.is_marked_unread(),
             is_tombstoned: room.is_tombstoned(),
             is_encrypted: room.encryption_state().is_encrypted(),
@@ -3913,6 +4227,7 @@ impl RoomListServiceRoomInfo {
             inviter_info,
             topic: is_invited.then(|| room.topic()).flatten(),
             join_rule: is_invited.then(|| room.join_rule().map(JoinRuleSummary::from)).flatten(),
+            is_private: is_room_private(&room),
             num_joined_members: room.joined_members_count(),
             num_invited_members: room.invited_members_count(),
             members_synced: room.are_members_synced(),
@@ -4104,9 +4419,12 @@ async fn start_matrix_client_login_and_sync(rt: Handle) {
         let mut subscriber_task_handles: Vec<JoinHandle<()>> = vec![
             // Listen for changes to our verification status and incoming verification requests.
             add_verification_event_handlers_and_sync_client(client.clone()),
+            // Listen for changes to users' identities, e.g., after we verify someone.
+            handle_user_identities_subscriber(client.clone()),
             handle_recovery_state_subscriber(client.clone(), e2ee_ready_sender.clone()),
             // Listen for updates to the blocked user list.
             handle_blocked_user_list_subscriber(client.clone()),
+            handle_recent_emojis_subscriber(client.clone()),
             // Listen for session changes, e.g., when the access token becomes invalid.
             handle_session_changes(client.clone()),
         ];
@@ -4699,6 +5017,11 @@ async fn update_room(
             }
         }
 
+        // We haven't added this joined room yet, since we didn't know whether it was a space.
+        if new_room.state == RoomState::Joined && !old_room.has_create_event {
+            return add_new_room(new_room, room_list_service).await;
+        }
+
         // First, we check for changes to room data that is relevant to any room,
         // including joined, invited, and other rooms.
         // This includes the room name and room avatar.
@@ -4758,6 +5081,13 @@ async fn update_room(
             });
         }
 
+        if old_room.is_private != new_room.is_private {
+            enqueue_rooms_list_update(RoomsListUpdate::UpdateIsPrivate {
+                room_id: new_room_id.clone(),
+                is_private: new_room.is_private,
+            });
+        }
+
         // Check to see if any room aliases have changed.
         if old_room.canonical_alias != new_room.canonical_alias
             || old_room.alt_aliases != new_room.alt_aliases
@@ -4808,7 +5138,7 @@ async fn update_room(
                 });
             }
 
-            if old_room.is_direct != new_room.is_direct {
+            if old_room.is_direct != new_room.is_direct || old_room.dm_user_id != new_room.dm_user_id {
                 log!("Updating room {} is_direct from {} to {}",
                     new_room_id,
                     old_room.is_direct,
@@ -4817,6 +5147,7 @@ async fn update_room(
                 enqueue_rooms_list_update(RoomsListUpdate::UpdateIsDirect {
                     room_id: new_room_id.clone(),
                     is_direct: new_room.is_direct,
+                    dm_user_id: new_room.dm_user_id.clone(),
                 });
             }
 
@@ -4849,6 +5180,7 @@ async fn update_room(
             if let Some(nupl) = new_room.user_power_levels
                 && old_room.user_power_levels.is_none_or(|oupl| oupl != nupl)
             {
+                Cx::post_action(UserPowerLevelsUpdated { room_id: new_room_id.clone(), user_power_levels: nupl });
                 let timeline_update_senders = get_timeline_update_senders(&new_room_id);
                 if !timeline_update_senders.is_empty() {
                     log!("Updating room {new_room_id} user power levels.");
@@ -4893,6 +5225,28 @@ async fn update_room(
 
 /// Invoked when the room list service has received an update to remove an existing room.
 fn remove_room(room: &RoomListServiceRoomInfo) {
+    // The room list service stops giving us a room once we've moved on to the newer room that replaced it,
+    // but we're still in that old room, so we keep it loaded and just hide it from the rooms list.
+    if is_outdated_room(&room.room) {
+        log!("Hiding outdated room {}, which was replaced by a newer room.", room.room_id);
+        enqueue_rooms_list_update(RoomsListUpdate::HideRoom { room_id: room.room_id.clone() });
+        // We might've only just learned about its tombstone, so the UI doesn't know about that yet.
+        if !room.is_tombstoned {
+            enqueue_rooms_list_update(RoomsListUpdate::TombstonedRoom { room_id: room.room_id.clone() });
+            let timeline_update_senders = ALL_JOINED_ROOMS.lock().unwrap().get(&room.room_id)
+                .map(JoinedRoomDetails::all_timeline_update_senders)
+                .unwrap_or_default();
+            if !timeline_update_senders.is_empty() {
+                spawn_fetch_successor_room_preview(
+                    room.room.client(),
+                    room.room.successor_room(),
+                    room.room_id.clone(),
+                    timeline_update_senders,
+                );
+            }
+        }
+        return;
+    }
     ALL_JOINED_ROOMS.lock().unwrap().remove(&room.room_id);
     enqueue_rooms_list_update(
         RoomsListUpdate::RemoveRoom {
@@ -4957,6 +5311,7 @@ async fn add_new_room(
                 alt_aliases: new_room.alt_aliases.clone(),
                 topic: new_room.topic.clone(),
                 join_rule: new_room.join_rule.clone(),
+                is_private: new_room.is_private,
                 invite_state: Default::default(),
                 is_selected: false,
                 is_direct: new_room.is_direct,
@@ -4972,6 +5327,9 @@ async fn add_new_room(
         }
         // Joined spaces are handled by the SpaceService, so don't handle them here.
         RoomState::Joined if new_room.is_space => return Ok(()),
+        // Right after we join a room, we can't tell if it's a space until its state arrives,
+        // so we wait to add it until then (in `update_room()`).
+        RoomState::Joined if !new_room.has_create_event => return Ok(()),
         RoomState::Joined => { } // Fall through to adding the joined room below.
     }
 
@@ -5020,6 +5378,7 @@ async fn add_new_room(
             pinned_messages_subscriber: None,
             threads_list_subscriber: None,
             room_info_subscriber: None,
+            identity_resets_subscriber: None,
         },
     );
     // A visible RoomScreen might still have this room's previous channel endpoints,
@@ -5046,7 +5405,10 @@ async fn add_new_room(
         has_been_shown: false,
         is_selected: false,
         is_direct: new_room.is_direct,
+        dm_user_id: new_room.dm_user_id.clone(),
         is_tombstoned: new_room.is_tombstoned,
+        is_private: new_room.is_private,
+        user_power_levels: new_room.user_power_levels,
     }));
 
     Cx::post_action(AppStateAction::RoomLoadedSuccessfully {
@@ -5054,6 +5416,62 @@ async fn add_new_room(
         is_invite: false,
     });
     Ok(())
+}
+
+/// Returns whether the user needs an invite to get into the given room or space when they're not in it.
+/// A room with no known join rule counts as private, since rooms are invite-only by default.
+pub fn is_room_private(room: &Room) -> bool {
+    match room.join_rule().map(JoinRuleSummary::from) {
+        Some(JoinRuleSummary::Public) => false,
+        // Anyone who's in one of the allowed rooms can join without an invite.
+        Some(JoinRuleSummary::Restricted(restricted) | JoinRuleSummary::KnockRestricted(restricted)) => {
+            let client = room.client();
+            !restricted.allowed_room_ids.iter()
+                .any(|room_id| client.get_room(room_id).is_some_and(|allowed| allowed.state() == RoomState::Joined))
+        }
+        _ => true,
+    }
+}
+
+/// Refreshes whether each room restricted to the given room is private, since the user just joined or left it.
+pub fn refresh_rooms_restricted_to(client: &Client, room_id: &RoomId) {
+    for room in client.joined_rooms().into_iter().chain(client.invited_rooms()) {
+        if let Some(JoinRuleSummary::Restricted(restricted) | JoinRuleSummary::KnockRestricted(restricted)) = room.join_rule().map(JoinRuleSummary::from)
+            && restricted.allowed_room_ids.iter().any(|allowed_id| allowed_id == room_id)
+        {
+            enqueue_rooms_list_update(RoomsListUpdate::UpdateIsPrivate {
+                room_id: room.room_id().to_owned(),
+                is_private: is_room_private(&room),
+            });
+        }
+    }
+}
+
+/// Returns whether the given room is outdated, meaning that we're still in it
+/// even though we've joined (or since left) the newer room that replaced it.
+///
+/// The room list service hides outdated rooms (see `room_list_service_loop()`).
+fn is_outdated_room(room: &Room) -> bool {
+    room.state() == RoomState::Joined
+        && room.successor_room()
+            .and_then(|successor| room.client().get_room(&successor.room_id))
+            .is_some_and(|successor| matches!(successor.state(), RoomState::Joined | RoomState::Left | RoomState::Banned))
+}
+
+/// Loads the given room if it's an outdated room that isn't loaded yet, since the rooms list never loads those.
+///
+/// It then shows up like any other joined room, just not in the rooms list. Returns whether it got loaded.
+async fn load_outdated_room(room: &Room) -> bool {
+    if room.is_space() || !is_outdated_room(room) || get_room_timeline(room.room_id()).is_some() {
+        return false;
+    }
+    let Some(sync_service) = get_sync_service() else { return false };
+    log!("Loading outdated room {}, which the rooms list hides.", room.room_id());
+    enqueue_rooms_list_update(RoomsListUpdate::HideRoom { room_id: room.room_id().to_owned() });
+    let room_info = RoomListServiceRoomInfo::from_room_ref(room, &current_user_id(), true).await;
+    add_new_room(&room_info, &sync_service.room_list_service()).await
+        .inspect_err(|e| error!("Failed to load outdated room {}: {e:?}", room.room_id()))
+        .is_ok()
 }
 
 /// Reads the account-wide list of blocked users from the account data in the local store.
@@ -5115,7 +5533,7 @@ fn handle_load_app_state(user_id: OwnedUserId) {
         match load_app_state(&user_id).await {
             Ok(Some(app_state)) => {
                 log!("Loaded app state from persistent storage. Restoring now...");
-                Cx::post_action(AppStateAction::RestoreAppStateFromPersistentState(app_state));
+                Cx::post_action(AppStateAction::RestoreAppStateFromPersistentState(Box::new(app_state)));
             }
             Ok(None) => {
                 // No saved file (fresh install) or file was unreadable; nothing to restore.
@@ -5516,6 +5934,14 @@ fn handle_room_list_service_state_subscriber(mut subscriber: Subscriber<room_lis
                 is_fully_synced = is_now_fully_synced;
                 log!("Received a room list service state update: {state:?}");
                 post_sync_status(is_fully_synced);
+                // Our own profile is only fetched once, so we fetch it again in case that failed while we weren't synced.
+                if is_fully_synced && let Some(user_id) = current_user_id() {
+                    submit_async_request(MatrixRequest::GetUserProfile {
+                        user_id,
+                        room_id: None,
+                        local_only: false,
+                    });
+                }
             }
         }
     })
@@ -5625,6 +6051,16 @@ async fn fetch_room_preview_with_avatar(
     Ok(FetchedRoomPreview::from(client, room_preview, room_avatar, via, alias))
 }
 
+/// Waits until we have the creation event of the given joined room, which says whether it's a space.
+///
+/// We don't have it right after we join a room, only once that room's state arrives.
+pub async fn wait_for_create_event(room: &Room) {
+    let mut room_info_updates = room.subscribe_info();
+    while room.create_content().is_none() && room.state() == RoomState::Joined {
+        if room_info_updates.next().await.is_none() { break }
+    }
+}
+
 /// Resolves a room link to determine whether we should show it as a room, space, or event.
 async fn resolve_room_link(
     client: &Client,
@@ -5656,14 +6092,17 @@ async fn resolve_room_link(
     let Some(mut room) = client.get_room(&room_id) else {
         return Ok(RoomLinkDestination::NotJoined);
     };
+    // We can't tell whether a room that we just joined is a space until its state arrives.
+    wait_for_create_event(&room).await;
     // Like the rooms list, we skip over old versions of upgraded rooms (unless one is already loaded),
     // and show the newest version instead.
     //
-    // TODO: we can't yet show or jump to messages in an older tombstoned/upgraded room, though.
+    // A link to a message still shows that message in its own room, though, even if it's an old version.
     const UPGRADED_ROOM_ERROR: &str =
         "Couldn't open that link: it points to an older version of a room that has since been upgraded.";
     let mut upgraded_room_ids = Vec::new();
-    while (!room.is_space() || room.state() == RoomState::Invited)
+    while link.event_id.is_none()
+        && (!room.is_space() || room.state() == RoomState::Invited)
         && let Some(successor) = room.successor_room()
         && let Some(successor_room) = client.get_room(&successor.room_id)
         && (room.state() != RoomState::Joined
@@ -5671,7 +6110,7 @@ async fn resolve_room_link(
         && get_room_timeline(room.room_id()).is_none()
     {
         upgraded_room_ids.push(room.room_id().to_owned());
-        if link.event_id.is_some() || upgraded_room_ids.contains(&successor.room_id) {
+        if upgraded_room_ids.contains(&successor.room_id) {
             return Err(UPGRADED_ROOM_ERROR.into());
         }
         room = successor_room;
@@ -5814,7 +6253,7 @@ async fn get_latest_event_details(
                 sender,
                 &sender_username,
             ).format_with(&sender_username, true);
-            Some(LatestEventPreview { timestamp: *timestamp, text, sender: Some(sender.clone()) })
+            Some(LatestEventPreview { timestamp: *timestamp, text: utils::collapse_html_line_breaks(text), sender: Some(sender.clone()) })
         }
         LatestEventValue::Local { timestamp, sender, profile, content, state: _ } => {
             // TODO: use the `state` enum to augment the preview text with more details.
@@ -5827,7 +6266,7 @@ async fn get_latest_event_details(
                 sender,
                 &sender_username,
             ).format_with(&sender_username, true);
-            Some(LatestEventPreview { timestamp: *timestamp, text, sender: Some(sender.clone()) })
+            Some(LatestEventPreview { timestamp: *timestamp, text: utils::collapse_html_line_breaks(text), sender: Some(sender.clone()) })
         }
         LatestEventValue::RemoteInvite { timestamp, .. } => {
             Some(LatestEventPreview {
@@ -5876,6 +6315,28 @@ async fn exceeds_upload_limit(size: u64, context: impl std::fmt::Display) -> Opt
         .map(|size| size > max_upload_size)
         .unwrap_or(true)
         .then(|| max_upload_size.into())
+}
+
+/// Uploads the given image so that it can be used as an avatar, returning its MXC URI.
+///
+/// Upon failure, this returns a message that explains why, e.g., if it's over the homeserver's upload limit.
+pub async fn upload_avatar_image(client: &Client, file_data: &FileUploadMetadata) -> Result<OwnedMxcUri, String> {
+    let name = file_data.file_name();
+    let size = utils::format_decimal_file_size(file_data.size);
+    log!("Uploading avatar image {name} ({} bytes)...", file_data.size);
+    if let Some(max_size) = exceeds_upload_limit(file_data.size, "the new avatar").await {
+        return Err(format!(
+            "\"{name}\" is {size}, over your homeserver's {} upload limit. \
+             Please choose a smaller image.",
+            utils::format_decimal_file_size(max_size),
+        ));
+    }
+    let data = tokio::fs::read(file_data.path()).await
+        .map_err(|e| format!("Couldn't read \"{name}\": {e}"))?;
+    let content_type: Mime = file_data.mime_type.parse().unwrap_or(mime::APPLICATION_OCTET_STREAM);
+    client.media().upload(&content_type, data, None).await
+        .map(|response| response.content_uri)
+        .map_err(|e| avatar_rejection_message(&e, &size, &file_data.mime_type))
 }
 
 /// Returns human-readable errors explaining why the homeserver refused an avatar upload.
@@ -7037,7 +7498,7 @@ async fn run_ios_web_auth_session(url: &str) -> Result<Option<Url>, Error> {
 
 bitflags! {
     /// The powers that a user has in a given room.
-    #[derive(Copy, Clone, PartialEq, Eq)]
+    #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
     pub struct UserPowerLevels: u64 {
         const Ban = 1 << 0;
         const Invite = 1 << 1;
@@ -7102,6 +7563,9 @@ bitflags! {
         // const BeaconInfo = 1 << 56;
         // const CallMember = 1 << 57;
         // const MemberHints = 1 << 58;
+        // -------------------------------------
+        /// The user is a moderator, an admin, or one of the room's creators.
+        const ModOrAdmin = 1 << 59;
     }
 }
 impl UserPowerLevels {
@@ -7120,7 +7584,16 @@ impl UserPowerLevels {
         retval.set(UserPowerLevels::RoomRedaction, user_power >= power_levels.for_message(MessageLikeEventType::RoomRedaction));
         retval.set(UserPowerLevels::Sticker, user_power >= power_levels.for_message(MessageLikeEventType::Sticker));
         retval.set(UserPowerLevels::RoomPinnedEvents, user_power >= power_levels.for_state(StateEventType::RoomPinnedEvents));
+        retval.set(UserPowerLevels::ModOrAdmin, RoomMemberRole::suggested_role_for_power_level(user_power) != RoomMemberRole::User);
         retval
+    }
+
+    /// Returns the powers to assume that a user has until their real power levels arrive.
+    ///
+    /// This avoids unexpectedly hiding any regular UI elements, but inviting
+    /// and moderation actions must only be offered to users who really can perform them.
+    pub fn assumed_until_fetched() -> Self {
+        Self::all() - (Self::Ban | Self::Invite | Self::Kick | Self::Redact | Self::ModOrAdmin)
     }
 
     pub async fn from_room(room: &Room, user_id: &UserId) -> Option<Self> {
@@ -7181,6 +7654,20 @@ impl UserPowerLevels {
     pub fn can_pin(self) -> bool {
         self.contains(UserPowerLevels::RoomPinnedEvents)
     }
+
+    pub fn is_mod_or_admin(self) -> bool {
+        self.contains(UserPowerLevels::ModOrAdmin)
+    }
+}
+
+/// The current user's power levels in the given room or space,
+/// posted whenever they change or a [`MatrixRequest::GetRoomPowerLevels`] request fetches them.
+///
+/// This is NOT a widget action.
+#[derive(Debug)]
+pub struct UserPowerLevelsUpdated {
+    pub room_id: OwnedRoomId,
+    pub user_power_levels: UserPowerLevels,
 }
 
 

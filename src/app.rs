@@ -9,17 +9,22 @@ use std::{
     time::Duration,
 };
 use makepad_widgets::*;
-use matrix_sdk::{RoomState, encryption::recovery::RecoveryState, ruma::{MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId}};
+use matrix_sdk::{encryption::recovery::RecoveryState, ruma::{MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId}};
+use matrix_sdk_ui::sync_service::State as SyncServiceState;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use crate::{
     block_user_modal::{BlockUserModalAction, BlockUserModalWidgetRefExt},
+    moderation_modal::{ModerationModalAction, ModerationModalWidgetRefExt},
+    remove_messages_modal::{RemoveMessagesModalAction, RemoveMessagesModalWidgetRefExt},
     avatar_cache::{clear_avatar_cache, process_avatar_updates}, room_preview_cache::{clear_room_preview_cache, process_room_preview_updates}, home::{
-        event_source_modal::{EventSourceModalAction, EventSourceModalWidgetRefExt}, home_screen::{MainViewVariantChangedAction, ScreenRestoredAction}, invite_modal::{InviteModalAction, InviteModalWidgetRefExt}, main_desktop_ui::MainDesktopUiAction, nav_history::{GoForwardAction, NavHistory, can_navigate_history}, nav_history_buttons::enable_nav_history_buttons, nav_history_menu::{ShowNavHistoryMenuAction, show_nav_history_menu}, navigation_tab_bar::{NavigationBarAction, SelectedTab}, new_message_context_menu::NewMessageContextMenuWidgetRefExt, room_context_menu::RoomContextMenuWidgetRefExt, room_screen::{DropDecodedImagesAction, InviteAction, MessageAction, clear_timeline_states, invalidate_single_timeline_state, drop_docked_pane_data}, rooms_list::{RoomsListAction, RoomsListRef, RoomsListUpdate, clear_all_invited_rooms, enqueue_rooms_list_update}, rooms_list_header::{RoomListSyncStatusGlobal, RoomsListHeaderAction, get_last_synced_at}
+        create_room_modal::{CreateRoomModalAction, CreateRoomModalWidgetRefExt}, event_source_modal::{EventSourceModalAction, EventSourceModalWidgetRefExt}, home_screen::{MainViewVariantChangedAction, ScreenRestoredAction}, invite_modal::{InviteModalAction, InviteModalWidgetRefExt}, leave_space_modal::{LeaveSpaceModalAction, LeaveSpaceModalWidgetRefExt}, main_desktop_ui::MainDesktopUiAction, nav_history::{GoForwardAction, NavHistory, can_navigate_history}, nav_history_menu::{ShowNavHistoryMenuAction, show_nav_history_menu}, navigation_tab_bar::{NavigationBarAction, SelectedTab}, new_message_context_menu::NewMessageContextMenuWidgetRefExt, room_context_menu::RoomContextMenuWidgetRefExt, room_screen::{DropDecodedImagesAction, InviteAction, MessageAction, clear_timeline_states, invalidate_single_timeline_state, drop_docked_pane_data}, rooms_list::{RoomsListAction, RoomsListRef, clear_all_invited_rooms}, rooms_list_header::{RoomsListHeaderAction, SyncStatusGlobal, get_last_synced_at}, space_lobby::clear_space_lobby_states, title_bar_buttons::enable_title_bar_buttons
     }, join_leave_room_modal::{
-        JoinLeaveModalKind, JoinLeaveRoomModalAction, JoinLeaveRoomModalWidgetRefExt
-    }, login::login_screen::LoginAction, logout::logout_confirm_modal::{LogoutAction, LogoutConfirmModalAction, LogoutConfirmModalWidgetRefExt}, persistence::{self, WindowGeomTracker}, profile::user_profile_cache::{clear_user_profile_cache, process_user_profile_updates}, room::{BasicRoomDetails, room_pane::{self, PaneLayout, RoomPaneKind}}, settings::{app_preferences::{AppPreferences, AppPreferencesGlobal, Appearance, AppearanceGlobal, UiZoom, set_img_msg_fit_max_height}, encryption_settings::{EncryptionModalAction, EncryptionModalWidgetRefExt}}, shared::{confirmation_modal::{ConfirmationModalContent, ConfirmationModalWidgetRefExt}, context_menu::{ContextMenuClosed, close_context_menus, is_context_menu_shown, menu_position_margin}, image_viewer::{ImageViewerAction, LoadState}, popup_list::{PopupKind, enqueue_popup_notification}, room_picker_modal::{RoomPickerModalAction, RoomPickerModalWidgetRefExt}, speech_text_input::cancel_all_dictation}, sliding_sync::{DirectMessageRoomAction, MatrixRequest, RecoveryAction, TimelineKind, current_user_id, submit_async_request}, utils::RoomNameId, verification::VerificationAction, verification_modal::{
+        JoinLeaveRoomModalAction, JoinLeaveRoomModalWidgetRefExt
+    }, login::login_screen::LoginAction, logout::logout_confirm_modal::{LogoutAction, LogoutConfirmModalAction, LogoutConfirmModalWidgetRefExt}, persistence::{self, WindowGeomTracker}, profile::{user_profile_cache::{clear_user_profile_cache, process_user_profile_updates}, user_verification_cache::{clear_user_verification_cache, process_user_verification_updates}}, room::{BasicRoomDetails, room_pane::{self, PaneLayout, RoomPaneKind}}, settings::{app_preferences::{AppPreferences, AppPreferencesGlobal, Appearance, AppearanceGlobal, UiZoom, set_img_msg_fit_max_height}, encryption_settings::{EncryptionModalAction, EncryptionModalWidgetRefExt}, text_rendering::apply_simpler_text_rendering}, shared::{confirmation_modal::{ConfirmationModalContent, ConfirmationModalWidgetRefExt}, context_menu::{ContextMenuClosed, close_context_menus, get_keyboard_height, is_context_menu_shown, menu_position_margin}, image_viewer::{ImageViewerAction, LoadState}, inline_image::clear_inline_image_cache, popup_list::{PopupKind, enqueue_popup_notification}, room_picker_modal::{RoomPickerModalAction, RoomPickerModalWidgetRefExt}, recent_emojis::{RecentEmojis, RecentEmojisAction, clear_recent_emojis, handle_recent_emojis_action, restore_recent_emojis, save_recent_emojis}, speech_text_input::cancel_all_dictation}, sliding_sync::{DirectMessageRoomAction, MatrixRequest, RecoveryAction, TimelineKind, current_user_id, submit_async_request}, utils::RoomNameId, verification::{UserVerificationRequestAction, VerificationAction}, verification_modal::{
         VerificationModalAction,
         VerificationModalWidgetRefExt,
+        show_dm_room_creation_confirmation,
     }
 };
 use crate::shared::file_upload_modal::{FileUploadModalWidgetRefExt, FileUploadModalAction};
@@ -45,7 +50,7 @@ script_mod! {
                         }
                         View {
                             width: Fill, height: Fit
-                            nav_history_buttons := NavHistoryButtons {}
+                            title_bar_buttons := TitleBarButtons { is_in_caption_bar: true }
                         }
                     }
                     // The min/max/close buttons only show up on Windows and on Linux without native decorations.
@@ -75,16 +80,9 @@ script_mod! {
                 }
 
                 body +: {
-                    // Only the top part of safe area inset padding is applied here,
-                    // since we don't have any bar or anything on the top.
-                    // The other sides are handled by widgets that might draw in those areas,
+                    // All safe area insets are handled by widgets that might draw in those areas,
                     // like the NavigationTabBar or room screen content.
-                    padding: Inset{
-                        top: (mod.widgets.SAFE_INSET_PAD_TOP),
-                        bottom: 0,
-                        left: 0,
-                        right: 0,
-                    }
+                    padding: 0
                     keyboard_min_shift: 12.0
 
                     overlay_container := View {
@@ -100,6 +98,7 @@ script_mod! {
                         }
                         login_screen_view := View {
                             visible: true
+                            margin: Inset{top: (mod.widgets.SAFE_INSET_PAD_TOP)}
                             login_screen := LoginScreen {}
                         }
 
@@ -116,6 +115,7 @@ script_mod! {
                         new_message_context_menu := NewMessageContextMenu { }
                         room_context_menu := RoomContextMenu { }
                         nav_history_menu := NavHistoryMenu { }
+                        emoji_picker_popup := EmojiPickerPopup { }
 
                         // A modal to confirm sending out an invite to a room.
                         invite_confirmation_modal := Modal {
@@ -135,6 +135,16 @@ script_mod! {
                         // A modal to pick one of the user's joined rooms.
                         room_picker_modal := Modal {
                             content := RoomPickerModal {}
+                        }
+
+                        // A modal to leave a space and choose which of its rooms to also leave.
+                        leave_space_modal := Modal {
+                            content := LeaveSpaceModal {}
+                        }
+
+                        // A modal to create a new room.
+                        create_room_modal := Modal {
+                            content := CreateRoomModal {}
                         }
 
                         // Show the logout confirmation modal.
@@ -175,6 +185,16 @@ script_mod! {
                         // A modal to confirm blocking or unblocking a user.
                         block_user_modal := Modal {
                             content := BlockUserModal {}
+                        }
+
+                        // A modal to confirm a moderation action, with an optional reason for it.
+                        moderation_modal := Modal {
+                            content := ModerationModal {}
+                        }
+
+                        // A modal to choose which of a user's messages to remove, and to show that happening.
+                        remove_messages_modal := Modal {
+                            content := RemoveMessagesModal {}
                         }
 
                         // A modal to preview and confirm file uploads.
@@ -236,6 +256,7 @@ script_mod! {
 // This runs before App::script_mod, so even the first frame uses the saved appearance.
 app_main!(App, configure: |cx| {
     cx.set_global(AppearanceGlobal(persistence::load_appearance()));
+    apply_simpler_text_rendering(cx, persistence::load_simpler_text_rendering());
 });
 
 #[derive(Script)]
@@ -244,10 +265,6 @@ pub struct App {
     /// The top-level app state, shared across various parts of the app.
     #[rust] app_state: AppState,
     #[rust] lifecycle: AppLifecycle,
-    /// The details of a room we're waiting on to be loaded so that we can navigate to it.
-    /// This can be either a room we're waiting to join, or one we're waiting to be invited to.
-    /// Also includes an optional room ID to be closed once the awaited room has been loaded.
-    #[rust] waiting_to_navigate_to_room: Option<(BasicRoomDetails, Option<OwnedRoomId>)>,
     /// Latest known window geometry (size, fullscreen/maximized, etc).
     #[rust] window_geom: WindowGeomTracker,
 }
@@ -265,6 +282,7 @@ impl ScriptHook for App {
         vm.with_cx_mut(|cx| {
             crate::shared::popup_list::set_global_popup_list(cx, &self.ui);
             crate::shared::mention_popup::set_global_mention_popup(cx, &self.ui);
+            crate::shared::emoji_picker_popup::set_global_emoji_picker_popup(cx, &self.ui);
         });
     }
 }
@@ -330,6 +348,7 @@ impl MatchEvent for App {
     fn handle_signal(&mut self, cx: &mut Cx) {
         // Apply background updates to these caches before any widget sees this Signal.
         process_user_profile_updates(cx);
+        process_user_verification_updates(cx);
         process_avatar_updates(cx);
         process_room_preview_updates(cx);
     }
@@ -388,6 +407,8 @@ impl MatchEvent for App {
                     #[cfg(feature = "a2app")]
                     crate::a2app::instances::quit_everything(cx);
                     self.ui.modal(cx, ids!(verification_modal)).close(cx);
+                    self.ui.remove_messages_modal(cx, ids!(remove_messages_modal.content)).reset();
+                    self.ui.modal(cx, ids!(remove_messages_modal)).close(cx);
                     self.app_state = Default::default();
                     // We also need to broadcast those default values out,
                     // such that all other widgets can be reset to their default state.
@@ -429,10 +450,19 @@ impl MatchEvent for App {
                 // which will open the login_status_modal to show the failure message.
             }
 
-            // The RoomsListHeader doesn't exist until the home screen is first drawn,
-            // so we keep the latest sync status for it to show once it's created.
+            // Sync indicators like the RoomsListHeader may not exist yet,
+            // so we keep the latest sync status for them to show once they're created.
             if let Some(RoomsListHeaderAction::SetSyncStatus(status)) = action.downcast_ref() {
-                cx.global::<RoomListSyncStatusGlobal>().0 = Some(status.clone());
+                cx.global::<SyncStatusGlobal>().room_list_sync_status = Some(status.clone());
+                // When shaders get built in the background, we create the Settings page once we're synced,
+                // so its shaders are ready before it's first opened.
+                if status.is_fully_synced && cx.is_building_shaders_in_background() {
+                    cx.action(NavigationBarAction::PrepareSettings);
+                }
+                continue;
+            }
+            if let Some(RoomsListHeaderAction::StateUpdate(state)) = action.downcast_ref() {
+                cx.global::<SyncStatusGlobal>().is_offline = matches!(state, SyncServiceState::Offline);
                 continue;
             }
 
@@ -445,17 +475,13 @@ impl MatchEvent for App {
             }
 
             // Handle an action requesting to open the new message context menu.
-            if let MessageAction::OpenMessageContextMenu { details, abs_pos } = action.as_widget_action().cast() {
+            if let MessageAction::OpenMessageContextMenu { details, abs_pos, own_reactions } = action.as_widget_action().cast() {
                 self.ui.callout_tooltip(cx, ids!(app_tooltip)).hide(cx);
-                let new_message_context_menu = self.ui.new_message_context_menu(cx, ids!(new_message_context_menu));
-                let expected_dimensions = new_message_context_menu.show(cx, details);
                 // Use the overlay container's rect (not the window's) to correctly position
                 // the context menu relative to the body area, which excludes the caption bar.
                 let rect = self.ui.view(cx, ids!(overlay_container)).area().rect(cx);
-                let margin = menu_position_margin(rect, abs_pos, expected_dimensions);
-                if let Some(mut main_content) = new_message_context_menu.view(cx, ids!(main_content)).borrow_mut() {
-                    main_content.walk.margin = margin;
-                }
+                self.ui.new_message_context_menu(cx, ids!(new_message_context_menu))
+                    .show(cx, details, &own_reactions, abs_pos, rect);
                 self.ui.redraw(cx);
                 continue;
             }
@@ -468,7 +494,7 @@ impl MatchEvent for App {
                 // Use the overlay container's rect (not the window's) to correctly position
                 // the context menu relative to the body area, which excludes the caption bar.
                 let rect = self.ui.view(cx, ids!(overlay_container)).area().rect(cx);
-                let margin = menu_position_margin(rect, pos, expected_dimensions);
+                let margin = menu_position_margin(cx, rect, pos, expected_dimensions);
                 if let Some(mut main_content) = room_context_menu.view(cx, ids!(main_content)).borrow_mut() {
                     main_content.walk.margin = margin;
                 }
@@ -477,6 +503,11 @@ impl MatchEvent for App {
             }
 
             if action.downcast_ref::<ContextMenuClosed>().is_some() {
+                continue;
+            }
+
+            if let Some(recent_emojis_action) = action.downcast_ref::<RecentEmojisAction>() {
+                handle_recent_emojis_action(cx, recent_emojis_action);
                 continue;
             }
 
@@ -574,32 +605,19 @@ impl MatchEvent for App {
                     let logged_in_actual = self.app_state.logged_in;
                     // The recovery state isn't persisted, so keep what we already know.
                     let recovery_state = self.app_state.recovery_state;
-                    self.app_state = app_state.clone();
+                    self.app_state = (**app_state).clone();
                     self.app_state.logged_in = logged_in_actual;
                     self.app_state.recovery_state = recovery_state;
                     room_pane::restore_saved_layout(self.app_state.room_pane_layout);
+                    if let Some(user_id) = current_user_id() {
+                        restore_recent_emojis(cx, &user_id, self.app_state.recent_emojis.clone());
+                    }
                     // Broadcast the restored preferences first so listeners
                     // (e.g. the Dock's captured `room_screen` template) are
                     // refreshed before `LoadDockFromAppState` instantiates
                     // any tabs from them.
                     self.app_state.app_prefs.broadcast_all(cx);
                     cx.action(MainDesktopUiAction::LoadDockFromAppState);
-                    continue;
-                }
-                Some(AppStateAction::NavigateToRoom { room_to_close, destination_room }) => {
-                    self.navigate_to_room(cx, room_to_close.as_ref(), destination_room);
-                    continue;
-                }
-                // If we successfully loaded a room that we were waiting on,
-                // we can now navigate to it and optionally close a previous room.
-                Some(AppStateAction::RoomLoadedSuccessfully { room_name_id, .. }) if
-                    self.waiting_to_navigate_to_room.as_ref()
-                        .is_some_and(|(dr, _)| dr.room_id() == room_name_id.room_id()) =>
-                {
-                    log!("Loaded awaited room {room_name_id:?}, navigating to it now...");
-                    if let Some((dest_room, room_to_close)) = self.waiting_to_navigate_to_room.take() {
-                        self.navigate_to_room(cx, room_to_close.as_ref(), &dest_room);
-                    }
                     continue;
                 }
                 _ => {}
@@ -615,6 +633,41 @@ impl MatchEvent for App {
                 }
                 Some(BlockUserModalAction::Close) => {
                     self.ui.modal(cx, ids!(block_user_modal)).close(cx);
+                    continue;
+                }
+                _ => {}
+            }
+
+            // Handle actions needed to open/close the moderation modal.
+            match action.downcast_ref() {
+                Some(ModerationModalAction::Open(request)) => {
+                    self.ui.moderation_modal(cx, ids!(moderation_modal.content))
+                        .set_info(cx, request.clone());
+                    self.ui.modal(cx, ids!(moderation_modal)).open(cx);
+                    continue;
+                }
+                Some(ModerationModalAction::Close) => {
+                    self.ui.modal(cx, ids!(moderation_modal)).close(cx);
+                    continue;
+                }
+                _ => {}
+            }
+
+            // Handle actions needed to open/close and update the remove messages modal.
+            match action.downcast_ref() {
+                Some(RemoveMessagesModalAction::Open(request)) => {
+                    self.ui.remove_messages_modal(cx, ids!(remove_messages_modal.content))
+                        .show(cx, request.clone());
+                    self.ui.modal(cx, ids!(remove_messages_modal)).open(cx);
+                    continue;
+                }
+                Some(RemoveMessagesModalAction::Close) => {
+                    self.ui.modal(cx, ids!(remove_messages_modal)).close(cx);
+                    continue;
+                }
+                Some(RemoveMessagesModalAction::Update(update)) => {
+                    self.ui.remove_messages_modal(cx, ids!(remove_messages_modal.content))
+                        .handle_update(cx, update);
                     continue;
                 }
                 _ => {}
@@ -650,6 +703,10 @@ impl MatchEvent for App {
             }
             if let Some(VerificationModalAction::Close) = action.downcast_ref() {
                 self.ui.modal(cx, ids!(verification_modal)).close(cx);
+                continue;
+            }
+            if let Some(UserVerificationRequestAction::ConfirmDmRoomCreation { user_id, response_sender }) = action.downcast_ref() {
+                show_dm_room_creation_confirmation(cx, user_id, response_sender);
                 continue;
             }
             match action.downcast_ref() {
@@ -773,6 +830,35 @@ impl MatchEvent for App {
                 _ => {}
             }
 
+            // Handle actions needed to open/close the leave space modal.
+            match action.downcast_ref() {
+                Some(LeaveSpaceModalAction::Open(space_name_id)) => {
+                    self.ui.leave_space_modal(cx, ids!(leave_space_modal.content)).show(cx, space_name_id.clone());
+                    self.ui.modal(cx, ids!(leave_space_modal)).open(cx);
+                    continue;
+                }
+                Some(LeaveSpaceModalAction::Close) => {
+                    self.ui.modal(cx, ids!(leave_space_modal)).close(cx);
+                    continue;
+                }
+                _ => {}
+            }
+
+            // Handle actions needed to open/close the create room modal.
+            match action.downcast_ref() {
+                Some(CreateRoomModalAction::Open) => {
+                    // Opening a modal gives key focus to its content, so we show the form afterwards to focus its name input.
+                    self.ui.modal(cx, ids!(create_room_modal)).open(cx);
+                    self.ui.create_room_modal(cx, ids!(create_room_modal.content)).show(cx);
+                    continue;
+                }
+                Some(CreateRoomModalAction::Close) => {
+                    self.ui.modal(cx, ids!(create_room_modal)).close(cx);
+                    continue;
+                }
+                _ => {}
+            }
+
             // Handle EventSourceModalAction to open/close the event source modal.
             match action.downcast_ref() {
                 Some(EventSourceModalAction::Open { room_id, event_id, latest_json }) => {
@@ -790,8 +876,14 @@ impl MatchEvent for App {
 
             // Handle DirectMessageRoomActions
             match action.downcast_ref() {
-                Some(DirectMessageRoomAction::FoundExisting { room_name_id, .. }) => {
-                    self.navigate_to_room(cx, None, &BasicRoomDetails::RoomId(room_name_id.clone()));
+                Some(
+                    DirectMessageRoomAction::FoundExisting { room_name_id, .. }
+                    | DirectMessageRoomAction::NewlyCreated { room_name_id, .. }
+                ) => {
+                    cx.action(AppStateAction::NavigateToRoom {
+                        room_to_close: None,
+                        destination_room: BasicRoomDetails::RoomId(room_name_id.clone()),
+                    });
                 }
                 Some(DirectMessageRoomAction::DidNotExist { user_profile }) => {
                     let user_profile = user_profile.clone();
@@ -837,9 +929,6 @@ impl MatchEvent for App {
                         None,
                     );
                 }
-                Some(DirectMessageRoomAction::NewlyCreated { room_name_id, .. }) => {
-                    self.navigate_to_room(cx, None, &BasicRoomDetails::RoomId(room_name_id.clone()));
-                }
                 _ => {}
             }
 
@@ -850,7 +939,10 @@ impl MatchEvent for App {
             match action.downcast_ref() {
                 Some(crate::a2app::ai::rooms::AiRoomAction::Created { room_name_id }) => {
                     log!("AI Rooms: AI room created: {room_name_id:?}; navigating to it.");
-                    self.navigate_to_room(cx, None, &BasicRoomDetails::RoomId(room_name_id.clone()));
+                    cx.action(AppStateAction::NavigateToRoom {
+                        room_to_close: None,
+                        destination_room: BasicRoomDetails::RoomId(room_name_id.clone()),
+                    });
                 }
                 Some(crate::a2app::ai::rooms::AiRoomAction::CreateFailed { error }) => {
                     log!("AI Rooms: AI room creation FAILED: {error}");
@@ -871,10 +963,14 @@ impl MatchEvent for App {
 fn clear_all_app_state(cx: &mut Cx) {
     room_pane::clear_all();
     clear_user_profile_cache(cx);
+    clear_user_verification_cache(cx);
     clear_all_invited_rooms(cx);
     clear_timeline_states(cx);
+    clear_space_lobby_states(cx);
     clear_avatar_cache(cx);
+    clear_inline_image_cache(cx);
     clear_room_preview_cache(cx);
+    clear_recent_emojis(cx);
 }
 
 #[derive(Debug)]
@@ -918,6 +1014,10 @@ impl AppStateSaveFingerprint {
 impl AppMain for App {
     fn script_mod(vm: &mut ScriptVm) -> makepad_widgets::ScriptValue {
         let appearance = vm.cx_mut().global::<AppearanceGlobal>().0;
+        vm.cx_mut().set_native_appearance(match appearance {
+            Appearance::Light => NativeAppearance::Light,
+            Appearance::Dark => NativeAppearance::Dark,
+        });
         // Order matters: base widgets first, then app widgets, then app UI.
         makepad_widgets::theme_mod(vm);
         match appearance {
@@ -951,6 +1051,8 @@ impl AppMain for App {
         crate::room::script_mod(vm);
         crate::join_leave_room_modal::script_mod(vm);
         crate::block_user_modal::script_mod(vm);
+        crate::moderation_modal::script_mod(vm);
+        crate::remove_messages_modal::script_mod(vm);
         crate::verification_modal::script_mod(vm);
         crate::profile::script_mod(vm);
         crate::home::script_mod(vm);
@@ -964,7 +1066,7 @@ impl AppMain for App {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
-        // The mentionable popup needs special top-level handling to close it if needed.
+        // The mentionable and emoji picker popups need special top-level handling to close them if needed.
         if matches!(event, Event::Draw(_) | Event::BackPressed { .. })
             || matches!(event, Event::KeyDown(key) if key.key_code == KeyCode::Escape)
         {
@@ -972,6 +1074,7 @@ impl AppMain for App {
             if cx.has_global::<MentionablePopupRef>() {
                 cx.get_global::<MentionablePopupRef>().clone().close_if_input_inactive(cx);
             }
+            crate::shared::emoji_picker_popup::get_emoji_picker_popup(cx).close_if_owner_inactive(cx);
         }
 
         if let Event::LiveEdit = event {
@@ -982,6 +1085,11 @@ impl AppMain for App {
         if let Event::WindowGeomChange(e) = event {
             self.app_state.app_prefs.refresh_ui_zoom_override(cx);
             self.window_geom.observe(&e.new_geom);
+        }
+
+        // The soft keyboard moves everything under a shown tooltip, which would then point at the wrong spot.
+        if get_keyboard_height(event).is_some() {
+            self.ui.callout_tooltip(cx, ids!(app_tooltip)).hide(cx);
         }
 
         self.handle_ui_zoom_shortcuts(cx, event);
@@ -1024,9 +1132,9 @@ impl AppMain for App {
         }
 
         // Now that the rest of the app has handled these actions, we can
-        // enable/disable the nav buttons in the title bar based on nav history state.
-        if let Event::Actions(_) = event && self.ui.view(cx, ids!(caption_bar)).visible() {
-            enable_nav_history_buttons(cx, &self.ui, &self.app_state);
+        // enable/disable the nav buttons based on nav history state.
+        if let Event::Actions(_) = event {
+            enable_title_bar_buttons(cx, &self.ui, &self.app_state);
         }
     }
 }
@@ -1182,6 +1290,11 @@ impl App {
 
         self.app_state.room_pane_layout = room_pane::saved_layout();
         self.app_state.last_synced_at = get_last_synced_at(cx).or(self.app_state.last_synced_at);
+        self.app_state.recent_emojis = save_recent_emojis(cx, &user_id);
+        // The rooms list isn't created until it's first shown.
+        if cx.has_global::<RoomsListRef>() {
+            cx.get_global::<RoomsListRef>().clone().save_space_graph(cx, &user_id);
+        }
         let app_state_json = match persistence::serialize_app_state(&self.app_state) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -1259,79 +1372,6 @@ impl App {
         self.ui.view(cx, ids!(home_screen_view)).set_visible(cx, !show_login);
     }
 
-    /// Navigates to the given `destination_room`, optionally closing the `room_to_close`.
-    fn navigate_to_room(
-        &mut self,
-        cx: &mut Cx,
-        room_to_close: Option<&OwnedRoomId>,
-        destination_room: &BasicRoomDetails,
-    ) {
-        // A closure that closes the given `room_to_close`, if it exists in an open tab.
-        let close_room_closure_opt = room_to_close.map(|to_close| {
-            let tab_id = LiveId::from_str(to_close.as_str());
-            let widget_uid = self.ui.widget_uid();
-            move |cx: &mut Cx| {
-                cx.widget_action(
-                    widget_uid, 
-                    DockAction::TabCloseWasPressed(tab_id),
-                );
-                enqueue_rooms_list_update(RoomsListUpdate::HideRoom { room_id: to_close.clone() });
-            }
-        });
-
-        let destination_room_id = destination_room.room_id();
-        let room_state = cx.get_global::<RoomsListRef>().get_room_state(destination_room_id);
-        let new_selected_room = match room_state {
-            Some(RoomState::Joined) => SelectedRoom::JoinedRoom {
-                room_name_id: destination_room.room_name_id().clone(),
-            },
-            Some(RoomState::Invited) => SelectedRoom::InvitedRoom {
-                room_name_id: destination_room.room_name_id().clone(),
-            },
-            // If the destination room is not yet loaded, show a join modal.
-            _ => {
-                log!("Destination room {:?} not loaded, showing join modal...", destination_room.room_name_id());
-                self.waiting_to_navigate_to_room = Some((
-                    destination_room.clone(),
-                    room_to_close.cloned(),
-                ));
-                cx.action(JoinLeaveRoomModalAction::Open {
-                    kind: JoinLeaveModalKind::JoinRoom {
-                        details: destination_room.clone(),
-                        is_space: false,
-                        via: destination_room.via().to_vec(),
-                    },
-                    show_tip: false,
-                });
-                return;
-            }
-        };
-
-
-        log!("Navigating to destination room {:?}, closing room {:?}",
-            destination_room.room_name_id(),
-            room_to_close,
-        );
-
-        // Before we navigate to the room, if the AddRoom tab is currently shown,
-        // then we programmatically navigate to the Home tab to show the actual room.
-        // The Mini Apps and Settings tabs would hide that room too.
-        if matches!(self.app_state.selected_tab, SelectedTab::AddRoom | SelectedTab::MiniApps | SelectedTab::Settings) {
-            cx.action(NavigationBarAction::GoToHome);
-        }
-        cx.widget_action(
-            self.ui.widget_uid(), 
-            RoomsListAction::Selected(new_selected_room),
-        );
-        // Select and scroll to the destination room in the rooms list.
-        enqueue_rooms_list_update(RoomsListUpdate::ScrollToRoom(destination_room_id.clone()));
-
-        // Close a previously/currently-open room if specified.
-        if let Some(closure) = close_room_closure_opt {
-            closure(cx);
-        }
-    }
-
 
 }
 
@@ -1383,9 +1423,15 @@ pub struct AppState {
     /// The layout that the user last chose for docked room panes.
     #[serde(default, deserialize_with = "crate::utils::deserialize_or_default")]
     pub room_pane_layout: Option<PaneLayout>,
+    /// Whether the user collapsed the rooms sidebar in desktop view mode, which applies to every space's dock.
+    #[serde(default, deserialize_with = "crate::utils::deserialize_or_default")]
+    pub is_rooms_sidebar_collapsed: bool,
     /// When we last got a sync response, as of the last time this app state was saved.
     #[serde(default, deserialize_with = "crate::utils::deserialize_or_default")]
     pub last_synced_at: Option<MilliSecondsSinceUnixEpoch>,
+    /// The emoji that the user picked in Robrix, as of the last time this app state was saved.
+    #[serde(default, deserialize_with = "crate::utils::deserialize_or_default")]
+    pub recent_emojis: RecentEmojis,
 }
 
 /// A snapshot of the main dock: all state needed to restore the dock tabs/layout.
@@ -1394,7 +1440,7 @@ pub struct SavedDockState {
     /// All items contained in the dock, keyed by their room or space ID.
     pub dock_items: HashMap<LiveId, DockItem>,
     /// The rooms that are currently open, keyed by their room or space ID.
-    pub open_rooms: HashMap<LiveId, SelectedRoom>,
+    pub open_rooms: FxHashMap<LiveId, SelectedRoom>,
     /// The order in which room/thread tabs were last viewed,
     /// from oldest at the front to most recent at the end.
     pub room_order: Vec<SelectedRoom>,
@@ -1644,6 +1690,7 @@ impl Eq for SelectedRoom {}
 ///
 /// These are *NOT* widget actions.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum AppStateAction {
     /// The given room was focused (selected).
     RoomFocused(SelectedRoom),
@@ -1661,7 +1708,7 @@ pub enum AppStateAction {
     RoomNameUpdated(RoomNameId),
     /// The given app state was loaded from persistent storage
     /// and is ready to be restored.
-    RestoreAppStateFromPersistentState(AppState),
+    RestoreAppStateFromPersistentState(Box<AppState>),
     /// The given room was successfully loaded from the homeserver
     /// and is now known to our client.
     ///
@@ -1675,6 +1722,10 @@ pub enum AppStateAction {
     NavigateToRoom {
         room_to_close: Option<OwnedRoomId>,
         destination_room: BasicRoomDetails,
+    },
+    /// A request to show the given joined space's lobby within the top-level space that it's in.
+    NavigateToSpace {
+        space_name_id: RoomNameId,
     },
     None,
 }

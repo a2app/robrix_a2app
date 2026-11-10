@@ -1,7 +1,7 @@
 use makepad_widgets::*;
-use matrix_sdk::ruma::OwnedEventId;
+use matrix_sdk::{RoomState, ruma::{OwnedEventId, OwnedRoomId}};
 #[cfg(feature = "a2app")]
-use {matrix_sdk::ruma::OwnedRoomId, std::collections::HashSet};
+use std::collections::HashSet;
 
 use crate::{
     app::{AppState, AppStateAction, SelectedRoom},
@@ -9,32 +9,39 @@ use crate::{
         nav_history::{GoBackAction, GoForwardAction, can_show, is_same_place},
         nav_history_menu::{LongPressWatcher, NavHistoryDirection, request_nav_history_menu},
         add_room::AddRoomScreenWidgetRefExt,
-        invite_screen::InviteScreenWidgetRefExt,
+        invite_screen::{InviteScreenWidgetRefExt, JoinRoomResultAction},
         navigation_tab_bar::{NavigationBarAction, SelectedTab},
         room_pane_screen::{RoomPaneScreenAction, RoomPaneScreenWidgetRefExt},
         room_screen::{NavigateToLinkAction, RoomScreenWidgetRefExt},
-        rooms_list::{AcceptedInviteKind, RoomsListAction, RoomsListRef},
+        rooms_list::{AcceptedInviteKind, RoomsListAction, RoomsListRef, RoomsListUpdate, enqueue_rooms_list_update},
+        rooms_list_header::RoomsListHeaderAction,
         space_lobby::SpaceLobbyScreenWidgetRefExt,
-        spaces_bar::SpacesBarAction,
+        spaces_bar::{SpacesBarAction, SpacesListUpdate, enqueue_spaces_list_update},
+        sync_indicator_bar::SyncIndicatorBarWidgetRefExt,
     },
+    join_leave_room_modal::{JoinLeaveModalKind, JoinLeaveRoomModalAction},
     logout::logout_confirm_modal::LogoutAction,
-    room::{pane_dock::{RoomPaneDockAction, SavedPaneContent}, pinned_messages_list::PinnedMessagesListAction, room_action_bar::{RoomActionBarAction, RoomActionBarWidgetRefExt}, room_pane::{self, RoomPaneKind}},
+    room::{BasicRoomDetails, pane_dock::{RoomPaneDockAction, SavedPaneContent}, pinned_messages_list::PinnedMessagesListAction, room_action_bar::{RoomActionBarAction, RoomActionBarWidgetRefExt}, room_pane::{self, RoomPaneKind}},
     settings::{
         app_preferences::{AppPreferencesGlobal, AppPreferencesAction, ViewModeOverride},
         settings_screen::SettingsScreenWidgetRefExt,
     },
     shared::mention_popup::MentionablePopupRef,
     shared::speech_text_input::cancel_all_dictation,
-    sliding_sync::TimelineKind,
+    sliding_sync::{MatrixRequest, OutdatedRoomNotLoaded, TimelineKind, submit_async_request},
+    space_service_sync::{SpaceRequest, SpaceRoomListAction},
     utils::{self, RoomNameId},
 };
+
+/// How far the spaces bar's shadow reaches around it.
+pub(crate) const SPACES_BAR_SHADOW_RADIUS: f64 = 15.0;
 
 script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
 
 
-    // Defines the total height of the StackNavigationView's header.
+    // Defines the height of the StackNavigationView's header, not counting the status bar area above it.
     // This has to be set in multiple places because of how StackNavigation
     // uses an Overlay view internally.
     mod.widgets.STACK_VIEW_HEADER_HEIGHT = 45
@@ -46,8 +53,9 @@ script_mod! {
         width: Fill, height: Fill
         draw_bg.color: (COLOR_PRIMARY)
         header +: {
-            height: (mod.widgets.STACK_VIEW_HEADER_HEIGHT),
-            padding: 0
+            // The header's background extends up through the status bar area.
+            height: (mod.widgets.STACK_VIEW_HEADER_HEIGHT + mod.widgets.SAFE_INSET_PAD_TOP),
+            padding: Inset{top: (mod.widgets.SAFE_INSET_PAD_TOP)}
             align: Align{y: 0.5}
 
             // Below is a shader to draw a shadow under the bottom half of the header
@@ -99,7 +107,7 @@ script_mod! {
         body +: {
             // The top margin leaves room for the stack nav header.
             // The other padding is for safe inset areas.
-            margin: Inset{top: (mod.widgets.STACK_VIEW_HEADER_HEIGHT)}
+            margin: Inset{top: (mod.widgets.STACK_VIEW_HEADER_HEIGHT + mod.widgets.SAFE_INSET_PAD_TOP)}
             padding: Inset{
                 left: (mod.widgets.SAFE_INSET_PAD_LEFT),
                 right: (mod.widgets.SAFE_INSET_PAD_RIGHT),
@@ -124,8 +132,29 @@ script_mod! {
             border_radius: 4.0
             border_size: 0.0
             shadow_color: (COLOR_SHADOW)
-            shadow_radius: 15.0
+            shadow_radius: #(SPACES_BAR_SHADOW_RADIUS)
             shadow_offset: vec2(1.0, 0.0)
+
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size3)
+                // The box reaches one anti-aliasing ramp below the bar, so its bottom row stays solid
+                // where it meets the nav bar, and the content beneath can't show through that seam.
+                sdf.box(
+                    self.sdf_rect_pos.x
+                    self.sdf_rect_pos.y
+                    self.sdf_rect_size.x
+                    self.sdf_rect_size.y + 1.0 / sdf.aa
+                    max(1.0 self.border_radius)
+                )
+                if sdf.shape > -1.0 {
+                    let m = self.shadow_radius
+                    let o = self.shadow_offset + self.rect_shift
+                    let v = GaussShadow.rounded_box_shadow(vec2(m) + o self.rect_size2+o self.pos * (self.rect_size3+vec2(m)) self.shadow_radius*0.5 self.border_radius*2.0)
+                    sdf.clear(self.shadow_color * v)
+                }
+                sdf.fill_keep(self.color)
+                return sdf.result
+            }
         }
 
         CachedWidget {
@@ -163,7 +192,8 @@ script_mod! {
                 flow: Right
                 align: Align{x: 0.0, y: 0.0}
                 padding: 0,
-                margin: 0,
+                // This keeps the desktop layout out of a tablet's status bar area.
+                margin: Inset{top: (mod.widgets.SAFE_INSET_PAD_TOP)},
 
                 show_bg: true
                 draw_bg +: {
@@ -204,6 +234,9 @@ script_mod! {
                             margin: Inset{left: -1.5, right: -1.5}
                             spacing: 2
                             align: Align{y: 0.5}
+
+                            // These are only shown if there's no window caption bar to show them, like on Android.
+                            title_bar_buttons := LargeTitleBarButtons { visible: false, margin: Inset{left: 1.2} }
 
                             CachedWidget {
                                 room_filter_input_bar := RoomFilterInputBar { is_main_filter: true }
@@ -279,65 +312,73 @@ script_mod! {
                         flow: Down
                         width: Fill, height: Fill
 
-                        // At the top of the root view, we use the PageFlip widget to show either
-                        // the main list of rooms or the settings screen.
-                        home_screen_page_flip := PageFlip {
-                            width: Fill, height: Fill
-                            padding: Inset{
-                                left: (mod.widgets.SAFE_INSET_PAD_LEFT),
-                                right: (mod.widgets.SAFE_INSET_PAD_RIGHT),
-                            }
+                        // Scrolling down a page slides the bottom bars (and the rooms list's header) out of view.
+                        mod.widgets.HideOnScrollView {
+                            content +: {
+                                // At the top of the root view, we use the PageFlip widget to show either
+                                // the main list of rooms or the settings screen.
+                                home_screen_page_flip := PageFlip {
+                                    width: Fill, height: Fill
+                                    padding: Inset{
+                                        left: (mod.widgets.SAFE_INSET_PAD_LEFT),
+                                        right: (mod.widgets.SAFE_INSET_PAD_RIGHT),
+                                    }
 
-                            lazy_init: true,
-                            active_page: @home_page
+                                    lazy_init: true,
+                                    active_page: @home_page
 
-                            home_page := View {
-                                width: Fill, height: Fill
-                                // Note: while the other page views have top padding, we do NOT add that here
-                                // because it is added in the `RoomsSideBar`'s `RoundedShadowView` itself.
-                                flow: Down
+                                    home_page := View {
+                                        width: Fill, height: Fill
+                                        // Note: while the other page views have top padding, we do NOT add that here
+                                        // because it is added in the header that the `HideOnScrollView` draws over this page.
+                                        flow: Down
 
-                                mod.widgets.RoomsSideBar {}
-                            }
+                                        mod.widgets.RoomsSideBar {}
+                                    }
 
-                            settings_page := View {
-                                width: Fill, height: Fill
+                                    settings_page := View {
+                                        width: Fill, height: Fill
 
-                                CachedWidget {
-                                    settings_screen := mod.widgets.SettingsScreen {}
+                                        CachedWidget {
+                                            settings_screen := mod.widgets.SettingsScreen {}
+                                        }
+                                    }
+
+                                    add_room_page := View {
+                                        width: Fill, height: Fill
+
+                                        CachedWidget {
+                                            add_room_screen := mod.widgets.AddRoomScreen {}
+                                        }
+                                    }
+
+                                    mini_apps_page := View {
+                                        width: Fill, height: Fill
+
+                                        CachedWidget {
+                                            mini_apps_screen := mod.widgets.MiniAppsScreen {}
+                                        }
+                                    }
                                 }
                             }
 
-                            add_room_page := View {
-                                width: Fill, height: Fill
-
+                            bottom_bars +: {
+                                // Show the SpacesBar right above the navigation tab bar.
+                                // We wrap it in the SpacesBarWrapper in order to animate it in or out,
+                                // and wrap *that* in a CachedWidget in order to maintain its shown/hidden state
+                                // across AdaptiveView transitions between Mobile view mode and Desktop view mode.
+                                //
+                                // ... Then we wrap *that* in a ... <https://www.youtube.com/watch?v=evUWersr7pc>
                                 CachedWidget {
-                                    add_room_screen := mod.widgets.AddRoomScreen {}
+                                    spaces_bar_wrapper := mod.widgets.SpacesBarWrapper {}
+                                }
+
+                                // At the bottom of the root view, show the navigation tab bar horizontally.
+                                CachedWidget {
+                                    navigation_tab_bar := mod.widgets.NavigationTabBar {}
                                 }
                             }
 
-                            mini_apps_page := View {
-                                width: Fill, height: Fill
-
-                                CachedWidget {
-                                    mini_apps_screen := mod.widgets.MiniAppsScreen {}
-                                }
-                            }
-                        }
-
-                        // Show the SpacesBar right above the navigation tab bar.
-                        // We wrap it in the SpacesBarWrapper in order to animate it in or out,
-                        // and wrap *that* in a CachedWidget in order to maintain its shown/hidden state
-                        // across AdaptiveView transitions between Mobile view mode and Desktop view mode.
-                        //
-                        // ... Then we wrap *that* in a ... <https://www.youtube.com/watch?v=evUWersr7pc>
-                        CachedWidget {
-                            spaces_bar_wrapper := mod.widgets.SpacesBarWrapper {}
-                        }
-
-                        // At the bottom of the root view, show the navigation tab bar horizontally.
-                        CachedWidget {
-                            navigation_tab_bar := mod.widgets.NavigationTabBar {}
                         }
                     }
 
@@ -345,11 +386,17 @@ script_mod! {
                         RoomScreenStackNavigationView := mod.widgets.RobrixStackNavigationView {
                             header +: {
                                 height: Fit
+                                flow: Down
                                 content := mod.widgets.RoomActionBarHeader {
                                     padding: Inset{
                                         left: (mod.widgets.SAFE_INSET_PAD_LEFT),
                                         right: (mod.widgets.SAFE_INSET_PAD_RIGHT),
                                     }
+                                }
+                                // The sync indicator bar overlaps the header's bottom edge, so only its taller
+                                // offline bar makes the header grow, and `set_mobile_stack_sync_bar_height()` moves the room down for it.
+                                sync_indicator_bar := mod.widgets.SyncIndicatorBar {
+                                    margin: Inset{top: -3}
                                 }
                             }
                             body +: {
@@ -570,6 +617,35 @@ mod navigation_tests {
     }
 
     #[test]
+    fn leaving_space_expires_mobile_consent_when_history_pruning_closes_its_last_screen() {
+        for is_desktop in [false, true] {
+            for keeps_pane_open in [false, true] {
+                let (mut cx, home, _) = fixture(is_desktop);
+                let space = RoomNameId::empty("!left-space-session:example.org".try_into().unwrap());
+                let left_space = SelectedRoom::Space { space_name_id: space.clone() };
+                let mut app_state = AppState {
+                    selected_room: keeps_pane_open.then(|| SelectedRoom::RoomPane {
+                        room_name_id: space.clone(), kind: RoomPaneKind::Members,
+                    }),
+                    ..Default::default()
+                };
+                app_state.nav_history.back.push(Some(left_space.clone()));
+                app_state.nav_history.forward.push(Some(left_space));
+
+                let left = cx.capture_actions(|cx| cx.action(SpaceRoomListAction::LeaveSpaceResult {
+                    space_name_id: space.clone(), result: Ok(()),
+                }));
+                let response = deliver(&mut cx, &home, &mut app_state, left);
+                assert!(app_state.nav_history.back.is_empty() && app_state.nav_history.forward.is_empty());
+                let room_closed = response.iter().any(|action| matches!(action.downcast_ref(),
+                    Some(crate::a2app::runtime::A2AppOp::RoomClosed { room_id, .. }) if room_id == space.room_id()));
+                assert_eq!(room_closed, !is_desktop && !keeps_pane_open,
+                    "mobile history keeps consent alive until its final screen closes; desktop owns its sessions");
+            }
+        }
+    }
+
+    #[test]
     fn swipe_back_expires_room_consent_only_when_committed_and_no_screen_keeps_the_room_open() {
         for is_committed in [false, true] {
             for keeps_previous_room in [false, true] {
@@ -704,41 +780,15 @@ mod navigation_tests {
 
 
 /// A simple wrapper around the SpacesBar that allows us to animate showing or hiding it.
-#[derive(Script, Widget, Animator)]
+#[derive(Script, ScriptHook, Widget, Animator)]
 pub struct SpacesBarWrapper {
     #[source] source: ScriptObjectRef,
     #[deref] view: View,
     #[apply_default] animator: Animator,
     /// Whether we drew the spaces bar last time (it's not drawn while hidden).
     #[rust] was_drawn: bool,
-}
-
-impl ScriptHook for SpacesBarWrapper {
-    fn on_after_apply(
-        &mut self,
-        vm: &mut ScriptVm,
-        apply: &Apply,
-        _scope: &mut Scope,
-        _value: ScriptValue,
-    ) {
-        // When the widget tree is re-applied (e.g. after a preference change),
-        // the deref `view` resets its height to the DSL default,
-        // which clashes with whatever animator state we were in (shown, hidden).
-        // Thus, we re-apply the current animator state to prevent a hidden SpacesBar
-        // from briefly becoming shown before being hidden again.
-        // Cutting to it also takes its values (e.g., colors) from the new template,
-        // but we let an in-progress show/hide finish rather than cut it short.
-        if !apply.is_reload() || self.animator.is_track_animating(live_id!(spaces_bar_animator)) {
-            return;
-        }
-        vm.with_cx_mut(|cx| {
-            if self.animator_in_state(cx, ids!(spaces_bar_animator.show)) {
-                self.animator_cut(cx, ids!(spaces_bar_animator.show));
-            } else {
-                self.animator_cut(cx, ids!(spaces_bar_animator.hide));
-            }
-        });
-    }
+    /// The room that the spaces bar keeps taking up while it replays its show animation.
+    #[rust] held_height: f64,
 }
 
 impl Widget for SpacesBarWrapper {
@@ -763,11 +813,46 @@ impl Widget for SpacesBarWrapper {
             return DrawStep::done();
         }
         self.was_drawn = true;
+        // While it replays its show animation, it grows within the room it already took up,
+        // so the content beneath it doesn't jump.
+        let mut walk = walk;
+        if self.animator_in_state(cx, ids!(spaces_bar_animator.show))
+            && let Size::Fixed(height) = walk.height
+            && height < self.held_height
+        {
+            walk.margin.top += self.held_height - height;
+        } else {
+            self.held_height = 0.0;
+        }
         self.view.draw_walk(cx, scope, walk)
     }
 }
 
 impl SpacesBarWrapperRef {
+    /// Moves the spaces bar down by `offset`, without changing how much room it takes up.
+    pub fn set_slide_offset(&self, offset: f64) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.view.walk.margin.top = offset;
+            inner.view.walk.margin.bottom = -offset;
+        }
+    }
+
+    /// Whether the spaces bar is shown or animating in, even if it's out of view.
+    pub fn is_shown(&self, cx: &Cx) -> bool {
+        self.borrow().is_some_and(|inner| inner.animator_in_state(cx, ids!(spaces_bar_animator.show)))
+    }
+
+    /// Shows the spaces bar by animating it in from fully hidden, even if it was already shown but out of view.
+    pub fn show_from_hidden(&self, cx: &mut Cx) {
+        if let Some(mut inner) = self.borrow_mut() {
+            if let Size::Fixed(height) = inner.view.walk.height {
+                inner.held_height = height;
+            }
+            inner.animator_cut(cx, ids!(spaces_bar_animator.hide));
+        }
+        self.show_or_hide(cx, true);
+    }
+
     /// Shows or hides the spaces bar by animating it in or out.
     fn show_or_hide(&self, cx: &mut Cx, show: bool) {
         let Some(mut inner) = self.borrow_mut() else { return };
@@ -836,7 +921,6 @@ pub struct HomeScreen {
     /// Note that the current selected tap is stored in `AppState` so that
     /// other widgets can easily access it.
     #[rust] previous_selection: SelectedTab,
-    #[rust] is_spaces_bar_shown: bool,
 
     /// The Home or Space tab that was previously selected before the transition
     /// to mobile view mode or before another transition (like going to AddRoom).
@@ -863,6 +947,14 @@ pub struct HomeScreen {
     ///
     /// `Some(None)` means the root view (the rooms list).
     #[rust] interactive_pop_place: Option<Option<SelectedRoom>>,
+
+    /// The screen that a trackpad swipe is pushing in over the current screen (or the rooms list).
+    #[rust] interactive_push_place: Option<SelectedRoom>,
+
+    /// The details of a room we're waiting on to be loaded so that we can navigate to it.
+    /// This can be either a room we're waiting to join, or one we're waiting to be invited to.
+    /// Also includes an optional room ID to be closed once the awaited room has been loaded.
+    #[rust] waiting_to_navigate_to_room: Option<(BasicRoomDetails, Option<OwnedRoomId>)>,
 }
 
 impl ScriptHook for HomeScreen {
@@ -961,9 +1053,8 @@ impl Widget for HomeScreen {
                         }
                     }
                     Some(NavigationBarAction::ToggleSpacesBar) => {
-                        self.is_spaces_bar_shown = !self.is_spaces_bar_shown;
-                        self.view.spaces_bar_wrapper(cx, ids!(spaces_bar_wrapper))
-                            .show_or_hide(cx, self.is_spaces_bar_shown);
+                        let spaces_bar_wrapper = self.view.spaces_bar_wrapper(cx, ids!(spaces_bar_wrapper));
+                        spaces_bar_wrapper.show_or_hide(cx, !spaces_bar_wrapper.is_shown(cx));
                     }
                     Some(NavigationBarAction::PrepareSettings) => {
                         // Calling `page()` instantiates the settings page (if needed) but doesn't show it.
@@ -1073,6 +1164,49 @@ impl Widget for HomeScreen {
                             Self::drop_resources_left_behind(cx, app_state, [revealed_place, None]);
                         }
                     }
+                    // A trackpad swipe started dragging a screen in over the current one,
+                    // so we show the place that going forwards one step would show.
+                    StackNavigationTransitionAction::InteractivePushStarted => {
+                        let stack_navigation = self.view.stack_navigation(cx, ids!(view_stack));
+                        let current_screen = app_state.selected_room.as_ref().filter(|_| stack_navigation.current_view().is_some());
+                        // Going forwards to the rooms list pops the current screen, so a swipe can't do that.
+                        if matches!(app_state.selected_tab, SelectedTab::Home | SelectedTab::Space { .. })
+                            && let Some(Some(next_screen)) = app_state.nav_history.next_place(current_screen, 1, can_show(cx))
+                            && let Some(view_id) = self.populate_mobile_stack_view(cx, &stack_navigation, &next_screen, true)
+                        {
+                            stack_navigation.set_interactive_push_view(cx, view_id);
+                            self.interactive_push_place = Some(next_screen);
+                        } else {
+                            stack_navigation.cancel_interactive_push(cx);
+                        }
+                    }
+                    StackNavigationTransitionAction::InteractivePushCommitted => {
+                        let stack_navigation = self.view.stack_navigation(cx, ids!(view_stack));
+                        let current_screen = app_state.selected_room.clone().filter(|_| stack_navigation.current_view().is_some());
+                        let next_place = app_state.nav_history.next_place(current_screen.as_ref(), 1, can_show(cx));
+                        // Going forwards may lead elsewhere at this point. For ex, if the pushed room was left.
+                        if let Some(Some(next_screen)) = next_place
+                            && self.interactive_push_place.take_if(
+                                |pushed_screen| is_same_place(Some(pushed_screen), Some(&next_screen))
+                            ).is_some()
+                        {
+                            cancel_all_dictation();
+                            let old_screens = Self::screens_with_resources(app_state);
+                            app_state.selected_room = Some(next_screen);
+                            app_state.nav_history.record_going_forward_from(current_screen, 1, can_show(cx));
+                            Self::drop_resources_left_behind(cx, app_state, old_screens);
+                            if let Some(view_id) = stack_navigation.destination_view() {
+                                stack_navigation.view_by_id(cx, view_id).room_screen(cx, ids!(room_screen)).mark_as_opened(cx);
+                            }
+                        } else {
+                            stack_navigation.cancel_interactive_push(cx);
+                        }
+                    }
+                    StackNavigationTransitionAction::InteractivePushCancelled => {
+                        if let Some(pushed_screen) = self.interactive_push_place.take() {
+                            Self::drop_resources_left_behind(cx, app_state, [Some(pushed_screen), None]);
+                        }
+                    }
                     _ => {}
                 }
 
@@ -1171,6 +1305,15 @@ impl Widget for HomeScreen {
                     }
                 }
 
+                // A sync status change can show or hide the offline bar in each room's header.
+                if action.downcast_ref::<RoomsListHeaderAction>().is_some() {
+                    let stack_navigation = self.view.stack_navigation(cx, ids!(view_stack));
+                    for view_id in stack_navigation.dynamic_stack_view_ids() {
+                        let stack_view = stack_navigation.view_by_id(cx, view_id);
+                        Self::set_mobile_stack_sync_bar_height(cx, &stack_view);
+                    }
+                }
+
                 // When a stack navigation pop is requested (back button pressed),
                 // reveal the previous screen from the nav history.
                 if let StackNavigationAction::Pop = action.as_widget_action().cast() {
@@ -1243,10 +1386,82 @@ impl Widget for HomeScreen {
                 if let Some(LogoutAction::ClearAppState { .. }) = action.downcast_ref() {
                     self.tab_to_restore_on_mobile = None;
                     // The login screen hides this view, so stop any in-progress backwards swipes.
-                    self.view.stack_navigation(cx, ids!(view_stack)).end_interactive_pop_without_animation(cx);
+                    self.view.stack_navigation(cx, ids!(view_stack)).end_interactive_transition_without_animation(cx);
                     self.interactive_pop_place = None;
+                    self.interactive_push_place = None;
                 }
 
+                match action.downcast_ref() {
+                    Some(AppStateAction::NavigateToRoom { room_to_close, destination_room }) => {
+                        let room_state = cx.get_global::<RoomsListRef>().get_room_state(destination_room.room_id());
+                        self.navigate_to_room(cx, app_state, room_to_close.as_ref(), destination_room, room_state);
+                    }
+                    Some(AppStateAction::NavigateToSpace { space_name_id }) => {
+                        self.navigate_to_space(cx, app_state, BasicRoomDetails::Name(space_name_id.clone()), None);
+                    }
+                    // If we successfully loaded a room that we were waiting on,
+                    // we can now navigate to it and optionally close a previous room.
+                    Some(AppStateAction::RoomLoadedSuccessfully { room_name_id, is_invite }) if
+                        self.waiting_to_navigate_to_room.as_ref()
+                            .is_some_and(|(dr, _)| dr.room_id() == room_name_id.room_id()) =>
+                    {
+                        log!("Loaded awaited room {room_name_id:?}, navigating to it now...");
+                        if let Some((dest_room, room_to_close)) = self.waiting_to_navigate_to_room.take() {
+                            // The rooms list might not have added this room yet, so we don't ask it for the room's state.
+                            let room_state = if *is_invite { RoomState::Invited } else { RoomState::Joined };
+                            self.navigate_to_room(cx, app_state, room_to_close.as_ref(), &dest_room, Some(room_state));
+                        }
+                    }
+                    _ => {}
+                }
+
+                // The room we're waiting to navigate to still isn't loaded, so we offer to join it.
+                if let Some(OutdatedRoomNotLoaded { room_id }) = action.downcast_ref()
+                    && let Some((destination_room, _)) = self.waiting_to_navigate_to_room.as_ref()
+                        .filter(|(dr, _)| dr.room_id() == room_id)
+                {
+                    log!("Destination room {:?} not loaded, showing join modal...", destination_room.room_name_id());
+                    cx.action(JoinLeaveRoomModalAction::Open {
+                        kind: JoinLeaveModalKind::JoinRoom {
+                            details: destination_room.clone(),
+                            is_space: destination_room.is_space(),
+                            via: destination_room.via().to_vec(),
+                        },
+                        show_tip: false,
+                    });
+                }
+
+                // Unlike a room, a space never gets loaded into the rooms list,
+                // so we navigate to a space as soon as we've joined it.
+                if let Some(JoinRoomResultAction::Joined { room_id, is_space: true }) = action.downcast_ref()
+                    && let Some((space, room_to_close)) = self.waiting_to_navigate_to_room
+                        .take_if(|(dr, _)| dr.room_id() == room_id)
+                {
+                    self.navigate_to_space(cx, app_state, space, room_to_close);
+                }
+                // We now know where to show the joined space that we're navigating to.
+                if let Some(SpaceRoomListAction::JoinedSpaceAncestor { space_name_id, dock_space, .. }) = action.downcast_ref()
+                    && let Some((_, room_to_close)) = self.waiting_to_navigate_to_room
+                        .take_if(|(dr, _)| dr.room_id() == space_name_id.room_id())
+                {
+                    self.show_joined_space(cx, app_state, space_name_id, dock_space.as_ref(), room_to_close.as_ref());
+                }
+
+                // A space that the user just left can't stay on the mobile screen stack or in the nav history.
+                if let Some(SpaceRoomListAction::LeaveSpaceResult { space_name_id, result: Ok(()) }) = action.downcast_ref() {
+                    let left_space = SelectedRoom::Space { space_name_id: space_name_id.clone() };
+                    let is_mobile = !effective_is_desktop(cx);
+                    if is_mobile && app_state.selected_room.as_ref() == Some(&left_space) {
+                        self.pop_selected_screen_view(cx, app_state, 1);
+                    }
+                    #[cfg(feature = "a2app")]
+                    let old_room_ids = is_mobile.then(|| Self::room_ids_in_mobile_navigation(app_state));
+                    app_state.nav_history.remove(&left_space, app_state.selected_room.as_ref());
+                    #[cfg(feature = "a2app")]
+                    if let Some(old_room_ids) = old_room_ids {
+                        Self::close_room_sessions_left_behind(cx, app_state, old_room_ids);
+                    }
+                }
             }
 
             // Once the rooms list is shown again and stack nav finished its transition animation,
@@ -1471,9 +1686,21 @@ impl HomeScreen {
 
     fn set_mobile_stack_header_height(cx: &mut Cx, stack_view: &WidgetRef, height: f64) {
         if let Some(mut body) = stack_view.view(cx, ids!(body)).borrow_mut() {
-            body.walk.margin.top = height;
+            // The header also covers the status bar area above its content.
+            body.walk.margin.top = height + cx.display_context.safe_area_insets.top;
         }
         stack_view.redraw(cx);
+    }
+
+    /// Moves a room down to below its header's sync indicator bar, which makes the header taller while we're offline.
+    fn set_mobile_stack_sync_bar_height(cx: &mut Cx, stack_view: &WidgetRef) {
+        let height = stack_view.sync_indicator_bar(cx, ids!(header.sync_indicator_bar)).extra_height(cx);
+        if let Some(mut body) = stack_view.view(cx, ids!(body)).borrow_mut()
+            && body.layout.padding.top != height
+        {
+            body.layout.padding.top = height;
+            body.redraw(cx);
+        }
     }
 
     /// Populates a `StackNavigationView` with the given room/screen's info.
@@ -1497,11 +1724,12 @@ impl HomeScreen {
                     return None;
                 };
                 Self::hide_displayed_stack_screen(cx, &stack_navigation_view);
-                stack_navigation_view.room_action_bar(cx, ids!(header.content))
-                    .set_expanded(cx, false, false);
-                stack_navigation_view.room_action_bar(cx, ids!(header.content))
-                    .set_room_context(Some(room_name_id), false);
+                let room_action_bar = stack_navigation_view.room_action_bar(cx, ids!(header.content));
+                room_action_bar.set_expanded(cx, false, false);
+                room_action_bar.set_room_id(cx, Some(room_name_id.room_id().clone()));
+                room_action_bar.set_room_context(Some(room_name_id), false);
                 Self::set_mobile_stack_header_height(cx, &stack_navigation_view, 45.0);
+                Self::set_mobile_stack_sync_bar_height(cx, &stack_navigation_view);
                 let thread_root = if let SelectedRoom::Thread { thread_root_event_id, .. } = selected_screen {
                     Some(thread_root_event_id.clone())
                 } else {
@@ -1538,6 +1766,7 @@ impl HomeScreen {
                 let header = stack_navigation_view.room_action_bar(cx, ids!(header.content));
                 header.set_expanded(cx, false, false);
                 header.set_room_context(Some(space_name_id), true);
+                header.set_room_id(cx, Some(space_name_id.room_id().clone()));
                 Self::set_mobile_stack_header_height(cx, &stack_navigation_view, 45.0);
                 stack_navigation_view
                     .space_lobby_screen(cx, ids!(space_lobby_screen))
@@ -1583,7 +1812,7 @@ impl HomeScreen {
 
     fn clear_mobile_navigation_state(&mut self, cx: &mut Cx) {
         let stack_navigation = self.view.stack_navigation(cx, ids!(view_stack));
-        stack_navigation.end_interactive_pop_without_animation(cx);
+        stack_navigation.end_interactive_transition_without_animation(cx);
         for view_id in stack_navigation.dynamic_stack_view_ids() {
             let stack_navigation_view = stack_navigation.view_by_id(cx, view_id);
             Self::hide_displayed_stack_screen(cx, &stack_navigation_view);
@@ -1594,6 +1823,7 @@ impl HomeScreen {
 
     fn hide_displayed_stack_screen(cx: &mut Cx, stack_navigation_view: &WidgetRef) {
         stack_navigation_view.room_action_bar(cx, ids!(header.content)).set_room_context(None, false);
+        stack_navigation_view.room_action_bar(cx, ids!(header.content)).set_room_id(cx, None);
         stack_navigation_view
             .room_screen(cx, ids!(room_screen))
             .hide_displayed_room(cx);
@@ -1690,7 +1920,7 @@ impl HomeScreen {
             if let AcceptedInviteKind::Space { dock_space: Some(dock_space) } = &kind {
                 self.switch_to_tab(cx, app_state, SelectedTab::Space { space_name_id: dock_space.clone() });
             }
-            self.view.stack_navigation(cx, ids!(view_stack)).end_interactive_pop_without_animation(cx);
+            self.view.stack_navigation(cx, ids!(view_stack)).end_interactive_transition_without_animation(cx);
             // The joined screen takes the invite screen's place, so going back won't show the invite.
             self.push_selected_screen_view(
                 cx,
@@ -1719,8 +1949,8 @@ impl HomeScreen {
         if let Some(pane_screen) = pane_screen {
             pane_screen.vacate(cx);
         }
-        let timeline_kind = room_pane::popped_out_from(room_name_id.room_id(), &kind);
-        if self.return_pane_to_screen(cx, app_state, room_pane::timeline_screen(&room_name_id, &timeline_kind)) {
+        let (screen, timeline_kind) = room_pane::get_return_destination(cx, &room_name_id, &kind);
+        if self.return_pane_to_screen(cx, app_state, screen) {
             room_pane::dock_when_shown(cx, timeline_kind, kind, saved);
         }
     }
@@ -1772,6 +2002,136 @@ impl HomeScreen {
             }
         }
         is_pushed
+    }
+
+    /// Selects the given screen, which `MainDesktopUI` shows in desktop view mode.
+    /// In mobile view mode, we push it right away so we don't restore the screen that was behind AddRoom instead.
+    fn select_screen(&mut self, cx: &mut Cx, app_state: &mut AppState, screen: SelectedRoom) {
+        if effective_is_desktop(cx) {
+            cx.widget_action(self.widget_uid(), RoomsListAction::Selected(screen));
+        } else {
+            self.navigate_to_screen(cx, app_state, screen);
+        }
+    }
+
+    /// Navigates to the given `destination_room`, optionally closing the `room_to_close`.
+    ///
+    /// The `room_state` is `None` if the room isn't loaded yet.
+    fn navigate_to_room(
+        &mut self,
+        cx: &mut Cx,
+        app_state: &mut AppState,
+        room_to_close: Option<&OwnedRoomId>,
+        destination_room: &BasicRoomDetails,
+        room_state: Option<RoomState>,
+    ) {
+        let destination_room_id = destination_room.room_id();
+        let new_selected_room = match room_state {
+            Some(RoomState::Joined) => SelectedRoom::JoinedRoom {
+                room_name_id: destination_room.room_name_id().clone(),
+            },
+            Some(RoomState::Invited) => SelectedRoom::InvitedRoom {
+                room_name_id: destination_room.room_name_id().clone(),
+            },
+            // Joined spaces aren't in the rooms list.
+            _ if destination_room.is_joined_space() => {
+                self.navigate_to_space(cx, app_state, destination_room.clone(), room_to_close.cloned());
+                return;
+            }
+            // The rooms list never loads an outdated room (one that a newer room replaced), so we ask for this
+            // room to be loaded in case it's one of those. If it isn't, and we haven't joined it, we offer to join it.
+            _ => {
+                log!("Destination room {:?} not loaded, checking if it's an outdated room...", destination_room.room_name_id());
+                self.waiting_to_navigate_to_room = Some((
+                    destination_room.clone(),
+                    room_to_close.cloned(),
+                ));
+                submit_async_request(MatrixRequest::LoadOutdatedRoom { room_id: destination_room_id.clone() });
+                return;
+            }
+        };
+
+
+        log!("Navigating to destination room {:?}, closing room {:?}",
+            destination_room.room_name_id(),
+            room_to_close,
+        );
+
+        // Before we navigate to the room, if the AddRoom tab is currently shown,
+        // then we programmatically navigate to the Home tab to show the actual room.
+        // The Mini Apps and Settings tabs would hide that room too.
+        if matches!(app_state.selected_tab, SelectedTab::AddRoom | SelectedTab::MiniApps | SelectedTab::Settings) {
+            self.switch_to_tab(cx, app_state, SelectedTab::Home);
+        }
+        self.select_screen(cx, app_state, new_selected_room);
+        // Select and scroll to the destination room in the rooms list.
+        enqueue_rooms_list_update(RoomsListUpdate::ScrollToRoom(destination_room_id.clone()));
+
+        // Close a previously/currently-open room if specified.
+        if let Some(room_to_close) = room_to_close {
+            self.close_room(cx, room_to_close);
+        }
+    }
+
+    /// Navigates to the given joined space, optionally closing the `room_to_close`.
+    ///
+    /// We first have to find out which top-level space it's in, since we show it there.
+    fn navigate_to_space(
+        &mut self,
+        cx: &mut Cx,
+        app_state: &mut AppState,
+        space: BasicRoomDetails,
+        room_to_close: Option<OwnedRoomId>,
+    ) {
+        let space_name_id = space.room_name_id().clone();
+        let was_sent = cx.get_global::<RoomsListRef>().get_space_request_sender().is_some_and(|sender|
+            sender.send(SpaceRequest::ResolveJoinedSpaceAncestor {
+                space_name_id: space_name_id.clone(),
+                was_invite: false,
+            }).is_ok()
+        );
+        if was_sent {
+            self.waiting_to_navigate_to_room = Some((space, room_to_close));
+        } else {
+            error!("Couldn't determine where joined space {space_name_id} should be shown; opening it here.");
+            self.show_joined_space(cx, app_state, &space_name_id, None, room_to_close.as_ref());
+        }
+    }
+
+    /// Shows the given joined space's lobby within its top-level space, `dock_space`,
+    /// or within the current dock if that's unknown.
+    fn show_joined_space(
+        &mut self,
+        cx: &mut Cx,
+        app_state: &mut AppState,
+        space_name_id: &RoomNameId,
+        dock_space: Option<&RoomNameId>,
+        room_to_close: Option<&OwnedRoomId>,
+    ) {
+        log!("Navigating to joined space {space_name_id:?} within space {dock_space:?}");
+        match dock_space {
+            Some(dock_space) => {
+                self.switch_to_tab(cx, app_state, SelectedTab::Space { space_name_id: dock_space.clone() });
+                enqueue_spaces_list_update(SpacesListUpdate::ScrollToSpace(dock_space.room_id().clone()));
+            }
+            None if matches!(app_state.selected_tab, SelectedTab::AddRoom | SelectedTab::MiniApps | SelectedTab::Settings) => {
+                self.switch_to_tab(cx, app_state, SelectedTab::Home);
+            }
+            None => {}
+        }
+        self.select_screen(cx, app_state, SelectedRoom::Space { space_name_id: space_name_id.clone() });
+        if let Some(room_to_close) = room_to_close {
+            self.close_room(cx, room_to_close);
+        }
+    }
+
+    /// Closes the given room's tab, if it's open, and hides it from the rooms list.
+    fn close_room(&self, cx: &mut Cx, room_id: &OwnedRoomId) {
+        cx.widget_action(
+            self.widget_uid(),
+            DockAction::TabCloseWasPressed(LiveId::from_str(room_id.as_str())),
+        );
+        enqueue_rooms_list_update(RoomsListUpdate::HideRoom { room_id: room_id.clone() });
     }
 
     /// Returns the screens that keep their resources when in mobile view mode,

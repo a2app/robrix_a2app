@@ -124,6 +124,18 @@ The following table shows which host systems can currently be used to build Robr
      </details>
 
      <details>
+     <summary>OpenMandriva Lx (<code>dnf</code>)</summary>
+
+     ```sh
+     sudo dnf install --refresh clang make git cmake pkgconf \
+       lib64openssl-devel lib64x11-devel lib64xcursor-devel \
+       lib64asound-devel lib64pulseaudio-devel lib64wayland-devel \
+       lib64xkbcommon-devel
+     ```
+
+     </details>
+
+     <details>
      <summary>openSUSE / SUSE (<code>zypper</code>)</summary>
 
      On openSUSE, run:
@@ -360,7 +372,7 @@ These are generally sorted in order of priority. If you're interested in helping
 - [x] List of members within a room (https://github.com/project-robius/robrix/pull/1094)
 - [x] List of pinned messages within a room (https://github.com/project-robius/robrix/pull/1096)
 - [x] List of threads within a room (https://github.com/project-robius/robrix/pull/1101)
-- [ ] Administrative abilities: ban, kick, mass delete messages, etc
+- [x] Administrative abilities: ban, kick, mass delete messages, etc
 - [x] Offline mode with persistent event cache: https://github.com/project-robius/robrix/pull/445
 
 

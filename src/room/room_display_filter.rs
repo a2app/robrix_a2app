@@ -6,7 +6,7 @@ use matrix_sdk::{RoomDisplayName, ruma::{
     OwnedRoomAliasId, RoomAliasId, RoomId, events::tag::{TagName, Tags}
 }};
 
-use crate::{home::rooms_list::{InvitedRoomInfo, JoinedRoomInfo}, home::spaces_bar::JoinedSpaceInfo};
+use crate::{home::rooms_list::{InvitedRoomInfo, JoinedRoomInfo}, home::spaces_bar::JoinedSpaceInfo, sliding_sync::UserPowerLevels};
 
 static EMPTY_TAGS: Tags = BTreeMap::new();
 
@@ -16,10 +16,18 @@ pub trait FilterableRoom {
     fn room_name(&self) -> Cow<'_, str>;
     fn unread_mentions(&self) -> u64;
     fn unread_messages(&self) -> u64;
+    fn is_marked_unread(&self) -> bool;
     fn canonical_alias(&self) -> Option<Cow<'_, RoomAliasId>>;
     fn alt_aliases(&self) -> Cow<'_, [OwnedRoomAliasId]>;
     fn tags(&self) -> &Tags;
     fn is_direct(&self) -> bool;
+    fn is_invite(&self) -> bool;
+    fn user_power_levels(&self) -> Option<UserPowerLevels>;
+
+    /// Returns whether this room has any unread messages or mentions, or is marked as unread.
+    fn has_unreads(&self) -> bool {
+        self.is_marked_unread() || self.unread_mentions() > 0 || self.unread_messages() > 0
+    }
 }
 
 impl FilterableRoom for JoinedRoomInfo {
@@ -45,6 +53,10 @@ impl FilterableRoom for JoinedRoomInfo {
         self.num_unread_messages
     }
 
+    fn is_marked_unread(&self) -> bool {
+        self.is_marked_unread
+    }
+
     fn canonical_alias(&self) -> Option<Cow<'_, RoomAliasId>> {
         self.canonical_alias.as_deref().map(Cow::Borrowed)
     }
@@ -59,6 +71,14 @@ impl FilterableRoom for JoinedRoomInfo {
 
     fn is_direct(&self) -> bool {
         self.is_direct
+    }
+
+    fn is_invite(&self) -> bool {
+        false
+    }
+
+    fn user_power_levels(&self) -> Option<UserPowerLevels> {
+        self.user_power_levels
     }
 }
 
@@ -85,6 +105,10 @@ impl FilterableRoom for InvitedRoomInfo {
         0
     }
 
+    fn is_marked_unread(&self) -> bool {
+        false
+    }
+
     fn canonical_alias(&self) -> Option<Cow<'_, RoomAliasId>> {
         self.canonical_alias.as_deref().map(Cow::Borrowed)
     }
@@ -99,6 +123,14 @@ impl FilterableRoom for InvitedRoomInfo {
 
     fn is_direct(&self) -> bool {
         self.is_direct
+    }
+
+    fn is_invite(&self) -> bool {
+        true
+    }
+
+    fn user_power_levels(&self) -> Option<UserPowerLevels> {
+        None
     }
 }
 
@@ -125,6 +157,10 @@ impl FilterableRoom for JoinedSpaceInfo {
         0 // TODO: calculate unread messages for spaces
     }
 
+    fn is_marked_unread(&self) -> bool {
+        false
+    }
+
     fn canonical_alias(&self) -> Option<Cow<'_, RoomAliasId>> {
         self.canonical_alias.as_deref().map(Cow::Borrowed)
     }
@@ -139,6 +175,14 @@ impl FilterableRoom for JoinedSpaceInfo {
 
     fn is_direct(&self) -> bool {
         false
+    }
+
+    fn is_invite(&self) -> bool {
+        false
+    }
+
+    fn user_power_levels(&self) -> Option<UserPowerLevels> {
+        None
     }
 }
 

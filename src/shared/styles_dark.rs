@@ -1,4 +1,4 @@
-//! Dark mode overrides for the colors defined in `styles.rs`.
+//! Dark mode overrides for the colors and icons defined in `styles.rs`.
 
 use makepad_widgets::*;
 
@@ -76,9 +76,16 @@ script_mod! {
     mod.widgets.COLOR_ACTIVE_PRIMARY_HOVER = #x0367C4
     mod.widgets.COLOR_ACTIVE_PRIMARY_DOWN = #x035AAE
 
+    // Translucent tints of COLOR_ACTIVE_PRIMARY_DARKER, so they work atop any background.
+    mod.widgets.COLOR_BG_ACCENT_TINT = #x5AABFF26
+    mod.widgets.COLOR_BG_ACCENT_TINT_HOVER = #x5AABFF3D
+    mod.widgets.COLOR_BG_ACCENT_TINT_DOWN = #x5AABFF52
+
     mod.widgets.COLOR_BG_PREVIEW = #x2B3240
     // Looks like COLOR_BG_PREVIEW atop a pane, but it also tints a hovered or highlighted message behind it.
     mod.widgets.COLOR_BG_PREVIEW_TRANSLUCENT = #x4D8DFF1F
+    // The area behind a link preview's image, a bit lighter than the preview itself.
+    mod.widgets.COLOR_BG_LINK_PREVIEW_IMAGE = #x4D8DFF1A
 
     // The dark lavender of the room action buttons and room pane headers.
     mod.widgets.COLOR_BG_LAVENDER = #x342F42
@@ -90,6 +97,9 @@ script_mod! {
     mod.widgets.COLOR_BG_LAVENDER_SELECTED = #x7C5BD7
     mod.widgets.COLOR_BG_LAVENDER_SELECTED_HOVER = #x7451D5
     mod.widgets.COLOR_BG_LAVENDER_SELECTED_DOWN = #x6B46D2
+
+    // The border of a lavender button, which helps it stand out from a dark background.
+    mod.widgets.COLOR_LAVENDER_BUTTON_BORDER = #x5E5185
 
     mod.widgets.COLOR_BG_PREVIEW_HOVER = #x2A4236
     mod.widgets.COLOR_BG_PREVIEW_DOWN = #x264837
@@ -297,10 +307,10 @@ script_mod! {
     // A darker version of the main Robrix purple color
     mod.widgets.COLOR_LOGIN_BG_TOP = #x292536
     mod.widgets.COLOR_LOGIN_BG_BOTTOM = #x1C1C1C
+    mod.widgets.ICON_SWITCH_APPEARANCE = mod.res.crate_resource("self://resources/icons/sun.svg")
 
     mod.widgets.COLOR_SPACE_LOBBY_NAME_TEXT = #xE6E6E6
     mod.widgets.COLOR_SPACE_LOBBY_TREE_LINES = #x737373
-    mod.widgets.COLOR_SPACE_LOBBY_ENTRY_TEXT_ACTIVE = #xFFFFFF
 
     mod.widgets.COLOR_INVITE_SCREEN_TOPIC_TEXT = #xBDBDBD
 
@@ -396,6 +406,9 @@ script_mod! {
     // Toggles, checkboxes, and radio buttons.
     // The mark is a toggle's knob, a checkbox's check, or a radio button's dot.
     mod.widgets.COLOR_TOGGLE_BG = #xFFFFFF19
+    mod.widgets.COLOR_TOGGLE_BG_HOVER = #xFFFFFF2E
+    // A darker Robrix purple, for hovering over an enabled toggle.
+    mod.widgets.COLOR_TOGGLE_BG_ACTIVE_HOVER = #x4624A3
     mod.widgets.COLOR_TOGGLE_BG_DISABLED = #xFFFFFF08
     mod.widgets.COLOR_TOGGLE_BORDER = #xFFFFFF1F
     mod.widgets.COLOR_TOGGLE_BORDER_HOVER = #xFFFFFF3F
@@ -405,11 +418,6 @@ script_mod! {
     mod.widgets.COLOR_TOGGLE_TEXT = #xFFFFFFBF
     mod.widgets.COLOR_TOGGLE_TEXT_DISABLED = #xFFFFFF54
 
-    mod.widgets.COLOR_LINK_PREVIEW_TITLE_DOWN = #xFFFFFFBF
-    mod.widgets.COLOR_LINK_PREVIEW_TITLE_FOCUS = #xFFFFFF99
-    mod.widgets.COLOR_LINK_PREVIEW_UNDERLINE = #xFFFFFF99
-    mod.widgets.COLOR_LINK_PREVIEW_UNDERLINE_DOWN = #xFFFFFFBF
-
     mod.widgets.COLOR_MESSAGE_TABLE_HEADER_BG = #xFFFFFF0C
     mod.widgets.COLOR_MESSAGE_TABLE_BORDER = #xFFFFFF1F
 
@@ -417,6 +425,8 @@ script_mod! {
     mod.widgets.COLOR_NAVIGATION_TAB_BG = #x303030
     mod.widgets.COLOR_NAVIGATION_TAB_BG_HOVER = #x3D3D3DD8
     mod.widgets.COLOR_NAVIGATION_TAB_BG_ACTIVE = #x4D4D4D
+    mod.widgets.COLOR_NAVIGATION_PILL_BG = #x353535
+    mod.widgets.COLOR_NAVIGATION_PILL_RING = #xFFFFFF2E
 
     mod.widgets.COLOR_IMAGE_VIEWER_BACKGROUND = #x121212E6
 

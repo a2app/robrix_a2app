@@ -10,7 +10,7 @@ license = "MIT"
 readme = "README.md"
 categories = ["gui"]
 repository = "https://github.com/project-robius/robrix"
-version = "1.0.0-beta.4"
+version = "1.0.0-beta.6"
 metadata.makepad-auto-version = "zqpv-Yj-K7WNVK2I8h5Okhho46Q="
 
 [dependencies]
@@ -42,7 +42,7 @@ iana-time-zone = "0.1"
 clap = { version = "4.0.16", features = ["derive"] }
 crossbeam-channel = "0.5.10"
 crossbeam-queue = "0.3.8"
-emojis = "0.9.0" # same as matrix-sdk-ui
+emojis = { version = "0.9.0", features = ["serde"] } # same as matrix-sdk-ui
 eyeball = { version = "0.8.8", features = ["tracing"] } # same as matrix-sdk-ui
 eyeball-im = { version = "0.9.1", features = [ "tracing" ] } # same as matrix-sdk-ui
 futures = "0.3"
@@ -65,6 +65,8 @@ matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", default-fe
     "sso-login",
     ## The SDK no longer registers a rustls crypto provider unless we ask for one.
     "rustls-aws-lc-rs",
+    ## For the account's recently used emoji, which Element and other clients share.
+    "experimental-element-recent-emojis",
 ] }
 matrix-sdk-ui = { git = "https://github.com/matrix-org/matrix-rust-sdk", default-features = false }
 ## Use the same ruma version as what's specified in matrix-sdk's Cargo.toml.
@@ -83,11 +85,13 @@ ruma = { git = "https://github.com/ruma/ruma", rev = "f5e5e1c885f598036fd4326c56
 num_cpus = "1.17.0"
 rand = "0.8.5"
 rangemap = "1.5.0"
+rustc-hash = "2.1.1"
 sanitize-filename = "0.6"
 serde = "1.0"
 serde_json = "1.0"
+strpack = "0.1.0"
 thiserror = "2.0.16"
-tokio = { version = "1.43.1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.44.0", features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 unicode-segmentation = "1.11.0"
 url = "2.5.0"
@@ -220,7 +224,8 @@ ruma = { git = "https://github.com/project-robius/ruma.git", branch = "tsp" }
 ## Octos dependencies share upstream main after #2443 and #2455 merged;
 ## see `a2app/agent/Cargo.toml` for the exact confined-worker protocol revision.
 
-## Our PR <https://github.com/matrix-org/matrix-rust-sdk/pull/7198> plus more thread fixes and pagination completion fixes.
+## Our PR <https://github.com/matrix-org/matrix-rust-sdk/pull/7198> plus more thread fixes, pagination completion fixes,
+## and support for replying to state events.
 ## Remove this once they're all merged upstream.
 [patch."https://github.com/matrix-org/matrix-rust-sdk"]
 matrix-sdk = { git = "https://github.com/project-robius/matrix-rust-sdk", branch = "robrix_pagination_completion" }
@@ -315,6 +320,9 @@ icons = [
     "./resources/icon_256.png",
     "./resources/icon_512.png",
     "./resources/icon.ico",
+    ## macOS uses this as-is. We build it from the PNGs above with `iconutil`, since cargo-packager's
+    ## own `.icns` uses legacy image types that macOS 26 shrinks into a gray frame.
+    "./packaging/macos/Robrix.icns",
 ]
 out_dir = "./dist"
 
@@ -364,7 +372,7 @@ section = "utils"
 [package.metadata.packager.appimage]
 ## The host's Mesa EGL driver must use the host's own libwayland-client, so we don't bundle an older one.
 ## AppImage's excludelist skips it too, but the linuxdeploy that cargo-packager uses predates that.
-excluded_libs = ["libwayland-client.so.0"]
+excluded_libraries = ["libwayland-client.so.0"]
 
 [package.metadata.packager.appimage.files]
 "./packaging/rs.robius.robrix.metainfo.xml" = "/usr/share/metainfo/rs.robius.robrix.metainfo.xml"

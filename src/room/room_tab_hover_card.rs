@@ -1,9 +1,9 @@
 //! The room tab hover card is a little overlay view that shows a room's
 //! avatar and full name when the user hovers over that tab in the dock.
 
-use std::collections::HashMap;
 use makepad_widgets::*;
 use makepad_widgets::makepad_platform::event::ScrollPhase;
+use rustc_hash::FxHashMap;
 use crate::{app::SelectedRoom, room::FetchedRoomAvatar, shared::avatar::AvatarWidgetRefExt};
 
 script_mod! {
@@ -77,6 +77,8 @@ pub struct RoomTabHoverCard {
     /// The latest mouse pointer position, used to check whether the card should stay open.
     #[rust] pointer: Option<Vec2d>,
     #[rust] is_open: bool,
+    /// The card was hidden for another tooltip, so it reopens right away instead of waiting.
+    #[rust] reopen_without_delay: bool,
     /// The latest drawn tab ID, name, and avatar; avoids re-populating unchanged cards.
     #[rust] drawn_content: Option<(LiveId, String, Option<FetchedRoomAvatar>)>,
     /// The latest rect/bounds of the tab that this hover card is positioned next to.
@@ -130,6 +132,7 @@ impl RoomTabHoverCard {
     }
 
     fn hide(&mut self, cx: &mut Cx) {
+        self.reopen_without_delay = false;
         cx.stop_timer(self.show_timer);
         self.show_timer = Timer::empty();
         self.tab_id = None;
@@ -140,7 +143,7 @@ impl RoomTabHoverCard {
         }
     }
 
-    fn update_hover(&mut self, cx: &mut Cx, event: &Event, hover_available: bool, dock: &DockRef, rooms: &HashMap<LiveId, SelectedRoom>) {
+    fn update_hover(&mut self, cx: &mut Cx, event: &Event, hover_available: bool, dock: &DockRef, rooms: &FxHashMap<LiveId, SelectedRoom>) {
         if self.tab_id.is_some_and(|id| !rooms.contains_key(&id)) {
             self.hide(cx);
         }
@@ -182,7 +185,7 @@ impl RoomTabHoverCard {
                 } else if changed {
                     cx.stop_timer(self.show_timer);
                     self.show_timer = Timer::empty();
-                    if self.is_open {
+                    if self.is_open || std::mem::take(&mut self.reopen_without_delay) {
                         // Replace an open card immediately, without hiding it.
                         self.show_for_hovered_tab(cx, dock, rooms);
                     } else {
@@ -205,7 +208,7 @@ impl RoomTabHoverCard {
         }
     }
 
-    fn show_for_hovered_tab(&mut self, cx: &mut Cx, dock: &DockRef, rooms: &HashMap<LiveId, SelectedRoom>) {
+    fn show_for_hovered_tab(&mut self, cx: &mut Cx, dock: &DockRef, rooms: &FxHashMap<LiveId, SelectedRoom>) {
         let Some(tab_id) = self.tab_id else { return };
         let Some(room) = rooms.get(&tab_id) else { return };
         let name = room.display_name();
@@ -275,6 +278,15 @@ impl RoomTabHoverCard {
 }
 
 impl RoomTabHoverCardRef {
+    /// Hides the card while another tooltip covers its spot, so it comes right back once that's gone.
+    pub fn hide_for_tooltip(&self, cx: &mut Cx) {
+        if let Some(mut inner) = self.borrow_mut() {
+            let reopen = inner.is_open || inner.reopen_without_delay;
+            inner.hide(cx);
+            inner.reopen_without_delay = reopen;
+        }
+    }
+
     /// Handle scrolls over the card, and keep a trackpad touch from dismissing it.
     /// Returns true if the rest of the desktop view should skip this event.
     pub fn handle_scroll(&self, cx: &mut Cx, event: &Event, scope: &mut Scope, dock: &DockRef) -> bool {
@@ -302,7 +314,7 @@ impl RoomTabHoverCardRef {
         event: &Event,
         hover_available: bool,
         dock: &DockRef,
-        rooms: &HashMap<LiveId, SelectedRoom>,
+        rooms: &FxHashMap<LiveId, SelectedRoom>,
     ) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.update_hover(cx, event, hover_available, dock, rooms);

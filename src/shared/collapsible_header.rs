@@ -4,15 +4,12 @@
 //! This widget can be clicked to toggle between expanded and collapsed.
 //!
 //! The collapsible header is *just* the header, it doesn't actually contain any content.
-//! This design is necessary because the header is drawn within a PortalList,
-//! and its content is also drawn within that PortalList separately from its content.
 
 use makepad_widgets::*;
 use makepad_widgets::animator::Animate;
 
 
 use super::expand_arrow::ExpandArrow;
-use super::unread_badge::UnreadBadgeWidgetRefExt as _;
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -55,12 +52,9 @@ script_mod! {
             }
         }
 
-        unread_badge := UnreadBadge {
-            margin: Inset{right: 5.5},
-        }
     }
 
-    // The room-category header reused for disclosures in settings and dialogs.
+    // A disclosure header for settings and dialogs.
     mod.widgets.RobrixSettingsCollapsibleHeader = mod.widgets.CollapsibleHeader {
         height: 40, margin: 0
         title: "Details"
@@ -73,48 +67,13 @@ script_mod! {
                 text_style: SETTINGS_BOLD_TEXT_STYLE {}
             }
         }
-        unread_badge +: { visible: false }
-    }
-}
-
-/// The categories of collapsible headers in the rooms list.
-#[derive(Copy, Clone, Debug, Default)]
-pub enum HeaderCategory {
-    /// Rooms the user has been invited to but has not yet joined.
-    Invites,
-    /// Joined rooms that the user has marked as favorites.
-    Favorites,
-    /// Joined rooms that are direct messages with other users.
-    DirectRooms,
-    /// Joined rooms that are not direct messages or favorites.
-    RegularRooms,
-    /// Joined rooms that the user has marked as low priority.
-    LowPriority,
-    /// Rooms that the user has left.
-    LeftRooms,
-    #[default]
-    None,
-}
-impl HeaderCategory {
-    fn as_str(&self) -> &'static str {
-        match self {
-            HeaderCategory::Invites => "Invites",
-            HeaderCategory::Favorites => "Favorites",
-            HeaderCategory::RegularRooms => "Rooms",
-            HeaderCategory::DirectRooms => "People",
-            HeaderCategory::LowPriority => "Low Priority",
-            HeaderCategory::LeftRooms => "Left Rooms",
-            HeaderCategory::None => "",
-        }
     }
 }
 
 #[derive(Clone, Debug, Default)]
 pub enum CollapsibleHeaderAction {
     /// The header was clicked to toggled its expanded/collapsed state.
-    Toggled {
-        category: HeaderCategory,
-    },
+    Toggled,
     /// A standalone disclosure header changed its expanded state.
     ExpansionChanged(bool),
     #[default]
@@ -124,15 +83,12 @@ pub enum CollapsibleHeaderAction {
 #[derive(Script, Widget)]
 pub struct CollapsibleHeader {
     #[deref] view: View,
-    /// A standalone disclosure title; empty keeps the DSL label or room-category name.
+    /// A standalone disclosure title; empty keeps the DSL label.
     #[live] title: String,
     /// A reload (like a theme switch) resets `#[live]` fields,
     /// so this only seeds `is_expanded` once, when the header is created.
     #[live(true)] starts_expanded: bool,
     #[rust] is_expanded: bool,
-    #[rust] category: HeaderCategory,
-    #[rust] num_unread_mentions: u64,
-    #[rust] num_unread_messages: u64,
 }
 
 impl ScriptHook for CollapsibleHeader {
@@ -146,7 +102,7 @@ impl Widget for CollapsibleHeader {
         if !self.view.visible() { return; }
         // Handle hits on this view as a whole before passing the event to the inner view.
         match event.hits(cx, self.view.area()) {
-            Hit::FingerDown(..) => {
+            Hit::FingerDown(fe) if !fe.device.is_touch() => {
                 cx.set_key_focus(self.view.area());
             }
             Hit::FingerUp(fe)
@@ -172,12 +128,7 @@ impl Widget for CollapsibleHeader {
         }
         if !self.title.is_empty() {
             self.view.child_by_path(ids!(label)).set_text(cx, &self.title);
-        } else if !matches!(self.category, HeaderCategory::None) {
-            self.view.child_by_path(ids!(label)).set_text(cx, self.category.as_str());
         }
-        self.view.child_by_path(ids!(unread_badge))
-            .as_unread_badge()
-            .update_counts(false, self.num_unread_mentions, self.num_unread_messages);
         let step = self.view.draw_walk(cx, scope, walk);
         cx.add_nav_stop(self.view.area(), NavRole::TextInput, Inset::default());
         step
@@ -201,9 +152,7 @@ impl CollapsibleHeader {
         }
         self.redraw(cx);
         let action = if self.title.is_empty() {
-            CollapsibleHeaderAction::Toggled {
-                category: self.category,
-            }
+            CollapsibleHeaderAction::Toggled
         } else {
             CollapsibleHeaderAction::ExpansionChanged(self.is_expanded)
         };
@@ -222,7 +171,7 @@ impl CollapsibleHeaderRef {
         }
     }
 
-    /// Sets the disclosure's state without changing its title or category.
+    /// Sets the disclosure's state without changing its title.
     pub fn set_expanded(&self, cx: &mut Cx, is_expanded: bool, animate: Animate) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.set_expanded(cx, is_expanded, animate);
@@ -234,23 +183,6 @@ impl CollapsibleHeaderRef {
         match actions.find_widget_action(self.widget_uid()).cast() {
             CollapsibleHeaderAction::ExpansionChanged(expanded) => Some(expanded),
             _ => None,
-        }
-    }
-
-    /// Sets the category and expanded state of the header.
-    pub fn set_details(
-        &self,
-        _cx: &mut Cx,
-        is_expanded: bool,
-        category: HeaderCategory,
-        num_unread_mentions: u64,
-        num_unread_messages: u64,
-    ) {
-        if let Some(mut inner) = self.borrow_mut() {
-            inner.is_expanded = is_expanded;
-            inner.category = category;
-            inner.num_unread_mentions = num_unread_mentions;
-            inner.num_unread_messages = num_unread_messages;
         }
     }
 
@@ -275,7 +207,7 @@ mod tests {
                 WidgetRef::script_from_value(vm, category).as_collapsible_header())
         });
         assert!(!settings.borrow().unwrap().is_expanded);
-        assert!(category.borrow().unwrap().is_expanded, "room categories keep their existing default");
+        assert!(category.borrow().unwrap().is_expanded, "plain headers keep their existing default");
         let actions = cx.capture_actions(|cx| {
             settings.set_expanded(cx, true, Animate::No);
             settings.set_title(cx, "Permission details");
@@ -296,9 +228,9 @@ mod tests {
             assert_eq!(settings.expansion_changed(&actions), Some(expanded));
             assert_eq!(settings.borrow().unwrap().title, "Permission details");
         }
-        category.set_details(&mut cx, true, HeaderCategory::Favorites, 0, 0);
+        category.set_expanded(&mut cx, true, Animate::No);
         let actions = cx.capture_actions(|cx| category.borrow_mut().unwrap().toggle_collapse(cx, &mut Scope::empty()));
         assert!(matches!(actions.find_widget_action(category.widget_uid()).cast(),
-            CollapsibleHeaderAction::Toggled { category: HeaderCategory::Favorites }));
+            CollapsibleHeaderAction::Toggled));
     }
 }

@@ -5,7 +5,7 @@
 //! 1. a narrow vertical strip, when in Desktop (widescreen) mode,
 //! 2. a wide, short horizontal strip, when in Mobile (narrowscreen) mode.
 
-use std::{borrow::Cow, collections::HashMap};
+use std::borrow::Cow;
 
 use indexmap::IndexMap;
 
@@ -13,6 +13,7 @@ use crossbeam_queue::SegQueue;
 use makepad_widgets::*;
 use matrix_sdk::{RoomDisplayName, RoomState};
 use ruma::{OwnedRoomAliasId, OwnedRoomId, room::JoinRuleSummary};
+use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::{
     app::AppStateAction, home::{navigation_tab_bar::{NavigationBarAction, SelectedTab}, rooms_list::get_invited_rooms}, logout::logout_confirm_modal::LogoutAction, room::{FetchedRoomAvatar, room_display_filter::{RoomDisplayFilter, RoomDisplayFilterBuilder, RoomFilterCriteria, SortFn}}, settings::app_preferences::{AppPreferencesAction, ViewModeOverride}, shared::{avatar::AvatarWidgetExt, navigation_bar_button::NavigationBarButton, room_filter_input_bar::MainFilterAction, unread_badge::UnreadBadgeWidgetExt as _}, utils::{self, RoomNameId}
@@ -118,6 +119,8 @@ script_mod! {
         auto_tail: false,
         bounce_at_start: true,
         bounce_at_end: true,
+        // Lets a mouse wheel scroll the list sideways in the Mobile layout, where it's horizontal.
+        use_vertical_finger_scroll: true,
         // Nothing here listens for scroll position changes.
         emit_scroll_actions: false,
         scroll_bar: ScrollBar {  // hide the scroll bar
@@ -127,6 +130,11 @@ script_mod! {
 
         spaces_bar_entry := mod.widgets.SpacesBarEntry {}
         StatusLabel := mod.widgets.SpacesStatusLabel {}
+        // Just the X and "Clear", which wraps below the X in the narrow Desktop bar.
+        clear_filter_button := mod.widgets.CompactClearFilterButton {
+            width: Fill{max: 70}
+            margin: Inset{top: 2, bottom: 2, left: 6, right: 6}
+        }
         BottomFiller := View {
             width: (NAVIGATION_TAB_BAR_SIZE)
             height: (NAVIGATION_TAB_BAR_SIZE)
@@ -399,7 +407,7 @@ pub struct SpacesBar {
     /// The set of all joined spaces, keyed by space ID, with homeserver-based ordering.
     ///
     /// In the future we could allow the user to re-order this arbitrarily, or apply a sort fn.
-    #[rust] all_joined_spaces: IndexMap<OwnedRoomId, JoinedSpaceInfo>,
+    #[rust] all_joined_spaces: IndexMap<OwnedRoomId, JoinedSpaceInfo, FxBuildHasher>,
 
     /// The currently-active filter function for the list of spaces.
     ///
@@ -429,6 +437,9 @@ pub struct SpacesBar {
 
     /// The most recently applied view-mode override.
     #[rust] applied_view_mode: ViewModeOverride,
+
+    /// The list we drew last time, kept so that handling its actions doesn't need a lookup.
+    #[rust] spaces_list: PortalListRef,
 }
 
 impl SpacesBar {
@@ -448,6 +459,14 @@ impl Widget for SpacesBar {
         }
 
         if let Event::Actions(actions) = event {
+            // Handle the "Clear filter" button after the status label being clicked.
+            if self.is_filtered
+                && self.spaces_list.items_with_actions(actions).iter()
+                    .any(|(_, item)| item.as_button().clicked(actions))
+            {
+                cx.action(MainFilterAction::Clear);
+            }
+
             for action in actions {
                 // Only handle filter changes from the home screen's filter bar,
                 // not from any other RoomFilterInputBar instance (e.g., SpaceLobbyScreen's).
@@ -511,6 +530,7 @@ impl Widget for SpacesBar {
         while let Some(widget_to_draw) = self.view.draw_walk(cx, scope, walk).step() {
             // We only care about drawing the portal list.
             let portal_list_ref = widget_to_draw.as_portal_list();
+            self.spaces_list = portal_list_ref.clone();
             let Some(mut list) = portal_list_ref.borrow_mut() else { continue };
 
             // AdaptiveView + CachedWidget does not properly handle DSL-level style overrides,
@@ -520,8 +540,10 @@ impl Widget for SpacesBar {
 
             let num_invited = self.displayed_invited_spaces.len();
             let len = num_invited + self.displayed_joined_spaces.len();
+            // While filtering, the "Clear filter" button comes right after the status label.
+            let num_status_items = 1 + self.is_filtered as usize;
             if len == 0 {
-                list.set_item_range(cx, 0, 1);
+                list.set_item_range(cx, 0, num_status_items);
                 while let Some(portal_list_index) = list.next_visible_item(cx) {
                     let item = if portal_list_index == 0 {
                         let item = list.item(cx, portal_list_index, id!(StatusLabel));
@@ -534,6 +556,8 @@ impl Widget for SpacesBar {
                             }
                         );
                         item
+                    } else if self.is_filtered && portal_list_index == 1 {
+                        list.item(cx, portal_list_index, id!(clear_filter_button))
                     } else {
                         list.item(cx, portal_list_index, id!(BottomFiller))
                     };
@@ -541,7 +565,7 @@ impl Widget for SpacesBar {
                 }
             }
             else {
-                list.set_item_range(cx, 0, len + 1);
+                list.set_item_range(cx, 0, len + num_status_items);
                 while let Some(portal_list_index) = list.next_visible_item(cx) {
                     let item = if let Some(invite) = self.displayed_invited_spaces.get(portal_list_index) {
                         let item = list.item(cx, portal_list_index, id!(spaces_bar_entry));
@@ -573,7 +597,7 @@ impl Widget for SpacesBar {
                         let num_joined = self.displayed_joined_spaces.len();
                         let text: Cow<'static, str> = if self.is_filtered {
                             let total = self.all_joined_spaces.len();
-                            format!("{num_joined} of {total} spaces").into()
+                            format!("{num_joined} of {total} spaces match.").into()
                         } else {
                             match num_joined {
                                 0   => "Found no joined spaces.".into(),
@@ -583,6 +607,9 @@ impl Widget for SpacesBar {
                         };
                         item.label(cx, ids!(label)).set_text(cx, &text);
                         item
+                    }
+                    else if self.is_filtered && portal_list_index == len + 1 {
+                        list.item(cx, portal_list_index, id!(clear_filter_button))
                     }
                     else {
                         list.item(cx, portal_list_index, id!(BottomFiller))
@@ -602,7 +629,7 @@ impl SpacesBar {
         // The matrix SDK frequently issues `Clear` + `Append` updates in one batch,
         // so we optimize for that. One thing we do is save avatars across a Clear + Append
         // to avoid briefly flickering between the placeholder text avatar and the space's real avatar image.
-        let mut cleared_space_avatars: HashMap<OwnedRoomId, FetchedRoomAvatar> = HashMap::new();
+        let mut cleared_space_avatars: FxHashMap<OwnedRoomId, FetchedRoomAvatar> = FxHashMap::default();
 
         let mut num_updates: usize = 0;
         let mut should_regenerate_displayed_spaces = false;
@@ -803,5 +830,10 @@ impl SpacesBarRef {
     /// Returns the avatar of the given space, if it's a joined top-level space in this bar.
     pub fn get_space_avatar(&self, space_id: &OwnedRoomId) -> Option<FetchedRoomAvatar> {
         self.borrow()?.all_joined_spaces.get(space_id).map(|space| space.space_avatar.clone())
+    }
+
+    /// Returns whether the given space is a joined top-level space in this bar.
+    pub fn is_joined_space(&self, space_id: &OwnedRoomId) -> bool {
+        self.borrow().is_some_and(|inner| inner.all_joined_spaces.contains_key(space_id))
     }
 }

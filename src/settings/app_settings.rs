@@ -4,8 +4,8 @@ use makepad_widgets::*;
 
 use crate::{
     app::AppState,
-    persistence,
-    settings::{is_settings_screen_shown, app_preferences::{AppPreferences, AppPreferencesAction, AppPreferencesGlobal, Appearance, AppearanceGlobal, MarkAsReadBehavior, ReadReceiptsPrivacy, ThumbnailMaxHeight, UiZoom, ViewModeOverride}},
+    home::quick_reaction::QuickReaction,
+    settings::{is_settings_screen_shown, app_preferences::{AppPreferences, AppPreferencesAction, AppPreferencesGlobal, Appearance, AppearanceGlobal, LinkPreviewStyle, MarkAsReadBehavior, ReadReceiptsPrivacy, ThumbnailMaxHeight, UiZoom, ViewModeOverride, set_appearance}, text_rendering::{is_simpler_text_rendering_enabled, set_simpler_text_rendering}},
     shared::popup_list::{enqueue_popup_notification, PopupKind},
 };
 
@@ -30,6 +30,14 @@ const READ_RECEIPTS_PRIVACY_DESC_OWN_DEVICES: &str =
     "<ul><li>Currently: only your own devices can see how far you've read.</li></ul>";
 
 // The descriptions beneath each on/off toggle, as `(on, off)` pairs.
+const DOUBLE_TAP_TO_REACT_DESC: (&str, &str) = (
+    "<ul><li>Currently: double tapping/clicking a message toggles this reaction.</li></ul>",
+    "<ul><li>Currently: double-tapping a message does nothing.</li></ul>",
+);
+const MOUSE_DRAG_SCROLLING_DESC: (&str, &str) = (
+    "<ul><li>Currently: scroll via mouse wheel, trackpad, or clicking and dragging.</li></ul>",
+    "<ul><li>Currently: scroll via mouse wheel or trackpad swipes.</li></ul>",
+);
 const SHOW_READ_RECEIPTS_DESC: (&str, &str) = (
     "<ul><li>Currently: each message shows the avatars of people who have read it.</li></ul>",
     "<ul><li>Currently: messages don't show who has read them.</li></ul>",
@@ -47,6 +55,15 @@ const MARK_AS_READ_DESC_VIEWING: &str =
     "<ul><li>Currently: messages are marked as read after you scroll or interact with a timeline.</li></ul>";
 const MARK_AS_READ_DESC_MANUAL: &str =
     "<ul><li>Currently: you must mark each room as read manually.</li></ul>";
+
+const LINK_PREVIEW_STYLE_DESC_AUTOMATIC: &str =
+    "<ul><li>Currently: a link's image goes beside its text, or above it if there isn't enough room.</li><li>Links to images and GIFs show a bigger image.</li></ul>";
+const LINK_PREVIEW_STYLE_DESC_COMPACT: &str =
+    "<ul><li>Currently: a link's image always goes beside its text.</li></ul>";
+const LINK_PREVIEW_STYLE_DESC_LARGE: &str =
+    "<ul><li>Currently: a link's image always goes above its text.</li><li>Links to images and GIFs show a bigger image.</li></ul>";
+const LINK_PREVIEW_STYLE_DESC_OFF: &str =
+    "<ul><li>Currently: links in messages don't fetch or show previews.</li></ul>";
 
 
 script_mod! {
@@ -162,7 +179,6 @@ script_mod! {
             body: "" // see UI_ZOOM_DESCRIPTION
         }
 
-
         SubsectionLabel {
             margin: Inset{top: 10}
             text: "Keyboard Shortcut to Send Message"
@@ -185,7 +201,106 @@ script_mod! {
 
         SubsectionLabel {
             margin: Inset{top: 10}
-            text: "Maximum Height of Thumbnails"
+            text: "Emojis & Reactions"
+        }
+
+        View {
+            width: Fill, height: Fit
+            flow: Down,
+            margin: Inset{left: 6},
+
+            View {
+                width: Fill, height: Fit
+                flow: Flow.Right{wrap: true, row_align: RowAlign.Center}
+                spacing: 6,
+
+                double_tap_to_react_toggle := mod.widgets.RobrixSettingsToggle {
+                    active: true,
+                    text: "Double-tap a message to react with:"
+                }
+                // Read-only while `double_tap_to_react_toggle` is off.
+                quick_reaction_input := RobrixTextInput {
+                    width: 50, height: Fit
+                    // The toggle has more margin above it than below it.
+                    margin: Inset{top: 5}
+                    padding: Inset{left: 8, right: 8, top: 5, bottom: 5}
+                    empty_text: ":+1:"
+                    autocapitalize: None,
+                    autocorrect: Disabled,
+                }
+            }
+            double_tap_to_react_description := mod.widgets.SettingsSectionDescription {
+                body: "" // set dynamically, see `DOUBLE_TAP_TO_REACT_DESC`
+            }
+            sync_recent_emojis_toggle := mod.widgets.RobrixSettingsToggle {
+                active: true,
+                text: "Sync recent emoji across devices"
+            }
+        }
+
+        mouse_drag_scrolling_section := View {
+            width: Fill, height: Fit
+            flow: Down,
+
+            SubsectionLabel {
+                margin: Inset{top: 10}
+                text: "Mouse Drag Scrolling"
+            }
+
+            View {
+                width: Fill, height: Fit
+                flow: Down,
+                margin: Inset{left: 6},
+
+                mouse_drag_scrolling_toggle := mod.widgets.RobrixSettingsToggle {
+                    active: true,
+                    text: "Click and drag to scroll"
+                }
+                mouse_drag_scrolling_description := mod.widgets.SettingsSectionDescription {
+                    body: "" // set dynamically, see `MOUSE_DRAG_SCROLLING_DESC`
+                }
+            }
+        }
+
+        SubsectionLabel {
+            margin: Inset{top: 10}
+            text: "Auto-Hide Bars While Scrolling"
+        }
+
+        View {
+            width: Fill, height: Fit
+            flow: Down,
+            margin: Inset{left: 6},
+
+            hide_header_on_scroll_toggle := mod.widgets.RobrixSettingsToggle {
+                active: true,
+                text: "Hide top bar while scrolling"
+            }
+            hide_bottom_bars_on_scroll_toggle := mod.widgets.RobrixSettingsToggle {
+                active: false,
+                text: "Fully hide bottom bar while scrolling"
+            }
+        }
+
+        SubsectionLabel {
+            margin: Inset{top: 10}
+            text: "Rooms List Filters"
+        }
+
+        View {
+            width: Fill, height: Fit
+            flow: Down,
+            margin: Inset{left: 6},
+
+            show_invites_in_unread_filters_toggle := mod.widgets.RobrixSettingsToggle {
+                active: false,
+                text: "Show Invites under Unreads & Mentions"
+            }
+        }
+
+        SubsectionLabel {
+            margin: Inset{top: 10}
+            text: "Maximum Height of Thumbnails & Previews"
         }
 
         View {
@@ -236,6 +351,38 @@ script_mod! {
                     }
                     text: "pixels"
                 }
+            }
+        }
+
+        SubsectionLabel {
+            margin: Inset{top: 10}
+            text: "Link Previews"
+        }
+
+        View {
+            width: Fill, height: Fit
+            flow: Down,
+            margin: Inset{left: 6},
+
+            View {
+                width: Fill, height: Fit
+                margin: Inset{top: 5, bottom: 5}
+                // `row_align` (not `align.y`) is what centers items within a wrapping row.
+                flow: Flow.Right{wrap: true, row_align: RowAlign.Center}
+
+                mod.widgets.SettingsItemLabel {
+                    width: Fit,
+                    text: "Link preview style:"
+                }
+
+                link_preview_style_dropdown := mod.widgets.RobrixSettingsDropDown {
+                    width: 220,
+                    labels: ["Automatic (default)", "Compact", "Large", "Off"]
+                    selected_item: 0
+                }
+            }
+            link_preview_style_description := mod.widgets.SettingsSectionDescription {
+                body: "" // set dynamically, see `LINK_PREVIEW_STYLE_DESC_*`
             }
         }
 
@@ -358,6 +505,30 @@ script_mod! {
                 }
             }
         }
+
+        text_rendering_section := View {
+            width: Fill, height: Fit
+            flow: Down,
+
+            SubsectionLabel {
+                margin: Inset{top: 10}
+                text: "Text Rendering"
+            }
+
+            View {
+                width: Fill, height: Fit
+                flow: Down,
+                margin: Inset{left: 6},
+
+                simpler_text_rendering_toggle := mod.widgets.RobrixSettingsToggle {
+                    active: false,
+                    text: "Use simpler text rendering"
+                }
+                mod.widgets.SettingsSectionDescription {
+                    body: "<ul><li>Draws text faster on older devices, but it may look slightly softer.</li></ul>"
+                }
+            }
+        }
     }
 }
 
@@ -420,11 +591,7 @@ impl AppSettings {
         if is_shown && let Some(index) = self.view.drop_down2(cx, ids!(appearance_dropdown)).changed(actions) {
             let new_appearance = Appearance::from_index(index);
             if new_appearance != cx.global::<AppearanceGlobal>().0 {
-                cx.global::<AppearanceGlobal>().0 = new_appearance;
-                if let Err(e) = persistence::save_appearance(new_appearance) {
-                    error!("Failed to save appearance. Error: {e}");
-                }
-                cx.request_style_reload();
+                set_appearance(cx, new_appearance);
                 enqueue_popup_notification(
                     "Updated appearance setting.",
                     PopupKind::Success,
@@ -448,22 +615,7 @@ impl AppSettings {
 
         let ui_zoom_input = self.view.text_input(cx, ids!(ui_zoom_input));
 
-        if is_shown && self.view.button(cx, ids!(ui_zoom_minus_button)).clicked(actions) {
-            let new_zoom = app_state.app_prefs.ui_zoom.zoom_out_by(UiZoom::BUTTON_STEP);
-            if new_zoom != app_state.app_prefs.ui_zoom {
-                app_state.app_prefs.ui_zoom = new_zoom;
-                app_state.app_prefs.on_ui_zoom_changed(cx);
-            }
-        }
-
-        if is_shown && self.view.button(cx, ids!(ui_zoom_plus_button)).clicked(actions) {
-            let new_zoom = app_state.app_prefs.ui_zoom.zoom_in_by(UiZoom::BUTTON_STEP);
-            if new_zoom != app_state.app_prefs.ui_zoom {
-                app_state.app_prefs.ui_zoom = new_zoom;
-                app_state.app_prefs.on_ui_zoom_changed(cx);
-            }
-        }
-
+        // A tap on minus or plus can blur the input in the same batch, so we commit what was typed first.
         if ui_zoom_input.returned(actions).is_some() || ui_zoom_input.key_focus_lost(actions) {
             let text = ui_zoom_input.text();
             match parse_zoom_percent(&text) {
@@ -488,6 +640,22 @@ impl AppSettings {
             }
         }
 
+        if is_shown && self.view.button(cx, ids!(ui_zoom_minus_button)).clicked(actions) {
+            let new_zoom = app_state.app_prefs.ui_zoom.zoom_out_by(UiZoom::BUTTON_STEP);
+            if new_zoom != app_state.app_prefs.ui_zoom {
+                app_state.app_prefs.ui_zoom = new_zoom;
+                app_state.app_prefs.on_ui_zoom_changed(cx);
+            }
+        }
+
+        if is_shown && self.view.button(cx, ids!(ui_zoom_plus_button)).clicked(actions) {
+            let new_zoom = app_state.app_prefs.ui_zoom.zoom_in_by(UiZoom::BUTTON_STEP);
+            if new_zoom != app_state.app_prefs.ui_zoom {
+                app_state.app_prefs.ui_zoom = new_zoom;
+                app_state.app_prefs.on_ui_zoom_changed(cx);
+            }
+        }
+
         for action in actions {
             if let Some(AppPreferencesAction::UiZoomChanged(new_zoom)) = action.downcast_ref() {
                 let new_zoom = *new_zoom;
@@ -496,6 +664,18 @@ impl AppSettings {
                 }
                 ui_zoom_input.set_text(cx, &new_zoom.format_percent());
             }
+        }
+
+        if is_shown
+            && let Some(enabled) = self.view.check_box(cx, ids!(simpler_text_rendering_toggle)).changed(actions)
+            && enabled != is_simpler_text_rendering_enabled(cx)
+        {
+            set_simpler_text_rendering(cx, enabled);
+            enqueue_popup_notification(
+                "Updated text rendering.",
+                PopupKind::Success,
+                Some(3.0),
+            );
         }
 
         if is_shown && let Some(cmd_enter_active) = self.view.check_box(cx, ids!(send_on_cmd_enter_toggle)).changed(actions)
@@ -512,6 +692,103 @@ impl AppSettings {
                     Some(3.0),
                 );
             }
+        }
+
+        if is_shown
+            && let Some(enabled) = self.view.check_box(cx, ids!(double_tap_to_react_toggle)).changed(actions)
+            && enabled != app_state.app_prefs.double_tap_to_react
+        {
+            app_state.app_prefs.double_tap_to_react = enabled;
+            Self::update_toggle_description(cx, &self.view, ids!(double_tap_to_react_description), enabled, DOUBLE_TAP_TO_REACT_DESC);
+            Self::set_input_enabled(cx, &self.view, ids!(quick_reaction_input), enabled, Animate::Yes);
+            app_state.app_prefs.on_double_tap_to_react_changed(cx);
+            enqueue_popup_notification(
+                "Updated double-tap to react.",
+                PopupKind::Success,
+                Some(3.0),
+            );
+        }
+
+        if is_shown
+            && let Some(enabled) = self.view.check_box(cx, ids!(sync_recent_emojis_toggle)).changed(actions)
+            && enabled != app_state.app_prefs.sync_recent_emojis
+        {
+            app_state.app_prefs.sync_recent_emojis = enabled;
+            app_state.app_prefs.on_sync_recent_emojis_changed(cx);
+            enqueue_popup_notification(
+                "Updated syncing of recent emoji.",
+                PopupKind::Success,
+                Some(3.0),
+            );
+        }
+
+        let quick_reaction_input = self.view.text_input(cx, ids!(quick_reaction_input));
+        if quick_reaction_input.returned(actions).is_some() || quick_reaction_input.key_focus_lost(actions) {
+            // A blank input goes back to the default reaction.
+            let new_reaction = QuickReaction::from_typed_text(&quick_reaction_input.text()).unwrap_or_default();
+            quick_reaction_input.set_text(cx, new_reaction.as_str());
+            if new_reaction != app_state.app_prefs.quick_reaction {
+                app_state.app_prefs.quick_reaction = new_reaction;
+                app_state.app_prefs.on_quick_reaction_changed(cx);
+                enqueue_popup_notification(
+                    "Updated quick reaction.",
+                    PopupKind::Success,
+                    Some(3.0),
+                );
+            }
+        }
+
+        if is_shown
+            && let Some(enabled) = self.view.check_box(cx, ids!(mouse_drag_scrolling_toggle)).changed(actions)
+            && enabled != app_state.app_prefs.mouse_drag_scrolling
+        {
+            app_state.app_prefs.mouse_drag_scrolling = enabled;
+            Self::update_toggle_description(cx, &self.view, ids!(mouse_drag_scrolling_description), enabled, MOUSE_DRAG_SCROLLING_DESC);
+            app_state.app_prefs.on_mouse_drag_scrolling_changed(cx);
+            enqueue_popup_notification(
+                "Updated mouse drag scrolling.",
+                PopupKind::Success,
+                Some(3.0),
+            );
+        }
+
+        if is_shown
+            && let Some(hide) = self.view.check_box(cx, ids!(hide_header_on_scroll_toggle)).changed(actions)
+            && hide != app_state.app_prefs.hide_header_on_scroll
+        {
+            app_state.app_prefs.hide_header_on_scroll = hide;
+            app_state.app_prefs.on_hide_header_on_scroll_changed(cx);
+            enqueue_popup_notification(
+                "Updated top bar scrolling.",
+                PopupKind::Success,
+                Some(3.0),
+            );
+        }
+
+        if is_shown
+            && let Some(hide) = self.view.check_box(cx, ids!(hide_bottom_bars_on_scroll_toggle)).changed(actions)
+            && hide != app_state.app_prefs.hide_bottom_bars_on_scroll
+        {
+            app_state.app_prefs.hide_bottom_bars_on_scroll = hide;
+            app_state.app_prefs.on_hide_bottom_bars_on_scroll_changed(cx);
+            enqueue_popup_notification(
+                "Updated bottom bar scrolling.",
+                PopupKind::Success,
+                Some(3.0),
+            );
+        }
+
+        if is_shown
+            && let Some(show) = self.view.check_box(cx, ids!(show_invites_in_unread_filters_toggle)).changed(actions)
+            && show != app_state.app_prefs.show_invites_in_unread_filters
+        {
+            app_state.app_prefs.show_invites_in_unread_filters = show;
+            app_state.app_prefs.on_show_invites_in_unread_filters_changed(cx);
+            enqueue_popup_notification(
+                "Updated the Unreads and Mentions filters.",
+                PopupKind::Success,
+                Some(3.0),
+            );
         }
 
         let custom_input = self.view.text_input(cx, ids!(thumb_custom_input));
@@ -535,8 +812,7 @@ impl AppSettings {
                 _ => ThumbnailMaxHeight::default(),
             };
             let custom_now = matches!(new_thumb, ThumbnailMaxHeight::Custom(_));
-            Self::set_thumb_custom_input_read_only(cx, &self.view, custom_now);
-            Self::set_thumb_custom_input_disabled(cx, &self.view, custom_now, Animate::Yes);
+            Self::set_input_enabled(cx, &self.view, ids!(thumb_custom_input), custom_now, Animate::Yes);
             if new_thumb != app_state.app_prefs.thumbnail_max_height {
                 app_state.app_prefs.thumbnail_max_height = new_thumb;
                 app_state.app_prefs.on_thumbnail_max_height_changed(cx);
@@ -560,6 +836,20 @@ impl AppSettings {
                 app_state.app_prefs.on_read_receipts_privacy_changed(cx);
                 enqueue_popup_notification(
                     "Updated read receipt privacy.",
+                    PopupKind::Success,
+                    Some(3.0),
+                );
+            }
+        }
+
+        if is_shown && let Some(index) = self.view.drop_down2(cx, ids!(link_preview_style_dropdown)).changed(actions) {
+            let new_style = LinkPreviewStyle::from_index(index);
+            if new_style != app_state.app_prefs.link_preview_style {
+                app_state.app_prefs.link_preview_style = new_style;
+                Self::update_link_preview_style_description(cx, &self.view, new_style);
+                app_state.app_prefs.on_link_preview_style_changed(cx);
+                enqueue_popup_notification(
+                    "Updated link preview style.",
                     PopupKind::Success,
                     Some(3.0),
                 );
@@ -696,13 +986,28 @@ impl AppSettings {
         // `on_after_apply`. Fine here cuz we're outside any apply walk.
         let send_toggle = self.view.check_box(cx, ids!(send_on_cmd_enter_toggle));
         send_toggle.set_active(cx, !prefs.send_on_enter, Animate::No);
+        self.view.check_box(cx, ids!(double_tap_to_react_toggle))
+            .set_active(cx, prefs.double_tap_to_react, Animate::No);
+        self.view.check_box(cx, ids!(sync_recent_emojis_toggle))
+            .set_active(cx, prefs.sync_recent_emojis, Animate::No);
 
+        self.view.check_box(cx, ids!(mouse_drag_scrolling_toggle))
+            .set_active(cx, prefs.mouse_drag_scrolling, Animate::No);
+        self.view.check_box(cx, ids!(hide_header_on_scroll_toggle))
+            .set_active(cx, prefs.hide_header_on_scroll, Animate::No);
+        self.view.check_box(cx, ids!(hide_bottom_bars_on_scroll_toggle))
+            .set_active(cx, prefs.hide_bottom_bars_on_scroll, Animate::No);
+        self.view.check_box(cx, ids!(show_invites_in_unread_filters_toggle))
+            .set_active(cx, prefs.show_invites_in_unread_filters, Animate::No);
         self.view.check_box(cx, ids!(show_read_receipts_toggle))
             .set_active(cx, prefs.show_read_receipts, Animate::No);
         self.view.check_box(cx, ids!(show_typing_notices_toggle))
             .set_active(cx, prefs.show_typing_notices, Animate::No);
         self.view.check_box(cx, ids!(send_typing_notices_toggle))
             .set_active(cx, prefs.send_typing_notices, Animate::No);
+        let is_simpler_text_rendering = is_simpler_text_rendering_enabled(cx);
+        self.view.check_box(cx, ids!(simpler_text_rendering_toggle))
+            .set_active(cx, is_simpler_text_rendering, Animate::No);
 
         self.view.check_box(cx, ids!(show_mini_apps_button_toggle))
             .set_active(cx, prefs.show_mini_apps_button, Animate::No);
@@ -723,6 +1028,7 @@ impl AppSettings {
         // Only write `thumb_custom_input`'s text on initial populate.
         // `on_after_apply` leaves it alone so in-progress edits survive.
         self.view.text_input(cx, ids!(thumb_custom_input)).set_text(cx, &custom_text);
+        self.view.text_input(cx, ids!(quick_reaction_input)).set_text(cx, prefs.quick_reaction.as_str());
     }
 
     /// Re-populated fields set by code, for use after an apply action reset things to DSL defaults.
@@ -743,6 +1049,12 @@ impl AppSettings {
         view.drop_down2(cx, ids!(mark_as_read_dropdown))
             .set_selected_item(cx, prefs.mark_as_read_behavior.to_index());
         Self::update_mark_as_read_description(cx, view, prefs.mark_as_read_behavior);
+        view.drop_down2(cx, ids!(link_preview_style_dropdown))
+            .set_selected_item(cx, prefs.link_preview_style.to_index());
+        Self::update_link_preview_style_description(cx, view, prefs.link_preview_style);
+        Self::update_toggle_description(cx, view, ids!(double_tap_to_react_description), prefs.double_tap_to_react, DOUBLE_TAP_TO_REACT_DESC);
+        Self::set_input_enabled(cx, view, ids!(quick_reaction_input), prefs.double_tap_to_react, Animate::No);
+        Self::update_toggle_description(cx, view, ids!(mouse_drag_scrolling_description), prefs.mouse_drag_scrolling, MOUSE_DRAG_SCROLLING_DESC);
         Self::update_toggle_description(cx, view, ids!(show_read_receipts_description), prefs.show_read_receipts, SHOW_READ_RECEIPTS_DESC);
         Self::update_toggle_description(cx, view, ids!(show_typing_notices_description), prefs.show_typing_notices, SHOW_TYPING_NOTICES_DESC);
         Self::update_toggle_description(cx, view, ids!(send_typing_notices_description), prefs.send_typing_notices, SEND_TYPING_NOTICES_DESC);
@@ -760,10 +1072,15 @@ impl AppSettings {
         // soft-keyboard caveat is only relevant on iOS/Android.
         view.widget(cx, ids!(send_shortcut_soft_keyboard_warning))
             .set_visible(cx, cfg!(any(target_os = "ios", target_os = "android")));
+        // A mouse on iOS/Android acts like a touch, which can always drag to scroll.
+        view.widget(cx, ids!(mouse_drag_scrolling_section))
+            .set_visible(cx, !cfg!(any(target_os = "ios", target_os = "android")));
+        // Linux and Windows already draw small text from the atlas, so there's nothing simpler to switch to.
+        view.widget(cx, ids!(text_rendering_section))
+            .set_visible(cx, !cfg!(any(target_os = "linux", target_os = "windows")));
 
         let custom_active = matches!(prefs.thumbnail_max_height, ThumbnailMaxHeight::Custom(_));
-        Self::set_thumb_custom_input_read_only(cx, view, custom_active);
-        Self::set_thumb_custom_input_disabled(cx, view, custom_active, Animate::No);
+        Self::set_input_enabled(cx, view, ids!(thumb_custom_input), custom_active, Animate::No);
 
         view.widget(cx, ids!(mini_apps_section))
             .set_visible(cx, cfg!(feature = "a2app"));
@@ -789,6 +1106,16 @@ impl AppSettings {
         view.html(cx, ids!(mark_as_read_description)).set_text(cx, text);
     }
 
+    fn update_link_preview_style_description(cx: &mut Cx, view: &View, style: LinkPreviewStyle) {
+        let text = match style {
+            LinkPreviewStyle::Automatic => LINK_PREVIEW_STYLE_DESC_AUTOMATIC,
+            LinkPreviewStyle::Compact => LINK_PREVIEW_STYLE_DESC_COMPACT,
+            LinkPreviewStyle::Large => LINK_PREVIEW_STYLE_DESC_LARGE,
+            LinkPreviewStyle::Off => LINK_PREVIEW_STYLE_DESC_OFF,
+        };
+        view.html(cx, ids!(link_preview_style_description)).set_text(cx, text);
+    }
+
     fn update_send_shortcut_description(cx: &mut Cx, view: &View, send_on_enter: bool) {
         let text = if send_on_enter {
             "<ul><li>Currently: 'Enter' to send, 'Shift + Enter' for a new line</li></ul>"
@@ -798,19 +1125,10 @@ impl AppSettings {
         view.html(cx, ids!(send_shortcut_description)).set_text(cx, text);
     }
 
-    /// Sets `is_read_only` based on whether the custom radio is selected.
-    /// Safe anywhere, since it's just a field write plus a redraw.
-    fn set_thumb_custom_input_read_only(cx: &mut Cx, view: &View, enabled: bool) {
-        view.text_input(cx, ids!(thumb_custom_input))
-            .set_is_read_only(cx, !enabled);
-    }
-
-    /// Sets the disabled animator state.
-    ///
-    /// A reload resets the input's disabled look but not its animator state,
-    /// so restoring it needs `Animate::No`, since an animated toggle would see nothing to do.
-    fn set_thumb_custom_input_disabled(cx: &mut Cx, view: &View, enabled: bool, animate: Animate) {
-        let input_ref = view.text_input(cx, ids!(thumb_custom_input));
+    /// Makes the given text input editable or read-only, with the matching enabled or disabled look.
+    fn set_input_enabled(cx: &mut Cx, view: &View, input: &[LiveId], enabled: bool, animate: Animate) {
+        let input_ref = view.text_input(cx, input);
+        input_ref.set_is_read_only(cx, !enabled);
         let Some(mut input) = input_ref.borrow_mut() else { return };
         input.animator_toggle(cx, !enabled, animate, ids!(disabled.on), ids!(disabled.off));
     }

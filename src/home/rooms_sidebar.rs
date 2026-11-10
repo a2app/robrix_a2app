@@ -2,9 +2,10 @@
 //!
 //! It differs in what content it includes based on the adaptive view:
 //! * On a narrow mobile view, it acts as the root_view of StackNavigation
-//!   * It includes a title label, a search bar, and the RoomsList.
+//!   * It only includes the RoomsList, because the `HideOnScrollView`
+//!     draws the title label, search bar, and filter bubbles over the top of it.
 //! * On a wide desktop view, it acts as a permanent tab that is on the left side of the dock.
-//!   * It only includes a title label and the RoomsList, because the SearcBar
+//!   * It only includes a title label, the filter bubbles, and the RoomsList, because the SearcBar
 //!     is at the top of the HomeScreen in Desktop view.
 
 use makepad_widgets::*;
@@ -20,7 +21,7 @@ script_mod! {
     mod.widgets.RoomsSideBar = #(RoomsSideBar::register_widget(vm)) {
         Desktop := SolidView {
             padding: Inset{top: 20, left: #(SIDE_PADDING)}
-            flow: Down, spacing: 5
+            flow: Down
             width: Fill, height: Fill
 
             draw_bg.color: (COLOR_PRIMARY_DARKER)
@@ -33,100 +34,42 @@ script_mod! {
                     rooms_list_header := RoomsListHeader {}
                 }
             }
-            CachedWidget {
-                rooms_list := RoomsList {}
+            // Reaches out to the sidebar's left edge, so the bubbles scroll out of view right at its edge.
+            View {
+                width: Fill, height: Fit
+                margin: Inset{top: 5, left: #(-SIDE_PADDING)}
+                CachedWidget {
+                    room_filter_bubbles := RoomFilterBubbles {}
+                }
+            }
+            // The rooms list goes first, so the header's rounded bottom edge and shadow get drawn over it.
+            // This doesn't clip sideways, so they still reach the sidebar's left edge.
+            View {
+                width: Fill, height: Fill
+                padding: Inset{top: 10}
+                flow: Overlay
+                clip_x: false
+
+                CachedWidget {
+                    rooms_list := RoomsList {}
+                }
+                // About as tall as the header, and clipped so only its rounded bottom edge shows below the bubbles.
+                View {
+                    width: Fill, height: 90
+                    margin: Inset{top: -90, left: #(-SIDE_PADDING)}
+                    clip_x: false, clip_y: false
+                    show_bg: true
+                    draw_bg: mod.widgets.RobrixHeaderBackground {}
+                }
             }
         },
 
         Mobile := View {
             width: Fill, height: Fill
-            flow: Down,
-            
-            RoundedShadowView {
-                width: Fill, height: Fit
-                padding: Inset{top: 15, left: #(SIDE_PADDING), right: #(SIDE_PADDING), bottom: 10}
-                flow: Down,
+            padding: Inset{left: #(SIDE_PADDING)}
 
-                show_bg: true
-                draw_bg +: {
-                    color: (COLOR_PRIMARY_DARKER)
-                    border_radius: 4.0
-                    border_size: 0.0
-                    shadow_color: (COLOR_HEADER_SHADOW)
-                    shadow_radius: 12.0
-                    shadow_offset: vec2(0.0, 0.0)
-
-                    pixel: fn() {
-                        let sdf = Sdf2d.viewport(self.pos * self.rect_size3)
-
-                        let mut fill_color = self.color
-                        if self.color_2.x > -0.5 {
-                            let dither = Math.random_2d(self.pos.xy) * 0.04 * self.color_dither
-                            let dir = if self.gradient_fill_horizontal > 0.5 self.pos.x else self.pos.y
-                            fill_color = mix(self.color self.color_2 dir + dither)
-                        }
-
-                        let mut stroke_color = self.border_color
-                        if self.border_color_2.x > -0.5 {
-                            let dither = Math.random_2d(self.pos.xy) * 0.04 * self.color_dither
-                            let dir = if self.gradient_border_horizontal > 0.5 self.pos.x else self.pos.y
-                            stroke_color = mix(self.border_color self.border_color_2 dir + dither)
-                        }
-
-                        sdf.box(
-                            self.sdf_rect_pos.x
-                            self.sdf_rect_pos.y
-                            self.sdf_rect_size.x
-                            self.sdf_rect_size.y
-                            max(1.0 self.border_radius)
-                        )
-                        if sdf.shape > -1.0 {
-                            let m = self.shadow_radius
-                            let o = self.shadow_offset + self.rect_shift
-                            let v = GaussShadow.rounded_box_shadow(vec2(m) + o self.rect_size2+o self.pos * (self.rect_size3+vec2(m)) self.shadow_radius*0.5 self.border_radius*2.0)
-                            // Only draw shadow on the bottom half of the view
-                            let pixel_y = self.pos.y * self.rect_size3.y
-                            let mid_y = self.sdf_rect_pos.y + self.sdf_rect_size.y * 0.5
-                            let bottom_mask = smoothstep(mid_y - m * 0.3 mid_y + m * 0.3 pixel_y)
-                            sdf.clear(self.shadow_color * v * bottom_mask)
-                        }
-
-                        sdf.fill_keep(fill_color)
-
-                        if self.border_size > 0.0 {
-                            sdf.stroke(stroke_color self.border_size)
-                        }
-                        return sdf.result
-                    }
-                }
-
-                CachedWidget {
-                    rooms_list_header := RoomsListHeader {}
-                }
-
-                View {
-                    width: Fill,
-                    height: 45,
-                    flow: Right
-                    padding: Inset{top: 5, bottom: 2}
-                    spacing: 5 
-                    align: Align{y: 0.5}
-
-                    CachedWidget {
-                        room_filter_input_bar := RoomFilterInputBar { is_main_filter: true }
-                    }
-
-                    // Hide this until it's implemented.
-                    // search_messages_button := SearchMessagesButton { }
-                }
-            }
-
-            View {
-                padding: Inset{left: #(SIDE_PADDING)}
-
-                CachedWidget {
-                    rooms_list := RoomsList {}
-                }
+            CachedWidget {
+                rooms_list := RoomsList {}
             }
         }
     }
@@ -135,9 +78,9 @@ script_mod! {
 /// A simple wrapper around `AdaptiveView` that contains several global singleton widgets.
 ///
 /// * In the mobile view, it serves as the root view of the StackNavigation,
-///   showing the title label, the search bar, and the RoomsList.
+///   showing only the RoomsList (see [`HideOnScrollView`](crate::home::hide_on_scroll::HideOnScrollView)).
 /// * In the desktop view, it is a permanent tab in the dock,
-///   showing only the title label and the RoomsList
+///   showing only the title label, the filter bubbles, and the RoomsList
 ///   (because the search bar is at the top of the HomeScreen).
 #[derive(Script, Widget)]
 pub struct RoomsSideBar {
@@ -145,6 +88,10 @@ pub struct RoomsSideBar {
 
     /// The most recently applied view-mode override.
     #[rust] applied_view_mode: ViewModeOverride,
+    /// Whether the desktop dock had collapsed us to zero width when we were last drawn.
+    #[rust] is_collapsed: bool,
+    /// How much of our full width the desktop dock shows while it animates us collapsing or expanding.
+    #[rust] visible_fraction: Option<f64>,
 }
 
 impl ScriptHook for RoomsSideBar {
@@ -183,10 +130,37 @@ impl Widget for RoomsSideBar {
                 }
             }
         }
+        // A hidden widget of ours could still have the key focus, but it shouldn't act on keys.
+        if self.is_collapsed && matches!(event, Event::KeyDown(_) | Event::KeyUp(_)) {
+            return;
+        }
         self.view.handle_event(cx, event, scope);
     }
 
-    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, mut walk: Walk) -> DrawStep {
+        // When the desktop dock collapses us to zero width, we don't draw anything,
+        // which also keeps Tab from moving the key focus to any of our hidden widgets.
+        let width = cx.peek_walk_turtle(walk).size.x;
+        self.is_collapsed = width <= 0.0;
+        if self.is_collapsed {
+            return DrawStep::done();
+        }
+        // While the dock animates our width, we lay out our content at its full width
+        // and slide it past the dock's left edge, so it doesn't reflow on every frame.
+        if let Some(visible_fraction) = self.visible_fraction {
+            let full_width = width / visible_fraction;
+            walk.width = Size::Fixed(full_width);
+            walk.margin.left -= full_width - width;
+        }
         self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl RoomsSideBarRef {
+    /// Sets how much of our full width the desktop dock shows while it animates us, or `None` once it's done.
+    pub fn set_visible_fraction(&self, visible_fraction: Option<f64>) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.visible_fraction = visible_fraction;
+        }
     }
 }

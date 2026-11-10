@@ -14,26 +14,16 @@ use crate::{
 };
 
 use super::rooms_list::{InvitedRoomInfo, InviterInfo, JoinedRoomInfo};
+
+/// Rooms list rows at or below this width only show the room's avatar.
+pub(crate) const ONLY_ICON_MAX_WIDTH: f64 = 90.0;
+/// Rooms list rows at or below this width show the avatar and name, but no message preview.
+pub(crate) const ICON_AND_NAME_MAX_WIDTH: f64 = 200.0;
+
 script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
 
-
-    // A cancel icon to be displayed in the RoomsListEntry when the room is tombstoned.
-    mod.widgets.TombstoneIcon = View {
-        width: Fit, height: Fit,
-        visible: false,
-
-        Icon {
-            width: 19, height: 19,
-            align: Align{x: 0.5, y: 0.5}
-            draw_icon +: {
-                svg: (ICON_TOMBSTONE)
-                color: (COLOR_FG_DANGER_RED)
-            }
-            icon_walk: Walk{ width: 15, height: 15 }
-        }
-    }
 
     mod.widgets.RoomName = Label {
         width: Fill, height: Fit
@@ -145,6 +135,38 @@ script_mod! {
         }
     }
 
+    // A room's avatar with its unread badge and tombstone icon on the avatar's top-right corner.
+    mod.widgets.RoomsListEntryAvatar = View {
+        width: 36, height: 36
+        flow: Overlay
+        // Don't clip (cut-off) the unread badge's glow
+        clip_x: false, clip_y: false
+
+        avatar := Avatar { width: Fill, height: Fill }
+        View {
+            width: Fill, height: Fill
+            align: Align{x: 1.0, y: 0.0}
+            clip_x: false, clip_y: false
+            tombstone_icon := mod.widgets.TombstoneIcon {
+                margin: Inset{top: -3, right: -4}
+                show_bg: true
+                draw_bg +: {
+                    color: (COLOR_PRIMARY_DARKER)
+                    // The icon is just a thin ring, so we put a solid circle behind it to stand out on the avatar.
+                    pixel: fn() {
+                        let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                        sdf.circle(self.rect_size.x * 0.5, self.rect_size.y * 0.5, self.rect_size.x * 0.5 - 1.0)
+                        sdf.fill(self.color)
+                        return sdf.result
+                    }
+                }
+            }
+            unread_badge := UnreadBadge {
+                margin: Inset{top: -4, right: -8}
+            }
+        }
+    }
+
     mod.widgets.RoomsListEntry = #(RoomsListEntry::register_widget(vm)) {
         flow: Down, height: Fit
 
@@ -154,26 +176,17 @@ script_mod! {
             height: Fit
 
             OnlyIcon := mod.widgets.RoomsListEntryContent {
-                align: Align{x: 0.5, y: 0.5}
-                padding: 5.
-                View {
-                    height: Fit
-                    flow: Overlay
-                    align: Align{ x: 1.0 }
-                    // Don't clip (cut-off) the unread badge's glow
-                    clip_x: false, clip_y: false
-                    avatar := Avatar {}
-                    unread_badge := UnreadBadge {}
-                    tombstone_icon := mod.widgets.TombstoneIcon {}
-                }
+                padding: Inset{top: 6, bottom: 6}
+                align: Align{x: 0.5}
+                has_name_tooltip: true
+                mod.widgets.RoomsListEntryAvatar {}
             }
             IconAndName := mod.widgets.RoomsListEntryContent {
-                padding: 5.
-                align: Align{x: 0.5, y: 0.5}
-                avatar := Avatar {}
+                padding: Inset{top: 6, bottom: 6, left: 5, right: 5}
+                align: Align{y: 0.5}
+                has_name_tooltip: true
+                mod.widgets.RoomsListEntryAvatar {}
                 room_name := mod.widgets.RoomName {}
-                unread_badge := UnreadBadge {}
-                tombstone_icon := mod.widgets.TombstoneIcon {}
             }
             FullPreview := mod.widgets.RoomsListEntryContent {
                 padding: 10
@@ -184,6 +197,8 @@ script_mod! {
                     align: Align{ x: 0.0, y: 0.0 }
                     // Don't clip (cut-off) the unread badge's glow
                     clip_x: false, clip_y: false
+                    spacing: 3
+
                     top := View {
                         width: Fill, height: Fit,
                         spacing: 3,
@@ -191,6 +206,7 @@ script_mod! {
                         room_name := mod.widgets.RoomName {}
                         timestamp := mod.widgets.RoomsListEntryTimestamp { }
                     }
+
                     bottom := View {
                         width: Fill, height: Fill,
                         spacing: 2,
@@ -245,8 +261,8 @@ impl RoomsListEntry {
         self.view
             .adaptive_view(cx, ids!(adaptive_preview))
             .set_variant_selector(|_cx, parent_size| match parent_size.x {
-                width if width <= 70.0 => id!(OnlyIcon),
-                width if width <= 200.0 => id!(IconAndName),
+                width if width <= ONLY_ICON_MAX_WIDTH => id!(OnlyIcon),
+                width if width <= ICON_AND_NAME_MAX_WIDTH => id!(IconAndName),
                 _ => id!(FullPreview),
             });
     }
@@ -275,8 +291,12 @@ pub struct RoomsListEntryContent {
     #[live] preview_link_color: Vec4f,
     #[live] selected_text_color: Vec4f,
     #[live] selected_code_bg_color: Vec4f,
+    /// Whether hovering over us shows the room's name in a tooltip, if we don't show all of it.
+    #[live] has_name_tooltip: bool,
 
     #[rust] room_id: Option<OwnedRoomId>,
+    #[rust] room_name: String,
+    #[rust] is_name_tooltip_shown: bool,
 
     /// `true` while a context menu that we opened is being shown.
     #[rust] is_context_menu_open: bool,
@@ -338,8 +358,32 @@ impl Widget for RoomsListEntryContent {
             // TODO: Invited rooms have no context menu, so don't emit secondary clicks.
             //       We should add a context menu for invited rooms.
             match hit {
+                Hit::FingerHoverIn(_) if self.has_name_tooltip && !self.room_name.is_empty() => {
+                    // The icon-only layout has no name label, and the other one might have cut the name off.
+                    let name_label = self.child_refs(cx).room_name.clone();
+                    let is_name_cut_off = name_label.borrow().is_none_or(|label| {
+                        let row = area.rect(cx);
+                        let max_width = row.pos.x + row.size.x - self.view.layout.padding.right - label.area().rect(cx).pos.x;
+                        utils::unwrapped_text_width(cx, &label.draw_text, &self.room_name) > max_width + 1.0
+                    });
+                    if is_name_cut_off {
+                        cx.widget_action(uid, TooltipAction::HoverIn {
+                            text: self.room_name.clone(),
+                            widget_rect: area.rect(cx),
+                            options: CalloutTooltipOptions {
+                                position: TooltipPosition::Right,
+                                ..Default::default()
+                            },
+                        });
+                        self.is_name_tooltip_shown = true;
+                    }
+                }
+                Hit::FingerHoverOut(_) => self.hide_name_tooltip(cx),
                 Hit::FingerDown(fe) => {
-                    cx.set_key_focus(area);
+                    self.hide_name_tooltip(cx);
+                    if !fe.device.is_touch() {
+                        cx.set_key_focus(area);
+                    }
                     if !self.is_invited && fe.device.mouse_button().is_some_and(|b| b.is_secondary()) {
                         self.is_context_menu_open = true;
                         cx.widget_action(
@@ -349,6 +393,9 @@ impl Widget for RoomsListEntryContent {
                     }
                 }
                 Hit::FingerLongPress(fe) if !self.is_invited => {
+                    // A long press can't be a scroll, so we take the key focus now,
+                    // and closing the menu gives it back to us instead of to the rooms filter.
+                    cx.set_key_focus(area);
                     self.is_context_menu_open = true;
                     cx.widget_action(
                         uid,
@@ -387,9 +434,26 @@ impl RoomsListEntryContent {
         if self.room_id.as_deref() != Some(room_id) {
             self.is_context_menu_open = false;
             self.animator_cut(cx, ids!(bg_hover.off));
+            self.hide_name_tooltip(cx);
             self.room_id = Some(room_id.to_owned());
         }
         self.is_invited = is_invited;
+    }
+
+    /// Shows the given room name, and keeps it for our name tooltip.
+    fn set_room_name(&mut self, cx: &mut Cx, name: &str) {
+        self.child_refs(cx).room_name.set_text(cx, name);
+        if self.room_name != name {
+            self.room_name.clear();
+            self.room_name.push_str(name);
+        }
+    }
+
+    fn hide_name_tooltip(&mut self, cx: &mut Cx) {
+        if self.is_name_tooltip_shown {
+            self.is_name_tooltip_shown = false;
+            cx.widget_action(self.widget_uid(), TooltipAction::HoverOut);
+        }
     }
 
     fn child_refs(&mut self, cx: &mut Cx) -> &EntryChildRefs {
@@ -410,8 +474,8 @@ impl RoomsListEntryContent {
     ) {
         // Note: in general, we must always set all fields in case a rooms list entry widget
         // was re-used by the portal list, to avoid showing any old content for a different entry.
+        self.set_room_name(cx, &room_info.room_name_id.display());
         let child_refs = self.child_refs(cx);
-        child_refs.room_name.set_text(cx, &room_info.room_name_id.display());
         if let Some(latest) = room_info.latest.as_ref() {
             child_refs.timestamp.set_text(cx, relative_format(latest.timestamp).as_deref().unwrap_or(""));
             child_refs.latest_message.show_html(cx, &latest.text);
@@ -441,8 +505,8 @@ impl RoomsListEntryContent {
             true => Cow::Owned(format!("[Space] {name}")),
             false => name,
         };
+        self.set_room_name(cx, &name);
         let child_refs = self.child_refs(cx);
-        child_refs.room_name.set_text(cx, &name);
         // Hide the timestamp field, and use the latest message field to show the inviter.
         child_refs.timestamp.set_text(cx, "");
         let inviter_string = match &room_info.inviter_info {

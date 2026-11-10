@@ -47,27 +47,10 @@ script_mod! {
     }
 
     mod.widgets.FileUploadModal = set_type_default() do #(FileUploadModal::register_widget(vm)) {
-        ..mod.widgets.RoundedView
+        ..mod.widgets.LargeModal
 
-        width: Fill { max: 1000 }
         height: Fill
-        margin: (mod.widgets.MODAL_MARGIN)
-        align: Align{x: 0.5, y: 0}
-        flow: Down
         spacing: 12
-        padding: Inset{top: 20, right: 25, bottom: 20, left: 25}
-
-        scroll_bars: ScrollBars {
-            show_scroll_x: false, show_scroll_y: true,
-            scroll_bar_y: ScrollBar {drag_scrolling: true}
-        }
-
-        show_bg: true,
-        draw_bg +: {
-            color: (COLOR_BG_FLOATING)
-            border_radius: 6.0
-            border_size: 0.0
-        }
 
         header := View {
             width: Fill, height: Fit,
@@ -849,6 +832,53 @@ fn show_upload_modal(staged: Result<(PendingUpload, PreviewSource), String>) {
         preview_id,
         preview: PreviewPayload::new(preview),
     });
+}
+
+/// Loads the file that the user just picked, if any, and converts it with `into_upload`.
+///
+/// Upon an error, this shows an error popup and returns `None`. Don't run this on the main UI thread.
+pub fn load_picked_file<T>(
+    picked_file_result: robius_file_picker::Result<Option<robius_file_picker::PickedFile>>,
+    into_upload: impl FnOnce(FileUploadMetadata) -> Result<T, String>,
+) -> Option<(T, PreviewSource)> {
+    let picked = match picked_file_result {
+        Ok(Some(picked)) => picked,
+        // The user dismissed the picker, so there's nothing to do.
+        Ok(None) => return None,
+        Err(err) => {
+            enqueue_popup_notification(format!("Error selecting a file: {err}"), PopupKind::Error, None);
+            return None;
+        }
+    };
+    let upload_and_preview = picked
+        .into_local_file()
+        .map_err(|e| format!("Failed to read selected file: {e}"))
+        .and_then(|file| load_file_metadata(UploadSource::Picked(file)))
+        .and_then(|(file_data, preview_source)| {
+            into_upload(file_data).map(|upload| (upload, preview_source))
+        });
+    match upload_and_preview {
+        Ok(pair) => Some(pair),
+        Err(e) => {
+            enqueue_popup_notification(e, PopupKind::Error, None);
+            None
+        }
+    }
+}
+
+/// Validates that a picked file is an acceptable avatar image format and size.
+pub fn validate_avatar_image(file_data: FileUploadMetadata) -> Result<FileUploadMetadata, String> {
+    let name = file_data.file_name();
+    if !crate::utils::is_supported_avatar_mimetype(&file_data.mime_type) {
+        return Err(format!(
+            "\"{name}\" isn't an image type that Matrix avatars support. \
+             Please choose a PNG, JPEG, GIF, WebP, or AVIF image."
+        ));
+    }
+    if file_data.size == 0 {
+        return Err(format!("\"{name}\" is empty (0 bytes). Please choose a different image."));
+    }
+    Ok(file_data)
 }
 
 pub fn handle_picker_launch_errors(result: robius_file_picker::Result<()>) {

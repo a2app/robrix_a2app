@@ -1,21 +1,25 @@
-//! A filterable list of a room's joined and invited members,
+//! A filterable list of a room's joined, invited, and banned members,
 //! showing each member's avatar, display name, and role.
 //!
 //! The list doesn't fetch members itself: its host provides them, e.g., a RoomScreen
 //! gives its timeline's members to a docked list, while a popped-out list's screen fetches them.
 
-use std::{borrow::Cow, collections::HashSet, sync::Arc};
+use std::{borrow::Cow, sync::Arc};
 
 use makepad_widgets::*;
-use matrix_sdk::{room::{RoomMember, RoomMemberRole}, ruma::{OwnedRoomId, events::room::{member::MembershipState, power_levels::UserPowerLevel}}};
+use matrix_sdk::{RoomMemberships, room::{RoomMember, RoomMemberRole}, ruma::{OwnedRoomId, events::room::{member::MembershipState, power_levels::UserPowerLevel}}};
+use matrix_sdk_ui::sync_service::State as SyncServiceState;
+use rustc_hash::FxHashSet;
 
 use crate::{
+    home::rooms_list_header::RoomsListHeaderAction,
     profile::{
         user_profile::{RoomMembershipInfo, UserProfile, UserProfilePaneInfo, UserProfileSlidingPaneRef, member_display_name, role_name},
         user_profile_cache,
+        user_verification_cache::{UserVerificationStatesUpdated, get_or_fetch_user_verification_state},
     },
     room::pane_dock::FRAME_PADDING,
-    shared::{avatar::AvatarWidgetRefExt, list_rows::{handle_row_actions, status_row}, room_filter_input_bar::RoomFilterInputBarWidgetRefExt, styles::set_view_bg_color},
+    shared::{avatar::AvatarWidgetRefExt, list_rows::{handle_row_actions, status_row}, room_filter_input_bar::RoomFilterInputBarWidgetRefExt, styles::set_view_bg_color, verification_badge::UserVerificationBadgeWidgetRefExt},
     utils::RoomNameId,
 };
 
@@ -51,6 +55,7 @@ script_mod! {
             scroll_bar: ListScrollBar {}
             auto_tail: false
             keep_invisible: false
+            emit_scroll_actions: false
 
             member_row := mod.widgets.AvatarListRow { padding: Inset{left: 6, right: 6} }
             loading_row := mod.widgets.ListLoadingRow {}
@@ -58,6 +63,11 @@ script_mod! {
         }
     }
 }
+
+/// The memberships of the room members shown in a [`RoomMembersList`].
+///
+/// This includes banned members so that a moderator can find them in order to unban them.
+pub const LISTED_MEMBERSHIPS: RoomMemberships = RoomMemberships::ACTIVE.union(RoomMemberships::BAN);
 
 /// The result of a [`crate::sliding_sync::MatrixRequest::GetRoomMembersList`] request.
 ///
@@ -123,12 +133,18 @@ impl MemberEntry {
     fn is_invited(&self) -> bool {
         matches!(self.member.membership(), MembershipState::Invite)
     }
+
+    fn is_banned(&self) -> bool {
+        matches!(self.member.membership(), MembershipState::Ban)
+    }
 }
 
 /// Returns the role of the given member to show beneath their name.
 fn role_text(member: &RoomMember) -> Cow<'static, str> {
-    if matches!(member.membership(), MembershipState::Invite) {
-        return "Invited".into();
+    match member.membership() {
+        MembershipState::Invite => return "Invited".into(),
+        MembershipState::Ban => return "Banned".into(),
+        _ => {}
     }
     let role = member.suggested_role_for_power_level();
     let default_level = match role {
@@ -161,7 +177,7 @@ pub struct RoomMembersList {
     #[rust] room_name_id: Option<RoomNameId>,
     /// The members given by our host, unsorted, or `None` until they're fetched.
     #[rust] members: Option<Arc<Vec<RoomMember>>>,
-    /// All members, sorted: joined before invited, then by power level, then by name.
+    /// All members, sorted: joined, then invited, then banned, then by power level, then by name.
     #[rust] entries: Vec<MemberEntry>,
     /// Indices into `entries` of the members that match the current filter.
     #[rust] filtered: Vec<usize>,
@@ -173,7 +189,7 @@ pub struct RoomMembersList {
     #[rust] error: Option<String>,
     #[rust] hovered_index: Option<usize>,
     /// The indices of the rows whose content is up to date, which needn't be set again when drawn.
-    #[rust] populated_rows: HashSet<usize>,
+    #[rust] populated_rows: FxHashSet<usize>,
 }
 
 impl ScriptHook for RoomMembersList {
@@ -190,6 +206,11 @@ impl Widget for RoomMembersList {
         self.view.handle_event(cx, event, scope);
 
         let Event::Actions(actions) = event else { return };
+
+        if actions.iter().any(|a| a.downcast_ref::<UserVerificationStatesUpdated>().is_some()) {
+            self.populated_rows.clear();
+            self.redraw(cx);
+        }
 
         let filter_bar = self.view.child_by_path(ids!(member_filter_bar)).as_room_filter_input_bar();
         if let Some(keywords) = filter_bar.changed(actions) {
@@ -241,6 +262,8 @@ impl Widget for RoomMembersList {
                     if !self.populated_rows.contains(&index) {
                         row.child_by_path(ids!(info.title)).set_text(cx, &entry.name);
                         row.child_by_path(ids!(info.subtitle)).set_text(cx, &entry.role);
+                        let verification_state = get_or_fetch_user_verification_state(cx, entry.member.user_id());
+                        row.user_verification_badge(cx, ids!(verification_badge)).show_state(cx, verification_state);
                         let avatar_url = entry.member.avatar_url().map(|u| u.to_owned());
                         if row.avatar(cx, ids!(avatar)).show_user(cx, avatar_url.as_ref(), &entry.name) {
                             self.populated_rows.insert(index);
@@ -277,7 +300,8 @@ impl RoomMembersList {
         self.error = None;
         let mut entries: Vec<MemberEntry> = members.iter().cloned().map(MemberEntry::new).collect();
         self.members = Some(members);
-        entries.sort_by(|a, b| a.is_invited().cmp(&b.is_invited())
+        entries.sort_by(|a, b| a.is_banned().cmp(&b.is_banned())
+            .then_with(|| a.is_invited().cmp(&b.is_invited()))
             .then_with(|| b.member.power_level().cmp(&a.member.power_level()))
             .then_with(|| a.search_text.cmp(&b.search_text))
         );
@@ -333,13 +357,20 @@ impl RoomMembersList {
 
     fn update_count_label(&mut self, cx: &mut Cx) {
         let invited = self.entries.iter().filter(|e| e.is_invited()).count();
-        let joined = self.entries.len() - invited;
-        let text = match (joined, invited) {
+        let banned = self.entries.iter().filter(|e| e.is_banned()).count();
+        let joined = self.entries.len() - invited - banned;
+        let mut text = match (joined, invited) {
             (0, 0) => String::new(),
             (1, 0) => String::from("1 member"),
             (j, 0) => format!("{j} members"),
             (j, i) => format!("{j} {}, {i} invited", if j == 1 { "member" } else { "members" }),
         };
+        if banned > 0 {
+            if !text.is_empty() {
+                text.push_str(", ");
+            }
+            text.push_str(&format!("{banned} banned"));
+        }
         self.view.child_by_path(ids!(member_count_label)).set_text(cx, &text);
     }
 }
@@ -410,4 +441,29 @@ pub fn show_member_profile(
         }),
     });
     pane.show(cx);
+}
+
+/// A change to a room's members, for a host that fetches them itself because it has no timeline to get them from.
+pub enum MembersUpdate {
+    Fetched(Arc<Vec<RoomMember>>),
+    Failed(String),
+    /// The members may have changed, so the host should fetch them again.
+    Outdated,
+}
+
+/// Returns how the given action changes the members of the given room, if at all.
+pub fn get_members_update(action: &Action, room_id: &OwnedRoomId) -> Option<MembersUpdate> {
+    match action.downcast_ref() {
+        Some(RoomMembersFetchAction::Fetched { room_id: fetched_room_id, members }) if fetched_room_id == room_id => {
+            return Some(MembersUpdate::Fetched(members.clone()));
+        }
+        Some(RoomMembersFetchAction::Failed { room_id: failed_room_id, error }) if failed_room_id == room_id => {
+            return Some(MembersUpdate::Failed(error.clone()));
+        }
+        _ => {}
+    }
+    let is_outdated = action.downcast_ref::<RoomMembersChanged>().is_some_and(|changed| changed.room_id == *room_id)
+        // Retry syncing members that failed to sync while we were offline.
+        || matches!(action.downcast_ref(), Some(RoomsListHeaderAction::StateUpdate(state)) if !matches!(state, SyncServiceState::Offline));
+    is_outdated.then_some(MembersUpdate::Outdated)
 }

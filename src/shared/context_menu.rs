@@ -2,7 +2,10 @@
 
 use makepad_widgets::*;
 
-use crate::home::{nav_history_menu::NavHistoryMenuWidgetRefExt, new_message_context_menu::NewMessageContextMenuWidgetRefExt, room_context_menu::RoomContextMenuWidgetRefExt};
+use crate::{
+    home::{nav_history_menu::NavHistoryMenuWidgetRefExt, new_message_context_menu::NewMessageContextMenuWidgetRefExt, room_context_menu::RoomContextMenuWidgetRefExt},
+    shared::emoji_picker_popup::EmojiPickerPopupWidgetRefExt,
+};
 
 pub const BUTTON_HEIGHT: f64 = 38.0;
 pub const MENU_WIDTH: f64 = 235.0;
@@ -91,6 +94,25 @@ script_mod! {
             border_color: (COLOR_CONTEXT_MENU_BORDER)
         }
     }
+
+    // The panel of a popup that floats beside what opened it, like the mention popup or the emoji picker.
+    // Like `ContextMenuContent`, each popup declares its own children.
+    mod.widgets.FloatingPopupContent = RoundedShadowView {
+        width: Fill, height: Fill
+        flow: Down
+        show_bg: true
+        cursor: MouseCursor.Default
+        grab_key_focus: false
+        draw_bg +: {
+            color: (COLOR_BG_FLOATING)
+            border_radius: 5.0
+            border_size: 1.0
+            border_color: (COLOR_MENTION_POPUP_BORDER)
+            shadow_color: (COLOR_SHADOW_STRONG)
+            shadow_radius: 12.0
+            shadow_offset: vec2(0.0, 3.0)
+        }
+    }
 }
 
 /// An action broadcast when a context menu was closed.
@@ -122,31 +144,61 @@ pub fn is_tap_outside(cx: &mut Cx, hit: &Hit, content_area: Area) -> bool {
     fue.is_over && !content_rect.contains(fue.abs_start) && !content_rect.contains(fue.abs)
 }
 
-/// Returns whether any of the app's context menus is shown.
+/// Returns whether any of the app's context menus (or its emoji picker popup) is shown.
 pub fn is_context_menu_shown(cx: &mut Cx, ui: &WidgetRef) -> bool {
     ui.new_message_context_menu(cx, ids!(new_message_context_menu)).is_currently_shown(cx)
         || ui.room_context_menu(cx, ids!(room_context_menu)).is_currently_shown(cx)
         || ui.nav_history_menu(cx, ids!(nav_history_menu)).is_currently_shown()
+        || ui.emoji_picker_popup(cx, ids!(emoji_picker_popup)).is_currently_shown()
 }
 
-/// Closes any of the app's context menus that are shown.
+/// Closes any of the app's context menus (or its emoji picker popup) that are shown.
 pub fn close_context_menus(cx: &mut Cx, ui: &WidgetRef) {
     ui.new_message_context_menu(cx, ids!(new_message_context_menu)).close(cx);
     ui.room_context_menu(cx, ids!(room_context_menu)).close(cx);
     ui.nav_history_menu(cx, ids!(nav_history_menu)).close(cx);
+    ui.emoji_picker_popup(cx, ids!(emoji_picker_popup)).close(cx);
 }
 
-/// Returns a margin that positions the context menu at `anchor_pos`,
-/// but ensuring that it stays within the given `container_rect`.
-pub fn menu_position_margin(container_rect: Rect, anchor_pos: DVec2, menu_size: DVec2) -> Inset {
+/// Returns a margin that positions the context menu at `anchor_pos`, opening below it and towards the container's
+/// horizontal middle, but ensuring that it stays within the given `container_rect` and below the status bar.
+///
+/// This only considers the part of the container that's below the top of the window,
+/// since the soft keyboard can pan the container up past it.
+pub fn menu_position_margin(cx: &Cx, container_rect: Rect, anchor_pos: DVec2, menu_size: DVec2) -> Inset {
+    let visible_top = container_rect.pos.y.max(0.0);
+    let x = if anchor_pos.x > container_rect.center().x { anchor_pos.x - menu_size.x } else { anchor_pos.x };
     Inset {
-        left: (anchor_pos.x - container_rect.pos.x)
+        left: (x - container_rect.pos.x)
             .min(container_rect.size.x - menu_size.x)
             .max(0.0),
+        // A menu that would go past the bottom safe area moves up just enough to fit.
         top: (anchor_pos.y - container_rect.pos.y)
-            .min(container_rect.size.y - menu_size.y)
-            .max(0.0),
+            .min(container_rect.size.y - cx.display_context.safe_area_insets.bottom - menu_size.y)
+            .max(visible_top - container_rect.pos.y + cx.display_context.safe_area_insets.top),
         right: 0.0,
         bottom: 0.0,
     }
+}
+
+/// Returns how much of the window the soft keyboard covers, if the given event changed that.
+pub fn get_keyboard_height(event: &Event) -> Option<f64> {
+    let Event::VirtualKeyboard(keyboard_event) = event else { return None };
+    Some(match keyboard_event {
+        VirtualKeyboardEvent::WillShow { height, .. } | VirtualKeyboardEvent::DidShow { height, .. } => *height,
+        VirtualKeyboardEvent::WillHide { .. } | VirtualKeyboardEvent::DidHide { .. } => 0.0,
+    })
+}
+
+/// Returns the part of the window a popup can draw in, `edge_gap` away from the safe area and the soft keyboard.
+///
+/// The soft keyboard can pan `overlay_origin` up, past the top of the window.
+pub fn get_popup_bounds(cx: &mut Cx2d, overlay_origin: DVec2, keyboard_height: f64, edge_gap: f64) -> Rect {
+    let window_size = cx.current_pass_size();
+    let insets = cx.display_context.safe_area_insets;
+    let left = overlay_origin.x.max(0.0) + insets.left + edge_gap;
+    let right = window_size.x - insets.right - edge_gap;
+    let top = overlay_origin.y.max(0.0) + insets.top + edge_gap;
+    let bottom = window_size.y - keyboard_height.max(insets.bottom) - edge_gap;
+    Rect { pos: dvec2(left, top), size: dvec2((right - left).max(0.0), (bottom - top).max(0.0)) }
 }

@@ -3,16 +3,18 @@
 //! See MentionableTextInput for more info for how it works with that.
 //! The main widget is an overlay so it can display anywhere within the app window.
 //!
-//! Currently it can show 3 kinds of content in the popup, each rendered by an `AvatarListRow`:
+//! Currently it can show 4 kinds of content in the popup, each rendered by an `AvatarListRow`:
 //! 1. Users to mention within a given room.
 //! 2. Rooms or spaces to insert a link to.
 //! 3. Slash commands.
+//! 4. Emoji whose shortcode or name matches what was typed after a ':'.
 //!
 
 use std::sync::Arc;
+use emojis::Emoji;
 use makepad_widgets::*;
 use crate::{
-    shared::{avatar::{TextAvatarBgColor, AvatarWidgetRefExt}, list_rows::{LIST_ROW_HEIGHT, handle_row_actions, status_row}, slash_commands::SlashCommand, styles::set_view_bg_color},
+    shared::{avatar::{TextAvatarBgColor, AvatarWidgetRefExt}, context_menu::{get_keyboard_height, get_popup_bounds}, list_rows::{LIST_ROW_HEIGHT, handle_row_actions, status_row}, slash_commands::SlashCommand, styles::set_view_bg_color},
     utils::RoomNameId,
 };
 use matrix_sdk::ruma::{OwnedMxcUri, OwnedRoomAliasId, OwnedUserId};
@@ -47,22 +49,7 @@ script_mod! {
             clip_x: false, clip_y: false
             width: Fit, height: Fit
 
-            main_content := RoundedShadowView {
-                width: Fill, height: Fill
-                flow: Down
-                show_bg: true
-                cursor: MouseCursor.Default
-                grab_key_focus: false
-                draw_bg +: {
-                    color: (COLOR_BG_FLOATING)
-                    border_radius: 5.0
-                    border_size: 1.0
-                    border_color: (COLOR_MENTION_POPUP_BORDER)
-                    shadow_color: (COLOR_SHADOW_STRONG)
-                    shadow_radius: 12.0
-                    shadow_offset: vec2(0.0, 3.0)
-                }
-
+            main_content := mod.widgets.FloatingPopupContent {
                 header_view := RoundedView {
                     width: Fill, height: #(HEADER_HEIGHT)
                     flow: Right
@@ -89,9 +76,22 @@ script_mod! {
                         width: Fill, height: Fill
                         flow: Down
                         padding: Inset{right: #(LIST_SIDE_PADDING)} // room for scroll bar
+                        emit_scroll_actions: false
                         row := mod.widgets.AvatarListRow {}
                         command_row := mod.widgets.AvatarListRow {
                             avatar := View { width: 0, height: 0 }
+                        }
+                        emoji_row := mod.widgets.AvatarListRow {
+                            avatar_box +: {
+                                align: Align{x: 0.5, y: 0.5}
+                                avatar := Label {
+                                    width: Fit, height: Fit, padding: 0
+                                    draw_text +: {
+                                        ink_centered: false
+                                        text_style: EMOJI_TEXT {}
+                                    }
+                                }
+                            }
                         }
                         loading_row := mod.widgets.ListLoadingRow {}
                         empty_row := mod.widgets.ListEmptyRow {}
@@ -122,6 +122,11 @@ pub enum MentionItem {
     NotifyRoom { room_name: String },
     Room(RoomMentionCandidate),
     Command(&'static SlashCommand),
+    Emoji {
+        emoji: &'static Emoji,
+        /// Like ":smile:", if the emoji has a shortcode.
+        shortcode: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -146,6 +151,12 @@ pub struct MentionablePopup {
     #[rust] cancel_scope: Option<CancelScope>,
     /// The location of the text input cursor that this popup is positioned near.
     #[rust] anchor_rect: Rect,
+    /// The source widget, which `anchor_rect` moves along with (e.g., as the soft keyboard shrinks the room screen).
+    #[rust] anchor_source: WidgetRef,
+    /// Where `anchor_source` was when we set `anchor_rect`.
+    #[rust] anchor_source_pos: DVec2,
+    /// How much of the window the soft keyboard covers, which the popup stays above.
+    #[rust] keyboard_height: f64,
     /// The MentionableTextInput widget instance that opened and is controlling this popup.
     #[rust] owner: Option<WidgetUid>,
     /// The UID of the source widget controlling this (e.g., the TextInput that triggered it).
@@ -175,6 +186,13 @@ pub struct MentionablePopup {
 
 impl Widget for MentionablePopup {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        // The keyboard is usually up before we open, so we keep track of it even while closed.
+        if let Some(height) = get_keyboard_height(event) {
+            self.keyboard_height = height;
+            if self.is_open {
+                self.redraw(cx);
+            }
+        }
         if !self.is_open {
             return;
         }
@@ -292,23 +310,26 @@ impl MentionablePopup {
 
     /// Recalculates and updates the position of the `popup_frame`.
     fn position_content(&mut self, cx: &mut Cx2d) {
-        let window_size = cx.current_pass_size();
         let edge = 10.0;
         let gap = 16.0; // space between the current line of text and the popup border
-        let anchor = self.anchor_rect;
+        let source_rect = self.anchor_source.area().rect(cx);
+        let anchor = if source_rect.size.y > 0.0 {
+            self.anchor_rect.translate(source_rect.pos - self.anchor_source_pos)
+        } else {
+            self.anchor_rect
+        };
         // The anchor is in absolute coords (relative to the whole app window),
         // but the margins are relatively to the overlay container.
         let overlay = cx.turtle().origin();
+        let bounds = get_popup_bounds(cx, overlay, self.keyboard_height, edge);
 
         // Align the left side of the popup with the current textinput's cursor location,
-        // and then ensure that the width is either limited by the app window size or a fixed max value.
-        let width = (window_size.x - 2.0 * edge).clamp(0.0, POPUP_MAX_WIDTH);
-        let left_win = anchor.pos.x.clamp(edge, (window_size.x - edge - width).max(edge));
+        // and then ensure that the width is either limited by the available space or a fixed max value.
+        let width = bounds.size.x.min(POPUP_MAX_WIDTH);
+        let left_win = anchor.pos.x.clamp(bounds.pos.x, bounds.pos.x + bounds.size.x - width);
 
-        // Measure space inside the overlay body, not the window: its top is at
-        // overlay.y, so the popup never spills up into the caption.
-        let top_limit = overlay.y + edge;
-        let bottom_limit = window_size.y - edge;
+        let top_limit = bounds.pos.y;
+        let bottom_limit = top_limit + bounds.size.y;
         // Must match header_view's fixed height in the DSL.
         let header_h = HEADER_HEIGHT;
         let space_above = (anchor.pos.y - gap - top_limit).max(0.0);
@@ -381,29 +402,32 @@ impl MentionablePopupRef {
         &self,
         cx: &mut Cx,
         owner: WidgetUid,
-        source_widget: WidgetUid,
+        source_widget: &WidgetRef,
         anchor_rect: Rect,
         trigger_start_byte: usize,
         header: &str,
         loading_message: &str,
     ) {
-        if source_widget == WidgetUid(0) {
+        let source_uid = source_widget.widget_uid();
+        if source_uid == WidgetUid(0) {
             self.cancel(cx);
             return;
         }
         {
             let Some(mut inner) = self.borrow_mut() else { return };
             let is_first_anchor = inner.owner != Some(owner)
-                || inner.source_widget != Some(source_widget)
+                || inner.source_widget != Some(source_uid)
                 || inner.trigger_start_byte != Some(trigger_start_byte);
             inner.owner = Some(owner);
-            inner.source_widget = Some(source_widget);
+            inner.source_widget = Some(source_uid);
             if is_first_anchor {
                 inner.anchor_rect = anchor_rect;
+                inner.anchor_source = source_widget.clone();
+                inner.anchor_source_pos = source_widget.area().rect(cx).pos;
                 inner.trigger_start_byte = Some(trigger_start_byte);
             }
             if !inner.is_open || is_first_anchor {
-                inner.cancel_scope = Some(cx.begin_widget_cancel_scope(source_widget.0, CancelScopeKind::Both));
+                inner.cancel_scope = Some(cx.begin_widget_cancel_scope(source_uid.0, CancelScopeKind::Both));
             }
             inner.is_open = true;
             inner.view.label(cx, ids!(main_content.header_view.header_label)).set_text(cx, header);
@@ -471,6 +495,7 @@ impl MentionablePopupRef {
         if let Some(mut inner) = self.borrow_mut() {
             if inner.is_open && inner.owner == Some(owner) && inner.anchor_rect != anchor {
                 inner.anchor_rect = anchor;
+                inner.anchor_source_pos = inner.anchor_source.area().rect(cx).pos;
                 inner.redraw(cx);
             }
         }
@@ -574,13 +599,20 @@ fn build_row(cx: &mut Cx, list: &mut PortalList, index: usize, item: &MentionIte
             new_widget.label(cx, ids!(info.title)).set_text(cx, &name);
             let alias = candidate.alias.as_ref().map(|a| a.as_str()).unwrap_or("");
             new_widget.label(cx, ids!(info.subtitle)).set_text(cx, alias);
-            new_widget.avatar(cx, ids!(avatar)).show_room(cx, candidate.room_name_id.room_id(), candidate.avatar_url.as_ref(), candidate.room_name_id.name_for_avatar());
+            new_widget.avatar(cx, ids!(avatar)).show_room(cx, candidate.room_name_id.room_id(), candidate.avatar_url.as_ref(), candidate.room_name_id.name_for_avatar(), TextAvatarBgColor::UnknownRoom);
             new_widget
         }
         MentionItem::Command(cmd) => {
             let new_widget = list.item(cx, index, id!(command_row));
             new_widget.label(cx, ids!(info.title)).set_text(cx, cmd.usage);
             new_widget.label(cx, ids!(info.subtitle)).set_text(cx, cmd.description);
+            new_widget
+        }
+        MentionItem::Emoji { emoji, shortcode } => {
+            let new_widget = list.item(cx, index, id!(emoji_row));
+            new_widget.label(cx, ids!(avatar)).set_text(cx, emoji.as_str());
+            new_widget.label(cx, ids!(info.title)).set_text(cx, shortcode.as_deref().unwrap_or(emoji.name()));
+            new_widget.label(cx, ids!(info.subtitle)).set_text(cx, if shortcode.is_some() { emoji.name() } else { "" });
             new_widget
         }
     }
