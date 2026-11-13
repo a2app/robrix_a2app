@@ -5,7 +5,7 @@
 use a2app_core::palette;
 use makepad_widgets::*;
 
-use crate::settings::app_preferences::Appearance;
+use robius_theme::Theme;
 
 /// The Robrix color behind each palette color, in `palette::NAMES` order.
 /// `transparent` takes the surface's color at no opacity.
@@ -65,10 +65,10 @@ const TOGGLE_COLORS: [&str; 13] = [
 /// Puts mini-app isolates on Robrix's current theme. Running ones restyle to it.
 ///
 /// Must run after `helpers.rs`, whose widget colors it copies.
-pub fn set(vm: &mut ScriptVm, appearance: Appearance) {
+pub fn set(vm: &mut ScriptVm, appearance: Theme) {
     makepad_widgets::set_splash_theme(match appearance {
-        Appearance::Light => SplashTheme::Light,
-        Appearance::Dark => SplashTheme::Dark,
+        Theme::Light => SplashTheme::Light,
+        Theme::Dark => SplashTheme::Dark,
     });
     let widgets = vm.module(id!(widgets));
     let colors = std::array::from_fn(|i| {
@@ -91,7 +91,7 @@ pub fn set(vm: &mut ScriptVm, appearance: Appearance) {
         }
     }
     makepad_widgets::set_splash_theme_script(SplashThemeScript {
-        theme: palette::theme_script(&colors, appearance == Appearance::Dark),
+        theme: palette::theme_script(&colors, appearance == Theme::Dark),
         widgets: widget_script,
     });
 }
@@ -122,7 +122,7 @@ mod tests {
         cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, Appearance::Light);
+            crate::shared::script_mod(vm, Theme::Light);
             let widgets = vm.module(id!(widgets));
             for (i, (name, host)) in PALETTE.iter().enumerate() {
                 let color = color_at(vm, widgets, &[host]).unwrap();

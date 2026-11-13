@@ -11,6 +11,7 @@ use std::{
 use makepad_widgets::*;
 use matrix_sdk::{encryption::recovery::RecoveryState, ruma::{MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId}};
 use matrix_sdk_ui::sync_service::State as SyncServiceState;
+use robius_theme::Theme;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use crate::{
@@ -21,7 +22,7 @@ use crate::{
         create_room_modal::{CreateRoomModalAction, CreateRoomModalWidgetRefExt}, event_source_modal::{EventSourceModalAction, EventSourceModalWidgetRefExt}, home_screen::{MainViewVariantChangedAction, ScreenRestoredAction}, invite_modal::{InviteModalAction, InviteModalWidgetRefExt}, leave_space_modal::{LeaveSpaceModalAction, LeaveSpaceModalWidgetRefExt}, main_desktop_ui::MainDesktopUiAction, nav_history::{GoForwardAction, NavHistory, can_navigate_history}, nav_history_menu::{ShowNavHistoryMenuAction, show_nav_history_menu}, navigation_tab_bar::{NavigationBarAction, SelectedTab}, new_message_context_menu::NewMessageContextMenuWidgetRefExt, room_context_menu::RoomContextMenuWidgetRefExt, room_screen::{DropDecodedImagesAction, InviteAction, MessageAction, clear_timeline_states, invalidate_single_timeline_state, drop_docked_pane_data}, rooms_list::{RoomsListAction, RoomsListRef, clear_all_invited_rooms}, rooms_list_header::{RoomsListHeaderAction, SyncStatusGlobal, get_last_synced_at}, space_lobby::clear_space_lobby_states, title_bar_buttons::enable_title_bar_buttons
     }, join_leave_room_modal::{
         JoinLeaveRoomModalAction, JoinLeaveRoomModalWidgetRefExt
-    }, login::login_screen::LoginAction, logout::logout_confirm_modal::{LogoutAction, LogoutConfirmModalAction, LogoutConfirmModalWidgetRefExt}, persistence::{self, WindowGeomTracker}, profile::{user_profile_cache::{clear_user_profile_cache, process_user_profile_updates}, user_verification_cache::{clear_user_verification_cache, process_user_verification_updates}}, room::{BasicRoomDetails, room_pane::{self, PaneLayout, RoomPaneKind}}, settings::{app_preferences::{AppPreferences, AppPreferencesGlobal, Appearance, AppearanceGlobal, UiZoom, set_img_msg_fit_max_height}, encryption_settings::{EncryptionModalAction, EncryptionModalWidgetRefExt}, text_rendering::apply_simpler_text_rendering}, shared::{confirmation_modal::{ConfirmationModalContent, ConfirmationModalWidgetRefExt}, context_menu::{ContextMenuClosed, close_context_menus, get_keyboard_height, is_context_menu_shown, menu_position_margin}, image_viewer::{ImageViewerAction, LoadState}, inline_image::clear_inline_image_cache, popup_list::{PopupKind, enqueue_popup_notification}, room_picker_modal::{RoomPickerModalAction, RoomPickerModalWidgetRefExt}, recent_emojis::{RecentEmojis, RecentEmojisAction, clear_recent_emojis, handle_recent_emojis_action, restore_recent_emojis, save_recent_emojis}, speech_text_input::cancel_all_dictation}, sliding_sync::{DirectMessageRoomAction, MatrixRequest, RecoveryAction, TimelineKind, current_user_id, submit_async_request}, utils::RoomNameId, verification::{UserVerificationRequestAction, VerificationAction}, verification_modal::{
+    }, login::login_screen::LoginAction, logout::logout_confirm_modal::{LogoutAction, LogoutConfirmModalAction, LogoutConfirmModalWidgetRefExt}, persistence::{self, WindowGeomTracker}, profile::{user_profile_cache::{clear_user_profile_cache, process_user_profile_updates}, user_verification_cache::{clear_user_verification_cache, process_user_verification_updates}}, room::{BasicRoomDetails, membership::{clear_room_membership_cache, process_room_membership_updates}, room_pane::{self, PaneLayout, RoomPaneKind}}, settings::{app_preferences::{AppPreferences, AppPreferencesGlobal, AppearanceGlobal, UiZoom, set_img_msg_fit_max_height}, encryption_settings::{EncryptionModalAction, EncryptionModalWidgetRefExt}, system_theme::{self, SystemThemeAction}, text_rendering::apply_simpler_text_rendering}, shared::{confirmation_modal::{ConfirmationModalContent, ConfirmationModalWidgetRefExt}, context_menu::{ContextMenuClosed, close_context_menus, get_keyboard_height, is_context_menu_shown, menu_position_margin}, image_viewer::{ImageViewerAction, LoadState}, inline_image::clear_inline_image_cache, popup_list::{PopupKind, enqueue_popup_notification}, room_picker_modal::{RoomPickerModalAction, RoomPickerModalWidgetRefExt}, recent_emojis::{RecentEmojis, RecentEmojisAction, clear_recent_emojis, handle_recent_emojis_action, restore_recent_emojis, save_recent_emojis}, speech_text_input::cancel_all_dictation}, sliding_sync::{DirectMessageRoomAction, MatrixRequest, RecoveryAction, TimelineKind, current_user_id, submit_async_request}, utils::RoomNameId, verification::{UserVerificationRequestAction, VerificationAction}, verification_modal::{
         VerificationModalAction,
         VerificationModalWidgetRefExt,
         show_dm_room_creation_confirmation,
@@ -256,6 +257,7 @@ script_mod! {
 // This runs before App::script_mod, so even the first frame uses the saved appearance.
 app_main!(App, configure: |cx| {
     cx.set_global(AppearanceGlobal(persistence::load_appearance()));
+    system_theme::init(cx);
     apply_simpler_text_rendering(cx, persistence::load_simpler_text_rendering());
 });
 
@@ -351,6 +353,7 @@ impl MatchEvent for App {
         process_user_verification_updates(cx);
         process_avatar_updates(cx);
         process_room_preview_updates(cx);
+        process_room_membership_updates(cx);
     }
 
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
@@ -370,6 +373,11 @@ impl MatchEvent for App {
         }
 
         for action in actions {
+            if let Some(SystemThemeAction(theme)) = action.downcast_ref() {
+                system_theme::set_system_theme(cx, *theme);
+                continue;
+            }
+
             match action.downcast_ref() {
                 Some(LogoutConfirmModalAction::Open) => {
                     let logout_confirm_modal = self.ui.logout_confirm_modal(cx, ids!(logout_confirm_modal.content));
@@ -441,6 +449,9 @@ impl MatchEvent for App {
                 if self.app_state.logged_in {
                     log!("Received LoginAction::LoginFailure while logged in; showing login screen.");
                     cancel_all_dictation();
+                    // The next session only reports membership changes that happen after it starts,
+                    // so our cached memberships could go stale (or belong to a different account).
+                    clear_room_membership_cache(cx);
                     self.app_state.logged_in = false;
                     self.app_state.recovery_state = RecoveryState::Unknown;
                     self.update_login_visibility(cx);
@@ -970,6 +981,7 @@ fn clear_all_app_state(cx: &mut Cx) {
     clear_avatar_cache(cx);
     clear_inline_image_cache(cx);
     clear_room_preview_cache(cx);
+    clear_room_membership_cache(cx);
     clear_recent_emojis(cx);
 }
 
@@ -1013,22 +1025,20 @@ impl AppStateSaveFingerprint {
 
 impl AppMain for App {
     fn script_mod(vm: &mut ScriptVm) -> makepad_widgets::ScriptValue {
-        let appearance = vm.cx_mut().global::<AppearanceGlobal>().0;
-        vm.cx_mut().set_native_appearance(match appearance {
-            Appearance::Light => NativeAppearance::Light,
-            Appearance::Dark => NativeAppearance::Dark,
-        });
+        let theme = system_theme::effective_theme(vm.cx_mut());
+        let native_appearance = system_theme::native_appearance(vm.cx_mut());
+        vm.cx_mut().set_native_appearance(native_appearance);
         // Order matters: base widgets first, then app widgets, then app UI.
         makepad_widgets::theme_mod(vm);
-        match appearance {
-            Appearance::Light => script_eval!(vm, { mod.theme = mod.themes.light }),
-            Appearance::Dark => script_eval!(vm, { mod.theme = mod.themes.dark }),
+        match theme {
+            Theme::Light => script_eval!(vm, { mod.theme = mod.themes.light }),
+            Theme::Dark => script_eval!(vm, { mod.theme = mod.themes.dark }),
         };
         makepad_widgets::widgets_mod(vm);
         // Complete an explicitly selected Makepad style before Robrix overrides it.
         makepad_widgets::desktop_style::apply_widgets(vm);
         makepad_code_editor::script_mod(vm);
-        crate::shared::script_mod(vm, appearance);
+        crate::shared::script_mod(vm, theme);
 
         #[cfg(feature = "tsp")]
         crate::tsp::script_mod(vm);
@@ -1048,6 +1058,8 @@ impl AppMain for App {
         crate::home::tombstone_footer::script_mod(vm);
         crate::home::editing_pane::script_mod(vm);
         crate::home::upload_progress::script_mod(vm);
+        crate::home::identity_reset_banner::script_mod(vm);
+        crate::home::failed_send_banner::script_mod(vm);
         crate::room::script_mod(vm);
         crate::join_leave_room_modal::script_mod(vm);
         crate::block_user_modal::script_mod(vm);
@@ -1506,6 +1518,7 @@ pub enum SelectedRoom {
         room_name_id: RoomNameId,
     },
     Space {
+        #[serde(deserialize_with = "RoomNameId::deserialize_space")]
         space_name_id: RoomNameId,
     },
     /// An in-room pane (like its member list) that was popped out of the room screen
@@ -1538,7 +1551,8 @@ impl SelectedRoom {
     }
 
     /// Returns the joined variant for the given space/room: `Space` if `is_space`, else `JoinedRoom`.
-    pub fn to_joined(room_name_id: RoomNameId, is_space: bool) -> Self {
+    pub fn to_joined(mut room_name_id: RoomNameId, is_space: bool) -> Self {
+        room_name_id.set_is_space(is_space);
         match is_space {
             true  => SelectedRoom::Space { space_name_id: room_name_id },
             false => SelectedRoom::JoinedRoom { room_name_id },
@@ -1567,7 +1581,7 @@ impl SelectedRoom {
             | SelectedRoom::Space { space_name_id: room_name_id }
             | SelectedRoom::RoomPane { room_name_id, .. }) = self;
         if room_name_id.room_id() != new_room_name.room_id()
-            || room_name_id.display_name() == new_room_name.display_name()
+            || room_name_id.display() == new_room_name.display()
         {
             return false;
         }
@@ -1759,6 +1773,7 @@ pub enum ConfirmDeleteAction {
 #[cfg(test)]
 mod appearance_tests {
     use super::*;
+    use crate::settings::app_preferences::Appearance;
 
     thread_local! {
         static ERRORS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };

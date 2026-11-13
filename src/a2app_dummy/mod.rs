@@ -29,12 +29,12 @@ script_mod! {
 pub mod splash_theme {
     use makepad_widgets::*;
 
-    use crate::settings::app_preferences::Appearance;
+    use robius_theme::Theme;
 
-    pub fn set(_vm: &mut ScriptVm, appearance: Appearance) {
-        makepad_widgets::set_splash_theme(match appearance {
-            Appearance::Light => SplashTheme::Light,
-            Appearance::Dark => SplashTheme::Dark,
+    pub fn set(_vm: &mut ScriptVm, theme: Theme) {
+        makepad_widgets::set_splash_theme(match theme {
+            Theme::Light => SplashTheme::Light,
+            Theme::Dark => SplashTheme::Dark,
         });
     }
 }

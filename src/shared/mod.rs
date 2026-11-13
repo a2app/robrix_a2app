@@ -1,5 +1,5 @@
 use makepad_widgets::ScriptVm;
-use crate::settings::app_preferences::Appearance;
+use robius_theme::Theme;
 
 pub mod attachment_download;
 pub mod avatar;
@@ -48,18 +48,18 @@ pub mod restore_status_view;
 pub mod image_viewer;
 
 
-pub fn script_mod(vm: &mut ScriptVm, appearance: Appearance) {
+pub fn script_mod(vm: &mut ScriptVm, theme: Theme) {
     // Order matters here, as some widget definitions depend on others.
     styles::script_mod(vm);
-    if appearance == Appearance::Dark {
+    if theme == Theme::Dark {
         styles_dark::script_mod(vm);
     }
     helpers::script_mod(vm);
     // Mini-app isolates take Robrix's theme too, helpers' widget colors included.
     #[cfg(feature = "a2app")]
-    crate::a2app::splash_theme::set(vm, appearance);
+    crate::a2app::splash_theme::set(vm, theme);
     #[cfg(not(feature = "a2app"))]
-    crate::a2app_dummy::splash_theme::set(vm, appearance);
+    crate::a2app_dummy::splash_theme::set(vm, theme);
     settings_controls::script_mod(vm);
     lazy_view::script_mod(vm);
     icon_button::script_mod(vm);

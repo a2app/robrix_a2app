@@ -1,8 +1,10 @@
 //! The RoomInputBar widget contains all components related to sending messages/content to a room.
 //!
-//! The RoomInputBar is capped to a maximum height of 75% of the containing RoomScreen's height.
+//! The RoomInputBar is capped to a maximum height of 75% of the containing RoomScreen's height,
+//! but it always shows at least one full line of its text input, and its warning banners in full.
 //!
 //! The widgets included in the RoomInputBar are:
+//! * banners that warn about a room member's identity being reset or a message that failed to send.
 //! * a preview of the message the user is replying to.
 //! * the location preview (which allows you to send your current location to the room),
 //!   plus a menu item to show the location preview.
@@ -14,6 +16,7 @@
 //! * A button to send the message.
 //! * The editing pane, which is shown when the user is editing a previous message.
 //! * A tombstone footer, which is shown if the room has been tombstoned (replaced).
+//! * A membership footer, which is shown if the user is no longer in the room.
 //! * A "cannot-send-message" notice, which is shown if the user cannot send messages to the room.
 //!
 
@@ -25,7 +28,8 @@ use matrix_sdk::room::reply::{EnforceThread, Reply};
 use ruma::events::room::message::AddMentions;
 use matrix_sdk_ui::timeline::{EmbeddedEvent, EventTimelineItem, TimelineEventItemId};
 use ruma::{events::room::message::{LocationMessageEventContent, MessageType, ReplyWithinThread, RoomMessageEventContent}, OwnedEventId, OwnedRoomId, OwnedTransactionId};
-use crate::{block_user_modal::{BlockUserModalAction, BlockUserRequest}, home::{editing_pane::{EditingPaneRef, EditingPaneState, EditingPaneWidgetExt, EditingPaneWidgetRefExt}, location_preview::{LocationPreviewWidgetExt, LocationPreviewWidgetRefExt}, room_screen::{MessageAction, display_name_or_user_id, populate_preview_of_timeline_item}, rooms_list::RoomsListRef, tombstone_footer::{SuccessorRoomDetails, TombstoneFooterWidgetExt}, upload_progress::{UploadProgressViewWidgetRefExt, UploadState}}, join_leave_room_modal::{JoinLeaveModalKind, JoinLeaveRoomModalAction}, location::init_location_subscriber, moderation::MemberModeration, moderation_modal::{ModerationModalAction, ModerationRequest}, profile::user_profile::{ShowUserProfileAction, UserProfile, UserProfileAndRoomId}, room::BasicRoomDetails, settings::app_preferences::{AppPreferencesAction, AppPreferencesGlobal}, shared::{avatar::{AvatarState, AvatarWidgetRefExt}, file_upload_modal::{AttachmentUpload, FileUploadAttemptId, FileUploadMetadata, PendingUpload, handle_picked_file, handle_picker_launch_errors, stage_local_file}, html_or_plaintext::HtmlOrPlaintextWidgetRefExt, mentionable_text_input::{MentionableTextInputRef, MentionableTextInputWidgetExt, MentionableTextInputWidgetRefExt, MentionableTextInputState}, popup_list::{PopupKind, enqueue_popup_notification}, room_input_popup_menu::RoomInputPopupMenuAction, slash_commands::{SlashCommandAction, SlashCommandOutcome}, styles::{apply_positive_button_style, apply_primary_button_style}}, sliding_sync::{MatrixRequest, TimelineKind, UserPowerLevels, submit_async_request}, utils};
+use crate::{block_user_modal::{BlockUserModalAction, BlockUserRequest}, home::{editing_pane::{EditingPaneRef, EditingPaneState, EditingPaneWidgetExt, EditingPaneWidgetRefExt}, location_preview::{LocationPreviewWidgetExt, LocationPreviewWidgetRefExt}, room_screen::{MessageAction, display_name_or_user_id, populate_preview_of_timeline_item}, rooms_list::RoomsListRef, tombstone_footer::{SuccessorRoomDetails, TombstoneFooterWidgetExt}, upload_progress::{UploadProgressViewWidgetRefExt, UploadState}}, join_leave_room_modal::{JoinLeaveModalKind, JoinLeaveRoomModalAction}, location::init_location_subscriber, moderation::MemberModeration, moderation_modal::{ModerationModalAction, ModerationRequest}, profile::user_profile::{ShowUserProfileAction, UserProfile, UserProfileAndRoomId}, room::{BasicRoomDetails, attachment_buttons::{AttachmentButtonsRef, AttachmentButtonsWidgetExt}}, settings::app_preferences::{AppPreferencesAction, AppPreferencesGlobal}, shared::{avatar::{AvatarState, AvatarWidgetRefExt}, file_upload_modal::{AttachmentUpload, FileUploadAttemptId, FileUploadMetadata, PendingUpload, handle_picked_file, handle_picker_launch_errors, stage_local_file}, html_or_plaintext::HtmlOrPlaintextWidgetRefExt, mentionable_text_input::{MentionableTextInputRef, MentionableTextInputWidgetExt, MentionableTextInputWidgetRefExt, MentionableTextInputState}, popup_list::{PopupKind, enqueue_popup_notification}, room_input_popup_menu::RoomInputPopupMenuAction, slash_commands::{SlashCommandAction, SlashCommandOutcome}, styles::{apply_positive_button_style, apply_primary_button_style}}, sliding_sync::{MatrixRequest, TimelineKind, UserPowerLevels, submit_async_request}, utils};
+use crate::room::{membership::RoomMembership, room_membership_footer::RoomMembershipFooterWidgetExt};
 use crate::room::reply_preview::CollapsiblePreviewWidgetRefExt;
 
 script_mod! {
@@ -57,49 +61,92 @@ script_mod! {
             // shadow_offset: vec2(0.0,0.0)
         }
 
-        // The top-most element is a preview of the message that the user is replying to, if any.
-        replying_preview := ReplyingPreview { }
+        // Everything above the message input, which always leaves room for one line of it.
+        banners_and_previews := View {
+            width: Fill, height: Fit
+            flow: Down
 
-        // Below that, display a preview of the current location that a user is about to send.
-        location_preview := LocationPreview { }
+            // The top-most elements warn about any room member whose identity was reset,
+            // and about a failed message that is holding up this room's send queue.
+            identity_reset_banner := IdentityResetBanner { }
+            failed_send_banner := FailedSendBanner { }
 
-        // Upload progress view (shown when a file upload is in progress)
-        upload_progress_view := UploadProgressView { }
+            // Below that, display a preview of the current location that a user is about to send.
+            location_preview := LocationPreview { }
 
-        // Below that, display one of multiple possible views:
-        // * the message input bar (buttons and message TextInput).
-        // * a notice that the user can't send messages to this room.
-        // * if this room was tombstoned, a "footer" view showing the successor room info.
-        // * the EditingPane, which slides up as an overlay in front of the other views below.
+            // Upload progress view (shown when a file upload is in progress)
+            upload_progress_view := UploadProgressView { }
+
+            // Below that, a preview of the message that the user is replying to, if any,
+            // which collapses to fit in the height that's left.
+            replying_preview := ReplyingPreview {
+                height: Fit{max: FitBound.Rel{base: Base.Unused, factor: 1.0}}
+            }
+        }
+
+        // Below that, if the user can't post here, display one of these notices instead of the message input bar.
+        // They sit outside the overlay below so that an in-progress edit can't cover them.
+        notices := RoundedYView {
+            width: Fill, height: Fit
+            flow: Down
+
+            // Rounded at the top like the RoomInputBar and EditingPane. The sides are inset by the RoomInputBar's
+            // -4 margins, so that the rounded corners aren't clipped off.
+            show_bg: true
+            draw_bg +: {
+                color: (COLOR_SECONDARY)
+                border_radius: vec2(4.0, 0.0)
+                border_inset: vec4(4.0, 0.0, 4.0, 0.0)
+            }
+
+            // A notice that the user can't send messages to this room.
+            can_not_send_message_notice := View {
+                visible: false
+                // Uneven so the text looks centered: the RoomInputBar's -4 bottom margin hides 4 of the bottom padding.
+                padding: Inset{top: 18, bottom: 22, left: 20, right: 20}
+                align: Align{x: 0.5, y: 0.5}
+                width: Fill, height: Fit
+
+                text := Label {
+                    width: Fill,
+                    flow: Flow.Right{wrap: true},
+                    align: Align{x: 0.5, y: 0.5}
+                    draw_text +: {
+                        color: (COLOR_TEXT)
+                        text_style: theme.font_italic {font_size: 12.2}
+                    }
+                    text: "You don't have permission to post to this room.",
+                }
+            }
+
+            // If this room was tombstoned, a "footer" view showing the successor room info.
+            tombstone_footer := TombstoneFooter { }
+
+            // If the user isn't in this room anymore, a footer saying why, with any way to re-join.
+            membership_footer := RoomMembershipFooter { }
+        }
+
+        // Below that, display the message input bar (buttons and message TextInput),
+        // or the EditingPane, which slides up as an overlay in front of it.
         overlay_wrapper := View {
             width: Fill,
-            height: Fit{max: FitBound.Rel{base: Base.Full, factor: 0.75}}
+            // The banners and previews above take up some of the input bar's max height,
+            // so this only gets what's left of it.
+            height: Fit{max: FitBound.Rel{base: Base.Unused, factor: 1.0}}
             flow: Overlay,
 
             // Below that, display a view that holds the message input bar and send button.
             input_bar := View {
                 width: Fill,
-                height: Fit{max: FitBound.Rel{base: Base.Full, factor: 0.75}}
+                height: Fit
                 flow: Right
                 // Bottom-align everything to ensure that buttons always stick to the bottom
                 // even when the mentionable_text_input box is very tall.
                 align: Align{y: 1.0},
                 padding: 6,
 
-                open_popup_menu_button := RobrixIconButton {
-                    padding: 9
+                attachment_buttons := AttachmentButtons {
                     margin: Inset { top: 4, left: 4, right: 4, bottom: 5}
-                    spacing: 0,
-                    draw_icon +: {
-                        svg: (ICON_ADD)
-                        color: (COLOR_ACTIVE_PRIMARY_DARKER)
-                    },
-                    draw_bg +: {
-                        color: (COLOR_BG_PREVIEW)
-                        color_hover: (COLOR_INPUT_BAR_ADD_BUTTON_BG_HOVER)
-                        color_down: (COLOR_INPUT_BAR_ADD_BUTTON_BG_DOWN)
-                    }
-                    icon_walk: Walk{width: 21, height: 21}
                 }
 
                 // A checkbox that enables TSP signing for the outgoing message.
@@ -136,29 +183,6 @@ script_mod! {
                 }
             }
 
-            can_not_send_message_notice := SolidView {
-                visible: false
-                padding: 20
-                align: Align{x: 0.5, y: 0.5}
-                width: Fill, height: Fit
-
-                show_bg: true
-                draw_bg.color: (COLOR_SECONDARY)
-
-                text := Label {
-                    width: Fill,
-                    flow: Flow.Right{wrap: true},
-                    align: Align{x: 0.5, y: 0.5}
-                    draw_text +: {
-                        color: (COLOR_TEXT)
-                        text_style: theme.font_italic {font_size: 12.2}
-                    }
-                    text: "You don't have permission to post to this room.",
-                }
-            }
-
-            tombstone_footer := TombstoneFooter { }
-
             editing_pane := EditingPane { }
         }
     }
@@ -175,11 +199,17 @@ enum RoomInputBarMode<'a> {
         room_id: &'a OwnedRoomId,
         successor: &'a SuccessorRoomDetails,
     },
+    /// The user isn't in this room anymore, so show the membership footer.
+    NotJoined {
+        room_id: &'a OwnedRoomId,
+        membership: &'a RoomMembership,
+    },
 }
 
 /// The input bar at the bottom of a RoomScreen that allows the user to send messages, upload files, etc.
 ///
 /// It also shows the tombstone footer for rooms that have been tombstoned,
+/// the membership footer for rooms that the user is no longer in,
 /// or a notice that the user cannot send messages to this room.
 #[derive(Script, Widget)]
 pub struct RoomInputBar {
@@ -194,6 +224,13 @@ pub struct RoomInputBar {
     /// Cached natural Fit height of the input_bar, used as the animation
     /// target when the editing pane is being hidden.
     #[rust] input_bar_natural_height: f64,
+    /// The height of the banners and previews with the replying preview's content fully collapsed,
+    /// as of when we last drew them.
+    #[rust] min_banners_and_previews_height: f64,
+    /// The height of the views below the replying preview's content, within the replying preview.
+    #[rust] height_below_reply_preview_content: f64,
+    /// Used to redraw once more after the banners and previews changed height.
+    #[rust] next_frame: NextFrame,
     /// Whether the currently-displayed room is encrypted, used to style the send button.
     #[rust] is_encrypted: bool,
     /// Whether the send button is currently enabled (the message input is non-empty).
@@ -208,10 +245,15 @@ pub struct RoomInputBar {
 
 #[derive(Clone)]
 struct ChildRefs {
+    banners_and_previews: ViewRef,
+    replying_preview: ViewRef,
     reply_preview_content: WidgetRef,
+    reply_preview_bottom_line: WidgetRef,
+    notices: ViewRef,
+    overlay_wrapper: ViewRef,
     input_bar: ViewRef,
     mentionable_text_input: MentionableTextInputRef,
-    open_popup_menu_button: ButtonRef,
+    attachment_buttons: AttachmentButtonsRef,
     send_message_button: ButtonRef,
     cancel_reply_button: ButtonRef,
     send_location_button: ButtonRef,
@@ -222,9 +264,9 @@ impl ScriptHook for RoomInputBar {
     fn on_after_new(&mut self, vm: &mut ScriptVm) {
         vm.with_cx_mut(|cx| {
             let send_on_enter = cx.global::<AppPreferencesGlobal>().0.send_on_enter;
-            self.mentionable_text_input(cx, ids!(mentionable_text_input))
-                .text_input_ref()
-                .set_submit_on_enter(send_on_enter);
+            let mentionable_text_input = self.mentionable_text_input(cx, ids!(mentionable_text_input));
+            mentionable_text_input.text_input_ref().set_submit_on_enter(send_on_enter);
+            self.attachment_buttons(cx, ids!(attachment_buttons)).set_input(mentionable_text_input.speech_text_input_ref());
         });
     }
 
@@ -235,6 +277,11 @@ impl ScriptHook for RoomInputBar {
 
 impl Widget for RoomInputBar {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        // Redraw after the banners and previews changed height (see draw_walk).
+        if self.next_frame.is_event(event).is_some() {
+            self.redraw(cx);
+        }
+
         let reply_preview_content_area = self.child_refs(cx).reply_preview_content.area();
         match event.hits(cx, reply_preview_content_area) {
             // If the hit occurred on the replying message preview, jump to it.
@@ -266,8 +313,39 @@ impl Widget for RoomInputBar {
         self.view.handle_event(cx, event, scope);
     }
 
-    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        let ChildRefs { reply_preview_content, input_bar, editing_pane, .. } = self.child_refs(cx).clone();
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, mut walk: Walk) -> DrawStep {
+        let ChildRefs {
+            banners_and_previews,
+            replying_preview,
+            reply_preview_content,
+            reply_preview_bottom_line,
+            notices,
+            overlay_wrapper,
+            input_bar,
+            editing_pane,
+            ..
+        } = self.child_refs(cx).clone();
+        // Where we reach into the screen's bottom safe area (e.g., under iOS's home indicator),
+        // our bottom-most view extends into it, so that its own color fills that area.
+        let safe_area_overlap = {
+            let parent = cx.turtle().rect();
+            let insets = cx.display_context.safe_area_insets;
+            let safe_area_top = cx.display_context.screen_size.y - insets.bottom;
+            (parent.pos.y + parent.size.y - safe_area_top).max(0.0).min(insets.bottom)
+        };
+        let is_notice_shown = !input_bar.visible();
+        let is_notice_at_bottom = is_notice_shown && !editing_pane.is_currently_shown(cx);
+        if let Some(mut inner) = notices.borrow_mut() {
+            inner.layout.padding.bottom = if is_notice_at_bottom { safe_area_overlap } else { 0.0 };
+        }
+        if let Some(mut inner) = overlay_wrapper.borrow_mut() {
+            inner.layout.padding.bottom = if is_notice_at_bottom { 0.0 } else { safe_area_overlap };
+            // An edit below a notice overlaps it a bit, so the notice fills in behind the edit's rounded corners.
+            inner.walk.margin.top = if is_notice_shown && !is_notice_at_bottom { -5.0 } else { 0.0 };
+        }
+        // A notice at our very top has its own rounded corners, so we don't draw our background behind it.
+        self.view.show_bg = !(is_notice_shown && banners_and_previews.area().rect(cx).size.y < 0.5);
+
         // Shrink the input_bar's height as the editing pane slides in,
         // and grow it back as the editing pane slides out.
         // slide=1.0 → editing pane hidden → input_bar at full Fit height.
@@ -297,7 +375,60 @@ impl Widget for RoomInputBar {
 
         reply_preview_content.set_visible(cx, true);
 
-        self.view.draw_walk(cx, scope, walk)
+        // Views are laid out top-down, so we reserve the input's minimum height before drawing the
+        // banners and previews above it. Those are shown in full even past our usual max height,
+        // except for the replying preview's content, which collapses to fit in what's left.
+        let min_input_height = self.get_min_input_height(cx);
+        let available_height = {
+            let parent = cx.turtle();
+            parent.unused_height() - parent.padding().bottom - walk.margin.height()
+        };
+        let max_height = cx.walk_max_height(walk)
+            .unwrap_or(available_height)
+            .max(min_input_height + self.min_banners_and_previews_height)
+            .min(available_height);
+        walk.height = Size::fit();
+        walk.max_height = Some(FitBound::Abs(max_height));
+        if let Some(mut inner) = banners_and_previews.borrow_mut() {
+            inner.walk.max_height = Some(FitBound::Abs((max_height - min_input_height).max(0.0)));
+        }
+        // A replying preview without room for its header is hidden rather than cut off.
+        let does_everything_fit = max_height >= min_input_height + self.min_banners_and_previews_height;
+        if let Some(mut inner) = replying_preview.borrow_mut() {
+            inner.walk.max_height = (!does_everything_fit).then_some(FitBound::Abs(0.0));
+        }
+        reply_preview_content.as_collapsible_preview()
+            .set_reserved_height_below(self.height_below_reply_preview_content);
+
+        let step = self.view.draw_walk(cx, scope, walk);
+
+        // Measure the views that the next draw has to make room for.
+        // A clipped view's children still have their full heights, so we measure those.
+        let mut min_banners_and_previews_height = 0.0;
+        banners_and_previews.children(&mut |id, child| {
+            if id != live_id!(replying_preview) && child.visible() {
+                min_banners_and_previews_height += child.area().rect(cx).size.y
+                    + child.walk(cx).margin.height();
+            }
+        });
+        if replying_preview.visible() {
+            let preview_rect = replying_preview.area().rect(cx);
+            let line_rect = reply_preview_bottom_line.area().rect(cx);
+            let content_rect = reply_preview_content.area().rect(cx);
+            let preview_bottom = line_rect.pos.y + line_rect.size.y;
+            min_banners_and_previews_height += preview_bottom - preview_rect.pos.y - content_rect.size.y;
+            self.height_below_reply_preview_content = preview_bottom - content_rect.pos.y - content_rect.size.y;
+        }
+        if min_banners_and_previews_height != self.min_banners_and_previews_height {
+            self.min_banners_and_previews_height = min_banners_and_previews_height;
+            self.next_frame = cx.new_next_frame();
+        }
+        // We only learn a notice's height once it's drawn, and a squeezed edit only regrows a bit per draw,
+        // so we redraw until the height we reserve for them stops changing.
+        if (self.get_min_input_height(cx) - min_input_height).abs() > 0.5 {
+            self.next_frame = cx.new_next_frame();
+        }
+        step
     }
 
     /// Gives key focus to the inner message text input.
@@ -336,7 +467,7 @@ impl RoomInputBar {
         let ChildRefs {
             input_bar,
             mentionable_text_input,
-            open_popup_menu_button,
+            attachment_buttons,
             send_message_button,
             cancel_reply_button,
             send_location_button,
@@ -344,6 +475,7 @@ impl RoomInputBar {
             ..
         } = self.child_refs(cx).clone();
         let text_input = mentionable_text_input.text_input_ref();
+        let attachment_action = attachment_buttons.handle_actions(cx, actions);
 
         for action in actions {
             // Handle changes to the `send_on_enter` preference.
@@ -394,12 +526,8 @@ impl RoomInputBar {
             cx.action(crate::a2app::runtime::A2AppOp::AbortAiRoom(room_id.clone()));
         }
 
-        if open_popup_menu_button.clicked(actions) {
-            let button_rect = open_popup_menu_button.area().rect(cx);
-            cx.widget_action(
-                room_screen_widget_uid,
-                RoomInputPopupMenuAction::Show { button_rect },
-            );
+        if attachment_action != RoomInputPopupMenuAction::None {
+            cx.widget_action(room_screen_widget_uid, attachment_action);
         }
 
         // Handle the send location button being clicked.
@@ -516,6 +644,7 @@ impl RoomInputBar {
                     }
                 }
             }
+            attachment_buttons.update_for_input(cx, true);
         }
 
         // If the user starts/stops typing in the message input box,
@@ -562,15 +691,53 @@ impl RoomInputBar {
 
     fn child_refs(&mut self, cx: &mut Cx) -> &ChildRefs {
         self.child_refs.get_or_insert_with(|| ChildRefs {
+            banners_and_previews: self.view.view(cx, ids!(banners_and_previews)),
+            replying_preview: self.view.view(cx, ids!(replying_preview)),
             reply_preview_content: self.view.widget(cx, ids!(replying_preview.reply_preview_content)),
+            reply_preview_bottom_line: self.view.widget(cx, ids!(replying_preview.bottom_line)),
+            notices: self.view.view(cx, ids!(notices)),
+            overlay_wrapper: self.view.view(cx, ids!(overlay_wrapper)),
             input_bar: self.view.view(cx, ids!(input_bar)),
             mentionable_text_input: self.view.mentionable_text_input(cx, ids!(mentionable_text_input)),
-            open_popup_menu_button: self.view.button(cx, ids!(open_popup_menu_button)),
+            attachment_buttons: self.view.attachment_buttons(cx, ids!(attachment_buttons)),
             send_message_button: self.view.button(cx, ids!(send_message_button)),
             cancel_reply_button: self.view.button(cx, ids!(cancel_reply_button)),
             send_location_button: self.view.button(cx, ids!(location_preview.send_location_button)),
             editing_pane: self.view.editing_pane(cx, ids!(editing_pane)),
         })
+    }
+
+    /// Returns the height that the views below the banners and previews need.
+    ///
+    /// That's enough for the text input there to show one full line,
+    /// or for a notice shown there instead to be shown in full, plus any in-progress edit below it.
+    fn get_min_input_height(&mut self, cx: &mut Cx) -> f64 {
+        let ChildRefs {
+            notices,
+            overlay_wrapper,
+            input_bar,
+            mentionable_text_input,
+            editing_pane,
+            ..
+        } = self.child_refs(cx).clone();
+        // At most one notice is shown, and an in-progress edit can stay shown below it.
+        let notices_height = notices.area().rect(cx).size.y;
+        let safe_area_padding = overlay_wrapper.borrow().map_or(0.0, |inner| inner.layout.padding.bottom);
+        if editing_pane.is_currently_shown(cx) {
+            return notices_height + editing_pane.get_min_height(cx) + safe_area_padding;
+        }
+        if input_bar.visible() {
+            let speech_text_input = mentionable_text_input.speech_text_input_ref();
+            let paddings_height = mentionable_text_input.borrow()
+                .map_or(0.0, |inner| inner.layout.padding.height())
+                + input_bar.borrow().map_or(0.0, |inner| inner.layout.padding.height());
+            let min_height = speech_text_input.get_min_height_for_ancestors(cx) + paddings_height;
+            // The buttons beside the text input can make the input bar even taller than that.
+            let extra_text_height = mentionable_text_input.text_input_ref().area().rect(cx).size.y
+                - speech_text_input.get_min_text_input_height(cx);
+            return min_height.max(self.input_bar_natural_height - extra_text_height.max(0.0)) + safe_area_padding;
+        }
+        notices_height
     }
 
     /// Runs the given slash command action within this room.
@@ -706,7 +873,7 @@ impl RoomInputBar {
         // 1. Populate and show the ReplyingPreview, of course.
         let replying_preview = self.view(cx, ids!(replying_preview));
         let (replying_preview_username, _) = replying_preview
-            .avatar(cx, ids!(reply_preview_content.preview_content.reply_preview_avatar))
+            .avatar(cx, ids!(replying_to_sender.reply_preview_avatar))
             .set_avatar_and_get_username(
                 cx,
                 timeline_kind,
@@ -717,7 +884,7 @@ impl RoomInputBar {
             );
 
         replying_preview
-            .label(cx, ids!(reply_preview_content.preview_content.reply_preview_username))
+            .label(cx, ids!(replying_to_sender.reply_preview_username))
             .set_text(cx, replying_preview_username.as_str());
 
         populate_preview_of_timeline_item(
@@ -834,9 +1001,37 @@ impl RoomInputBar {
             ShowEditingPaneBehavior::RestoreExisting { editing_pane_state } => {
                 editing_pane.restore_state(cx, editing_pane_state, timeline_kind);
             }
+            ShowEditingPaneBehavior::RestoreFailed { event_tl_item, edited_text } => {
+                editing_pane.show_failed_edit(cx, event_tl_item, timeline_kind, &edited_text);
+            }
         };
 
         self.redraw(cx);
+    }
+
+    /// Puts an edit that failed to send back into the editing pane, so the user doesn't lose what they typed.
+    ///
+    /// The `event_tl_item` is the message that was being edited, if this timeline still has it.
+    fn restore_failed_edit(
+        &mut self,
+        cx: &mut Cx,
+        event_tl_item: Option<EventTimelineItem>,
+        timeline_kind: TimelineKind,
+        edited_text: String,
+    ) {
+        let editing_pane = self.view.editing_pane(cx, ids!(editing_pane));
+        // We must not replace another edit that the user has started since then.
+        if let Some(event_tl_item) = event_tl_item.filter(|_| !editing_pane.is_editing()) {
+            let behavior = ShowEditingPaneBehavior::RestoreFailed { event_tl_item, edited_text: edited_text.clone() };
+            self.show_editing_pane(cx, behavior, timeline_kind);
+            if editing_pane.is_editing() { return; }
+        }
+        cx.copy_to_clipboard(&edited_text);
+        enqueue_popup_notification(
+            "Your edit couldn't be put back in the editor, so it was copied to the clipboard.",
+            PopupKind::Warning,
+            None,
+        );
     }
 
     /// This should be invoked after the EditingPane has been fully hidden.
@@ -852,18 +1047,22 @@ impl RoomInputBar {
     } 
 
     /// Updates the room state to set which mode and views are shown in the RoomInputBar.
+    ///
+    /// The `not_joined` membership should only be `Some` if the user isn't in this room (anymore).
     fn update_room_state(
         &mut self,
         cx: &mut Cx,
         room_id: &OwnedRoomId,
         tombstone_info: Option<&SuccessorRoomDetails>,
         user_power_levels: UserPowerLevels,
+        not_joined: Option<&RoomMembership>,
     ) {
         // If the room is tombstoned, that takes precedence over anything else.
-        let mode = match tombstone_info {
-            Some(successor) => RoomInputBarMode::Tombstoned { room_id, successor },
-            None if user_power_levels.can_send_message() => RoomInputBarMode::Input,
-            None => RoomInputBarMode::CannotSend,
+        let mode = match (tombstone_info, not_joined) {
+            (Some(successor), _) => RoomInputBarMode::Tombstoned { room_id, successor },
+            (None, Some(membership)) => RoomInputBarMode::NotJoined { room_id, membership },
+            (None, None) if user_power_levels.can_send_message() => RoomInputBarMode::Input,
+            (None, None) => RoomInputBarMode::CannotSend,
         };
         self.view.view(cx, ids!(input_bar))
             .set_visible(cx, matches!(mode, RoomInputBarMode::Input));
@@ -877,10 +1076,19 @@ impl RoomInputBar {
             tombstone_footer.hide(cx);
         }
 
-        // The user can't post here anymore, so cancel any in-progress edit, reply, input, etc.
-        if !matches!(mode, RoomInputBarMode::Input) {
+        let membership_footer = self.room_membership_footer(cx, ids!(membership_footer));
+        if let RoomInputBarMode::NotJoined { room_id, membership } = mode {
+            membership_footer.show(cx, room_id, membership);
+        } else {
+            membership_footer.hide(cx);
+        }
+
+        // An edit that the user is in the middle of stays shown so they don't lose it, but it can't be sent.
+        let is_input_mode = matches!(mode, RoomInputBarMode::Input);
+        self.editing_pane(cx, ids!(editing_pane)).set_submit_blocked(!is_input_mode);
+        // The user can't post here anymore, so cancel any in-progress reply, dictation, etc.
+        if !is_input_mode {
             self.cancel_dictation(cx);
-            self.editing_pane(cx, ids!(editing_pane)).force_reset_hide(cx);
             self.was_replying_preview_visible = false;
             self.clear_replying_to(cx);
             self.view.location_preview(cx, ids!(location_preview)).clear();
@@ -938,15 +1146,15 @@ impl RoomInputBar {
             script_apply_eval!(cx, send_message_button, {
                 draw_icon.svg: mod.widgets.ICON_SEND_ENCRYPTED,
             });
-            // empty_text = "Send encrypted message…";
-            empty_text = "Message…";
+            empty_text = "Send encrypted message…";
+            // empty_text = "Message…";
         } else {
             apply_positive_button_style(cx, &mut send_message_button);
             script_apply_eval!(cx, send_message_button, {
                 draw_icon.svg: mod.widgets.ICON_SEND_UNENCRYPTED,
             });
-            // empty_text = "Send unencrypted message…";
-            empty_text = "Message…";
+            empty_text = "Send unencrypted message…";
+            // empty_text = "Message…";
         }
 
         self.text_input(cx, ids!(input_bar.mentionable_text_input.text_input))
@@ -1096,6 +1304,8 @@ impl RoomInputBarRef {
         text_input.set_text(cx, &draft);
         text_input.set_cursor(cx, end, false);
         text_input.set_key_focus(cx);
+        // Programmatic insertion emits no input action to refresh the attachment buttons.
+        inner.attachment_buttons(cx, ids!(input_bar.attachment_buttons)).update_for_input(cx, false);
         Ok(())
     }
 
@@ -1133,9 +1343,10 @@ impl RoomInputBarRef {
         room_id: &OwnedRoomId,
         tombstone_info: Option<&SuccessorRoomDetails>,
         user_power_levels: UserPowerLevels,
+        not_joined: Option<&RoomMembership>,
     ) {
         let Some(mut inner) = self.borrow_mut() else { return };
-        inner.update_room_state(cx, room_id, tombstone_info, user_power_levels);
+        inner.update_room_state(cx, room_id, tombstone_info, user_power_levels, not_joined);
     }
 
     /// Updates the message input's placeholder based on this room's encryption status.
@@ -1205,6 +1416,18 @@ impl RoomInputBarRef {
         inner.show_current_location_preview(cx);
     }
 
+    /// See [`RoomInputBar::restore_failed_edit()`].
+    pub fn restore_failed_edit(
+        &self,
+        cx: &mut Cx,
+        event_tl_item: Option<EventTimelineItem>,
+        timeline_kind: TimelineKind,
+        edited_text: String,
+    ) {
+        let Some(mut inner) = self.borrow_mut() else { return };
+        inner.restore_failed_edit(cx, event_tl_item, timeline_kind, edited_text);
+    }
+
     /// Forwards the result of an edit request to the `EditingPane` widget
     /// within this `RoomInputBar`.
     pub fn handle_edit_result(
@@ -1230,6 +1453,8 @@ impl RoomInputBarRef {
         let room_id = timeline_kind.room_id().to_owned();
         if inner.timeline_kind.as_ref() != Some(&timeline_kind) {
             inner.cancel_dictation(cx);
+            // The previous timeline's edit was saved with its state, and must not be shown for this one.
+            inner.editing_pane(cx, ids!(editing_pane)).force_reset_hide(cx);
         }
         inner.room_screen_widget_uid = Some(room_screen_widget_uid);
         inner.timeline_kind = Some(timeline_kind);
@@ -1269,6 +1494,7 @@ impl RoomInputBarRef {
         saved_state: RoomInputBarState,
         user_power_levels: UserPowerLevels,
         tombstone_info: Option<&SuccessorRoomDetails>,
+        not_joined: Option<&RoomMembership>,
         is_encrypted: bool,
     ) {
         let Some(mut inner) = self.borrow_mut() else { return };
@@ -1289,6 +1515,7 @@ impl RoomInputBarRef {
         // 1. Restore the state of the MentionableTextInput.
         inner.mentionable_text_input(cx, ids!(input_bar.mentionable_text_input))
             .restore_state(cx, mentionable_input_state);
+        inner.attachment_buttons(cx, ids!(input_bar.attachment_buttons)).update_for_input(cx, false);
 
         // 2. Restore the state of the replying-to preview.
         if let Some(replying_to) = replying_to {
@@ -1315,8 +1542,8 @@ impl RoomInputBarRef {
             .as_upload_progress_view()
             .restore_state(cx, upload);
 
-        // 5. Apply this room's tombstone state and the user's power levels.
-        inner.update_room_state(cx, timeline_kind.room_id(), tombstone_info, user_power_levels);
+        // 5. Apply this room's tombstone state, the user's power levels, and their membership.
+        inner.update_room_state(cx, timeline_kind.room_id(), tombstone_info, user_power_levels, not_joined);
     }
 
     /// See [`UploadProgressView::on_timeline_reconnected()`].
@@ -1441,11 +1668,17 @@ enum ShowEditingPaneBehavior {
     RestoreExisting {
         editing_pane_state: EditingPaneState,
     },
+    /// Show an edit that failed to send, so the user gets back what they had typed.
+    RestoreFailed {
+        event_tl_item: EventTimelineItem,
+        edited_text: String,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::room::attachment_buttons::AttachmentButtonsWidgetRefExt;
 
     #[test]
     fn checked_draft_refuses_an_unavailable_composer_or_message_input() {
@@ -1461,5 +1694,28 @@ mod tests {
         let input_bar = widget.as_room_input_bar();
         assert!(input_bar.borrow().is_some());
         assert!(input_bar.try_append_draft(&mut cx, "Draft text").is_err());
+    }
+
+    #[test]
+    fn programmatic_draft_collapses_attachment_buttons_without_input_actions() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.init_cx_os();
+        let widget = cx.with_vm(|vm| {
+            <crate::app::App as AppMain>::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.RoomInputBar {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let input_bar = widget.as_room_input_bar();
+        let attachments = widget.attachment_buttons(&cx, ids!(input_bar.attachment_buttons));
+        let expand_button = attachments.button(&cx, ids!(open_popup_menu_button));
+        let file_button = attachments.button(&cx, ids!(upload_file_button));
+        assert!(!expand_button.visible());
+        assert!(file_button.visible());
+
+        input_bar.try_append_draft(&mut cx, "Draft text").unwrap();
+
+        assert_eq!(widget.text_input(&cx, ids!(input_bar.mentionable_text_input.text_input)).text(), "Draft text");
+        assert!(expand_button.visible());
+        assert!(!file_button.visible());
     }
 }

@@ -6,8 +6,10 @@ use matrix_sdk::{Client, RoomDisplayName, RoomHeroWithProfile, RoomState, room_p
 use ruma::{OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedRoomOrAliasId, OwnedServerName, UserId, room::{JoinRuleSummary, RoomType}};
 
 use crate::shared::avatar::AvatarImage;
-use crate::utils::RoomNameId;
+use crate::utils::{RoomNameId, avatar_from_room_name, get_name_or_alias};
 
+pub mod attachment_buttons;
+pub mod membership;
 pub mod message_list;
 pub mod pane_dock;
 pub mod pinned_messages_list;
@@ -15,6 +17,7 @@ pub mod reply_preview;
 pub mod room_action_bar;
 pub mod room_info;
 pub mod room_members_list;
+pub mod room_membership_footer;
 pub mod room_pane;
 pub mod room_tab_hover_card;
 pub mod room_tabs;
@@ -28,6 +31,8 @@ pub fn script_mod(vm: &mut ScriptVm) {
     room_tab_hover_card::script_mod(vm);
     room_tabs::script_mod(vm);
     reply_preview::script_mod(vm);
+    attachment_buttons::script_mod(vm);
+    room_membership_footer::script_mod(vm);
     room_input_bar::script_mod(vm);
     typing_notice::script_mod(vm);
     room_members_list::script_mod(vm);
@@ -223,14 +228,26 @@ impl FetchedRoomPreview {
     pub fn from(
         client: &Client,
         room_preview: RoomPreview,
-        room_avatar: FetchedRoomAvatar,
+        room_avatar: Option<FetchedRoomAvatar>,
         via: Vec<OwnedServerName>,
         alias: Option<OwnedRoomAliasId>,
     ) -> Self {
-        let display_name = room_preview.name.map_or(
-            RoomDisplayName::Empty,
-            RoomDisplayName::Named,
-        );
+        // For a room we're in or banned from, the preview's name is the SDK's computed name as a string,
+        // so we use the name from our own copy of that room instead.
+        let display_name = if matches!(room_preview.state, Some(RoomState::Joined | RoomState::Banned))
+            && let Some(room) = client.get_room(&room_preview.room_id)
+        {
+            let canonical_alias = room.canonical_alias().or_else(|| room_preview.canonical_alias.clone());
+            let mut alt_aliases = room.alt_aliases();
+            alt_aliases.extend(alias.clone());
+            get_name_or_alias(room.cached_display_name(), canonical_alias.as_deref(), &alt_aliases)
+        } else {
+            get_name_or_alias(
+                room_preview.name.filter(|name| !name.is_empty()).map(RoomDisplayName::Named),
+                room_preview.canonical_alias.as_deref(),
+                alias.as_slice(),
+            )
+        };
         let is_in_allowed_room = match &room_preview.join_rule {
             Some(JoinRuleSummary::Restricted(restricted) | JoinRuleSummary::KnockRestricted(restricted)) => {
                 restricted.allowed_room_ids.iter()
@@ -238,9 +255,10 @@ impl FetchedRoomPreview {
             }
             _ => false,
         };
+        let room_name_id = RoomNameId::new(display_name, room_preview.room_id, room_preview.room_type == Some(RoomType::Space));
         Self {
-            room_name_id: RoomNameId::new(display_name, room_preview.room_id),
-            room_avatar,
+            room_avatar: room_avatar.unwrap_or_else(|| avatar_from_room_name(room_name_id.name_for_avatar())),
+            room_name_id,
             via,
             alias,
             is_in_allowed_room,

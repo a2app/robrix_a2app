@@ -86,7 +86,8 @@ script_mod! {
 
         edit_text_input := MentionableTextInput {
             width: Fill
-            height: Fit{max: FitBound.Rel{base: Base.Full, factor: 0.75}}
+            // Only take the height that's left below the header.
+            height: Fit{max: FitBound.Rel{base: Base.Unused, factor: 1.0}}
             margin: Inset{ bottom: 5, top: 5 }
             // Editing sends an edit rather than a new message, so slash commands don't apply.
             allow_slash_commands: false
@@ -99,7 +100,7 @@ script_mod! {
 
         visible: false,
         width: Fill,
-        height: Fit{max: FitBound.Rel{base: Base.Full, factor: 0.75}}
+        height: Fit
         align: Align{x: 0.5, y: 1.0}
 
         editing_content := mod.widgets.EditingContent { }
@@ -158,6 +159,8 @@ pub struct EditingPane {
 
     #[rust] info: Option<EditingPaneInfo>,
     #[rust] is_animating_out: bool,
+    /// Whether this edit can't be sent right now, e.g., because the user can no longer post in this room.
+    #[rust] is_submit_blocked: bool,
     #[rust] last_content_height: f64,
     /// Used to force this widget's parent to do a re-draw
     /// after the hide animation completes on this pane.
@@ -246,6 +249,14 @@ impl Widget for EditingPane {
             if self.button(cx, ids!(accept_button)).clicked(actions)
                 || edit_text_input.returned(actions).is_some()
             {
+                if self.is_submit_blocked {
+                    enqueue_popup_notification(
+                        "You can't send this edit because you can't post in this room right now.",
+                        PopupKind::Warning,
+                        Some(5.0),
+                    );
+                    return;
+                }
                 // The edit is the text as shown now, so stop adding dictated words to it.
                 mentionable_input.cancel_dictation(cx);
                 let edited_text = mentionable_input.add_via_to_room_links(edit_text_input.text().trim());
@@ -418,6 +429,13 @@ impl Widget for EditingPane {
             self.visible = false;
         };
 
+        // Our own height animates, so we cap our content by our parent's max height instead.
+        let editing_content = self.view(cx, ids!(editing_content));
+        let max_height = cx.current_turtle_max_height();
+        if let Some(mut ec) = editing_content.borrow_mut() {
+            ec.walk.max_height = max_height.map(FitBound::Abs);
+        }
+
         // Animate both the layout height and content position simultaneously:
         // 1. walk.height grows from 0 to ch (and shrinks back during hide),
         //    so the RoomInputBar border grows/shrinks smoothly.
@@ -432,7 +450,7 @@ impl Widget for EditingPane {
             } else {
                 10000.0
             };
-            if let Some(mut ec) = self.view(cx, ids!(editing_content)).borrow_mut() {
+            if let Some(mut ec) = editing_content.borrow_mut() {
                 ec.walk.margin.top = offset;
                 ec.walk.margin.bottom = -offset;
             }
@@ -445,7 +463,7 @@ impl Widget for EditingPane {
             }
         } else {
             // Fully shown or not animating: reset margins.
-            if let Some(mut ec) = self.view(cx, ids!(editing_content)).borrow_mut() {
+            if let Some(mut ec) = editing_content.borrow_mut() {
                 ec.walk.margin.top = 0.0;
                 ec.walk.margin.bottom = 0.0;
             }
@@ -454,7 +472,7 @@ impl Widget for EditingPane {
         let step = self.view.draw_walk(cx, scope, walk);
 
         // Read area rect AFTER drawing to capture this frame's layout.
-        let ec_height = self.view(cx, ids!(editing_content)).area().rect(cx).size.y;
+        let ec_height = editing_content.area().rect(cx).size.y;
         if ec_height > 0.0 {
             self.last_content_height = ec_height;
         }
@@ -476,6 +494,36 @@ impl EditingPane {
     /// Returns `true` if this pane is currently being shown.
     pub fn is_currently_shown(&self, _cx: &mut Cx) -> bool {
         self.visible
+    }
+
+    /// Returns whether the user is in the middle of an edit, i.e., this pane is shown and isn't closing.
+    pub fn is_editing(&self) -> bool {
+        self.visible && !self.is_animating_out
+    }
+
+    /// Sets whether the edit in this pane can be sent. The pane stays shown either way,
+    /// so the user never loses what they typed, and trying to send it tells them why they can't.
+    pub fn set_submit_blocked(&mut self, is_blocked: bool) {
+        self.is_submit_blocked = is_blocked;
+    }
+
+    /// Shows this pane to edit the given event again, with the text of an edit that failed to send.
+    pub fn show_failed_edit(
+        &mut self,
+        cx: &mut Cx,
+        event_tl_item: EventTimelineItem,
+        timeline_kind: TimelineKind,
+        edited_text: &str,
+    ) {
+        self.show(cx, event_tl_item, timeline_kind);
+        if !self.is_editing() { return; }
+        let edit_text_input = self.mentionable_text_input(cx, ids!(editing_content.edit_text_input));
+        edit_text_input.set_text(cx, edited_text);
+        edit_text_input.text_input_ref().set_cursor(
+            cx,
+            Cursor { index: edited_text.len(), prefer_next_row: false },
+            false,
+        );
     }
 
     /// Call this when the result of an edit operation is received.
@@ -624,6 +672,15 @@ impl EditingPaneRef {
         self.borrow().map_or(1.0, |inner| inner.slide)
     }
 
+    /// Returns the smallest height this pane can be while still showing a full line of its text input.
+    pub fn get_min_height(&self, cx: &mut Cx) -> f64 {
+        let Some(inner) = self.borrow() else { return 0.0 };
+        let content_height = inner.view(cx, ids!(editing_content)).area().rect(cx).size.y;
+        let input = inner.mentionable_text_input(cx, ids!(editing_content.edit_text_input));
+        let text_input_height = input.text_input_ref().area().rect(cx).size.y;
+        content_height - text_input_height + input.speech_text_input_ref().get_min_text_input_height(cx)
+    }
+
     /// See [`EditingPane::handle_edit_result()`].
     pub fn handle_edit_result(
         &self,
@@ -671,6 +728,29 @@ impl EditingPaneRef {
     ) {
         let Some(mut inner) = self.borrow_mut() else { return };
         inner.restore_state(cx, editing_pane_state, timeline_kind);
+    }
+
+    /// See [`EditingPane::is_editing()`].
+    pub fn is_editing(&self) -> bool {
+        self.borrow().is_some_and(|inner| inner.is_editing())
+    }
+
+    /// See [`EditingPane::set_submit_blocked()`].
+    pub fn set_submit_blocked(&self, is_blocked: bool) {
+        let Some(mut inner) = self.borrow_mut() else { return };
+        inner.set_submit_blocked(is_blocked);
+    }
+
+    /// See [`EditingPane::show_failed_edit()`].
+    pub fn show_failed_edit(
+        &self,
+        cx: &mut Cx,
+        event_tl_item: EventTimelineItem,
+        timeline_kind: TimelineKind,
+        edited_text: &str,
+    ) {
+        let Some(mut inner) = self.borrow_mut() else { return };
+        inner.show_failed_edit(cx, event_tl_item, timeline_kind, edited_text);
     }
 
     /// Hides the editing pane immediately and clears its state without animating it out.

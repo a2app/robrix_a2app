@@ -180,7 +180,7 @@ mod tests {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let choices = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             super::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.PermissionChoices {} });
             WidgetRef::script_from_value(vm, value).as_permission_choices()
@@ -201,7 +201,7 @@ mod tests {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let tabs = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             super::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.PermissionChoices { tabs: true, labels: ["Rules", "History"] } });
             WidgetRef::script_from_value(vm, value).as_permission_choices()
@@ -223,7 +223,7 @@ mod tests {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let choices = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             super::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.PermissionChoices { horizontal: true, labels: ["Read", "Write"] } });
             WidgetRef::script_from_value(vm, value).as_permission_choices()
@@ -247,7 +247,7 @@ mod tests {
         let template = |vm: &mut ScriptVm| script_eval!(vm, { mod.widgets.PermissionChoices { labels: ["Ask", "Allow"] } });
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             super::script_mod(vm);
             let value = template(vm);
             WidgetRef::script_from_value(vm, value)
@@ -269,7 +269,7 @@ mod tests {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let (first, second) = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             super::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.PermissionChoices { labels: ["Ask", "Allow", "Block"] } });
             let first = WidgetRef::script_from_value(vm, value).as_permission_choices();

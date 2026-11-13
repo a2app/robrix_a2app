@@ -1630,7 +1630,7 @@ pub fn process(cx: &mut Cx, ui: &WidgetRef, event: &Event) {
                 continue;
             }
             if let Some(AppStateAction::RoomFocused(selected)) = action.downcast_ref() {
-                let room = |r: &RoomNameId| (r.room_id().to_string(), r.display_name().to_string());
+                let room = |r: &RoomNameId| (r.room_id().to_string(), r.display().into_owned());
                 let payload = match selected {
                     SelectedRoom::JoinedRoom { room_name_id } => {
                         let (room_id, name) = room(room_name_id);
@@ -12258,7 +12258,7 @@ mod permission_tests {
         let template = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             super::super::host_set::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppHost {} });
             vm.bx.heap.new_object_ref(value.as_object().unwrap())
@@ -12482,7 +12482,7 @@ View{note := Label{text:"waiting"}}
         let (template, root) = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             super::super::host_set::script_mod(vm);
             let template = script_eval!(vm, { mod.widgets.MiniAppHost {} });
             let template = vm.bx.heap.new_object_ref(template.as_object().unwrap());
@@ -12571,7 +12571,7 @@ View{note := Label{text:"waiting"}}
         let (template, root) = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             super::super::host_set::script_mod(vm);
             let template = script_eval!(vm, { mod.widgets.MiniAppHost {} });
             let template = vm.bx.heap.new_object_ref(template.as_object().unwrap());

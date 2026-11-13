@@ -400,8 +400,17 @@ script_mod! {
                                 }
                             }
                             body +: {
+                                // The RoomInputBar fills the bottom safe area itself, with its bottom view's own color.
+                                padding: Inset{
+                                    left: (mod.widgets.SAFE_INSET_PAD_LEFT),
+                                    right: (mod.widgets.SAFE_INSET_PAD_RIGHT),
+                                }
                                 room_screen := mod.widgets.RoomScreen {
                                     room_actions +: {visible: false}
+                                    // Its panel's background fills the bottom safe area too, but its content stays above it.
+                                    keyboard_view +: { room_screen_wrapper +: { user_profile_sliding_pane +: { main_content +: {
+                                        padding: Inset{bottom: (mod.widgets.SAFE_INSET_PAD_BOTTOM)}
+                                    }}}}
                                 }
                             }
                         }
@@ -451,7 +460,7 @@ mod navigation_tests {
         let (home, picker) = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let home_type = HomeScreen::register_widget(vm);
             let value = script_eval!(vm, {
@@ -985,6 +994,14 @@ impl Widget for HomeScreen {
                     Some(NavigationBarAction::GoToHome) => {
                         self.switch_to_tab(cx, app_state, SelectedTab::Home);
                     }
+                    // Tapping AddRoom while it's already shown scrolls it back up to its top.
+                    Some(NavigationBarAction::GoToAddRoom { search_for: None }) if app_state.selected_tab == SelectedTab::AddRoom => {
+                        if let Some(page) = self.view.page_flip(cx, ids!(home_screen_page_flip))
+                            .page(cx, page_for_tab(&SelectedTab::AddRoom))
+                        {
+                            page.add_room_screen(cx, ids!(add_room_screen)).scroll_to_top(cx);
+                        }
+                    }
                     Some(NavigationBarAction::GoToAddRoom { search_for }) => {
                         let stack_navigation = self.view.stack_navigation(cx, ids!(view_stack));
                         // Skip searching for a clicked link (room/space) if the user has already left
@@ -1042,6 +1059,12 @@ impl Widget for HomeScreen {
                             } else {
                                 error!("BUG: failed to set active page to show settings screen.");
                             }
+                        }
+                        // Tapping Settings while it's already open scrolls it back up to its top.
+                        else if let Some(settings_page) = self.view.page_flip(cx, ids!(home_screen_page_flip))
+                            .page(cx, page_for_tab(&SelectedTab::Settings))
+                        {
+                            settings_page.settings_screen(cx, ids!(settings_screen)).scroll_to_top(cx);
                         }
                     }
                     Some(NavigationBarAction::CloseSettings) => {
@@ -1389,6 +1412,8 @@ impl Widget for HomeScreen {
                     self.view.stack_navigation(cx, ids!(view_stack)).end_interactive_transition_without_animation(cx);
                     self.interactive_pop_place = None;
                     self.interactive_push_place = None;
+                    // The next login starts from the rooms list, not from the last account's open room.
+                    self.view.stack_navigation(cx, ids!(view_stack)).pop_to_root(cx);
                 }
 
                 match action.downcast_ref() {
@@ -2119,7 +2144,7 @@ impl HomeScreen {
             }
             None => {}
         }
-        self.select_screen(cx, app_state, SelectedRoom::Space { space_name_id: space_name_id.clone() });
+        self.select_screen(cx, app_state, SelectedRoom::to_joined(space_name_id.clone(), true));
         if let Some(room_to_close) = room_to_close {
             self.close_room(cx, room_to_close);
         }

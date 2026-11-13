@@ -19,7 +19,7 @@ use a2app_core::layout::PaneSide;
 use a2app_core::manifest::{instance_tag, MiniAppId, MiniAppManifest};
 use a2app_core::services::PaneState;
 use crate::room::room_pane::{self, RoomPaneKind, RoomPaneOp};
-use crate::settings::app_preferences::Appearance;
+use robius_theme::Theme;
 
 /// `(app, room)`; `None` is a room-less app in the host modal.
 pub type InstanceKey = (MiniAppId, Option<OwnedRoomId>);
@@ -112,7 +112,7 @@ impl Drop for InlineSurface {
 struct Registry {
     host_template: Option<ScriptObjectRef>,
     /// The appearance live hosts were last styled for, once a host surface said.
-    host_appearance: Option<Appearance>,
+    host_appearance: Option<Theme>,
     instances: HashMap<InstanceKey, MiniAppInstance>,
     /// Inline A2UI surfaces by isolate heap key.
     inline: HashMap<usize, InlineSurface>,
@@ -171,7 +171,7 @@ pub fn set_host_template(obj: ScriptObjectRef) {
 
 /// Re-applies the current template to live hosts, which a reload's walk doesn't reach, but only for a new
 /// `appearance` or DSL: it re-binds an app's root View to Robrix's template until the app restyles.
-pub fn restyle_hosts(vm: &mut ScriptVm, appearance: Appearance, is_template_changed: bool) {
+pub fn restyle_hosts(vm: &mut ScriptVm, appearance: Theme, is_template_changed: bool) {
     let Some((template, styled_for)) = with_registry(|r| {
         Some((r.host_template.clone()?, r.host_appearance.replace(appearance)))
     }) else { return };
@@ -925,7 +925,7 @@ mod tests {
     use super::*;
 
     /// Runs Robrix's styles for `appearance`, as a style reload does, and returns their host template.
-    fn styled_host_template(vm: &mut ScriptVm, appearance: Appearance) -> ScriptObjectRef {
+    fn styled_host_template(vm: &mut ScriptVm, appearance: Theme) -> ScriptObjectRef {
         crate::shared::script_mod(vm, appearance);
         super::super::host_set::script_mod(vm);
         let value = script_eval!(vm, { mod.widgets.MiniAppHost {} });
@@ -960,6 +960,8 @@ mod tests {
 
     #[test]
     fn hosts_follow_a_new_appearance_but_light_only_ones_stay_light() {
+        use crate::settings::app_preferences::{Appearance, AppearanceGlobal};
+        use crate::settings::system_theme;
         let previous_account = super::super::information_flow::TEST_ACCOUNT
             .with(|account| account.replace(Some("@restyle-hosts:example.org".into())));
         let manifest = |id: &str, source: &str| {
@@ -975,13 +977,16 @@ mod tests {
         let light_only = manifest("restyle-light-only", light_only_source);
         super::super::runtime::initialize_background_test(themed.clone());
         let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.set_global(AppearanceGlobal(Appearance::Auto));
+        system_theme::set_system_theme(&mut cx, Some(Theme::Light));
+        let theme = system_theme::effective_theme(&mut cx);
         let template = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            styled_host_template(vm, Appearance::Light)
+            styled_host_template(vm, theme)
         });
         set_host_template(template);
-        cx.with_vm(|vm| restyle_hosts(vm, Appearance::Light, false));
+        cx.with_vm(|vm| restyle_hosts(vm, theme, false));
         let themed_host = ensure(&mut cx, &(themed.id.clone(), None), &themed, &[]).unwrap();
         let light_only_host = ensure(&mut cx, &(light_only.id.clone(), None), &light_only, &[]).unwrap();
         let look = |cx: &mut Cx, host: &WidgetRef| [surface(cx, host, id!(color)), surface(cx, host, id!(border_color)), scroll_bar(cx, host)];
@@ -1004,14 +1009,16 @@ mod tests {
         };
         mark(&mut cx, &themed_host);
         mark(&mut cx, &light_only_host);
-        let template = cx.with_vm(|vm| vm.with_reload(|vm| styled_host_template(vm, Appearance::Light)));
+        let template = cx.with_vm(|vm| vm.with_reload(|vm| styled_host_template(vm, theme)));
         set_host_template(template);
-        cx.with_vm(|vm| restyle_hosts(vm, Appearance::Light, false));
+        cx.with_vm(|vm| restyle_hosts(vm, theme, false));
         assert_eq!([surface(&mut cx, &themed_host, id!(color)), surface(&mut cx, &light_only_host, id!(color))], [marked, marked]);
 
-        let template = cx.with_vm(|vm| vm.with_reload(|vm| styled_host_template(vm, Appearance::Dark)));
+        system_theme::set_system_theme(&mut cx, Some(Theme::Dark));
+        let theme = system_theme::effective_theme(&mut cx);
+        let template = cx.with_vm(|vm| vm.with_reload(|vm| styled_host_template(vm, theme)));
         set_host_template(template);
-        cx.with_vm(|vm| restyle_hosts(vm, Appearance::Dark, false));
+        cx.with_vm(|vm| restyle_hosts(vm, theme, false));
         let dark_surface = token(&mut cx, "COLOR_PRIMARY");
         assert_ne!(dark_surface, light_only_look[0]);
         assert_eq!(surface(&mut cx, &themed_host, id!(color)), dark_surface, "a host must follow a new appearance");
@@ -1023,9 +1030,18 @@ mod tests {
         assert_eq!([isolate(&mut cx, &themed_host), isolate(&mut cx, &light_only_host)], isolates, "apps restyle in place");
         assert_eq!(splash_of(&mut cx, &themed_host).text(), themed.source, "and keep their source");
 
+        system_theme::set_system_theme(&mut cx, Some(Theme::Light));
+        let theme = system_theme::effective_theme(&mut cx);
+        let template = cx.with_vm(|vm| vm.with_reload(|vm| styled_host_template(vm, theme)));
+        set_host_template(template);
+        cx.with_vm(|vm| restyle_hosts(vm, theme, false));
+        assert_eq!(surface(&mut cx, &themed_host, id!(color)), light_only_look[0]);
+        assert_eq!([isolate(&mut cx, &themed_host), isolate(&mut cx, &light_only_host)], isolates, "returning to light keeps the same apps alive");
+        assert_eq!(splash_of(&mut cx, &themed_host).text(), themed.source);
+
         quit_everything(&mut cx);
         clear_host_template();
-        cx.with_vm(|vm| crate::shared::script_mod(vm, Appearance::Light));
+        cx.with_vm(|vm| crate::shared::script_mod(vm, Theme::Light));
         super::super::information_flow::TEST_ACCOUNT.with(|account| account.replace(previous_account));
     }
 }

@@ -200,7 +200,7 @@ mod tests {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let (settings, category) = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             let settings = script_eval!(vm, { mod.widgets.RobrixSettingsCollapsibleHeader { title: "Individual abilities" } });
             let category = script_eval!(vm, { mod.widgets.CollapsibleHeader {} });
             (WidgetRef::script_from_value(vm, settings).as_collapsible_header(),
@@ -217,7 +217,7 @@ mod tests {
         assert_eq!(settings.borrow().unwrap().title, "Permission details");
         cx.with_vm(|vm| {
             let value = vm.with_reload(|vm| {
-                crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Dark);
+                crate::shared::script_mod(vm, robius_theme::Theme::Dark);
                 script_eval!(vm, { mod.widgets.RobrixSettingsCollapsibleHeader { title: "Permission details" } })
             });
             settings.clone().script_apply(vm, &Apply::ScriptReapply, &mut Scope::empty(), value);

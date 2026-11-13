@@ -2,7 +2,7 @@
 
 use makepad_widgets::{makepad_platform::event::finger::TouchState, *};
 
-use matrix_sdk::ruma::OwnedRoomId;
+use matrix_sdk::{RoomState, ruma::OwnedRoomId};
 use crate::{
     home::rooms_list::{RoomTombstoned, RoomsListRef},
     profile::user_verification_cache::{UserVerificationStatesUpdated, get_or_fetch_dm_user_verification_state},
@@ -10,7 +10,7 @@ use crate::{
     sliding_sync::{UserPowerLevels, UserPowerLevelsUpdated},
     utils::{self, RoomNameId},
 };
-use super::room_pane::RoomPaneKind;
+use super::{membership::{RoomMembershipChanged, get_room_membership}, room_pane::RoomPaneKind};
 
 const HEADER_HEIGHT: f64 = 45.0;
 const BUTTON_SIZE: f64 = 40.0;
@@ -463,6 +463,13 @@ impl Widget for RoomActionBar {
                     && self.room_id.as_ref() == Some(room_id)
                 {
                     self.set_can_invite(cx, user_power_levels.can_invite());
+                }
+                // We can't invite anyone to a room that we aren't in anymore.
+                if let Some(RoomMembershipChanged { room_id }) = action.downcast_ref()
+                    && self.room_id.as_ref() == Some(room_id)
+                    && get_room_membership(cx, room_id).is_some_and(|m| m.state != RoomState::Joined)
+                {
+                    self.set_can_invite(cx, false);
                 }
             }
         }

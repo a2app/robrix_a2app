@@ -7,7 +7,7 @@ use makepad_widgets::*;
 use a2app_core::manifest::{MiniAppId, MiniAppManifest};
 use crate::a2app::host_set::{MiniAppHostAreaWidgetExt, Templates};
 use crate::a2app::instances::{self, InstanceKey, Surface};
-use crate::settings::app_preferences::AppearanceGlobal;
+use crate::settings::system_theme;
 use matrix_sdk::ruma::OwnedRoomId;
 
 script_mod! {
@@ -186,8 +186,8 @@ impl ScriptHook for MiniAppHostPane {
         if let Some(template) = self.templates.get(live_id!(AppHost)) {
             instances::set_host_template(template);
             if apply.is_new() || apply.is_reload() {
-                let appearance = vm.cx_mut().global::<AppearanceGlobal>().0;
-                instances::restyle_hosts(vm, appearance, apply.is_live_edit_reload());
+                let theme = system_theme::effective_theme(vm.cx_mut());
+                instances::restyle_hosts(vm, theme, apply.is_live_edit_reload());
             }
         }
         // A reload resets the margin that fits the card to the window.
@@ -406,7 +406,7 @@ mod tests {
         let pane = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             super::super::host_set::script_mod(vm);
             vm.bx.captured_errors = Some(Vec::new());
             super::script_mod(vm);

@@ -1179,7 +1179,7 @@ mod tests {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let card = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             super::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.AiTurnTimelineCard {} });
             WidgetRef::script_from_value(vm, value).as_ai_turn_timeline_card()
@@ -1209,8 +1209,8 @@ mod tests {
     /// A turn card's tint and spinner follow a live switch to dark, even when the turn hasn't changed.
     #[test]
     fn turn_card_follows_a_live_switch_to_dark() {
-        use crate::settings::app_preferences::Appearance;
-        fn card_template(vm: &mut ScriptVm, appearance: Appearance) -> ScriptValue {
+        use robius_theme::Theme;
+        fn card_template(vm: &mut ScriptVm, appearance: Theme) -> ScriptValue {
             makepad_widgets::script_mod(vm);
             crate::shared::script_mod(vm, appearance);
             super::script_mod(vm);
@@ -1228,7 +1228,7 @@ mod tests {
         let is_close = |a: [f32; 4], b: [f32; 4]| a.iter().zip(b).all(|(a, b)| (a - b).abs() < 0.002);
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let mut widget = cx.with_vm(|vm| {
-            let value = card_template(vm, Appearance::Light);
+            let value = card_template(vm, Theme::Light);
             WidgetRef::script_from_value(vm, value)
         });
         let card = widget.as_ai_turn_timeline_card();
@@ -1254,7 +1254,7 @@ mod tests {
 
         // As a live switch does: rerun the scripts in dark, then reapply the card, which resets its tint.
         cx.with_vm(|vm| {
-            let value = vm.with_reload(|vm| card_template(vm, Appearance::Dark));
+            let value = vm.with_reload(|vm| card_template(vm, Theme::Dark));
             widget.script_apply(vm, &Apply::ScriptReapply, &mut Scope::empty(), value);
         });
         let [dark_running, dark_done, dark_spinner] = tokens(&mut cx,

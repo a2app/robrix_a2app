@@ -698,7 +698,7 @@ mod tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::permission_choices::script_mod(vm);
             crate::a2app::permission_message_preview::script_mod(vm);
             crate::a2app::permission_prompt::script_mod(vm);
@@ -726,7 +726,7 @@ mod tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::permission_choices::script_mod(vm);
             crate::a2app::permission_message_preview::script_mod(vm);
             crate::a2app::permission_prompt::script_mod(vm);
@@ -814,7 +814,7 @@ mod tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::permission_choices::script_mod(vm);
             crate::a2app::permission_message_preview::script_mod(vm);
             crate::a2app::permission_prompt::script_mod(vm);
@@ -948,7 +948,7 @@ mod tests {
         let (inspector, screen) = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.ProtectionInspector {} });
             let inspector = WidgetRef::script_from_value(vm, value);

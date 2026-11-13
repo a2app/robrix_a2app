@@ -472,18 +472,21 @@ impl MainDesktopUI {
     ) {
         let joined = SelectedRoom::to_joined(room_name_id.clone(), is_space);
         let dock = self.view.dock(cx, ids!(dock));
-        if let Some((new_widget, _)) = dock.replace_tab(
-            cx,
-            joined.tab_id(),
-            joined.dock_kind(),
-            Some(joined.display_name()),
-            false,
-        ) {
+        // A room we left and then got invited back to might still be open in its own room screen.
+        if matches!(self.open_rooms.get(&joined.tab_id()), Some(SelectedRoom::InvitedRoom { .. }))
+            && let Some((new_widget, _)) = dock.replace_tab(
+                cx,
+                joined.tab_id(),
+                joined.dock_kind(),
+                Some(joined.display_name()),
+                false,
+            )
+        {
             match is_space {
                 true => new_widget.as_space_lobby_screen()
-                    .set_displayed_space(cx, room_name_id),
+                    .set_displayed_space(cx, joined.room_name()),
                 false => new_widget.as_room_screen()
-                    .set_displayed_room(cx, room_name_id, None),
+                    .set_displayed_room(cx, joined.room_name(), None),
             }
 
             // Note: don't return here. Whether or not this invited room is opened in a tab,
@@ -633,7 +636,7 @@ impl MainDesktopUI {
                 }
             };
 
-        let SavedDockState { dock_items, open_rooms, room_order, selected_room } = to_restore;
+        let SavedDockState { mut dock_items, open_rooms, room_order, selected_room } = to_restore;
         let has_permanent_home_tab = matches!(
             dock_items.get(&id!(home_tab)),
             Some(DockItem::Tab { template, .. }) if *template == id!(PermanentTab)
@@ -642,6 +645,12 @@ impl MainDesktopUI {
         self.room_order = room_order;
         self.open_rooms = open_rooms;
 
+        // Saved tab titles can be out of date, so we rebuild them from each tab's room.
+        for (tab_id, room) in &self.open_rooms {
+            if let Some(DockItem::Tab { name, .. }) = dock_items.get_mut(tab_id) {
+                *name = room.display_name();
+            }
+        }
         dock.load_state(cx, dock_items);
         self.rooms_sidebar.restore_state(cx, &dock, app_state);
         // Loading the dock clears its focused tab, so we clear the previous dock's selection too,
@@ -1008,9 +1017,9 @@ impl WidgetMatchEvent for MainDesktopUI {
                 RoomsListAction::InviteAccepted { room_name_id, kind } => {
                     // A space's SpaceLobbyScreen should be shown in its top-level ancestor space's dock
                     // (assuming the user is still on that space's InviteScreen).
-                    let space = SelectedRoom::Space { space_name_id: room_name_id.clone() };
+                    let space = SelectedRoom::to_joined(room_name_id.clone(), true);
                     if let AcceptedInviteKind::Space { dock_space: Some(dock_space) } = kind
-                        && self.open_rooms.contains_key(&space.tab_id())
+                        && matches!(self.open_rooms.get(&space.tab_id()), Some(SelectedRoom::InvitedRoom { .. }))
                         && self.most_recently_selected_room.as_ref()
                             .is_some_and(|sr| sr.room_id() == room_name_id.room_id())
                     {

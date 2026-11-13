@@ -1195,7 +1195,7 @@ pub(super) fn switch_to_dark(cx: &mut Cx, widget: &WidgetRef, template: impl FnO
         let value = vm.with_reload(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Dark);
+            crate::shared::script_mod(vm, robius_theme::Theme::Dark);
             super::permission_choices::script_mod(vm);
             super::permission_message_preview::script_mod(vm);
             super::permission_prompt::script_mod(vm);
@@ -1242,7 +1242,7 @@ mod tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             super::super::permission_choices::script_mod(vm);
             super::super::permission_message_preview::script_mod(vm);
             super::super::permission_prompt::script_mod(vm);

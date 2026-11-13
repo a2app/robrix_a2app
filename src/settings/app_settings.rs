@@ -92,12 +92,12 @@ script_mod! {
             }
 
             appearance_dropdown := mod.widgets.RobrixSettingsDropDown {
-                labels: ["Light Theme", "Dark Theme"]
+                labels: ["Auto (follow system)", "Light Theme", "Dark Theme"]
                 selected_item: 0
             }
         }
         mod.widgets.SettingsSectionDescription {
-            body: "<ul><li>Automatic switching is coming soon!</li></ul>"
+            body: "<ul><li>Auto follows your system's light or dark appearance. If the system has no preference, Robrix uses the light theme.</li></ul>"
         }
 
 
@@ -185,7 +185,7 @@ script_mod! {
         }
 
         send_on_cmd_enter_toggle := mod.widgets.RobrixSettingsToggle {
-            margin: Inset{left: 6.5, top: 10, bottom: 10}
+            margin: Inset{left: 6.5, top: 8.5, bottom: 8.5}
             active: false,
             text: "" // we set this text dynamically based on the toggle state and target platform
         }
@@ -216,7 +216,7 @@ script_mod! {
 
                 double_tap_to_react_toggle := mod.widgets.RobrixSettingsToggle {
                     active: true,
-                    text: "Double-tap a message to react with:"
+                    text: "Double-tap to react with:"
                 }
                 // Read-only while `double_tap_to_react_toggle` is off.
                 quick_reaction_input := RobrixTextInput {

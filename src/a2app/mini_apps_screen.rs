@@ -39,7 +39,8 @@ use crate::shared::speech_text_input::SpeechTextInputWidgetExt;
 use crate::shared::password_input::PasswordTextInputWidgetExt;
 use crate::shared::room_picker_modal::{RoomPickerContent, RoomPickerModalAction};
 use crate::shared::hover_highlight::handle_hover_hit_with_test;
-use crate::settings::app_preferences::{Appearance, AppearanceGlobal};
+use crate::settings::system_theme;
+use robius_theme::Theme;
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -721,13 +722,9 @@ script_mod! {
                         align: Align{x: 1.0, y: 0.0}
                         padding: Inset{top: 2, bottom: 0, left: 4, right: 6}
                     }
-                    // `mic_clearance` only ever insets the scroll bar's bottom, which a
-                    // top-mounted mic doesn't need, so it drops to the normal inset and the
-                    // top inset below keeps the bar clear of the button instead.
-                    mic_clearance: 3
-                    scroll_bar_inset: Inset{top: 36, right: 4, bottom: 3}
-
                     text_input +: {
+                        // Keep the scroll bar clear of the top-mounted microphone.
+                        scroll_bar_inset: Inset{top: 36, right: 4, bottom: 3}
                         // Enter inserts a newline; the Generate button submits.
                         is_multiline: true
                         empty_text: "Describe a new app or a change…"
@@ -1959,7 +1956,7 @@ impl MiniAppRow {
         self.view.widget(cx, ids!(row_summary)).set_visible(cx, !row.summary.is_empty());
         self.view.widget(cx, ids!(row_update_badge)).set_visible(cx, row.has_update);
         self.view.button(cx, ids!(row_open_button)).set_text(cx, row.open_label);
-        let is_dark = cx.get_global_ref::<AppearanceGlobal>().is_some_and(|appearance| appearance.0 == Appearance::Dark);
+        let is_dark = system_theme::effective_theme(cx) == Theme::Dark;
         let tile = tile_color(row.tint, is_dark);
         if self.tile_color == Some(tile) {
             return;
@@ -3995,7 +3992,7 @@ mod picker_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -4018,7 +4015,7 @@ mod picker_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -4052,7 +4049,7 @@ mod picker_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -4096,7 +4093,7 @@ mod picker_tests {
         let (screen, picker) = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             let screen = WidgetRef::script_from_value(vm, value);
@@ -5156,7 +5153,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppProviderRow {} });
             WidgetRef::script_from_value(vm, value)
@@ -5192,7 +5189,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -5222,7 +5219,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -5261,7 +5258,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppRow {} });
             WidgetRef::script_from_value(vm, value)
@@ -5306,7 +5303,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -5349,7 +5346,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -5373,7 +5370,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppVersionRow {} });
             WidgetRef::script_from_value(vm, value)
@@ -5455,7 +5452,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppCapabilityRow {} });
             WidgetRef::script_from_value(vm, value)
@@ -5536,7 +5533,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -5562,7 +5559,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -5592,7 +5589,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -5611,7 +5608,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -5668,7 +5665,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -5721,7 +5718,7 @@ mod access_tests {
         let widget = cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -5763,7 +5760,7 @@ mod access_tests {
         cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -6324,7 +6321,7 @@ mod create_card_tests {
         cx.with_vm(|vm| {
             makepad_widgets::script_mod(vm);
             makepad_code_editor::script_mod(vm);
-            crate::shared::script_mod(vm, crate::settings::app_preferences::Appearance::Light);
+            crate::shared::script_mod(vm, robius_theme::Theme::Light);
             crate::a2app::script_mod(vm);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
@@ -6383,17 +6380,18 @@ mod create_card_tests {
 #[cfg(test)]
 mod theme_tests {
     use super::*;
+    use crate::settings::app_preferences::{Appearance, AppearanceGlobal};
 
-    /// Runs Robrix's styles for `appearance` in the app's order, as a start or a switch does.
-    fn styles(vm: &mut ScriptVm, appearance: Appearance) {
+    /// Runs Robrix's styles for `theme` in the app's order, as a start or a switch does.
+    fn styles(vm: &mut ScriptVm, theme: Theme) {
         makepad_widgets::theme_mod(vm);
-        match appearance {
-            Appearance::Light => script_eval!(vm, { mod.theme = mod.themes.light }),
-            Appearance::Dark => script_eval!(vm, { mod.theme = mod.themes.dark }),
+        match theme {
+            Theme::Light => script_eval!(vm, { mod.theme = mod.themes.light }),
+            Theme::Dark => script_eval!(vm, { mod.theme = mod.themes.dark }),
         };
         makepad_widgets::widgets_mod(vm);
         makepad_code_editor::script_mod(vm);
-        crate::shared::script_mod(vm, appearance);
+        crate::shared::script_mod(vm, theme);
         crate::a2app::script_mod(vm);
     }
 
@@ -6420,7 +6418,7 @@ mod theme_tests {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         cx.set_global(AppearanceGlobal(Appearance::Light));
         let row = cx.with_vm(|vm| {
-            styles(vm, Appearance::Light);
+            styles(vm, Theme::Light);
             let value = script_eval!(vm, { mod.widgets.MiniAppRow {} });
             WidgetRef::script_from_value(vm, value)
         });
@@ -6438,14 +6436,21 @@ mod theme_tests {
 
         // A reapply puts the tile's DSL color back, so the next populate must not skip it as cached,
         // even when the appearance stays the same (as on a rotation's re-bake).
-        for appearance in [Appearance::Dark, Appearance::Dark] {
+        for (appearance, system) in [
+            (Appearance::Dark, None),
+            (Appearance::Auto, Some(Theme::Light)),
+            (Appearance::Auto, Some(Theme::Dark)),
+            (Appearance::Auto, Some(Theme::Dark)),
+        ] {
             cx.global::<AppearanceGlobal>().0 = appearance;
+            system_theme::set_system_theme(&mut cx, system);
+            let theme = system_theme::effective_theme(&mut cx);
             cx.with_vm(|vm| {
-                let value = vm.with_reload(|vm| { styles(vm, appearance); script_eval!(vm, { mod.widgets.MiniAppRow {} }) });
+                let value = vm.with_reload(|vm| { styles(vm, theme); script_eval!(vm, { mod.widgets.MiniAppRow {} }) });
                 row.clone().script_apply(vm, &Apply::ScriptReapply, &mut Scope::empty(), value);
             });
             row.borrow_mut::<MiniAppRow>().unwrap().populate(&mut cx, &data);
-            assert_eq!(tile(&mut cx), tile_color(data.tint, true));
+            assert_eq!(tile(&mut cx), tile_color(data.tint, theme == Theme::Dark));
         }
     }
 
@@ -6453,7 +6458,7 @@ mod theme_tests {
     fn a_reload_redoes_the_console_height_and_hint_layout() {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let screen = cx.with_vm(|vm| {
-            styles(vm, Appearance::Light);
+            styles(vm, Theme::Light);
             let value = script_eval!(vm, { mod.widgets.MiniAppsScreen {} });
             WidgetRef::script_from_value(vm, value)
         });
@@ -6464,7 +6469,7 @@ mod theme_tests {
         }
         // Even with the screen's page hidden, which gets no reload event.
         cx.with_vm(|vm| {
-            let value = vm.with_reload(|vm| { styles(vm, Appearance::Dark); script_eval!(vm, { mod.widgets.MiniAppsScreen {} }) });
+            let value = vm.with_reload(|vm| { styles(vm, Theme::Dark); script_eval!(vm, { mod.widgets.MiniAppsScreen {} }) });
             screen.clone().script_apply(vm, &Apply::ScriptReapply, &mut Scope::empty(), value);
         });
         let inner = screen.borrow::<MiniAppsScreen>().unwrap();
@@ -6476,7 +6481,7 @@ mod theme_tests {
     fn provider_details_take_the_appearance_colors() {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let row = cx.with_vm(|vm| {
-            styles(vm, Appearance::Light);
+            styles(vm, Theme::Light);
             let value = script_eval!(vm, { mod.widgets.MiniAppProviderRow {} });
             WidgetRef::script_from_value(vm, value)
         });
@@ -6489,7 +6494,7 @@ mod theme_tests {
         assert!(detail(&mut cx, false).starts_with("<font color=\"#106fcc\">Tap to set up</font>"));
         assert!(detail(&mut cx, true).starts_with("<font color=\"#138808\">✅ In use</font>"));
         cx.with_vm(|vm| {
-            let value = vm.with_reload(|vm| { styles(vm, Appearance::Dark); script_eval!(vm, { mod.widgets.MiniAppProviderRow {} }) });
+            let value = vm.with_reload(|vm| { styles(vm, Theme::Dark); script_eval!(vm, { mod.widgets.MiniAppProviderRow {} }) });
             row.clone().script_apply(vm, &Apply::ScriptReapply, &mut Scope::empty(), value);
         });
         assert!(detail(&mut cx, false).starts_with("<font color=\"#5aabff\">Tap to set up</font>"));
